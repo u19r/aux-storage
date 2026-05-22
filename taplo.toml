@@ -1,0 +1,18 @@
+include = ["**/Cargo.toml"]
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = [
+  "dependencies",
+  "dev-dependencies",
+  "build-dependencies",
+  "workspace.dependencies",
+]
+
+[rule.formatting]
+reorder_keys = true
+reorder_arrays = true
+column_width = 1000
+
+[rule.schema]
+url = "https://json.schemastore.org/cargo.json"

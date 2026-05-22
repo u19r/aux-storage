@@ -1,0 +1,33 @@
+{
+  "source": "AWS CLI Query protocol error fixtures captured from disposable topics on 2026-05-05 and normalized for volatile resource identifiers.",
+  "cases": {
+    "invalid_topic_name": {
+      "code": "InvalidParameter",
+      "message": "Invalid parameter: Topic Name"
+    },
+    "invalid_topic_arn": {
+      "code": "InvalidParameter",
+      "message": "Invalid parameter: TopicArn Reason: An ARN must have at least 6 elements, not 1"
+    },
+    "missing_topic": {
+      "code": "NotFound",
+      "message": "Topic does not exist"
+    },
+    "unsupported_protocol": {
+      "code": "InvalidParameter",
+      "message": "Invalid parameter: Amazon SNS does not support this protocol string: ftp"
+    },
+    "invalid_attribute_name": {
+      "code": "InvalidParameter",
+      "message": "Invalid parameter: AttributeName"
+    },
+    "empty_message": {
+      "code": "InvalidParameter",
+      "message": "Invalid parameter: Empty message"
+    },
+    "invalid_token": {
+      "code": "InvalidParameter",
+      "message": "Invalid token"
+    }
+  }
+}

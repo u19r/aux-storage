@@ -1,0 +1,210 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+rust-version = "1.94.0"
+edition = "2024"
+repository = "https://github.com/u19r/aux-storage"
+readme = "README.md"
+description = "Storage, queue, and pubsub compatible services and libraries."
+keywords = ["storage", "queue", "pubsub", "sqlite"]
+categories = []
+license = "BUSL-1.1"
+
+[workspace.dependencies]
+############################################
+# rust-random
+rand = "0.10.1"
+
+############################################
+# tokio-rs
+axum = "0.8.9"
+deadpool-postgres = "0.14.1"
+rustls = "0.23.40"
+rustls-native-certs = "0.8.2"
+tokio = { version = "1.52.3", features = ["full", "tracing"] }
+tokio-postgres = "0.7.17"
+tokio-postgres-rustls = "0.13.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+
+############################################
+# futures-rs (rust-lang)
+futures = "0.3.31"
+futures-util = "0.3.31"
+
+############################################
+# hyperium
+bytes = "1.11.1"
+http = "1.4.0"
+httpdate = "1.0.3"
+tower-http = { version = "0.6.8", features = ["catch-panic", "cors"] }
+
+############################################
+# serde-rs
+md5 = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+url = "2.5.8"
+
+############################################
+# awslabs
+aws-config = "1.8.16"
+aws-credential-types = "1.2.14"
+aws-sdk-dynamodb = "1.111.0"
+aws-sdk-sns = "1.99.0"
+aws-sdk-sqs = "1.98.0"
+aws-sigv4 = "1.4.3"
+aws-smithy-runtime-api = "1.12.0"
+aws-smithy-types = "1.4.7"
+
+############################################
+# dtolnay
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+inventory = "0.3.24"
+quote = "1.0.44"
+syn = { version = "2.0.117", features = ["full"] }
+thiserror = "2.0.18"
+
+############################################
+# marshallpierce
+base64 = "0.22.1"
+hex = "0.4.3"
+
+############################################
+# chrono-rs
+chrono = { version = "0.4.43", features = ["clock", "serde"] }
+
+############################################
+# cucumber-rs
+cucumber = "0.23.0"
+
+############################################
+# seanmonstar
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
+
+############################################
+# rust-rocksdb
+rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
+
+############################################
+# clap-rs
+clap = { version = "4.6.1", features = ["derive"] }
+
+############################################
+# uuid-rs
+uuid = { version = "1.23.1", features = ["serde", "v4", "v5", "v7"] }
+
+############################################
+# idanarye
+typed-builder = "0.23.2"
+
+############################################
+# jeromefroe
+hashring = "0.3.6"
+
+############################################
+# datafuselabs
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+
+############################################
+# Stebalien
+tempfile = "3.27.0"
+
+############################################
+# Other / standalone
+base32 = "0.5.1"
+cargo_metadata = "0.23.1"
+#0.10.0 with fix for rust 1.91
+foundationdb = { version = "0.10.0", features = ["fdb-7_3"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
+hostname = "0.4"
+httpmock = "0.8.3"
+ipnet = "2.12.0"
+jsonschema = { version = "0.46.4", default-features = false, features = ["resolve-file"] }
+lz4_flex = "0.13.1"
+metrics = "0.24.5"
+metrics-exporter-prometheus = "0.18.3"
+notify = "8.2.0"
+proptest = "1.11.0"
+quint-connect = "0.1.1"
+rust_decimal = "1.42.0"
+schemars = "1.2.1"
+smallvec = { version = "1.15.1", features = ["serde"] }
+toml = "1.1.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+turso = { version = "0.6.0", default-features = false }
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
+xxhash-rust = { version = "0.8.11", features = ["xxh3"] }
+
+############################################
+# aux-common
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "64f4447b0b5532bfb04655060d8892c7c22d33ae" }
+
+############################################
+# Local path dependencies
+tokio-rusqlite = { path = "vended/tokio-rusqlite" }
+
+rusqlite = { version = "0.39.0", features = ["bundled", "uuid"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+string_slice = "deny"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+implicit_hasher = "allow"
+match_same_arms = "allow"
+cargo_common_metadata = "allow"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+dead_code = "warn"
+unused_imports = "warn"
+unused_variables = "warn"
+unused_must_use = "warn"
+
+[profile.test]
+opt-level = 0
+debug = 0
+lto = false
+codegen-units = 256
+incremental = false
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+overflow-checks = true
+panic = "unwind"
+lto = "fat"
+strip = "symbols"
+
+[profile.fast-release]
+inherits = "release"
+opt-level = 1
+codegen-units = 256
+lto = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+lto = false
+codegen-units = 1
+split-debuginfo = "packed"
+
+[profile.dev]
+lto = false
+debug-assertions = true
+opt-level = 0
+strip = "none"
+debug = 0
+incremental = false
+codegen-units = 256

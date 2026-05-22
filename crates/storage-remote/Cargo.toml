@@ -1,0 +1,34 @@
+[package]
+publish = false
+name = "storage-remote"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = { workspace = true }
+aws-sigv4-signing = { workspace = true }
+http = { workspace = true }
+http-request = { workspace = true }
+metrics = { workspace = true }
+metrics-facade = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+storage-provider = { path = "../storage-provider" }
+storage-sync = { path = "../storage-sync" }
+storage-types = { path = "../storage-types" }
+stream = { path = "../stream", default-features = false }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+httpmock = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

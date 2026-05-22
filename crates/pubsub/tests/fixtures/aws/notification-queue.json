@@ -1,0 +1,5 @@
+{
+  "source": "AWS queue subscription notification captured from disposable resources on 2026-05-05 and normalized for volatile values.",
+  "queue_message_attributes": null,
+  "body": "{\n  \"Type\" : \"Notification\",\n  \"MessageId\" : \"<MESSAGE_ID>\",\n  \"TopicArn\" : \"<TOPIC_ARN>\",\n  \"Subject\" : \"order\",\n  \"Message\" : \"created\",\n  \"Timestamp\" : \"<TIMESTAMP>\",\n  \"SignatureVersion\" : \"1\",\n  \"Signature\" : \"<SIGNATURE>\",\n  \"SigningCertURL\" : \"<SIGNING_CERT_URL>\",\n  \"UnsubscribeURL\" : \"<UNSUBSCRIBE_URL>\",\n  \"MessageAttributes\" : {\n    \"event\" : {\"Type\":\"String\",\"Value\":\"created\"}\n  }\n}"
+}

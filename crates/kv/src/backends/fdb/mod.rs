@@ -1,0 +1,28 @@
+#[cfg(feature = "foundationdb-backend")]
+mod constants;
+#[cfg(feature = "foundationdb-backend")]
+mod keyspace;
+#[cfg(feature = "foundationdb-backend")]
+mod metrics;
+#[cfg(feature = "foundationdb-backend")]
+mod store;
+
+#[cfg(feature = "foundationdb-backend")]
+pub use metrics::{foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot};
+#[cfg(feature = "foundationdb-backend")]
+pub use store::{FoundationDbConfig, FoundationDbKvStore};
+
+#[cfg(all(test, feature = "foundationdb-backend"))]
+pub(crate) mod fdb_support_tests;
+
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod grv_cache_tests;
+
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod queue_provider_tests;
+
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod operation_shape_tests;
+
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod stream_provider_tests;

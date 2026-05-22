@@ -1,0 +1,19 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "bg-job-store"
+version = "0.1.0"
+description = "Job lock store implementations for bg-jobs"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = { workspace = true }
+bg-jobs = { path = "../bg-jobs" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { path = "../storage-types" }
+
+[lints]
+workspace = true

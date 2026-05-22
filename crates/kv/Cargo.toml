@@ -1,0 +1,51 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "kv"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = ["rocksdb-backend"]
+rocksdb-backend = ["dep:rocksdb"]
+foundationdb-backend = ["dep:foundationdb"]
+
+[dependencies]
+async-trait = { workspace = true }
+bg-jobs = { path = "../bg-jobs" }
+chrono = { workspace = true }
+foundationdb = { workspace = true, optional = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+lru-ttl-cache = { workspace = true }
+metrics-facade = { workspace = true }
+pubsub-provider = { path = "../pubsub-provider" }
+queue-provider = { path = "../queue-provider" }
+rocksdb = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common", features = ["rocksdb"] }
+storage-condition = { path = "../storage-condition" }
+storage-provider = { path = "../storage-provider" }
+storage-sync = { path = "../storage-sync" }
+storage-types = { path = "../storage-types", features = ["rocksdb"] }
+stream-provider = { path = "../stream-provider" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+proptest = { workspace = true }
+quint-connect = { workspace = true }
+tempfile = { workspace = true }
+tracing-test = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,66 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "sql"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = ["sqlite-backend"]
+sqlite-backend = ["storage-types/sqlite", "dep:rusqlite", "dep:tokio-rusqlite"]
+turso-backend = ["sqlite-backend", "storage-types/turso", "dep:turso"]
+postgres-backend = [
+    "sqlite-backend",
+    "storage-types/postgres",
+    "dep:deadpool-postgres",
+    "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+]
+postgres-tests = ["postgres-backend"]
+
+[dependencies]
+async-trait = { workspace = true }
+bg-jobs = { path = "../bg-jobs" }
+chrono = { workspace = true }
+futures = { workspace = true }
+openraft = { workspace = true }
+pubsub-provider = { path = "../pubsub-provider" }
+queue-provider = { path = "../queue-provider" }
+rand = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common" }
+storage-condition = { path = "../storage-condition" }
+storage-provider = { path = "../storage-provider" }
+storage-sync = { path = "../storage-sync" }
+storage-types = { path = "../storage-types", default-features = false }
+stream-provider = { path = "../stream-provider" }
+tracing = { workspace = true }
+
+metrics-facade = { workspace = true }
+
+tokio = { workspace = true }
+tokio-rusqlite = { workspace = true, optional = true }
+turso = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+deadpool-postgres = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+tempfile = { workspace = true }
+tracing-test = { workspace = true }
+
+[lints]
+workspace = true

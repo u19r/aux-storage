@@ -1,0 +1,17 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "storage-condition"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+serde_json = { workspace = true }
+storage-types = { path = "../storage-types" }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

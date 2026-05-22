@@ -1,0 +1,24 @@
+[package]
+edition = "2024"
+license.workspace = true
+name = "stream-provider"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-types = { path = "../storage-types" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

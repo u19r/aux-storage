@@ -1,0 +1,22 @@
+[package]
+publish = false
+name = "storage-sync"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+openraft = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+storage-backfill = { path = "../storage-backfill" }
+storage-types = { path = "../storage-types" }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

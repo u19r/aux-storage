@@ -1,0 +1,2154 @@
+use std::{collections::HashMap, sync::Arc, time::Instant};
+
+use async_trait::async_trait;
+use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig};
+use queue_provider::{
+    MessageAttributeValue, MessageId, MessageResponse, Queue, QueueError, QueueInternalKind,
+    QueueMessage, QueueProvider, QueueResult, QueueValidationKind, ReceiptHandle,
+};
+use serde::{Deserialize, Serialize};
+use storage_types::{
+    AttributeValue, DurationSeconds, StorageEnum, StorageError, StorageResult, TimestampMillis,
+};
+use uuid::Uuid;
+
+use crate::{
+    SortedKvDbStorageProvider,
+    constants::PARTITION_ROUTING_RETRIES_TOTAL_METRIC,
+    helpers::deserialize_item_from_bytes,
+    keys::{
+        key_queue_root, key_receipt_checkpoint_uuid, key_receipt_handle, queue_message_prefix,
+        queue_message_storage_key, queue_visibility_storage_key, visibility_key,
+    },
+    newtypes::MessageVisibilityKey,
+    partition_family::{
+        DEFAULT_STANDARD_QUEUE_PARTITION_COUNT, PartitionFamilyKind, QueueReceiptHandleData,
+        ResolvedPartitionFamily, default_partition_family_config, find_partition_by_id,
+        initial_partition_infos, ordered_log_hash, queue_body_prefix_with_slot,
+        queue_checkpoint_key_with_slot, queue_family_component, queue_partition_marker_bytes,
+        queue_partition_marker_key, queue_payload_key_with_slot, queue_ready_hint_bytes,
+        queue_ready_hint_key, queue_ready_key_with_slot, queue_ready_prefix_with_slot,
+        queue_state_key_with_slot, queue_wake_key, wake_value_bytes,
+    },
+    queue::{
+        PartitionedQueueMessageWrite, QueueClaimRange, QueueKvStore, QueuePrewarmPartition,
+        constants::{
+            PARTITIONED_QUEUE_EMPTY_RECEIVE_POLL_MS,
+            PARTITIONED_QUEUE_RECEIVE_COALESCE_CLAIM_ROUNDS,
+            PARTITIONED_QUEUE_RECEIVE_SCAN_OVERFETCH_MULTIPLIER,
+            PARTITIONED_QUEUE_RECEIVE_SCAN_SHARDS, PARTITIONED_QUEUE_SEND_MAX_ATTEMPTS,
+            QUEUE_PREWARM_MESSAGE_ID, RECEIVE_SCAN_MAX_LIMIT, RECEIVE_SCAN_MIN_LIMIT,
+            VISIBILITY_RECORD_ACTIVE_STATE, VISIBILITY_RECORD_RECEIPT_HANDLE_FIELD,
+            VISIBILITY_RECORD_STATE_FIELD,
+        },
+        record_queue_storage_operation, set_queue_storage_gauge,
+        storage::{queue_payload_delete_range, queue_payload_is_chunk_key},
+    },
+    sorted_kv_store::{DirectWriteOperation, TransactWriteOperation},
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PartitionedQueueBody {
+    body: String,
+    message_attributes: Option<HashMap<String, MessageAttributeValue>>,
+    created_at: TimestampMillis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PartitionedQueueState {
+    pub(crate) queue_url: String,
+    pub(crate) visibility_timestamp: TimestampMillis,
+    pub(crate) delivery_attempt: u32,
+    pub(crate) claim_nonce: Option<String>,
+    pub(crate) checkpoint_data: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueueDeleteLedgerEntry {
+    payload_key: Vec<u8>,
+    state_key: Vec<u8>,
+    created_at: TimestampMillis,
+}
+
+fn partitioned_body_bytes(
+    body: String,
+    message_attributes: Option<HashMap<String, MessageAttributeValue>>,
+    created_at: TimestampMillis,
+) -> StorageResult<Vec<u8>> {
+    storage_types::storage_serde::to_bytes(&PartitionedQueueBody {
+        body,
+        message_attributes,
+        created_at,
+    })
+}
+
+fn record_deferred_payload_cleanup(count: u64) {
+    record_queue_storage_operation("queue_payload_cleanup", "deferred", count);
+    record_queue_storage_operation("queue_payload_orphan", "created", count);
+}
+
+fn queue_delete_ledger_prefix(queue_url: &str) -> Vec<u8> {
+    format!("qdata/{}/delete_ledger/", queue_family_component(queue_url)).into_bytes()
+}
+
+pub(crate) fn queue_delete_ledger_key(
+    queue_url: &str,
+    placement_slot: u16,
+    partition_id: u16,
+    message_id_hex: &str,
+) -> Vec<u8> {
+    let mut key = queue_delete_ledger_prefix(queue_url);
+    key.extend_from_slice(format!("{placement_slot:04x}:{partition_id:04x}:").as_bytes());
+    key.extend_from_slice(message_id_hex.as_bytes());
+    key
+}
+
+fn queue_delete_ledger_entry_bytes(
+    queue_url: &str,
+    route: QueuePartitionRoute,
+    message_id_hex: &str,
+) -> StorageResult<Vec<u8>> {
+    storage_types::storage_serde::to_bytes(&QueueDeleteLedgerEntry {
+        payload_key: queue_payload_key_with_slot(
+            queue_url,
+            route.placement_slot,
+            route.partition_id,
+            message_id_hex,
+        ),
+        state_key: queue_state_key_with_slot(
+            queue_url,
+            route.placement_slot,
+            route.partition_id,
+            message_id_hex,
+        ),
+        created_at: TimestampMillis::now(),
+    })
+}
+
+fn parse_ready_hint_value(value: &[u8]) -> Option<(u16, TimestampMillis)> {
+    let partition_id_bytes = value.get(..2)?;
+    let timestamp_bytes = value.get(2..10)?;
+    let partition_id = u16::from_be_bytes([partition_id_bytes[0], partition_id_bytes[1]]);
+    let next_visible_at = TimestampMillis::from(i64::from_be_bytes([
+        timestamp_bytes[0],
+        timestamp_bytes[1],
+        timestamp_bytes[2],
+        timestamp_bytes[3],
+        timestamp_bytes[4],
+        timestamp_bytes[5],
+        timestamp_bytes[6],
+        timestamp_bytes[7],
+    ]));
+    Some((partition_id, next_visible_at))
+}
+
+const QUEUE_PAYLOAD_CLEANUP_JOB_ID: BackgroundJobName = BackgroundJobName::Database {
+    kind: bg_jobs::DatabaseJobKind::QueuePayloadCleanup,
+};
+const QUEUE_PAYLOAD_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+const QUEUE_PAYLOAD_CLEANUP_BATCH_LIMIT: u32 = 256;
+
+pub struct QueuePayloadCleanupJob<S: QueueKvStore + 'static> {
+    provider: Arc<SortedKvDbStorageProvider<S>>,
+}
+
+impl<S: QueueKvStore + 'static> QueuePayloadCleanupJob<S> {
+    pub fn new(provider: Arc<SortedKvDbStorageProvider<S>>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl<S: QueueKvStore + 'static> BackgroundJob for QueuePayloadCleanupJob<S> {
+    async fn execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let cleaned = self
+            .provider
+            .cleanup_queue_payload_orphans(QUEUE_PAYLOAD_CLEANUP_BATCH_LIMIT)
+            .await?;
+        Ok(cleaned > 0)
+    }
+}
+
+#[derive(Clone)]
+enum QueueRoutingState {
+    Control(ResolvedPartitionFamily),
+}
+
+#[derive(Clone, Copy)]
+struct QueuePartitionRoute {
+    partition_id: u16,
+    placement_slot: u16,
+}
+
+struct PreparedPartitionedQueueMessage {
+    message_id: MessageId,
+    message_id_hex: String,
+    queue_url: String,
+    visibility_timestamp: TimestampMillis,
+    state_bytes: Vec<u8>,
+    payload_bytes: Vec<u8>,
+}
+
+impl<S> SortedKvDbStorageProvider<S>
+where S: QueueKvStore + 'static
+{
+    fn queue_key_prefix(queue_url: &str) -> Vec<u8> {
+        format!("sys/queues/{queue_url}/").into_bytes()
+    }
+
+    fn record_queue_partition_load(
+        &self,
+        queue_url: &str,
+        partition_id: u16,
+        sample: crate::partition_family::PartitionLoadSample,
+    ) {
+        self.runtime_partition_load_tracker.record(
+            crate::partition_family::RuntimePartitionLoadSample {
+                family_kind: PartitionFamilyKind::StandardQueue,
+                family_component: queue_family_component(queue_url),
+                partition_id,
+                sample,
+            },
+        );
+    }
+
+    fn local_queue_partition_load_hint(&self, queue_url: &str, partition_id: u16) -> u64 {
+        let family_component = queue_family_component(queue_url);
+        self.runtime_partition_load_tracker.load_hint(
+            PartitionFamilyKind::StandardQueue,
+            &family_component,
+            partition_id,
+        ) + self.kv_store.partition_runtime_load_hint(
+            PartitionFamilyKind::StandardQueue,
+            &family_component,
+            partition_id,
+        )
+    }
+
+    fn queue_partition_route_for_send(
+        &self,
+        routing_state: &QueueRoutingState,
+        queue_url: &str,
+        message_id: &MessageId,
+    ) -> Option<QueuePartitionRoute> {
+        match routing_state {
+            QueueRoutingState::Control(family) => {
+                let writable: Vec<_> = family
+                    .partitions
+                    .iter()
+                    .filter(|partition| partition.is_writable())
+                    .collect();
+                let first = writable.first()?;
+                if writable.len() == 1 {
+                    return Some(QueuePartitionRoute {
+                        partition_id: first.partition_id,
+                        placement_slot: first.placement_slot,
+                    });
+                }
+
+                let primary_index = usize::try_from(queue_partition_hash(queue_url, message_id))
+                    .unwrap_or(0)
+                    % writable.len();
+                // Power-of-two choices: compare the primary hash route with a
+                // second deterministic route so hot queues can avoid a locally
+                // overloaded partition without making send placement random.
+                let mut secondary_route_key = queue_url.as_bytes().to_vec();
+                secondary_route_key.extend_from_slice(message_id.as_bytes());
+                secondary_route_key.extend_from_slice(b"/secondary-route");
+                let secondary_index = usize::try_from(ordered_log_hash(&secondary_route_key))
+                    .unwrap_or(0)
+                    % writable.len();
+
+                let primary = writable[primary_index];
+                let secondary = writable[secondary_index];
+                let primary_hint =
+                    self.local_queue_partition_load_hint(queue_url, primary.partition_id);
+                let secondary_hint =
+                    self.local_queue_partition_load_hint(queue_url, secondary.partition_id);
+                let chosen = match primary_hint.cmp(&secondary_hint) {
+                    std::cmp::Ordering::Less => primary,
+                    std::cmp::Ordering::Greater => secondary,
+                    std::cmp::Ordering::Equal => primary,
+                };
+
+                Some(QueuePartitionRoute {
+                    partition_id: chosen.partition_id,
+                    placement_slot: chosen.placement_slot,
+                })
+            }
+        }
+    }
+
+    async fn queue_roots_for_payload_cleanup(&self) -> StorageResult<Vec<String>> {
+        let items = self
+            .kv_store
+            .get_prefix(b"sys/queues/", true, None, true)
+            .await?;
+        let mut queue_urls = Vec::new();
+        for (key, value) in items.items {
+            let key_text = String::from_utf8_lossy(&key);
+            if key_text.contains("/messages/")
+                || key_text.contains("/visibility/")
+                || key_text.contains("/receipt_handles/")
+            {
+                continue;
+            }
+            let Ok(queue) = storage_types::storage_serde::from_bytes::<Queue>(&value) else {
+                continue;
+            };
+            queue_urls.push(queue.queue_url);
+        }
+        Ok(queue_urls)
+    }
+
+    pub(crate) async fn cleanup_queue_payload_orphans(&self, limit: u32) -> StorageResult<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let now = TimestampMillis::now();
+        let mut remaining = limit;
+        let mut scanned = 0u64;
+        let mut deleted = 0u64;
+        let mut oldest_age_ms = 0i64;
+        let mut pending_deletes = Vec::new();
+        let mut ledger_scanned = 0u64;
+
+        for queue_url in self.queue_roots_for_payload_cleanup().await? {
+            if remaining == 0 {
+                break;
+            }
+            let ledger_entries = self
+                .kv_store
+                .get_prefix(
+                    &queue_delete_ledger_prefix(&queue_url),
+                    true,
+                    Some(remaining),
+                    false,
+                )
+                .await?;
+            let ledger_entries_found = !ledger_entries.items.is_empty();
+            if ledger_entries_found {
+                ledger_scanned = ledger_scanned
+                    .saturating_add(u64::try_from(ledger_entries.items.len()).unwrap_or(u64::MAX));
+                remaining = remaining
+                    .saturating_sub(u32::try_from(ledger_entries.items.len()).unwrap_or(u32::MAX));
+                for (ledger_key, ledger_value) in ledger_entries.items {
+                    let Ok(entry) = storage_types::storage_serde::from_bytes::<
+                        QueueDeleteLedgerEntry,
+                    >(&ledger_value) else {
+                        pending_deletes.push(DirectWriteOperation::Delete {
+                            key: ledger_key.into_vec(),
+                        });
+                        continue;
+                    };
+                    oldest_age_ms = oldest_age_ms.max(
+                        now.timestamp_millis()
+                            .saturating_sub(entry.created_at.timestamp_millis()),
+                    );
+                    pending_deletes.extend([
+                        queue_payload_delete_range(entry.payload_key),
+                        DirectWriteOperation::Delete {
+                            key: entry.state_key,
+                        },
+                        DirectWriteOperation::Delete {
+                            key: ledger_key.into_vec(),
+                        },
+                    ]);
+                    deleted = deleted.saturating_add(1);
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            if ledger_entries_found {
+                continue;
+            }
+            let Some(family) = self
+                .load_queue_family_state(&queue_url)
+                .await
+                .map_err(|error| StorageError::internal(&error.to_string()))?
+            else {
+                continue;
+            };
+            for route in queue_partition_routes(&QueueRoutingState::Control(family.clone())) {
+                if remaining == 0 {
+                    break;
+                }
+                let payload_prefix = queue_body_prefix_with_slot(
+                    &queue_url,
+                    route.placement_slot,
+                    route.partition_id,
+                );
+                let payloads = self
+                    .kv_store
+                    .get_prefix(&payload_prefix, true, Some(remaining), false)
+                    .await?;
+                if payloads.items.is_empty() {
+                    continue;
+                }
+
+                scanned =
+                    scanned.saturating_add(u64::try_from(payloads.items.len()).unwrap_or(u64::MAX));
+                remaining = remaining
+                    .saturating_sub(u32::try_from(payloads.items.len()).unwrap_or(u32::MAX));
+                let payload_infos = payloads
+                    .items
+                    .into_iter()
+                    .filter_map(|(payload_key, payload_value)| {
+                        if queue_payload_is_chunk_key(&payload_key) {
+                            return None;
+                        }
+                        let message_id_hex =
+                            std::str::from_utf8(payload_key.get(payload_prefix.len()..)?)
+                                .ok()?
+                                .to_string();
+                        if message_id_hex.contains('/') {
+                            return None;
+                        }
+                        let state_key = queue_state_key_with_slot(
+                            &queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &message_id_hex,
+                        );
+                        Some((payload_key, payload_value, message_id_hex, state_key))
+                    })
+                    .collect::<Vec<_>>();
+                let states = self
+                    .kv_store
+                    .multi_get(
+                        payload_infos
+                            .iter()
+                            .map(|(_, _, _, state_key)| state_key.clone())
+                            .collect(),
+                        false,
+                    )
+                    .await?;
+                let mut payload_deletes = 0u64;
+                for ((payload_key, payload_value, message_id_hex, state_key), state) in
+                    payload_infos.into_iter().zip(states)
+                {
+                    let mut delete_state = false;
+                    if let Some(state_bytes) = state {
+                        let Ok(state) = storage_types::storage_serde::from_bytes::<
+                            PartitionedQueueState,
+                        >(&state_bytes) else {
+                            continue;
+                        };
+                        let Ok(message_id) = message_id_hex.parse::<MessageId>() else {
+                            continue;
+                        };
+                        let visibility_key = MessageVisibilityKey(visibility_key(
+                            state.visibility_timestamp,
+                            &message_id,
+                        ));
+                        let ready_key = queue_ready_key_with_slot(
+                            &queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &visibility_key,
+                        );
+                        if self.kv_store.get(&ready_key, false).await?.is_some() {
+                            continue;
+                        }
+                        delete_state = true;
+                    }
+                    if let Ok(body) = storage_types::storage_serde::from_bytes::<PartitionedQueueBody>(
+                        &payload_value,
+                    ) {
+                        oldest_age_ms = oldest_age_ms.max(
+                            now.timestamp_millis()
+                                .saturating_sub(body.created_at.timestamp_millis()),
+                        );
+                    }
+                    pending_deletes.push(queue_payload_delete_range(payload_key.into_vec()));
+                    payload_deletes = payload_deletes.saturating_add(1);
+                    if delete_state {
+                        pending_deletes.push(DirectWriteOperation::Delete { key: state_key });
+                    }
+                }
+                if payload_deletes == 0 {
+                    continue;
+                }
+                deleted = deleted.saturating_add(payload_deletes);
+            }
+        }
+        if !pending_deletes.is_empty() {
+            self.kv_store
+                .transact_write_unchecked(pending_deletes)
+                .await?;
+        }
+
+        record_queue_storage_operation("queue_payload_cleanup", "orphan_scanned", scanned);
+        record_queue_storage_operation("queue_payload_cleanup", "ledger_scanned", ledger_scanned);
+        record_queue_storage_operation("queue_payload_cleanup", "orphan_deleted", deleted);
+        set_queue_storage_gauge(
+            "queue_payload_cleanup",
+            "oldest_orphan_age_ms",
+            oldest_age_ms as f64,
+        );
+        set_queue_storage_gauge(
+            "queue_payload_cleanup",
+            "last_orphan_scan_count",
+            scanned as f64,
+        );
+        Ok(deleted)
+    }
+
+    async fn start_queue_payload_cleanup_task(&self) -> StorageResult<()> {
+        if !self.database_jobs_enabled || !self.kv_store.supports_partition_families() {
+            return Ok(());
+        }
+        if self
+            .job_manager
+            .is_job_running(QUEUE_PAYLOAD_CLEANUP_JOB_ID)
+            .await
+        {
+            return Ok(());
+        }
+        let job = QueuePayloadCleanupJob::new(Arc::new(self.clone()));
+        let config = JobConfig {
+            start_immediately: false,
+            sleep_duration: std::time::Duration::from_secs(QUEUE_PAYLOAD_CLEANUP_INTERVAL_SECONDS),
+            jitter_percent: 10,
+        };
+        self.job_manager
+            .register_job(QUEUE_PAYLOAD_CLEANUP_JOB_ID, job, config)
+            .await
+            .map_err(|error| {
+                StorageError::internal(&format!(
+                    "register queue payload cleanup job failed: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn queue_receive_hinted_route_window(
+        &self,
+        queue_url: &str,
+        routes: &[QueuePartitionRoute],
+        scan_shards: usize,
+        now: TimestampMillis,
+    ) -> StorageResult<Vec<QueuePartitionRoute>> {
+        if routes.is_empty() || scan_shards == 0 {
+            return Ok(Vec::new());
+        }
+        let ready_limit = routes.len();
+        let start = {
+            let mut cursors = match self.queue_receive_hint_cursors.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let cursor = cursors.entry(queue_url.to_string()).or_insert(0);
+            let start = *cursor % routes.len();
+            *cursor = (start + ready_limit.max(1)) % routes.len();
+            start
+        };
+
+        let sampled_routes = (0..routes.len())
+            .map(|offset| routes[(start + offset) % routes.len()])
+            .collect::<Vec<_>>();
+        let hint_keys = sampled_routes
+            .iter()
+            .map(|route| queue_ready_hint_key(queue_url, route.placement_slot, route.partition_id))
+            .collect::<Vec<_>>();
+        let hints = self.kv_store.multi_get(hint_keys, false).await?;
+        let mut ready_routes = Vec::with_capacity(ready_limit);
+        for (route, hint) in sampled_routes.into_iter().zip(hints) {
+            let Some(value) = hint else {
+                continue;
+            };
+            let Some((partition_id, next_visible_at)) = parse_ready_hint_value(&value) else {
+                continue;
+            };
+            if partition_id == route.partition_id && next_visible_at <= now {
+                ready_routes.push(route);
+                if ready_routes.len() >= ready_limit {
+                    break;
+                }
+            }
+        }
+        Ok(ready_routes)
+    }
+
+    fn queue_claim_seed(queue_url: &str, partition_id: u16) -> u64 {
+        // Claims rotate visible candidates per receive call so repeated scans
+        // do not keep contending on the same oldest ready entries.
+        let nonce = Uuid::now_v7();
+        let bytes = nonce.as_bytes();
+        let mut seed_bytes = [0u8; 8];
+        seed_bytes.copy_from_slice(&bytes[..8]);
+        let nonce_seed = u64::from_be_bytes(seed_bytes);
+        let route_seed =
+            ordered_log_hash(&[queue_url.as_bytes(), &partition_id.to_be_bytes()].concat());
+        nonce_seed ^ route_seed
+    }
+
+    async fn receive_partitioned_messages_once_coalesced(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: DurationSeconds,
+        routing_state: &QueueRoutingState,
+    ) -> QueueResult<Vec<MessageResponse>> {
+        self.receive_partitioned_messages_with_claim_rounds(
+            queue_url,
+            max_messages,
+            visibility_timeout,
+            routing_state,
+        )
+        .await
+    }
+
+    async fn receive_partitioned_messages_with_claim_rounds(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: DurationSeconds,
+        routing_state: &QueueRoutingState,
+    ) -> QueueResult<Vec<MessageResponse>> {
+        let mut claimed_messages = Vec::new();
+        for _ in 0..PARTITIONED_QUEUE_RECEIVE_COALESCE_CLAIM_ROUNDS {
+            let remaining = max_messages
+                .saturating_sub(u32::try_from(claimed_messages.len()).unwrap_or(u32::MAX));
+            if remaining == 0 {
+                break;
+            }
+            match self
+                .receive_partitioned_messages_once(
+                    queue_url,
+                    remaining,
+                    visibility_timeout,
+                    routing_state,
+                )
+                .await
+            {
+                Ok(messages) if messages.is_empty() => break,
+                Ok(mut messages) => claimed_messages.append(&mut messages),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(claimed_messages)
+    }
+
+    fn is_partition_routing_retryable(storage_error: &storage_types::StorageError) -> bool {
+        matches!(
+            storage_error.as_ref(),
+            StorageEnum::ConditionalCheckFailed
+                | StorageEnum::TransactionConflict { .. }
+                | StorageEnum::TransactionCanceled { .. }
+        )
+    }
+
+    fn visibility_record_bytes(receipt_handle: Option<&ReceiptHandle>) -> QueueResult<Vec<u8>> {
+        let mut item = HashMap::from([(
+            VISIBILITY_RECORD_STATE_FIELD.to_string(),
+            AttributeValue::S(VISIBILITY_RECORD_ACTIVE_STATE.to_string()),
+        )]);
+        if let Some(receipt_handle) = receipt_handle {
+            item.insert(
+                VISIBILITY_RECORD_RECEIPT_HANDLE_FIELD.to_string(),
+                AttributeValue::S(receipt_handle.to_string()),
+            );
+        }
+        Ok(storage_types::storage_serde::to_bytes(&item)?)
+    }
+
+    fn receipt_mapping_bytes(visibility_key: &MessageVisibilityKey) -> QueueResult<Vec<u8>> {
+        Ok(storage_types::storage_serde::to_bytes(&HashMap::from([(
+            "visibility_key".to_string(),
+            AttributeValue::S(visibility_key.to_string()),
+        )]))?)
+    }
+
+    async fn fetch_receipt_from_db(
+        &self,
+        queue_url: &str,
+        receipt_handle: &ReceiptHandle,
+    ) -> QueueResult<(MessageVisibilityKey, MessageId)> {
+        let receipt_handle_key = key_receipt_handle(queue_url, receipt_handle);
+        let Some(raw) = self
+            .kv_store
+            .get(receipt_handle_key.as_bytes(), true)
+            .await?
+        else {
+            return Err(QueueError::ResourceNotFound {
+                resource_type: "receipt_handle",
+                resource_id: receipt_handle.0.clone(),
+            });
+        };
+
+        let vis = deserialize_item_from_bytes(&raw)?;
+        let visibility_key = match vis.get("visibility_key") {
+            Some(AttributeValue::S(vis_key)) => MessageVisibilityKey(vis_key.clone()),
+            _ => {
+                return Err(QueueError::internal(
+                    QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                ));
+            }
+        };
+        let message_id = visibility_key.get_message_id()?;
+
+        Ok((visibility_key, message_id))
+    }
+
+    async fn load_queue_family_state(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<ResolvedPartitionFamily>> {
+        Ok(self
+            .load_partition_family_state(
+                PartitionFamilyKind::StandardQueue,
+                &queue_family_component(queue_url),
+            )
+            .await?)
+    }
+
+    async fn ensure_queue_family_state(
+        &self,
+        queue_url: &str,
+        initial_partition_count: u16,
+    ) -> QueueResult<ResolvedPartitionFamily> {
+        if let Some(existing) = self.load_queue_family_state(queue_url).await? {
+            return Ok(existing);
+        }
+
+        let partitions = initial_partition_infos(initial_partition_count);
+        let family = ResolvedPartitionFamily {
+            config: default_partition_family_config(
+                PartitionFamilyKind::StandardQueue,
+                initial_partition_count,
+            ),
+            partitions,
+        };
+        self.save_partition_family_state(
+            PartitionFamilyKind::StandardQueue,
+            &queue_family_component(queue_url),
+            &family,
+        )
+        .await?;
+        Ok(family)
+    }
+
+    async fn queue_routing_state(&self, queue_url: &str) -> QueueResult<Option<QueueRoutingState>> {
+        Ok(self
+            .load_queue_family_state(queue_url)
+            .await?
+            .map(QueueRoutingState::Control))
+    }
+
+    fn prepare_partitioned_queue_message(
+        mut message: QueueMessage,
+    ) -> QueueResult<PreparedPartitionedQueueMessage> {
+        if message.message_id == MessageId::default() {
+            message.message_id = MessageId::random();
+        }
+
+        let visibility_timestamp = message
+            .visibility_timestamp
+            .unwrap_or_else(TimestampMillis::now);
+        let state = PartitionedQueueState {
+            queue_url: message.queue_url.clone(),
+            visibility_timestamp,
+            delivery_attempt: 0,
+            claim_nonce: None,
+            checkpoint_data: None,
+        };
+        let state_bytes = storage_types::storage_serde::to_bytes(&state)?;
+        let payload_bytes =
+            partitioned_body_bytes(message.body, message.message_attributes, message.created_at)?;
+        Ok(PreparedPartitionedQueueMessage {
+            message_id: message.message_id,
+            message_id_hex: message.message_id.to_string(),
+            queue_url: message.queue_url,
+            visibility_timestamp,
+            state_bytes,
+            payload_bytes,
+        })
+    }
+
+    fn partitioned_queue_write_for_route(
+        prepared: &PreparedPartitionedQueueMessage,
+        route: QueuePartitionRoute,
+        wake_key: &[u8],
+        wake_bytes: &[u8],
+    ) -> PartitionedQueueMessageWrite {
+        let visibility_key = MessageVisibilityKey(visibility_key(
+            prepared.visibility_timestamp,
+            &prepared.message_id,
+        ));
+        PartitionedQueueMessageWrite {
+            state_key: queue_state_key_with_slot(
+                &prepared.queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &prepared.message_id_hex,
+            ),
+            state_bytes: prepared.state_bytes.clone(),
+            payload_key: queue_payload_key_with_slot(
+                &prepared.queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &prepared.message_id_hex,
+            ),
+            payload_bytes: prepared.payload_bytes.clone(),
+            ready_key: queue_ready_key_with_slot(
+                &prepared.queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &visibility_key,
+            ),
+            ready_hint_key: queue_ready_hint_key(
+                &prepared.queue_url,
+                route.placement_slot,
+                route.partition_id,
+            ),
+            ready_hint_bytes: queue_ready_hint_bytes(
+                route.partition_id,
+                prepared.visibility_timestamp,
+            ),
+            wake_key: wake_key.to_vec(),
+            wake_bytes: wake_bytes.to_vec(),
+        }
+    }
+
+    async fn send_partitioned_messages(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> QueueResult<Vec<MessageId>> {
+        let started_at = Instant::now();
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prepared_messages = Vec::with_capacity(messages.len());
+        for message in messages {
+            prepared_messages.push(Self::prepare_partitioned_queue_message(message)?);
+        }
+        let queue_url = prepared_messages
+            .first()
+            .map(|message| message.queue_url.as_str())
+            .ok_or_else(|| QueueError::internal(QueueInternalKind::NoWritableQueuePartition))?;
+        if prepared_messages
+            .iter()
+            .any(|message| message.queue_url.as_str() != queue_url)
+        {
+            return Err(QueueError::validation_with_detail(
+                QueueValidationKind::InvalidParameterValue,
+                "send_messages requires all messages to target the same queue_url",
+            ));
+        }
+
+        self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
+            .await?;
+        let cache_key = crate::sorted_kv::PartitionFamilyCacheKey::new(
+            PartitionFamilyKind::StandardQueue,
+            &queue_family_component(queue_url),
+        );
+        let wake_key = queue_wake_key(queue_url);
+        let wake_bytes = wake_value_bytes()?;
+        for attempt in 0..PARTITIONED_QUEUE_SEND_MAX_ATTEMPTS {
+            let routing_state = match self.queue_routing_state(queue_url).await? {
+                Some(routing_state) => routing_state,
+                None => QueueRoutingState::Control(
+                    self.ensure_queue_family_state(
+                        queue_url,
+                        DEFAULT_STANDARD_QUEUE_PARTITION_COUNT,
+                    )
+                    .await?,
+                ),
+            };
+            let mut send_messages = Vec::with_capacity(prepared_messages.len());
+            let mut partition_load = HashMap::<u16, (u64, u64)>::new();
+            for prepared in &prepared_messages {
+                let route = self
+                    .queue_partition_route_for_send(
+                        &routing_state,
+                        &prepared.queue_url,
+                        &prepared.message_id,
+                    )
+                    .ok_or_else(|| {
+                        QueueError::internal(QueueInternalKind::NoWritableQueuePartition)
+                    })?;
+                let entry = partition_load.entry(route.partition_id).or_default();
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry
+                    .1
+                    .saturating_add(u64::try_from(prepared.state_bytes.len()).unwrap_or(u64::MAX));
+                send_messages.push(Self::partitioned_queue_write_for_route(
+                    prepared,
+                    route,
+                    &wake_key,
+                    &wake_bytes,
+                ));
+            }
+            let QueueRoutingState::Control(_) = &routing_state;
+
+            match self
+                .kv_store
+                .write_partitioned_queue_messages(send_messages)
+                .await
+            {
+                Ok(()) => {
+                    tracing::debug!(
+                        queue_url = %queue_url,
+                        message_count = prepared_messages.len(),
+                        attempt,
+                        elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+                        "sent partitioned queue messages"
+                    );
+                    for (partition_id, (writes, bytes)) in partition_load {
+                        self.record_queue_partition_load(
+                            queue_url,
+                            partition_id,
+                            crate::partition_family::PartitionLoadSample {
+                                writes,
+                                bytes,
+                                conflicts: u64::try_from(attempt).unwrap_or(u64::MAX),
+                                routing_key_bucket_bitmap: 0,
+                                queue_scan_work: 0,
+                                queue_claim_conflicts: 0,
+                                oldest_visible_age_ms: 0,
+                                visible_count: 0,
+                                invisible_count: 0,
+                            },
+                        );
+                    }
+                    return Ok(prepared_messages
+                        .into_iter()
+                        .map(|message| message.message_id)
+                        .collect());
+                }
+                Err(error) if Self::is_partition_routing_retryable(&error) => {
+                    metrics_facade::counter!(
+                        PARTITION_ROUTING_RETRIES_TOTAL_METRIC,
+                        "family_kind" => "standard_queue",
+                        "operation" => "send",
+                        "reason" => "stale_topology"
+                    )
+                    .increment(1);
+                    self.invalidate_partition_family_cache(&cache_key);
+                }
+                Err(error) => return Err(QueueError::TransactWrite(error)),
+            }
+        }
+        Err(QueueError::internal(
+            QueueInternalKind::PartitionedQueueSendRetriesExhausted,
+        ))
+    }
+
+    async fn send_partitioned_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
+        let mut sent_ids = self.send_partitioned_messages(vec![message]).await?;
+        sent_ids
+            .pop()
+            .ok_or_else(|| QueueError::internal(QueueInternalKind::NoWritableQueuePartition))
+    }
+
+    async fn receive_partitioned_messages_once(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: DurationSeconds,
+        routing_state: &QueueRoutingState,
+    ) -> QueueResult<Vec<MessageResponse>> {
+        let started_at = Instant::now();
+        let mut messages = Vec::new();
+        let per_partition_claim_limit = max_messages.max(1);
+        let per_partition_scan_limit = max_messages
+            .saturating_mul(PARTITIONED_QUEUE_RECEIVE_SCAN_OVERFETCH_MULTIPLIER)
+            .clamp(RECEIVE_SCAN_MIN_LIMIT, RECEIVE_SCAN_MAX_LIMIT);
+        let now = TimestampMillis::now();
+        let mut scanned_partitions = 0usize;
+        let mut claim_ranges = Vec::new();
+
+        let routes = queue_partition_routes(routing_state);
+        let receive_scan_shards = max_messages.max(1);
+        let scan_shards = usize::try_from(receive_scan_shards)
+            .unwrap_or(1)
+            .clamp(1, PARTITIONED_QUEUE_RECEIVE_SCAN_SHARDS)
+            .min(routes.len());
+        let route_window = self
+            .queue_receive_hinted_route_window(queue_url, &routes, scan_shards, now)
+            .await?;
+
+        for route in route_window {
+            if messages.len() >= usize::try_from(max_messages).unwrap_or(10) {
+                break;
+            }
+            scanned_partitions = scanned_partitions.saturating_add(1);
+
+            let ready_start = queue_ready_key_with_slot(
+                queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &MessageVisibilityKey(visibility_key(
+                    TimestampMillis::from(0),
+                    &MessageId::default(),
+                )),
+            );
+            let ready_end = queue_ready_key_with_slot(
+                queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &MessageVisibilityKey(visibility_key(now + 1, &MessageId::default())),
+            );
+            claim_ranges.push(QueueClaimRange {
+                queue_url: queue_url.to_string(),
+                placement_slot: route.placement_slot,
+                partition_id: route.partition_id,
+                ready_start,
+                ready_end,
+                ready_hint_key: queue_ready_hint_key(
+                    queue_url,
+                    route.placement_slot,
+                    route.partition_id,
+                ),
+                limit: per_partition_scan_limit,
+                scan_limit: per_partition_scan_limit,
+                claim_limit: per_partition_claim_limit,
+                candidate_seed: Self::queue_claim_seed(queue_url, route.partition_id),
+            });
+        }
+
+        let mut claimed_messages = self
+            .kv_store
+            .claim_queue_messages_from_ranges(
+                claim_ranges,
+                now,
+                visibility_timeout,
+                usize::try_from(max_messages).unwrap_or(10),
+            )
+            .await
+            .map_err(QueueError::TransactWrite)?;
+        let ready_entries_seen = claimed_messages.ready_entries_seen;
+        claimed_messages.messages.sort_by(|left, right| {
+            left.visibility_timestamp
+                .cmp(&right.visibility_timestamp)
+                .then_with(|| left.message_id_hex.cmp(&right.message_id_hex))
+        });
+
+        for claimed in claimed_messages.messages {
+            let message_id = claimed
+                .message_id_hex
+                .parse::<MessageId>()
+                .map_err(|error| {
+                    QueueError::internal_with_detail(
+                        QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                        error,
+                    )
+                })?;
+            let body: PartitionedQueueBody =
+                storage_types::storage_serde::from_bytes(&claimed.body_bytes).map_err(|error| {
+                    QueueError::internal_with_detail(
+                        QueueInternalKind::PartitionedQueueBodyDecode,
+                        format!(
+                            "deserialize claimed partitioned queue body message_id={} error={:?}",
+                            claimed.message_id_hex,
+                            error.as_ref()
+                        ),
+                    )
+                })?;
+            let receipt_handle = QueueReceiptHandleData {
+                partition_id: claimed.partition_id,
+                message_id_hex: claimed.message_id_hex,
+                visibility_timestamp_ms: claimed.visibility_timestamp.timestamp_millis(),
+                delivery_attempt: claimed.delivery_attempt,
+                claim_nonce: claimed.claim_nonce,
+            }
+            .encode()?;
+            messages.push(MessageResponse::from_message(
+                QueueMessage {
+                    message_id,
+                    queue_url: queue_url.to_string(),
+                    body: body.body,
+                    message_attributes: body.message_attributes,
+                    receipt_handle: Some(ReceiptHandle(receipt_handle.clone())),
+                    created_at: body.created_at,
+                    visibility_timestamp: Some(claimed.visibility_timestamp),
+                },
+                &ReceiptHandle(receipt_handle),
+            ));
+        }
+
+        tracing::debug!(
+            queue_url,
+            max_messages,
+            scanned_partitions,
+            ready_entries_seen,
+            claimed_messages = messages.len(),
+            elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+            "received partitioned queue messages"
+        );
+
+        Ok(messages)
+    }
+
+    async fn receive_partitioned_messages(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: DurationSeconds,
+        wait_time_seconds: DurationSeconds,
+        routing_state: QueueRoutingState,
+    ) -> QueueResult<Vec<MessageResponse>> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(u64::from(*wait_time_seconds));
+        let mut messages = Vec::new();
+        loop {
+            let remaining_max_messages =
+                max_messages.saturating_sub(u32::try_from(messages.len()).unwrap_or(u32::MAX));
+            if remaining_max_messages == 0 {
+                return Ok(messages);
+            }
+
+            let mut received = self
+                .receive_partitioned_messages_once_coalesced(
+                    queue_url,
+                    remaining_max_messages,
+                    visibility_timeout,
+                    &routing_state,
+                )
+                .await?;
+            let received_messages = !received.is_empty();
+            messages.append(&mut received);
+
+            if messages.len() >= usize::try_from(max_messages).unwrap_or(10) {
+                return Ok(messages);
+            }
+            if *wait_time_seconds == 0 {
+                return Ok(messages);
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(messages);
+            }
+
+            if received_messages {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let sample_delay = remaining.min(std::time::Duration::from_millis(
+                PARTITIONED_QUEUE_EMPTY_RECEIVE_POLL_MS,
+            ));
+            let _ = self
+                .kv_store
+                .wait_for_change(&queue_wake_key(queue_url), sample_delay)
+                .await?;
+        }
+    }
+
+    async fn load_partitioned_state(
+        &self,
+        queue_url: &str,
+        handle: &QueueReceiptHandleData,
+    ) -> QueueResult<(PartitionedQueueState, MessageId, QueuePartitionRoute)> {
+        let message_id = handle
+            .message_id_hex
+            .parse::<MessageId>()
+            .map_err(|error| {
+                QueueError::internal_with_detail(
+                    QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                    error,
+                )
+            })?;
+        let routing_state = self
+            .queue_routing_state(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
+        let route = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
+        let state_key = queue_state_key_with_slot(
+            queue_url,
+            route.placement_slot,
+            route.partition_id,
+            &handle.message_id_hex,
+        );
+        let Some(state_bytes) = self.kv_store.get(&state_key, true).await? else {
+            return Err(QueueError::ResourceNotFound {
+                resource_type: "receipt_handle",
+                resource_id: handle.message_id_hex.clone(),
+            });
+        };
+        let state: PartitionedQueueState = storage_types::storage_serde::from_bytes(&state_bytes)
+            .map_err(|error| {
+            QueueError::internal_with_detail(
+                QueueInternalKind::PartitionedQueueStateDecode,
+                format!(
+                    "deserialize partitioned queue receipt state key={} error={:?}",
+                    String::from_utf8_lossy(&state_key),
+                    error.as_ref()
+                ),
+            )
+        })?;
+        let Some(claim_nonce) = &state.claim_nonce else {
+            return Err(QueueError::ResourceNotFound {
+                resource_type: "receipt_handle",
+                resource_id: handle.message_id_hex.clone(),
+            });
+        };
+        if state.delivery_attempt != handle.delivery_attempt || claim_nonce != &handle.claim_nonce {
+            return Err(QueueError::ResourceNotFound {
+                resource_type: "receipt_handle",
+                resource_id: handle.message_id_hex.clone(),
+            });
+        }
+        Ok((state, message_id, route))
+    }
+
+    async fn delete_partitioned_message_with_state(
+        &self,
+        queue_url: &str,
+        handle: &QueueReceiptHandleData,
+        started_at: Instant,
+    ) -> QueueResult<()> {
+        let now = TimestampMillis::now();
+        let (state, message_id, route) = self.load_partitioned_state(queue_url, handle).await?;
+        if state.visibility_timestamp < now {
+            return Err(QueueError::validation(
+                QueueValidationKind::CannotOperateVisibleMessage,
+            ));
+        }
+        let visibility_key =
+            MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
+        let ready_key = queue_ready_key_with_slot(
+            queue_url,
+            route.placement_slot,
+            route.partition_id,
+            &visibility_key,
+        );
+        self.kv_store
+            .transact_write_unchecked(vec![
+                DirectWriteOperation::CheckValue {
+                    key: ready_key.clone(),
+                    expected_value: state.claim_nonce.clone().map(|nonce| nonce.into_bytes()),
+                },
+                DirectWriteOperation::Delete { key: ready_key },
+                DirectWriteOperation::Put {
+                    key: queue_delete_ledger_key(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &handle.message_id_hex,
+                    ),
+                    value: queue_delete_ledger_entry_bytes(
+                        queue_url,
+                        route,
+                        &handle.message_id_hex,
+                    )?,
+                },
+            ])
+            .await
+            .map_err(QueueError::TransactWrite)?;
+        record_deferred_payload_cleanup(1);
+        tracing::debug!(
+            queue_url,
+            partition_id = handle.partition_id,
+            elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+            "deleted partitioned queue message through state fallback"
+        );
+        Ok(())
+    }
+
+    async fn find_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
+        let queues = self
+            .kv_store
+            .get_prefix(b"sys/queues/", true, None, true)
+            .await?;
+
+        for (key, value) in queues.items {
+            let key_text = String::from_utf8_lossy(&key);
+            if key_text.contains("/messages/")
+                || key_text.contains("/visibility/")
+                || key_text.contains("/receipt_handles/")
+            {
+                continue;
+            }
+
+            let queue: Queue = match storage_types::storage_serde::from_bytes(&value) {
+                Ok(queue) => queue,
+                Err(_) => continue,
+            };
+            if queue.queue_name == queue_name {
+                return Ok(Some(queue));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+pub(crate) fn partitioned_ready_visibility_key(
+    storage_key: &[u8],
+) -> QueueResult<MessageVisibilityKey> {
+    let key_text = String::from_utf8(storage_key.to_vec()).map_err(|error| {
+        QueueError::internal_with_detail(
+            QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+            error,
+        )
+    })?;
+    let (_, suffix) = key_text.rsplit_once("/ready/").ok_or_else(|| {
+        QueueError::internal_with_detail(
+            QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+            key_text.clone(),
+        )
+    })?;
+    Ok(MessageVisibilityKey(suffix.to_string()))
+}
+
+fn queue_partition_hash(queue_url: &str, message_id: &MessageId) -> u64 {
+    let mut key = queue_url.as_bytes().to_vec();
+    key.extend_from_slice(message_id.as_bytes());
+    ordered_log_hash(&key)
+}
+
+fn queue_partition_routes(routing_state: &QueueRoutingState) -> Vec<QueuePartitionRoute> {
+    match routing_state {
+        QueueRoutingState::Control(family) => family
+            .partitions
+            .iter()
+            .filter(|partition| partition.is_readable())
+            .map(|partition| QueuePartitionRoute {
+                partition_id: partition.partition_id,
+                placement_slot: partition.placement_slot,
+            })
+            .collect(),
+    }
+}
+
+fn queue_partition_route_for_id(
+    routing_state: &QueueRoutingState,
+    partition_id: u16,
+) -> Option<QueuePartitionRoute> {
+    match routing_state {
+        QueueRoutingState::Control(family) => {
+            find_partition_by_id(&family.partitions, partition_id).map(|partition| {
+                QueuePartitionRoute {
+                    partition_id: partition.partition_id,
+                    placement_slot: partition.placement_slot,
+                }
+            })
+        }
+    }
+}
+
+#[async_trait]
+impl<S> QueueProvider for SortedKvDbStorageProvider<S>
+where S: QueueKvStore + 'static
+{
+    async fn initialize(&self) -> QueueResult<()> {
+        self.start_partition_reconcile_task().await?;
+        self.start_queue_payload_cleanup_task().await?;
+        Ok(())
+    }
+
+    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+        let key = key_queue_root(&queue.queue_url);
+        let value = storage_types::storage_serde::to_bytes(&queue)?;
+        self.kv_store.put(key.as_bytes(), &value, None).await?;
+        if self.kv_store.supports_partition_families() {
+            let family = self
+                .ensure_queue_family_state(&queue.queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
+                .await?;
+            let prewarm_partitions = queue_partition_routes(&QueueRoutingState::Control(family))
+                .into_iter()
+                .map(|route| QueuePrewarmPartition {
+                    placement_slot: route.placement_slot,
+                    partition_id: route.partition_id,
+                    marker_key: queue_state_key_with_slot(
+                        &queue.queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        QUEUE_PREWARM_MESSAGE_ID,
+                    ),
+                })
+                .collect();
+            self.kv_store
+                .prewarm_partitioned_queue(&queue.queue_url, prewarm_partitions)
+                .await?;
+            let marker_key = queue_partition_marker_key(&queue.queue_url);
+            self.kv_store
+                .put(
+                    &marker_key,
+                    &queue_partition_marker_bytes(DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)?,
+                    None,
+                )
+                .await?;
+            self.kv_store
+                .put(
+                    &queue_wake_key(&queue.queue_url),
+                    &wake_value_bytes()?,
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {
+        let key = key_queue_root(queue_url);
+        match self.kv_store.get(key.as_bytes(), true).await? {
+            Some(value) => {
+                let queue: Queue = storage_types::storage_serde::from_bytes(&value)?;
+                Ok(Some(queue))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
+        self.find_queue_by_name(queue_name).await
+    }
+
+    async fn list_queues(&self, queue_name_prefix: Option<&str>) -> QueueResult<Vec<Queue>> {
+        let items = self
+            .kv_store
+            .get_prefix(b"sys/queues/", true, None, true)
+            .await?;
+        let mut queues = Vec::new();
+        for (key, value) in items.items {
+            let key_text = String::from_utf8_lossy(&key);
+            if key_text.contains("/messages/")
+                || key_text.contains("/visibility/")
+                || key_text.contains("/receipt_handles/")
+            {
+                continue;
+            }
+
+            let queue: Queue = match storage_types::storage_serde::from_bytes(&value) {
+                Ok(queue) => queue,
+                Err(_) => continue,
+            };
+            if queue_name_prefix.is_none_or(|prefix| queue.queue_name.starts_with(prefix)) {
+                queues.push(queue);
+            }
+        }
+        Ok(queues)
+    }
+
+    async fn delete_queue(&self, queue_url: &str) -> QueueResult<()> {
+        if let Some(family) = self.load_queue_family_state(queue_url).await? {
+            for route in queue_partition_routes(&QueueRoutingState::Control(family)) {
+                self.kv_store
+                    .delete_prefix(queue_ready_prefix_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                    ))
+                    .await?;
+                self.kv_store
+                    .delete_prefix(queue_state_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        "",
+                    ))
+                    .await?;
+                self.kv_store
+                    .delete_prefix(queue_body_prefix_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                    ))
+                    .await?;
+                record_queue_storage_operation("queue_payload_cleanup", "prefix_delete", 1);
+                self.kv_store
+                    .delete_prefix(queue_checkpoint_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        "",
+                    ))
+                    .await?;
+            }
+            self.delete_partition_family_state(
+                PartitionFamilyKind::StandardQueue,
+                &queue_family_component(queue_url),
+            )
+            .await?;
+        }
+        self.kv_store
+            .delete(&queue_partition_marker_key(queue_url))
+            .await?;
+        let _ = self.kv_store.delete(&queue_wake_key(queue_url)).await;
+        self.kv_store
+            .delete_prefix(Self::queue_key_prefix(queue_url))
+            .await?;
+        self.kv_store
+            .delete(key_queue_root(queue_url).as_bytes())
+            .await?;
+        Ok(())
+    }
+
+    async fn purge_queue(&self, queue_url: &str) -> QueueResult<()> {
+        if let Some(family) = self.load_queue_family_state(queue_url).await? {
+            for route in queue_partition_routes(&QueueRoutingState::Control(family)) {
+                self.kv_store
+                    .delete_prefix(queue_ready_prefix_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                    ))
+                    .await?;
+                self.kv_store
+                    .delete_prefix(queue_state_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        "",
+                    ))
+                    .await?;
+                self.kv_store
+                    .delete_prefix(queue_body_prefix_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                    ))
+                    .await?;
+                record_queue_storage_operation("queue_payload_cleanup", "prefix_delete", 1);
+                self.kv_store
+                    .delete_prefix(queue_checkpoint_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        "",
+                    ))
+                    .await?;
+            }
+        }
+        self.kv_store
+            .delete_prefix(queue_message_prefix(queue_url))
+            .await?;
+        self.kv_store
+            .delete_prefix(format!("sys/queues/{queue_url}/visibility/").into_bytes())
+            .await?;
+        self.kv_store
+            .delete_prefix(format!("sys/queues/{queue_url}/receipt_handles/").into_bytes())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_queue_attributes(
+        &self,
+        queue_url: &str,
+        attributes: HashMap<String, String>,
+    ) -> QueueResult<()> {
+        let Some(mut queue) = self.get_queue(queue_url).await? else {
+            return Err(QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            });
+        };
+        queue.attributes = attributes;
+        let key = key_queue_root(queue_url);
+        let value = storage_types::storage_serde::to_bytes(&queue)?;
+        self.kv_store.put(key.as_bytes(), &value, None).await?;
+        Ok(())
+    }
+
+    async fn send_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
+        self.send_partitioned_message(message).await
+    }
+
+    async fn send_messages(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> QueueResult<Vec<QueueResult<MessageId>>> {
+        let message_ids = self.send_partitioned_messages(messages).await?;
+        Ok(message_ids.into_iter().map(Ok).collect())
+    }
+
+    async fn receive_messages(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: DurationSeconds,
+        wait_time_seconds: DurationSeconds,
+    ) -> QueueResult<Vec<MessageResponse>> {
+        let routing_state = QueueRoutingState::Control(
+            self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
+                .await?,
+        );
+        self.receive_partitioned_messages(
+            queue_url,
+            max_messages,
+            visibility_timeout,
+            wait_time_seconds,
+            routing_state,
+        )
+        .await
+    }
+
+    async fn delete_message(
+        &self,
+        queue_url: &str,
+        receipt_handle: ReceiptHandle,
+    ) -> QueueResult<()> {
+        let started_at = Instant::now();
+        if let Some(routing_state) = self.queue_routing_state(queue_url).await?
+            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
+        {
+            let now = TimestampMillis::now();
+            let message_id = handle
+                .message_id_hex
+                .parse::<MessageId>()
+                .map_err(|error| {
+                    QueueError::internal_with_detail(
+                        QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                        error,
+                    )
+                })?;
+            let visibility_timestamp = TimestampMillis::from(handle.visibility_timestamp_ms);
+            if visibility_timestamp < now {
+                return Err(QueueError::validation(
+                    QueueValidationKind::CannotOperateVisibleMessage,
+                ));
+            }
+            let route = queue_partition_route_for_id(&routing_state, handle.partition_id)
+                .ok_or_else(|| {
+                    QueueError::internal(QueueInternalKind::MissingQueuePartitionState)
+                })?;
+            let visibility_key =
+                MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));
+            let ready_key = queue_ready_key_with_slot(
+                queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &visibility_key,
+            );
+            if let Err(error) = self
+                .kv_store
+                .transact_write_unchecked(vec![
+                    DirectWriteOperation::CheckValue {
+                        key: ready_key.clone(),
+                        expected_value: Some(handle.claim_nonce.as_bytes().to_vec()),
+                    },
+                    DirectWriteOperation::Delete { key: ready_key },
+                    DirectWriteOperation::Put {
+                        key: queue_delete_ledger_key(
+                            queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &handle.message_id_hex,
+                        ),
+                        value: queue_delete_ledger_entry_bytes(
+                            queue_url,
+                            route,
+                            &handle.message_id_hex,
+                        )?,
+                    },
+                ])
+                .await
+            {
+                return match error.as_ref() {
+                    StorageEnum::ConditionalCheckFailed
+                    | StorageEnum::TransactionCanceled { .. } => {
+                        self.delete_partitioned_message_with_state(queue_url, &handle, started_at)
+                            .await
+                    }
+                    _ => Err(QueueError::TransactWrite(error)),
+                };
+            }
+            record_deferred_payload_cleanup(1);
+            tracing::debug!(
+                queue_url,
+                partition_id = handle.partition_id,
+                "deleted partitioned queue message"
+            );
+            return Ok(());
+        }
+
+        let now = TimestampMillis::now();
+        let (visibility_key_value, message_id) = self
+            .fetch_receipt_from_db(queue_url, &receipt_handle)
+            .await?;
+
+        if visibility_key_value.get_timestamp()? < now {
+            return Err(QueueError::validation(
+                QueueValidationKind::CannotOperateVisibleMessage,
+            ));
+        }
+
+        let visibility_delete_key = queue_visibility_storage_key(
+            queue_url,
+            visibility_key_value.get_timestamp()?,
+            &message_id,
+        );
+        let message_key = queue_message_storage_key(queue_url, &message_id);
+        let receipt_handle_key = key_receipt_handle(queue_url, &receipt_handle);
+        let checkpoint_key = key_receipt_checkpoint_uuid(queue_url, &receipt_handle);
+
+        self.kv_store
+            .transact_write(vec![
+                TransactWriteOperation::Delete {
+                    key: visibility_delete_key,
+                    condition: None,
+                },
+                TransactWriteOperation::Delete {
+                    key: message_key,
+                    condition: None,
+                },
+                TransactWriteOperation::Delete {
+                    key: receipt_handle_key.into_bytes(),
+                    condition: None,
+                },
+                TransactWriteOperation::Delete {
+                    key: checkpoint_key.into_bytes(),
+                    condition: None,
+                },
+            ])
+            .await
+            .map_err(QueueError::TransactWrite)?;
+
+        Ok(())
+    }
+
+    async fn delete_messages(
+        &self,
+        queue_url: &str,
+        receipt_handles: Vec<ReceiptHandle>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        let Some(routing_state) = self.queue_routing_state(queue_url).await? else {
+            let mut results = Vec::with_capacity(receipt_handles.len());
+            for receipt_handle in receipt_handles {
+                results.push(self.delete_message(queue_url, receipt_handle).await);
+            }
+            return Ok(results);
+        };
+
+        let mut decoded_handles = Vec::with_capacity(receipt_handles.len());
+        for receipt_handle in &receipt_handles {
+            let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str()) else {
+                let mut results = Vec::with_capacity(receipt_handles.len());
+                for receipt_handle in receipt_handles {
+                    results.push(self.delete_message(queue_url, receipt_handle).await);
+                }
+                return Ok(results);
+            };
+            decoded_handles.push(handle);
+        }
+
+        let now = TimestampMillis::now();
+        let mut results = std::iter::repeat_with(|| None)
+            .take(decoded_handles.len())
+            .collect::<Vec<Option<QueueResult<()>>>>();
+        let mut operations = Vec::with_capacity(decoded_handles.len().saturating_mul(2));
+        let mut deferred_payload_cleanup = 0u64;
+
+        for (index, handle) in decoded_handles.iter().enumerate() {
+            let message_id = match handle.message_id_hex.parse::<MessageId>() {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    results[index] = Some(Err(QueueError::internal_with_detail(
+                        QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                        error,
+                    )));
+                    continue;
+                }
+            };
+            let Some(route) = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            else {
+                results[index] = Some(Err(QueueError::internal(
+                    QueueInternalKind::MissingQueuePartitionState,
+                )));
+                continue;
+            };
+            let visibility_timestamp = TimestampMillis::from(handle.visibility_timestamp_ms);
+            if visibility_timestamp < now {
+                results[index] = Some(Err(QueueError::validation(
+                    QueueValidationKind::CannotOperateVisibleMessage,
+                )));
+                continue;
+            }
+
+            let visibility_key =
+                MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));
+            let ready_key = queue_ready_key_with_slot(
+                queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &visibility_key,
+            );
+            operations.extend([
+                DirectWriteOperation::CheckValue {
+                    key: ready_key.clone(),
+                    expected_value: Some(handle.claim_nonce.as_bytes().to_vec()),
+                },
+                DirectWriteOperation::Delete { key: ready_key },
+                DirectWriteOperation::Put {
+                    key: queue_delete_ledger_key(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &handle.message_id_hex,
+                    ),
+                    value: queue_delete_ledger_entry_bytes(
+                        queue_url,
+                        route,
+                        &handle.message_id_hex,
+                    )?,
+                },
+            ]);
+            deferred_payload_cleanup = deferred_payload_cleanup.saturating_add(1);
+            results[index] = Some(Ok(()));
+        }
+
+        if !operations.is_empty()
+            && let Err(error) = self.kv_store.transact_write_unchecked(operations).await
+        {
+            if matches!(
+                error.as_ref(),
+                StorageEnum::ConditionalCheckFailed | StorageEnum::TransactionCanceled { .. }
+            ) {
+                let mut fallback_results = Vec::with_capacity(decoded_handles.len());
+                for handle in decoded_handles {
+                    fallback_results.push(
+                        self.delete_partitioned_message_with_state(
+                            queue_url,
+                            &handle,
+                            Instant::now(),
+                        )
+                        .await,
+                    );
+                }
+                return Ok(fallback_results);
+            }
+            return Err(QueueError::TransactWrite(error));
+        }
+        record_deferred_payload_cleanup(deferred_payload_cleanup);
+
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or(Ok(())))
+            .collect())
+    }
+
+    async fn change_message_visibility(
+        &self,
+        queue_url: &str,
+        receipt_handle: ReceiptHandle,
+        visibility_timeout: DurationSeconds,
+    ) -> QueueResult<()> {
+        if self.queue_routing_state(queue_url).await?.is_some()
+            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
+        {
+            let now = TimestampMillis::now();
+            let (mut state, message_id, route) =
+                self.load_partitioned_state(queue_url, &handle).await?;
+            if state.visibility_timestamp < now {
+                return Err(QueueError::validation(
+                    QueueValidationKind::CannotOperateVisibleMessage,
+                ));
+            }
+            let old_visibility_key =
+                MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
+            let Some(claim_nonce) = state.claim_nonce.clone() else {
+                return Err(QueueError::ResourceNotFound {
+                    resource_type: "receipt_handle",
+                    resource_id: handle.message_id_hex,
+                });
+            };
+            state.visibility_timestamp = now + visibility_timeout;
+            let new_visibility_key =
+                MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
+            let message_id_hex = message_id.to_string();
+            self.kv_store
+                .transact_write_unchecked(vec![
+                    DirectWriteOperation::CheckValue {
+                        key: queue_ready_key_with_slot(
+                            queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &old_visibility_key,
+                        ),
+                        expected_value: Some(claim_nonce.as_bytes().to_vec()),
+                    },
+                    DirectWriteOperation::Delete {
+                        key: queue_ready_key_with_slot(
+                            queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &old_visibility_key,
+                        ),
+                    },
+                    DirectWriteOperation::Put {
+                        key: queue_ready_key_with_slot(
+                            queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &new_visibility_key,
+                        ),
+                        value: claim_nonce.into_bytes(),
+                    },
+                    DirectWriteOperation::Put {
+                        key: queue_state_key_with_slot(
+                            queue_url,
+                            route.placement_slot,
+                            route.partition_id,
+                            &message_id_hex,
+                        ),
+                        value: storage_types::storage_serde::to_bytes(&state)?,
+                    },
+                    DirectWriteOperation::Put {
+                        key: queue_wake_key(queue_url),
+                        value: wake_value_bytes()?,
+                    },
+                ])
+                .await
+                .map_err(QueueError::TransactWrite)?;
+            return Ok(());
+        }
+
+        let now = TimestampMillis::now();
+        let (old_visibility_key, message_id) = self
+            .fetch_receipt_from_db(queue_url, &receipt_handle)
+            .await?;
+
+        if old_visibility_key.get_timestamp()? < now {
+            return Err(QueueError::validation(
+                QueueValidationKind::CannotOperateVisibleMessage,
+            ));
+        }
+
+        let new_timestamp = now + visibility_timeout;
+        let new_visibility_key = MessageVisibilityKey(visibility_key(new_timestamp, &message_id));
+        let receipt_handle_key = key_receipt_handle(queue_url, &receipt_handle);
+
+        self.kv_store
+            .transact_write(vec![
+                TransactWriteOperation::Delete {
+                    key: queue_visibility_storage_key(
+                        queue_url,
+                        old_visibility_key.get_timestamp()?,
+                        &message_id,
+                    ),
+                    condition: None,
+                },
+                TransactWriteOperation::Put {
+                    key: queue_visibility_storage_key(queue_url, new_timestamp, &message_id),
+                    value: Self::visibility_record_bytes(Some(&receipt_handle))?,
+                    condition: None,
+                },
+                TransactWriteOperation::Put {
+                    key: receipt_handle_key.into_bytes(),
+                    value: Self::receipt_mapping_bytes(&new_visibility_key)?,
+                    condition: None,
+                },
+            ])
+            .await
+            .map_err(QueueError::TransactWrite)?;
+
+        Ok(())
+    }
+
+    async fn change_message_visibilities(
+        &self,
+        queue_url: &str,
+        entries: Vec<(ReceiptHandle, DurationSeconds)>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        let Some(routing_state) = self.queue_routing_state(queue_url).await? else {
+            let mut results = Vec::with_capacity(entries.len());
+            for (receipt_handle, visibility_timeout) in entries {
+                results.push(
+                    self.change_message_visibility(queue_url, receipt_handle, visibility_timeout)
+                        .await,
+                );
+            }
+            return Ok(results);
+        };
+
+        let mut decoded_entries = Vec::with_capacity(entries.len());
+        for (receipt_handle, visibility_timeout) in &entries {
+            let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str()) else {
+                let mut results = Vec::with_capacity(entries.len());
+                for (receipt_handle, visibility_timeout) in entries {
+                    results.push(
+                        self.change_message_visibility(
+                            queue_url,
+                            receipt_handle,
+                            visibility_timeout,
+                        )
+                        .await,
+                    );
+                }
+                return Ok(results);
+            };
+            decoded_entries.push((handle, *visibility_timeout));
+        }
+
+        let now = TimestampMillis::now();
+        let mut results = std::iter::repeat_with(|| None)
+            .take(decoded_entries.len())
+            .collect::<Vec<Option<QueueResult<()>>>>();
+        let mut operations = Vec::with_capacity(decoded_entries.len().saturating_mul(3) + 1);
+        let mut changed_any = false;
+
+        for (index, (handle, visibility_timeout)) in decoded_entries.into_iter().enumerate() {
+            let message_id = match handle.message_id_hex.parse::<MessageId>() {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    results[index] = Some(Err(QueueError::internal_with_detail(
+                        QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                        error,
+                    )));
+                    continue;
+                }
+            };
+            let Some(route) = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            else {
+                results[index] = Some(Err(QueueError::internal(
+                    QueueInternalKind::MissingQueuePartitionState,
+                )));
+                continue;
+            };
+            let state_key = queue_state_key_with_slot(
+                queue_url,
+                route.placement_slot,
+                route.partition_id,
+                &handle.message_id_hex,
+            );
+            let Some(state_bytes) = self.kv_store.get(&state_key, true).await? else {
+                results[index] = Some(Err(QueueError::ResourceNotFound {
+                    resource_type: "receipt_handle",
+                    resource_id: handle.message_id_hex,
+                }));
+                continue;
+            };
+            let mut state: PartitionedQueueState =
+                storage_types::storage_serde::from_bytes(&state_bytes).map_err(|error| {
+                    QueueError::internal_with_detail(
+                        QueueInternalKind::PartitionedQueueStateDecode,
+                        format!(
+                            "deserialize partitioned queue receipt state key={} error={:?}",
+                            String::from_utf8_lossy(&state_key),
+                            error.as_ref()
+                        ),
+                    )
+                })?;
+            let Some(claim_nonce) = &state.claim_nonce else {
+                results[index] = Some(Err(QueueError::ResourceNotFound {
+                    resource_type: "receipt_handle",
+                    resource_id: handle.message_id_hex,
+                }));
+                continue;
+            };
+            if state.delivery_attempt != handle.delivery_attempt
+                || claim_nonce != &handle.claim_nonce
+            {
+                results[index] = Some(Err(QueueError::ResourceNotFound {
+                    resource_type: "receipt_handle",
+                    resource_id: handle.message_id_hex,
+                }));
+                continue;
+            }
+            if state.visibility_timestamp < now {
+                results[index] = Some(Err(QueueError::validation(
+                    QueueValidationKind::CannotOperateVisibleMessage,
+                )));
+                continue;
+            }
+
+            let old_visibility_key =
+                MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
+            let claim_nonce = claim_nonce.clone();
+            state.visibility_timestamp = now + visibility_timeout;
+            let new_visibility_key =
+                MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
+            let message_id_hex = message_id.to_string();
+            operations.extend([
+                DirectWriteOperation::CheckValue {
+                    key: queue_ready_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &old_visibility_key,
+                    ),
+                    expected_value: Some(claim_nonce.as_bytes().to_vec()),
+                },
+                DirectWriteOperation::Delete {
+                    key: queue_ready_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &old_visibility_key,
+                    ),
+                },
+                DirectWriteOperation::Put {
+                    key: queue_ready_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &new_visibility_key,
+                    ),
+                    value: claim_nonce.into_bytes(),
+                },
+                DirectWriteOperation::Put {
+                    key: queue_state_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &message_id_hex,
+                    ),
+                    value: storage_types::storage_serde::to_bytes(&state)?,
+                },
+            ]);
+            changed_any = true;
+            results[index] = Some(Ok(()));
+        }
+
+        if changed_any {
+            operations.push(DirectWriteOperation::Put {
+                key: queue_wake_key(queue_url),
+                value: wake_value_bytes()?,
+            });
+            self.kv_store
+                .transact_write_unchecked(operations)
+                .await
+                .map_err(QueueError::TransactWrite)?;
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or(Ok(())))
+            .collect())
+    }
+
+    async fn update_message_snapshot_checkpoint(
+        &self,
+        queue_url: &str,
+        receipt_handle: ReceiptHandle,
+        checkpoint_data: String,
+    ) -> QueueResult<()> {
+        if self.queue_routing_state(queue_url).await?.is_some()
+            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
+        {
+            let (mut state, _, route) = self.load_partitioned_state(queue_url, &handle).await?;
+            state.checkpoint_data = Some(checkpoint_data);
+            let value = storage_types::storage_serde::to_bytes(&state)?;
+            self.kv_store
+                .put(
+                    &queue_state_key_with_slot(
+                        queue_url,
+                        route.placement_slot,
+                        route.partition_id,
+                        &handle.message_id_hex,
+                    ),
+                    &value,
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let key = key_receipt_checkpoint_uuid(queue_url, &receipt_handle);
+        let value = storage_types::storage_serde::to_bytes(&HashMap::from([(
+            "checkpoint_data".to_string(),
+            AttributeValue::S(checkpoint_data),
+        )]))?;
+        self.kv_store
+            .put(key.as_bytes(), &value, None)
+            .await
+            .map_err(Into::into)
+    }
+}

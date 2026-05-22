@@ -1,0 +1,11 @@
+{
+  "source": "AWS HTTPS subscription confirmation captured from disposable resources on 2026-05-05 and normalized for volatile values.",
+  "headers": {
+    "content-type": "text/plain; charset=UTF-8",
+    "user-agent": "Amazon Simple Notification Service Agent",
+    "x-amz-sns-message-type": "SubscriptionConfirmation",
+    "x-amz-sns-message-id": "<MESSAGE_ID>",
+    "x-amz-sns-topic-arn": "<TOPIC_ARN>"
+  },
+  "body": "{\n  \"Type\" : \"SubscriptionConfirmation\",\n  \"MessageId\" : \"<MESSAGE_ID>\",\n  \"Token\" : \"<TOKEN>\",\n  \"TopicArn\" : \"<TOPIC_ARN>\",\n  \"Message\" : \"You have chosen to subscribe to the topic <TOPIC_ARN>.\\nTo confirm the subscription, visit the SubscribeURL included in this message.\",\n  \"SubscribeURL\" : \"<SUBSCRIBE_URL>\",\n  \"Timestamp\" : \"<TIMESTAMP>\",\n  \"SignatureVersion\" : \"1\",\n  \"Signature\" : \"<SIGNATURE>\",\n  \"SigningCertURL\" : \"<SIGNING_CERT_URL>\"\n}"
+}

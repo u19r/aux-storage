@@ -1,0 +1,29 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "bg-jobs"
+version = "0.1.0"
+description = "Background jobs"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+hostname = { workspace = true }
+metrics-facade = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+storage-types = { path = "../storage-types" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+
+[lints]
+workspace = true

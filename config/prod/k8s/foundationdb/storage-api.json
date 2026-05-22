@@ -1,0 +1,13 @@
+{
+  "$schema": "../../../../crates/config/config.schema.json",
+  "description": "Production Kubernetes storage-api profile using FoundationDB for the shared control-plane storage surface.",
+  "features": {
+    "backends": {
+      "sqlite": null,
+      "foundationdb": {
+        "cluster_file": "/etc/foundationdb/fdb.cluster",
+        "subspace_prefix": "pd/"
+      }
+    }
+  }
+}

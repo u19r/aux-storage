@@ -1,0 +1,21 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "http-error"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-types = { path = "../storage-types" }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

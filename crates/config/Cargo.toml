@@ -1,0 +1,42 @@
+[package]
+name = "config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "config-compile-time-manifest"
+path = "src/bin/config_compile_time_manifest.rs"
+required-features = ["compile-time-manifest"]
+
+[[bin]]
+name = "configuration_doc"
+path = "src/bin/configuration_doc/mod.rs"
+
+[features]
+default = []
+compile-time-manifest = ["dep:cargo_metadata"]
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+cargo_metadata = { workspace = true, optional = true }
+chrono = { workspace = true }
+jsonschema = { workspace = true }
+schemars = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

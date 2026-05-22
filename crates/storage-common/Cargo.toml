@@ -1,0 +1,27 @@
+[package]
+publish = false
+name = "storage-common"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Backend-agnostic shared helpers for storage providers (pagination, projection, key schema validation, retry logic)"
+
+[features]
+rocksdb = ["storage-types/rocksdb"]
+
+[dependencies]
+async-trait = { workspace = true }
+bg-jobs = { path = "../bg-jobs" }
+md5 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+storage-types = { path = "../storage-types" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+
+[lints]
+workspace = true

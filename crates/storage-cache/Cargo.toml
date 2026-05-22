@@ -1,0 +1,26 @@
+[package]
+publish = false
+name = "storage-cache"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+readme = "README.md"
+description = "Reference cache model and model-based tests for distributed write-through storage caching"
+
+[dependencies]
+hashring = { workspace = true }
+metrics-facade = { workspace = true }
+openraft = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-types = { path = "../storage-types" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

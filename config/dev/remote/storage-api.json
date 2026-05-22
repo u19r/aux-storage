@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/u19r/aux-storage/refs/heads/main/crates/config/config.schema.json?token=GHSAT0AAAAAADK4QYGE6FCAG4LATCSLN4UI2QGCFVA",
+  "description": "storage-api profile backing the remote-storage developer topology.",
+  "features": {
+    "metrics": {
+      "prometheus": {
+        "bearer_token": "docker-compose-dev-metrics-token"
+      }
+    }
+  }
+}

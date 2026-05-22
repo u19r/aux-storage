@@ -1,0 +1,852 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Storage API",
+    "description": "",
+    "license": {
+      "name": "BUSL-1.1",
+      "identifier": "BUSL-1.1"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/pubsub": {
+      "post": {
+        "tags": [
+          "crate::routes::pubsub"
+        ],
+        "operationId": "pubsub_endpoint",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SNS-compatible response"
+          }
+        }
+      }
+    },
+    "/queue": {
+      "post": {
+        "tags": [
+          "crate::routes::queue"
+        ],
+        "operationId": "queue_endpoint",
+        "requestBody": {
+          "content": {
+            "application/x-amz-json-1.0": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SQS-compatible response"
+          }
+        }
+      }
+    },
+    "/storage": {
+      "post": {
+        "tags": [
+          "crate::routes::dynamodb"
+        ],
+        "summary": "Execute a DynamoDB-compatible storage operation.",
+        "description": "Sends a DynamoDB-compatible JSON-RPC request through the AuxFn storage gateway using the `x-amz-target` header to select the operation. The aggregated internal-private `/storage` surface accepts either an authenticated bearer session or an `x-api-key` service token bound to the `storage-gateway` service, while non-DynamoDB helper traffic stays on separate internal routes.",
+        "operationId": "dynamodb_endpoint",
+        "parameters": [
+          {
+            "name": "x-amz-target",
+            "in": "header",
+            "description": "DynamoDB operation target (e.g., DynamoDB_20120810.CreateTable)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "description": "Optional service token bound to the storage-gateway service when the caller is a machine principal",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "DynamoDB operation successful",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong machine credential type or service binding",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-aux-audience": "internal_private",
+        "x-aux-internal": true,
+        "x-aux-authn-classification": "session_or_service_token"
+      }
+    },
+    "/storage/_internal/storage/replication/apply": {
+      "post": {
+        "tags": [
+          "crate::routes::internal"
+        ],
+        "operationId": "apply_replication_endpoint",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicationApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replication mutations were processed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationApplyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong service token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storage/_internal/storage/replication/health": {
+      "get": {
+        "tags": [
+          "crate::routes::internal"
+        ],
+        "operationId": "replication_health_endpoint",
+        "responses": {
+          "200": {
+            "description": "Replication health returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationHealthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong service token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storage/_internal/storage/replication/heartbeat": {
+      "post": {
+        "tags": [
+          "crate::routes::internal"
+        ],
+        "operationId": "replication_heartbeat_endpoint",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicationHeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replication heartbeat acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationHeartbeatResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong service token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AttributeValue": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "S"
+            ],
+            "properties": {
+              "S": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "N"
+            ],
+            "properties": {
+              "N": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "B"
+            ],
+            "properties": {
+              "B": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "SS"
+            ],
+            "properties": {
+              "SS": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "NS"
+            ],
+            "properties": {
+              "NS": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "BS"
+            ],
+            "properties": {
+              "BS": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "BOOL"
+            ],
+            "properties": {
+              "BOOL": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "NULL"
+            ],
+            "properties": {
+              "NULL": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "L"
+            ],
+            "properties": {
+              "L": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AttributeValue"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "M"
+            ],
+            "properties": {
+              "M": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/AttributeValue"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "__type",
+          "message"
+        ],
+        "properties": {
+          "__type": {
+            "type": "string",
+            "description": "AWS-compatible JSON error field name. DynamoDB and SQS JSON protocol\nerrors use `__type`. Machine-readable API error type.",
+            "example": "ValidationException"
+          },
+          "documentation_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional documentation link for operator or developer remediation.",
+            "example": "/docs/explanations/error-code-catalog"
+          },
+          "message": {
+            "type": "string",
+            "description": "AWS-compatible JSON error field name. DynamoDB and SQS JSON protocol\nerrors use `message`. Human-readable error message.",
+            "example": "One or more parameter values were invalid."
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Request correlation identifier echoed in the response body.",
+            "example": "018f1f61-2a6f-7ac3-b9b6-7f65bb2d91fd"
+          },
+          "retry_after_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional retry budget for rate-limited responses.",
+            "example": 2,
+            "minimum": 0
+          }
+        }
+      },
+      "KeyAttributes": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/AttributeValue"
+        },
+        "propertyNames": {
+          "type": "string"
+        }
+      },
+      "ReplicationApplyRequest": {
+        "type": "object",
+        "required": [
+          "SourceRegion",
+          "Mutations"
+        ],
+        "properties": {
+          "Mutations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicationMutation"
+            }
+          },
+          "SourceRegion": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationApplyResponse": {
+        "type": "object",
+        "required": [
+          "ReceivedMutations",
+          "AppliedMutations",
+          "SkippedMutations"
+        ],
+        "properties": {
+          "AppliedMutations": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ReceivedMutations": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "SkippedMutations": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ReplicationEventMetadata": {
+        "type": "object",
+        "required": [
+          "origin_region",
+          "origin_sequence",
+          "origin_hlc",
+          "origin_commit_ts",
+          "table_replica_epoch",
+          "write_source"
+        ],
+        "properties": {
+          "origin_commit_ts": {
+            "$ref": "#/components/schemas/TimestampMillis"
+          },
+          "origin_hlc": {
+            "$ref": "#/components/schemas/ReplicationHybridLogicalClock"
+          },
+          "origin_region": {
+            "type": "string"
+          },
+          "origin_sequence": {
+            "$ref": "#/components/schemas/StreamItemId"
+          },
+          "table_replica_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "write_source": {
+            "$ref": "#/components/schemas/ReplicationWriteSource"
+          }
+        }
+      },
+      "ReplicationHealthResponse": {
+        "type": "object",
+        "required": [
+          "Peers"
+        ],
+        "properties": {
+          "Peers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicationPeerHealth"
+            }
+          },
+          "SelfRegion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReplicationHeartbeatRequest": {
+        "type": "object",
+        "required": [
+          "SourceRegion",
+          "SentAt"
+        ],
+        "properties": {
+          "SentAt": {
+            "$ref": "#/components/schemas/TimestampMillis"
+          },
+          "SourceLatestCommitTs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          },
+          "SourceRegion": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationHeartbeatResponse": {
+        "type": "object",
+        "required": [
+          "RegionName",
+          "AcknowledgedAt"
+        ],
+        "properties": {
+          "AcknowledgedAt": {
+            "$ref": "#/components/schemas/TimestampMillis"
+          },
+          "LastAppliedCommitTs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          },
+          "RegionName": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationHybridLogicalClock": {
+        "type": "object",
+        "required": [
+          "physical_ms",
+          "logical"
+        ],
+        "properties": {
+          "logical": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "physical_ms": {
+            "$ref": "#/components/schemas/TimestampMillis"
+          }
+        }
+      },
+      "ReplicationMutation": {
+        "type": "object",
+        "required": [
+          "TableName",
+          "Key",
+          "Metadata"
+        ],
+        "properties": {
+          "Key": {
+            "$ref": "#/components/schemas/KeyAttributes"
+          },
+          "Metadata": {
+            "$ref": "#/components/schemas/ReplicationEventMetadata"
+          },
+          "NewImage": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "OldImage": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AttributeValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "TableName": {
+            "$ref": "#/components/schemas/TableName"
+          }
+        }
+      },
+      "ReplicationPeerHealth": {
+        "type": "object",
+        "required": [
+          "RegionName",
+          "Healthy"
+        ],
+        "properties": {
+          "Healthy": {
+            "type": "boolean"
+          },
+          "HeartbeatStalenessMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "LastAuthFailureAt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          },
+          "LastHeartbeatAt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          },
+          "LastHeartbeatRttMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "LastReceivedCommitTs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          },
+          "RegionName": {
+            "type": "string"
+          },
+          "ReplicationLagMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "SenderQueueDepth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "SourceLatestCommitTs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimestampMillis"
+              }
+            ]
+          }
+        }
+      },
+      "ReplicationWriteSource": {
+        "type": "string",
+        "enum": [
+          "local",
+          "replicated"
+        ]
+      },
+      "StreamItemId": {
+        "type": "string",
+        "example": "000000000000000000000000"
+      },
+      "TableName": {
+        "type": "string"
+      },
+      "TimestampMillis": {
+        "type": "integer",
+        "format": "int64"
+      }
+    }
+  }
+}

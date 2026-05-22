@@ -1,0 +1,42 @@
+[package]
+edition = "2024"
+license.workspace = true
+name = "storage-types"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = []
+sqlite = []
+postgres = []
+rocksdb = []
+turso = []
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+inventory = { workspace = true }
+lz4_flex = { workspace = true }
+
+rust_decimal = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+typed-builder = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+proptest = { workspace = true }
+quint-connect = { workspace = true }
+storage-derive = { path = "../storage-derive" }
+
+[lints]
+workspace = true

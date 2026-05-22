@@ -1,0 +1,61 @@
+[package]
+edition = "2024"
+license.workspace = true
+name = "storage-api"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sql", "sql/sqlite-backend", "storage/sqlite", "storage-types/sqlite"]
+turso = ["storage/turso", "storage-types/turso"]
+postgres = ["storage/postgres", "storage-types/postgres"]
+rocksdb = ["storage/rocksdb", "storage-types/rocksdb"]
+foundationdb = ["storage/foundationdb"]
+queue = ["dep:queue", "dep:queue-provider"]
+pubsub = ["dep:pubsub", "dep:pubsub-provider"]
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+bg-jobs = { path = "../bg-jobs" }
+chrono = { workspace = true }
+clap = { workspace = true }
+config = { path = "../config" }
+http-error = { path = "../http-error" }
+http-request = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-facade = { workspace = true }
+notify = { workspace = true, default-features = true }
+openraft = { workspace = true }
+pubsub = { path = "../pubsub", default-features = false, optional = true }
+pubsub-provider = { path = "../pubsub-provider", optional = true }
+queue = { path = "../queue", default-features = false, optional = true }
+queue-provider = { path = "../queue-provider", optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sql = { path = "../sql", default-features = false, optional = true }
+storage = { path = "../storage", default-features = false }
+storage-backfill = { path = "../storage-backfill" }
+storage-provider = { path = "../storage-provider" }
+storage-sync = { path = "../storage-sync" }
+storage-types = { path = "../storage-types", default-features = false }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
+storage-cache = { path = "../storage-cache" }
+
+[lints]
+workspace = true

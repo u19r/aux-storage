@@ -1,0 +1,64 @@
+[package]
+edition = "2024"
+license.workspace = true
+name = "storage"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sql", "sql/sqlite-backend", "storage-types/sqlite", "stream/sqlite"]
+turso = [
+    "dep:sql",
+    "sql/sqlite-backend",
+    "sql/turso-backend",
+    "storage-types/turso",
+    "stream/turso",
+]
+postgres = [
+    "dep:sql",
+    "sql/postgres-backend",
+    "storage-types/postgres",
+    "stream/postgres",
+]
+rocksdb = ["dep:kv", "storage-types/rocksdb", "stream/rocksdb"]
+foundationdb = ["dep:kv", "kv/foundationdb-backend", "stream/foundationdb"]
+remote = ["dep:storage-remote"]
+opt-loop-profiling = ["dep:opt-loop-probe"]
+
+[dependencies]
+async-trait = { workspace = true }
+bg-job-store = { path = "../bg-job-store" }
+bg-jobs = { path = "../bg-jobs" }
+config = { path = "../config" }
+futures = { workspace = true }
+kv = { path = "../kv", optional = true }
+lru-ttl-cache = { workspace = true }
+metrics-facade = { workspace = true }
+opt-loop-probe = { workspace = true, optional = true }
+pubsub-provider = { path = "../pubsub-provider" }
+queue-provider = { path = "../queue-provider" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sql = { path = "../sql", optional = true, default-features = false }
+storage-backfill = { path = "../storage-backfill" }
+storage-cache = { path = "../storage-cache" }
+storage-common = { path = "../storage-common" }
+storage-condition = { path = "../storage-condition" }
+storage-derive = { path = "../storage-derive" }
+storage-provider = { path = "../storage-provider" }
+storage-remote = { path = "../storage-remote", optional = true }
+storage-sync = { path = "../storage-sync" }
+storage-types = { path = "../storage-types" }
+stream = { path = "../stream", default-features = false }
+tokio = { workspace = true }
+tracing = { workspace = true }
+typed-builder = { workspace = true }
+
+[dev-dependencies]
+alloc-counter = { workspace = true }
+
+[lints]
+workspace = true

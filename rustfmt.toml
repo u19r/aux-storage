@@ -1,0 +1,36 @@
+# Rust formatting configuration
+# This defines the code style preferences for this project
+edition = "2024"
+style_edition = "2024"
+unstable_features = true
+
+# Line length and wrapping
+max_width = 100
+wrap_comments = true
+format_code_in_doc_comments = true
+
+# Imports
+imports_granularity = "Crate"
+reorder_imports = true
+group_imports = "StdExternalCrate"
+
+# Function and struct formatting
+fn_single_line = false
+where_single_line = true
+force_explicit_abi = true
+
+# Control flow
+control_brace_style = "AlwaysSameLine"
+indent_style = "Block"
+
+# Trailing elements
+trailing_comma = "Vertical"
+trailing_semicolon = true
+
+# String formatting
+format_strings = true
+format_macro_matchers = true
+
+# Comments and documentation
+normalize_comments = true
+normalize_doc_attributes = true

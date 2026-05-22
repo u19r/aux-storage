@@ -1,0 +1,10 @@
+{
+  "source": "AWS raw queue subscription notification captured from disposable resources on 2026-05-05 and normalized for volatile values.",
+  "body": "raw-created",
+  "message_attributes": {
+    "event": {
+      "StringValue": "created",
+      "DataType": "String"
+    }
+  }
+}

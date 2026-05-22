@@ -1,0 +1,66 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "queue"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "queue"
+path = "src/main/mod.rs"
+
+[features]
+default = ["sqlite", "server"]
+server = [
+    "dep:axum",
+    "dep:clap",
+    "dep:metrics-exporter-prometheus",
+    "dep:serde",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+]
+sqlite = ["dep:sql", "sql/sqlite-backend", "storage-types/sqlite"]
+turso = ["dep:sql", "sql/sqlite-backend", "sql/turso-backend", "storage-types/turso"]
+postgres = ["dep:sql", "sql/postgres-backend", "storage-types/postgres"]
+rocksdb = ["dep:kv", "storage-types/rocksdb"]
+foundationdb = ["dep:kv", "kv/foundationdb-backend"]
+remote = ["dep:queue-remote"]
+opt-loop-profiling = ["dep:opt-loop-probe"]
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true, optional = true }
+bg-jobs = { path = "../bg-jobs" }
+clap = { workspace = true, optional = true }
+config = { path = "../config" }
+http-error = { path = "../http-error" }
+kv = { path = "../kv", optional = true }
+md5 = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+metrics-facade = { workspace = true }
+opt-loop-probe = { workspace = true, optional = true }
+queue-provider = { path = "../queue-provider" }
+queue-remote = { path = "../queue-remote", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+sql = { path = "../sql", optional = true, default-features = false }
+storage-types = { path = "../storage-types" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+url = { workspace = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+aws-config = { workspace = true }
+aws-sdk-sqs = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

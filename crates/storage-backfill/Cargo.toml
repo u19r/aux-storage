@@ -1,0 +1,27 @@
+[package]
+publish = false
+name = "storage-backfill"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+metrics-facade = { workspace = true }
+storage-types = { path = "../storage-types" }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
+tracing-test = { workspace = true }
+
+[lints]
+workspace = true
