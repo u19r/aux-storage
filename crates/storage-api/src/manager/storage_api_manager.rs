@@ -12,12 +12,12 @@ use http_error::HttpApiError;
 use storage::{DatabaseManager, ReplicationMutationApplyOutcome};
 use storage_types::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
-    DeleteTableRequest, DescribeTableRequest, DescribeTimeToLiveRequest, GetItemRequest,
-    GetStreamRecordsRequest, ListTablesRequest, MultiRegionConsistency, PutItemRequest,
-    QueryRequest, ReplicaDescription, ReplicationApplyRequest, ReplicationHeartbeatRequest,
-    ScanRequest, StreamSpecification, TableDescription, TableName, TimestampMillis,
-    TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
-    UpdateTimeToLiveRequest,
+    DeleteTableRequest, DescribeStreamRequest, DescribeTableRequest, DescribeTimeToLiveRequest,
+    GetItemRequest, GetRecordsRequest, GetShardIteratorRequest, GetStreamRecordsRequest,
+    ListStreamsRequest, ListTablesRequest, MultiRegionConsistency, PutItemRequest, QueryRequest,
+    ReplicaDescription, ReplicationApplyRequest, ReplicationHeartbeatRequest, ScanRequest,
+    StreamSpecification, TableDescription, TableName, TimestampMillis, TransactGetItemsRequest,
+    TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest, UpdateTimeToLiveRequest,
 };
 
 use crate::types::{
@@ -355,6 +355,16 @@ pub trait StorageApiManager: Send + Sync {
         &self,
         request: GetStreamRecordsRequest,
     ) -> Result<Response, HttpApiError>;
+    async fn list_streams(&self, request: ListStreamsRequest) -> Result<Response, HttpApiError>;
+    async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> Result<Response, HttpApiError>;
+    async fn get_shard_iterator(
+        &self,
+        request: GetShardIteratorRequest,
+    ) -> Result<Response, HttpApiError>;
+    async fn get_records(&self, request: GetRecordsRequest) -> Result<Response, HttpApiError>;
     async fn apply_replication(
         &self,
         request: ReplicationApplyRequest,
@@ -491,6 +501,28 @@ impl StorageApiManager for StorageApiManagerImpl {
         request: GetStreamRecordsRequest,
     ) -> Result<Response, HttpApiError> {
         self.get_stream_records_internal(request).await
+    }
+
+    async fn list_streams(&self, request: ListStreamsRequest) -> Result<Response, HttpApiError> {
+        self.list_streams_internal(request).await
+    }
+
+    async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.describe_stream_internal(request).await
+    }
+
+    async fn get_shard_iterator(
+        &self,
+        request: GetShardIteratorRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.get_shard_iterator_internal(request).await
+    }
+
+    async fn get_records(&self, request: GetRecordsRequest) -> Result<Response, HttpApiError> {
+        self.get_records_internal(request).await
     }
 
     async fn apply_replication(

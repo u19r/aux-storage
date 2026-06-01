@@ -43,6 +43,13 @@ impl SqlParam {
             value: SqlValue::Bytes(value.into()),
         }
     }
+
+    #[must_use]
+    pub fn boolean(value: bool) -> Self {
+        Self {
+            value: SqlValue::Bool(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

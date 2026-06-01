@@ -1,6 +1,6 @@
 use serde_json::json;
 use storage::DatabaseManager;
-use storage_types::{TableName, TransactWriteItemsRequest};
+use storage_types::{AttributeValue, TableName, TransactWriteItemsRequest};
 
 use crate::{
     routes::routes_support_tests::{
@@ -183,4 +183,66 @@ async fn transact_write_items_put_operations() {
         .await;
     assert!(get_result2.is_ok());
     assert!(get_result2.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn transact_write_condition_failure_returns_all_old_item_when_requested() {
+    let db = create_test_db_manager().await;
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "TxnConditionAllOld",
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("create table");
+    db.put_item(storage::PutItemInput {
+        table_name: TableName::new("TxnConditionAllOld"),
+        item: std::collections::HashMap::from([
+            ("id".to_string(), AttributeValue::S("item1".to_string())),
+            ("status".to_string(), AttributeValue::S("open".to_string())),
+        ])
+        .into(),
+        condition_expression: None,
+        expression_attribute_names: None,
+        expression_attribute_values: None,
+        return_values: None,
+    })
+    .await
+    .expect("seed item");
+
+    let err = handle_transact_write_items(
+        db,
+        json!({
+            "TransactItems": [{
+                "Update": {
+                    "TableName": "TxnConditionAllOld",
+                    "Key": {"id": {"S": "item1"}},
+                    "UpdateExpression": "SET #status = :next",
+                    "ConditionExpression": "#status = :expected",
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": {
+                        ":next": {"S": "closed"},
+                        ":expected": {"S": "missing"}
+                    },
+                    "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                }
+            }]
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect_err("transaction should fail");
+
+    let reasons = err.cancellation_reasons.expect("cancellation reasons");
+    let item = reasons[0].item.as_ref().expect("conditional failure item");
+    assert_eq!(
+        item.get("status"),
+        Some(&AttributeValue::S("open".to_string()))
+    );
 }

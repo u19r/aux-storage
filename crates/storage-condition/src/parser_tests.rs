@@ -17,7 +17,7 @@ fn parse_simple_equality_condition() {
 
     let expected = Condition::Equal {
         field: "name".to_string(),
-        value: "John".to_string(),
+        value: AttributeValue::S("John".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 }
@@ -41,7 +41,7 @@ fn parse_attribute_names_substitution() {
 
     let expected = Condition::Equal {
         field: "name".to_string(),
-        value: "John".to_string(),
+        value: AttributeValue::S("John".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 }
@@ -148,7 +148,10 @@ fn parse_in_condition() {
 
     let expected = Condition::In {
         field: "name".to_string(),
-        values: vec!["John".to_string(), "Bob".to_string()],
+        values: vec![
+            AttributeValue::S("John".to_string()),
+            AttributeValue::S("Bob".to_string()),
+        ],
     };
     assert_eq!(result.unwrap(), expected);
 }
@@ -202,10 +205,35 @@ fn parse_function_conditions() {
         }
     ));
 
+    let result = parse_condition_expression(
+        "size(name) BETWEEN :size_val AND :size_max",
+        None,
+        Some(&HashMap::from([
+            (":size_val".to_string(), AttributeValue::N("1".to_string())),
+            (":size_max".to_string(), AttributeValue::N("8".to_string())),
+        ])),
+    );
+    assert!(matches!(result.unwrap(), Condition::And { .. }));
+
     let result =
         parse_condition_expression("attribute_type(name, :type)", None, Some(&attribute_values));
     assert!(result.is_ok());
     assert!(matches!(result.unwrap(), Condition::AttributeType { .. }));
+}
+
+#[test]
+fn parse_literal_equality_condition() {
+    let values = HashMap::from([(":value".to_string(), AttributeValue::S("same".to_string()))]);
+
+    let condition = parse_condition_expression(":value = :value", None, Some(&values)).unwrap();
+
+    assert_eq!(
+        condition,
+        Condition::ValueEqual {
+            left: AttributeValue::S("same".to_string()),
+            right: AttributeValue::S("same".to_string()),
+        }
+    );
 }
 
 #[test]
@@ -324,6 +352,33 @@ fn parse_parenthesized_expressions() {
         }
         _ => panic!("Expected OR condition with parenthesized AND"),
     }
+}
+
+#[test]
+fn parse_parenthesized_comparison_operands() {
+    let mut attribute_names = HashMap::new();
+    attribute_names.insert("#name".to_string(), "name".to_string());
+
+    let mut attribute_values = HashMap::new();
+    attribute_values.insert(
+        ":name_val".to_string(),
+        AttributeValue::S("John".to_string()),
+    );
+
+    let condition = parse_condition_expression(
+        "(#name) = (:name_val)",
+        Some(&attribute_names),
+        Some(&attribute_values),
+    )
+    .expect("parenthesized comparison operands should parse");
+
+    assert_eq!(
+        condition,
+        Condition::Equal {
+            field: "name".to_string(),
+            value: AttributeValue::S("John".to_string()),
+        }
+    );
 }
 
 #[test]
@@ -493,7 +548,7 @@ fn parse_string_literals() {
 
     let expected = Condition::Equal {
         field: "name".to_string(),
-        value: "John Doe".to_string(),
+        value: AttributeValue::S("John Doe".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 
@@ -503,7 +558,7 @@ fn parse_string_literals() {
 
     let expected = Condition::Equal {
         field: "name".to_string(),
-        value: "Jane Smith".to_string(),
+        value: AttributeValue::S("Jane Smith".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 }
@@ -515,7 +570,7 @@ fn parse_number_literals() {
 
     let expected = Condition::Equal {
         field: "age".to_string(),
-        value: "25".to_string(),
+        value: AttributeValue::N("25".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 
@@ -525,7 +580,7 @@ fn parse_number_literals() {
 
     let expected = Condition::Equal {
         field: "balance".to_string(),
-        value: "-100".to_string(),
+        value: AttributeValue::N("-100".to_string()),
     };
     assert_eq!(result.unwrap(), expected);
 }

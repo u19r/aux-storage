@@ -48,12 +48,17 @@ pub async fn create_stream_provider(
                 .connection_string
                 .clone()
                 .ok_or_else(|| StreamError::internal("postgres stream backend missing dsn"))?;
-            let (pool_size, tls_enabled) = config
-                .postgres
-                .as_ref()
-                .map_or((16, true), |cfg| (cfg.max_pool_size, cfg.tls));
-            let provider =
-                PostgresStorageProvider::new_with_tls(&dsn, pool_size, tls_enabled).await?;
+            let (pool_size, background_pool_size, tls_enabled) =
+                config.postgres.as_ref().map_or((16, 4, true), |cfg| {
+                    (cfg.max_pool_size, cfg.background_max_pool_size, cfg.tls)
+                });
+            let provider = PostgresStorageProvider::new_with_tls(
+                &dsn,
+                pool_size,
+                background_pool_size,
+                tls_enabled,
+            )
+            .await?;
             Ok(Box::new(provider))
         }
         #[cfg(not(feature = "postgres"))]

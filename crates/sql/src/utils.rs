@@ -2,8 +2,9 @@ use std::{collections::HashMap, fmt::Write as _};
 
 use queue_provider::{QueueMessage, ReceiptHandle};
 use storage_types::{
-    AttributeDefinition, AttributeValue, GlobalSecondaryIndex, KeyAttributeType, KeySchemaElement,
-    KeyType, StorageError, StorageResult, StoredTableInfo, TableName,
+    AttributeDefinition, AttributeValue, GlobalSecondaryIndex, KeyAttributeType, KeyAttributes,
+    KeySchemaElement, KeyType, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    TableName,
 };
 
 use crate::{
@@ -17,6 +18,103 @@ pub fn dynamodb_type_to_sql_type(attr_type: &KeyAttributeType) -> &'static str {
         KeyAttributeType::S => "TEXT",
         KeyAttributeType::N => "NUMERIC",
         KeyAttributeType::B => "BLOB",
+    }
+}
+
+pub(crate) fn main_table_attributes_blob(
+    key_attributes: &KeyAttributes,
+    non_key_attributes: &HashMap<String, AttributeValue>,
+) -> StorageResult<String> {
+    let has_number_key = key_attributes
+        .iter()
+        .any(|(_, value)| matches!(value, AttributeValue::N(_)));
+    if !has_number_key {
+        return if non_key_attributes.is_empty() {
+            Ok("{}".to_string())
+        } else {
+            serde_json::to_string(non_key_attributes)
+                .map_err(|error| StorageEnum::Serialization(error).into())
+        };
+    }
+
+    let mut attributes = HashMap::with_capacity(key_attributes.len() + non_key_attributes.len());
+    attributes.extend(
+        key_attributes
+            .iter()
+            .map(|(name, value)| (name.to_string(), normalize_wire_number(value))),
+    );
+    attributes.extend(
+        non_key_attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), normalize_wire_number(value))),
+    );
+    serde_json::to_string(&attributes).map_err(|error| StorageEnum::Serialization(error).into())
+}
+
+fn normalize_wire_number(value: &AttributeValue) -> AttributeValue {
+    match value {
+        AttributeValue::N(number) => AttributeValue::N(expand_scientific_number(number)),
+        AttributeValue::NS(values) => AttributeValue::NS(
+            values
+                .iter()
+                .map(|value| expand_scientific_number(value))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn expand_scientific_number(value: &str) -> String {
+    let Some((mantissa, exponent)) = value.split_once(['e', 'E']) else {
+        return value.to_string();
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return value.to_string();
+    };
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.trim_start_matches(['+', '-']);
+    let mut digits = String::new();
+    let mut fractional_digits = 0i32;
+    let mut after_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                if after_decimal {
+                    fractional_digits += 1;
+                }
+            }
+            '.' if !after_decimal => after_decimal = true,
+            _ => return value.to_string(),
+        }
+    }
+    if digits.is_empty() {
+        return value.to_string();
+    }
+
+    let decimal_position = digits.len() as i32 - fractional_digits + exponent;
+    let expanded = if decimal_position <= 0 {
+        format!(
+            "0.{}{}",
+            "0".repeat(decimal_position.unsigned_abs() as usize),
+            digits
+        )
+    } else if decimal_position as usize >= digits.len() {
+        format!(
+            "{}{}",
+            digits,
+            "0".repeat(decimal_position as usize - digits.len())
+        )
+    } else {
+        let split = decimal_position as usize;
+        let (integer, fractional) = digits.split_at(split);
+        format!("{integer}.{fractional}")
+    };
+
+    if negative && expanded != "0" {
+        format!("-{expanded}")
+    } else {
+        expanded
     }
 }
 
@@ -316,6 +414,7 @@ pub(crate) fn sql_row_to_stored_stable_info(
             .map(|ss| serde_json::from_str(&ss))
             .transpose()
             .map_err(rusqlite_type_err)?,
+        deletion_protection_enabled: row.get("deletion_protection_enabled")?,
     })
 }
 

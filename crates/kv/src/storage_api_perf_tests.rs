@@ -542,7 +542,7 @@ async fn api_update_in_keyspace(
         .update_item(UpdateItemRequest {
             table_name: table,
             key: key_for("write", target).into(),
-            update_expression: "SET payload = :payload, counter = :counter".to_string(),
+            update_expression: Some("SET payload = :payload, counter = :counter".to_string()),
             attribute_updates: None,
             condition_expression: None,
             expression_attribute_names: None,

@@ -1,14 +1,14 @@
 use crate::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest,
     DYNAMODB_STREAM_RECORDS_LIMIT_MAX, DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE,
-    DYNAMODB_STREAM_RECORDS_LIMIT_MIN, DeleteItemRequest, DeleteTableRequest, DescribeTableRequest,
-    GetItemRequest, GetStreamRecordsRequest, KeyAttributes, KeyType, ListTablesRequest,
-    PutItemRequest, QueryRequest, ScanRequest, TableName, TransactGetItemsRequest,
-    TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
+    DYNAMODB_STREAM_RECORDS_LIMIT_MIN, DeleteItemRequest, DeleteTableRequest,
+    DescribeStreamRequest, DescribeTableRequest, GetItemRequest, GetRecordsRequest,
+    GetShardIteratorRequest, GetStreamRecordsRequest, KeyAttributes, KeyType, ListStreamsRequest,
+    ListTablesRequest, PutItemRequest, QueryRequest, ScanRequest, TableName,
+    TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
     dynamodb_limits::{
-        MAX_LIST_TABLES_LIMIT, validate_attribute_name, validate_expression_size,
-        validate_index_name, validate_item, validate_projected_attribute_limit,
-        validate_transaction_request_size,
+        MAX_LIST_TABLES_LIMIT, validate_attribute_name, validate_index_name, validate_item,
+        validate_projected_attribute_limit, validate_transaction_request_size,
     },
     request_expression_validation::{
         validate_expression_attribute_name_keys, validate_expression_attribute_value_keys,
@@ -17,6 +17,16 @@ use crate::{
 };
 
 const LIST_TABLES_FIELDS: &[&str] = &["ExclusiveStartTableName", "Limit"];
+const LIST_STREAMS_FIELDS: &[&str] = &["ExclusiveStartStreamArn", "Limit", "TableName"];
+const DESCRIBE_STREAM_FIELDS: &[&str] =
+    &["ExclusiveStartShardId", "Limit", "ShardFilter", "StreamArn"];
+const GET_SHARD_ITERATOR_FIELDS: &[&str] = &[
+    "SequenceNumber",
+    "ShardId",
+    "ShardIteratorType",
+    "StreamArn",
+];
+const GET_RECORDS_FIELDS: &[&str] = &["Limit", "ShardIterator"];
 const PUT_ITEM_FIELDS: &[&str] = &[
     "TableName",
     "Item",
@@ -67,24 +77,6 @@ const UPDATE_ITEM_FIELDS: &[&str] = &[
     "ReturnItemCollectionMetrics",
     "ReturnValuesOnConditionCheckFailure",
 ];
-const SCAN_FIELDS: &[&str] = &[
-    "TableName",
-    "IndexName",
-    "AttributesToGet",
-    "ConditionalOperator",
-    "ProjectionExpression",
-    "FilterExpression",
-    "ScanFilter",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Limit",
-    "ExclusiveStartKey",
-    "ReturnConsumedCapacity",
-    "TotalSegments",
-    "Segment",
-    "ConsistentRead",
-    "Select",
-];
 const QUERY_FIELDS: &[&str] = &[
     "TableName",
     "IndexName",
@@ -101,6 +93,24 @@ const QUERY_FIELDS: &[&str] = &[
     "ReturnConsumedCapacity",
     "ConsistentRead",
     "ScanIndexForward",
+    "Select",
+];
+const SCAN_FIELDS: &[&str] = &[
+    "TableName",
+    "IndexName",
+    "AttributesToGet",
+    "ConditionalOperator",
+    "ProjectionExpression",
+    "FilterExpression",
+    "ScanFilter",
+    "ExpressionAttributeNames",
+    "ExpressionAttributeValues",
+    "Limit",
+    "ExclusiveStartKey",
+    "ReturnConsumedCapacity",
+    "TotalSegments",
+    "Segment",
+    "ConsistentRead",
     "Select",
 ];
 
@@ -128,7 +138,7 @@ impl DynamoRequestValidate for PutItemRequest {
         if self.item.is_empty() {
             return Err("Item cannot be empty".to_string());
         }
-        validate_item(&self.item, "Item")?;
+        validate_item(&self.item, "Item").map_err(prefixed_number_validation_message)?;
         validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         validate_return_item_collection_metrics(
             self.return_item_collection_metrics.as_deref(),
@@ -139,7 +149,12 @@ impl DynamoRequestValidate for PutItemRequest {
             "returnValuesOnConditionCheckFailure",
             true,
         )?;
-        validate_expression_size(self.condition_expression.as_deref(), "ConditionExpression")?;
+        validate_expression_size_for_label(
+            self.condition_expression.as_deref(),
+            "ConditionExpression",
+            true,
+            false,
+        )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
@@ -155,7 +170,9 @@ impl DynamoRequestValidate for PutItemRequest {
 impl DynamoRequestValidate for GetItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
-        validate_key_not_empty(&self.key)?;
+        if self.key.is_empty() {
+            return Err("The provided key element does not match the schema".to_string());
+        }
         validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), false)?;
         validate_expression_set(
@@ -184,6 +201,12 @@ impl DynamoRequestValidate for DeleteItemRequest {
             "returnValuesOnConditionCheckFailure",
             true,
         )?;
+        validate_expression_size_for_label(
+            self.condition_expression.as_deref(),
+            "ConditionExpression",
+            true,
+            false,
+        )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
@@ -199,7 +222,11 @@ impl DynamoRequestValidate for UpdateItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
         validate_key_not_empty(&self.key)?;
-        if self.update_expression.trim().is_empty() {
+        if self
+            .update_expression
+            .as_ref()
+            .is_some_and(|expression| expression.trim().is_empty())
+        {
             return Err("UpdateExpression cannot be empty".to_string());
         }
         validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), false)?;
@@ -212,14 +239,24 @@ impl DynamoRequestValidate for UpdateItemRequest {
             "returnValuesOnConditionCheckFailure",
             false,
         )?;
-        validate_expression_size(Some(&self.update_expression), "UpdateExpression")?;
-        validate_expression_size(self.condition_expression.as_deref(), "ConditionExpression")?;
+        validate_expression_size_for_label(
+            self.update_expression.as_deref(),
+            "UpdateExpression",
+            true,
+            false,
+        )?;
+        validate_expression_size_for_label(
+            self.condition_expression.as_deref(),
+            "ConditionExpression",
+            true,
+            false,
+        )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
             [
                 (self.condition_expression.as_deref(), "ConditionExpression"),
-                (Some(self.update_expression.as_str()), "UpdateExpression"),
+                (self.update_expression.as_deref(), "UpdateExpression"),
             ],
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
@@ -241,14 +278,23 @@ impl DynamoRequestValidate for QueryRequest {
         {
             return Err("Invalid KeyConditionExpression".to_string());
         }
-        validate_expression_size(
+        validate_expression_size_for_label(
             Some(&self.key_condition_expression),
             "KeyConditionExpression",
+            false,
+            false,
         )?;
-        validate_expression_size(self.filter_expression.as_deref(), "FilterExpression")?;
-        validate_expression_size(
+        validate_expression_size_for_label(
+            self.filter_expression.as_deref(),
+            "FilterExpression",
+            false,
+            false,
+        )?;
+        validate_expression_size_for_label(
             self.projection_expression.as_deref(),
             "ProjectionExpression",
+            false,
+            false,
         )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), false)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), false)?;
@@ -276,14 +322,18 @@ impl DynamoRequestValidate for BatchGetItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         if self.request_items.is_empty() {
-            return Err("RequestItems cannot be empty".to_string());
+            return Err("The requestItems parameter is required for BatchGetItem".to_string());
         }
 
         let mut total_requests = 0;
         for (table_name, keys_and_attributes) in &self.request_items {
             validate_table_name(table_name)?;
             if keys_and_attributes.keys.is_empty() {
-                return Err(format!("Keys for table '{table_name}' cannot be empty"));
+                return Err(format!(
+                    "1 validation error detected: Value at \
+                     'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member \
+                     must have length greater than or equal to 1"
+                ));
             }
 
             if keys_and_attributes.keys.len() > 100 {
@@ -296,11 +346,12 @@ impl DynamoRequestValidate for BatchGetItemRequest {
 
             total_requests += keys_and_attributes.keys.len();
             for key in &keys_and_attributes.keys {
-                validate_key_not_empty(key)?;
+                if key.is_empty() {
+                    return Err("The provided key element does not match the schema".to_string());
+                }
             }
-            validate_expression_size(
+            validate_projection_expression_size(
                 keys_and_attributes.projection_expression.as_deref(),
-                "ProjectionExpression",
             )?;
             validate_expression_attribute_name_keys(
                 keys_and_attributes.expression_attribute_names.as_ref(),
@@ -325,6 +376,59 @@ impl DynamoRequestValidate for BatchGetItemRequest {
     }
 }
 
+fn validate_projection_expression_size(expression: Option<&str>) -> Result<(), String> {
+    if let Some(expression) = expression
+        && expression.len() > crate::MAX_EXPRESSION_BYTES
+    {
+        return Err(
+            "Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size;"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_expression_size_for_label(
+    expression: Option<&str>,
+    label: &str,
+    prefixed: bool,
+    include_actual_size: bool,
+) -> Result<(), String> {
+    let Some(expression) = expression else {
+        return Ok(());
+    };
+    if expression.len() <= crate::MAX_EXPRESSION_BYTES {
+        return Ok(());
+    }
+
+    let mut message =
+        format!("Invalid {label}: Expression size has exceeded the maximum allowed size;");
+    if include_actual_size {
+        message.push_str(&format!(" expression size: {}", expression.len()));
+    }
+    if prefixed {
+        Err(format!("1 validation error detected: {message}"))
+    } else {
+        Err(message)
+    }
+}
+
+fn prefixed_number_validation_message(message: String) -> String {
+    if message == "The parameter cannot be converted to a numeric value" {
+        return "1 validation error detected: The parameter cannot be converted to a numeric \
+                value: "
+            .to_string();
+    }
+    if message == "Attempting to store more than 38 significant digits in a Number"
+        || message
+            == "Number underflow. Attempting to store a number with magnitude smaller than \
+                supported range"
+    {
+        return format!("1 validation error detected: {message}");
+    }
+    message
+}
+
 impl DynamoRequestValidate for TransactWriteItemsRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_transact_write_items_request(self)
@@ -343,10 +447,7 @@ impl DynamoRequestValidate for TransactGetItemsRequest {
         for item in &self.transact_items {
             validate_table_name(&item.get.table_name)?;
             validate_key_not_empty(&item.get.key)?;
-            validate_expression_size(
-                item.get.projection_expression.as_deref(),
-                "ProjectionExpression",
-            )?;
+            validate_projection_expression_size(item.get.projection_expression.as_deref())?;
             validate_expression_attribute_name_keys(
                 item.get.expression_attribute_names.as_ref(),
                 false,
@@ -391,7 +492,11 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
         }
 
         if request.table_name.as_ref().len() < 3 || request.table_name.as_ref().len() > 255 {
-            return Err("TableName must be between 3 and 255 characters".to_string());
+            return Err(format!(
+                "1 validation error detected: Value '{}' at 'tableName' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 3",
+                request.table_name
+            ));
         }
 
         if !request
@@ -400,7 +505,11 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
             .chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
         {
-            return Err("TableName contains invalid characters".to_string());
+            return Err(format!(
+                "1 validation error detected: Value '{}' at 'tableName' failed to satisfy \
+                 constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+                request.table_name
+            ));
         }
 
         if request.attribute_definitions.is_empty() {
@@ -619,10 +728,17 @@ impl TryFrom<serde_json::Value> for ScanRequest {
         {
             return Err("Invalid FilterExpression".to_string());
         }
-        validate_expression_size(request.filter_expression.as_deref(), "FilterExpression")?;
-        validate_expression_size(
+        validate_expression_size_for_label(
+            request.filter_expression.as_deref(),
+            "FilterExpression",
+            false,
+            false,
+        )?;
+        validate_expression_size_for_label(
             request.projection_expression.as_deref(),
             "ProjectionExpression",
+            false,
+            false,
         )?;
         validate_expression_attribute_name_keys(
             request.expression_attribute_names.as_ref(),
@@ -673,6 +789,131 @@ impl TryFrom<serde_json::Value> for GetStreamRecordsRequest {
             return Err("TableName cannot be empty".to_string());
         }
 
+        if let Some(limit) = request.limit
+            && !(DYNAMODB_STREAM_RECORDS_LIMIT_MIN..=DYNAMODB_STREAM_RECORDS_LIMIT_MAX)
+                .contains(&limit)
+        {
+            return Err(DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE.to_string());
+        }
+
+        Ok(request)
+    }
+}
+
+impl TryFrom<serde_json::Value> for ListStreamsRequest {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        reject_unknown_fields(&value, LIST_STREAMS_FIELDS)?;
+        let request: ListStreamsRequest =
+            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+
+        if let Some(table_name) = &request.table_name {
+            validate_table_name(table_name)?;
+        }
+        if let Some(limit) = request.limit
+            && !(1..=100).contains(&limit)
+        {
+            return Err("Limit must be between 1 and 100".to_string());
+        }
+        if request
+            .exclusive_start_stream_arn
+            .as_ref()
+            .is_some_and(|arn| arn.is_empty())
+        {
+            return Err("ExclusiveStartStreamArn cannot be empty".to_string());
+        }
+
+        Ok(request)
+    }
+}
+
+impl TryFrom<serde_json::Value> for DescribeStreamRequest {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        reject_unknown_fields(&value, DESCRIBE_STREAM_FIELDS)?;
+        let request: DescribeStreamRequest =
+            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+
+        if request.stream_arn.is_empty() {
+            return Err("StreamArn cannot be empty".to_string());
+        }
+        if let Some(limit) = request.limit
+            && !(1..=100).contains(&limit)
+        {
+            return Err("Limit must be between 1 and 100".to_string());
+        }
+        if request
+            .exclusive_start_shard_id
+            .as_ref()
+            .is_some_and(|shard_id| shard_id.is_empty())
+        {
+            return Err("ExclusiveStartShardId cannot be empty".to_string());
+        }
+
+        Ok(request)
+    }
+}
+
+impl TryFrom<serde_json::Value> for GetShardIteratorRequest {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        reject_unknown_fields(&value, GET_SHARD_ITERATOR_FIELDS)?;
+        let request: GetShardIteratorRequest =
+            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+
+        if request.stream_arn.is_empty() {
+            return Err("StreamArn cannot be empty".to_string());
+        }
+        if request.shard_id.is_empty() {
+            return Err("ShardId cannot be empty".to_string());
+        }
+        match request.shard_iterator_type.as_str() {
+            "TRIM_HORIZON" | "LATEST" => {
+                if request.sequence_number.is_some() {
+                    return Err("SequenceNumber is only valid with AT_SEQUENCE_NUMBER or \
+                                AFTER_SEQUENCE_NUMBER"
+                        .to_string());
+                }
+            }
+            "AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER" => {
+                if request
+                    .sequence_number
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+                {
+                    return Err("SequenceNumber is required for AT_SEQUENCE_NUMBER and \
+                                AFTER_SEQUENCE_NUMBER"
+                        .to_string());
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Value '{}' at 'shardIteratorType' failed to satisfy constraint: Member must \
+                     satisfy enum value set: [TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, \
+                     AFTER_SEQUENCE_NUMBER]",
+                    request.shard_iterator_type
+                ));
+            }
+        }
+
+        Ok(request)
+    }
+}
+
+impl TryFrom<serde_json::Value> for GetRecordsRequest {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        reject_unknown_fields(&value, GET_RECORDS_FIELDS)?;
+        let request: GetRecordsRequest =
+            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+
+        if request.shard_iterator.is_empty() {
+            return Err("ShardIterator cannot be empty".to_string());
+        }
         if let Some(limit) = request.limit
             && !(DYNAMODB_STREAM_RECORDS_LIMIT_MIN..=DYNAMODB_STREAM_RECORDS_LIMIT_MAX)
                 .contains(&limit)
@@ -838,7 +1079,12 @@ fn validate_transact_write_items_request(
             )?;
             validate_table_name(&put.table_name)?;
             validate_item(&put.item, "TransactItems Put Item")?;
-            validate_expression_size(put.condition_expression.as_deref(), "ConditionExpression")?;
+            validate_expression_size_for_label(
+                put.condition_expression.as_deref(),
+                "ConditionExpression",
+                false,
+                true,
+            )?;
             validate_expression_attribute_name_keys(
                 put.expression_attribute_names.as_ref(),
                 false,
@@ -862,10 +1108,17 @@ fn validate_transact_write_items_request(
             )?;
             validate_table_name(&update.table_name)?;
             validate_key_not_empty(&update.key)?;
-            validate_expression_size(Some(&update.update_expression), "UpdateExpression")?;
-            validate_expression_size(
+            validate_expression_size_for_label(
+                Some(&update.update_expression),
+                "UpdateExpression",
+                false,
+                false,
+            )?;
+            validate_expression_size_for_label(
                 update.condition_expression.as_deref(),
                 "ConditionExpression",
+                false,
+                true,
             )?;
             validate_expression_attribute_name_keys(
                 update.expression_attribute_names.as_ref(),
@@ -874,6 +1127,9 @@ fn validate_transact_write_items_request(
             validate_expression_attribute_value_keys(
                 update.expression_attribute_values.as_ref(),
                 false,
+            )?;
+            validate_transact_expression_attribute_value_payloads(
+                update.expression_attribute_values.as_ref(),
             )?;
             validate_expression_set(
                 [
@@ -896,9 +1152,11 @@ fn validate_transact_write_items_request(
             )?;
             validate_table_name(&delete.table_name)?;
             validate_key_not_empty(&delete.key)?;
-            validate_expression_size(
+            validate_expression_size_for_label(
                 delete.condition_expression.as_deref(),
                 "ConditionExpression",
+                false,
+                true,
             )?;
             validate_expression_attribute_name_keys(
                 delete.expression_attribute_names.as_ref(),
@@ -926,7 +1184,12 @@ fn validate_transact_write_items_request(
             )?;
             validate_table_name(&check.table_name)?;
             validate_key_not_empty(&check.key)?;
-            validate_expression_size(Some(&check.condition_expression), "ConditionExpression")?;
+            validate_expression_size_for_label(
+                Some(&check.condition_expression),
+                "ConditionExpression",
+                false,
+                true,
+            )?;
             validate_expression_attribute_name_keys(
                 check.expression_attribute_names.as_ref(),
                 false,
@@ -948,6 +1211,47 @@ fn validate_transact_write_items_request(
     }
 
     Ok(())
+}
+
+fn validate_transact_expression_attribute_value_payloads(
+    values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
+) -> Result<(), String> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    for (key, value) in values {
+        if let Err(message) =
+            crate::validate_attribute_value_for_write(value, "ExpressionAttributeValues")
+        {
+            return Err(transact_expression_attribute_value_error(
+                key, value, &message,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn transact_expression_attribute_value_error(
+    key: &str,
+    value: &crate::AttributeValue,
+    message: &str,
+) -> String {
+    let message = match value {
+        crate::AttributeValue::NS(_)
+            if message.ends_with("Input collection contains duplicates.") =>
+        {
+            "Input collection contains duplicates".to_string()
+        }
+        crate::AttributeValue::SS(values) if message.contains("contains duplicates") => {
+            format!(
+                "One or more parameter values were invalid: Input collection [{}] contains \
+                 duplicates.",
+                values.join(", ")
+            )
+        }
+        _ => message.to_string(),
+    };
+    format!("ExpressionAttributeValues contains invalid value: {message} for key {key}")
 }
 
 fn validate_return_consumed_capacity(value: Option<&str>, prefixed: bool) -> Result<(), String> {

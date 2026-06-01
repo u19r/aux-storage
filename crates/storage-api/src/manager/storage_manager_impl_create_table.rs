@@ -73,6 +73,7 @@ impl StorageApiManagerImpl {
                 stream_specification: table_info.stream_specification,
                 latest_stream_arn,
                 latest_stream_label,
+                deletion_protection_enabled: table_info.deletion_protection_enabled,
             },
         };
 

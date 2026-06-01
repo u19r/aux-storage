@@ -24,11 +24,11 @@ pub enum Condition {
     },
     Equal {
         field: String,
-        value: String,
+        value: storage_types::AttributeValue,
     },
     NotEqual {
         field: String,
-        value: String,
+        value: storage_types::AttributeValue,
     },
     Between {
         field: String,
@@ -37,7 +37,15 @@ pub enum Condition {
     },
     In {
         field: String,
-        values: Vec<String>,
+        values: Vec<storage_types::AttributeValue>,
+    },
+    ValueEqual {
+        left: storage_types::AttributeValue,
+        right: storage_types::AttributeValue,
+    },
+    ValueNotEqual {
+        left: storage_types::AttributeValue,
+        right: storage_types::AttributeValue,
     },
     Contains {
         field: String,

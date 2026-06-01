@@ -7,15 +7,23 @@ use crate::update_logic::{
     BoundUpdateOperation, SetFunction, UpdateOperation, apply_update_operations,
     before_update_item, parse_update_expression, resolve_attribute_value,
     return_values_need_old_item, return_values_need_updated_fields,
-    split_operations_preserving_functions, value::BoundUpdateOperand,
+    split_operations_preserving_functions, update_item_response, updated_attributes_for_response,
+    value::BoundUpdateOperand,
 };
 
 const UPDATE_CLONE_AUDIT_ITERATIONS: usize = 512;
 const UPDATE_EXPRESSION_AUDIT_ITERATIONS: usize = 1024;
 
 #[test]
-fn given_return_values_do_not_need_old_when_applying_update_then_full_item_clone_is_skipped_tests()
-{
+fn update_logic_allocation_profile_tests() {
+    assert_return_values_do_not_need_old_when_applying_update_then_full_item_clone_is_skipped();
+    assert_updated_old_response_when_applying_update_then_only_projected_old_fields_are_cloned();
+    assert_update_expression_binding_and_condition_cache_allocation_profile();
+    assert_response_field_collection_allocation_profile();
+    assert_arithmetic_bound_operand_construction_allocation_profile();
+}
+
+fn assert_return_values_do_not_need_old_when_applying_update_then_full_item_clone_is_skipped() {
     let item = clone_audit_item();
     let operations = clone_audit_operations();
 
@@ -36,6 +44,30 @@ fn given_return_values_do_not_need_old_when_applying_update_then_full_item_clone
         optimized.allocated_bytes < baseline.allocated_bytes,
         "expected conditional old-item preservation to allocate fewer bytes, baseline={} \
          optimized={}",
+        baseline.allocated_bytes,
+        optimized.allocated_bytes
+    );
+}
+
+fn assert_updated_old_response_when_applying_update_then_only_projected_old_fields_are_cloned() {
+    let item = clone_audit_item();
+    let operations = clone_audit_operations();
+
+    let baseline = measure_updated_old_full_item_clone(&item, &operations);
+    let optimized = measure_updated_old_projected_fields(&item, &operations);
+
+    alloc_counter::emit_report(&baseline);
+    alloc_counter::emit_report(&optimized);
+
+    assert!(
+        optimized.allocation_count < baseline.allocation_count,
+        "expected updated-old projection to allocate less often, baseline={} optimized={}",
+        baseline.allocation_count,
+        optimized.allocation_count
+    );
+    assert!(
+        optimized.allocated_bytes < baseline.allocated_bytes,
+        "expected updated-old projection to allocate fewer bytes, baseline={} optimized={}",
         baseline.allocated_bytes,
         optimized.allocated_bytes
     );
@@ -83,8 +115,57 @@ fn measure_preserve_old_only_if_needed(
     guard.finish()
 }
 
-#[test]
-fn update_expression_binding_and_condition_cache_allocation_profile_tests() {
+fn measure_updated_old_full_item_clone(
+    item: &HashMap<String, AttributeValue>,
+    operations: &[UpdateOperation],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "update_apply_updated_old_full_item_clone_baseline",
+        file!(),
+        line!(),
+        Some("updated_old_full_clone"),
+    );
+    for _ in 0..UPDATE_CLONE_AUDIT_ITERATIONS {
+        let item_to_update = item.clone();
+        let old_for_response = Some(item_to_update.clone());
+        let updated =
+            apply_update_operations(item_to_update, operations).expect("apply update operations");
+        let response = update_item_response(
+            operations,
+            old_for_response,
+            Some(updated),
+            Some(&ReturnValuesOldNewUpdated::UpdatedOld),
+        )
+        .expect("build response");
+        std::hint::black_box(response.attributes);
+    }
+    guard.finish()
+}
+
+fn measure_updated_old_projected_fields(
+    item: &HashMap<String, AttributeValue>,
+    operations: &[UpdateOperation],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "update_apply_updated_old_projected_fields",
+        file!(),
+        line!(),
+        Some("updated_old_projected"),
+    );
+    for _ in 0..UPDATE_CLONE_AUDIT_ITERATIONS {
+        let item_to_update = item.clone();
+        let attributes = updated_attributes_for_response(operations, &item_to_update);
+        let old_for_response = (!attributes.is_empty()).then_some(attributes);
+        let updated =
+            apply_update_operations(item_to_update, operations).expect("apply update operations");
+        std::hint::black_box((old_for_response, updated.len()));
+    }
+    guard.finish()
+}
+
+fn assert_update_expression_binding_and_condition_cache_allocation_profile() {
     let names = HashMap::from([
         ("#payload".to_string(), "payload_0".to_string()),
         ("#counter".to_string(), "counter".to_string()),
@@ -130,8 +211,7 @@ fn update_expression_binding_and_condition_cache_allocation_profile_tests() {
     assert!(report.allocation_count > 0);
 }
 
-#[test]
-fn response_field_collection_allocation_profile_tests() {
+fn assert_response_field_collection_allocation_profile() {
     let operations = bound_response_field_operations();
     let legacy_default = measure_legacy_response_field_string_collection(&operations, false);
     let optimized_default = measure_optimized_response_field_collection(&operations, false);
@@ -149,8 +229,7 @@ fn response_field_collection_allocation_profile_tests() {
     assert!(optimized_updated.allocated_bytes < legacy_updated.allocated_bytes);
 }
 
-#[test]
-fn arithmetic_bound_operand_construction_allocation_profile_tests() {
+fn assert_arithmetic_bound_operand_construction_allocation_profile() {
     let legacy = measure_legacy_arithmetic_bound_operand_construction();
     let optimized = measure_optimized_arithmetic_bound_operand_construction();
 
@@ -196,10 +275,8 @@ fn measure_optimized_arithmetic_bound_operand_construction()
     for _ in 0..UPDATE_EXPRESSION_AUDIT_ITERATIONS {
         let operation = BoundUpdateOperation::SetArithmetic {
             field: Arc::from("counter"),
-            operands: Box::new((
-                BoundUpdateOperand::Path(Arc::from("counter")),
-                BoundUpdateOperand::Path(Arc::from("increment")),
-            )),
+            lhs: BoundUpdateOperand::Path(Arc::from("counter")),
+            rhs: BoundUpdateOperand::Path(Arc::from("increment")),
             operator: crate::update_logic::ArithmeticOperator::Add,
         };
         std::hint::black_box(operation);
@@ -1056,6 +1133,24 @@ fn apply_delete_from_string_set() {
 }
 
 #[test]
+fn apply_delete_removes_attribute_when_string_set_becomes_empty() {
+    let mut item = HashMap::new();
+    item.insert(
+        "tags".to_string(),
+        AttributeValue::SS(vec!["remove_me".to_string()]),
+    );
+
+    let operations = vec![UpdateOperation::Delete {
+        field: Arc::from("tags"),
+        value: AttributeValue::SS(vec!["remove_me".to_string()]),
+    }];
+
+    let updated = apply_update_operations(item, &operations).unwrap();
+
+    assert!(!updated.contains_key("tags"));
+}
+
+#[test]
 fn apply_delete_from_number_set() {
     let mut item = HashMap::new();
     item.insert(
@@ -1129,7 +1224,7 @@ fn apply_delete_on_non_set_type_fails() {
         result
             .unwrap_err()
             .to_string()
-            .contains("DELETE operation not supported")
+            .contains("An operand in the update expression has an incorrect data type")
     );
 }
 
@@ -1407,7 +1502,7 @@ fn apply_add_rejects_incompatible_existing_type() {
     assert!(
         error
             .to_string()
-            .contains("ADD operation type mismatch for field field")
+            .contains("An operand in the update expression has an incorrect data type")
     );
 }
 
@@ -1700,6 +1795,32 @@ fn apply_set_nested_path_rejects_absent_or_wrong_type_parents_like_dynamodb() {
             "The document path provided in the update expression is invalid for update"
         );
     }
+}
+
+#[test]
+fn apply_remove_nested_path_rejects_absent_intermediate_parent_like_dynamodb() {
+    let item = HashMap::from([(
+        "m".to_string(),
+        AttributeValue::M(HashMap::from([(
+            "child".to_string(),
+            AttributeValue::S("old".to_string()),
+        )])),
+    )]);
+
+    let missing_leaf =
+        parse_update_expression("REMOVE m.absent", None, None).expect("missing leaf parses");
+    assert_eq!(
+        apply_update_operations(item.clone(), &missing_leaf).expect("missing leaf is a no-op"),
+        item
+    );
+
+    let missing_parent = parse_update_expression("REMOVE m.absent.child", None, None)
+        .expect("missing parent parses");
+    let error = apply_update_operations(item, &missing_parent).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "The document path provided in the update expression is invalid for update"
+    );
 }
 
 #[test]
@@ -2218,4 +2339,25 @@ fn operation_splitter_preserves_function_arguments() {
     assert_eq!(result, Vec::<String>::new());
     let result = split_operations_preserving_functions("SET field = :value");
     assert_eq!(result, vec!["SET field = :value"]);
+}
+
+#[test]
+fn update_expression_sections_accept_case_and_whitespace_variants() {
+    let mut names = HashMap::new();
+    names.insert("#result".to_string(), "result".to_string());
+    names.insert("#old".to_string(), "old".to_string());
+
+    let mut values = HashMap::new();
+    values.insert(":v".to_string(), AttributeValue::S("written".to_string()));
+
+    let operations = parse_update_expression(
+        "set #result = :v\nREMOVE\t#old",
+        Some(&names),
+        Some(&values),
+    )
+    .expect("update expression should accept lowercase sections and newline/tab separators");
+
+    assert_eq!(operations.len(), 2);
+    assert!(matches!(operations[0], UpdateOperation::Set { .. }));
+    assert!(matches!(operations[1], UpdateOperation::Remove { .. }));
 }

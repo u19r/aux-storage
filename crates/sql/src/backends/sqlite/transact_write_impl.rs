@@ -1,7 +1,10 @@
+use std::{collections::HashMap, sync::LazyLock};
+
 use storage_condition::{evaluate_condition, parse_condition_expression};
 use storage_provider::before_update_item;
 use storage_types::{
-    GuardedTransactWriteItemsRequest, StorageError, StorageResult, TransactWriteItemsEncodeRequest,
+    AttributeValue, GuardedTransactWriteItemsRequest, StorageEnum, StorageError, StorageResult,
+    TransactWriteItemsEncodeRequest, context::WrappedError as _,
 };
 use tracing::warn;
 
@@ -10,13 +13,21 @@ use crate::{
     provider_core::transaction::{
         TransactionKeyPreflight, all_old, conditional_check_failed_reason,
         preflight_transact_item_key_with_table_info, transact_item_table_name,
-        transaction_canceled_for_item_error_with_len, transaction_canceled_for_preflights,
-        transaction_canceled_for_reason, validate_no_duplicate_transact_item_keys,
+        transaction_canceled_for_indexed_reasons, transaction_canceled_for_item_error_with_len,
+        transaction_canceled_for_preflights, transaction_canceled_for_reason,
+        transaction_cancellation_reason_at, validate_no_duplicate_transact_item_keys,
         validate_transact_key, validate_transact_put_item_key,
     },
     transaction_manager::with_transaction,
     utils::SqliteConn,
 };
+
+pub(crate) fn condition_item_ref(
+    old_item: Option<&HashMap<String, AttributeValue>>,
+) -> &HashMap<String, AttributeValue> {
+    static EMPTY_ITEM: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
+    old_item.unwrap_or(&EMPTY_ITEM)
+}
 
 impl SQLiteStorageProvider {
     fn execute_transact_put_encode(
@@ -53,22 +64,21 @@ impl SQLiteStorageProvider {
             None
         };
 
-        if let Some(condition) = &condition {
-            let condition_item = old_item.clone().unwrap_or_default();
-            if !evaluate_condition(&condition_item, condition) {
-                return Err(transaction_canceled_for_reason(
-                    item_index,
-                    conditional_check_failed_reason(
-                        all_old(
-                            put_request
-                                .return_values_on_condition_check_failure
-                                .as_ref(),
-                        )
-                        .then_some(old_item.as_ref())
-                        .flatten(),
-                    )?,
-                ));
-            }
+        if let Some(condition) = &condition
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
+        {
+            return Err(transaction_canceled_for_reason(
+                item_index,
+                conditional_check_failed_reason(
+                    all_old(
+                        put_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    )
+                    .then_some(old_item.as_ref())
+                    .flatten(),
+                )?,
+            ));
         }
 
         Self::do_put_wire_item(
@@ -116,22 +126,21 @@ impl SQLiteStorageProvider {
             None
         };
 
-        if let Some(condition) = &condition {
-            let condition_item = old_item.clone().unwrap_or_default();
-            if !evaluate_condition(&condition_item, condition) {
-                return Err(transaction_canceled_for_reason(
-                    item_index,
-                    conditional_check_failed_reason(
-                        all_old(
-                            put_request
-                                .return_values_on_condition_check_failure
-                                .as_ref(),
-                        )
-                        .then_some(old_item.as_ref())
-                        .flatten(),
-                    )?,
-                ));
-            }
+        if let Some(condition) = &condition
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
+        {
+            return Err(transaction_canceled_for_reason(
+                item_index,
+                conditional_check_failed_reason(
+                    all_old(
+                        put_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    )
+                    .then_some(old_item.as_ref())
+                    .flatten(),
+                )?,
+            ));
         }
 
         Self::do_put_item(
@@ -148,6 +157,7 @@ impl SQLiteStorageProvider {
     fn execute_transact_update(
         sqlite: &SqliteConn<'_>,
         update_request: &storage_types::TransactUpdateRequest,
+        item_index: usize,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<()> {
         let (operations, condition) = before_update_item(
@@ -156,16 +166,39 @@ impl SQLiteStorageProvider {
             update_request.expression_attribute_names.as_ref(),
             update_request.expression_attribute_values.as_ref(),
         )?;
+        let old_item = update_request
+            .condition_expression
+            .is_some()
+            .then(|| Self::do_get_item(&update_request.table_name, &update_request.key, sqlite))
+            .transpose()?
+            .flatten();
 
-        Self::do_update_item(
+        let result = Self::do_update_item(
             &operations,
             &condition,
             &update_request.table_name,
             &update_request.key,
             sqlite,
             immediate_gsi_consistency,
-        )
-        .map(|_| ())
+        );
+        if let Err(error) = result {
+            if matches!(error.to_enum(), StorageEnum::ConditionalCheckFailed) {
+                return Err(transaction_canceled_for_reason(
+                    item_index,
+                    conditional_check_failed_reason(
+                        all_old(
+                            update_request
+                                .return_values_on_condition_check_failure
+                                .as_ref(),
+                        )
+                        .then_some(old_item.as_ref())
+                        .flatten(),
+                    )?,
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn execute_transact_delete(
@@ -202,22 +235,21 @@ impl SQLiteStorageProvider {
             None
         };
 
-        if let Some(condition) = &condition {
-            let condition_item = old_item.clone().unwrap_or_default();
-            if !evaluate_condition(&condition_item, condition) {
-                return Err(transaction_canceled_for_reason(
-                    item_index,
-                    conditional_check_failed_reason(
-                        all_old(
-                            delete_request
-                                .return_values_on_condition_check_failure
-                                .as_ref(),
-                        )
-                        .then_some(old_item.as_ref())
-                        .flatten(),
-                    )?,
-                ));
-            }
+        if let Some(condition) = &condition
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
+        {
+            return Err(transaction_canceled_for_reason(
+                item_index,
+                conditional_check_failed_reason(
+                    all_old(
+                        delete_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    )
+                    .then_some(old_item.as_ref())
+                    .flatten(),
+                )?,
+            ));
         }
 
         Self::do_delete_item(
@@ -249,7 +281,6 @@ impl SQLiteStorageProvider {
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
         validate_transact_key(&table_info, key)?;
         let old_item = Self::do_get_item(table_name, key, sqlite)?;
-        let item = old_item.clone().unwrap_or_default();
 
         let condition = parse_condition_expression(
             condition_expression,
@@ -261,7 +292,7 @@ impl SQLiteStorageProvider {
             StorageError::validation("Invalid condition expression")
         })?;
 
-        if !evaluate_condition(&item, &condition) {
+        if !evaluate_condition(condition_item_ref(old_item.as_ref()), &condition) {
             return Err(transaction_canceled_for_reason(
                 item_index,
                 conditional_check_failed_reason(
@@ -305,6 +336,7 @@ impl SQLiteStorageProvider {
             validate_no_duplicate_transact_item_keys(&preflights)?;
 
             let item_count = request.transact_items.len();
+            let mut cancellation_reasons = vec![None; item_count];
             for (index, item) in request.transact_items.iter().enumerate() {
                 let result = match item {
                     storage_types::TransactWriteItem {
@@ -326,6 +358,7 @@ impl SQLiteStorageProvider {
                     } => Self::execute_transact_update(
                         sqlite,
                         update_request,
+                        index,
                         immediate_gsi_consistency,
                     ),
                     storage_types::TransactWriteItem {
@@ -357,10 +390,14 @@ impl SQLiteStorageProvider {
                     }
                 };
                 if let Err(error) = result {
-                    return Err(transaction_canceled_for_item_error_with_len(
-                        index, item_count, error,
-                    ));
+                    let Some(reason) = transaction_cancellation_reason_at(&error, index) else {
+                        return Err(error);
+                    };
+                    cancellation_reasons[index] = Some(reason);
                 }
+            }
+            if let Some(error) = transaction_canceled_for_indexed_reasons(cancellation_reasons) {
+                return Err(error);
             }
             Ok(())
         })
@@ -429,6 +466,7 @@ impl SQLiteStorageProvider {
                     } => Self::execute_transact_update(
                         sqlite,
                         update_request,
+                        index,
                         immediate_gsi_consistency,
                     ),
                     storage_types::TransactWriteItem {
@@ -520,6 +558,7 @@ impl SQLiteStorageProvider {
                         Self::execute_transact_update(
                             sqlite,
                             update_request,
+                            index,
                             immediate_gsi_consistency,
                         )?;
                     }

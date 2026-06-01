@@ -1,3 +1,9 @@
+use std::borrow::Cow;
+
+use storage_types::{
+    attribute_map_numbers_need_write_normalization, normalize_attribute_map_numbers_for_write,
+};
+
 use crate::{
     storage_ops::imports::{
         AttributeValue, BatchItem, HashMap, IndexName, ItemKey, KeyAttributes, KeySchemaElement,
@@ -6,6 +12,18 @@ use crate::{
     },
     ttl::{TtlIndexMutation, plan_ttl_index_mutations},
 };
+
+fn normalized_attribute_map_for_write(
+    item: &HashMap<String, AttributeValue>,
+) -> Cow<'_, HashMap<String, AttributeValue>> {
+    if !attribute_map_numbers_need_write_normalization(item) {
+        return Cow::Borrowed(item);
+    }
+
+    let mut normalized = item.clone();
+    normalize_attribute_map_numbers_for_write(&mut normalized);
+    Cow::Owned(normalized)
+}
 
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
     pub(super) fn ttl_index_mutations_for_items(
@@ -42,6 +60,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 "Item must have at least one attribute",
             ));
         }
+        let item = normalized_attribute_map_for_write(item);
+        let item = item.as_ref();
 
         let item_key =
             ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, item)?
@@ -186,6 +206,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         };
 
         StreamRecord {
+            cursor: None,
             keys,
             sequence_number,
             new_image,

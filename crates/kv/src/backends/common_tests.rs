@@ -1,10 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use storage_common::ttl::{self, TtlConfigRecord};
+use storage_condition::parse_condition_expression;
 use storage_provider::UpdateOperation;
 use storage_types::{
-    AttributeDefinition, AttributeValue, KeyAttributeType, KeySchemaElement, KeyType,
+    AttributeDefinition, AttributeValue, KeyAttributeType, KeySchemaElement, KeyType, StorageEnum,
     StoredTableInfo, TableName, TableStatus, TimeToLiveStatus, TimestampMillis,
+    context::WrappedError as _,
 };
 
 use crate::{
@@ -72,6 +74,7 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
                 value: new_ttl,
             }]),
             condition: None,
+            return_values_on_condition_check_failure: None,
             replication: None,
             preserve_old_item: false,
             transaction_validation: false,
@@ -93,6 +96,200 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
         &plan.mutations[2],
         KvMutation::Put { key, value } if key == &new_ttl_key && value.is_empty()
     ));
+}
+
+#[test]
+fn plan_table_delete_accepts_equivalent_scientific_number_key() {
+    let table_info = number_table_info("number_delete_plan");
+    let current = HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::N(
+                "0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+            ),
+        ),
+        ("sk".to_string(), AttributeValue::N("1".to_string())),
+    ]);
+    let current_bytes =
+        storage_types::storage_serde::to_bytes(&current).expect("serialize current item");
+
+    let plan = plan_table_write(
+        &[TransactWriteTableOperation::Delete {
+            table_info,
+            key: HashMap::from([
+                ("pk".to_string(), AttributeValue::N("1E-130".to_string())),
+                ("sk".to_string(), AttributeValue::N("1".to_string())),
+            ])
+            .into(),
+            condition: None,
+            return_values_on_condition_check_failure: None,
+            replication: None,
+            ttl_config: None,
+        }],
+        vec![Some(current_bytes)],
+        &[None],
+        false,
+    )
+    .expect("equivalent number key should match stored item");
+
+    assert_eq!(plan.mutations.len(), 1);
+    assert!(matches!(plan.mutations[0], KvMutation::Delete { .. }));
+}
+
+#[test]
+fn plan_table_write_collects_cancellation_reasons_after_first_failure() {
+    let table_info = ttl_table_info("transaction_reason_plan");
+    let values = HashMap::from([(
+        ":closed".to_string(),
+        AttributeValue::S("closed".to_string()),
+    )]);
+    let condition = parse_condition_expression("status = :closed", None, Some(&values))
+        .expect("condition expression");
+    let current_one = item_with_status("pk", "sk-1", "open");
+    let current_two = item_with_status("pk", "sk-2", "open");
+
+    let error = plan_table_write(
+        &[
+            TransactWriteTableOperation::Check {
+                table_info: table_info.clone(),
+                key: key_attrs("pk", "sk-1").into(),
+                condition: condition.clone(),
+                return_values_on_condition_check_failure: None,
+            },
+            TransactWriteTableOperation::Check {
+                table_info,
+                key: key_attrs("pk", "sk-2").into(),
+                condition,
+                return_values_on_condition_check_failure: None,
+            },
+        ],
+        vec![
+            Some(storage_types::storage_serde::to_bytes(&current_one).expect("item one")),
+            Some(storage_types::storage_serde::to_bytes(&current_two).expect("item two")),
+        ],
+        &[None, None],
+        false,
+    );
+    let Err(error) = error else {
+        panic!("transaction should cancel");
+    };
+
+    let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        panic!("expected transaction cancellation, got {error:?}");
+    };
+    assert_eq!(
+        reasons,
+        &vec![
+            "ConditionalCheckFailed".to_string(),
+            "ConditionalCheckFailed".to_string()
+        ]
+    );
+}
+
+#[test]
+fn plan_table_write_rejects_duplicate_transaction_item_targets() {
+    let table_info = ttl_table_info("duplicate_transaction_targets_plan");
+    let result = plan_table_write(
+        &[
+            TransactWriteTableOperation::Put {
+                table_info: table_info.clone(),
+                item: item_with_status("pk", "sk", "open"),
+                condition: None,
+                return_values_on_condition_check_failure: None,
+                replication: None,
+                ttl_config: None,
+            },
+            TransactWriteTableOperation::Delete {
+                table_info,
+                key: key_attrs("pk", "sk").into(),
+                condition: None,
+                return_values_on_condition_check_failure: None,
+                replication: None,
+                ttl_config: None,
+            },
+        ],
+        vec![None, None],
+        &[None, None],
+        false,
+    );
+    let Err(error) = result else {
+        panic!("duplicate transaction item targets should fail preflight");
+    };
+
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        panic!("expected validation error, got {error:?}");
+    };
+    assert_eq!(
+        message,
+        "Transaction request cannot include multiple operations on one item"
+    );
+}
+
+#[test]
+fn plan_table_write_rejects_invalid_number_key_before_backend_encoding() {
+    let table_info = number_table_info("invalid_transaction_number_key_plan");
+    let result = plan_table_write(
+        &[TransactWriteTableOperation::Delete {
+            table_info,
+            key: HashMap::from([
+                (
+                    "pk".to_string(),
+                    AttributeValue::N("not-a-number".to_string()),
+                ),
+                ("sk".to_string(), AttributeValue::N("1".to_string())),
+            ])
+            .into(),
+            condition: None,
+            return_values_on_condition_check_failure: None,
+            replication: None,
+            ttl_config: None,
+        }],
+        vec![None],
+        &[None],
+        false,
+    );
+    let Err(error) = result else {
+        panic!("invalid number key should fail before backend key encoding");
+    };
+
+    assert!(
+        !matches!(error.to_enum(), StorageEnum::TransactionCanceled { .. }),
+        "invalid transaction key should not be wrapped as cancellation"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("The parameter cannot be converted to a numeric value"),
+        "{message}"
+    );
+}
+
+#[test]
+fn plan_table_delete_condition_on_missing_item_does_not_see_synthetic_key() {
+    let table_info = ttl_table_info("delete_missing_condition_plan");
+    let condition =
+        parse_condition_expression("attribute_exists(pk)", None, None).expect("condition");
+    let result = plan_table_write(
+        &[TransactWriteTableOperation::Delete {
+            table_info,
+            key: key_attrs("pk", "sk-missing").into(),
+            condition: Some(condition),
+            return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
+            replication: None,
+            ttl_config: None,
+        }],
+        vec![None],
+        &[None],
+        false,
+    );
+    let Err(error) = result else {
+        panic!("delete condition on missing item should fail");
+    };
+
+    let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        panic!("expected transaction cancellation, got {error:?}");
+    };
+    assert_eq!(reasons, &vec!["ConditionalCheckFailed".to_string()]);
 }
 
 fn ttl_config(table_name: &TableName) -> TtlConfigRecord {
@@ -117,12 +314,37 @@ fn ttl_table_info(name: &str) -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
+    }
+}
+
+fn number_table_info(name: &str) -> StoredTableInfo {
+    StoredTableInfo {
+        table_name: TableName::new(name),
+        table_status: TableStatus::Active,
+        created_at: TimestampMillis::now(),
+        attribute_definitions: vec![
+            attr("pk", KeyAttributeType::N),
+            attr("sk", KeyAttributeType::N),
+        ],
+        key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        global_secondary_indexes: None,
+        table_size_bytes: 0,
+        item_count: 0,
+        stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 
 fn item_with_ttl(pk: &str, sk: &str, ttl_value: &str) -> HashMap<String, AttributeValue> {
     let mut item = key_attrs(pk, sk);
     item.insert("ttl".to_string(), AttributeValue::N(ttl_value.to_string()));
+    item
+}
+
+fn item_with_status(pk: &str, sk: &str, status: &str) -> HashMap<String, AttributeValue> {
+    let mut item = key_attrs(pk, sk);
+    item.insert("status".to_string(), AttributeValue::S(status.to_string()));
     item
 }
 

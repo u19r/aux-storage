@@ -35,7 +35,8 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
     global_secondary_indexes TEXT,
     table_size_bytes INTEGER DEFAULT 0,
     item_count INTEGER DEFAULT 0,
-    stream_specification TEXT
+    stream_specification TEXT,
+    deletion_protection_enabled INTEGER NOT NULL DEFAULT 0
 )"
         }
         SqlDialectKind::Postgres => {
@@ -49,8 +50,21 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
         global_secondary_indexes TEXT,
         table_size_bytes BIGINT DEFAULT 0,
         item_count BIGINT DEFAULT 0,
-        stream_specification TEXT
+        stream_specification TEXT,
+        deletion_protection_enabled BOOLEAN NOT NULL DEFAULT FALSE
     )"
+        }
+    })
+}
+
+pub(crate) fn add_deletion_protection_column(dialect: &dyn SqlDialect) -> SqlStatement {
+    SqlStatement::static_sql(match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "ALTER TABLE tables ADD COLUMN deletion_protection_enabled INTEGER NOT NULL DEFAULT 0"
+        }
+        SqlDialectKind::Postgres => {
+            "ALTER TABLE tables ADD COLUMN IF NOT EXISTS deletion_protection_enabled BOOLEAN NOT \
+             NULL DEFAULT FALSE"
         }
     })
 }
@@ -148,13 +162,13 @@ pub(crate) fn get_table_info(
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
 FROM tables WHERE table_name = ?1"
             }
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
      FROM tables WHERE table_name = $1"
             }
         },
@@ -172,21 +186,22 @@ pub(crate) fn insert_table(
     key_schema: impl Into<String>,
     global_secondary_indexes: Option<String>,
     stream_specification: Option<String>,
+    deletion_protection_enabled: bool,
 ) -> SqlStatement {
     let sql = match dialect.kind() {
         SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
             r"INSERT INTO tables (
     id, table_name, table_status, created_at,
     attribute_definitions, key_schema, global_secondary_indexes,
-    table_size_bytes, item_count, stream_specification
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+    table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
         }
         SqlDialectKind::Postgres => {
             "INSERT INTO tables (
         id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8)"
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9)"
         }
     };
     let mut params = vec![
@@ -209,6 +224,7 @@ pub(crate) fn insert_table(
         Some(value) => params.push(SqlParam::text(value)),
         None => params.push(SqlParam::null()),
     }
+    params.push(SqlParam::boolean(deletion_protection_enabled));
     SqlStatement::with_params(sql, params)
 }
 
@@ -234,7 +250,7 @@ pub(crate) fn list_all_tables(dialect: &dyn SqlDialect, limit: u32) -> SqlStatem
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
 FROM tables
 ORDER BY table_name ASC
 LIMIT ?1"
@@ -242,7 +258,7 @@ LIMIT ?1"
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
     FROM tables
     ORDER BY table_name ASC
     LIMIT $1"
@@ -262,7 +278,7 @@ pub(crate) fn list_tables_after(
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
 FROM tables
 WHERE table_name > ?1
 ORDER BY table_name ASC
@@ -271,7 +287,7 @@ LIMIT ?2"
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
     FROM tables
     WHERE table_name > $1
     ORDER BY table_name ASC
@@ -281,6 +297,27 @@ LIMIT ?2"
         vec![
             SqlParam::text(exclusive_start_table_name),
             SqlParam::integer(i64::from(limit)),
+        ],
+    )
+}
+
+pub(crate) fn update_deletion_protection(
+    dialect: &dyn SqlDialect,
+    deletion_protection_enabled: bool,
+    table_name: impl Into<String>,
+) -> SqlStatement {
+    SqlStatement::with_params(
+        match dialect.kind() {
+            SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+                "UPDATE tables SET deletion_protection_enabled = ?1 WHERE table_name = ?2"
+            }
+            SqlDialectKind::Postgres => {
+                "UPDATE tables SET deletion_protection_enabled = $1 WHERE table_name = $2"
+            }
+        },
+        vec![
+            SqlParam::boolean(deletion_protection_enabled),
+            SqlParam::text(table_name),
         ],
     )
 }

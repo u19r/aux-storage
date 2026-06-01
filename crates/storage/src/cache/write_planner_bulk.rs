@@ -30,6 +30,7 @@ use crate::{
     namespace_routing::NamespaceRouteRecord,
 };
 
+#[cfg_attr(not(feature = "cache-write-planner"), allow(dead_code))]
 impl<'a, L> StorageCacheWritePlanner<'a, L>
 where L: StorageCachePlannerLoad
 {
@@ -149,6 +150,12 @@ where L: StorageCachePlannerLoad
         &self,
         request: &BatchWriteItemRequest,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(StorageCacheWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         self.cache_effects_for_batch_write(
             request,
             self.query_proof_cache_index_transitions_for_batch_write(request)
@@ -177,6 +184,12 @@ where L: StorageCachePlannerLoad
         &self,
         request: &BatchWriteItemEncodeRequest,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(StorageCacheWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         self.cache_effects_for_batch_write_encode(
             request,
             self.query_proof_cache_index_transitions_for_batch_write_encode(request)
@@ -207,6 +220,12 @@ where L: StorageCachePlannerLoad
         transact_items: &[TransactWriteItem],
         pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(StorageCacheWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         self.cache_effects_for_transact_write_items(
             transact_items,
             self.query_proof_index_transitions_for_transact_write_items(
@@ -247,6 +266,12 @@ where L: StorageCachePlannerLoad
         transact_items: &[TransactEncodeItem],
         pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(StorageCacheWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         self.cache_effects_for_transact_write_items_encode(
             transact_items,
             self.query_proof_index_transitions_for_transact_write_items_encode(

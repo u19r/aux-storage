@@ -33,7 +33,7 @@ impl SyncWriteResolver<'_> {
                     self.resolve_update(storage_types::UpdateItemRequest {
                         table_name: update.table_name,
                         key: update.key,
-                        update_expression: update.update_expression,
+                        update_expression: Some(update.update_expression),
                         attribute_updates: None,
                         condition_expression: update.condition_expression,
                         expression_attribute_names: update.expression_attribute_names,

@@ -9,7 +9,7 @@ use storage_sync::SyncWriteRequest;
 use storage_types::{
     AttributeValue, AttributeValueLookup, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
     BatchWriteItemResponse, EncodeWriteRequest, KeySchemaElement, StorageEnum, StorageError,
-    StorageResult, TableName, TableNamespace, TransactWriteItemsEncodeRequest,
+    StorageResult, TableName, TableNamespace, TransactEncodeItem, TransactWriteItemsEncodeRequest,
     TransactWriteItemsResponse, WriteRequest, context::WrappedError,
     validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
 };
@@ -21,7 +21,7 @@ use crate::{
         record_storage_operation_for_target, set_transact_encode_item_table_name,
         transact_encode_item_table_name, validate_transact_encode_item_expression_usage,
     },
-    namespace_routing::NamespaceStorageMode,
+    namespace_routing::{NamespaceRouteRecord, NamespaceStorageMode},
     updated_at_apply::{
         refresh_existing_batch_write_encode_timestamps, refresh_existing_batch_write_timestamps,
         refresh_existing_transact_encode_item_timestamp, stamp_batch_write_encode_request,
@@ -35,11 +35,44 @@ pub(crate) struct RoutedWriteDispatchKey {
     pub(crate) target_role: RoutedWriteTargetRole,
 }
 
+struct PreparedBatchWriteItem {
+    request: BatchWriteItemRequest,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
+struct PreparedBatchWriteItemEncode {
+    request: BatchWriteItemEncodeRequest,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
+struct PreparedTransactWriteItemsEncode {
+    request: TransactWriteItemsEncodeRequest,
+    client_request_token: Option<String>,
+    return_consumed_capacity: Option<String>,
+    return_item_collection_metrics: Option<String>,
+    pending_routes: HashMap<TableNamespace, NamespaceRouteRecord>,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
 impl DatabaseManager {
     pub async fn batch_write_item(
         &self,
         request: BatchWriteItemRequest,
     ) -> StorageResult<BatchWriteItemResponse> {
+        let prepared = self.prepare_batch_write_item(request).await?;
+        if self.single_node_sync_mode_enabled() {
+            return self.batch_write_item_single_node_sync(prepared).await;
+        }
+        if self.route_resolver.is_none() {
+            return self.batch_write_item_unrouted(prepared).await;
+        }
+        self.batch_write_item_routed(prepared).await
+    }
+
+    async fn prepare_batch_write_item(
+        &self,
+        request: BatchWriteItemRequest,
+    ) -> StorageResult<PreparedBatchWriteItem> {
         let mut request = request;
         self.validate_batch_write_unique_keys(&request).await?;
         if self.single_table_mode_enabled() {
@@ -47,52 +80,93 @@ impl DatabaseManager {
         } else {
             refresh_existing_batch_write_timestamps(&mut request)?;
         }
-        let query_proof_request = request.clone();
-        let cache_write_planner = self.cache_write_planner();
-        let cache_effects = cache_write_planner
-            .plan_batch_write_cache_effects(&query_proof_request)
-            .await?;
-        if self.single_node_sync_mode_enabled() {
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        self.run_single_node_sync_write_request(
-                            "batch_write_item",
-                            SyncWriteRequest::BatchWriteItem(request),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(BatchWriteItemResponse {
-                            unprocessed_items: None,
-                            item_collection_metrics: None,
-                            consumed_capacity: None,
-                        })
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
-        if self.route_resolver.is_none() {
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = record_storage_operation(
-                            "batch_write_item",
-                            self.storage.batch_write_item(request, true),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
+        let cache_effects = self.plan_batch_write_cache_effects(&request).await?;
+        Ok(PreparedBatchWriteItem {
+            request,
+            cache_effects,
+        })
+    }
 
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_batch_write_cache_effects(
+        &self,
+        request: &BatchWriteItemRequest,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        self.cache_write_planner()
+            .plan_batch_write_cache_effects(request)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_batch_write_cache_effects(
+        &self,
+        _request: &BatchWriteItemRequest,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn batch_write_item_single_node_sync(
+        &self,
+        prepared: PreparedBatchWriteItem,
+    ) -> StorageResult<BatchWriteItemResponse> {
+        let PreparedBatchWriteItem {
+            request,
+            cache_effects,
+        } = prepared;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                self.run_single_node_sync_write_request(
+                    "batch_write_item",
+                    SyncWriteRequest::BatchWriteItem(request),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(BatchWriteItemResponse {
+                    unprocessed_items: None,
+                    item_collection_metrics: None,
+                    consumed_capacity: None,
+                })
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn batch_write_item_unrouted(
+        &self,
+        prepared: PreparedBatchWriteItem,
+    ) -> StorageResult<BatchWriteItemResponse> {
+        let PreparedBatchWriteItem {
+            request,
+            cache_effects,
+        } = prepared;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = record_storage_operation(
+                    "batch_write_item",
+                    self.storage.batch_write_item(request, true),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn batch_write_item_routed(
+        &self,
+        prepared: PreparedBatchWriteItem,
+    ) -> StorageResult<BatchWriteItemResponse> {
+        let PreparedBatchWriteItem {
+            request,
+            cache_effects,
+        } = prepared;
         let (per_connection, physical_to_logical) = self
             .plan_routed_batch_write_requests::<WriteRequest>(
                 request.request_items,
@@ -158,7 +232,8 @@ impl DatabaseManager {
             };
             let mut seen_keys = Vec::with_capacity(write_requests.len());
             for write_request in write_requests {
-                let key = batch_write_request_primary_key(write_request, &table_info.key_schema)?;
+                let key = batch_write_request_primary_key(write_request, &table_info.key_schema)
+                    .map_err(batch_write_key_error)?;
                 if seen_keys.contains(&key) {
                     return Err(StorageError::validation(
                         "Provided list of item keys contains duplicates",
@@ -174,41 +249,86 @@ impl DatabaseManager {
         &self,
         request: BatchWriteItemEncodeRequest,
     ) -> StorageResult<BatchWriteItemResponse> {
-        let mut request = request;
-        if self.single_table_mode_enabled() {
-            stamp_batch_write_encode_request(&mut request)?;
-        } else {
-            refresh_existing_batch_write_encode_timestamps(&mut request)?;
-        }
-        let query_proof_request = request.clone();
-        let cache_write_planner = self.cache_write_planner();
-        let cache_effects = cache_write_planner
-            .plan_batch_write_encode_cache_effects(&query_proof_request)
-            .await?;
+        let prepared = self.prepare_batch_write_item_encode(request).await?;
         if self.single_node_sync_mode_enabled() {
             return Err(StorageError::unsupported(
                 "BatchWriteItem encode single-node sync routing is not implemented yet",
             ));
         }
         if self.route_resolver.is_none() {
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = record_storage_operation(
-                            "batch_write_item",
-                            self.storage.batch_write_item_encode(request, true),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
+            return self.batch_write_item_encode_unrouted(prepared).await;
         }
+        self.batch_write_item_encode_routed(prepared).await
+    }
 
+    async fn prepare_batch_write_item_encode(
+        &self,
+        request: BatchWriteItemEncodeRequest,
+    ) -> StorageResult<PreparedBatchWriteItemEncode> {
+        let mut request = request;
+        if self.single_table_mode_enabled() {
+            stamp_batch_write_encode_request(&mut request)?;
+        } else {
+            refresh_existing_batch_write_encode_timestamps(&mut request)?;
+        }
+        let cache_effects = self.plan_batch_write_encode_cache_effects(&request).await?;
+        Ok(PreparedBatchWriteItemEncode {
+            request,
+            cache_effects,
+        })
+    }
+
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_batch_write_encode_cache_effects(
+        &self,
+        request: &BatchWriteItemEncodeRequest,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        self.cache_write_planner()
+            .plan_batch_write_encode_cache_effects(request)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_batch_write_encode_cache_effects(
+        &self,
+        _request: &BatchWriteItemEncodeRequest,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn batch_write_item_encode_unrouted(
+        &self,
+        prepared: PreparedBatchWriteItemEncode,
+    ) -> StorageResult<BatchWriteItemResponse> {
+        let PreparedBatchWriteItemEncode {
+            request,
+            cache_effects,
+        } = prepared;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = record_storage_operation(
+                    "batch_write_item",
+                    self.storage.batch_write_item_encode(request, true),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn batch_write_item_encode_routed(
+        &self,
+        prepared: PreparedBatchWriteItemEncode,
+    ) -> StorageResult<BatchWriteItemResponse> {
+        let PreparedBatchWriteItemEncode {
+            request,
+            cache_effects,
+        } = prepared;
         let (per_connection, physical_to_logical) = self
             .plan_routed_batch_write_requests::<EncodeWriteRequest>(
                 request.request_items,
@@ -334,6 +454,22 @@ impl DatabaseManager {
         &self,
         request: TransactWriteItemsEncodeRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        let prepared = self.prepare_transact_write_items_encode(request).await?;
+        if self.single_node_sync_mode_enabled() {
+            return Err(StorageError::unsupported(
+                "TransactWriteItems encode single-node sync routing is not implemented yet",
+            ));
+        }
+        if self.route_resolver.is_none() {
+            return self.transact_write_items_encode_unrouted(prepared).await;
+        }
+        self.transact_write_items_encode_routed(prepared).await
+    }
+
+    async fn prepare_transact_write_items_encode(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+    ) -> StorageResult<PreparedTransactWriteItemsEncode> {
         let mut request = request;
         let client_request_token = request.client_request_token.clone();
         let return_consumed_capacity = request.return_consumed_capacity.clone();
@@ -349,45 +485,111 @@ impl DatabaseManager {
         }
         let pending_routes =
             Self::pending_namespace_routes_from_transact_items(&request.transact_items)?;
-        let cache_effects = if self.cache_write_effects_enabled() {
-            let cache_write_planner = self.cache_write_planner();
-            cache_write_planner
-                .plan_transact_write_encode_cache_effects(&request.transact_items, &pending_routes)
-                .await?
-        } else {
-            self.empty_cache_write_effects()
-        };
-        if self.single_node_sync_mode_enabled() {
-            return Err(StorageError::unsupported(
-                "TransactWriteItems encode single-node sync routing is not implemented yet",
-            ));
-        }
-        if self.route_resolver.is_none() {
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = record_storage_operation(
-                            "transact_write_items",
-                            self.storage.transact_write_items_encode(request),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
+        let cache_effects = self
+            .plan_transact_write_encode_cache_effects(&request.transact_items, &pending_routes)
+            .await?;
+        Ok(PreparedTransactWriteItemsEncode {
+            request,
+            client_request_token,
+            return_consumed_capacity,
+            return_item_collection_metrics,
+            pending_routes,
+            cache_effects,
+        })
+    }
 
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_transact_write_encode_cache_effects(
+        &self,
+        transact_items: &[TransactEncodeItem],
+        pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        if !self.cache_write_effects_enabled() {
+            return Ok(self.empty_cache_write_effects());
+        }
+        self.cache_write_planner()
+            .plan_transact_write_encode_cache_effects(transact_items, pending_routes)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_transact_write_encode_cache_effects(
+        &self,
+        _transact_items: &[TransactEncodeItem],
+        _pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn transact_write_items_encode_unrouted(
+        &self,
+        prepared: PreparedTransactWriteItemsEncode,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let PreparedTransactWriteItemsEncode {
+            request,
+            cache_effects,
+            ..
+        } = prepared;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = record_storage_operation(
+                    "transact_write_items",
+                    self.storage.transact_write_items_encode(request),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn transact_write_items_encode_routed(
+        &self,
+        prepared: PreparedTransactWriteItemsEncode,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let PreparedTransactWriteItemsEncode {
+            request,
+            client_request_token,
+            return_consumed_capacity,
+            return_item_collection_metrics,
+            pending_routes,
+            cache_effects,
+        } = prepared;
+        let per_connection = self
+            .plan_routed_transact_write_items_encode(request.transact_items, &pending_routes)
+            .await?;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                self.execute_routed_transact_write_items_encode(
+                    per_connection,
+                    client_request_token,
+                    return_consumed_capacity,
+                    return_item_collection_metrics,
+                )
+                .await
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn plan_routed_transact_write_items_encode(
+        &self,
+        transact_items: Vec<TransactEncodeItem>,
+        pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsEncodeRequest>> {
         let default_connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
         let mut per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsEncodeRequest> =
             BTreeMap::new();
-        for item in request.transact_items {
+        for item in transact_items {
             let logical_table = transact_encode_item_table_name(&item)?;
             let route = self
-                .resolve_namespace_route_for_table_with_pending(&logical_table, &pending_routes)
+                .resolve_namespace_route_for_table_with_pending(&logical_table, pending_routes)
                 .await?;
             if let Some(route) = route {
                 ensure_route_writes_not_paused(&route)?;
@@ -431,42 +633,40 @@ impl DatabaseManager {
                     .push(item);
             }
         }
+        Ok(per_connection)
+    }
 
-        self.execute_with_cache_effects(
-            PreparedCacheWrite::Effects(cache_effects.clone()),
-            || async {
-                let mut primary_response: Option<TransactWriteItemsResponse> = None;
-                for (dispatch_key, mut request_for_connection) in per_connection {
-                    request_for_connection.client_request_token = client_request_token.clone();
-                    request_for_connection.return_consumed_capacity =
-                        return_consumed_capacity.clone();
-                    request_for_connection.return_item_collection_metrics =
-                        return_item_collection_metrics.clone();
+    async fn execute_routed_transact_write_items_encode(
+        &self,
+        per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsEncodeRequest>,
+        client_request_token: Option<String>,
+        return_consumed_capacity: Option<String>,
+        return_item_collection_metrics: Option<String>,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let mut primary_response: Option<TransactWriteItemsResponse> = None;
+        for (dispatch_key, mut request_for_connection) in per_connection {
+            request_for_connection.client_request_token = client_request_token.clone();
+            request_for_connection.return_consumed_capacity = return_consumed_capacity.clone();
+            request_for_connection.return_item_collection_metrics =
+                return_item_collection_metrics.clone();
 
-                    let provider =
-                        self.provider_for_request_connection(&dispatch_key.connection_id)?;
-                    let response = record_storage_operation_for_target(
-                        "transact_write_items",
-                        dispatch_key.target_role,
-                        provider.transact_write_items_encode(request_for_connection),
-                    )
-                    .await?;
-                    if primary_response.is_none() {
-                        primary_response = Some(response);
-                    }
-                    self.maybe_run_gsi_maintenance_for_connection(&dispatch_key.connection_id)
-                        .await?;
-                }
+            let provider = self.provider_for_request_connection(&dispatch_key.connection_id)?;
+            let response = record_storage_operation_for_target(
+                "transact_write_items",
+                dispatch_key.target_role,
+                provider.transact_write_items_encode(request_for_connection),
+            )
+            .await?;
+            if primary_response.is_none() {
+                primary_response = Some(response);
+            }
+            self.maybe_run_gsi_maintenance_for_connection(&dispatch_key.connection_id)
+                .await?;
+        }
 
-                primary_response.ok_or_else(|| {
-                    StorageError::internal(
-                        "transact_write_items_encode routing produced no write targets",
-                    )
-                })
-            },
-            |response| async { Ok((response, cache_effects)) },
-        )
-        .await
+        primary_response.ok_or_else(|| {
+            StorageError::internal("transact_write_items_encode routing produced no write targets")
+        })
     }
 }
 
@@ -589,6 +789,21 @@ fn batch_write_request_primary_key(
     Err(StorageError::validation(
         "WriteRequest must contain exactly one of PutRequest or DeleteRequest",
     ))
+}
+
+fn batch_write_key_error(error: StorageError) -> StorageError {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return error;
+    };
+    if message == "The parameter cannot be converted to a numeric value"
+        || message == "Attempting to store more than 38 significant digits in a Number"
+        || message
+            == "Number underflow. Attempting to store a number with magnitude smaller than \
+                supported range"
+    {
+        return StorageError::raw_validation(message.clone());
+    }
+    error
 }
 
 fn key_values_from_attributes(

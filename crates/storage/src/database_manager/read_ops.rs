@@ -10,9 +10,9 @@ use storage_types::{
     DurableBatchPointReadProof, DurableBatchPointReadProofEntry, DurablePointReadProof,
     DurablePointReadRequest, GetStreamRecordsResponse, ItemResponse, KeyAttributes,
     KeySchemaElement, KeysAndAttributes, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StreamItemId, StreamName, StreamSpecification, StreamViewType, TableName,
-    TableNamespace, TransactGetItemsRequest, TransactGetItemsResponse, TryFromWireItem, WireItem,
-    context::WrappedError, preflight_transact_get_item_key_with_table_info,
+    StorageResult, StoredTableInfo, StreamItemId, StreamName, StreamSpecification, StreamViewType,
+    TableName, TableNamespace, TransactGetItemsRequest, TransactGetItemsResponse, TryFromWireItem,
+    WireItem, context::WrappedError, preflight_transact_get_item_key_with_table_info,
     transaction_canceled_for_preflights, validate_no_duplicate_transact_item_keys,
 };
 use stream::StreamError;
@@ -471,23 +471,37 @@ impl DatabaseManager {
         let return_consumed_capacity = request.return_consumed_capacity;
         let mut transact_items = request.transact_items;
         let mut preflights = Vec::with_capacity(transact_items.len());
-        let mut consumed_capacity_counts: Vec<TransactGetConsumedCapacityCount> = Vec::new();
+        let mut table_infos = Vec::<(TableName, StoredTableInfo)>::new();
+        let mut consumed_capacity_counts =
+            should_track_transact_get_consumed_capacity(return_consumed_capacity.as_deref())
+                .then(Vec::new);
         for item in &mut transact_items {
             let requested_table_name = item.get.table_name.clone();
             item.get.table_name = TableName::new(item.get.table_name.dynamodb_resource_name());
-            let table_info = self
-                .get_table_info(&item.get.table_name)
-                .await
-                .map_err(transact_get_table_not_found_as_resource_not_found)?;
+            let table_info_index = if let Some(index) = table_infos
+                .iter()
+                .position(|(table_name, _)| table_name == &item.get.table_name)
+            {
+                index
+            } else {
+                let table_info = self
+                    .get_table_info(&item.get.table_name)
+                    .await
+                    .map_err(transact_get_table_not_found_as_resource_not_found)?;
+                table_infos.push((item.get.table_name.clone(), table_info));
+                table_infos.len() - 1
+            };
+            let table_info = &table_infos[table_info_index].1;
             preflights.push(preflight_transact_get_item_key_with_table_info(
-                item,
-                &table_info,
+                item, table_info,
             )?);
-            increment_transact_get_consumed_capacity_count(
-                &mut consumed_capacity_counts,
-                &table_info.table_name,
-                &requested_table_name,
-            );
+            if let Some(counts) = consumed_capacity_counts.as_mut() {
+                increment_transact_get_consumed_capacity_count(
+                    counts,
+                    &table_info.table_name,
+                    &requested_table_name,
+                );
+            }
         }
         if let Some(error) = transaction_canceled_for_preflights(&preflights) {
             return Err(error);
@@ -504,16 +518,12 @@ impl DatabaseManager {
                 .await?;
             let item = match (item, get.projection_expression.as_deref()) {
                 (Some(item), Some(projection_expression)) => {
-                    let projected = storage_api_projection(
-                        &[item],
+                    let projected = storage_api_project_item(
+                        &item,
                         projection_expression,
                         get.expression_attribute_names.as_ref(),
-                    )
-                    .into_iter()
-                    .next();
-                    projected
-                        .map(AttributeMap::from)
-                        .and_then(|item| (!item.is_empty()).then_some(item))
+                    );
+                    (!projected.is_empty()).then_some(AttributeMap::from(projected))
                 }
                 (Some(item), None) => Some(AttributeMap::from(item)),
                 (None, _) => None,
@@ -522,10 +532,9 @@ impl DatabaseManager {
         }
         Ok(TransactGetItemsResponse {
             responses,
-            consumed_capacity: transact_get_consumed_capacity(
-                return_consumed_capacity.as_deref(),
-                &consumed_capacity_counts,
-            ),
+            consumed_capacity: consumed_capacity_counts.as_deref().and_then(|counts| {
+                transact_get_consumed_capacity(return_consumed_capacity.as_deref(), counts)
+            }),
         })
     }
 
@@ -552,6 +561,10 @@ struct TransactGetConsumedCapacityCount {
     canonical_table_name: TableName,
     response_table_name: TableName,
     count: usize,
+}
+
+fn should_track_transact_get_consumed_capacity(return_consumed_capacity: Option<&str>) -> bool {
+    matches!(return_consumed_capacity, Some("TOTAL" | "INDEXES"))
 }
 
 fn increment_transact_get_consumed_capacity_count(
@@ -787,31 +800,212 @@ pub(crate) fn normalize_unprocessed_keys_for_shared_table(
     Ok(())
 }
 
-fn storage_api_projection(
+#[cfg(test)]
+pub(super) fn storage_api_projection(
     items: &[HashMap<String, AttributeValue>],
     projection_expr: &str,
     expression_attribute_names: Option<&HashMap<String, String>>,
 ) -> Vec<HashMap<String, AttributeValue>> {
-    let attributes = projection_expr
-        .split(',')
-        .map(str::trim)
-        .filter(|attribute| !attribute.is_empty())
-        .map(|attribute| {
-            expression_attribute_names
-                .and_then(|names| names.get(attribute))
-                .map_or_else(|| attribute.to_string(), Clone::clone)
-        })
-        .collect::<Vec<_>>();
+    let path_count = projection_expr
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b',')
+        .count()
+        + 1;
+    let mut paths = Vec::with_capacity(path_count);
+    for path in projection_expr.split(',').map(str::trim) {
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(path) = parse_projection_path(path, expression_attribute_names) {
+            paths.push(path);
+        }
+    }
 
     let mut projected_items = Vec::with_capacity(items.len());
     for item in items {
-        let mut projected_item = HashMap::with_capacity(attributes.len());
-        for attr_name in &attributes {
-            if let Some(value) = item.get(attr_name) {
-                projected_item.insert(attr_name.clone(), value.clone());
-            }
-        }
-        projected_items.push(projected_item);
+        projected_items.push(project_item_with_paths(item, &paths, path_count));
     }
     projected_items
+}
+
+pub(super) fn storage_api_project_item(
+    item: &HashMap<String, AttributeValue>,
+    projection_expr: &str,
+    expression_attribute_names: Option<&HashMap<String, String>>,
+) -> HashMap<String, AttributeValue> {
+    let path_count = projection_expr
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b',')
+        .count()
+        + 1;
+    let mut paths = Vec::with_capacity(path_count);
+    for path in projection_expr.split(',').map(str::trim) {
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(path) = parse_projection_path(path, expression_attribute_names) {
+            paths.push(path);
+        }
+    }
+    project_item_with_paths(item, &paths, path_count)
+}
+
+fn project_item_with_paths(
+    item: &HashMap<String, AttributeValue>,
+    paths: &[Vec<ProjectionSegment>],
+    path_count: usize,
+) -> HashMap<String, AttributeValue> {
+    let mut projected_item = ProjectedValue::Map(HashMap::with_capacity(path_count));
+    for path in paths {
+        if let Some(value) = get_projection_path_value(item, path) {
+            insert_projected_value(&mut projected_item, path, value.clone());
+        }
+    }
+    projected_item.into_attribute_map().unwrap_or_default()
+}
+
+#[derive(Clone)]
+enum ProjectionSegment {
+    Key(String),
+    Index(usize),
+}
+
+enum ProjectedValue {
+    Map(HashMap<String, AttributeValue>),
+    List(Vec<Option<AttributeValue>>),
+}
+
+fn parse_projection_path(
+    path: &str,
+    attribute_names: Option<&HashMap<String, String>>,
+) -> Option<Vec<ProjectionSegment>> {
+    let mut segments =
+        Vec::with_capacity(path.as_bytes().iter().filter(|byte| **byte == b'.').count() + 1);
+    let mut cursor = 0usize;
+    while cursor < path.len() {
+        let bytes = path.as_bytes();
+        match bytes.get(cursor).copied()? {
+            b'.' => cursor += 1,
+            b'[' => {
+                cursor += 1;
+                let end = path.get(cursor..)?.find(']')? + cursor;
+                let index = path.get(cursor..end)?.parse().ok()?;
+                segments.push(ProjectionSegment::Index(index));
+                cursor = end + 1;
+            }
+            _ => {
+                let end = path
+                    .get(cursor..)?
+                    .find(['.', '['])
+                    .map_or(path.len(), |offset| cursor + offset);
+                let raw = path.get(cursor..end)?;
+                let key = attribute_names
+                    .and_then(|names| names.get(raw))
+                    .map_or_else(|| raw.to_string(), Clone::clone);
+                segments.push(ProjectionSegment::Key(key));
+                cursor = end;
+            }
+        }
+    }
+    Some(segments)
+}
+
+fn get_projection_path_value<'a>(
+    item: &'a HashMap<String, AttributeValue>,
+    path: &[ProjectionSegment],
+) -> Option<&'a AttributeValue> {
+    let (first, rest) = path.split_first()?;
+    let ProjectionSegment::Key(first_key) = first else {
+        return None;
+    };
+    let mut current = item.get(first_key)?;
+    for segment in rest {
+        match (segment, current) {
+            (ProjectionSegment::Key(key), AttributeValue::M(map)) => current = map.get(key)?,
+            (ProjectionSegment::Index(index), AttributeValue::L(list)) => {
+                current = list.get(*index)?
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn insert_projected_value(
+    target: &mut ProjectedValue,
+    path: &[ProjectionSegment],
+    value: AttributeValue,
+) {
+    let Some((head, tail)) = path.split_first() else {
+        return;
+    };
+    match (target, head) {
+        (ProjectedValue::Map(map), ProjectionSegment::Key(key)) if tail.is_empty() => {
+            map.insert(key.clone(), value);
+        }
+        (ProjectedValue::Map(map), ProjectionSegment::Key(key)) => {
+            let child = map
+                .entry(key.clone())
+                .or_insert_with(|| match tail.first() {
+                    Some(ProjectionSegment::Index(_)) => AttributeValue::L(Vec::new()),
+                    _ => AttributeValue::M(HashMap::new()),
+                });
+            insert_projected_attribute_value(child, tail, value);
+        }
+        (ProjectedValue::List(list), ProjectionSegment::Index(index)) => {
+            if list.len() <= *index {
+                list.resize_with(index + 1, || None);
+            }
+            if tail.is_empty() {
+                list[*index] = Some(value);
+            } else {
+                let child = list[*index].get_or_insert_with(|| match tail.first() {
+                    Some(ProjectionSegment::Index(_)) => AttributeValue::L(Vec::new()),
+                    _ => AttributeValue::M(HashMap::new()),
+                });
+                insert_projected_attribute_value(child, tail, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_projected_attribute_value(
+    target: &mut AttributeValue,
+    path: &[ProjectionSegment],
+    value: AttributeValue,
+) {
+    match target {
+        AttributeValue::M(map) => {
+            let mut projected = ProjectedValue::Map(std::mem::take(map));
+            insert_projected_value(&mut projected, path, value);
+            if let ProjectedValue::Map(updated) = projected {
+                *map = updated;
+            }
+        }
+        AttributeValue::L(list) => {
+            let mut projected = ProjectedValue::List(
+                std::mem::take(list)
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>(),
+            );
+            insert_projected_value(&mut projected, path, value);
+            if let ProjectedValue::List(updated) = projected {
+                *list = updated.into_iter().flatten().collect();
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ProjectedValue {
+    fn into_attribute_map(self) -> Option<HashMap<String, AttributeValue>> {
+        match self {
+            Self::Map(map) => Some(map),
+            Self::List(_) => None,
+        }
+    }
 }

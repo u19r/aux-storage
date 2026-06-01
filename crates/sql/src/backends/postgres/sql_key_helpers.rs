@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-#[cfg(test)]
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use deadpool_postgres::GenericClient;
 #[cfg(test)]
@@ -22,6 +20,13 @@ use crate::{
     },
     write_plan::WriteMaintenancePlan,
 };
+
+#[derive(Clone)]
+pub(super) struct PreparedGetItemQuery {
+    table_info: StoredTableInfo,
+    sql: String,
+    bind_values: Vec<String>,
+}
 
 impl PostgresStorageProvider {
     pub(super) fn key_attribute_type(
@@ -69,7 +74,7 @@ impl PostgresStorageProvider {
     ) -> String {
         match attribute_type {
             storage_types::KeyAttributeType::N => {
-                format!("CAST(${parameter_index} AS NUMERIC)")
+                format!("CAST(${parameter_index} AS TEXT)::NUMERIC")
             }
             storage_types::KeyAttributeType::S | storage_types::KeyAttributeType::B => {
                 format!("${parameter_index}")
@@ -77,12 +82,12 @@ impl PostgresStorageProvider {
         }
     }
 
-    pub(super) fn build_postgres_table_creation_sql(
+    pub(super) fn build_postgres_table_creation_sqls(
         table_name: &TableName,
         attribute_definitions: &[storage_types::AttributeDefinition],
         key_schema: &[storage_types::KeySchemaElement],
         global_secondary_indexes: Option<&[storage_types::GlobalSecondaryIndex]>,
-    ) -> String {
+    ) -> Vec<String> {
         let physical_table_name = physical_names::physical_table_name(table_name);
         let mut key_columns = Vec::new();
         let mut processed_attributes = std::collections::HashSet::new();
@@ -122,11 +127,11 @@ impl PostgresStorageProvider {
                 storage_types::KeyType::Range => primary_key_columns.push(column_name),
             }
         }
-        sql_statements::create_physical_table(
+        vec![sql_statements::create_physical_table(
             &physical_table_name,
             &key_columns,
             &primary_key_columns,
-        )
+        )]
     }
 
     pub(super) fn build_postgres_gsi_creation_sqls(
@@ -200,7 +205,7 @@ impl PostgresStorageProvider {
             .global_secondary_indexes
             .as_ref()
             .map(|indexes| indexes.iter().cloned().map(Into::into).collect());
-        let create_table_sql = Self::build_postgres_table_creation_sql(
+        let create_table_sqls = Self::build_postgres_table_creation_sqls(
             table_name,
             &request.attribute_definitions,
             &request.key_schema,
@@ -220,10 +225,12 @@ impl PostgresStorageProvider {
         let ttl_table_name = physical_names::physical_ttl_index_table_name(table_name);
         let create_ttl_sql = sql_statements::create_ttl_index_table(&ttl_table_name);
 
-        client
-            .batch_execute(&create_table_sql)
-            .await
-            .map_err(|err| Self::map_postgres_error("create main table storage", err))?;
+        for create_table_sql in create_table_sqls {
+            client
+                .batch_execute(&create_table_sql)
+                .await
+                .map_err(|err| Self::map_postgres_error("create main table storage", err))?;
+        }
         for gsi_sql in gsi_sqls {
             client
                 .batch_execute(&gsi_sql)
@@ -350,38 +357,56 @@ impl PostgresStorageProvider {
         scan_forward: bool,
         bind_values: &mut Vec<String>,
     ) -> StorageResult<Option<String>> {
+        Self::build_exclusive_start_predicate_after_prefix(
+            ordered_columns,
+            exclusive_start_key,
+            scan_forward,
+            0,
+            bind_values,
+        )
+    }
+
+    pub(super) fn build_exclusive_start_predicate_after_prefix(
+        ordered_columns: &[OrderedKeyColumn],
+        exclusive_start_key: &storage_types::ItemKey,
+        scan_forward: bool,
+        fixed_prefix_columns: usize,
+        bind_values: &mut Vec<String>,
+    ) -> StorageResult<Option<String>> {
         let components = Self::key_components_from_item_key(exclusive_start_key)?;
         if components.is_empty() || ordered_columns.is_empty() {
             return Ok(None);
         }
         let component_count = components.len().min(ordered_columns.len());
-        if component_count == 0 {
+        let fixed_prefix_columns = fixed_prefix_columns.min(component_count);
+        if component_count <= fixed_prefix_columns {
             return Ok(None);
         }
         let op = if scan_forward { ">" } else { "<" };
-        let mut clauses = Vec::with_capacity(component_count);
-        for boundary_idx in 0..component_count {
-            let mut parts = Vec::with_capacity(boundary_idx + 1);
-            for idx in 0..boundary_idx {
-                bind_values.push(components[idx].clone());
-                let placeholder = Self::postgres_placeholder_for_type(
-                    bind_values.len(),
-                    &ordered_columns[idx].attribute_type,
-                );
-                parts.push(format!("{} = {placeholder}", ordered_columns[idx].column));
-            }
-            bind_values.push(components[boundary_idx].clone());
-            let placeholder = Self::postgres_placeholder_for_type(
-                bind_values.len(),
-                &ordered_columns[boundary_idx].attribute_type,
-            );
-            parts.push(format!(
-                "{} {op} {placeholder}",
-                ordered_columns[boundary_idx].column
-            ));
-            clauses.push(format!("({})", parts.join(" AND ")));
+        let columns = &ordered_columns[fixed_prefix_columns..component_count];
+        let component_values = &components[fixed_prefix_columns..component_count];
+        if columns.len() == 1 {
+            bind_values.push(component_values[0].clone());
+            let placeholder =
+                Self::postgres_placeholder_for_type(bind_values.len(), &columns[0].attribute_type);
+            return Ok(Some(format!("{} {op} {placeholder}", columns[0].column)));
         }
-        Ok(Some(clauses.join(" OR ")))
+
+        let column_tuple = columns
+            .iter()
+            .map(|column| column.column.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = columns
+            .iter()
+            .zip(component_values)
+            .map(|(column, value)| {
+                bind_values.push(value.clone());
+                Self::postgres_placeholder_for_type(bind_values.len(), &column.attribute_type)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(format!("({column_tuple}) {op} ({placeholders})")))
     }
 
     pub(super) fn key_attribute_types_map_for_schema(
@@ -424,7 +449,7 @@ impl PostgresStorageProvider {
             match condition {
                 storage_condition::Condition::Equal { field, value } => {
                     let (column, attribute_type) = key_field(field)?;
-                    bind_values.push(value.clone());
+                    bind_values.push(key_condition_scalar_value(value)?);
                     let placeholder = PostgresStorageProvider::postgres_placeholder_for_type(
                         bind_values.len(),
                         &attribute_type,
@@ -491,8 +516,10 @@ impl PostgresStorageProvider {
                         ));
                     }
                     let prefix = match prefix {
-                        storage_types::AttributeValue::S(prefix)
-                        | storage_types::AttributeValue::B(prefix) => prefix,
+                        storage_types::AttributeValue::S(prefix) => prefix.clone(),
+                        storage_types::AttributeValue::B(prefix) => {
+                            prefix.trim_end_matches('=').to_string()
+                        }
                         _ => {
                             return Err(StorageError::validation(
                                 "begins_with is only valid for string or binary key attributes",
@@ -764,12 +791,12 @@ impl PostgresStorageProvider {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        #[cfg(test)]
         let started = Instant::now();
         client
             .execute(&sql, &params)
             .await
             .map_err(|err| Self::map_postgres_error(error_context, err))?;
+        self.record_transaction_phase("batch_write_item", "gsi_execute", started.elapsed());
         #[cfg(test)]
         provider_perf::record("postgres", _perf_counter, started.elapsed());
         Ok(())
@@ -782,6 +809,16 @@ impl PostgresStorageProvider {
         key_attributes: &KeyAttributes,
         table_info: &StoredTableInfo,
     ) -> StorageResult<Option<WireItem>> {
+        let prepared = Self::prepare_get_item_query(table_name, key_attributes, table_info)?;
+        self.execute_prepared_get_item_query(client, &prepared, "get_item", "db_query")
+            .await
+    }
+
+    pub(super) fn prepare_get_item_query(
+        table_name: &TableName,
+        key_attributes: &KeyAttributes,
+        table_info: &StoredTableInfo,
+    ) -> StorageResult<PreparedGetItemQuery> {
         let select_projection =
             Self::build_select_projection_for_origin(table_info, &table_info.key_schema, None)?;
         let key_bindings = Self::key_column_bindings_for_schema(
@@ -794,16 +831,44 @@ impl PostgresStorageProvider {
         let where_sql = Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
         let table_name_safe = table_name.sanitized_name();
         let sql = sql_statements::get_item(&table_name_safe, &select_projection, &where_sql);
-        let params: Vec<&(dyn ToSql + Sync)> = bind_values
+        Ok(PreparedGetItemQuery {
+            table_info: table_info.clone(),
+            sql,
+            bind_values,
+        })
+    }
+
+    pub(super) async fn execute_prepared_get_item_query<C: GenericClient + Sync>(
+        &self,
+        client: &C,
+        prepared: &PreparedGetItemQuery,
+        operation: &'static str,
+        phase: &'static str,
+    ) -> StorageResult<Option<WireItem>> {
+        let params: Vec<&(dyn ToSql + Sync)> = prepared
+            .bind_values
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
+        let started = Instant::now();
         let row = client
-            .query_opt(&sql, &params)
+            .query_opt(&prepared.sql, &params)
             .await
             .map_err(|err| Self::map_postgres_error("get_item query", err))?;
-        row.map(|row| Self::row_to_wire_item(&row, table_info))
+        self.record_transaction_phase(operation, phase, started.elapsed());
+        row.map(|row| Self::row_to_wire_item(&row, &prepared.table_info))
             .transpose()
+    }
+}
+
+fn key_condition_scalar_value(value: &storage_types::AttributeValue) -> StorageResult<String> {
+    match value {
+        storage_types::AttributeValue::S(value)
+        | storage_types::AttributeValue::N(value)
+        | storage_types::AttributeValue::B(value) => Ok(value.clone()),
+        _ => Err(StorageError::validation(
+            "KeyConditionExpression comparison values must be scalar",
+        )),
     }
 }
 

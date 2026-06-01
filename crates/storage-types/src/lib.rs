@@ -19,12 +19,16 @@ mod constants;
 pub use constants::*;
 mod dynamodb_limits;
 #[cfg(test)]
+mod dynamodb_limits_perf_tests;
+#[cfg(test)]
 mod dynamodb_limits_tests;
 pub use dynamodb_limits::{
     MAX_ATTRIBUTE_NAME_BYTES, MAX_ATTRIBUTE_NESTING_DEPTH, MAX_EXPRESSION_BYTES,
     MAX_ITEM_SIZE_BYTES, MAX_LIST_TABLES_LIMIT, MAX_PARTITION_KEY_BYTES, MAX_PROJECTED_ATTRIBUTES,
     MAX_QUERY_SCAN_RESPONSE_BYTES, MAX_SORT_KEY_BYTES, MAX_TRANSACTION_REQUEST_BYTES,
-    validate_attribute_value_for_write, validate_item_key_attributes_for_schema,
+    attribute_map_numbers_need_write_normalization, normalize_attribute_map_numbers_for_write,
+    normalize_dynamodb_number_for_write, validate_attribute_value_for_write,
+    validate_item_key_attributes_for_schema, validate_key_attribute_value_for_schema,
     validate_key_attributes_for_schema,
 };
 pub mod dynamodb_binary;
@@ -55,6 +59,8 @@ mod timestamp_seconds_fractional;
 mod timestamp_seconds_tests;
 pub use timestamp_seconds_fractional::*;
 mod transaction_runtime;
+#[cfg(test)]
+mod transaction_runtime_tests;
 pub use transaction_runtime::*;
 mod duration_seconds;
 #[cfg(test)]

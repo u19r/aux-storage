@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use storage_common::{
     DEFAULT_GENERIC_LIMIT, GsiKeyPart, GsiWriteAction, MAX_GENERIC_LIMIT, TtlConfigRecord,
@@ -10,8 +10,11 @@ use storage_types::{
     AttributeValue, AttributeValueLookup, ItemKey, KeyAttributes, ReplicationEventMetadata,
     SerializesToKey, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
     conditional_check_failed_reason, context::WrappedError as _,
-    return_values_on_condition_check_failure_all_old, transaction_canceled_for_item_error,
-    transaction_canceled_for_item_error_with_len,
+    normalize_dynamodb_number_for_write, preflight_transact_put_item_key_with_table_info,
+    preflight_transact_write_key_with_table_info, return_values_on_condition_check_failure_all_old,
+    transaction_canceled_for_indexed_reasons, transaction_canceled_for_item_error,
+    transaction_canceled_for_item_error_with_len, transaction_canceled_for_reason,
+    transaction_cancellation_reason_at,
 };
 
 use crate::{
@@ -348,6 +351,7 @@ pub fn plan_table_operation(
             key,
             operations,
             condition,
+            return_values_on_condition_check_failure,
             replication,
             preserve_old_item,
             transaction_validation,
@@ -357,6 +361,7 @@ pub fn plan_table_operation(
             key,
             operations,
             condition.as_ref(),
+            return_values_on_condition_check_failure.as_ref(),
             current_bytes,
             TableUpdateContext {
                 stream: TableStreamContext {
@@ -385,14 +390,30 @@ pub fn plan_table_write(
     stream_ids: &[Option<StreamItemId>],
     immediate_gsi_consistency: bool,
 ) -> StorageResult<TableWritePlan> {
+    preflight_table_write_operations(operations)?;
+    plan_table_write_preflighted(
+        operations,
+        current_values,
+        stream_ids,
+        immediate_gsi_consistency,
+    )
+}
+
+pub(crate) fn plan_table_write_preflighted(
+    operations: &[TransactWriteTableOperation],
+    current_values: Vec<Option<Vec<u8>>>,
+    stream_ids: &[Option<StreamItemId>],
+    immediate_gsi_consistency: bool,
+) -> StorageResult<TableWritePlan> {
     let mut plan = TableWritePlan {
         results: Vec::with_capacity(operations.len()),
         mutations: Vec::new(),
         stats: TableWritePlanStats::default(),
     };
+    let mut cancellation_reasons: Option<Vec<Option<String>>> = None;
 
     for (index, (operation, current)) in operations.iter().zip(current_values).enumerate() {
-        let (old_new, mutations) = plan_table_operation(
+        let result = plan_table_operation(
             operation,
             current.as_deref(),
             stream_ids[index],
@@ -405,7 +426,21 @@ pub fn plan_table_write(
             } else {
                 error
             }
-        })?;
+        });
+        let (old_new, mutations) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error.to_enum(), StorageEnum::TransactionCanceled { .. })
+                    && let Some(reason) = transaction_cancellation_reason_at(&error, index)
+                {
+                    cancellation_reasons.get_or_insert_with(|| vec![None; operations.len()])
+                        [index] = Some(reason);
+                    plan.results.push((None, None));
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         for mutation in mutations {
             plan.stats.mutation_count += 1;
             if is_gsi_mutation(&mutation) {
@@ -416,8 +451,80 @@ pub fn plan_table_write(
         plan.results.push(old_new);
     }
 
+    if let Some(cancellation_reasons) = cancellation_reasons
+        && let Some(error) = transaction_canceled_for_indexed_reasons(cancellation_reasons)
+    {
+        return Err(error);
+    }
+
     collapse_redundant_gsi_mutations(&mut plan);
     Ok(plan)
+}
+
+pub(crate) fn preflight_table_write_operations(
+    operations: &[TransactWriteTableOperation],
+) -> StorageResult<()> {
+    if let [operation] = operations {
+        let preflight = preflight_table_write_operation(operation)?;
+        if let Some(validation_reason) = preflight.validation_reason {
+            return Err(transaction_canceled_for_reason(0, validation_reason));
+        }
+        return Ok(());
+    }
+
+    let mut fingerprints = Vec::with_capacity(operations.len());
+    let mut cancellation_reasons: Option<Vec<Option<String>>> = None;
+    for (index, operation) in operations.iter().enumerate() {
+        let preflight = preflight_table_write_operation(operation)?;
+        if let Some(validation_reason) = preflight.validation_reason {
+            cancellation_reasons.get_or_insert_with(|| vec![None; operations.len()])[index] =
+                Some(validation_reason);
+            continue;
+        }
+        if cancellation_reasons.is_none()
+            && let Some(fingerprint) = preflight.key_fingerprint
+        {
+            fingerprints.push(fingerprint);
+        }
+    }
+    if let Some(cancellation_reasons) = cancellation_reasons {
+        if let Some(error) = transaction_canceled_for_indexed_reasons(cancellation_reasons) {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    validate_no_duplicate_transact_key_fingerprints(&fingerprints)
+}
+
+fn validate_no_duplicate_transact_key_fingerprints(fingerprints: &[String]) -> StorageResult<()> {
+    let mut seen = HashSet::with_capacity(fingerprints.len());
+    for fingerprint in fingerprints {
+        if !seen.insert(fingerprint.as_str()) {
+            return Err(StorageError::validation(
+                "Transaction request cannot include multiple operations on one item",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_table_write_operation(
+    operation: &TransactWriteTableOperation,
+) -> StorageResult<storage_types::TransactionKeyPreflight> {
+    match operation {
+        TransactWriteTableOperation::Put {
+            table_info, item, ..
+        } => preflight_transact_put_item_key_with_table_info(table_info, item),
+        TransactWriteTableOperation::Delete {
+            table_info, key, ..
+        }
+        | TransactWriteTableOperation::Check {
+            table_info, key, ..
+        }
+        | TransactWriteTableOperation::Update {
+            table_info, key, ..
+        } => preflight_transact_write_key_with_table_info(table_info, key),
+    }
 }
 
 fn collapse_redundant_gsi_mutations(plan: &mut TableWritePlan) {
@@ -576,12 +683,10 @@ fn plan_table_delete(
         merge_key_attributes(&mut current, key, table_info)?;
     }
     if let Some(condition) = condition {
-        let mut condition_current = current.clone();
-        merge_key_attributes(&mut condition_current, key, table_info)?;
         ensure_condition_for_table(
             index,
             condition,
-            &condition_current,
+            &current,
             return_values_on_condition_check_failure,
             table_info,
         )?;
@@ -669,6 +774,7 @@ fn plan_table_update(
     key: &KeyAttributes,
     operations: &[UpdateOperation],
     condition: Option<&Condition>,
+    return_values_on_condition_check_failure: Option<&String>,
     current_bytes: Option<&[u8]>,
     update_context: TableUpdateContext<'_>,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
@@ -684,7 +790,13 @@ fn plan_table_update(
         merge_key_attributes(&mut current, key, table_info)?;
     }
     if let Some(condition) = condition {
-        ensure_condition_for_table(update_context.index, condition, &current, None, table_info)?;
+        ensure_condition_for_table(
+            update_context.index,
+            condition,
+            &current,
+            return_values_on_condition_check_failure,
+            table_info,
+        )?;
     }
 
     let internal_old_item_needed =
@@ -950,18 +1062,39 @@ fn merge_key_attributes(
         };
 
         if let Some(existing) = current.get(&key_element.attribute_name) {
-            if existing != key_value {
+            if !key_attribute_values_match(existing, key_value) {
                 return Err(StorageError::internal(&format!(
                     "Key attribute mismatch for {}",
                     key_element.attribute_name
                 )));
             }
         } else {
-            current.insert(key_element.attribute_name.clone(), key_value.clone());
+            current.insert(
+                key_element.attribute_name.clone(),
+                normalize_key_attribute_value_for_write(key_value),
+            );
         }
     }
 
     Ok(())
+}
+
+fn key_attribute_values_match(left: &AttributeValue, right: &AttributeValue) -> bool {
+    match (left, right) {
+        (AttributeValue::N(left), AttributeValue::N(right)) => {
+            normalize_dynamodb_number_for_write(left) == normalize_dynamodb_number_for_write(right)
+        }
+        _ => left == right,
+    }
+}
+
+fn normalize_key_attribute_value_for_write(value: &AttributeValue) -> AttributeValue {
+    match value {
+        AttributeValue::N(number) => {
+            AttributeValue::N(normalize_dynamodb_number_for_write(number).into_owned())
+        }
+        _ => value.clone(),
+    }
 }
 
 fn key_attributes_to_item_map(

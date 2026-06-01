@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
-    DEFAULT_POSTGRES_MAX_POOL_SIZE, DEFAULT_REMOTE_REGION, DEFAULT_STORAGE_ROCKS_DB_PATH,
-    DEFAULT_STORAGE_SQLITE_DB_PATH, DEFAULT_STORAGE_TURSO_DB_PATH,
+    DEFAULT_REMOTE_REGION, DEFAULT_STORAGE_ROCKS_DB_PATH, DEFAULT_STORAGE_SQLITE_DB_PATH,
+    DEFAULT_STORAGE_TURSO_DB_PATH,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -107,6 +107,9 @@ pub struct PostgresBackendConfig {
     #[serde(default = "default_postgres_max_pool_size")]
     #[schemars(default = "default_postgres_max_pool_size")]
     pub max_pool_size: usize,
+    #[serde(default = "default_postgres_background_max_pool_size")]
+    #[schemars(default = "default_postgres_background_max_pool_size")]
+    pub background_max_pool_size: usize,
     #[serde(default)]
     #[schemars(default)]
     pub tls: bool,
@@ -116,7 +119,13 @@ pub struct PostgresBackendConfig {
 }
 
 fn default_postgres_max_pool_size() -> usize {
-    DEFAULT_POSTGRES_MAX_POOL_SIZE
+    std::thread::available_parallelism()
+        .map_or(20, |cores| usize::from(cores) + 8)
+        .max(20)
+}
+
+fn default_postgres_background_max_pool_size() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

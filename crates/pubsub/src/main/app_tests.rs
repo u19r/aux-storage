@@ -141,6 +141,7 @@ fn selected_pubsub_backend_prefers_explicit_non_default_backends() {
     backends.postgres = Some(PostgresBackendConfig {
         dsn: "postgres://localhost/pubsub".to_string(),
         max_pool_size: 4,
+        background_max_pool_size: 2,
         tls: false,
         immediate_gsi_consistency: false,
     });

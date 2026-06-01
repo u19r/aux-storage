@@ -16,6 +16,7 @@ rocksdb = ["storage/rocksdb", "storage-types/rocksdb"]
 foundationdb = ["storage/foundationdb"]
 queue = ["dep:queue", "dep:queue-provider"]
 pubsub = ["dep:pubsub", "dep:pubsub-provider"]
+tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -24,6 +25,7 @@ bg-jobs = { path = "../bg-jobs" }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { path = "../config" }
+console-subscriber = { version = "0.5.0", optional = true }
 http-error = { path = "../http-error" }
 http-request = { workspace = true }
 metrics = { workspace = true }
@@ -40,6 +42,7 @@ serde_json = { workspace = true }
 sql = { path = "../sql", default-features = false, optional = true }
 storage = { path = "../storage", default-features = false }
 storage-backfill = { path = "../storage-backfill" }
+storage-condition = { path = "../storage-condition" }
 storage-provider = { path = "../storage-provider" }
 storage-sync = { path = "../storage-sync" }
 storage-types = { path = "../storage-types", default-features = false }

@@ -21,6 +21,7 @@ foundationdb = { workspace = true, optional = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 lru-ttl-cache = { workspace = true }
+metrics = { workspace = true }
 metrics-facade = { workspace = true }
 pubsub-provider = { path = "../pubsub-provider" }
 queue-provider = { path = "../queue-provider" }

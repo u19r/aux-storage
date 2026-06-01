@@ -190,6 +190,61 @@ async fn put_item_condition_failure_returns_dynamodb_error_code() {
     assert_eq!(err.message, "The conditional request failed");
 }
 
+#[tokio::test]
+async fn put_item_condition_failure_returns_all_old_item_when_requested() {
+    let db = create_test_db_manager().await;
+
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "ConditionalPutAllOld",
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("create table");
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "ConditionalPutAllOld",
+            "Item": {
+                "id": {"S": "item1"},
+                "value": {"S": "old"}
+            }
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("seed item");
+
+    let err = handle_put_item(
+        db,
+        json!({
+            "TableName": "ConditionalPutAllOld",
+            "Item": {
+                "id": {"S": "item1"},
+                "value": {"S": "new"}
+            },
+            "ConditionExpression": "attribute_not_exists(id)",
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect_err("conditional put should fail");
+
+    let item = err.item.expect("conditional failure item");
+    assert_eq!(
+        item.get("value"),
+        Some(&AttributeValue::S("old".to_string()))
+    );
+}
+
 fn expect_get_item_response(response: Response) -> storage_types::GetItemResponse {
     match response {
         Response::GetItem(response) => response,

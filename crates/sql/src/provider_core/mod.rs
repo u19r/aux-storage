@@ -11,3 +11,5 @@ pub(crate) mod write;
 
 #[cfg(test)]
 mod table_lifecycle_tests;
+#[cfg(test)]
+mod write_alloc_tests;

@@ -73,8 +73,8 @@ impl SQLiteStorageProvider {
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                          key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification FROM tables WHERE table_name = ?1 ORDER BY \
-                         table_name LIMIT ?2",
+                         stream_specification, deletion_protection_enabled FROM tables WHERE \
+                         table_name = ?1 ORDER BY table_name LIMIT ?2",
                     )
                     .map_err(map_sqlite_error)?;
                 let rows = stmt
@@ -88,7 +88,8 @@ impl SQLiteStorageProvider {
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                          key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification FROM tables ORDER BY table_name LIMIT ?1",
+                         stream_specification, deletion_protection_enabled FROM tables ORDER BY \
+                         table_name LIMIT ?1",
                     )
                     .map_err(map_sqlite_error)?;
                 let rows = stmt
@@ -411,6 +412,7 @@ fn table_metadata_record_from_row(
     let table_size_bytes: i64 = row.get(7)?;
     let item_count: i64 = row.get(8)?;
     let stream_specification: Option<String> = row.get(9)?;
+    let deletion_protection_enabled: bool = row.get(10)?;
     let payload_json = serde_json::json!({
         "id": id,
         "table_name": table_name,
@@ -422,6 +424,7 @@ fn table_metadata_record_from_row(
         "table_size_bytes": table_size_bytes,
         "item_count": item_count,
         "stream_specification": stream_specification,
+        "deletion_protection_enabled": deletion_protection_enabled,
     })
     .to_string();
     Ok(LogicalBackfillRecord::DomainRecord {

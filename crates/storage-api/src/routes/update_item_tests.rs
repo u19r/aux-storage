@@ -6,7 +6,8 @@ use storage_types::{AttributeValue, TableName, UpdateItemRequest, UpdateItemResp
 
 use crate::{
     routes::routes_test_support::{
-        default_conformance_backends, handle_create_table, handle_put_item, handle_update_item,
+        default_conformance_backends, handle_create_table, handle_get_item, handle_put_item,
+        handle_update_item,
     },
     types::Response,
 };
@@ -144,6 +145,124 @@ async fn update_item_runtime_validation_matches_across_conformance_backends() {
 }
 
 #[tokio::test]
+async fn update_item_without_update_expression_is_noop_upsert_across_conformance_backends() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_hash_table(db.clone(), "UpdateNoopUpsert").await;
+        handle_put_item(
+            db.clone(),
+            json!({
+                "TableName": "UpdateNoopUpsert",
+                "Item": {
+                    "pk": {"S": "existing"},
+                    "payload": {"S": "keep"}
+                }
+            })
+            .try_into()
+            .expect("put item request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} seed item: {err:?}", backend.name));
+
+        let existing_response = handle_update_item(
+            db.clone(),
+            json!({
+                "TableName": "UpdateNoopUpsert",
+                "Key": {"pk": {"S": "existing"}}
+            })
+            .try_into()
+            .expect("existing no-op update request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} existing no-op update: {err:?}", backend.name));
+
+        let Response::UpdateItem(existing_response) = existing_response else {
+            panic!("{} expected existing UpdateItem response", backend.name);
+        };
+        assert_eq!(
+            serde_json::to_value(existing_response).expect("response json"),
+            json!({}),
+            "{} existing item response",
+            backend.name
+        );
+
+        let missing_response = handle_update_item(
+            db.clone(),
+            json!({
+                "TableName": "UpdateNoopUpsert",
+                "Key": {"pk": {"S": "missing"}}
+            })
+            .try_into()
+            .expect("missing no-op update request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} missing no-op update: {err:?}", backend.name));
+
+        let Response::UpdateItem(missing_response) = missing_response else {
+            panic!("{} expected missing UpdateItem response", backend.name);
+        };
+        assert_eq!(
+            serde_json::to_value(missing_response).expect("response json"),
+            json!({}),
+            "{} missing item response",
+            backend.name
+        );
+
+        let existing_item = expect_get_item_response(
+            handle_get_item(
+                db.clone(),
+                json!({
+                    "TableName": "UpdateNoopUpsert",
+                    "Key": {"pk": {"S": "existing"}},
+                    "ConsistentRead": true
+                })
+                .try_into()
+                .expect("get existing item request"),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} get existing item: {err:?}", backend.name)),
+        );
+        assert_eq!(
+            existing_item
+                .item
+                .and_then(|item| item.get("payload").cloned()),
+            Some(AttributeValue::S("keep".to_string())),
+            "{} existing item should be unchanged",
+            backend.name
+        );
+
+        let missing_item = expect_get_item_response(
+            handle_get_item(
+                db.clone(),
+                json!({
+                    "TableName": "UpdateNoopUpsert",
+                    "Key": {"pk": {"S": "missing"}},
+                    "ConsistentRead": true
+                })
+                .try_into()
+                .expect("get missing-upserted item request"),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} get missing-upserted item: {err:?}", backend.name)),
+        );
+        assert_eq!(
+            serde_json::to_value(missing_item).expect("missing item json"),
+            json!({"Item": {"pk": {"S": "missing"}}}),
+            "{} missing item should be key-only upsert",
+            backend.name
+        );
+    }
+}
+
+fn expect_get_item_response(response: Response) -> storage_types::GetItemResponse {
+    match response {
+        Response::GetItem(response) => response,
+        Response::GetWire(response) => response.into_get_item_response().unwrap(),
+        other => panic!("Expected GetItem response, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn update_item_condition_failure_matches_across_conformance_backends() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
@@ -192,6 +311,58 @@ async fn update_item_condition_failure_matches_across_conformance_backends() {
         );
         assert_eq!(
             err.message, "The conditional request failed",
+            "{}",
+            backend.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_item_condition_failure_returns_all_old_item_when_requested() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_hash_table(db.clone(), "UpdateConditionalAllOld").await;
+        handle_put_item(
+            db.clone(),
+            json!({
+                "TableName": "UpdateConditionalAllOld",
+                "Item": {
+                    "pk": {"S": "p"},
+                    "status": {"S": "open"}
+                }
+            })
+            .try_into()
+            .expect("put item request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} seed item: {err:?}", backend.name));
+
+        let err = handle_update_item(
+            db,
+            json!({
+                "TableName": "UpdateConditionalAllOld",
+                "Key": {"pk": {"S": "p"}},
+                "UpdateExpression": "SET #status = :next",
+                "ConditionExpression": "#status = :expected",
+                "ExpressionAttributeNames": {"#status": "status"},
+                "ExpressionAttributeValues": {
+                    ":next": {"S": "closed"},
+                    ":expected": {"S": "missing"}
+                },
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            })
+            .try_into()
+            .expect("update item request"),
+        )
+        .await
+        .expect_err("conditional update should fail");
+
+        let item = err
+            .item
+            .unwrap_or_else(|| panic!("{} conditional failure item", backend.name));
+        assert_eq!(
+            item.get("status"),
+            Some(&AttributeValue::S("open".to_string())),
             "{}",
             backend.name
         );

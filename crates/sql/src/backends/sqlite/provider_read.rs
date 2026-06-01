@@ -176,6 +176,7 @@ impl SQLiteStorageProvider {
         let read_target = plan_read_target(&request.table_name, &table_info, &request.index_name)?;
         let where_clause = parse_key_condition_expression(
             &request.key_condition_expression,
+            &read_target.key_schema,
             request.expression_attribute_names.as_ref(),
             request.expression_attribute_values.as_ref(),
         )?;

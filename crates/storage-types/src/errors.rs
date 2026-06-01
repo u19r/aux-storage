@@ -2,7 +2,7 @@ use std::fmt::Error;
 
 use thiserror::Error;
 
-use crate::{ItemKeyError, dynamodb_table_not_found_message, err_context};
+use crate::{AttributeMap, ItemKeyError, dynamodb_table_not_found_message, err_context};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageValidationKind {
@@ -98,6 +98,11 @@ pub enum StorageEnum {
     #[error("The conditional request failed")]
     ConditionalCheckFailed,
 
+    // ConditionalCheckFailedException with the item requested by
+    // ReturnValuesOnConditionCheckFailure.
+    #[error("The conditional request failed")]
+    ConditionalCheckFailedWithItem { item: AttributeMap },
+
     // Internal cache-authority guard conflict. Manager paths must translate
     // this to durable fallback, not Dynamo condition failure.
     #[error("Durable guard conflict.")]
@@ -119,6 +124,14 @@ pub enum StorageEnum {
     // ValidationException – DO NOT prefix with 'Validation error:' to keep exact message parity.
     #[error("{message}")]
     Validation { message: String },
+
+    // ValidationException with a DynamoDB message that must not be normalized by API adapters.
+    #[error("{message}")]
+    RawValidation { message: String },
+
+    // ValidationException for DynamoDB table deletion protection.
+    #[error("{message}")]
+    DeletionProtectionEnabled { table_name: String, message: String },
 
     // TransactionConflictException canonical message.
     #[error("Operation was rejected because there is an ongoing transaction for the item.")]
@@ -178,6 +191,21 @@ impl StorageError {
             StorageValidationInput::Message(message) => message,
         };
         Self::Base(StorageEnum::Validation { message })
+    }
+
+    pub fn raw_validation(message: impl Into<String>) -> Self {
+        Self::Base(StorageEnum::RawValidation {
+            message: message.into(),
+        })
+    }
+
+    pub fn deletion_protection_enabled(table_name: &(impl ToString + ?Sized)) -> Self {
+        Self::Base(StorageEnum::DeletionProtectionEnabled {
+            table_name: table_name.to_string(),
+            message: "Resource cannot be deleted as it is currently protected against deletion. \
+                      Disable deletion protection first."
+                .to_string(),
+        })
     }
 
     #[must_use]

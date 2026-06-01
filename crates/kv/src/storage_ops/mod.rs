@@ -10,16 +10,18 @@ mod resolved_sync_apply;
 mod write_helpers;
 
 pub(crate) use gsi::{GsiBackfillJob, GsiUpdateJob};
+#[cfg(test)]
+pub(crate) use provider_impl::{
+    TransactConditionBindingCacheEntry, cached_transact_condition_binding,
+    encode_requests_to_write_requests, normalize_conditional_transaction_error,
+    normalized_attribute_map_for_write, normalized_wire_item_for_write,
+    project_wire_item_table_key_and_ttl, ttl_index_direct_operations_for_wire_items,
+    ttl_tracking_enabled, wire_item_key_token_from_item_key,
+};
 pub(crate) use provider_impl::{
     compute_items_bytes, decode_wire_item_from_storage_bytes, encode_wire_item_storage_bytes,
     now_ms_u64, record_provider_stage, record_query_result, record_read, record_write,
     should_log_job,
-};
-#[cfg(test)]
-pub(crate) use provider_impl::{
-    encode_requests_to_write_requests, normalize_conditional_transaction_error,
-    project_wire_item_table_key_and_ttl, ttl_index_direct_operations_for_wire_items,
-    ttl_tracking_enabled, wire_item_key_token_from_item_key,
 };
 pub(crate) use write_helpers::{key_schema_for_gsi, project_gsi_item};
 

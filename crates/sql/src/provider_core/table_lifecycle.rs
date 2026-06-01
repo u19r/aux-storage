@@ -9,6 +9,7 @@ pub(crate) struct PreparedTableMetadata {
     pub(crate) key_schema_json: String,
     pub(crate) global_secondary_indexes_json: Option<String>,
     pub(crate) stream_specification_json: Option<String>,
+    pub(crate) deletion_protection_enabled: bool,
 }
 
 pub(crate) fn validate_create_table_request(request: &CreateTableRequest) -> StorageResult<()> {
@@ -38,6 +39,7 @@ pub(crate) fn prepare_table_metadata(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let deletion_protection_enabled = request.deletion_protection_enabled.unwrap_or(false);
 
     Ok(PreparedTableMetadata {
         created_at,
@@ -45,6 +47,7 @@ pub(crate) fn prepare_table_metadata(
         key_schema_json,
         global_secondary_indexes_json,
         stream_specification_json,
+        deletion_protection_enabled,
     })
 }
 

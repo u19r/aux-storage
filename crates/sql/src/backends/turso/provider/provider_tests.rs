@@ -647,7 +647,16 @@ async fn turso_put_update_delete_write_dynamodb_storage_stream_records() {
         .iter()
         .map(|record| record.sequence_number.clone())
         .collect::<Vec<_>>();
-    assert_eq!(sequence_numbers, vec!["1", "2", "3"]);
+    let cursors = records
+        .iter()
+        .map(|record| record.cursor.clone().expect("stream cursor"))
+        .collect::<Vec<_>>();
+    assert_eq!(sequence_numbers, cursors);
+    assert!(
+        sequence_numbers
+            .windows(2)
+            .all(|window| window[0] < window[1])
+    );
     assert!(
         records[2]
             .old_image
@@ -838,6 +847,229 @@ async fn turso_gsi_updates_are_delayed_by_default() {
 }
 
 #[tokio::test]
+async fn turso_gsi_update_job_drains_write_burst() {
+    let provider = create_test_provider().await;
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage tables");
+
+    let table_name = TableName::new("turso_gsi_burst_table");
+    provider
+        .create_table(&gsi_create_table_request(&table_name))
+        .await
+        .expect("create gsi table");
+
+    for batch_start in (0..96).step_by(24) {
+        let writes = (batch_start..batch_start + 24)
+            .map(|item_id| WriteRequest {
+                put_request: Some(PutRequest {
+                    item: HashMap::from([
+                        (
+                            "pk".to_string(),
+                            AttributeValue::S(format!("user-{item_id}")),
+                        ),
+                        (
+                            "gpk".to_string(),
+                            AttributeValue::S("group-burst".to_string()),
+                        ),
+                    ]),
+                }),
+                delete_request: None,
+            })
+            .collect();
+
+        provider
+            .batch_write_item(
+                BatchWriteItemRequest {
+                    request_items: HashMap::from([(table_name.clone(), writes)]),
+                    return_consumed_capacity: None,
+                    return_item_collection_metrics: None,
+                },
+                false,
+            )
+            .await
+            .expect("write burst batch");
+    }
+
+    let before = query_gsi_group(&provider, table_name.clone(), "group-burst").await;
+    assert!(
+        before.is_empty(),
+        "default mode should delay burst GSI rows"
+    );
+
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("run gsi update job");
+
+    let after = query_gsi_group(&provider, table_name, "group-burst").await;
+    assert_eq!(after.len(), 96);
+    assert!(
+        !provider.gsi_propagation_governor.lag_above_target(),
+        "gsi lag should reset after draining the stream"
+    );
+}
+
+#[tokio::test]
+async fn turso_gsi_update_job_removes_stale_keys_after_repeated_overwrites() {
+    let provider = create_test_provider().await;
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage tables");
+
+    let table_name = TableName::new("turso_gsi_repeated_overwrite_table");
+    provider
+        .create_table(&gsi_create_table_request(&table_name))
+        .await
+        .expect("create gsi table");
+
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", Some("group-1")).await;
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("publish initial gsi row");
+    assert_eq!(
+        query_gsi_group(&provider, table_name.clone(), "group-1")
+            .await
+            .len(),
+        1
+    );
+
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", Some("group-2")).await;
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", Some("group-3")).await;
+
+    assert_eq!(
+        query_gsi_group(&provider, table_name.clone(), "group-1")
+            .await
+            .len(),
+        1,
+        "default mode should leave the old GSI key visible before catch-up"
+    );
+    assert!(
+        query_gsi_group(&provider, table_name.clone(), "group-3")
+            .await
+            .is_empty(),
+        "default mode should delay the newest GSI key before catch-up"
+    );
+
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("catch up repeated gsi moves");
+
+    assert!(
+        query_gsi_group(&provider, table_name.clone(), "group-1")
+            .await
+            .is_empty(),
+        "catch-up must remove the original stale GSI key"
+    );
+    assert!(
+        query_gsi_group(&provider, table_name.clone(), "group-2")
+            .await
+            .is_empty(),
+        "catch-up must remove the intermediate stale GSI key"
+    );
+    assert_eq!(
+        query_gsi_group(&provider, table_name, "group-3")
+            .await
+            .len(),
+        1,
+        "catch-up must publish only the latest GSI key"
+    );
+}
+
+#[tokio::test]
+async fn turso_gsi_update_job_removes_index_entry_when_gsi_key_is_removed() {
+    let provider = create_test_provider().await;
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage tables");
+
+    let table_name = TableName::new("turso_gsi_key_removed_table");
+    provider
+        .create_table(&gsi_create_table_request(&table_name))
+        .await
+        .expect("create gsi table");
+
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", Some("group-1")).await;
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("publish initial gsi row");
+    assert_eq!(
+        query_gsi_group(&provider, table_name.clone(), "group-1")
+            .await
+            .len(),
+        1
+    );
+
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", None).await;
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("catch up gsi key removal");
+
+    assert!(
+        query_gsi_group(&provider, table_name, "group-1")
+            .await
+            .is_empty(),
+        "catch-up must remove the GSI row when the item no longer has the GSI key"
+    );
+}
+
+#[tokio::test]
+async fn turso_gsi_update_job_removes_index_entry_on_delete() {
+    let provider = create_test_provider().await;
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage tables");
+
+    let table_name = TableName::new("turso_gsi_delete_table");
+    provider
+        .create_table(&gsi_create_table_request(&table_name))
+        .await
+        .expect("create gsi table");
+
+    put_turso_gsi_item(&provider, table_name.clone(), "user-1", Some("group-1")).await;
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("publish initial gsi row");
+    assert_eq!(
+        query_gsi_group(&provider, table_name.clone(), "group-1")
+            .await
+            .len(),
+        1
+    );
+
+    provider
+        .delete_item(
+            table_name.clone(),
+            HashMap::from([("pk".to_string(), AttributeValue::S("user-1".to_string()))]).into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("delete item");
+    provider
+        .run_job(storage_common::GSI_UPDATE_JOB)
+        .await
+        .expect("catch up delete");
+
+    assert!(
+        query_gsi_group(&provider, table_name, "group-1")
+            .await
+            .is_empty(),
+        "catch-up must remove a stale GSI row for a deleted item"
+    );
+}
+
+#[tokio::test]
 #[ignore = "manual full GSI update job profile"]
 async fn turso_gsi_update_job_realistic_batch_profile() {
     let provider = create_test_provider().await;
@@ -1000,4 +1232,21 @@ async fn query_gsi_group(
         .await
         .expect("query immediate gsi")
         .0
+}
+
+async fn put_turso_gsi_item(
+    provider: &TursoStorageProvider,
+    table_name: TableName,
+    pk: &str,
+    gpk: Option<&str>,
+) {
+    let mut item = HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]);
+    if let Some(gpk) = gpk {
+        item.insert("gpk".to_string(), AttributeValue::S(gpk.to_string()));
+    }
+
+    provider
+        .put_item(table_name, item, None, None, None, None)
+        .await
+        .expect("put gsi test item");
 }

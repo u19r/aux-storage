@@ -79,15 +79,16 @@ pub(super) fn get_attribute_value<'a>(
     get_path_value(item, &path)
 }
 
-pub(super) fn remove_attribute_value(item: &mut HashMap<String, AttributeValue>, field: &str) {
+pub(super) fn remove_attribute_value(
+    item: &mut HashMap<String, AttributeValue>,
+    field: &str,
+) -> StorageResult<()> {
     if is_top_level_path(field) {
         item.remove(field);
-        return;
+        return Ok(());
     }
-    let Ok(path) = parse_update_path(field) else {
-        return;
-    };
-    remove_path_value(item, &path);
+    let path = parse_update_path(field)?;
+    remove_path_value(item, &path)
 }
 
 fn is_top_level_path(field: &str) -> bool {
@@ -254,25 +255,32 @@ fn set_nested_path_value(
     }
 }
 
-fn remove_path_value(item: &mut HashMap<String, AttributeValue>, path: &[UpdatePathSegment]) {
+fn remove_path_value(
+    item: &mut HashMap<String, AttributeValue>,
+    path: &[UpdatePathSegment],
+) -> StorageResult<()> {
     let Some((first, rest)) = path.split_first() else {
-        return;
+        return Ok(());
     };
     let UpdatePathSegment::Name(name) = first else {
-        return;
+        return Ok(());
     };
     if rest.is_empty() {
         item.remove(name);
-        return;
+        return Ok(());
     }
-    if let Some(root) = item.get_mut(name) {
-        remove_nested_path_value(root, rest);
-    }
+    let Some(root) = item.get_mut(name) else {
+        return remove_missing_path_result(rest);
+    };
+    remove_nested_path_value(root, rest)
 }
 
-fn remove_nested_path_value(current: &mut AttributeValue, path: &[UpdatePathSegment]) {
+fn remove_nested_path_value(
+    current: &mut AttributeValue,
+    path: &[UpdatePathSegment],
+) -> StorageResult<()> {
     let Some((segment, rest)) = path.split_first() else {
-        return;
+        return Ok(());
     };
     if rest.is_empty() {
         match (segment, current) {
@@ -286,19 +294,35 @@ fn remove_nested_path_value(current: &mut AttributeValue, path: &[UpdatePathSegm
             }
             _ => {}
         }
-        return;
+        return Ok(());
     }
     match (segment, current) {
         (UpdatePathSegment::Name(name), AttributeValue::M(map)) => {
-            if let Some(next) = map.get_mut(name) {
-                remove_nested_path_value(next, rest);
-            }
+            let Some(next) = map.get_mut(name) else {
+                return remove_missing_path_result(rest);
+            };
+            remove_nested_path_value(next, rest)
         }
         (UpdatePathSegment::Index(index), AttributeValue::L(list)) => {
-            if let Some(next) = list.get_mut(*index) {
-                remove_nested_path_value(next, rest);
-            }
+            let Some(next) = list.get_mut(*index) else {
+                return remove_missing_path_result(rest);
+            };
+            remove_nested_path_value(next, rest)
         }
-        _ => {}
+        _ => Err(invalid_update_document_path()),
     }
+}
+
+fn remove_missing_path_result(rest: &[UpdatePathSegment]) -> StorageResult<()> {
+    if rest.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_update_document_path())
+    }
+}
+
+fn invalid_update_document_path() -> StorageError {
+    StorageError::validation(
+        "The document path provided in the update expression is invalid for update",
+    )
 }

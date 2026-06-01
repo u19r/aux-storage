@@ -2,13 +2,15 @@ use std::collections::HashMap;
 
 use storage_common::ttl::TtlConfigRecord;
 use storage_types::{
-    AttributeValue, KeyAttributes, PreparedBatchOperation, StorageEnum, StorageError, TableName,
+    AttributeValue, KeyAttributes, PreparedBatchOperation, StorageError, TableName,
     TimeToLiveStatus, context::ErrorContext as _,
 };
 
 use crate::{
-    SQLiteStorageProvider, error_handler::map_sqlite_error, stream_writer::write_stream_entries,
-    utils::SqliteConn,
+    SQLiteStorageProvider,
+    error_handler::map_sqlite_error,
+    stream_writer::write_stream_entries,
+    utils::{SqliteConn, main_table_attributes_blob},
 };
 
 pub(crate) fn execute_prepared_batch_operation(
@@ -168,11 +170,7 @@ pub(crate) fn execute_put_item_sql(
         })
         .collect::<Result<Vec<_>, StorageError>>()?;
 
-    let non_key_json = if non_key_attributes.is_empty() {
-        "{}".to_string()
-    } else {
-        serde_json::to_string(non_key_attributes).map_err(StorageEnum::Serialization)?
-    };
+    let non_key_json = main_table_attributes_blob(key_attributes, non_key_attributes)?;
 
     sqlite
         .execute(

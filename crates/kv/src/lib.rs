@@ -41,6 +41,8 @@ pub use backends::rocksdb::RocksDbKvStore;
 pub use sorted_kv::SortedKvDbStorageProvider;
 
 #[cfg(test)]
+mod helpers_tests;
+#[cfg(test)]
 mod key_template_tests;
 #[cfg(test)]
 mod keys_tests;

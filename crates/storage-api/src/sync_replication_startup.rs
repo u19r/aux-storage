@@ -1,6 +1,8 @@
+use std::sync::Arc;
+#[cfg(any(test, feature = "sqlite"))]
+use std::time::Duration;
 #[cfg(any(test, feature = "sqlite"))]
 use std::{collections::BTreeMap, path::Path};
-use std::{sync::Arc, time::Duration};
 
 use config::StorageSyncReplicationConfig;
 #[cfg(any(test, feature = "sqlite"))]

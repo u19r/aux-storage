@@ -15,6 +15,8 @@ pub struct StoredTableInfo {
     pub table_size_bytes: u64,
     pub item_count: u64,
     pub stream_specification: Option<StreamSpecification>,
+    #[serde(default)]
+    pub deletion_protection_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

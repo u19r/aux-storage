@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::collections::{BTreeMap, HashMap};
 
 use storage_sync::SyncWriteRequest;
 use storage_types::{
     DurableTransactWriteGuard, GuardedTransactWriteItemsRequest, StorageError, StorageResult,
-    TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    TableNamespace, TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
 };
 
 use crate::{
@@ -15,22 +15,43 @@ use crate::{
         transact_item_table_name, validate_transact_write_item_expression_usage,
         write_bulk_ops::RoutedWriteDispatchKey,
     },
-    namespace_routing::NamespaceStorageMode,
+    namespace_routing::{NamespaceRouteRecord, NamespaceStorageMode},
     point_read_cache::{AuthoritativePointReadPurpose, PointReadGetRequest},
     updated_at_apply::{refresh_existing_transact_write_item_timestamp, stamp_transact_write_item},
 };
+
+struct PreparedTransactWriteItems {
+    request: TransactWriteItemsRequest,
+    client_request_token: Option<String>,
+    return_consumed_capacity: Option<String>,
+    return_item_collection_metrics: Option<String>,
+    pending_routes: HashMap<TableNamespace, NamespaceRouteRecord>,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
 
 impl DatabaseManager {
     pub async fn transact_write_items(
         &self,
         request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
-        let started = Instant::now();
+        let prepared = self.prepare_transact_write_items(request).await?;
+        if self.single_node_sync_mode_enabled() {
+            return self.transact_write_items_single_node_sync(prepared).await;
+        }
+        if self.route_resolver.is_none() {
+            return self.transact_write_items_unrouted(prepared).await;
+        }
+        self.transact_write_items_routed(prepared).await
+    }
+
+    async fn prepare_transact_write_items(
+        &self,
+        request: TransactWriteItemsRequest,
+    ) -> StorageResult<PreparedTransactWriteItems> {
         let mut request = request;
         let client_request_token = request.client_request_token.clone();
         let return_consumed_capacity = request.return_consumed_capacity.clone();
         let return_item_collection_metrics = request.return_item_collection_metrics.clone();
-        let operation_count = request.transact_items.len();
 
         for item in &mut request.transact_items {
             if self.single_table_mode_enabled() {
@@ -40,112 +61,158 @@ impl DatabaseManager {
             }
             validate_transact_write_item_expression_usage(item)?;
         }
-        let validation_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let route_started = Instant::now();
         let pending_routes =
             Self::pending_namespace_routes_from_transact_write_items(&request.transact_items)?;
-        let routing_prepare_ms = route_started.elapsed().as_secs_f64() * 1000.0;
-        let cache_plan_started = Instant::now();
-        let cache_effects = if self.cache_write_effects_enabled() {
-            let cache_write_planner = self.cache_write_planner();
-            cache_write_planner
-                .plan_transact_write_cache_effects(&request.transact_items, &pending_routes)
-                .await?
-        } else {
-            self.empty_cache_write_effects()
-        };
-        let cache_plan_ms = cache_plan_started.elapsed().as_secs_f64() * 1000.0;
-        if self.single_node_sync_mode_enabled() {
-            if client_request_token.is_some() {
-                return Err(StorageError::unsupported(
-                    "TransactWriteItems client request tokens are not implemented for single-node \
-                     sync routing yet",
-                ));
-            }
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let storage_started = Instant::now();
-                        self.run_single_node_sync_write_request(
-                            "transact_write_items",
-                            SyncWriteRequest::TransactWriteItems(request),
-                        )
-                        .await?;
-                        let storage_ms = storage_started.elapsed().as_secs_f64() * 1000.0;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        tracing::debug!(
-                            operation_count,
-                            validation_ms,
-                            routing_prepare_ms,
-                            cache_plan_ms,
-                            storage_ms,
-                            total_ms = started.elapsed().as_secs_f64() * 1000.0,
-                            "storage sync transact_write_items phase timing"
-                        );
-                        Ok(TransactWriteItemsResponse {
-                            consumed_capacity: None,
-                            item_collection_metrics: None,
-                        })
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
-        if self.route_resolver.is_none() {
-            if let Some(response) = self
-                .try_cached_guarded_transact_write_items(
-                    &request,
-                    cache_effects.clone(),
-                    TransactionTiming {
-                        operation_count,
-                        validation_ms,
-                        routing_prepare_ms,
-                        cache_plan_ms,
-                        started,
-                    },
-                )
-                .await?
-            {
-                return Ok(response);
-            }
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let storage_started = Instant::now();
-                        let response = record_storage_operation(
-                            "transact_write_items",
-                            self.storage.transact_write_items(request),
-                        )
-                        .await?;
-                        let storage_ms = storage_started.elapsed().as_secs_f64() * 1000.0;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        tracing::debug!(
-                            operation_count,
-                            validation_ms,
-                            routing_prepare_ms,
-                            cache_plan_ms,
-                            storage_ms,
-                            total_ms = started.elapsed().as_secs_f64() * 1000.0,
-                            "storage transact_write_items phase timing"
-                        );
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
+        let cache_effects = self
+            .plan_transact_write_cache_effects(&request.transact_items, &pending_routes)
+            .await?;
+        Ok(PreparedTransactWriteItems {
+            request,
+            client_request_token,
+            return_consumed_capacity,
+            return_item_collection_metrics,
+            pending_routes,
+            cache_effects,
+        })
+    }
 
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_transact_write_cache_effects(
+        &self,
+        transact_items: &[TransactWriteItem],
+        pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        if !self.cache_write_effects_enabled() {
+            return Ok(self.empty_cache_write_effects());
+        }
+        self.cache_write_planner()
+            .plan_transact_write_cache_effects(transact_items, pending_routes)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_transact_write_cache_effects(
+        &self,
+        _transact_items: &[TransactWriteItem],
+        _pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn transact_write_items_single_node_sync(
+        &self,
+        prepared: PreparedTransactWriteItems,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let PreparedTransactWriteItems {
+            request,
+            client_request_token,
+            cache_effects,
+            ..
+        } = prepared;
+        if client_request_token.is_some() {
+            return Err(StorageError::unsupported(
+                "TransactWriteItems client request tokens are not implemented for single-node \
+                 sync routing yet",
+            ));
+        }
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                self.run_single_node_sync_write_request(
+                    "transact_write_items",
+                    SyncWriteRequest::TransactWriteItems(request),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(TransactWriteItemsResponse {
+                    consumed_capacity: None,
+                    item_collection_metrics: None,
+                })
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn transact_write_items_unrouted(
+        &self,
+        prepared: PreparedTransactWriteItems,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        if let Some(response) = self
+            .try_cached_guarded_transact_write_items(
+                &prepared.request,
+                prepared.cache_effects.clone(),
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+        let PreparedTransactWriteItems {
+            request,
+            cache_effects,
+            ..
+        } = prepared;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = record_storage_operation(
+                    "transact_write_items",
+                    self.storage.transact_write_items(request),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn transact_write_items_routed(
+        &self,
+        prepared: PreparedTransactWriteItems,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let PreparedTransactWriteItems {
+            request,
+            client_request_token,
+            return_consumed_capacity,
+            return_item_collection_metrics,
+            pending_routes,
+            cache_effects,
+        } = prepared;
+        let per_connection = self
+            .plan_routed_transact_write_items(request.transact_items, &pending_routes)
+            .await?;
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                self.execute_routed_transact_write_items(
+                    per_connection,
+                    client_request_token,
+                    return_consumed_capacity,
+                    return_item_collection_metrics,
+                )
+                .await
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn plan_routed_transact_write_items(
+        &self,
+        transact_items: Vec<TransactWriteItem>,
+        pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
+    ) -> StorageResult<BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest>> {
         let default_connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
         let mut per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest> =
             BTreeMap::new();
-        for item in request.transact_items {
+        for item in transact_items {
             let logical_table = transact_item_table_name(&item)?;
             let route = self
-                .resolve_namespace_route_for_table(&logical_table)
+                .resolve_namespace_route_for_table_with_pending(&logical_table, pending_routes)
                 .await?;
             if let Some(route) = route {
                 ensure_route_writes_not_paused(&route)?;
@@ -189,61 +256,46 @@ impl DatabaseManager {
                     .push(item);
             }
         }
+        Ok(per_connection)
+    }
 
-        self.execute_with_cache_effects(
-            PreparedCacheWrite::Effects(cache_effects.clone()),
-            || async {
-                let storage_started = Instant::now();
-                let mut primary_response: Option<TransactWriteItemsResponse> = None;
-                let mut dispatch_count = 0usize;
-                for (dispatch_key, mut request_for_connection) in per_connection {
-                    request_for_connection.client_request_token = client_request_token.clone();
-                    request_for_connection.return_consumed_capacity =
-                        return_consumed_capacity.clone();
-                    request_for_connection.return_item_collection_metrics =
-                        return_item_collection_metrics.clone();
+    async fn execute_routed_transact_write_items(
+        &self,
+        per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest>,
+        client_request_token: Option<String>,
+        return_consumed_capacity: Option<String>,
+        return_item_collection_metrics: Option<String>,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        let mut primary_response: Option<TransactWriteItemsResponse> = None;
+        for (dispatch_key, mut request_for_connection) in per_connection {
+            request_for_connection.client_request_token = client_request_token.clone();
+            request_for_connection.return_consumed_capacity = return_consumed_capacity.clone();
+            request_for_connection.return_item_collection_metrics =
+                return_item_collection_metrics.clone();
 
-                    let provider =
-                        self.provider_for_request_connection(&dispatch_key.connection_id)?;
-                    let response = record_storage_operation_for_target(
-                        "transact_write_items",
-                        dispatch_key.target_role,
-                        provider.transact_write_items(request_for_connection),
-                    )
-                    .await?;
-                    if primary_response.is_none() {
-                        primary_response = Some(response);
-                    }
-                    dispatch_count += 1;
-                    self.maybe_run_gsi_maintenance_for_connection(&dispatch_key.connection_id)
-                        .await?;
-                }
+            let provider = self.provider_for_request_connection(&dispatch_key.connection_id)?;
+            let response = record_storage_operation_for_target(
+                "transact_write_items",
+                dispatch_key.target_role,
+                provider.transact_write_items(request_for_connection),
+            )
+            .await?;
+            if primary_response.is_none() {
+                primary_response = Some(response);
+            }
+            self.maybe_run_gsi_maintenance_for_connection(&dispatch_key.connection_id)
+                .await?;
+        }
 
-                let response = primary_response.ok_or_else(|| {
-                    StorageError::internal("transact_write_items routing produced no write targets")
-                })?;
-                tracing::debug!(
-                    operation_count,
-                    validation_ms,
-                    routing_prepare_ms,
-                    cache_plan_ms,
-                    storage_ms = storage_started.elapsed().as_secs_f64() * 1000.0,
-                    dispatch_count,
-                    total_ms = started.elapsed().as_secs_f64() * 1000.0,
-                    "storage transact_write_items phase timing"
-                );
-                Ok(response)
-            },
-            |response| async { Ok((response, cache_effects)) },
-        )
-        .await
+        primary_response.ok_or_else(|| {
+            StorageError::internal("transact_write_items routing produced no write targets")
+        })
     }
 
     async fn try_cached_guarded_transact_write_items(
         &self,
         request: &TransactWriteItemsRequest,
         cache_effects: storage_cache::RuntimeWriteEffects,
-        timing: TransactionTiming,
     ) -> StorageResult<Option<TransactWriteItemsResponse>> {
         if !self.cache_services.authoritative_write_preimages_enabled() {
             return Ok(None);
@@ -262,7 +314,6 @@ impl DatabaseManager {
         self.cache_services
             .prepare_write_intents(&cache_effects)
             .await?;
-        let storage_started = Instant::now();
         let guarded_request = GuardedTransactWriteItemsRequest {
             request: request.clone(),
             guards,
@@ -293,15 +344,6 @@ impl DatabaseManager {
         self.cache_services
             .apply_write_effects(&cache_effects)
             .await?;
-        tracing::debug!(
-            operation_count = timing.operation_count,
-            validation_ms = timing.validation_ms,
-            routing_prepare_ms = timing.routing_prepare_ms,
-            cache_plan_ms = timing.cache_plan_ms,
-            storage_ms = storage_started.elapsed().as_secs_f64() * 1000.0,
-            total_ms = timing.started.elapsed().as_secs_f64() * 1000.0,
-            "storage guarded transact_write_items phase timing"
-        );
         Ok(Some(response))
     }
 
@@ -364,12 +406,4 @@ impl DatabaseManager {
         }
         Ok(None)
     }
-}
-
-struct TransactionTiming {
-    operation_count: usize,
-    validation_ms: f64,
-    routing_prepare_ms: f64,
-    cache_plan_ms: f64,
-    started: Instant,
 }

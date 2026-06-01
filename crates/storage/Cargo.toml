@@ -27,6 +27,7 @@ rocksdb = ["dep:kv", "storage-types/rocksdb", "stream/rocksdb"]
 foundationdb = ["dep:kv", "kv/foundationdb-backend", "stream/foundationdb"]
 remote = ["dep:storage-remote"]
 opt-loop-profiling = ["dep:opt-loop-probe"]
+cache-write-planner = []
 
 [dependencies]
 async-trait = { workspace = true }
@@ -36,6 +37,7 @@ config = { path = "../config" }
 futures = { workspace = true }
 kv = { path = "../kv", optional = true }
 lru-ttl-cache = { workspace = true }
+metrics = { workspace = true }
 metrics-facade = { workspace = true }
 opt-loop-probe = { workspace = true, optional = true }
 pubsub-provider = { path = "../pubsub-provider" }

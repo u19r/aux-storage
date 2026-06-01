@@ -1,4 +1,8 @@
-use crate::extract_expression_attribute_placeholders;
+use smallvec::SmallVec;
+
+use crate::collect_expression_attribute_placeholder_refs;
+
+const MAX_EXPRESSION_SUBSTITUTION_BYTES: usize = 2 * 1024 * 1024;
 
 const DYNAMODB_RESERVED_WORDS: &str =
     "\
@@ -63,7 +67,32 @@ pub(crate) fn validate_expression_attribute_value_keys(
             prefixed,
         ));
     }
+    let value_size = values.iter().try_fold(0usize, |size, (key, value)| {
+        serde_json::to_vec(value)
+            .map(|encoded| size + key.len() + encoded.len())
+            .map_err(|err| format!("Invalid ExpressionAttributeValues: {err}"))
+    })?;
+    if value_size > MAX_EXPRESSION_SUBSTITUTION_BYTES {
+        return Err(validation_message(
+            "ExpressionAttributeValues exceeds max size".to_string(),
+            prefixed,
+        ));
+    }
     for key in values.keys() {
+        if key.len() > 255 {
+            let size_suffix = if prefixed {
+                format!(" size of key: {}", key.len())
+            } else {
+                String::new()
+            };
+            return Err(validation_message(
+                format!(
+                    "ExpressionAttributeValues contains invalid key: The expression attribute map \
+                     contains a key that is too long;{size_suffix}"
+                ),
+                prefixed,
+            ));
+        }
         let mut chars = key.chars();
         if chars.next() != Some(':')
             || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
@@ -93,7 +122,27 @@ pub(crate) fn validate_expression_attribute_name_keys(
             prefixed,
         ));
     }
+    let name_size = names
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum::<usize>();
+    if name_size > MAX_EXPRESSION_SUBSTITUTION_BYTES {
+        return Err(validation_message(
+            "ExpressionAttributeNames exceeds max size".to_string(),
+            prefixed,
+        ));
+    }
     for key in names.keys() {
+        if key.len() > 255 {
+            return Err(validation_message(
+                format!(
+                    "ExpressionAttributeNames contains invalid key: The expression attribute map \
+                     contains a key that is too long; size of key: {}",
+                    key.len()
+                ),
+                prefixed,
+            ));
+        }
         let mut chars = key.chars();
         if chars.next() != Some('#')
             || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
@@ -122,34 +171,63 @@ where
     let expressions = expressions
         .into_iter()
         .filter_map(|(expression, label)| expression.map(|expression| (expression, label)))
-        .collect::<Vec<_>>();
+        .map(ExpressionValidationContext::new)
+        .collect::<SmallVec<[_; 2]>>();
 
-    for (expression, label) in &expressions {
-        validate_expression_shape(expression, label, prefixed)?;
-        validate_expression_names(expression, label, names, prefixed)?;
-        validate_update_expression_paths(expression, label, names, prefixed)?;
-        validate_expression_values(expression, label, values, prefixed)?;
-        validate_update_add_delete_value_types(expression, label, values, prefixed)?;
+    for context in &expressions {
+        validate_expression_shape(context, names, prefixed)?;
+        validate_expression_names(context, names, prefixed)?;
+        validate_projection_expression_paths(context.expression, context.label, names, prefixed)?;
+        validate_update_expression_paths(context, names, prefixed)?;
+        validate_expression_values(context, values, prefixed)?;
+        validate_update_add_delete_value_types(context, values, prefixed)?;
     }
 
     validate_unused_expression_names(names, &expressions, prefixed)?;
     validate_unused_expression_values(values, &expressions, prefixed)
 }
 
+struct ExpressionValidationContext<'a> {
+    expression: &'a str,
+    label: &'static str,
+    used_names: SmallVec<[&'a str; 8]>,
+    used_values: SmallVec<[&'a str; 8]>,
+    update_sections: Option<SmallVec<[UpdateExpressionSection<'a>; 4]>>,
+}
+
+impl<'a> ExpressionValidationContext<'a> {
+    fn new((expression, label): (&'a str, &'static str)) -> Self {
+        let mut used_names = SmallVec::new();
+        let mut used_values = SmallVec::new();
+        collect_expression_attribute_placeholder_refs(
+            expression,
+            &mut used_names,
+            &mut used_values,
+        );
+        let update_sections =
+            (label == "UpdateExpression").then(|| update_expression_sections(expression));
+        Self {
+            expression,
+            label,
+            used_names,
+            used_values,
+            update_sections,
+        }
+    }
+}
+
 fn validate_expression_names(
-    expression: &str,
-    label: &str,
+    context: &ExpressionValidationContext<'_>,
     names: Option<&std::collections::HashMap<String, String>>,
     prefixed: bool,
 ) -> Result<(), String> {
-    let used_names = extract_expression_attribute_placeholders(expression).0;
-
-    for name in used_names {
-        if names.is_none_or(|names| !names.contains_key(&name)) {
+    for &name in &context.used_names {
+        if names.is_none_or(|names| !names.contains_key(name)) {
             return Err(validation_message(
                 format!(
-                    "Invalid {label}: An expression attribute name used in the document path is \
-                     not defined; attribute name: {name}"
+                    "Invalid {}: An expression attribute name used in the document path is not \
+                     defined; attribute name: {name}",
+                    context.label
                 ),
                 prefixed,
             ));
@@ -159,20 +237,22 @@ fn validate_expression_names(
 }
 
 fn validate_update_add_delete_value_types(
-    expression: &str,
-    label: &str,
+    context: &ExpressionValidationContext<'_>,
     values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
     prefixed: bool,
 ) -> Result<(), String> {
-    if label != "UpdateExpression" {
+    if context.label != "UpdateExpression" {
         return Ok(());
     }
     let Some(values) = values else {
         return Ok(());
     };
 
-    for section in update_expression_sections(expression)
-        .into_iter()
+    for section in context
+        .update_sections
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
         .filter(|section| matches!(section.keyword, "ADD" | "DELETE"))
     {
         for action in split_top_level_args(section.body) {
@@ -238,28 +318,26 @@ fn update_action_operand_type_name(value: &crate::AttributeValue) -> &'static st
 }
 
 fn validate_expression_values(
-    expression: &str,
-    label: &str,
+    context: &ExpressionValidationContext<'_>,
     values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
     prefixed: bool,
 ) -> Result<(), String> {
-    let used_values = extract_expression_attribute_placeholders(expression).1;
-
-    for value in used_values {
-        if values.is_none_or(|values| !values.contains_key(&value)) {
+    for &value in &context.used_values {
+        if values.is_none_or(|values| !values.contains_key(value)) {
             return Err(validation_message(
                 format!(
-                    "Invalid {label}: An expression attribute value used in expression is not \
-                     defined; attribute value: {value}"
+                    "Invalid {}: An expression attribute value used in expression is not defined; \
+                     attribute value: {value}",
+                    context.label
                 ),
                 prefixed,
             ));
         }
     }
-    validate_expression_attribute_value_payloads(label, values, prefixed)?;
-    validate_begins_with_value_operands(expression, label, values, prefixed)?;
-    validate_attribute_type_value_operands(expression, label, values, prefixed)?;
-    validate_between_bounds(expression, label, values, prefixed)?;
+    validate_expression_attribute_value_payloads(context.label, values, prefixed)?;
+    validate_begins_with_value_operands(context.expression, context.label, values, prefixed)?;
+    validate_attribute_type_value_operands(context.expression, context.label, values, prefixed)?;
+    validate_between_bounds(context.expression, context.label, values, prefixed)?;
     Ok(())
 }
 
@@ -283,19 +361,19 @@ fn validate_expression_attribute_value_payloads(
 
 fn validate_unused_expression_names(
     names: Option<&std::collections::HashMap<String, String>>,
-    expressions: &[(&str, &str)],
+    expressions: &[ExpressionValidationContext<'_>],
     prefixed: bool,
 ) -> Result<(), String> {
     let Some(names) = names else {
         return Ok(());
     };
-    let used_names = expressions
-        .iter()
-        .flat_map(|(expression, _)| extract_expression_attribute_placeholders(expression).0)
-        .collect::<std::collections::HashSet<_>>();
     let mut unused_names = names
         .keys()
-        .filter(|key| !used_names.contains(*key))
+        .filter(|key| {
+            !expressions
+                .iter()
+                .any(|context| context.used_names.contains(&key.as_str()))
+        })
         .cloned()
         .collect::<Vec<_>>();
     unused_names.sort();
@@ -313,19 +391,19 @@ fn validate_unused_expression_names(
 
 fn validate_unused_expression_values(
     values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
-    expressions: &[(&str, &str)],
+    expressions: &[ExpressionValidationContext<'_>],
     prefixed: bool,
 ) -> Result<(), String> {
     let Some(values) = values else {
         return Ok(());
     };
-    let used_values = expressions
-        .iter()
-        .flat_map(|(expression, _)| extract_expression_attribute_placeholders(expression).1)
-        .collect::<std::collections::HashSet<_>>();
     let mut unused_values = values
         .keys()
-        .filter(|key| !used_values.contains(*key))
+        .filter(|key| {
+            !expressions
+                .iter()
+                .any(|context| context.used_values.contains(&key.as_str()))
+        })
         .cloned()
         .collect::<Vec<_>>();
     unused_values.sort();
@@ -341,23 +419,39 @@ fn validate_unused_expression_values(
     ))
 }
 
-fn validate_expression_shape(expression: &str, label: &str, prefixed: bool) -> Result<(), String> {
+fn validate_expression_shape(
+    context: &ExpressionValidationContext<'_>,
+    names: Option<&std::collections::HashMap<String, String>>,
+    prefixed: bool,
+) -> Result<(), String> {
+    let expression = context.expression;
+    let label = context.label;
+    if let Some(error) = invalid_function_name_error(expression, label) {
+        return Err(validation_message(error, prefixed));
+    }
     if let Some(error) = document_path_index_syntax_error(expression, label) {
         return Err(validation_message(error, prefixed));
     }
     if let Some(error) = function_context_error(expression, label) {
         return Err(validation_message(error, prefixed));
     }
-    if let Some(error) = update_expression_grammar_error(expression, label) {
+    if label == "UpdateExpression"
+        && let Some(error) = update_expression_grammar_error_for_sections(
+            context.update_sections.as_deref().unwrap_or_default(),
+        )
+    {
         return Err(validation_message(error, prefixed));
     }
     if let Some(error) = function_syntax_or_arity_error(expression, label) {
         return Err(validation_message(error, prefixed));
     }
-    if let Some(error) = contains_same_operand_error(expression, label) {
+    if let Some(error) = contains_same_operand_error(expression, label, names) {
         return Err(validation_message(error, prefixed));
     }
     if let Some(error) = attribute_type_literal_operand_error(expression, label) {
+        return Err(validation_message(error, prefixed));
+    }
+    if let Some(error) = in_operand_count_error(expression, label) {
         return Err(validation_message(error, prefixed));
     }
     if let Some(reserved_word) = reserved_word_in_expression(expression, label) {
@@ -381,7 +475,134 @@ fn validate_expression_shape(expression: &str, label: &str, prefixed: bool) -> R
             prefixed,
         ));
     }
+    if expression.trim_end().ends_with('(') {
+        return Err(validation_message(
+            format!("Invalid {label}: Syntax error; token: \"<EOF>\", near: \"(\""),
+            prefixed,
+        ));
+    }
     Ok(())
+}
+
+fn invalid_function_name_error(expression: &str, label: &str) -> Option<String> {
+    let allowed = match label {
+        "ConditionExpression" | "FilterExpression" | "KeyConditionExpression" => &[
+            "attribute_exists",
+            "attribute_not_exists",
+            "attribute_type",
+            "begins_with",
+            "contains",
+            "size",
+        ][..],
+        "UpdateExpression" => &["if_not_exists", "list_append"][..],
+        _ => return None,
+    };
+
+    for call in expression_function_names(expression) {
+        if allowed
+            .iter()
+            .any(|function_name| call.eq_ignore_ascii_case(function_name) && call != *function_name)
+        {
+            return Some(format!(
+                "Invalid {label}: Invalid function name; function: {call}"
+            ));
+        }
+    }
+    None
+}
+
+fn expression_function_names(expression: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut index = 0usize;
+    while index < expression.len() {
+        let Some((relative_start, _)) = expression.get(index..).and_then(|tail| {
+            tail.char_indices()
+                .find(|(_, ch)| ch.is_ascii_alphabetic() || *ch == '_')
+        }) else {
+            break;
+        };
+        let start = index + relative_start;
+        let mut end = start;
+        for (relative_index, ch) in expression.get(start..).unwrap_or_default().char_indices() {
+            if relative_index == 0 {
+                end = start + ch.len_utf8();
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                end = start + relative_index + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let tail = expression.get(end..).unwrap_or_default().trim_start();
+        if tail.starts_with('(')
+            && let Some(name) = expression.get(start..end)
+        {
+            names.push(name);
+        }
+        index = end;
+    }
+    names
+}
+
+fn in_operand_count_error(expression: &str, label: &str) -> Option<String> {
+    if !matches!(
+        label,
+        "ConditionExpression" | "FilterExpression" | "KeyConditionExpression"
+    ) {
+        return None;
+    }
+    for operands in in_operand_lists(expression) {
+        let count = split_nonempty_top_level_args(operands).len();
+        if count > 100 {
+            return Some(format!(
+                "Invalid {label}: The IN operator is provided with too many operands; number of \
+                 operands: {count}"
+            ));
+        }
+    }
+    None
+}
+
+fn in_operand_lists(expression: &str) -> Vec<&str> {
+    let mut lists = Vec::new();
+    let mut offset = 0usize;
+    let upper = expression.to_ascii_uppercase();
+    while let Some(relative_index) = upper.get(offset..).and_then(|tail| tail.find(" IN ")) {
+        let after_in = offset + relative_index + 4;
+        let Some(open_relative) = expression.get(after_in..).and_then(|tail| tail.find('(')) else {
+            break;
+        };
+        let open = after_in + open_relative;
+        let mut depth = 1usize;
+        let args_start = open + 1;
+        let Some(tail) = expression.get(args_start..) else {
+            break;
+        };
+        let mut found_close = false;
+        for (relative_arg_index, ch) in tail.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let close = args_start + relative_arg_index;
+                        if let Some(args) = expression.get(args_start..close) {
+                            lists.push(args);
+                        }
+                        offset = close + 1;
+                        found_close = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !found_close {
+            break;
+        }
+    }
+    lists
 }
 
 fn validate_between_bounds(
@@ -534,12 +755,9 @@ fn dynamodb_attribute_value_display(value: &crate::AttributeValue) -> String {
     }
 }
 
-fn update_expression_grammar_error(expression: &str, label: &str) -> Option<String> {
-    if label != "UpdateExpression" {
-        return None;
-    }
-
-    let sections = update_expression_sections(expression);
+fn update_expression_grammar_error_for_sections(
+    sections: &[UpdateExpressionSection<'_>],
+) -> Option<String> {
     for keyword in ["SET", "REMOVE", "ADD", "DELETE"] {
         if sections
             .iter()
@@ -554,7 +772,7 @@ fn update_expression_grammar_error(expression: &str, label: &str) -> Option<Stri
         }
     }
 
-    set_action_syntax_error(&sections).or_else(|| add_delete_action_syntax_error(&sections))
+    set_action_syntax_error(sections).or_else(|| add_delete_action_syntax_error(sections))
 }
 
 fn function_context_error(expression: &str, label: &str) -> Option<String> {
@@ -582,9 +800,9 @@ struct UpdateExpressionSection<'a> {
     body: &'a str,
 }
 
-fn update_expression_sections(expression: &str) -> Vec<UpdateExpressionSection<'_>> {
-    let mut sections = Vec::new();
-    let mut current_keyword: Option<(String, usize)> = None;
+fn update_expression_sections(expression: &str) -> SmallVec<[UpdateExpressionSection<'_>; 4]> {
+    let mut sections = SmallVec::new();
+    let mut current_keyword: Option<(&'static str, usize)> = None;
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
 
@@ -603,11 +821,10 @@ fn update_expression_sections(expression: &str) -> Vec<UpdateExpressionSection<'
         let Some(token) = identifier_at(expression, index) else {
             continue;
         };
-        if !matches!(
-            token.to_ascii_uppercase().as_str(),
-            "SET" | "REMOVE" | "ADD" | "DELETE"
-        ) || !is_top_level_update_keyword(expression, index, token.len())
-        {
+        let Some(keyword) = update_section_keyword(token) else {
+            continue;
+        };
+        if !is_top_level_update_keyword(expression, index, token.len()) {
             continue;
         }
 
@@ -615,18 +832,18 @@ fn update_expression_sections(expression: &str) -> Vec<UpdateExpressionSection<'
             && let Some(body) = expression.get(body_start..index)
         {
             sections.push(UpdateExpressionSection {
-                keyword: leaked_update_keyword(keyword),
+                keyword,
                 body: body.trim(),
             });
         }
-        current_keyword = Some((token.to_ascii_uppercase(), index + token.len()));
+        current_keyword = Some((keyword, index + token.len()));
     }
 
     if let Some((keyword, body_start)) = current_keyword
         && let Some(body) = expression.get(body_start..)
     {
         sections.push(UpdateExpressionSection {
-            keyword: leaked_update_keyword(keyword),
+            keyword,
             body: body.trim(),
         });
     }
@@ -634,13 +851,17 @@ fn update_expression_sections(expression: &str) -> Vec<UpdateExpressionSection<'
     sections
 }
 
-fn leaked_update_keyword(keyword: String) -> &'static str {
-    match keyword.as_str() {
-        "SET" => "SET",
-        "REMOVE" => "REMOVE",
-        "ADD" => "ADD",
-        "DELETE" => "DELETE",
-        _ => unreachable!("update keyword was prefiltered"),
+fn update_section_keyword(token: &str) -> Option<&'static str> {
+    if token.eq_ignore_ascii_case("SET") {
+        Some("SET")
+    } else if token.eq_ignore_ascii_case("REMOVE") {
+        Some("REMOVE")
+    } else if token.eq_ignore_ascii_case("ADD") {
+        Some("ADD")
+    } else if token.eq_ignore_ascii_case("DELETE") {
+        Some("DELETE")
+    } else {
+        None
     }
 }
 
@@ -790,17 +1011,18 @@ fn trailing_arithmetic_operator(value: &str) -> Option<char> {
 }
 
 fn validate_update_expression_paths(
-    expression: &str,
-    label: &str,
+    context: &ExpressionValidationContext<'_>,
     names: Option<&std::collections::HashMap<String, String>>,
     prefixed: bool,
 ) -> Result<(), String> {
-    if label != "UpdateExpression" {
+    if context.label != "UpdateExpression" {
         return Ok(());
     }
 
-    let sections = update_expression_sections(expression);
-    let paths = update_expression_paths(&sections, names);
+    let paths = update_expression_paths(
+        context.update_sections.as_deref().unwrap_or_default(),
+        names,
+    );
     for (left_index, left) in paths.iter().enumerate() {
         for right in paths.iter().skip(left_index + 1) {
             if document_paths_overlap(&left.parts, &right.parts) {
@@ -821,6 +1043,39 @@ fn validate_update_expression_paths(
 
 struct UpdatePath {
     parts: Vec<String>,
+}
+
+fn validate_projection_expression_paths(
+    expression: &str,
+    label: &str,
+    names: Option<&std::collections::HashMap<String, String>>,
+    prefixed: bool,
+) -> Result<(), String> {
+    if label != "ProjectionExpression" {
+        return Ok(());
+    }
+
+    let paths = split_top_level_args(expression)
+        .into_iter()
+        .filter_map(|path| document_path_parts(path.trim(), names))
+        .collect::<Vec<_>>();
+    for (left_index, left) in paths.iter().enumerate() {
+        for right in paths.iter().skip(left_index + 1) {
+            if document_paths_overlap(left, right) {
+                return Err(validation_message(
+                    format!(
+                        "Invalid ProjectionExpression: Two document paths overlap with each \
+                         other; must remove or rewrite one of these paths; path one: [{}], path \
+                         two: [{}]",
+                        left.join(", "),
+                        right.join(", ")
+                    ),
+                    prefixed,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn update_expression_paths(
@@ -1108,13 +1363,20 @@ fn size_function_has_comparison(expression: &str, close_paren: usize) -> bool {
         || tail.starts_with(">=")
         || tail.starts_with('<')
         || tail.starts_with('>')
+        || tail
+            .get(..7)
+            .is_some_and(|token| token.eq_ignore_ascii_case("BETWEEN"))
 }
 
-fn contains_same_operand_error(expression: &str, label: &str) -> Option<String> {
+fn contains_same_operand_error(
+    expression: &str,
+    label: &str,
+    names: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
     for args in function_argument_lists(expression, "contains") {
         let parts = split_top_level_args(args);
         if parts.len() == 2 && parts[0].trim() == parts[1].trim() {
-            let operand = parts[0].trim();
+            let operand = resolve_expression_path_for_message(parts[0].trim(), names);
             return Some(format!(
                 "Invalid {label}: The first operand must be distinct from the remaining operands \
                  for this operator or function; operator: contains, first operand: [{operand}]"
@@ -1122,6 +1384,16 @@ fn contains_same_operand_error(expression: &str, label: &str) -> Option<String> 
         }
     }
     None
+}
+
+fn resolve_expression_path_for_message(
+    path: &str,
+    names: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    let Some(names) = names else {
+        return path.to_string();
+    };
+    names.get(path).cloned().unwrap_or_else(|| path.to_string())
 }
 
 fn attribute_type_literal_operand_error(expression: &str, label: &str) -> Option<String> {
@@ -1177,10 +1449,15 @@ fn validate_attribute_type_value_operands(
             attribute_type.as_str(),
             "S" | "SS" | "N" | "NS" | "B" | "BS" | "BOOL" | "NULL" | "L" | "M"
         ) {
+            let valid_types = if prefixed {
+                "{S,SS,N,NS,B,BS,BOOL,NULL,L,M}"
+            } else {
+                "{N,BS,L,B,NULL,M,S,SS,NS,BOOL}"
+            };
             return Err(validation_message(
                 format!(
                     "Invalid {label}: Invalid attribute type name found; type: {attribute_type}, \
-                     valid types: {{S,SS,N,NS,B,BS,BOOL,NULL,L,M}}"
+                     valid types: {valid_types}"
                 ),
                 prefixed,
             ));
@@ -1567,3 +1844,7 @@ fn validation_message(message: String, prefixed: bool) -> String {
         message
     }
 }
+
+#[cfg(test)]
+#[path = "request_expression_validation_perf_tests.rs"]
+mod request_expression_validation_perf_tests;

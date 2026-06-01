@@ -5,7 +5,6 @@ pub const DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS: u64 = 500;
 pub const DEFAULT_STORAGE_SQLITE_DB_PATH: &str = "/var/lib/aux-storage/db/sqlite/main.db";
 pub const DEFAULT_STORAGE_TURSO_DB_PATH: &str = "main.turso.db";
 pub const DEFAULT_STORAGE_ROCKS_DB_PATH: &str = "/var/lib/aux-storage/db/rocksdb";
-pub const DEFAULT_POSTGRES_MAX_POOL_SIZE: usize = 10;
 pub const DEFAULT_REMOTE_REGION: &str = "us-east-1";
 
 pub const DEFAULT_TRACING_LOG_LEVEL: &str = "warn";

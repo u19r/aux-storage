@@ -1000,7 +1000,7 @@ async fn postgres_stream_lifecycle_works() {
     let Some(dsn) = postgres_test_dsn() else {
         return;
     };
-    let provider = PostgresStorageProvider::new_with_tls(&dsn, 8, true)
+    let provider = PostgresStorageProvider::new_with_tls(&dsn, 8, 2, true)
         .await
         .expect("postgres provider");
     provider
@@ -1062,7 +1062,7 @@ async fn postgres_queue_lifecycle_works() {
     let Some(dsn) = postgres_test_dsn() else {
         return;
     };
-    let provider = PostgresStorageProvider::new_with_tls(&dsn, 8, true)
+    let provider = PostgresStorageProvider::new_with_tls(&dsn, 8, 2, true)
         .await
         .expect("postgres provider");
     provider.initialize().await.expect("initialize queue");

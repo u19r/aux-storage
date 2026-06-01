@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use smallvec::SmallVec;
+
 use crate::{AttributeValue, StorageError, StorageResult};
 
 #[must_use]
@@ -178,6 +180,77 @@ fn collect_expression_attribute_placeholders<'a>(
     expression: &'a str,
     names: &mut Vec<&'a str>,
     values: &mut Vec<&'a str>,
+) {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut chars = expression.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if in_single_quote {
+            if ch == '\\' {
+                let _ = chars.next();
+                continue;
+            }
+            if ch == '\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if in_double_quote {
+            if ch == '\\' {
+                let _ = chars.next();
+                continue;
+            }
+            if ch == '"' {
+                in_double_quote = false;
+            }
+            continue;
+        }
+
+        if ch == '\'' {
+            in_single_quote = true;
+            continue;
+        }
+        if ch == '"' {
+            in_double_quote = true;
+            continue;
+        }
+
+        if ch != '#' && ch != ':' {
+            continue;
+        }
+
+        let mut end = idx + ch.len_utf8();
+        let mut has_identifier = false;
+        while let Some((next_idx, next_ch)) = chars.peek().copied() {
+            if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
+                has_identifier = true;
+                end = next_idx + next_ch.len_utf8();
+                let _ = chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if !has_identifier {
+            continue;
+        }
+
+        let token = expression.get(idx..end).unwrap_or_default();
+        if ch == '#' {
+            if !names.contains(&token) {
+                names.push(token);
+            }
+        } else if !values.contains(&token) {
+            values.push(token);
+        }
+    }
+}
+
+pub(crate) fn collect_expression_attribute_placeholder_refs<'a>(
+    expression: &'a str,
+    names: &mut SmallVec<[&'a str; 8]>,
+    values: &mut SmallVec<[&'a str; 8]>,
 ) {
     let mut in_single_quote = false;
     let mut in_double_quote = false;

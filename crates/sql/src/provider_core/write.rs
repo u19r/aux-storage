@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use storage_condition::{Condition, evaluate_condition};
 use storage_provider::{BoundUpdateOperation, apply_bound_update_operations};
 use storage_types::{AttributeValue, KeyAttributes, StorageEnum, StorageError, StorageResult};
+
+type AttributeMap = HashMap<String, AttributeValue>;
+type UpdatePlan = (AttributeMap, AttributeMap);
 
 pub(crate) fn validate_update_key(key: &KeyAttributes) -> StorageResult<()> {
     if key.is_empty() {
@@ -14,13 +17,10 @@ pub(crate) fn validate_update_key(key: &KeyAttributes) -> StorageResult<()> {
 }
 
 pub(crate) fn apply_update_to_existing_or_key(
-    existing_item: Option<HashMap<String, AttributeValue>>,
+    existing_item: Option<AttributeMap>,
     key: &KeyAttributes,
     operations: &[BoundUpdateOperation<'_>],
-) -> StorageResult<(
-    HashMap<String, AttributeValue>,
-    HashMap<String, AttributeValue>,
-)> {
+) -> StorageResult<UpdatePlan> {
     validate_update_key(key)?;
     let item_to_update = existing_item.unwrap_or_else(|| {
         key.iter()
@@ -32,20 +32,23 @@ pub(crate) fn apply_update_to_existing_or_key(
 }
 
 pub(crate) fn plan_update_from_existing_item(
-    existing_item: Option<HashMap<String, AttributeValue>>,
+    existing_item: Option<AttributeMap>,
     key: &KeyAttributes,
     operations: &[BoundUpdateOperation<'_>],
     condition: Option<&Condition>,
-) -> StorageResult<(
-    HashMap<String, AttributeValue>,
-    HashMap<String, AttributeValue>,
-)> {
-    let item_for_condition = existing_item.clone().unwrap_or_default();
+) -> StorageResult<UpdatePlan> {
     if let Some(condition) = condition
-        && !evaluate_condition(&item_for_condition, condition)
+        && !evaluate_condition(condition_item_ref(existing_item.as_ref()), condition)
     {
         return Err(StorageEnum::ConditionalCheckFailed.into());
     }
 
     apply_update_to_existing_or_key(existing_item, key, operations)
+}
+
+fn condition_item_ref(
+    old_item: Option<&HashMap<String, AttributeValue>>,
+) -> &HashMap<String, AttributeValue> {
+    static EMPTY_ITEM: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
+    old_item.unwrap_or(&EMPTY_ITEM)
 }

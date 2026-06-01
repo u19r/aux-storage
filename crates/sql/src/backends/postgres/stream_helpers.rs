@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use deadpool_postgres::GenericClient;
 use storage_types::{
@@ -78,6 +78,7 @@ impl PostgresStorageProvider {
             params.push(&entry.created_at_ms);
             params.push(&entry.data_type);
         }
+        let started = Instant::now();
         client.execute(&sql, &params).await.map_err(|err| {
             let detail = err
                 .as_db_error()
@@ -85,6 +86,7 @@ impl PostgresStorageProvider {
                 .unwrap_or_else(|| format!("{err:?}"));
             StorageError::internal(&format!("postgres insert stream entries failed: {detail}"))
         })?;
+        self.record_transaction_phase("batch_write_item", "stream_write_insert", started.elapsed());
         Ok(())
     }
 
@@ -95,7 +97,10 @@ impl PostgresStorageProvider {
         item_data: &HashMap<String, storage_provider::AttributeValue>,
         input: PostgresWriteStreamEntriesInput<'_>,
     ) -> StorageResult<()> {
-        if !crate::stream_writer::should_write_stream_entries(table_info) {
+        if !crate::stream_writer::should_write_stream_entries_for_gsi_mode(
+            table_info,
+            self.immediate_gsi_consistency,
+        ) {
             return Ok(());
         }
         let PostgresWriteStreamEntriesInput {

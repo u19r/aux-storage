@@ -1,9 +1,14 @@
+use std::collections::HashMap;
+
 use storage_types::{
-    AttributeDefinition, GlobalSecondaryIndex, IndexName, KeyAttributeType, KeySchemaElement,
-    KeyType, Projection, TableName,
+    AttributeDefinition, AttributeValue, GlobalSecondaryIndex, IndexName, KeyAttributeType,
+    KeyAttributes, KeySchemaElement, KeyType, Projection, TableName,
 };
 
-use crate::utils::{SqliteTableRowidMode, build_gsi_creation_sqls, build_table_creation_sql};
+use crate::utils::{
+    SqliteTableRowidMode, build_gsi_creation_sqls, build_table_creation_sql,
+    main_table_attributes_blob,
+};
 
 fn attribute_definitions() -> Vec<AttributeDefinition> {
     vec![
@@ -47,6 +52,72 @@ fn global_secondary_indexes() -> Vec<GlobalSecondaryIndex> {
             non_key_attributes: None,
         },
     }]
+}
+
+#[test]
+fn main_table_attributes_blob_includes_number_keys_to_preserve_exact_wire_values() {
+    let mut key_attributes = KeyAttributes::new();
+    key_attributes.insert(
+        "pk",
+        AttributeValue::N("99999999999999999999999999999999999999".to_string()),
+    );
+    key_attributes.insert("sk", AttributeValue::N("1".to_string()));
+    let non_key_attributes = HashMap::from([(
+        "label".to_string(),
+        AttributeValue::S("number-key".to_string()),
+    )]);
+
+    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let attributes: HashMap<String, AttributeValue> =
+        serde_json::from_str(&blob).expect("attribute map");
+
+    assert_eq!(
+        attributes.get("pk"),
+        Some(&AttributeValue::N(
+            "99999999999999999999999999999999999999".to_string()
+        ))
+    );
+    assert_eq!(
+        attributes.get("label"),
+        Some(&AttributeValue::S("number-key".to_string()))
+    );
+}
+
+#[test]
+fn main_table_attributes_blob_expands_scientific_number_keys() {
+    let mut key_attributes = KeyAttributes::new();
+    key_attributes.insert("pk", AttributeValue::N("1E-130".to_string()));
+    key_attributes.insert("sk", AttributeValue::N("1".to_string()));
+    let non_key_attributes = HashMap::new();
+
+    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let attributes: HashMap<String, AttributeValue> =
+        serde_json::from_str(&blob).expect("attribute map");
+
+    assert_eq!(
+        attributes.get("pk"),
+        Some(&AttributeValue::N(format!("0.{}1", "0".repeat(129))))
+    );
+}
+
+#[test]
+fn main_table_attributes_blob_keeps_string_key_rows_compact() {
+    let mut key_attributes = KeyAttributes::new();
+    key_attributes.insert("pk", AttributeValue::S("pk1".to_string()));
+    let non_key_attributes = HashMap::from([(
+        "label".to_string(),
+        AttributeValue::S("string-key".to_string()),
+    )]);
+
+    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let attributes: HashMap<String, AttributeValue> =
+        serde_json::from_str(&blob).expect("attribute map");
+
+    assert!(!attributes.contains_key("pk"));
+    assert_eq!(
+        attributes.get("label"),
+        Some(&AttributeValue::S("string-key".to_string()))
+    );
 }
 
 #[test]

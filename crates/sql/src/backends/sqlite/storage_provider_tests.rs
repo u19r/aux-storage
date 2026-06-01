@@ -18,8 +18,8 @@ use storage_types::{
     ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
     ReplicationWriteSource, ReturnValuesOldNewUpdated, ScanTableRequest, StorageEnum, StorageError,
     StorageResult, StreamItemId, StreamName, StreamSpecification, StreamViewType, TableName,
-    TimeToLiveSpecification, TimestampMillis, UpdateItemRequest, UpdateTimeToLiveRequest,
-    UserStreamName, WireItem,
+    TimeToLiveSpecification, TimestampMillis, UpdateItemRequest, UpdateTableRequest,
+    UpdateTimeToLiveRequest, UserStreamName, WireItem, context::WrappedError,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamItem, StreamProvider,
@@ -98,6 +98,58 @@ async fn create_revision_test_table(table_name: &str) -> SQLiteStorageProvider {
         .unwrap();
 
     provider
+}
+
+#[tokio::test]
+async fn given_deletion_protection_enabled_when_delete_table_then_rejects_until_disabled() {
+    let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
+    provider.initialize_storage().await.unwrap();
+
+    let table_name = TableName::new("ProtectedTable");
+    let mut request = CreateTableRequest::new(
+        table_name.clone(),
+        vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: KeyAttributeType::S,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        storage_types::BillingMode::PayPerRequest,
+    );
+    request.deletion_protection_enabled = Some(true);
+
+    provider.create_table(&request).await.unwrap();
+    let table_info = provider.get_table_info(&table_name).await.unwrap();
+    assert!(table_info.deletion_protection_enabled);
+
+    let error = provider.delete_table(&table_name).await.unwrap_err();
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::DeletionProtectionEnabled { .. }
+    ));
+    assert!(provider.table_exists(&table_name).await.unwrap());
+
+    provider
+        .update_table(UpdateTableRequest {
+            table_name: table_name.clone(),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: Some(false),
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            table_class: None,
+        })
+        .await
+        .unwrap();
+
+    provider.delete_table(&table_name).await.unwrap();
+    assert!(!provider.table_exists(&table_name).await.unwrap());
 }
 
 async fn create_limit_boundary_table(table_name: &str) -> SQLiteStorageProvider {
@@ -234,7 +286,7 @@ async fn sqlite_durable_proof_tracks_put_update_and_delete_revisions() {
         .update_item(UpdateItemRequest {
             table_name: TableName::new(table_name),
             key: revision_test_key("item#1"),
-            update_expression: "SET #value = :value".to_string(),
+            update_expression: Some("SET #value = :value".to_string()),
             attribute_updates: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([(
@@ -1468,7 +1520,7 @@ async fn sqlite_guarded_delete_and_update_validate_present_revision() {
             request: UpdateItemRequest {
                 table_name: TableName::new(table_name),
                 key: revision_test_key("item#1"),
-                update_expression: "SET #value = :value".to_string(),
+                update_expression: Some("SET #value = :value".to_string()),
                 attribute_updates: None,
                 condition_expression: None,
                 expression_attribute_names: Some(HashMap::from([(
@@ -3249,6 +3301,60 @@ async fn put_item_with_gsi_creates_stream_entries_without_stream_spec() {
 }
 
 #[tokio::test]
+async fn immediate_gsi_put_item_skips_stream_entries_without_stream_spec() {
+    let table_name = TableName::new("ImmediateGsiNoStreamTestTable");
+    let provider = create_empty_gsi_test_table_with_settings(
+        table_name.as_ref(),
+        storage_provider::SqliteSettings {
+            immediate_gsi_consistency: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    provider
+        .put_item(
+            table_name.clone(),
+            HashMap::from([
+                (
+                    "pk".to_string(),
+                    AttributeValue::S("partition1".to_string()),
+                ),
+                ("sk".to_string(), AttributeValue::S("sort1".to_string())),
+                (
+                    "gsi_pk".to_string(),
+                    AttributeValue::S("gsi_partition1".to_string()),
+                ),
+                (
+                    "gsi_sk".to_string(),
+                    AttributeValue::S("gsi_sort1".to_string()),
+                ),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let page = StreamProvider::read_forward(&provider, StreamName::system_table_stream(), None, 10)
+        .await
+        .unwrap();
+    assert!(
+        page.items.is_empty(),
+        "immediate GSI writes should not create async stream entries"
+    );
+
+    let rows = provider
+        .query_table(&gsi_query_request(table_name.as_ref(), "gsi_partition1"))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(rows.len(), 1, "immediate GSI entry should still be visible");
+}
+
+#[tokio::test]
 async fn put_item_with_ttl_skips_stream_entries_without_stream_spec() {
     let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
     provider.initialize_storage().await.unwrap();
@@ -3537,7 +3643,10 @@ async fn pointer_stream_dereferences_item_version_when_pointer_id_differs() {
     .unwrap();
 
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sequence_number, "1");
+    assert_eq!(
+        records[0].cursor.as_deref(),
+        Some(records[0].sequence_number.as_str())
+    );
     assert_eq!(
         records[0].keys.get("pk"),
         Some(&AttributeValue::S("partition1".to_string()))

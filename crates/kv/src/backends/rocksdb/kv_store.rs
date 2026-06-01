@@ -24,7 +24,8 @@ use crate::{
     backends::{
         common::{
             KvMutation, RangeKeyDecision, RangeScanSettings, operation_requires_stream_entries,
-            plan_table_write, plan_transact_operation, table_operation_primary_key,
+            plan_table_write_preflighted, plan_transact_operation,
+            preflight_table_write_operations, table_operation_primary_key,
         },
         rocksdb::constants::{
             ROCKSDB_BATCH_WRITE_RETRIES, ROCKSDB_CONDITIONAL_PUT_FAILURE_METRIC,
@@ -97,6 +98,7 @@ impl RocksDbKvStore {
         operations: Vec<TransactWriteTableOperation>,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<OldNewItems>> {
+        preflight_table_write_operations(&operations)?;
         let db_guard = self.db.read().await;
         let opts = write_options_sync();
         let otxn_opts = transaction_options_with_snapshot();
@@ -117,7 +119,7 @@ impl RocksDbKvStore {
                 None
             });
         }
-        let plan = plan_table_write(
+        let plan = plan_table_write_preflighted(
             &operations,
             current_values,
             &stream_ids,
@@ -382,13 +384,18 @@ impl SortedKvStore for RocksDbKvStore {
         unreachable!("rocksdb batch write loop returns on success or final failure")
     }
     async fn get(&self, key: &[u8], _consistent_read: bool) -> StorageResult<Option<Vec<u8>>> {
-        let db_guard = self.db.read().await;
-
-        match db_guard.get(key) {
-            Ok(Some(data)) => Ok(Some(data)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::internal(&format!("get key failed: {e}"))),
-        }
+        let db = Arc::clone(&self.db);
+        let key = key.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let db_guard = db.blocking_read();
+            match db_guard.get(key) {
+                Ok(Some(data)) => Ok(Some(data)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(StorageError::internal(&format!("get key failed: {e}"))),
+            }
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
     }
 
     async fn multi_get(
@@ -396,22 +403,27 @@ impl SortedKvStore for RocksDbKvStore {
         keys: Vec<Vec<u8>>,
         _consistent_read: bool,
     ) -> StorageResult<Vec<Option<Vec<u8>>>> {
-        let db_guard = self.db.read().await;
-        let results = db_guard.multi_get(keys.iter());
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let db_guard = db.blocking_read();
+            let results = db_guard.multi_get(keys.iter());
 
-        let mut values = Vec::with_capacity(results.len());
-        for result in results {
-            match result {
-                Ok(data) => values.push(data),
-                Err(e) => {
-                    return Err(StorageError::internal(&format!(
-                        "multi_get keys failed: {e}"
-                    )));
+            let mut values = Vec::with_capacity(results.len());
+            for result in results {
+                match result {
+                    Ok(data) => values.push(data),
+                    Err(e) => {
+                        return Err(StorageError::internal(&format!(
+                            "multi_get keys failed: {e}"
+                        )));
+                    }
                 }
             }
-        }
 
-        Ok(values)
+            Ok(values)
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
     }
 
     async fn put(
@@ -526,33 +538,37 @@ impl SortedKvStore for RocksDbKvStore {
             None => (None, scan_start.clone()),
         };
         let scan = RangeScanSettings::new(&scan_start, &scan_end, limit, page_bytes)?;
-        let db_guard = self.db.read().await;
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let db_guard = db.blocking_read();
+            let direction = if scan.forward() {
+                rocksdb::Direction::Forward
+            } else {
+                rocksdb::Direction::Reverse
+            };
 
-        let direction = if scan.forward() {
-            rocksdb::Direction::Forward
-        } else {
-            rocksdb::Direction::Reverse
-        };
+            let iter = db_guard.iterator(rocksdb::IteratorMode::From(&iterator_start, direction));
 
-        let iter = db_guard.iterator(rocksdb::IteratorMode::From(&iterator_start, direction));
+            let mut items = Vec::new();
 
-        let mut items = Vec::new();
-
-        for entry in iter.flatten() {
-            let (key, value) = entry;
-            match scan.evaluate_key(&key) {
-                RangeKeyDecision::Include => {
-                    items.push((key.into_vec(), value.into_vec()));
-                    if items.len() >= scan.fetch_limit() {
-                        break;
+            for entry in iter.flatten() {
+                let (key, value) = entry;
+                match scan.evaluate_key(&key) {
+                    RangeKeyDecision::Include => {
+                        items.push((key.into_vec(), value.into_vec()));
+                        if items.len() >= scan.fetch_limit() {
+                            break;
+                        }
                     }
+                    RangeKeyDecision::Skip => {}
+                    RangeKeyDecision::Stop => break,
                 }
-                RangeKeyDecision::Skip => {}
-                RangeKeyDecision::Stop => break,
             }
-        }
 
-        Ok(scan.finalize(items, false))
+            Ok(scan.finalize(items, false))
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
     }
 
     async fn get_range_values(
@@ -582,33 +598,37 @@ impl SortedKvStore for RocksDbKvStore {
             None => (None, scan_start.clone()),
         };
         let scan = RangeScanSettings::new(&scan_start, &scan_end, limit, page_bytes)?;
-        let db_guard = self.db.read().await;
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let db_guard = db.blocking_read();
+            let direction = if scan.forward() {
+                rocksdb::Direction::Forward
+            } else {
+                rocksdb::Direction::Reverse
+            };
 
-        let direction = if scan.forward() {
-            rocksdb::Direction::Forward
-        } else {
-            rocksdb::Direction::Reverse
-        };
+            let iter = db_guard.iterator(rocksdb::IteratorMode::From(&iterator_start, direction));
 
-        let iter = db_guard.iterator(rocksdb::IteratorMode::From(&iterator_start, direction));
+            let mut values = Vec::new();
 
-        let mut values = Vec::new();
-
-        for entry in iter.flatten() {
-            let (key, value) = entry;
-            match scan.evaluate_key(&key) {
-                RangeKeyDecision::Include => {
-                    values.push(value.into_vec());
-                    if values.len() >= scan.fetch_limit() {
-                        break;
+            for entry in iter.flatten() {
+                let (key, value) = entry;
+                match scan.evaluate_key(&key) {
+                    RangeKeyDecision::Include => {
+                        values.push(value.into_vec());
+                        if values.len() >= scan.fetch_limit() {
+                            break;
+                        }
                     }
+                    RangeKeyDecision::Skip => {}
+                    RangeKeyDecision::Stop => break,
                 }
-                RangeKeyDecision::Skip => {}
-                RangeKeyDecision::Stop => break,
             }
-        }
 
-        Ok(scan.finalize_values(values, false))
+            Ok(scan.finalize_values(values, false))
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
     }
 }
 
@@ -803,6 +823,10 @@ fn is_rocksdb_transaction_retryable(error: &StorageError) -> bool {
         error.to_enum(),
         StorageEnum::TransactionCanceled { .. } | StorageEnum::TransactionConflict { .. }
     )
+}
+
+fn map_rocksdb_blocking_join_error(error: tokio::task::JoinError) -> StorageError {
+    StorageError::internal(&format!("rocksdb blocking task failed: {error}"))
 }
 
 #[expect(clippy::needless_pass_by_value)]

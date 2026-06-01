@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use storage_types::{AttributeValue, StorageError, StorageResult};
+use storage_condition::{Condition, parse_condition_expression};
+use storage_types::{AttributeValue, KeySchemaElement, KeyType, StorageError, StorageResult};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledKeyCondition {
@@ -9,6 +10,11 @@ pub(crate) struct CompiledKeyCondition {
 }
 
 impl CompiledKeyCondition {
+    #[cfg(test)]
+    pub(crate) fn new(condition: String, values: Vec<String>) -> Self {
+        Self { condition, values }
+    }
+
     pub fn into_parts(self) -> (String, Vec<String>) {
         (self.condition, self.values)
     }
@@ -16,280 +22,196 @@ impl CompiledKeyCondition {
 
 pub fn parse_key_condition_expression(
     expression: &str,
+    key_schema: &[KeySchemaElement],
     attribute_names: Option<&HashMap<String, String>>,
     attribute_values: Option<&HashMap<String, AttributeValue>>,
 ) -> StorageResult<CompiledKeyCondition> {
-    let expr = expression.trim();
+    let condition = parse_condition_expression(expression, attribute_names, attribute_values)
+        .map_err(|err| {
+            StorageError::validation(format!("Invalid key condition expression: {err}"))
+        })?;
+    validate_key_condition(&condition, key_schema)?;
+    compile_key_condition(&condition)
+}
 
-    // Special case: handle equality AND BETWEEN where the first AND precedes
-    // BETWEEN
-    if let (Some(first_and), Some(between_pos)) = (expr.find(" AND "), expr.find(" BETWEEN "))
-        && first_and < between_pos
-    {
-        let first_condition = expr.get(..first_and).unwrap_or("").trim();
-        let between_condition = expr.get(first_and + 5..).unwrap_or("").trim();
+fn validate_key_condition(
+    condition: &Condition,
+    key_schema: &[KeySchemaElement],
+) -> StorageResult<()> {
+    let hash_key = key_schema
+        .iter()
+        .find(|key| key.key_type == KeyType::Hash)
+        .map(|key| key.attribute_name.as_str())
+        .ok_or_else(|| StorageError::validation("table hash key schema missing"))?;
+    let range_key = key_schema
+        .iter()
+        .find(|key| key.key_type == KeyType::Range)
+        .map(|key| key.attribute_name.as_str());
 
-        let mut conditions = Vec::new();
-        let mut values = Vec::new();
+    let mut hash_equality_seen = false;
+    let mut range_condition_seen = false;
+    validate_key_condition_node(
+        condition,
+        hash_key,
+        range_key,
+        &mut hash_equality_seen,
+        &mut range_condition_seen,
+    )?;
 
-        // First condition: expect equality (hash key)
-        if let Some(equals_pos) = first_condition.find(" = ") {
-            let left = first_condition.get(..equals_pos).unwrap_or("").trim();
-            let right = first_condition.get(equals_pos + 3..).unwrap_or("").trim();
+    if !hash_equality_seen {
+        return Err(StorageError::validation(format!(
+            "Query condition missed key schema element: {hash_key}"
+        )));
+    }
+    Ok(())
+}
 
-            let attr_name = resolve_attribute_name_simple(left, attribute_names);
-            let attr_value = resolve_attribute_value_simple(right, attribute_values)?;
-
-            conditions.push(format!("{attr_name} = ?1"));
-            values.push(scalar_value(&attr_value)?);
-        }
-
-        // BETWEEN condition for range key
-        if let Some(between_pos) = between_condition.find(" BETWEEN ") {
-            let left = between_condition.get(..between_pos).unwrap_or("").trim();
-            let right = between_condition
-                .get(between_pos + 9..)
-                .unwrap_or("")
-                .trim();
-
-            if let Some(and_pos) = right.find(" AND ") {
-                let start_val = right.get(..and_pos).unwrap_or("").trim();
-                let end_val = right.get(and_pos + 5..).unwrap_or("").trim();
-
-                let attr_name = resolve_attribute_name_simple(left, attribute_names);
-                let start_attr = resolve_attribute_value_simple(start_val, attribute_values)?;
-                let end_attr = resolve_attribute_value_simple(end_val, attribute_values)?;
-
-                conditions.push(format!(
-                    "{} BETWEEN ?{} AND ?{}",
-                    attr_name,
-                    values.len() + 1,
-                    values.len() + 2
+fn validate_key_condition_node(
+    condition: &Condition,
+    hash_key: &str,
+    range_key: Option<&str>,
+    hash_equality_seen: &mut bool,
+    range_condition_seen: &mut bool,
+) -> StorageResult<()> {
+    match condition {
+        Condition::And { conditions } => {
+            if conditions.is_empty() {
+                return Err(StorageError::validation(
+                    "Invalid key condition expression: empty AND condition",
                 ));
-                values.push(scalar_value(&start_attr)?);
-                values.push(scalar_value(&end_attr)?);
             }
-        }
-
-        return Ok(CompiledKeyCondition {
-            condition: conditions.join(" AND "),
-            values,
-        });
-    }
-
-    // Compound conditions without BETWEEN
-    if expr.contains(" AND ") && !expr.contains(" BETWEEN ") {
-        let parts: Vec<&str> = expr.split(" AND ").collect();
-        let mut conditions = Vec::new();
-        let mut values = Vec::new();
-
-        for (i, part) in parts.iter().enumerate() {
-            let part = part.trim();
-
-            // Equality
-            if let Some(equals_pos) = part.find(" = ") {
-                let left = part.get(..equals_pos).unwrap_or("").trim();
-                let right = part.get(equals_pos + 3..).unwrap_or("").trim();
-
-                let attr_name = resolve_attribute_name_simple(left, attribute_names);
-                let attr_value = resolve_attribute_value_simple(right, attribute_values)?;
-
-                conditions.push(format!("{} = ?{}", attr_name, i + 1));
-                values.push(scalar_value(&attr_value)?);
-                continue;
+            for child in conditions {
+                validate_key_condition_node(
+                    child,
+                    hash_key,
+                    range_key,
+                    hash_equality_seen,
+                    range_condition_seen,
+                )?;
             }
-
-            // begins_with(attr, :prefix)
-            if let Some(start) = part.find("begins_with(") {
-                let func_content = part.get(start + 12..).unwrap_or("");
-                if let Some(end) = func_content.find(')') {
-                    let func_args = func_content.get(..end).unwrap_or("");
-                    let args: Vec<&str> = func_args.split(',').map(str::trim).collect();
-                    if args.len() == 2 {
-                        let attr_name = resolve_attribute_name_simple(args[0], attribute_names);
-                        let attr_value = resolve_attribute_value_simple(args[1], attribute_values)?;
-
-                        // Validate that prefix_value is a string type
-                        if !matches!(attr_value, AttributeValue::S(_)) {
-                            return Err(StorageError::validation(
-                                "begins_with is only valid for string types",
-                            ));
-                        }
-
-                        let prefix = scalar_value(&attr_value)?;
-
-                        conditions.push(format!("{} LIKE ?{}", attr_name, i + 1));
-                        values.push(format!("{prefix}%"));
-                        continue;
-                    }
-                }
+            Ok(())
+        }
+        Condition::Equal { field, .. } if field == hash_key => {
+            if *hash_equality_seen {
+                return Err(StorageError::validation(
+                    "Query key condition not supported",
+                ));
             }
-
-            // Comparisons
-            for (op, sql_op) in [
-                (" < ", " < "),
-                (" <= ", " <= "),
-                (" > ", " > "),
-                (" >= ", " >= "),
-            ] {
-                if let Some(pos) = part.find(op) {
-                    let left = part.get(..pos).unwrap_or("").trim();
-                    let right = part.get(pos + op.len()..).unwrap_or("").trim();
-
-                    let attr_name = resolve_attribute_name_simple(left, attribute_names);
-                    let attr_value = resolve_attribute_value_simple(right, attribute_values)?;
-
-                    conditions.push(format!("{}{}?{}", attr_name, sql_op, i + 1));
-                    values.push(scalar_value(&attr_value)?);
-                    break;
-                }
+            *hash_equality_seen = true;
+            Ok(())
+        }
+        Condition::Equal { field, .. }
+        | Condition::LessThan { field, .. }
+        | Condition::LessThanEqual { field, .. }
+        | Condition::GreaterThan { field, .. }
+        | Condition::GreaterThanEqual { field, .. }
+        | Condition::Between { field, .. }
+        | Condition::BeginsWith { field, .. } => {
+            if Some(field.as_str()) != range_key {
+                return Err(StorageError::validation(
+                    "Query key condition not supported",
+                ));
             }
-        }
-
-        return Ok(CompiledKeyCondition {
-            condition: conditions.join(" AND "),
-            values,
-        });
-    }
-
-    // Simple equality
-    if let Some(equals_pos) = expr.find(" = ") {
-        let left = expr.get(..equals_pos).unwrap_or("").trim();
-        let right = expr.get(equals_pos + 3..).unwrap_or("").trim();
-
-        let attr_name = resolve_attribute_name_simple(left, attribute_names);
-        let attr_value = resolve_attribute_value_simple(right, attribute_values)?;
-
-        return Ok(CompiledKeyCondition {
-            condition: format!("{attr_name} = ?1"),
-            values: vec![scalar_value(&attr_value)?],
-        });
-    }
-
-    // begins_with(attr, :prefix)
-    if let Some(start) = expr.find("begins_with(") {
-        let func_content = expr.get(start + 12..).unwrap_or("");
-        if let Some(end) = func_content.find(')') {
-            let func_args = func_content.get(..end).unwrap_or("");
-            let args: Vec<&str> = func_args.split(',').map(str::trim).collect();
-            if args.len() == 2 {
-                let attr_name = resolve_attribute_name_simple(args[0], attribute_names);
-                let attr_value = resolve_attribute_value_simple(args[1], attribute_values)?;
-
-                // Validate that prefix_value is a string type
-                if !matches!(attr_value, AttributeValue::S(_)) {
-                    return Err(StorageError::validation(
-                        "begins_with is only valid for string types",
-                    ));
-                }
-
-                let prefix = scalar_value(&attr_value)?;
-
-                return Ok(CompiledKeyCondition {
-                    condition: format!("{attr_name} LIKE ?1"),
-                    values: vec![format!("{}%", prefix)],
-                });
+            if *range_condition_seen {
+                return Err(StorageError::validation(
+                    "Query key condition not supported",
+                ));
             }
+            *range_condition_seen = true;
+            Ok(())
         }
+        _ => Err(StorageError::validation(
+            "Invalid operator used in KeyConditionExpression",
+        )),
     }
-
-    // BETWEEN
-    if let Some(between_pos) = expr.find(" BETWEEN ") {
-        let left = expr.get(..between_pos).unwrap_or("").trim();
-        let right = expr.get(between_pos + 9..).unwrap_or("").trim();
-
-        if let Some(and_pos) = right.find(" AND ") {
-            let start_val = right.get(..and_pos).unwrap_or("").trim();
-            let end_val = right.get(and_pos + 5..).unwrap_or("").trim();
-
-            let attr_name = resolve_attribute_name_simple(left, attribute_names);
-            let start_attr = resolve_attribute_value_simple(start_val, attribute_values)?;
-            let end_attr = resolve_attribute_value_simple(end_val, attribute_values)?;
-
-            return Ok(CompiledKeyCondition {
-                condition: format!("{attr_name} BETWEEN ?1 AND ?2"),
-                values: vec![scalar_value(&start_attr)?, scalar_value(&end_attr)?],
-            });
-        }
-    }
-
-    // Single comparison
-    for (op, sql_op) in [
-        (" < ", " < "),
-        (" <= ", " <= "),
-        (" > ", " > "),
-        (" >= ", " >= "),
-    ] {
-        if let Some(pos) = expr.find(op) {
-            let left = expr.get(..pos).unwrap_or("").trim();
-            let right = expr.get(pos + op.len()..).unwrap_or("").trim();
-
-            let attr_name = resolve_attribute_name_simple(left, attribute_names);
-            let attr_value = resolve_attribute_value_simple(right, attribute_values)?;
-
-            return Ok(CompiledKeyCondition {
-                condition: format!("{attr_name}{sql_op}?1"),
-                values: vec![scalar_value(&attr_value)?],
-            });
-        }
-    }
-
-    Err(unsupported_key_condition_expression_error(expression))
 }
 
-fn scalar_value(attr_value: &AttributeValue) -> StorageResult<String> {
-    attr_value
-        .inner_str()
-        .map(str::to_owned)
-        .map_err(|error| expected_scalar_attribute_value_error(&error))
+fn compile_key_condition(condition: &Condition) -> StorageResult<CompiledKeyCondition> {
+    let mut values = Vec::new();
+    let condition = compile_key_condition_sql(condition, &mut values)?;
+    Ok(CompiledKeyCondition { condition, values })
 }
 
-fn resolve_attribute_name_simple(
-    name: &str,
-    attribute_names: Option<&HashMap<String, String>>,
-) -> String {
-    if let Some(stripped) = name.strip_prefix('#') {
-        if let Some(map) = attribute_names
-            && let Some(resolved) = map.get(name)
-        {
-            return resolved.clone();
+fn compile_key_condition_sql(
+    condition: &Condition,
+    values: &mut Vec<String>,
+) -> StorageResult<String> {
+    match condition {
+        Condition::Equal { field, value } => {
+            let value = key_condition_scalar_value(value)?;
+            compile_binary_comparison(field, "=", &value, values)
         }
-        return stripped.to_string();
+        Condition::LessThan { field, value } => {
+            compile_binary_comparison(field, "<", value, values)
+        }
+        Condition::LessThanEqual { field, value } => {
+            compile_binary_comparison(field, "<=", value, values)
+        }
+        Condition::GreaterThan { field, value } => {
+            compile_binary_comparison(field, ">", value, values)
+        }
+        Condition::GreaterThanEqual { field, value } => {
+            compile_binary_comparison(field, ">=", value, values)
+        }
+        Condition::Between { field, min, max } => {
+            values.push(min.clone());
+            let min_placeholder = values.len();
+            values.push(max.clone());
+            let max_placeholder = values.len();
+            Ok(format!(
+                "{field} BETWEEN ?{min_placeholder} AND ?{max_placeholder}"
+            ))
+        }
+        Condition::BeginsWith { field, prefix } => {
+            let prefix = begins_with_prefix(prefix)?;
+            values.push(format!("{prefix}%"));
+            Ok(format!("{field} LIKE ?{}", values.len()))
+        }
+        Condition::And { conditions } => {
+            if conditions.is_empty() {
+                return Err(StorageError::validation(
+                    "Invalid key condition expression: empty AND condition",
+                ));
+            }
+            let compiled = conditions
+                .iter()
+                .map(|condition| compile_key_condition_sql(condition, values))
+                .collect::<StorageResult<Vec<_>>>()?;
+            Ok(format!("({})", compiled.join(" AND ")))
+        }
+        _ => Err(StorageError::validation(
+            "Unsupported key condition expression",
+        )),
     }
-    name.to_string()
 }
 
-pub fn resolve_attribute_value_simple(
+fn compile_binary_comparison(
+    field: &str,
+    operator: &str,
     value: &str,
-    attribute_values: Option<&HashMap<String, AttributeValue>>,
-) -> StorageResult<AttributeValue> {
-    if value.starts_with(':') {
-        if let Some(map) = attribute_values
-            && let Some(resolved) = map.get(value)
-        {
-            return Ok(resolved.clone());
+    values: &mut Vec<String>,
+) -> StorageResult<String> {
+    values.push(value.to_string());
+    Ok(format!("{field} {operator} ?{}", values.len()))
+}
+
+fn key_condition_scalar_value(value: &AttributeValue) -> StorageResult<String> {
+    match value {
+        AttributeValue::S(value) | AttributeValue::N(value) | AttributeValue::B(value) => {
+            Ok(value.clone())
         }
-        return Err(missing_expression_attribute_value_error(value));
+        _ => Err(StorageError::validation(
+            "KeyConditionExpression comparison values must be scalar",
+        )),
     }
-    Ok(AttributeValue::S(value.to_string()))
 }
 
-#[cold]
-#[inline(never)]
-fn unsupported_key_condition_expression_error(expression: &str) -> StorageError {
-    StorageError::validation(format!(
-        "Unsupported key condition expression: {expression}"
-    ))
-}
-
-#[cold]
-#[inline(never)]
-fn missing_expression_attribute_value_error(value: &str) -> StorageError {
-    StorageError::validation(format!("ExpressionAttributeValues missing key: {value}"))
-}
-
-#[cold]
-#[inline(never)]
-fn expected_scalar_attribute_value_error(error: &storage_types::ConversionError) -> StorageError {
-    StorageError::validation(format!("expected scalar attribute value: {error}"))
+fn begins_with_prefix(prefix: &AttributeValue) -> StorageResult<String> {
+    match prefix {
+        AttributeValue::S(prefix) => Ok(prefix.clone()),
+        AttributeValue::B(prefix) => Ok(prefix.trim_end_matches('=').to_string()),
+        _ => Err(StorageError::validation(
+            "begins_with is only valid for string or binary key attributes",
+        )),
+    }
 }

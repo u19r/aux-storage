@@ -238,6 +238,7 @@ fn table_info(table_name: &TableName) -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 

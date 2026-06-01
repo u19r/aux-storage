@@ -371,6 +371,7 @@ fn gsi_attribute_type_conversion_bug() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     // GSI key schema - this is what the function processes

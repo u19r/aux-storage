@@ -7,6 +7,8 @@ mod sql_statements;
 mod stream_helpers;
 mod table_metadata;
 mod transaction_helpers;
+#[cfg(test)]
+mod transaction_helpers_alloc_tests;
 mod ttl_helpers;
 
 mod durable_revision;

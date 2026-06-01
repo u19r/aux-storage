@@ -136,6 +136,7 @@ pub async fn create_storage_provider_bundle(
             let provider = PostgresStorageProvider::new_with_tls(
                 &settings.dsn,
                 settings.max_pool_size,
+                settings.background_max_pool_size,
                 settings.tls,
             )
             .await?

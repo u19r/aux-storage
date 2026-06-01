@@ -1,16 +1,18 @@
-use std::collections::HashMap;
-#[cfg(test)]
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use async_trait::async_trait;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 #[cfg(test)]
 use storage_common::provider_perf;
 use storage_common::{
-    GSI_UPDATE_JOB, TTL_SWEEP_JOB, normalize_limit as calc_limit,
+    GSI_UPDATE_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure as apply_shared_gsi_write_pressure,
+    normalize_limit as calc_limit, observe_gsi_lag,
     ttl::{TtlConfigRecord, ttl_gsi_name},
 };
-use storage_condition::{Condition, evaluate_condition, parse_condition_expression};
+use storage_condition::{
+    Condition, condition_has_repeated_root_field, parse_condition_expression,
+    try_evaluate_condition_with_cached_roots, try_evaluate_condition_with_root,
+};
 use storage_provider::{StorageProvider, split_item_into_key_and_attributes_sync};
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
@@ -19,16 +21,19 @@ use storage_types::{
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
     KeysAndAttributes, PutItemResponse, QueryTableRequest, ReplicationMutation, ScanTableRequest,
     StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName,
-    TableStatus, TimeToLiveDescription, TimeToLiveStatus, UpdateItemRequest, UpdateItemResponse,
-    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem, WriteRequest,
+    TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, UpdateItemRequest,
+    UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
 };
 use stream_provider::{CursorName, CursorPosition, StreamDataType, StreamItem, StreamProvider};
 use tokio_postgres::types::ToSql;
 
 use crate::{
-    backends::postgres::{
-        PostgresStorageProvider, physical_names, record_read, record_write, sql_statements,
-        stream_helpers::PostgresWriteStreamEntriesInput,
+    backends::{
+        postgres::{
+            PostgresStorageProvider, physical_names, record_read, record_write, sql_statements,
+            stream_helpers::PostgresWriteStreamEntriesInput,
+        },
+        prepare_batch_operation,
     },
     billing_metrics::{
         WriteCostTally, attr_map_payload_bytes, record_read_cost, record_write_cost,
@@ -40,6 +45,46 @@ use crate::{
         decode_exclusive_start,
     },
 };
+
+fn evaluate_wire_condition(
+    old_item: Option<&WireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    if condition_has_repeated_root_field(condition) {
+        return evaluate_wire_condition_cached(old_item, condition);
+    }
+    let mut root_value = |field: &str| match old_item {
+        Some(item) => item.attribute_value(field),
+        None => Ok(None),
+    };
+    try_evaluate_condition_with_root(condition, &mut root_value)
+}
+
+fn evaluate_wire_condition_cached(
+    old_item: Option<&WireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    let mut root_value = |field: &str| {
+        Ok(match old_item {
+            Some(item) => item.attribute_value(field)?,
+            None => None,
+        })
+    };
+    try_evaluate_condition_with_cached_roots(condition, &mut root_value)
+}
+
+fn current_ms_u64() -> u64 {
+    u64::try_from(*TimestampMillis::now()).unwrap_or(0)
+}
+
+async fn apply_gsi_write_pressure(provider: &PostgresStorageProvider) -> StorageResult<()> {
+    apply_shared_gsi_write_pressure(
+        provider.immediate_gsi_consistency,
+        &provider.gsi_propagation_governor,
+        current_ms_u64(),
+    )
+    .await
+}
 
 #[async_trait]
 impl StorageProvider for PostgresStorageProvider {
@@ -160,6 +205,8 @@ impl StorageProvider for PostgresStorageProvider {
         expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
+        let _write_permit = self.acquire_foreground_write_permit("put_item").await?;
+        apply_gsi_write_pressure(self).await?;
         let bytes_written = attr_map_payload_bytes(&item);
         let response = self
             .retry_postgres_conflicts("put_item", || {
@@ -188,53 +235,8 @@ impl StorageProvider for PostgresStorageProvider {
                         &split_item.key_attributes,
                         None,
                     )?;
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    #[cfg(test)]
-                    let tx_begin_started = Instant::now();
-                    let transaction = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start put_item transaction", err)
-                    })?;
-                    #[cfg(test)]
-                    provider_perf::record("postgres", "tx_begin", tx_begin_started.elapsed());
                     let key_absence_condition =
                         is_key_absence_condition(condition.as_ref(), &table_info);
-                    let old_item = if key_absence_condition {
-                        None
-                    } else {
-                        #[cfg(test)]
-                        let main_read_started = Instant::now();
-                        let old_item = self
-                            .get_item_with_client(
-                                &transaction,
-                                &table_name,
-                                &split_item.key_attributes,
-                                &table_info,
-                            )
-                            .await?;
-                        #[cfg(test)]
-                        provider_perf::record(
-                            "postgres",
-                            "sql_query_main_row",
-                            main_read_started.elapsed(),
-                        );
-                        old_item
-                    };
-
-                    if !key_absence_condition && let Some(condition) = &condition {
-                        let old_item_for_condition = old_item
-                            .as_ref()
-                            .map(WireItem::to_attribute_map)
-                            .transpose()?
-                            .unwrap_or_default();
-                        if !evaluate_condition(&old_item_for_condition, condition) {
-                            return Err(StorageEnum::ConditionalCheckFailed.into());
-                        }
-                    }
-
                     let attributes_blob = if split_item.non_key_attributes.is_empty() {
                         "{}".to_string()
                     } else {
@@ -242,7 +244,6 @@ impl StorageProvider for PostgresStorageProvider {
                             Self::map_postgres_error("serialize non-key attributes", err)
                         })?
                     };
-
                     let table_name_safe = table_name.sanitized_name();
                     let key_columns = key_bindings
                         .iter()
@@ -286,14 +287,11 @@ impl StorageProvider for PostgresStorageProvider {
                             &assignments,
                         )
                     };
-
                     let mut bind_values = key_bindings
                         .iter()
                         .map(|binding| binding.value.clone())
                         .collect::<Vec<_>>();
                     bind_values.push(attributes_blob);
-                    #[cfg(test)]
-                    let main_write_started = Instant::now();
                     let revision_key_json = split_item
                         .key_attributes
                         .canonical_dynamo_json()
@@ -306,7 +304,10 @@ impl StorageProvider for PostgresStorageProvider {
                         &format!("${}", bind_values.len() + 1),
                         &format!("${}", bind_values.len() + 2),
                     );
-                    let combined_sql = sql_statements::dml_ctes(&[sql, revision_sql]);
+                    let combined_sql = sql_statements::dml_ctes_returning_last_column(
+                        &[sql, revision_sql],
+                        "revision",
+                    );
                     let table_name_value = table_name.to_string();
                     let mut combined_bind_values = bind_values;
                     combined_bind_values.push(table_name_value);
@@ -315,7 +316,63 @@ impl StorageProvider for PostgresStorageProvider {
                         .iter()
                         .map(|value| value as &(dyn ToSql + Sync))
                         .collect();
-                    let main_write_result = transaction.execute(&combined_sql, &params).await;
+                    let mut client = self.acquire_client("put_item").await?;
+                    let _connection_hold = self.connection_hold_timer("put_item");
+                    #[cfg(test)]
+                    let tx_begin_started = Instant::now();
+                    let transaction = self
+                        .begin_transaction(&mut client, "put_item", "start put_item transaction")
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("put_item");
+                    #[cfg(test)]
+                    provider_perf::record("postgres", "tx_begin", tx_begin_started.elapsed());
+                    let old_item = if key_absence_condition {
+                        None
+                    } else {
+                        let main_read_started = Instant::now();
+                        let old_item = self
+                            .get_item_with_client(
+                                &transaction,
+                                &table_name,
+                                &split_item.key_attributes,
+                                &table_info,
+                            )
+                            .await?;
+                        self.record_transaction_phase(
+                            "put_item",
+                            "old_item_read",
+                            main_read_started.elapsed(),
+                        );
+                        #[cfg(test)]
+                        provider_perf::record(
+                            "postgres",
+                            "sql_query_main_row",
+                            main_read_started.elapsed(),
+                        );
+                        old_item
+                    };
+
+                    if !key_absence_condition && let Some(condition) = &condition {
+                        let condition_started = Instant::now();
+                        let condition_matches =
+                            evaluate_wire_condition(old_item.as_ref(), condition)?;
+                        self.record_transaction_phase(
+                            "put_item",
+                            "condition_eval",
+                            condition_started.elapsed(),
+                        );
+                        if !condition_matches {
+                            return Err(StorageEnum::ConditionalCheckFailed.into());
+                        }
+                    }
+
+                    let main_write_started = Instant::now();
+                    let main_write_result = transaction.query_one(&combined_sql, &params).await;
+                    self.record_transaction_phase(
+                        "put_item",
+                        "main_write",
+                        main_write_started.elapsed(),
+                    );
                     if let Err(err) = main_write_result {
                         if key_absence_condition && Self::is_postgres_constraint_error(&err) {
                             return Err(StorageEnum::ConditionalCheckFailed.into());
@@ -328,18 +385,23 @@ impl StorageProvider for PostgresStorageProvider {
                         "sql_execute_main_upsert",
                         main_write_started.elapsed(),
                     );
-                    #[cfg(test)]
-                    provider_perf::record(
-                        "postgres",
-                        "sql_execute_revision",
-                        std::time::Duration::ZERO,
-                    );
+                    let revision = main_write_result
+                        .and_then(|row| row.try_get::<_, i64>(0))
+                        .map_err(|err| Self::map_postgres_error("decode put_item revision", err))?;
+                    let item_stream_version = storage_types::ItemStreamVersion::try_from(revision)?;
 
+                    let ttl_materialize_started = Instant::now();
                     let old_item_for_ttl = old_item
                         .as_ref()
                         .map(WireItem::to_attribute_map)
                         .transpose()?;
+                    self.record_transaction_phase(
+                        "put_item",
+                        "old_item_ttl_materialize",
+                        ttl_materialize_started.elapsed(),
+                    );
                     if self.immediate_gsi_consistency {
+                        let gsi_started = Instant::now();
                         self.apply_gsi_entries_for_item_change_with_client(
                             &transaction,
                             &table_name,
@@ -348,8 +410,12 @@ impl StorageProvider for PostgresStorageProvider {
                             Some(&split_item.all_attributes),
                         )
                         .await?;
+                        self.record_transaction_phase(
+                            "put_item",
+                            "gsi_sync",
+                            gsi_started.elapsed(),
+                        );
                     }
-                    #[cfg(test)]
                     let ttl_started = Instant::now();
                     self.sync_ttl_index_entries_with_client(
                         &transaction,
@@ -358,17 +424,9 @@ impl StorageProvider for PostgresStorageProvider {
                         Some(&split_item.all_attributes),
                     )
                     .await?;
+                    self.record_transaction_phase("put_item", "ttl_sync", ttl_started.elapsed());
                     #[cfg(test)]
                     provider_perf::record("postgres", "ttl_sync", ttl_started.elapsed());
-                    let item_stream_version = storage_types::ItemStreamVersion::try_from(
-                        Self::get_item_revision_with_client(
-                            &transaction,
-                            &table_name,
-                            &split_item.key_attributes,
-                        )
-                        .await?,
-                    )?;
-                    #[cfg(test)]
                     let stream_started = Instant::now();
                     self.write_stream_entries_for_item_with_client(
                         &transaction,
@@ -382,21 +440,36 @@ impl StorageProvider for PostgresStorageProvider {
                         },
                     )
                     .await?;
+                    self.record_transaction_phase(
+                        "put_item",
+                        "stream_write",
+                        stream_started.elapsed(),
+                    );
                     #[cfg(test)]
                     provider_perf::record("postgres", "stream_write", stream_started.elapsed());
-                    #[cfg(test)]
                     let commit_started = Instant::now();
                     transaction.commit().await.map_err(|err| {
                         Self::map_postgres_write_error("commit put_item transaction", err)
                     })?;
+                    self.record_transaction_phase(
+                        "put_item",
+                        "tx_commit",
+                        commit_started.elapsed(),
+                    );
                     #[cfg(test)]
                     provider_perf::record("postgres", "tx_commit", commit_started.elapsed());
 
+                    let return_values_started = Instant::now();
                     let attributes = if matches!(return_values, Some(AllOld::AllOld)) {
                         old_item.map(WireItem::into_attribute_map).transpose()?
                     } else {
                         None
                     };
+                    self.record_transaction_phase(
+                        "put_item",
+                        "return_values",
+                        return_values_started.elapsed(),
+                    );
                     Ok(PutItemResponse {
                         attributes: attributes.map(Into::into),
                     })
@@ -414,15 +487,17 @@ impl StorageProvider for PostgresStorageProvider {
         key: KeyAttributes,
         _consistent_read: bool,
     ) -> StorageResult<Option<WireItem>> {
+        let prepare_started = Instant::now();
         let table_info = self.get_table_info_cached_arc(&table_name).await?;
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
+        let prepared = Self::prepare_get_item_query(&table_name, &key, &table_info)?;
+        self.record_transaction_phase("get_item", "prepare", prepare_started.elapsed());
+        let client = self.acquire_client("get_item").await?;
+        let _connection_hold = self.connection_hold_timer("get_item");
+        let query_started = Instant::now();
         let result = self
-            .get_item_with_client(&client, &table_name, &key, &table_info)
+            .execute_prepared_get_item_query(&client, &prepared, "get_item", "db_query")
             .await?;
+        self.record_transaction_phase("get_item", "db_query_total", query_started.elapsed());
         let bytes_read = result.as_ref().map_or(0, |item| item.payload_len());
         record_read(usize::from(result.is_some()), bytes_read);
         record_read_cost("get_item", "get", 1, bytes_read as u64);
@@ -435,10 +510,9 @@ impl StorageProvider for PostgresStorageProvider {
     ) -> StorageResult<(Vec<ItemVersionedWireItem>, Option<String>)> {
         let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
         let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
+            .acquire_client("scan_table_with_item_stream_versions")
+            .await?;
+        let _connection_hold = self.connection_hold_timer("scan_table_with_item_stream_versions");
         let (items, next_cursor) = self.scan_table(request).await?;
         let mut versioned = Vec::with_capacity(items.len());
         for item in items {
@@ -463,11 +537,8 @@ impl StorageProvider for PostgresStorageProvider {
         request: DurablePointReadRequest,
     ) -> StorageResult<DurablePointReadProof> {
         let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
+        let client = self.acquire_client("get_item_with_durable_proof").await?;
+        let _connection_hold = self.connection_hold_timer("get_item_with_durable_proof");
         let item = self
             .get_item_with_client(&client, &request.table_name, &request.key, &table_info)
             .await?;
@@ -493,6 +564,8 @@ impl StorageProvider for PostgresStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
+        let _write_permit = self.acquire_foreground_write_permit("delete_item").await?;
+        apply_gsi_write_pressure(self).await?;
         let key_bytes = attr_map_payload_bytes(&key);
         let result = self
             .retry_postgres_conflicts("delete_item", || {
@@ -510,14 +583,16 @@ impl StorageProvider for PostgresStorageProvider {
 
                     let table_info = self.get_table_info_cached_arc(&table_name).await?;
                     let key_attributes = key.clone();
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    let transaction = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start delete_item transaction", err)
-                    })?;
+                    let mut client = self.acquire_client("delete_item").await?;
+                    let _connection_hold = self.connection_hold_timer("delete_item");
+                    let transaction = self
+                        .begin_transaction(
+                            &mut client,
+                            "delete_item",
+                            "start delete_item transaction",
+                        )
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("delete_item");
                     let old_item = self
                         .get_item_with_client(
                             &transaction,
@@ -527,15 +602,10 @@ impl StorageProvider for PostgresStorageProvider {
                         )
                         .await?;
 
-                    if let Some(condition) = &condition {
-                        let old_item_for_condition = old_item
-                            .as_ref()
-                            .map(WireItem::to_attribute_map)
-                            .transpose()?
-                            .unwrap_or_default();
-                        if !evaluate_condition(&old_item_for_condition, condition) {
-                            return Err(StorageEnum::ConditionalCheckFailed.into());
-                        }
+                    if let Some(condition) = &condition
+                        && !evaluate_wire_condition(old_item.as_ref(), condition)?
+                    {
+                        return Err(StorageEnum::ConditionalCheckFailed.into());
                     }
 
                     let Some(old_item) = old_item else {
@@ -613,6 +683,10 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: GuardedPutItemRequest,
     ) -> StorageResult<PutItemResponse> {
+        let _write_permit = self
+            .acquire_foreground_write_permit("guarded_put_item")
+            .await?;
+        apply_gsi_write_pressure(self).await?;
         self.do_guarded_put_item(request).await
     }
 
@@ -620,6 +694,10 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: GuardedDeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
+        let _write_permit = self
+            .acquire_foreground_write_permit("guarded_delete_item")
+            .await?;
+        apply_gsi_write_pressure(self).await?;
         self.do_guarded_delete_item(request).await
     }
 
@@ -786,10 +864,11 @@ impl StorageProvider for PostgresStorageProvider {
             &mut bind_values,
         )?);
         if let Some(start_key) = exclusive_start_key.as_ref()
-            && let Some(predicate) = Self::build_exclusive_start_predicate(
+            && let Some(predicate) = Self::build_exclusive_start_predicate_after_prefix(
                 &ordered_columns,
                 start_key,
                 scan_forward,
+                1,
                 &mut bind_values,
             )?
         {
@@ -830,74 +909,44 @@ impl StorageProvider for PostgresStorageProvider {
         request: BatchWriteItemRequest,
         _should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse> {
+        let _write_permit = self
+            .acquire_foreground_write_permit("batch_write_item")
+            .await?;
+        apply_gsi_write_pressure(self).await?;
         let mut billed_tally = WriteCostTally::default();
         for write_requests in request.request_items.values() {
             for write_request in write_requests {
                 billed_tally.record_write_request(write_request);
             }
         }
+        let prepare_started = Instant::now();
+        let mut prepared_ops = Vec::new();
+        for (table_name, write_requests) in request.request_items {
+            let table_info = self.get_table_info_cached_arc(&table_name).await?;
+            for write_request in write_requests {
+                let prepared = prepare_batch_operation(&table_info, write_request)?;
+                prepared_ops.push(Self::prepare_postgres_batch_operation(prepared)?);
+            }
+        }
+        self.record_transaction_phase("batch_write_item", "prepare", prepare_started.elapsed());
         let response = self
             .retry_postgres_conflicts("batch_write_item", || {
-                let request = request.clone();
+                let prepared_ops = prepared_ops.clone();
                 async move {
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    let tx = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start batch_write_item transaction", err)
-                    })?;
+                    let mut client = self.acquire_client("batch_write_item").await?;
+                    let _connection_hold = self.connection_hold_timer("batch_write_item");
+                    let tx = self
+                        .begin_transaction(
+                            &mut client,
+                            "batch_write_item",
+                            "start batch_write_item transaction",
+                        )
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("batch_write_item");
 
-                    for (table_name, write_requests) in request.request_items {
-                        self.get_table_info_cached_arc(&table_name).await?;
-
-                        for write_request in write_requests {
-                            match write_request {
-                                WriteRequest {
-                                    put_request: Some(put_request),
-                                    delete_request: None,
-                                } => {
-                                    self.transact_put_with_client(
-                                        &tx,
-                                        storage_types::TransactPutRequest {
-                                            table_name: table_name.clone(),
-                                            item: put_request.item,
-                                            condition_expression: None,
-                                            expression_attribute_names: None,
-                                            expression_attribute_values: None,
-                                            return_values_on_condition_check_failure: None,
-                                        },
-                                        None,
-                                    )
-                                    .await?;
-                                }
-                                WriteRequest {
-                                    put_request: None,
-                                    delete_request: Some(delete_request),
-                                } => {
-                                    self.transact_delete_with_client(
-                                        &tx,
-                                        storage_types::TransactDeleteRequest {
-                                            table_name: table_name.clone(),
-                                            key: delete_request.key,
-                                            condition_expression: None,
-                                            expression_attribute_names: None,
-                                            expression_attribute_values: None,
-                                            return_values_on_condition_check_failure: None,
-                                        },
-                                        None,
-                                    )
-                                    .await?;
-                                }
-                                _ => {
-                                    return Err(StorageError::validation(
-                                        "Each WriteRequest must contain exactly one of PutRequest \
-                                         or DeleteRequest",
-                                    ));
-                                }
-                            }
-                        }
+                    for prepared_op in &prepared_ops {
+                        self.execute_prepared_batch_operation_with_client(&tx, prepared_op)
+                            .await?;
                     }
 
                     tx.commit().await.map_err(|err| {
@@ -947,6 +996,7 @@ impl StorageProvider for PostgresStorageProvider {
                 continue;
             }
 
+            let prepare_started = Instant::now();
             let table_info = match self.get_table_info_cached_arc(&table_name).await {
                 Ok(info) => info,
                 Err(err) if matches!(err.as_ref(), StorageEnum::TableNotFound { .. }) => {
@@ -978,83 +1028,85 @@ impl StorageProvider for PostgresStorageProvider {
             let mut select_projection = Vec::with_capacity(key_columns.len() + 1);
             for (_, column_name, attribute_type) in &key_columns {
                 if matches!(attribute_type, storage_types::KeyAttributeType::N) {
-                    select_projection.push(format!("{column_name}::TEXT AS {column_name}"));
+                    select_projection.push(format!("item.{column_name}::TEXT AS {column_name}"));
                 } else {
-                    select_projection.push(column_name.clone());
+                    select_projection.push(format!("item.{column_name} AS {column_name}"));
                 }
             }
-            select_projection.push("attributes_blob".to_string());
+            select_projection.push("item.attributes_blob AS attributes_blob".to_string());
             let select_projection = select_projection.join(", ");
 
             let mut bind_values =
                 Vec::with_capacity(key_columns.len() * keys_and_attributes.keys.len());
-            let sql = if key_columns.len() == 1 {
-                let (attribute_name, column_name, attribute_type) = &key_columns[0];
-                let mut placeholders = Vec::with_capacity(keys_and_attributes.keys.len());
-                for key in &keys_and_attributes.keys {
-                    let key_attributes = key.clone();
+            let tuple_columns = key_columns
+                .iter()
+                .map(|(_, column_name, _)| column_name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let join_predicates = key_columns
+                .iter()
+                .map(|(_, column_name, _)| format!("item.{column_name} = requested.{column_name}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut values_rows = Vec::with_capacity(keys_and_attributes.keys.len());
+            for key in &keys_and_attributes.keys {
+                let key_attributes = key.clone();
+                let mut row_placeholders = Vec::with_capacity(key_columns.len());
+                for (attribute_name, _, attribute_type) in &key_columns {
                     let value = key_attributes
                         .get(attribute_name)
                         .ok_or_else(StorageError::invalid_or_missing_key)?;
                     bind_values.push(Self::scalar_key_value(value, attribute_name)?);
-                    placeholders.push(Self::postgres_placeholder_for_type(
+                    row_placeholders.push(Self::postgres_placeholder_for_type(
                         bind_values.len(),
                         attribute_type,
                     ));
                 }
-                sql_statements::batch_get_single_key(
-                    &select_projection,
-                    &physical_names::physical_table_name(&table_name),
-                    column_name,
-                    &placeholders.join(", "),
-                )
-            } else {
-                let tuple_columns = key_columns
-                    .iter()
-                    .map(|(_, column_name, _)| column_name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut tuple_predicates = Vec::with_capacity(keys_and_attributes.keys.len());
-                for key in &keys_and_attributes.keys {
-                    let key_attributes = key.clone();
-                    let mut tuple_placeholders = Vec::with_capacity(key_columns.len());
-                    for (attribute_name, _, attribute_type) in &key_columns {
-                        let value = key_attributes
-                            .get(attribute_name)
-                            .ok_or_else(StorageError::invalid_or_missing_key)?;
-                        bind_values.push(Self::scalar_key_value(value, attribute_name)?);
-                        tuple_placeholders.push(Self::postgres_placeholder_for_type(
-                            bind_values.len(),
-                            attribute_type,
-                        ));
-                    }
-                    tuple_predicates.push(format!("({})", tuple_placeholders.join(", ")));
-                }
-                sql_statements::batch_get_composite_key(
-                    &select_projection,
-                    &physical_names::physical_table_name(&table_name),
-                    &tuple_columns,
-                    &tuple_predicates.join(", "),
-                )
-            };
+                values_rows.push(format!("({})", row_placeholders.join(", ")));
+            }
+            let sql = sql_statements::batch_get_composite_key(
+                &select_projection,
+                &physical_names::physical_table_name(&table_name),
+                &tuple_columns,
+                &values_rows.join(", "),
+                &join_predicates,
+            );
+            self.record_transaction_phase("batch_get_item", "prepare", prepare_started.elapsed());
 
             let params: Vec<&(dyn ToSql + Sync)> = bind_values
                 .iter()
                 .map(|value| value as &(dyn ToSql + Sync))
                 .collect();
-            let client = match self.pool.get().await {
-                Ok(client) => client,
-                Err(_) => {
-                    unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
-                    continue;
-                }
+            let query_result = {
+                let client = match self.acquire_client("batch_get_item").await {
+                    Ok(client) => client,
+                    Err(_) => {
+                        unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
+                        continue;
+                    }
+                };
+                let _connection_hold = self.connection_hold_timer("batch_get_item");
+                let query_started = Instant::now();
+                let result = client.query(&sql, &params).await;
+                self.record_transaction_phase(
+                    "batch_get_item",
+                    "db_query",
+                    query_started.elapsed(),
+                );
+                result
             };
-            match client.query(&sql, &params).await {
+            match query_result {
                 Ok(rows) => {
+                    let decode_started = Instant::now();
                     let mut table_items = Vec::with_capacity(rows.len());
                     for row in rows {
                         table_items.push(Self::row_to_wire_item(&row, &table_info)?);
                     }
+                    self.record_transaction_phase(
+                        "batch_get_item",
+                        "row_decode",
+                        decode_started.elapsed(),
+                    );
                     total_items_returned += table_items.len();
                     total_bytes_read += wire_items_payload_bytes(&table_items) as usize;
                     if !table_items.is_empty() {
@@ -1091,6 +1143,8 @@ impl StorageProvider for PostgresStorageProvider {
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {
+        let _write_permit = self.acquire_foreground_write_permit("update_item").await?;
+        apply_gsi_write_pressure(self).await?;
         self.do_update_item(request).await
     }
 
@@ -1098,6 +1152,10 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: GuardedUpdateItemRequest,
     ) -> StorageResult<UpdateItemResponse> {
+        let _write_permit = self
+            .acquire_foreground_write_permit("guarded_update_item")
+            .await?;
+        apply_gsi_write_pressure(self).await?;
         self.do_guarded_update_item(request).await
     }
 
@@ -1105,6 +1163,10 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: storage_types::TransactWriteItemsRequest,
     ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
+        let _write_permit = self
+            .acquire_foreground_write_permit("transact_write_items")
+            .await?;
+        apply_gsi_write_pressure(self).await?;
         self.do_transact_write_items(request).await
     }
 
@@ -1170,11 +1232,8 @@ impl StorageProvider for PostgresStorageProvider {
                     .map_err(|err| {
                         Self::map_postgres_error("serialize ttl attribute definitions", err)
                     })?;
-                let client = self
-                    .pool
-                    .get()
-                    .await
-                    .map_err(Self::map_postgres_client_acquire_error)?;
+                let client = self.acquire_client("update_time_to_live").await?;
+                let _connection_hold = self.connection_hold_timer("update_time_to_live");
                 client
                     .execute(
                         sql_statements::update_attribute_definitions(),
@@ -1305,10 +1364,13 @@ impl PostgresStorageProvider {
     }
 
     pub(super) async fn process_gsi_updates(&self) -> StorageResult<bool> {
+        let _background_permit = self.acquire_background_work_permit().await?;
         let cursor_name: CursorName = "gsi-update-cursor".to_string().into();
         let stream_name = StreamName::system_table_stream();
         let mut cursor_position = self
             .ensure_gsi_update_cursor(&stream_name, &cursor_name)
+            .await?;
+        self.refresh_gsi_update_lag(&stream_name, cursor_position)
             .await?;
         let mut did_work = false;
         let mut table_infos: HashMap<TableName, Option<StoredTableInfo>> = HashMap::new();
@@ -1335,17 +1397,23 @@ impl PostgresStorageProvider {
             let records = records_result.records;
 
             if records.is_empty() {
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                    .await?;
                 return Ok(did_work);
             }
 
             let mut client = self
-                .pool
-                .get()
-                .await
-                .map_err(Self::map_postgres_client_acquire_error)?;
-            let transaction = client.transaction().await.map_err(|err| {
-                Self::map_postgres_write_error("start postgres gsi update transaction", err)
-            })?;
+                .acquire_background_client("process_gsi_updates")
+                .await?;
+            let _connection_hold = self.connection_hold_timer("process_gsi_updates");
+            let transaction = self
+                .begin_transaction(
+                    &mut client,
+                    "process_gsi_updates",
+                    "start postgres gsi update transaction",
+                )
+                .await?;
+            let _transaction_hold = self.transaction_hold_timer("process_gsi_updates");
 
             for (pointer, stream_items) in records {
                 let filtered_info = if let Some(cached) = table_infos.get(&pointer.table_name) {
@@ -1382,6 +1450,8 @@ impl PostgresStorageProvider {
             })?;
 
             let Some(last_item) = last_item else {
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                    .await?;
                 return Ok(did_work);
             };
             self.advance_cursor(stream_name.clone(), cursor_name.clone(), last_item)
@@ -1390,11 +1460,33 @@ impl PostgresStorageProvider {
                     StorageError::internal(&format!("postgres advance gsi cursor failed: {err}"))
                 })?;
             cursor_position = Some(last_item);
+            self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                .await?;
 
             if !had_more {
                 return Ok(did_work);
             }
         }
+    }
+
+    async fn refresh_gsi_update_lag(
+        &self,
+        stream_name: &StreamName,
+        cursor_position: Option<StreamItemId>,
+    ) -> StorageResult<()> {
+        let page = self
+            .read_forward(stream_name.clone(), cursor_position, 1)
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!("postgres gsi lag read failed: {err}"))
+            })?;
+        let now_ms = current_ms_u64();
+        observe_gsi_lag(
+            &self.gsi_propagation_governor,
+            page.items.first().map(|item| item.created_at),
+            now_ms,
+        );
+        Ok(())
     }
 }
 

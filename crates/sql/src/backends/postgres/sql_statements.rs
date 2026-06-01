@@ -382,7 +382,8 @@ pub fn create_storage_metadata_tables() -> &'static str {
         global_secondary_indexes TEXT,
         table_size_bytes BIGINT DEFAULT 0,
         item_count BIGINT DEFAULT 0,
-        stream_specification TEXT
+        stream_specification TEXT,
+        deletion_protection_enabled BOOLEAN NOT NULL DEFAULT FALSE
     );
     CREATE TABLE IF NOT EXISTS gsi_backfill (
         table_name TEXT NOT NULL,
@@ -407,13 +408,18 @@ pub fn create_storage_metadata_tables() -> &'static str {
 }
 
 #[must_use]
+pub fn add_deletion_protection_column() -> &'static str {
+    crate::provider_core::statements::metadata::add_deletion_protection_column(&PostgresDialect).sql
+}
+
+#[must_use]
 pub fn table_exists() -> &'static str {
     metadata::table_exists(&PostgresDialect, "").sql
 }
 
 #[must_use]
 pub fn insert_table_metadata() -> &'static str {
-    metadata::insert_table(&PostgresDialect, "", "", 0, "", "", None, None).sql
+    metadata::insert_table(&PostgresDialect, "", "", 0, "", "", None, None, false).sql
 }
 
 #[must_use]
@@ -459,6 +465,11 @@ pub fn delete_stream_items_for_table() -> &'static str {
 #[must_use]
 pub fn update_stream_specification() -> &'static str {
     "UPDATE tables SET stream_specification = $1 WHERE table_name = $2"
+}
+
+#[must_use]
+pub fn update_deletion_protection() -> &'static str {
+    "UPDATE tables SET deletion_protection_enabled = $1 WHERE table_name = $2"
 }
 
 #[must_use]
@@ -522,7 +533,7 @@ pub fn bump_item_revision_with_placeholders(table_name: &str, key_json: &str) ->
     format!(
         "INSERT INTO item_revisions (table_name, key_json, revision) VALUES ({table_name}, \
          {key_json}, 1) ON CONFLICT(table_name, key_json) DO UPDATE SET revision = \
-         item_revisions.revision + 1 RETURNING 1"
+         item_revisions.revision + 1 RETURNING revision"
     )
 }
 
@@ -552,28 +563,16 @@ pub fn select_ordered_rows(
 }
 
 #[must_use]
-pub fn batch_get_single_key(
-    select_projection: &str,
-    physical_table_name: &str,
-    column_name: &str,
-    placeholders: &str,
-) -> String {
-    format!(
-        "SELECT {select_projection} FROM \"{physical_table_name}\" WHERE {column_name} IN \
-         ({placeholders})"
-    )
-}
-
-#[must_use]
 pub fn batch_get_composite_key(
     select_projection: &str,
     physical_table_name: &str,
     tuple_columns: &str,
-    predicates: &str,
+    values_rows: &str,
+    join_predicates: &str,
 ) -> String {
     format!(
-        "SELECT {select_projection} FROM \"{physical_table_name}\" WHERE ({tuple_columns}) IN \
-         ({predicates})"
+        "SELECT {select_projection} FROM \"{physical_table_name}\" AS item JOIN (VALUES \
+         {values_rows}) AS requested({tuple_columns}) ON {join_predicates}"
     )
 }
 
@@ -628,6 +627,28 @@ pub fn dml_ctes(statements: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" + ");
     format!("WITH {ctes} SELECT {counts}")
+}
+
+#[must_use]
+pub fn dml_ctes_returning_last_column(statements: &[String], column: &str) -> String {
+    let ctes = statements
+        .iter()
+        .enumerate()
+        .map(|(index, statement)| format!("write_{index} AS ({statement})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last_index = statements.len().saturating_sub(1);
+    if last_index == 0 {
+        return format!("WITH {ctes} SELECT {column} FROM write_{last_index}");
+    }
+    let counts = (0..last_index)
+        .map(|index| format!("(SELECT COUNT(*) FROM write_{index})"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    format!(
+        "WITH {ctes} SELECT write_{last_index}.{column} FROM write_{last_index} CROSS JOIN \
+         (SELECT {counts} AS affected_rows) AS write_counts"
+    )
 }
 
 #[must_use]

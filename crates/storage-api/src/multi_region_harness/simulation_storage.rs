@@ -211,6 +211,7 @@ fn storage_config_for_region(
                 postgres: Some(PostgresSettings {
                     dsn,
                     max_pool_size: config.postgres_max_pool_size,
+                    background_max_pool_size: 4,
                     tls: config.postgres_tls,
                     immediate_gsi_consistency: false,
                 }),

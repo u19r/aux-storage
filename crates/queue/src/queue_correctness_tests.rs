@@ -116,6 +116,7 @@ fn postgres_case(_label: &str) -> Option<BackendCase> {
     config.postgres = Some(PostgresSettings {
         dsn,
         max_pool_size: 16,
+        background_max_pool_size: 4,
         tls: false,
     });
     Some(BackendCase {

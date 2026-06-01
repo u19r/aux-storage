@@ -4,7 +4,10 @@ use std::vec;
 
 use storage_types::AttributeValue;
 
-use crate::{Condition, SizeComparison, evaluate_condition};
+use crate::{
+    Condition, SizeComparison, condition_has_repeated_root_field, evaluate_condition,
+    parse_condition_expression, try_evaluate_condition_with_root,
+};
 
 fn create_test_item() -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
@@ -84,41 +87,41 @@ fn equal_condition() {
     // String equality
     let condition = Condition::Equal {
         field: "name".to_string(),
-        value: "John".to_string(),
+        value: AttributeValue::S("John".to_string()),
     };
     assert!(evaluate_condition(&item, &condition));
 
     let condition = Condition::Equal {
         field: "name".to_string(),
-        value: "Jane".to_string(),
+        value: AttributeValue::S("Jane".to_string()),
     };
     assert!(!evaluate_condition(&item, &condition));
 
     // Number equality
     let condition = Condition::Equal {
         field: "age".to_string(),
-        value: "25".to_string(),
+        value: AttributeValue::N("25".to_string()),
     };
     assert!(evaluate_condition(&item, &condition));
 
     // Binary equality
     let condition = Condition::Equal {
         field: "data".to_string(),
-        value: "YmluYXJ5X2RhdGE=".to_string(),
+        value: AttributeValue::B("YmluYXJ5X2RhdGE=".to_string()),
     };
     assert!(evaluate_condition(&item, &condition));
 
     // Boolean equality
     let condition = Condition::Equal {
         field: "active".to_string(),
-        value: "true".to_string(),
+        value: AttributeValue::BOOL(true),
     };
     assert!(evaluate_condition(&item, &condition));
 
     // NULL equality
     let condition = Condition::Equal {
         field: "deleted".to_string(),
-        value: "null".to_string(),
+        value: AttributeValue::NULL(true),
     };
     assert!(evaluate_condition(&item, &condition));
 }
@@ -254,15 +257,60 @@ fn in_condition() {
     // String in
     let condition = Condition::In {
         field: "name".to_string(),
-        values: vec!["John".to_string(), "Alice".to_string()],
+        values: vec![
+            AttributeValue::S("John".to_string()),
+            AttributeValue::S("Alice".to_string()),
+        ],
     };
     assert!(evaluate_condition(&item, &condition));
 
     let condition = Condition::In {
         field: "name".to_string(),
-        values: vec!["Jane".to_string(), "Bob".to_string()],
+        values: vec![
+            AttributeValue::S("Jane".to_string()),
+            AttributeValue::S("Bob".to_string()),
+        ],
     };
     assert!(!evaluate_condition(&item, &condition));
+}
+
+#[test]
+fn in_condition_matches_maps_structurally() {
+    let map = HashMap::from([
+        ("child".to_string(), AttributeValue::S("value".to_string())),
+        ("num".to_string(), AttributeValue::N("5".to_string())),
+    ]);
+    let item = HashMap::from([("m".to_string(), AttributeValue::M(map.clone()))]);
+
+    let condition = Condition::In {
+        field: "m".to_string(),
+        values: vec![
+            AttributeValue::M(HashMap::from([(
+                "other".to_string(),
+                AttributeValue::S("x".to_string()),
+            )])),
+            AttributeValue::M(map),
+        ],
+    };
+
+    assert!(evaluate_condition(&item, &condition));
+}
+
+#[test]
+fn literal_value_equality_condition() {
+    let item = HashMap::new();
+
+    let condition = Condition::ValueEqual {
+        left: AttributeValue::S("same".to_string()),
+        right: AttributeValue::S("same".to_string()),
+    };
+    assert!(evaluate_condition(&item, &condition));
+
+    let condition = Condition::ValueNotEqual {
+        left: AttributeValue::S("same".to_string()),
+        right: AttributeValue::S("other".to_string()),
+    };
+    assert!(evaluate_condition(&item, &condition));
 }
 
 #[test]
@@ -702,7 +750,7 @@ fn and_condition() {
             },
             Condition::Equal {
                 field: "active".to_string(),
-                value: "true".to_string(),
+                value: AttributeValue::BOOL(true),
             },
         ],
     };
@@ -715,7 +763,7 @@ fn and_condition() {
             },
             Condition::Equal {
                 field: "active".to_string(),
-                value: "false".to_string(),
+                value: AttributeValue::BOOL(false),
             },
         ],
     };
@@ -733,7 +781,7 @@ fn or_condition() {
             },
             Condition::Equal {
                 field: "active".to_string(),
-                value: "true".to_string(),
+                value: AttributeValue::BOOL(true),
             },
         ],
     };
@@ -746,7 +794,7 @@ fn or_condition() {
             },
             Condition::Equal {
                 field: "active".to_string(),
-                value: "false".to_string(),
+                value: AttributeValue::BOOL(false),
             },
         ],
     };
@@ -779,7 +827,7 @@ fn deeply_nested_and_or_conditions() {
                     },
                     Condition::Equal {
                         field: "active".to_string(),
-                        value: "true".to_string(),
+                        value: AttributeValue::BOOL(true),
                     },
                 ],
             },
@@ -812,7 +860,7 @@ fn deeply_nested_and_or_conditions() {
             },
             Condition::Equal {
                 field: "active".to_string(),
-                value: "true".to_string(),
+                value: AttributeValue::BOOL(true),
             },
         ],
     };
@@ -847,13 +895,13 @@ fn deeply_nested_and_or_conditions() {
                     },
                     Condition::Equal {
                         field: "active".to_string(),
-                        value: "true".to_string(),
+                        value: AttributeValue::BOOL(true),
                     },
                 ],
             },
             Condition::Equal {
                 field: "deleted".to_string(),
-                value: "null".to_string(),
+                value: AttributeValue::NULL(true),
             },
         ],
     };
@@ -877,7 +925,7 @@ fn condition_with_missing_fields() {
 
     let condition = Condition::Equal {
         field: "missing".to_string(),
-        value: "value".to_string(),
+        value: AttributeValue::S("value".to_string()),
     };
     assert!(!evaluate_condition(&item, &condition));
 
@@ -941,4 +989,108 @@ fn list_map_attribute_types() {
         field: "map_attr".to_string(),
     };
     assert!(evaluate_condition(&item, &condition));
+}
+
+#[test]
+fn root_lookup_condition_matches_map_evaluation_for_nested_paths() {
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("tenant#1".to_string())),
+        ("sk".to_string(), AttributeValue::S("item#1".to_string())),
+        (
+            "payload".to_string(),
+            AttributeValue::M(HashMap::from([
+                (
+                    "status".to_string(),
+                    AttributeValue::S("active".to_string()),
+                ),
+                (
+                    "scores".to_string(),
+                    AttributeValue::L(vec![
+                        AttributeValue::N("1".to_string()),
+                        AttributeValue::N("7".to_string()),
+                    ]),
+                ),
+            ])),
+        ),
+        (
+            "tags".to_string(),
+            AttributeValue::SS(vec!["hot".to_string(), "tracked".to_string()]),
+        ),
+    ]);
+    let values = HashMap::from([
+        (
+            ":active".to_string(),
+            AttributeValue::S("active".to_string()),
+        ),
+        (
+            ":tracked".to_string(),
+            AttributeValue::S("tracked".to_string()),
+        ),
+        (":seven".to_string(), AttributeValue::N("7".to_string())),
+    ]);
+    let condition = parse_condition_expression(
+        "payload.status = :active AND contains(tags, :tracked) AND payload.scores[1] = :seven",
+        None,
+        Some(&values),
+    )
+    .expect("parse condition");
+
+    let mut root_value = |field: &str| Ok::<_, ()>(item.get(field).cloned());
+    assert_eq!(
+        try_evaluate_condition_with_root(&condition, &mut root_value).expect("evaluate"),
+        evaluate_condition(&item, &condition)
+    );
+}
+
+#[test]
+fn root_lookup_condition_preserves_missing_attribute_semantics() {
+    let item = HashMap::from([(
+        "pk".to_string(),
+        AttributeValue::S("tenant#missing".to_string()),
+    )]);
+    let values = HashMap::from([(
+        ":value".to_string(),
+        AttributeValue::S("anything".to_string()),
+    )]);
+    let condition = parse_condition_expression(
+        "attribute_not_exists(payload.status) AND missing <> :value",
+        None,
+        Some(&values),
+    )
+    .expect("parse condition");
+
+    let mut root_value = |field: &str| Ok::<_, ()>(item.get(field).cloned());
+    assert_eq!(
+        try_evaluate_condition_with_root(&condition, &mut root_value).expect("evaluate"),
+        evaluate_condition(&item, &condition)
+    );
+}
+
+#[test]
+fn repeated_root_detection_only_flags_duplicate_roots() {
+    let values = HashMap::from([
+        (
+            ":active".to_string(),
+            AttributeValue::S("active".to_string()),
+        ),
+        (
+            ":prefix".to_string(),
+            AttributeValue::S("prefix".to_string()),
+        ),
+    ]);
+    let repeated = parse_condition_expression(
+        "payload.status = :active AND begins_with(payload.search, :prefix)",
+        None,
+        Some(&values),
+    )
+    .expect("parse repeated root condition");
+    assert!(condition_has_repeated_root_field(&repeated));
+
+    let single = parse_condition_expression(
+        "status = :active AND begins_with(search, :prefix)",
+        None,
+        Some(&values),
+    )
+    .expect("parse single root condition");
+    assert!(!condition_has_repeated_root_field(&single));
 }

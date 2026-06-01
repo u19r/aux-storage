@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use storage_condition::evaluate_condition;
-use storage_provider::{apply_bound_update_operations, before_update_item, update_item_response};
+use storage_provider::{
+    apply_bound_update_operations, before_update_item_optional, update_item_response,
+};
 use storage_sync::{
     ResolvedSyncMutation, ResolvedSyncMutationBatch, SyncCreateTableMutation, SyncDeleteMutation,
     SyncDeleteTableMutation, SyncItemBaseVersion, SyncMutationId, SyncMutationResolver,
@@ -328,13 +330,13 @@ impl<'a> SyncWriteResolver<'a> {
             ..
         } = request;
         validate_update_expression_usage(
-            &update_expression,
+            update_expression.as_deref(),
             condition_expression.as_deref(),
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
         )?;
-        let (operations, condition) = before_update_item(
-            &update_expression,
+        let (operations, condition) = before_update_item_optional(
+            update_expression.as_deref(),
             condition_expression.as_deref(),
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),

@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use serde::ser::SerializeMap as _;
 use storage_common::{GsiKeyPart, GsiWriteAction, plan_gsi_write_actions};
 use storage_types::{
     AttributeValue, GlobalSecondaryIndex, IndexName, KeyAttributeType, KeySchemaElement,
@@ -470,12 +469,12 @@ pub(crate) fn projected_attributes_blob(
     let attributes = projected_item
         .iter()
         .filter(|(name, _)| !is_projected_key_attribute(name, gsi_key_schema, table_key_schema))
-        .map(|(name, value)| (name.as_str(), value))
-        .collect::<Vec<_>>();
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
     if attributes.is_empty() {
         return Ok("{}".to_string());
     }
-    serde_json::to_string(&AttributePairs(&attributes)).map_err(|err| {
+    serde_json::to_string(&attributes).map_err(|err| {
         StorageError::internal(&format!("serialize projected gsi attributes failed: {err}"))
     })
 }
@@ -489,19 +488,6 @@ fn is_projected_key_attribute(
         .iter()
         .chain(table_key_schema.iter())
         .any(|key| key.attribute_name == name)
-}
-
-struct AttributePairs<'a>(&'a [(&'a str, &'a AttributeValue)]);
-
-impl serde::Serialize for AttributePairs<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, value) in self.0 {
-            map.serialize_entry(name, value)?;
-        }
-        map.end()
-    }
 }
 
 fn key_attribute_type(

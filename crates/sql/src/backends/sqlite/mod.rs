@@ -67,6 +67,8 @@ mod stream_provider_tests;
 #[cfg(test)]
 mod sync_raft_log_store_tests;
 #[cfg(test)]
+mod transact_write_impl_tests;
+#[cfg(test)]
 mod update_item_tests;
 #[cfg(all(test, not(feature = "turso-backend")))]
 mod write_path_alloc_tests;

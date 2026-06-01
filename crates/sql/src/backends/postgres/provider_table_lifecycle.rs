@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use storage_common::{
     GSI_UPDATE_JOB, GsiJobConfig, JobIntervalMillis, RegistersJobs, TTL_SWEEP_JOB,
@@ -28,6 +30,14 @@ impl PostgresStorageProvider {
             .batch_execute(sql_statements::create_storage_metadata_tables())
             .await
             .map_err(|err| StorageError::internal(&format!("postgres init failed: {err}")))?;
+        client
+            .batch_execute(sql_statements::add_deletion_protection_column())
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!(
+                    "postgres deletion protection migration failed: {err}"
+                ))
+            })?;
 
         self.initialize_stream().await.map_err(|err| {
             StorageError::internal(&format!("postgres stream init failed: {err}"))
@@ -70,12 +80,25 @@ impl PostgresStorageProvider {
         #[derive(Clone)]
         struct PostgresGsiUpdateJob {
             provider: PostgresStorageProvider,
+            run_budget: Duration,
         }
 
         #[async_trait]
         impl bg_jobs::BackgroundJob for PostgresGsiUpdateJob {
             async fn execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(self.provider.process_gsi_updates().await?)
+                let mut work_done = false;
+                let started = Instant::now();
+                loop {
+                    let progressed = self.provider.process_gsi_updates().await?;
+                    work_done |= progressed;
+                    if !progressed
+                        || !self.provider.gsi_propagation_governor.lag_above_target()
+                        || started.elapsed() >= self.run_budget
+                    {
+                        break;
+                    }
+                }
+                Ok(work_done)
             }
         }
 
@@ -95,12 +118,14 @@ impl PostgresStorageProvider {
             mgr: &self.job_manager,
         };
         if !self.immediate_gsi_consistency {
+            let gsi_cfg = GsiJobConfig::default();
             registrar
                 .register_timed_job(
                     GSI_UPDATE_JOB,
-                    GsiJobConfig::default().update_interval_ms,
+                    gsi_cfg.update_interval_ms,
                     PostgresGsiUpdateJob {
                         provider: self.clone(),
+                        run_budget: gsi_update_run_budget(gsi_cfg.update_interval_ms),
                     },
                 )
                 .await?;
@@ -172,6 +197,7 @@ impl PostgresStorageProvider {
                             &metadata.key_schema_json,
                             &metadata.global_secondary_indexes_json,
                             &metadata.stream_specification_json,
+                            &metadata.deletion_protection_enabled,
                         ],
                     )
                     .await
@@ -270,6 +296,11 @@ impl PostgresStorageProvider {
         let table_name_value = table_name.to_string();
         let table_name_safe = table_name.sanitized_name();
         let table_info = self.get_table_info(table_name).await.ok();
+        if let Some(table_info) = table_info.as_ref()
+            && table_info.deletion_protection_enabled
+        {
+            return Err(StorageError::deletion_protection_enabled(table_name));
+        }
 
         self.retry_postgres_conflicts("delete_table", || {
             let table_name_value = table_name_value.clone();
@@ -403,6 +434,22 @@ impl PostgresStorageProvider {
                 )
                 .await
                 .map_err(|err| Self::map_postgres_error("update stream specification", err))?;
+        }
+
+        if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
+            table_info.deletion_protection_enabled = deletion_protection_enabled;
+            let client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            client
+                .execute(
+                    sql_statements::update_deletion_protection(),
+                    &[&deletion_protection_enabled, &table_name.as_ref()],
+                )
+                .await
+                .map_err(|err| Self::map_postgres_error("update deletion protection", err))?;
         }
 
         if let Some(gsi_updates) = request.global_secondary_index_updates {
@@ -595,7 +642,12 @@ impl PostgresStorageProvider {
                 stream_specification: table_info.stream_specification.clone(),
                 latest_stream_arn: None,
                 latest_stream_label: None,
+                deletion_protection_enabled: table_info.deletion_protection_enabled,
             },
         })
     }
+}
+
+fn gsi_update_run_budget(interval_ms: JobIntervalMillis) -> Duration {
+    Duration::from_millis(interval_ms.0.saturating_mul(95) / 100)
 }

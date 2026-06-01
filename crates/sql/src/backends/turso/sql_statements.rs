@@ -25,6 +25,11 @@ pub fn create_tables_table() -> &'static str {
 }
 
 #[must_use]
+pub fn add_deletion_protection_column() -> &'static str {
+    metadata::add_deletion_protection_column(&TursoDialect).sql
+}
+
+#[must_use]
 pub fn create_gsi_backfill_table() -> &'static str {
     metadata::create_gsi_backfill_table(&TursoDialect).sql
 }
@@ -53,13 +58,13 @@ pub fn get_table_info() -> &'static str {
 pub fn list_table_infos() -> &'static str {
     r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
 FROM tables"
 }
 
 #[must_use]
 pub fn insert_table() -> &'static str {
-    metadata::insert_table(&TursoDialect, "", "", 0, "", "", None, None).sql
+    metadata::insert_table(&TursoDialect, "", "", 0, "", "", None, None, false).sql
 }
 
 #[must_use]
@@ -80,6 +85,11 @@ pub fn list_all_tables() -> &'static str {
 #[must_use]
 pub fn delete_table_metadata() -> &'static str {
     metadata::delete_table_metadata(&TursoDialect, "").sql
+}
+
+#[must_use]
+pub fn update_deletion_protection() -> &'static str {
+    metadata::update_deletion_protection(&TursoDialect, false, "").sql
 }
 
 #[must_use]

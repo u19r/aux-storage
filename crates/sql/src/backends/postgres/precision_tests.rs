@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use storage_types::{
     AttributeDefinition, AttributeValue, GlobalSecondaryIndex, IndexName, ItemKey,
     KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType, StoredTableInfo,
-    TableName, TableStatus,
+    TableKey, TableName, TableStatus,
 };
 
 use crate::backends::postgres::PostgresStorageProvider;
@@ -63,6 +63,7 @@ fn table_info_with_numeric_keys() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 
@@ -74,7 +75,7 @@ fn postgres_number_keys_use_numeric_sql_type_and_casted_placeholders() {
     );
     assert_eq!(
         PostgresStorageProvider::postgres_placeholder_for_type(3, &KeyAttributeType::N),
-        "CAST($3 AS NUMERIC)"
+        "CAST($3 AS TEXT)::NUMERIC"
     );
 }
 
@@ -107,14 +108,17 @@ fn postgres_table_and_gsi_creation_use_numeric_for_number_keys() {
         },
     }];
 
-    let table_sql = PostgresStorageProvider::build_postgres_table_creation_sql(
+    let table_sqls = PostgresStorageProvider::build_postgres_table_creation_sqls(
         &table_name,
         &attribute_definitions,
         &key_schema,
         Some(&gsis),
     );
+    assert_eq!(table_sqls.len(), 1);
+    let table_sql = &table_sqls[0];
     assert!(table_sql.contains("pk NUMERIC"));
     assert!(table_sql.contains("gsi_pk NUMERIC"));
+    assert!(!table_sql.contains("PARTITION BY HASH"));
 
     let gsi_sqls = PostgresStorageProvider::build_postgres_gsi_creation_sqls(
         &table_name,
@@ -126,6 +130,7 @@ fn postgres_table_and_gsi_creation_use_numeric_for_number_keys() {
     let gsi_sql = &gsi_sqls[0];
     assert!(gsi_sql.contains("gsi_pk NUMERIC"));
     assert!(gsi_sql.contains("table_pk NUMERIC"));
+    assert!(!gsi_sql.contains("PARTITION BY HASH"));
 }
 
 #[test]
@@ -170,7 +175,7 @@ fn postgres_numeric_conditions_and_pagination_keep_full_precision_strings() {
     let key_types = HashMap::from([("pk".to_string(), KeyAttributeType::N)]);
     let condition = storage_condition::Condition::Equal {
         field: "pk".to_string(),
-        value: high_precision.clone(),
+        value: AttributeValue::N(high_precision.clone()),
     };
     let condition_sql = PostgresStorageProvider::compile_key_condition_sql(
         &condition,
@@ -178,7 +183,7 @@ fn postgres_numeric_conditions_and_pagination_keep_full_precision_strings() {
         &mut bind_values,
     )
     .expect("compile key condition");
-    assert_eq!(condition_sql, "pk = CAST($1 AS NUMERIC)");
+    assert_eq!(condition_sql, "pk = CAST($1 AS TEXT)::NUMERIC");
     assert_eq!(bind_values, vec![high_precision.clone()]);
 
     let table_info = table_info_with_numeric_keys();
@@ -203,8 +208,83 @@ fn postgres_numeric_conditions_and_pagination_keep_full_precision_strings() {
     .expect("pagination predicate")
     .expect("predicate exists");
 
-    assert!(pagination_sql.contains("pk > CAST($1 AS NUMERIC)"));
-    assert!(pagination_sql.contains("pk = CAST($2 AS NUMERIC)"));
+    assert!(pagination_sql.contains("(pk, sk) > (CAST($1 AS TEXT)::NUMERIC, $2)"));
     assert_eq!(pagination_bind_values[0], high_precision);
-    assert_eq!(pagination_bind_values[1], pagination_bind_values[0]);
+    assert_eq!(pagination_bind_values[1], "sort-1");
+}
+
+#[test]
+fn postgres_query_pagination_skips_fixed_hash_prefix_for_table_reads() {
+    let table_info = table_info_with_numeric_keys();
+    let ordered_columns = PostgresStorageProvider::ordered_key_columns_for_origin(
+        &table_info,
+        &table_info.key_schema,
+        None,
+    )
+    .expect("ordered columns");
+    let exclusive_start_key = ItemKey::table_key(
+        TableName::new("precision_table"),
+        AttributeValue::N("42".to_string()),
+        Some(AttributeValue::S("sort-1".to_string())),
+    );
+    let mut bind_values = Vec::new();
+
+    let predicate = PostgresStorageProvider::build_exclusive_start_predicate_after_prefix(
+        &ordered_columns,
+        &exclusive_start_key,
+        true,
+        1,
+        &mut bind_values,
+    )
+    .expect("pagination predicate")
+    .expect("predicate exists");
+
+    assert_eq!(predicate, "sk > $1");
+    assert_eq!(bind_values, vec!["sort-1"]);
+}
+
+#[test]
+fn postgres_query_pagination_skips_fixed_hash_prefix_for_gsi_reads() {
+    let table_info = table_info_with_numeric_keys();
+    let gsi_key_schema = &table_info
+        .global_secondary_indexes
+        .as_ref()
+        .expect("gsi metadata")[0]
+        .key_schema;
+    let ordered_columns = PostgresStorageProvider::ordered_key_columns_for_origin(
+        &table_info,
+        gsi_key_schema,
+        Some(&table_info.key_schema),
+    )
+    .expect("ordered columns");
+    let exclusive_start_key = ItemKey::index_key(
+        TableName::new("precision_table"),
+        IndexName::new("gsi_precision"),
+        AttributeValue::N("7".to_string()),
+        Some(AttributeValue::S("gsi-sort-1".to_string())),
+        TableKey::new(
+            TableName::new("precision_table"),
+            AttributeValue::N("42".to_string()),
+            Some(AttributeValue::S("sort-1".to_string())),
+        ),
+    );
+    let mut bind_values = Vec::new();
+
+    let predicate = PostgresStorageProvider::build_exclusive_start_predicate_after_prefix(
+        &ordered_columns,
+        &exclusive_start_key,
+        false,
+        1,
+        &mut bind_values,
+    )
+    .expect("pagination predicate")
+    .expect("predicate exists");
+
+    assert!(!predicate.contains("gsi_pk <"));
+    assert!(
+        predicate.contains("(gsi_sk, table_pk, table_sk) < ($1, CAST($2 AS TEXT)::NUMERIC, $3)")
+    );
+    assert_eq!(bind_values[0], "gsi-sort-1");
+    assert_eq!(bind_values[1], "42");
+    assert_eq!(bind_values[2], "sort-1");
 }

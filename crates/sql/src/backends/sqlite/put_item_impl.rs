@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
-use storage_condition::{Condition, evaluate_condition};
+use storage_condition::{
+    Condition, condition_has_repeated_root_field, evaluate_condition,
+    try_evaluate_condition_with_cached_roots, try_evaluate_condition_with_root,
+};
 use storage_provider::split_item_into_key_and_attributes_sync;
 use storage_types::{
     AttributeValue, KeyAttributes, KeySchemaElement, ReplicationEventMetadata, SplitDynamoItem,
@@ -11,11 +14,45 @@ use crate::{
     SQLiteStorageProvider,
     error_handler::map_sqlite_error,
     stream_writer::{
-        WriteWireStreamEntriesInput, should_write_stream_entries, write_stream_entries,
-        write_stream_entries_wire,
+        WriteWireStreamEntriesInput, should_write_stream_entries_for_gsi_mode,
+        write_stream_entries, write_stream_entries_wire,
     },
-    utils::SqliteConn,
+    utils::{SqliteConn, main_table_attributes_blob},
 };
+
+pub(crate) fn condition_item_ref(
+    old_item: Option<&HashMap<String, AttributeValue>>,
+) -> &HashMap<String, AttributeValue> {
+    static EMPTY_ITEM: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
+    old_item.unwrap_or(&EMPTY_ITEM)
+}
+
+fn evaluate_wire_condition(
+    old_item: Option<&WireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    if condition_has_repeated_root_field(condition) {
+        return evaluate_wire_condition_cached(old_item, condition);
+    }
+    let mut root_value = |field: &str| match old_item {
+        Some(item) => item.attribute_value(field),
+        None => Ok(None),
+    };
+    try_evaluate_condition_with_root(condition, &mut root_value)
+}
+
+fn evaluate_wire_condition_cached(
+    old_item: Option<&WireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    let mut root_value = |field: &str| {
+        Ok(match old_item {
+            Some(item) => item.attribute_value(field)?,
+            None => None,
+        })
+    };
+    try_evaluate_condition_with_cached_roots(condition, &mut root_value)
+}
 
 impl SQLiteStorageProvider {
     pub fn do_put_wire_item(
@@ -32,7 +69,8 @@ impl SQLiteStorageProvider {
         let key_attributes = extract_wire_item_key_attributes(item, &table_info.key_schema)?;
 
         let ttl_config = SQLiteStorageProvider::load_ttl_config_txn(sqlite, table_name)?;
-        let should_write_stream = should_write_stream_entries(&table_info);
+        let should_write_stream =
+            should_write_stream_entries_for_gsi_mode(&table_info, immediate_gsi_consistency);
         let should_track_ttl = ttl_tracking_enabled(ttl_config.as_ref());
         let needs_old_item =
             should_return_old || condition.is_some() || should_write_stream || should_track_ttl;
@@ -43,15 +81,10 @@ impl SQLiteStorageProvider {
             None
         };
 
-        if let Some(condition) = condition {
-            let old_item_for_condition = old_item
-                .as_ref()
-                .map(WireItem::to_attribute_map)
-                .transpose()?
-                .unwrap_or_default();
-            if !evaluate_condition(&old_item_for_condition, condition) {
-                return Err(StorageEnum::ConditionalCheckFailed.into());
-            }
+        if let Some(condition) = condition
+            && !evaluate_wire_condition(old_item.as_ref(), condition)?
+        {
+            return Err(StorageEnum::ConditionalCheckFailed.into());
         }
 
         let attributes_blob = wire_item_attributes_blob(item)?;
@@ -129,7 +162,7 @@ impl SQLiteStorageProvider {
         let old_item = Self::do_get_item(table_name, &key_attributes, sqlite)?;
 
         if let Some(condition) = condition
-            && !evaluate_condition(&old_item.clone().unwrap_or(HashMap::new()), condition)
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
         {
             return Err(StorageEnum::ConditionalCheckFailed.into());
         }
@@ -148,11 +181,7 @@ impl SQLiteStorageProvider {
 
         // Add non-key attributes as JSON blob
         columns.push("attributes_blob".to_string());
-        let blob_json = if non_key_attributes.is_empty() {
-            "{}".to_string()
-        } else {
-            serde_json::to_string(&non_key_attributes)?
-        };
+        let blob_json = main_table_attributes_blob(&key_attributes, &non_key_attributes)?;
         values.push(blob_json.clone());
 
         let placeholders: String = (1..=values.len())
@@ -176,17 +205,18 @@ impl SQLiteStorageProvider {
 
         tracing::Span::current().record("rows_affected", rows_affected);
 
-        // Write to streams
-        write_stream_entries(
-            sqlite,
-            &table_info,
-            &all_attributes,
-            old_item.as_ref(),
-            false,
-            item_stream_version,
-            replication,
-        )
-        .context("write stream entries")?;
+        if should_write_stream_entries_for_gsi_mode(&table_info, immediate_gsi_consistency) {
+            write_stream_entries(
+                sqlite,
+                &table_info,
+                &all_attributes,
+                old_item.as_ref(),
+                false,
+                item_stream_version,
+                replication,
+            )
+            .context("write stream entries")?;
+        }
 
         if immediate_gsi_consistency {
             SQLiteStorageProvider::apply_immediate_gsi_updates(

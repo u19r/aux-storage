@@ -24,11 +24,11 @@ fn write_route_stage_metrics_accept_known_write_stages() {
             MANAGER_STAGE,
             RESPONSE_ENCODE_STAGE,
         ] {
-            let timer = DynamoRouteTimer::new(operation.to_string());
+            let timer = DynamoRouteTimer::new(operation);
             timer.record_stage(stage, SUCCESS_STATUS, Instant::now());
         }
 
-        let timer = DynamoRouteTimer::new(operation.to_string());
+        let timer = DynamoRouteTimer::new(operation);
         timer.record_stage(MANAGER_STAGE, ERROR_STATUS, Instant::now());
     }
 }

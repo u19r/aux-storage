@@ -86,7 +86,8 @@ pub enum BoundUpdateOperation<'a> {
     },
     SetArithmetic {
         field: Arc<str>,
-        operands: Box<(BoundUpdateOperand<'a>, BoundUpdateOperand<'a>)>,
+        lhs: BoundUpdateOperand<'a>,
+        rhs: BoundUpdateOperand<'a>,
         operator: ArithmeticOperator,
     },
     SetIfNotExists {
@@ -145,7 +146,8 @@ impl BoundUpdateOperation<'_> {
 /// Split update expression by commas, but preserve commas inside function calls
 #[must_use]
 pub fn split_operations_preserving_functions(expression: &str) -> Vec<String> {
-    split_operation_parts_preserving_functions(expression)
+    let normalized = normalize_update_section_keywords(expression);
+    split_operation_parts_preserving_functions(&normalized)
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -296,12 +298,17 @@ fn parse_update_expression_plan(
     update_expression: &str,
     expression_attribute_names: Option<&HashMap<String, String>>,
 ) -> StorageResult<Vec<UpdateOperationPlan>> {
-    let parts = split_operation_parts_preserving_functions(update_expression);
+    let normalized_expression = normalize_update_section_keywords(update_expression);
+    let parts = split_operation_parts_preserving_functions(&normalized_expression);
     let mut operations = Vec::with_capacity(parts.len());
 
     for part in parts {
         // Parse SET operations
-        if let Some(set_part) = part.strip_prefix("SET ") {
+        if part == "SET" {
+            return Err(StorageError::validation(
+                "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"SET\"",
+            ));
+        } else if let Some(set_part) = part.strip_prefix("SET ") {
             let assignment = set_part.trim();
             if let Some((field, value_expr)) = split_assignment(assignment) {
                 push_set_operation_plan(
@@ -526,7 +533,8 @@ fn bind_borrowed_update_expression_plan<'a>(
                     let rhs = bind_borrowed_update_value_plan(rhs, expression_attribute_values)?;
                     BoundUpdateOperation::SetArithmetic {
                         field: Arc::clone(field),
-                        operands: Box::new((lhs, rhs)),
+                        lhs,
+                        rhs,
                         operator: *operator,
                     }
                 }
@@ -656,6 +664,86 @@ fn push_set_operation_plan(
 fn split_assignment(assignment: &str) -> Option<(&str, &str)> {
     let (field, value_expr) = assignment.split_once('=')?;
     Some((field.trim(), value_expr.trim()))
+}
+
+fn normalize_update_section_keywords(expression: &str) -> String {
+    let mut normalized = String::with_capacity(expression.len());
+    let mut index = 0;
+    let mut paren_depth = 0usize;
+
+    while index < expression.len() {
+        let Some(ch) = expression.get(index..).and_then(|tail| tail.chars().next()) else {
+            break;
+        };
+        match ch {
+            '(' => {
+                paren_depth += 1;
+                normalized.push(ch);
+                index += ch.len_utf8();
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                normalized.push(ch);
+                index += ch.len_utf8();
+            }
+            _ if paren_depth == 0 => {
+                if let Some((keyword, consumed)) = update_section_keyword_at(expression, index) {
+                    while normalized.ends_with(char::is_whitespace) {
+                        normalized.pop();
+                    }
+                    if !normalized.is_empty() && !normalized.ends_with(',') {
+                        normalized.push(' ');
+                    }
+                    normalized.push_str(keyword);
+                    normalized.push(' ');
+                    index += consumed;
+                    while expression
+                        .get(index..)
+                        .and_then(|tail| tail.chars().next())
+                        .is_some_and(char::is_whitespace)
+                    {
+                        index += expression
+                            .get(index..)
+                            .and_then(|tail| tail.chars().next())
+                            .map_or(0, char::len_utf8);
+                    }
+                    continue;
+                }
+                normalized.push(ch);
+                index += ch.len_utf8();
+            }
+            _ => {
+                normalized.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    normalized
+}
+
+fn update_section_keyword_at(expression: &str, index: usize) -> Option<(&'static str, usize)> {
+    if index > 0 {
+        let previous = expression.get(..index)?.chars().next_back()?;
+        if !previous.is_whitespace() && previous != ',' {
+            return None;
+        }
+    }
+    let remaining = expression.get(index..)?;
+    for keyword in ["SET", "REMOVE", "ADD", "DELETE"] {
+        let candidate = remaining.get(..keyword.len())?;
+        if !candidate.eq_ignore_ascii_case(keyword) {
+            continue;
+        }
+        let after_keyword = remaining.get(keyword.len()..)?;
+        let Some(next) = after_keyword.chars().next() else {
+            continue;
+        };
+        if next.is_whitespace() {
+            return Some((keyword, keyword.len()));
+        }
+    }
+    None
 }
 
 fn split_keyword(bytes: &[u8]) -> Option<(&'static str, usize)> {
@@ -879,7 +967,7 @@ pub fn apply_update_operations(
 
     for operation in operations {
         if let UpdateOperation::Remove { field } = operation {
-            remove_attribute_value(&mut item, field);
+            remove_attribute_value(&mut item, field)?;
         }
     }
 
@@ -890,30 +978,13 @@ pub fn apply_update_operations(
     }
 
     for operation in operations {
-        if let UpdateOperation::Delete { field, value } = operation
-            && let Some(existing_value) = item.get_mut(field.as_ref())
-        {
-            match (existing_value, value) {
-                (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                (AttributeValue::NS(existing_set), AttributeValue::NS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                (AttributeValue::BS(existing_set), AttributeValue::BS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                _ => {
-                    return Err(StorageError::validation(format!(
-                        "DELETE operation not supported for field type: {field}"
-                    )));
-                }
+        if let UpdateOperation::Delete { field, value } = operation {
+            let Some(existing_value) = item.get_mut(field.as_ref()) else {
+                continue;
+            };
+            let remove_attribute = apply_delete_set_operation(existing_value, value, field)?;
+            if remove_attribute {
+                item.remove(field.as_ref());
             }
         }
     }
@@ -959,10 +1030,10 @@ pub fn apply_bound_update_operations(
             }
             BoundUpdateOperation::SetArithmetic {
                 field,
-                operands,
+                lhs,
+                rhs,
                 operator,
             } => {
-                let (lhs, rhs) = operands.as_ref();
                 let value = evaluate_bound_set_arithmetic(&item, lhs, *operator, rhs)?;
                 set_attribute_value(&mut item, field, value)?;
             }
@@ -991,7 +1062,7 @@ pub fn apply_bound_update_operations(
 
     for operation in operations {
         if let BoundUpdateOperation::Remove { field } = operation {
-            remove_attribute_value(&mut item, field);
+            remove_attribute_value(&mut item, field)?;
         }
     }
 
@@ -1002,30 +1073,14 @@ pub fn apply_bound_update_operations(
     }
 
     for operation in operations {
-        if let BoundUpdateOperation::Delete { field, value } = operation
-            && let Some(existing_value) = item.get_mut(field.as_ref())
-        {
-            match (existing_value, value.as_ref()) {
-                (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                (AttributeValue::NS(existing_set), AttributeValue::NS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                (AttributeValue::BS(existing_set), AttributeValue::BS(delete_set)) => {
-                    for item_to_delete in delete_set {
-                        existing_set.retain(|item| item != item_to_delete);
-                    }
-                }
-                _ => {
-                    return Err(StorageError::validation(format!(
-                        "DELETE operation not supported for field type: {field}"
-                    )));
-                }
+        if let BoundUpdateOperation::Delete { field, value } = operation {
+            let Some(existing_value) = item.get_mut(field.as_ref()) else {
+                continue;
+            };
+            let remove_attribute =
+                apply_delete_set_operation(existing_value, value.as_ref(), field)?;
+            if remove_attribute {
+                item.remove(field.as_ref());
             }
         }
     }
@@ -1106,13 +1161,8 @@ fn apply_add_operation(
         (AttributeValue::BS(existing_set), AttributeValue::BS(add_set)) => {
             append_unique_values(existing_set, add_set);
         }
-        (existing, add) => {
-            return Err(StorageError::validation(format!(
-                "ADD operation type mismatch for field {field}: existing attribute type {} cannot \
-                 be added to operand type {}",
-                attribute_value_type_name(existing),
-                attribute_value_type_name(add),
-            )));
+        _ => {
+            return Err(update_operand_type_error());
         }
     }
 
@@ -1156,6 +1206,38 @@ fn append_unique_values(existing: &mut Vec<String>, values_to_add: &[String]) {
     }
 }
 
+fn apply_delete_set_operation(
+    existing_value: &mut AttributeValue,
+    delete_value: &AttributeValue,
+    _field: &str,
+) -> StorageResult<bool> {
+    match (existing_value, delete_value) {
+        (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set)) => {
+            remove_set_members(existing_set, delete_set);
+            Ok(existing_set.is_empty())
+        }
+        (AttributeValue::NS(existing_set), AttributeValue::NS(delete_set)) => {
+            remove_set_members(existing_set, delete_set);
+            Ok(existing_set.is_empty())
+        }
+        (AttributeValue::BS(existing_set), AttributeValue::BS(delete_set)) => {
+            remove_set_members(existing_set, delete_set);
+            Ok(existing_set.is_empty())
+        }
+        _ => Err(update_operand_type_error()),
+    }
+}
+
+fn update_operand_type_error() -> StorageError {
+    StorageError::validation("An operand in the update expression has an incorrect data type")
+}
+
+fn remove_set_members(existing_set: &mut Vec<String>, delete_set: &[String]) {
+    for item_to_delete in delete_set {
+        existing_set.retain(|item| item != item_to_delete);
+    }
+}
+
 fn attribute_value_type_name(value: &AttributeValue) -> &'static str {
     match value {
         AttributeValue::S(_) => "S",
@@ -1178,8 +1260,26 @@ pub fn before_update_item<'a>(
     expression_attribute_names: Option<&HashMap<String, String>>,
     expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
 ) -> StorageResult<(Vec<BoundUpdateOperation<'a>>, Option<Condition>)> {
-    let plan = cached_update_expression_plan(update_expression, expression_attribute_names)?;
-    let operations = bind_borrowed_update_expression_plan(&plan, expression_attribute_values)?;
+    before_update_item_optional(
+        Some(update_expression),
+        condition_expression,
+        expression_attribute_names,
+        expression_attribute_values,
+    )
+}
+
+pub fn before_update_item_optional<'a>(
+    update_expression: Option<&str>,
+    condition_expression: Option<&str>,
+    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
+) -> StorageResult<(Vec<BoundUpdateOperation<'a>>, Option<Condition>)> {
+    let operations = if let Some(update_expression) = update_expression {
+        let plan = cached_update_expression_plan(update_expression, expression_attribute_names)?;
+        bind_borrowed_update_expression_plan(&plan, expression_attribute_values)?
+    } else {
+        Vec::new()
+    };
 
     let condition = if let Some(expr) = condition_expression {
         Some(
@@ -1219,7 +1319,6 @@ fn cached_condition_expression(
         && let Some(cached) = conditions.iter().find(|cached| {
             attribute_names_match(expression_attribute_names, &cached.attribute_names)
                 && condition_attribute_values_match(
-                    condition_expression,
                     expression_attribute_values,
                     &cached.attribute_values,
                 )
@@ -1238,7 +1337,6 @@ fn cached_condition_expression(
         if let Some(cached) = conditions.iter().find(|cached| {
             attribute_names_match(expression_attribute_names, &cached.attribute_names)
                 && condition_attribute_values_match(
-                    condition_expression,
                     expression_attribute_values,
                     &cached.attribute_values,
                 )
@@ -1276,95 +1374,10 @@ fn sorted_condition_attribute_values(
 }
 
 fn condition_attribute_values_match(
-    condition_expression: &str,
     expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
     cached_values: &[(String, AttributeValue)],
 ) -> bool {
-    if !condition_value_placeholders_are_subset_of_cached(condition_expression, cached_values) {
-        return false;
-    }
     cached_values.iter().all(|(key, value)| {
-        condition_expression_contains_value_placeholder(condition_expression, key)
-            && expression_attribute_values.and_then(|values| values.get(key)) == Some(value)
+        expression_attribute_values.and_then(|values| values.get(key)) == Some(value)
     })
-}
-
-fn condition_value_placeholders_are_subset_of_cached(
-    expression: &str,
-    cached_values: &[(String, AttributeValue)],
-) -> bool {
-    scan_value_placeholders(expression, |token| {
-        cached_values.iter().any(|(key, _)| key == token)
-    })
-}
-
-fn condition_expression_contains_value_placeholder(expression: &str, expected: &str) -> bool {
-    let mut found = false;
-    let _ = scan_value_placeholders(expression, |token| {
-        if token == expected {
-            found = true;
-        }
-        true
-    });
-    found
-}
-
-fn scan_value_placeholders(expression: &str, mut visit: impl FnMut(&str) -> bool) -> bool {
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut chars = expression.char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if in_single_quote {
-            if ch == '\\' {
-                let _ = chars.next();
-                continue;
-            }
-            if ch == '\'' {
-                in_single_quote = false;
-            }
-            continue;
-        }
-        if in_double_quote {
-            if ch == '\\' {
-                let _ = chars.next();
-                continue;
-            }
-            if ch == '"' {
-                in_double_quote = false;
-            }
-            continue;
-        }
-
-        if ch == '\'' {
-            in_single_quote = true;
-            continue;
-        }
-        if ch == '"' {
-            in_double_quote = true;
-            continue;
-        }
-        if ch != ':' {
-            continue;
-        }
-
-        let mut end = idx + ch.len_utf8();
-        let mut has_identifier = false;
-        while let Some((next_idx, next_ch)) = chars.peek().copied() {
-            if next_ch.is_ascii_alphanumeric() || next_ch == '_' {
-                has_identifier = true;
-                end = next_idx + next_ch.len_utf8();
-                let _ = chars.next();
-            } else {
-                break;
-            }
-        }
-        if !has_identifier {
-            continue;
-        }
-        if !visit(expression.get(idx..end).unwrap_or_default()) {
-            return false;
-        }
-    }
-    true
 }

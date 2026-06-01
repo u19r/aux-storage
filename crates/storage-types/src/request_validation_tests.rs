@@ -38,6 +38,18 @@ fn get_item_rejects_unknown_fields() {
 }
 
 #[test]
+fn get_item_empty_key_uses_dynamodb_schema_message() {
+    let payload = json!({
+        "TableName": "TestTable",
+        "Key": {},
+    });
+
+    let err = GetItemRequest::try_from(payload).expect_err("empty key should fail");
+
+    assert_eq!(err, "The provided key element does not match the schema");
+}
+
+#[test]
 fn put_item_rejects_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
@@ -108,7 +120,7 @@ fn create_table_rejects_invalid_table_and_key_shapes() {
                 payload["TableName"] = json!("bad/table");
                 payload
             },
-            "TableName contains invalid characters",
+            "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
         ),
         (
             "empty attribute definitions",
@@ -299,7 +311,10 @@ fn batch_and_transaction_requests_reject_structurally_invalid_operations() {
         .expect_err("transact write item with multiple operations should fail");
 
     assert!(batch_write_err.contains("exactly one of PutRequest or DeleteRequest"));
-    assert_eq!(batch_get_err, "Key cannot be empty");
+    assert_eq!(
+        batch_get_err,
+        "The provided key element does not match the schema"
+    );
     assert_eq!(
         transact_err,
         "TransactItems can only contain one of Check, Put, Update or Delete"
@@ -613,6 +628,11 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
         "Item": { "pk": { "S": "1" } },
         "ConditionExpression": "contains(name, name)"
     });
+    let put_trailing_open_parenthesis = json!({
+        "TableName": "TestTable",
+        "Item": { "pk": { "S": "1" } },
+        "ConditionExpression": "attribute_exists("
+    });
     let put_attribute_type_literal = json!({
         "TableName": "TestTable",
         "Item": { "pk": { "S": "1" } },
@@ -686,6 +706,16 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
         "ConditionExpression": "size(#n) > :size",
         "ExpressionAttributeNames": { "#n": "name" },
         "ExpressionAttributeValues": { ":size": { "N": "3" } }
+    });
+    let put_size_between = json!({
+        "TableName": "TestTable",
+        "Item": { "pk": { "S": "1" } },
+        "ConditionExpression": "size(#n) BETWEEN :lower AND :upper",
+        "ExpressionAttributeNames": { "#n": "name" },
+        "ExpressionAttributeValues": {
+            ":lower": { "N": "1" },
+            ":upper": { "N": "8" }
+        }
     });
     let put_between_number_bounds_reversed = json!({
         "TableName": "TestTable",
@@ -774,6 +804,12 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
          first operand: [name]"
     );
     assert_eq!(
+        PutItemRequest::try_from(put_trailing_open_parenthesis)
+            .expect_err("trailing open parenthesis should fail"),
+        "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \
+         \"<EOF>\", near: \"(\""
+    );
+    assert_eq!(
         PutItemRequest::try_from(put_attribute_type_literal)
             .expect_err("attribute_type literal type should fail"),
         "1 validation error detected: Invalid ConditionExpression: Incorrect operand type for \
@@ -828,6 +864,7 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
          be used this way in an expression; function: contains"
     );
     assert!(PutItemRequest::try_from(put_size_greater_than).is_ok());
+    assert!(PutItemRequest::try_from(put_size_between).is_ok());
     assert_eq!(
         PutItemRequest::try_from(put_between_number_bounds_reversed)
             .expect_err("BETWEEN number lower bound greater than upper should fail"),
@@ -850,6 +887,37 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
          AttributeValue: {B:eg==}, upper bound operand: AttributeValue: {B:YQ==}"
     );
     assert!(PutItemRequest::try_from(put_between_equal_bounds).is_ok());
+}
+
+#[test]
+fn expression_attribute_names_reject_aggregate_size_above_dynamodb_limit() {
+    let oversized_name = "a".repeat((2 * 1024 * 1024) + 1);
+    let delete_item = json!({
+        "TableName": "TestTable",
+        "Key": { "pk": { "S": "1" } },
+        "ConditionExpression": "attribute_not_exists(#n)",
+        "ExpressionAttributeNames": { "#n": oversized_name }
+    });
+    let transact_write = json!({
+        "TransactItems": [{
+            "Delete": {
+                "TableName": "TestTable",
+                "Key": { "pk": { "S": "1" } },
+                "ConditionExpression": "attribute_not_exists(#n)",
+                "ExpressionAttributeNames": { "#n": "a".repeat((2 * 1024 * 1024) + 1) }
+            }
+        }]
+    });
+
+    assert_eq!(
+        DeleteItemRequest::try_from(delete_item).expect_err("large names should fail"),
+        "1 validation error detected: ExpressionAttributeNames exceeds max size"
+    );
+    assert_eq!(
+        TransactWriteItemsRequest::try_from(transact_write)
+            .expect_err("transaction large names should fail"),
+        "ExpressionAttributeNames exceeds max size"
+    );
 }
 
 #[test]
@@ -1901,6 +1969,34 @@ fn batch_get_projection_expressions_reject_attribute_errors_with_dynamodb_messag
             }
         }
     });
+    let too_long_name_token = format!("#{}", "a".repeat(255));
+    let too_long_projection_name = json!({
+        "RequestItems": {
+            "TestTable": {
+                "Keys": [{ "pk": { "S": "1" } }],
+                "ProjectionExpression": too_long_name_token,
+                "ExpressionAttributeNames": {
+                    format!("#{}", "a".repeat(255)): "m"
+                }
+            }
+        }
+    });
+    let too_long_projection_expression = json!({
+        "RequestItems": {
+            "TestTable": {
+                "Keys": [{ "pk": { "S": "1" } }],
+                "ProjectionExpression": "a".repeat(crate::MAX_EXPRESSION_BYTES + 1)
+            }
+        }
+    });
+    let overlapping_projection = json!({
+        "RequestItems": {
+            "TestTable": {
+                "Keys": [{ "pk": { "S": "1" } }],
+                "ProjectionExpression": "m, m.child"
+            }
+        }
+    });
 
     assert_eq!(
         BatchGetItemRequest::try_from(raw_reserved_projection)
@@ -1933,6 +2029,23 @@ fn batch_get_projection_expressions_reject_attribute_errors_with_dynamodb_messag
     assert_eq!(
         BatchGetItemRequest::try_from(unused_name).expect_err("unused name should fail"),
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
+    );
+    assert_eq!(
+        BatchGetItemRequest::try_from(too_long_projection_name)
+            .expect_err("too long name token should fail"),
+        "ExpressionAttributeNames contains invalid key: The expression attribute map contains a \
+         key that is too long; size of key: 256"
+    );
+    assert_eq!(
+        BatchGetItemRequest::try_from(too_long_projection_expression)
+            .expect_err("too long projection expression should fail"),
+        "Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size;"
+    );
+    assert_eq!(
+        BatchGetItemRequest::try_from(overlapping_projection)
+            .expect_err("overlapping projection should fail"),
+        "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or \
+         rewrite one of these paths; path one: [m], path two: [m, child]"
     );
 }
 
@@ -2837,12 +2950,14 @@ fn transaction_update_expression_values_reject_invalid_sets_before_execution() {
     assert_eq!(
         TransactWriteItemsRequest::try_from(transact_set_duplicate)
             .expect_err("transaction SET should reject invalid sets"),
-        "One or more parameter values were invalid: Input collection contains duplicates."
+        "ExpressionAttributeValues contains invalid value: Input collection contains duplicates \
+         for key :set"
     );
     assert_eq!(
         TransactWriteItemsRequest::try_from(transact_add_empty)
             .expect_err("transaction ADD should reject empty sets"),
-        "One or more parameter values were invalid: Binary sets should not be empty"
+        "ExpressionAttributeValues contains invalid value: One or more parameter values were \
+         invalid: Binary sets should not be empty for key :set"
     );
 }
 

@@ -416,6 +416,7 @@ async fn given_api_error_with_invalid_status_code_when_rendering_then_the_respon
             message: "bad status".to_string(),
             status_code: 99,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         },
     );

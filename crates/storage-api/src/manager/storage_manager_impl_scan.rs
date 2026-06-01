@@ -6,7 +6,7 @@ use crate::{
     manager::{
         StorageApiManagerImpl,
         storage_manager_impl_consumed_capacity::calculate_consumed_capacity_from_inputs,
-        storage_manager_impl_query::{
+        storage_manager_impl_expression::{
             apply_filter_expression_refs, apply_projection_expression_refs,
         },
         storage_manager_impl_read_pagination::{
@@ -44,8 +44,10 @@ impl StorageApiManagerImpl {
         .map_err(HttpApiError::from)?;
 
         if request.index_name.is_some() && request.consistent_read == Some(true) {
-            return Err(HttpApiError::validation_error(
+            return Err(HttpApiError::dynamodb_protocol_error(
+                "ValidationException",
                 "Consistent reads are not supported on global secondary indexes",
+                400,
             ));
         }
         self.ensure_sync_read_barrier(request.consistent_read.unwrap_or(false))

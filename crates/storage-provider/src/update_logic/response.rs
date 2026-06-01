@@ -92,7 +92,7 @@ fn non_empty_updated_attributes<T: UpdateFieldName>(
     (!attributes.is_empty()).then_some(attributes)
 }
 
-fn updated_attributes_for_response<T: UpdateFieldName>(
+pub fn updated_attributes_for_response<T: UpdateFieldName>(
     operations: &[T],
     item: &HashMap<String, AttributeValue>,
 ) -> HashMap<String, AttributeValue> {

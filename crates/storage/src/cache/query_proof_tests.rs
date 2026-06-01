@@ -136,6 +136,7 @@ fn base_table_info(table_name: &TableName) -> storage_types::StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 

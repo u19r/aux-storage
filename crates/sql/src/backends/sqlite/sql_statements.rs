@@ -20,6 +20,14 @@ pub fn create_tables_table() -> (&'static str, impl rusqlite::Params) {
 }
 
 #[must_use]
+pub fn add_deletion_protection_column() -> (&'static str, impl rusqlite::Params) {
+    (
+        metadata::add_deletion_protection_column(&SqliteDialect).sql,
+        (),
+    )
+}
+
+#[must_use]
 pub fn create_gsi_backfill_table() -> (&'static str, impl rusqlite::Params) {
     (metadata::create_gsi_backfill_table(&SqliteDialect).sql, ())
 }
@@ -150,6 +158,7 @@ pub fn check_table_exists(table_name: &str) -> (&'static str, impl rusqlite::Par
 }
 
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn insert_table(
     table_id: u128,
     table_name: &TableName,
@@ -158,6 +167,7 @@ pub fn insert_table(
     key_schema: &str,
     global_secondary_indexes: Option<&str>,
     stream_specification: Option<&str>,
+    deletion_protection_enabled: bool,
 ) -> (&'static str, impl rusqlite::Params) {
     let table_id = table_id.to_string();
     (
@@ -170,6 +180,7 @@ pub fn insert_table(
             key_schema,
             global_secondary_indexes.map(str::to_owned),
             stream_specification.map(str::to_owned),
+            deletion_protection_enabled,
         )
         .sql,
         (
@@ -183,6 +194,11 @@ pub fn insert_table(
             0i64,
             0i64,
             stream_specification,
+            if deletion_protection_enabled {
+                1i64
+            } else {
+                0i64
+            },
         ),
     )
 }
@@ -197,6 +213,29 @@ pub fn update_table_status(
         metadata::update_table_status(&SqliteDialect, table_status.clone(), table_name.as_ref())
             .sql,
         (table_status, table_name.as_ref()),
+    )
+}
+
+#[must_use]
+pub fn update_deletion_protection(
+    table_name: &TableName,
+    deletion_protection_enabled: bool,
+) -> (&'static str, impl rusqlite::Params) {
+    (
+        metadata::update_deletion_protection(
+            &SqliteDialect,
+            deletion_protection_enabled,
+            table_name.as_ref(),
+        )
+        .sql,
+        (
+            if deletion_protection_enabled {
+                1i64
+            } else {
+                0i64
+            },
+            table_name.as_ref(),
+        ),
     )
 }
 

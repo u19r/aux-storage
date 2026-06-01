@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
 };
 
 use alloc_counter::AllocationGuard;
@@ -17,7 +18,9 @@ use storage_types::{
 use stream_provider::StreamProvider as _;
 
 use crate::{
-    backends::common::plan_table_write,
+    backends::common::{
+        plan_table_write, plan_table_write_preflighted, preflight_table_write_operations,
+    },
     kv_support_tests::create_test_provider,
     sorted_kv_store::{SortedKvStore, TransactWriteOperation, TransactWriteTableOperation},
     storage_provider::{
@@ -36,6 +39,10 @@ const TABLE_NAME_BATCH_IMMEDIATE_GSI: &str = "alloc_batch_encode_immediate_gsi";
 const TRANSACT_UPDATE_ITERATIONS: usize = 64;
 const TRANSACT_UPDATE_WIDTH: usize = 4;
 const UPDATE_PLAN_ITERATIONS: usize = 512;
+const PREFLIGHTED_PLAN_ITERATIONS: usize = 128;
+const PREFLIGHTED_PLAN_WIDTH: usize = 25;
+
+type AllocationReport = alloc_counter::AllocationReport<'static>;
 
 fn alloc_suite_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -739,6 +746,7 @@ fn measure_update_plan_old_item_retention(
                 key: update_key.clone(),
                 operations: Arc::clone(&update_operations),
                 condition: None,
+                return_values_on_condition_check_failure: None,
                 replication: None,
                 preserve_old_item,
                 transaction_validation: false,
@@ -754,6 +762,127 @@ fn measure_update_plan_old_item_retention(
     guard.finish()
 }
 
+fn measure_transaction_plan_duplicate_preflight_baseline() -> AllocationReport {
+    measure_transaction_plan_preflight_path(
+        "kv_transaction_plan_duplicate_preflight_baseline",
+        "baseline",
+        false,
+    )
+}
+
+fn measure_transaction_plan_preflighted_optimized() -> AllocationReport {
+    measure_transaction_plan_preflight_path(
+        "kv_transaction_plan_preflighted_optimized",
+        "optimized",
+        true,
+    )
+}
+
+fn measure_transaction_plan_preflight_path(
+    test_name: &'static str,
+    label: &'static str,
+    use_preflighted_plan: bool,
+) -> AllocationReport {
+    let table_info = update_plan_table_info();
+    let update_operations = Arc::<[UpdateOperation]>::from(vec![
+        UpdateOperation::Set {
+            field: "payload_0".to_string().into(),
+            value: AttributeValue::S("updated".to_string()),
+        },
+        UpdateOperation::Add {
+            field: "counter".to_string().into(),
+            value: AttributeValue::N("1".to_string()),
+        },
+    ]);
+    let operations = transaction_plan_operations(&table_info, Arc::clone(&update_operations));
+    let current_values = transaction_plan_current_values();
+    let stream_ids = vec![None; operations.len()];
+
+    let guard = AllocationGuard::start(module_path!(), test_name, file!(), line!(), Some(label));
+    for _ in 0..PREFLIGHTED_PLAN_ITERATIONS {
+        preflight_table_write_operations(&operations).expect("preflight transaction operations");
+        let plan = if use_preflighted_plan {
+            plan_table_write_preflighted(&operations, current_values.clone(), &stream_ids, false)
+        } else {
+            plan_table_write(&operations, current_values.clone(), &stream_ids, false)
+        }
+        .expect("plan transaction table write");
+        std::hint::black_box((plan.results.len(), plan.mutations.len()));
+    }
+    guard.finish()
+}
+
+fn measure_transaction_plan_preflight_runtime(use_preflighted_plan: bool) -> Duration {
+    let table_info = update_plan_table_info();
+    let update_operations = Arc::<[UpdateOperation]>::from(vec![
+        UpdateOperation::Set {
+            field: "payload_0".to_string().into(),
+            value: AttributeValue::S("updated".to_string()),
+        },
+        UpdateOperation::Add {
+            field: "counter".to_string().into(),
+            value: AttributeValue::N("1".to_string()),
+        },
+    ]);
+    let operations = transaction_plan_operations(&table_info, Arc::clone(&update_operations));
+    let current_values = transaction_plan_current_values();
+    let stream_ids = vec![None; operations.len()];
+
+    let started = Instant::now();
+    for _ in 0..PREFLIGHTED_PLAN_ITERATIONS {
+        preflight_table_write_operations(&operations).expect("preflight transaction operations");
+        let plan = if use_preflighted_plan {
+            plan_table_write_preflighted(&operations, current_values.clone(), &stream_ids, false)
+        } else {
+            plan_table_write(&operations, current_values.clone(), &stream_ids, false)
+        }
+        .expect("plan transaction table write");
+        std::hint::black_box((plan.results.len(), plan.mutations.len()));
+    }
+    started.elapsed()
+}
+
+fn transaction_plan_operations(
+    table_info: &StoredTableInfo,
+    update_operations: Arc<[UpdateOperation]>,
+) -> Vec<TransactWriteTableOperation> {
+    (0..PREFLIGHTED_PLAN_WIDTH)
+        .map(|index| TransactWriteTableOperation::Update {
+            table_info: table_info.clone(),
+            key: transaction_plan_key(index),
+            operations: Arc::clone(&update_operations),
+            condition: None,
+            return_values_on_condition_check_failure: None,
+            replication: None,
+            preserve_old_item: false,
+            transaction_validation: false,
+            ttl_config: None,
+        })
+        .collect()
+}
+
+fn transaction_plan_current_values() -> Vec<Option<Vec<u8>>> {
+    (0..PREFLIGHTED_PLAN_WIDTH)
+        .map(|index| {
+            let item = update_plan_item_for_key(index);
+            Some(storage_types::storage_serde::to_bytes(&item).expect("serialize current item"))
+        })
+        .collect()
+}
+
+fn transaction_plan_key(index: usize) -> KeyAttributes {
+    KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S(format!("pk-{index:03}")),
+        ),
+        (
+            "sk".to_string(),
+            AttributeValue::S(format!("sk-{index:03}")),
+        ),
+    ]))
+}
+
 fn update_plan_table_info() -> StoredTableInfo {
     StoredTableInfo {
         table_name: TableName::new("alloc_update_plan"),
@@ -765,13 +894,22 @@ fn update_plan_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 
 fn update_plan_item() -> HashMap<String, AttributeValue> {
+    update_plan_item_for_key_values("pk".to_string(), "sk".to_string())
+}
+
+fn update_plan_item_for_key(index: usize) -> HashMap<String, AttributeValue> {
+    update_plan_item_for_key_values(format!("pk-{index:03}"), format!("sk-{index:03}"))
+}
+
+fn update_plan_item_for_key_values(pk: String, sk: String) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::new();
-    item.insert("pk".to_string(), AttributeValue::S("pk".to_string()));
-    item.insert("sk".to_string(), AttributeValue::S("sk".to_string()));
+    item.insert("pk".to_string(), AttributeValue::S(pk));
+    item.insert("sk".to_string(), AttributeValue::S(sk));
     for index in 0..32 {
         item.insert(
             format!("payload_{index}"),
@@ -1077,4 +1215,46 @@ fn given_update_plan_does_not_need_old_item_when_old_result_is_skipped_then_allo
         baseline.allocated_bytes,
         optimized.allocated_bytes
     );
+}
+
+#[test]
+fn given_backend_already_preflighted_transaction_when_planning_then_duplicate_preflight_is_skipped_tests()
+ {
+    let _suite_lock = alloc_suite_lock();
+    let baseline = measure_transaction_plan_duplicate_preflight_baseline();
+    let optimized = measure_transaction_plan_preflighted_optimized();
+
+    alloc_counter::emit_report(&baseline);
+    alloc_counter::emit_report(&optimized);
+
+    assert!(
+        optimized.allocation_count < baseline.allocation_count,
+        "expected preflighted transaction plan to allocate less often, baseline={} optimized={}",
+        baseline.allocation_count,
+        optimized.allocation_count
+    );
+    assert!(
+        optimized.allocated_bytes < baseline.allocated_bytes,
+        "expected preflighted transaction plan to allocate fewer bytes, baseline={} optimized={}",
+        baseline.allocated_bytes,
+        optimized.allocated_bytes
+    );
+}
+
+#[test]
+#[ignore = "manual runtime perf probe; run with --ignored --nocapture before/after transaction \
+            planning changes"]
+fn transaction_preflighted_plan_runtime_perf_probe() {
+    for measurement in 1..=3 {
+        let baseline = measure_transaction_plan_preflight_runtime(false);
+        let optimized = measure_transaction_plan_preflight_runtime(true);
+        println!(
+            "transaction_preflighted_plan measurement={measurement} baseline_ms={:.3} \
+             optimized_ms={:.3} baseline_ns_per_iter={:.2} optimized_ns_per_iter={:.2}",
+            baseline.as_secs_f64() * 1_000.0,
+            optimized.as_secs_f64() * 1_000.0,
+            baseline.as_nanos() as f64 / PREFLIGHTED_PLAN_ITERATIONS as f64,
+            optimized.as_nanos() as f64 / PREFLIGHTED_PLAN_ITERATIONS as f64
+        );
+    }
 }

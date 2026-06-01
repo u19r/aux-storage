@@ -5,24 +5,29 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use bg_jobs::JobManager;
+use storage_common::GsiPropagationGovernor;
 #[cfg(test)]
 use storage_common::provider_perf;
 use storage_condition::{Condition, evaluate_condition, parse_condition_expression};
-use storage_provider::split_item_into_key_and_attributes_sync;
+use storage_provider::{StorageProvider as _, split_item_into_key_and_attributes_sync};
 use storage_types::{
     AttributeDefinition, AttributeValue, DurablePointReadGuard, ItemKey, KeyAttributeType,
     KeyAttributes, KeySchemaElement, KeyType, ReplicationEventMetadata, SplitDynamoItem,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamName, TableName, TableStatus,
-    TimestampMillis, WireItem, WireItemKeyAttributes, context::ErrorContext as _,
+    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName,
+    TableStatus, TimestampMillis, WireItem, WireItemKeyAttributes, context::ErrorContext as _,
+    normalize_attribute_map_numbers_for_write,
 };
-use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
+use stream_provider::{
+    CursorName, CursorPosition, EmbeddedStreamItem, StoredStreamPointer, StreamDataType,
+    StreamItem, StreamProvider,
+};
 use tracing::instrument;
 use turso::{Builder, Connection as TursoConnection, Error as TursoError, Value as TursoValue};
 use uuid::Uuid;
@@ -50,6 +55,13 @@ pub(crate) struct TursoWriteStreamEntriesInput<'a> {
     pub is_deleted: bool,
     pub item_stream_version: storage_types::ItemStreamVersion,
     pub replication: Option<&'a ReplicationEventMetadata>,
+}
+
+pub(super) fn condition_item_ref(
+    old_item: Option<&HashMap<String, AttributeValue>>,
+) -> &HashMap<String, AttributeValue> {
+    static EMPTY_ITEM: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
+    old_item.unwrap_or(&EMPTY_ITEM)
 }
 
 #[cfg(test)]
@@ -168,6 +180,7 @@ pub struct TursoStorageProvider {
     job_manager: JobManager,
     table_info_cache: Arc<tokio::sync::RwLock<HashMap<TableName, Arc<StoredTableInfo>>>>,
     pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) gsi_propagation_governor: Arc<GsiPropagationGovernor>,
     pub(crate) ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -208,6 +221,7 @@ impl TursoStorageProvider {
             job_manager: JobManager::new_for_test(),
             table_info_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             immediate_gsi_consistency: false,
+            gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
             ddl_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
@@ -674,11 +688,13 @@ impl TursoStorageProvider {
     where
         C: TursoSqlConnection + ?Sized,
     {
+        let mut item = item.clone();
+        normalize_attribute_map_numbers_for_write(&mut item);
         let SplitDynamoItem {
             key_attributes,
             all_attributes,
             ..
-        } = split_item_into_key_and_attributes_sync(item.clone(), table_info)?;
+        } = split_item_into_key_and_attributes_sync(item, table_info)?;
 
         if is_key_absence_condition(condition, table_info) {
             self.insert_main_row(conn, table_info, &key_attributes, &all_attributes)
@@ -710,11 +726,10 @@ impl TursoStorageProvider {
             .get_item_map_by_key(conn, table_info, &key_attributes)
             .await?;
 
-        if let Some(condition) = condition {
-            let condition_item = old_item.clone().unwrap_or_default();
-            if !evaluate_condition(&condition_item, condition) {
-                return Err(StorageEnum::ConditionalCheckFailed.into());
-            }
+        if let Some(condition) = condition
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
+        {
+            return Err(StorageEnum::ConditionalCheckFailed.into());
         }
 
         self.upsert_main_row(conn, table_info, &key_attributes, &all_attributes)
@@ -773,11 +788,13 @@ impl TursoStorageProvider {
     where
         C: TursoSqlConnection + ?Sized,
     {
+        let mut item = item.clone();
+        normalize_attribute_map_numbers_for_write(&mut item);
         let SplitDynamoItem {
             key_attributes,
             all_attributes,
             ..
-        } = split_item_into_key_and_attributes_sync(item.clone(), table_info)?;
+        } = split_item_into_key_and_attributes_sync(item, table_info)?;
 
         self.upsert_main_row(conn, table_info, &key_attributes, &all_attributes)
             .await?;
@@ -836,7 +853,7 @@ impl TursoStorageProvider {
         }
 
         if let Some(condition) = condition
-            && !evaluate_condition(old_item.as_ref().unwrap_or(&HashMap::new()), condition)
+            && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
         {
             return Err(StorageEnum::ConditionalCheckFailed.into());
         }
@@ -886,7 +903,10 @@ impl TursoStorageProvider {
             item_stream_version,
             replication,
         } = input;
-        if !crate::stream_writer::should_write_stream_entries(table_info) {
+        if !crate::stream_writer::should_write_stream_entries_for_gsi_mode(
+            table_info,
+            self.immediate_gsi_consistency,
+        ) {
             return Ok(());
         }
 
@@ -1269,32 +1289,6 @@ impl TursoStorageProvider {
         Ok(())
     }
 
-    pub(crate) async fn upsert_gsi_rows<C>(
-        &self,
-        conn: &C,
-        table_info: &StoredTableInfo,
-        full_item: &HashMap<String, AttributeValue>,
-    ) -> StorageResult<()>
-    where
-        C: TursoSqlConnection + ?Sized,
-    {
-        #[cfg(test)]
-        let plan_started = Instant::now();
-        let statements = plan_turso_gsi_sql_statements(table_info, None, Some(full_item))?;
-        #[cfg(test)]
-        provider_perf::record("turso", "gsi_upsert_plan", plan_started.elapsed());
-
-        #[cfg(test)]
-        let execute_started = Instant::now();
-        for statement in statements.statements() {
-            self.execute(conn, &statement.sql, statement.params.clone())
-                .await?;
-        }
-        #[cfg(test)]
-        provider_perf::record("turso", "gsi_upsert_execute", execute_started.elapsed());
-        Ok(())
-    }
-
     pub(crate) async fn build_wire_item_from_main_row_view(
         &self,
         row: TursoRowView<'_>,
@@ -1336,52 +1330,195 @@ impl TursoStorageProvider {
     }
 
     pub(crate) async fn process_gsi_updates(&self) -> StorageResult<bool> {
-        let this = self.clone();
-        self.with_exclusive_transaction(true, move |conn| {
-            let this = this.clone();
-            Box::pin(async move {
-                let table_rows = this
-                    .query_rows(conn, sql_statements::list_table_infos(), Vec::new())
-                    .await?;
-                for table_row in table_rows {
-                    let table_info = row_to_table_info(&table_row)?;
-                    if table_info.global_secondary_indexes.is_none() {
-                        continue;
-                    }
+        let cursor_name: CursorName = "gsi-update-cursor".to_string().into();
+        let stream_name = StreamName::system_table_stream();
+        let mut cursor_position = self
+            .ensure_gsi_update_cursor(&stream_name, &cursor_name)
+            .await?;
+        self.refresh_gsi_update_lag(&stream_name, cursor_position)
+            .await?;
+        let mut did_work = false;
+        let mut table_infos: HashMap<TableName, Option<StoredTableInfo>> = HashMap::new();
 
-                    if let Some(gsis) = table_info.global_secondary_indexes.as_ref() {
-                        for gsi in gsis {
-                            let gsi_table = gsi_table_name(&table_info.table_name, &gsi.index_name);
-                            let _ = this
-                                .execute(
+        loop {
+            let records_result = self
+                .get_items_from_pointer_stream(
+                    stream_name.clone(),
+                    cursor_position,
+                    Some(crate::constants::GSI_UPDATE_STREAM_FETCH_LIMIT),
+                )
+                .await
+                .map_err(|error| {
+                    StorageError::internal(&format!("turso gsi stream read failed: {error}"))
+                })?;
+
+            let had_more = records_result.last_evaluated_key.is_some();
+            let last_item = records_result.last_evaluated_key.or_else(|| {
+                records_result
+                    .records
+                    .last()
+                    .map(|(pointer, _)| pointer.stream_item_id)
+            });
+            let records = records_result.records;
+
+            if records.is_empty() {
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                    .await?;
+                return Ok(did_work);
+            }
+
+            let batch_infos = table_infos.clone();
+            let this = self.clone();
+            let batch_did_work = self
+                .with_exclusive_transaction(true, move |conn| {
+                    let this = this.clone();
+                    let records = records.clone();
+                    let mut table_infos = batch_infos.clone();
+                    Box::pin(async move {
+                        let mut batch_did_work = false;
+                        for (pointer, stream_items) in records {
+                            let filtered_info =
+                                if let Some(cached) = table_infos.get(&pointer.table_name) {
+                                    cached.clone()
+                                } else {
+                                    let loaded = this
+                                        .get_table_info(&pointer.table_name)
+                                        .await
+                                        .ok()
+                                        .and_then(|info| turso_user_gsi_table_info(&info));
+                                    table_infos.insert(pointer.table_name.clone(), loaded.clone());
+                                    loaded
+                                };
+                            let Some(table_info) = filtered_info.as_ref() else {
+                                continue;
+                            };
+
+                            let (old_item, new_item) = turso_gsi_images(&stream_items);
+                            if old_item.is_some() || new_item.is_some() {
+                                this.apply_gsi_rows_for_item_change(
                                     conn,
-                                    &sql_statements::delete_all_gsi_rows(&gsi_table),
-                                    Vec::new(),
+                                    table_info,
+                                    old_item.as_ref(),
+                                    new_item.as_ref(),
                                 )
                                 .await?;
+                                batch_did_work = true;
+                            }
                         }
-                    }
+                        Ok((batch_did_work, table_infos))
+                    })
+                })
+                .await?;
+            did_work |= batch_did_work.0;
+            table_infos = batch_did_work.1;
 
-                    let table_name_safe = table_info.table_name.sanitized_name();
-                    let rows = this
-                        .query_rows(
-                            conn,
-                            &sql_statements::select_all_main_rows(&table_name_safe),
-                            Vec::new(),
-                        )
-                        .await?;
+            let Some(last_item) = last_item else {
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                    .await?;
+                return Ok(did_work);
+            };
+            self.advance_cursor(stream_name.clone(), cursor_name.clone(), last_item)
+                .await
+                .map_err(|error| {
+                    StorageError::internal(&format!("turso advance gsi cursor failed: {error}"))
+                })?;
+            cursor_position = Some(last_item);
+            self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                .await?;
 
-                    for row in rows {
-                        let full_item = row_to_item_map_main(&row, &table_info)?;
-                        this.upsert_gsi_rows(conn, &table_info, &full_item).await?;
-                    }
-                }
-
-                Ok(false)
-            })
-        })
-        .await
+            if !had_more {
+                return Ok(did_work);
+            }
+        }
     }
+
+    async fn ensure_gsi_update_cursor(
+        &self,
+        stream_name: &StreamName,
+        cursor_name: &CursorName,
+    ) -> StorageResult<Option<StreamItemId>> {
+        let cursor_position = self
+            .get_cursor(stream_name.clone(), cursor_name.clone())
+            .await
+            .map_err(|error| {
+                StorageError::internal(&format!("turso get gsi cursor failed: {error}"))
+            })?
+            .map(|cursor| cursor.position);
+
+        if cursor_position.is_none() {
+            self.create_cursor(
+                stream_name.clone(),
+                cursor_name.clone(),
+                CursorPosition::Head,
+            )
+            .await
+            .map_err(|error| {
+                StorageError::internal(&format!("turso create gsi cursor failed: {error}"))
+            })?;
+        }
+
+        Ok(cursor_position)
+    }
+
+    async fn refresh_gsi_update_lag(
+        &self,
+        stream_name: &StreamName,
+        cursor_position: Option<StreamItemId>,
+    ) -> StorageResult<()> {
+        let page = self
+            .read_forward(stream_name.clone(), cursor_position, 1)
+            .await
+            .map_err(|error| {
+                StorageError::internal(&format!("turso gsi lag read failed: {error}"))
+            })?;
+        storage_common::observe_gsi_lag(
+            &self.gsi_propagation_governor,
+            page.items.first().map(|item| item.created_at),
+            current_ms_u64(),
+        );
+        Ok(())
+    }
+}
+
+fn current_ms_u64() -> u64 {
+    u64::try_from(*TimestampMillis::now()).unwrap_or(0)
+}
+
+fn turso_user_gsi_table_info(table_info: &StoredTableInfo) -> Option<StoredTableInfo> {
+    let mut filtered = table_info.clone();
+    filtered.global_secondary_indexes = table_info.global_secondary_indexes.as_ref().map(|gsis| {
+        gsis.iter()
+            .filter(|gsi| !storage_common::ttl::is_ttl_index(&gsi.index_name))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    filtered
+        .global_secondary_indexes
+        .as_ref()
+        .filter(|gsis| !gsis.is_empty())?;
+    Some(filtered)
+}
+
+type TursoGsiImage = Option<HashMap<String, AttributeValue>>;
+
+fn turso_gsi_images(stream_items: &[StreamItem]) -> (TursoGsiImage, TursoGsiImage) {
+    let Some(first) = stream_items.first() else {
+        return (None, None);
+    };
+
+    if first.data_type == StreamDataType::DeleteMarker {
+        let old_item = stream_items
+            .last()
+            .and_then(|item| storage_types::storage_serde::from_bytes(&item.data).ok());
+        return (old_item, None);
+    }
+
+    let new_item = storage_types::storage_serde::from_bytes(&first.data).ok();
+    let old_item = stream_items
+        .get(1)
+        .filter(|item| item.data_type != StreamDataType::DeleteMarker)
+        .and_then(|item| storage_types::storage_serde::from_bytes(&item.data).ok());
+    (old_item, new_item)
 }
 
 async fn query_once(
@@ -1457,6 +1594,7 @@ pub(crate) fn row_to_table_info(
     let table_size_bytes =
         u64::try_from(row_required_i64(row, "table_size_bytes")?).unwrap_or_default();
     let item_count = u64::try_from(row_required_i64(row, "item_count")?).unwrap_or_default();
+    let deletion_protection_enabled = row_required_i64(row, "deletion_protection_enabled")? != 0;
 
     Ok(StoredTableInfo {
         table_name,
@@ -1468,6 +1606,7 @@ pub(crate) fn row_to_table_info(
         table_size_bytes,
         item_count,
         stream_specification,
+        deletion_protection_enabled,
     })
 }
 

@@ -7,9 +7,9 @@ use metrics_facade::{HistogramMetric, histogram};
 use rand::{RngExt as _, rng};
 use storage_provider::RemoteTimeoutOverrides;
 use storage_types::{
-    GlobalSecondaryIndex, QueryRequest, QueryTableRequest, ScanRequest, ScanTableRequest,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, TableDescription, TimestampMillis,
-    context::WrappedError,
+    ExclusiveStartKey, GlobalSecondaryIndex, KeyAttributes, QueryRequest, QueryTableRequest,
+    ScanRequest, ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    TableDescription, TimestampMillis, context::WrappedError,
 };
 
 use crate::{
@@ -87,6 +87,7 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
         table_size_bytes: table.table_size_bytes,
         item_count: table.item_count,
         stream_specification: table.stream_specification,
+        deletion_protection_enabled: table.deletion_protection_enabled,
     }
 }
 
@@ -94,7 +95,11 @@ pub(super) fn build_scan_request(request: &ScanTableRequest) -> ScanRequest {
     let mut remote_request = ScanRequest::new(request.table_name.clone())
         .with_index_name(request.index_name.clone())
         .with_limit(request.limit)
-        .with_exclusive_start_key(request.exclusive_start_key.clone());
+        .with_exclusive_start_key(None);
+    remote_request.exclusive_start_key = request
+        .exclusive_start_key
+        .as_ref()
+        .map(exclusive_start_key_from_string);
     remote_request.consistent_read = Some(request.consistent_read);
     remote_request
 }
@@ -108,10 +113,20 @@ pub(super) fn build_query_request(request: &QueryTableRequest) -> QueryRequest {
     .with_expression_attribute_names(request.expression_attribute_names.clone())
     .with_expression_attribute_values(request.expression_attribute_values.clone())
     .with_limit(request.limit)
-    .with_exclusive_start_key(request.exclusive_start_key.clone())
+    .with_exclusive_start_key(None)
     .with_scan_index_forward(request.scan_index_forward);
+    remote_request.exclusive_start_key = request
+        .exclusive_start_key
+        .as_ref()
+        .map(exclusive_start_key_from_string);
     remote_request.consistent_read = Some(request.consistent_read);
     remote_request
+}
+
+fn exclusive_start_key_from_string(value: &String) -> ExclusiveStartKey {
+    serde_json::from_str::<KeyAttributes>(value)
+        .map(ExclusiveStartKey::Key)
+        .unwrap_or_else(|_| ExclusiveStartKey::Token(value.clone()))
 }
 
 pub(crate) fn record_latency(operation: &str, endpoint: &str, outcome: &str, elapsed: Duration) {
@@ -176,10 +191,13 @@ pub(super) fn error_label(error: &StorageError) -> &'static str {
         StorageEnum::InternalServerError { .. } => "internal_server_error",
         StorageEnum::GuardConflict { .. } => "guard_conflict",
         StorageEnum::Unsupported { .. } => "unsupported",
-        StorageEnum::ConditionalCheckFailed => "conditional_check_failed",
+        StorageEnum::ConditionalCheckFailed
+        | StorageEnum::ConditionalCheckFailedWithItem { .. } => "conditional_check_failed",
         StorageEnum::TableAlreadyExists { .. } => "table_exists",
         StorageEnum::TableNotFound { .. } => "table_not_found",
-        StorageEnum::Validation { .. } => "validation",
+        StorageEnum::Validation { .. }
+        | StorageEnum::RawValidation { .. }
+        | StorageEnum::DeletionProtectionEnabled { .. } => "validation",
         StorageEnum::TransactionConflict { .. } => "transaction_conflict",
         StorageEnum::TransactionInProgress { .. } => "transaction_in_progress",
         StorageEnum::TransactionCanceled { .. } => "transaction_canceled",

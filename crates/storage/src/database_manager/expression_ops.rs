@@ -17,7 +17,7 @@ pub(crate) fn validate_transact_write_item_expression_usage(
     }
     if let Some(update) = &item.update {
         validate_update_expression_usage(
-            &update.update_expression,
+            Some(&update.update_expression),
             update.condition_expression.as_deref(),
             update.expression_attribute_names.as_ref(),
             update.expression_attribute_values.as_ref(),
@@ -52,7 +52,7 @@ pub(crate) fn validate_transact_encode_item_expression_usage(
     }
     if let Some(update) = &item.update {
         validate_update_expression_usage(
-            &update.update_expression,
+            Some(&update.update_expression),
             update.condition_expression.as_deref(),
             update.expression_attribute_names.as_ref(),
             update.expression_attribute_values.as_ref(),
@@ -76,7 +76,7 @@ pub(crate) fn validate_transact_encode_item_expression_usage(
 }
 
 pub(crate) fn validate_update_expression_usage(
-    update_expression: &str,
+    update_expression: Option<&str>,
     condition_expression: Option<&str>,
     expression_attribute_names: Option<&HashMap<String, String>>,
     expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
@@ -84,6 +84,6 @@ pub(crate) fn validate_update_expression_usage(
     validate_expression_attribute_usage(
         expression_attribute_names,
         expression_attribute_values,
-        std::iter::once(update_expression).chain(condition_expression),
+        update_expression.into_iter().chain(condition_expression),
     )
 }

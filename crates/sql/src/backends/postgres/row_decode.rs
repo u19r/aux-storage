@@ -56,19 +56,18 @@ impl PostgresStorageProvider {
             effective_limit,
         );
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
         let params: Vec<&(dyn ToSql + Sync)> = bind_values
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        let rows = client
-            .query(&sql, &params)
-            .await
-            .map_err(|err| Self::map_postgres_error("load ordered rows", err))?;
+        let rows = {
+            let client = self.acquire_client("query_table").await?;
+            let _connection_hold = self.connection_hold_timer("query_table");
+            client
+                .query(&sql, &params)
+                .await
+                .map_err(|err| Self::map_postgres_error("load ordered rows", err))?
+        };
 
         let mut items: Vec<WireItem> = rows
             .into_iter()

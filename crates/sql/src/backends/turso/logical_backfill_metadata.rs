@@ -47,6 +47,11 @@ where
                 TursoValue::Integer(u64_to_i64(table_info.table_size_bytes, "table size")?),
                 TursoValue::Integer(u64_to_i64(table_info.item_count, "item count")?),
                 option_string_to_value(stream_specification_json),
+                TursoValue::Integer(if table_info.deletion_protection_enabled {
+                    1
+                } else {
+                    0
+                }),
             ],
         )
         .await?;

@@ -153,6 +153,7 @@ async fn batch_write_key_validation_priority_matches_dynamodb() {
         let db = backend.create_db().await;
         create_batch_table(db.as_ref()).await;
         create_binary_batch_table(db.as_ref()).await;
+        create_number_batch_table(db.as_ref()).await;
 
         for (case_name, payload, expected_message) in [
             (
@@ -216,6 +217,58 @@ async fn batch_write_key_validation_priority_matches_dynamodb() {
                 }),
                 "One or more parameter values are not valid. The AttributeValue for a key \
                  attribute cannot contain an empty binary value. Key: pk",
+            ),
+            (
+                "empty number hash key",
+                json!({
+                    "RequestItems": {
+                        "BatchWriteNumberRouteTable": [
+                            {
+                                "DeleteRequest": {
+                                    "Key": {
+                                        "pk": {"N": ""}
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }),
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                "too many significant digits in number hash key",
+                json!({
+                    "RequestItems": {
+                        "BatchWriteNumberRouteTable": [
+                            {
+                                "DeleteRequest": {
+                                    "Key": {
+                                        "pk": {"N": "999999999999999999999999999999999999999"}
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }),
+                "Attempting to store more than 38 significant digits in a Number",
+            ),
+            (
+                "number hash key underflow",
+                json!({
+                    "RequestItems": {
+                        "BatchWriteNumberRouteTable": [
+                            {
+                                "DeleteRequest": {
+                                    "Key": {
+                                        "pk": {"N": "1E-131"}
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }),
+                "Number underflow. Attempting to store a number with magnitude smaller than \
+                 supported range",
             ),
             (
                 "duplicate before later oversized hash key",
@@ -315,6 +368,23 @@ async fn create_binary_batch_table(db: &storage::DatabaseManager) {
     .expect("create binary batch write route table");
 }
 
+async fn create_number_batch_table(db: &storage::DatabaseManager) {
+    db.create_table(&CreateTableRequest::new(
+        TableName::new("BatchWriteNumberRouteTable"),
+        vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: KeyAttributeType::N,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        BillingMode::PayPerRequest,
+    ))
+    .await
+    .expect("create number batch write route table");
+}
+
 async fn batch_get_payloads(
     db: std::sync::Arc<storage::DatabaseManager>,
     backend_name: &str,
@@ -366,7 +436,7 @@ fn assert_empty_batch_write_response(response: &Response, backend_name: &str) {
         response
             .unprocessed_items
             .as_ref()
-            .is_none_or(std::collections::HashMap::is_empty),
+            .is_some_and(std::collections::HashMap::is_empty),
         "{}",
         backend_name
     );

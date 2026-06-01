@@ -378,6 +378,38 @@ async fn ensure_table_stream_enabled(
     Ok(())
 }
 
+async fn ensure_raw_table_stream_enabled(
+    db: &DatabaseManager,
+    table_name: &TableName,
+) -> Result<(), StorageError> {
+    let table_info = db.storage_provider().get_table_info(table_name).await?;
+    if table_info
+        .stream_specification
+        .as_ref()
+        .is_some_and(|stream| stream.stream_enabled)
+    {
+        return Ok(());
+    }
+
+    db.storage_provider()
+        .update_table(UpdateTableRequest {
+            table_name: table_name.clone(),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: Some(system_table_stream_specification()),
+            table_class: None,
+        })
+        .await?;
+    wait_for_raw_table_active(db, table_name).await?;
+    Ok(())
+}
+
 fn system_table_stream_specification() -> StreamSpecification {
     StreamSpecification {
         stream_enabled: true,
@@ -587,7 +619,7 @@ async fn create_shared_namespace(
 ) -> Result<(), StorageError> {
     let table_name = Tables::shared_namespace(location_code);
     if raw_table_exists(db, &table_name).await? {
-        ensure_table_stream_enabled(db, &table_name).await?;
+        ensure_raw_table_stream_enabled(db, &table_name).await?;
         return Ok(());
     }
     create_table_if_missing_raw(

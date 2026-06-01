@@ -393,13 +393,18 @@ impl SQLiteStorageProvider {
         let table_size_bytes = payload_i64(&payload, "table_size_bytes")?;
         let item_count = payload_i64(&payload, "item_count")?;
         let stream_specification = payload_optional_string(&payload, "stream_specification")?;
+        let deletion_protection_enabled = payload
+            .get("deletion_protection_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         sqlite
             .execute(
                 r"INSERT INTO tables (
                     id, table_name, table_status, created_at, attribute_definitions, key_schema,
-                    global_secondary_indexes, table_size_bytes, item_count, stream_specification
+                    global_secondary_indexes, table_size_bytes, item_count, stream_specification,
+                    deletion_protection_enabled
                   )
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                   ON CONFLICT(table_name)
                   DO UPDATE SET
                     id = excluded.id,
@@ -410,7 +415,8 @@ impl SQLiteStorageProvider {
                     global_secondary_indexes = excluded.global_secondary_indexes,
                     table_size_bytes = excluded.table_size_bytes,
                     item_count = excluded.item_count,
-                    stream_specification = excluded.stream_specification",
+                    stream_specification = excluded.stream_specification,
+                    deletion_protection_enabled = excluded.deletion_protection_enabled",
                 (
                     id.as_str(),
                     table_name.as_str(),
@@ -422,6 +428,11 @@ impl SQLiteStorageProvider {
                     table_size_bytes,
                     item_count,
                     stream_specification.as_deref(),
+                    if deletion_protection_enabled {
+                        1i64
+                    } else {
+                        0i64
+                    },
                 ),
             )
             .map_err(map_sqlite_error)?;

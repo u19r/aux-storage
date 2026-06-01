@@ -19,6 +19,28 @@ fn conditional_check_failed_http_message_contains_canonical_text() {
 }
 
 #[test]
+fn conditional_check_failed_response_can_include_all_old_item() {
+    let item: AttributeMap = serde_json::from_value(json!({
+        "pk": {"S": "p"},
+        "note": {"S": "old"}
+    }))
+    .expect("attribute map");
+    let storage_err: StorageError =
+        StorageEnum::ConditionalCheckFailedWithItem { item: item.clone() }.into();
+    let handler: HttpApiError = storage_err.into();
+
+    let (status, axum::response::Json(body)): (StatusCode, _) = handler.into();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.error_type,
+        "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
+    );
+    assert_eq!(body.message, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE);
+    assert_eq!(body.item, Some(item));
+}
+
+#[test]
 fn transaction_conflict_passes_through_storage_message() {
     let storage_err: StorageError = StorageEnum::TransactionConflict {
         message: "custom conflict message".to_string(),

@@ -44,6 +44,7 @@ storage-types = { path = "../storage-types", default-features = false }
 stream-provider = { path = "../stream-provider" }
 tracing = { workspace = true }
 
+metrics = { workspace = true }
 metrics-facade = { workspace = true }
 
 tokio = { workspace = true }

@@ -1,9 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
 
 use crate::{
     AttributeValue, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, KeyAttributeType, KeyAttributes,
     StorageEnum, StorageError, StorageResult, StoredTableInfo, TableName, TransactGetItem,
-    TransactWriteItem, context::WrappedError as _,
+    TransactWriteItem, context::WrappedError as _, normalize_dynamodb_number_for_write,
+    validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -79,12 +83,28 @@ pub fn transaction_canceled_for_indexed_reasons(
 pub fn transaction_canceled_for_preflights(
     preflights: &[TransactionKeyPreflight],
 ) -> Option<StorageError> {
-    transaction_canceled_for_indexed_reasons(
-        preflights
-            .iter()
-            .map(|preflight| preflight.validation_reason.clone())
-            .collect(),
-    )
+    let first_index = preflights
+        .iter()
+        .position(|preflight| preflight.validation_reason.is_some())?;
+    let mut reasons = vec!["None".to_string(); preflights.len()];
+    for (index, preflight) in preflights.iter().enumerate().skip(first_index) {
+        if let Some(reason) = preflight.validation_reason.as_ref() {
+            reasons[index] = reason.clone();
+        }
+    }
+    Some(StorageEnum::TransactionCanceled { reasons }.into())
+}
+
+pub fn transaction_cancellation_reason_at(error: &StorageError, index: usize) -> Option<String> {
+    match error.to_enum() {
+        StorageEnum::TransactionCanceled { reasons } => reasons
+            .get(index)
+            .filter(|reason| reason.as_str() != "None")
+            .cloned(),
+        StorageEnum::ConditionalCheckFailed => Some("ConditionalCheckFailed".to_string()),
+        StorageEnum::Validation { message } => Some(format!("ValidationError\t{message}")),
+        _ => None,
+    }
 }
 
 pub fn transaction_validation_reason(error: &StorageError) -> Option<String> {
@@ -135,39 +155,100 @@ pub fn preflight_transact_item_key_with_table_info(
     item: &TransactWriteItem,
     table_info: &StoredTableInfo,
 ) -> StorageResult<TransactionKeyPreflight> {
-    let result = match item {
+    match item {
         TransactWriteItem { put: Some(put), .. } => {
-            validate_transact_put_item_key(table_info, &put.item)
-                .and_then(|()| transact_put_item_key_fingerprint(table_info, &put.item))
+            preflight_transact_put_item_key_with_table_info(table_info, &put.item)
         }
         TransactWriteItem {
             delete: Some(delete),
             ..
-        } => validate_transact_key(table_info, &delete.key)
-            .and_then(|()| transact_key_fingerprint(table_info, &delete.key)),
+        } => preflight_transact_write_key_with_table_info(table_info, &delete.key),
         TransactWriteItem {
             update: Some(update),
             ..
-        } => validate_transact_key(table_info, &update.key)
-            .and_then(|()| transact_key_fingerprint(table_info, &update.key)),
+        } => preflight_transact_write_key_with_table_info(table_info, &update.key),
         TransactWriteItem {
             condition_check: Some(check),
             ..
-        } => validate_transact_key(table_info, &check.key)
-            .and_then(|()| transact_key_fingerprint(table_info, &check.key)),
-        _ => Ok(String::new()),
-    };
-    transaction_key_preflight_from_key_result(result)
+        } => preflight_transact_write_key_with_table_info(table_info, &check.key),
+        _ => Ok(TransactionKeyPreflight::default()),
+    }
+}
+
+pub fn preflight_transact_put_item_key_with_table_info(
+    table_info: &StoredTableInfo,
+    item: &HashMap<String, AttributeValue>,
+) -> StorageResult<TransactionKeyPreflight> {
+    preflight_transact_write_key_result(
+        validate_transact_put_item_key(table_info, item)
+            .and_then(|()| transact_put_item_key_fingerprint(table_info, item)),
+    )
+}
+
+pub fn preflight_transact_write_key_with_table_info(
+    table_info: &StoredTableInfo,
+    key: &KeyAttributes,
+) -> StorageResult<TransactionKeyPreflight> {
+    preflight_transact_write_key_result(
+        validate_transact_key(table_info, key)
+            .and_then(|()| transact_key_fingerprint(table_info, key)),
+    )
+}
+
+fn preflight_transact_write_key_result(
+    result: StorageResult<String>,
+) -> StorageResult<TransactionKeyPreflight> {
+    match result {
+        Err(error) if transact_write_key_error_is_top_level(&error) => {
+            Err(raw_validation_from_error(error))
+        }
+        result => transaction_key_preflight_from_key_result(result),
+    }
 }
 
 pub fn preflight_transact_get_item_key_with_table_info(
     item: &TransactGetItem,
     table_info: &StoredTableInfo,
 ) -> StorageResult<TransactionKeyPreflight> {
-    transaction_key_preflight_from_key_result(
-        validate_transact_key(table_info, &item.get.key)
-            .and_then(|()| transact_key_fingerprint(table_info, &item.get.key)),
-    )
+    if let Err(error) = validate_transact_key_shape(table_info, &item.get.key) {
+        return transaction_key_preflight_from_key_result(Err(error));
+    }
+    if let Err(error) = validate_key_attributes_for_schema(&table_info.key_schema, &item.get.key) {
+        if transact_get_key_size_error_is_top_level(&error) {
+            return Err(error);
+        }
+        return transaction_key_preflight_from_key_result(Err(error));
+    }
+    transaction_key_preflight_from_key_result(transact_key_fingerprint(table_info, &item.get.key))
+}
+
+fn transact_get_key_size_error_is_top_level(error: &StorageError) -> bool {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return false;
+    };
+    message.contains("key attribute cannot contain an empty string value")
+        || message.contains("key attribute cannot contain an empty binary value")
+}
+
+fn transact_write_key_error_is_top_level(error: &StorageError) -> bool {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return false;
+    };
+    message.contains("key attribute cannot contain an empty string value")
+        || message.contains("key attribute cannot contain an empty binary value")
+        || message.contains("The parameter cannot be converted to a numeric value")
+        || message.contains("Attempting to store more than 38 significant digits in a Number")
+        || message.contains(
+            "Number underflow. Attempting to store a number with magnitude smaller than supported \
+             range",
+        )
+}
+
+fn raw_validation_from_error(error: StorageError) -> StorageError {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return error;
+    };
+    StorageError::raw_validation(message.clone())
 }
 
 pub fn validate_no_duplicate_transact_item_keys(
@@ -227,6 +308,7 @@ pub fn validate_transact_put_item_key(
             )));
         }
     }
+    validate_item_key_attributes_for_schema(&table_info.key_schema, item)?;
     Ok(())
 }
 
@@ -234,20 +316,19 @@ pub fn transact_put_item_key_fingerprint(
     table_info: &StoredTableInfo,
     item: &HashMap<String, AttributeValue>,
 ) -> StorageResult<String> {
-    let mut key = KeyAttributes::with_capacity(table_info.key_schema.len());
-    for key_schema in &table_info.key_schema {
-        let value = item.get(&key_schema.attribute_name).ok_or_else(|| {
-            StorageError::validation(format!(
-                "One or more parameter values were invalid: Missing the key {} in the item",
-                key_schema.attribute_name
-            ))
-        })?;
-        key.insert(key_schema.attribute_name.clone(), value.clone());
-    }
-    transact_key_fingerprint(table_info, &key)
+    transact_key_fingerprint_from_values(table_info, |name| item.get(name))
 }
 
 pub fn validate_transact_key(
+    table_info: &StoredTableInfo,
+    key: &KeyAttributes,
+) -> StorageResult<()> {
+    validate_transact_key_shape(table_info, key)?;
+    validate_key_attributes_for_schema(&table_info.key_schema, key)?;
+    Ok(())
+}
+
+fn validate_transact_key_shape(
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
 ) -> StorageResult<()> {
@@ -267,22 +348,49 @@ pub fn transact_key_fingerprint(
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
 ) -> StorageResult<String> {
-    let key_json = key
-        .canonical_dynamo_json()
-        .map_err(|err| StorageError::internal(&err.to_string()))?;
-    Ok(format!(
-        "{}\t{}",
+    transact_key_fingerprint_from_values(table_info, |name| key.get(name))
+}
+
+fn transact_key_fingerprint_from_values<'a>(
+    table_info: &StoredTableInfo,
+    mut value_for: impl FnMut(&str) -> Option<&'a AttributeValue>,
+) -> StorageResult<String> {
+    let mut fingerprint = String::with_capacity(128);
+    append_fingerprint_part(
+        &mut fingerprint,
+        "T",
         table_info.table_name.dynamodb_resource_name(),
-        key_json
-    ))
+    );
+    for key_schema in &table_info.key_schema {
+        let Some(value) = value_for(&key_schema.attribute_name) else {
+            continue;
+        };
+        append_fingerprint_part(&mut fingerprint, "K", &key_schema.attribute_name);
+        append_attribute_value_fingerprint(&mut fingerprint, value);
+    }
+    Ok(fingerprint)
+}
+
+fn append_attribute_value_fingerprint(fingerprint: &mut String, value: &AttributeValue) {
+    match value {
+        AttributeValue::S(value) => append_fingerprint_part(fingerprint, "S", value),
+        AttributeValue::N(value) => {
+            append_fingerprint_part(fingerprint, "N", normalize_dynamodb_number_for_write(value));
+        }
+        AttributeValue::B(value) => append_fingerprint_part(fingerprint, "B", value),
+        _ => {}
+    }
+}
+
+fn append_fingerprint_part(fingerprint: &mut String, tag: &str, value: impl AsRef<str>) {
+    let value = value.as_ref();
+    let _ = write!(fingerprint, "{tag}:{}:", value.len());
+    fingerprint.push_str(value);
+    fingerprint.push(';');
 }
 
 fn transaction_cancellation_reason(error: &StorageError) -> Option<String> {
-    match error.to_enum() {
-        StorageEnum::ConditionalCheckFailed => Some("ConditionalCheckFailed".to_string()),
-        StorageEnum::Validation { message } => Some(format!("ValidationError\t{message}")),
-        _ => None,
-    }
+    transaction_cancellation_reason_at(error, 0)
 }
 
 fn transact_key_schema_error() -> StorageError {

@@ -187,6 +187,11 @@ fn validate_backend_details(backends: &crate::Backends, path: &str) -> Result<()
                 "{path}.postgres.max_pool_size must be greater than 0"
             )));
         }
+        if postgres.background_max_pool_size == 0 {
+            return Err(ConfigError::validation(format!(
+                "{path}.postgres.background_max_pool_size must be greater than 0"
+            )));
+        }
     }
     if let Some(remote) = &backends.remote {
         if remote.endpoint_urls.is_empty() {

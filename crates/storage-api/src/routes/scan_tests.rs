@@ -78,6 +78,56 @@ async fn put_test_item(db: &DatabaseManager, table_name: &str, id: &str, name: &
     .unwrap();
 }
 
+async fn put_nested_scan_item(db: &DatabaseManager, table_name: &str) {
+    let item = HashMap::from([
+        ("id".to_string(), AttributeValue::S("item-1".to_string())),
+        (
+            "status".to_string(),
+            AttributeValue::S("active".to_string()),
+        ),
+        (
+            "tags".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("red".to_string()),
+                AttributeValue::S("blue".to_string()),
+            ]),
+        ),
+        (
+            "profile".to_string(),
+            AttributeValue::M(HashMap::from([
+                ("name".to_string(), AttributeValue::S("Ada".to_string())),
+                ("age".to_string(), AttributeValue::N("37".to_string())),
+                ("city".to_string(), AttributeValue::S("London".to_string())),
+            ])),
+        ),
+        (
+            "nested".to_string(),
+            AttributeValue::M(HashMap::from([(
+                "list".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::M(HashMap::from([
+                        ("v".to_string(), AttributeValue::S("first".to_string())),
+                        ("x".to_string(), AttributeValue::S("drop".to_string())),
+                    ])),
+                    AttributeValue::M(HashMap::from([(
+                        "v".to_string(),
+                        AttributeValue::S("second".to_string()),
+                    )])),
+                ]),
+            )])),
+        ),
+    ]);
+
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(TableName::new(table_name))
+            .item(item)
+            .build(),
+    )
+    .await
+    .unwrap();
+}
+
 async fn put_test_item_hash_range(db: &DatabaseManager, table_name: &str, pk: &str, sk: &str) {
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
@@ -445,6 +495,101 @@ async fn scan_with_projection_expression() {
     } else {
         panic!("Expected Scan response");
     }
+}
+
+#[tokio::test]
+async fn scan_filter_expression_uses_full_condition_expression_engine() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "FullFilterTable").await;
+    put_nested_scan_item(db.as_ref(), "FullFilterTable").await;
+
+    let payload = json!({
+        "TableName": "FullFilterTable",
+        "FilterExpression": "contains(tags, :tag) AND profile.age >= :minAge",
+        "ExpressionAttributeValues": {
+            ":tag": {"S": "red"},
+            ":minAge": {"N": "30"}
+        }
+    });
+
+    let result = handle_scan(db, payload.try_into().unwrap()).await.unwrap();
+    let Response::Scan(response) = result else {
+        panic!("Expected Scan response");
+    };
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn scan_filter_expression_supports_size_function() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "FullFilterSizeTable").await;
+    put_nested_scan_item(db.as_ref(), "FullFilterSizeTable").await;
+
+    let payload = json!({
+        "TableName": "FullFilterSizeTable",
+        "FilterExpression": "size(tags) = :tagCount",
+        "ExpressionAttributeValues": {
+            ":tagCount": {"N": "2"}
+        }
+    });
+
+    let result = handle_scan(db, payload.try_into().unwrap()).await.unwrap();
+    let Response::Scan(response) = result else {
+        panic!("Expected Scan response");
+    };
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn scan_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "NestedProjectionTable").await;
+    put_nested_scan_item(db.as_ref(), "NestedProjectionTable").await;
+
+    let payload = json!({
+        "TableName": "NestedProjectionTable",
+        "ProjectionExpression": "id, profile.#n, tags[0], nested.#list[0].v",
+        "ExpressionAttributeNames": {
+            "#n": "name",
+            "#list": "list"
+        }
+    });
+
+    let result = handle_scan(db, payload.try_into().unwrap()).await.unwrap();
+    let Response::Scan(response) = result else {
+        panic!("Expected Scan response");
+    };
+    let items = response.items.expect("projected items");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+
+    assert_eq!(
+        item.get("profile"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "name".to_string(),
+            AttributeValue::S("Ada".to_string()),
+        )])))
+    );
+    assert_eq!(
+        item.get("tags"),
+        Some(&AttributeValue::L(vec![AttributeValue::S(
+            "red".to_string()
+        )]))
+    );
+    assert_eq!(
+        item.get("nested"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "list".to_string(),
+            AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+                "v".to_string(),
+                AttributeValue::S("first".to_string()),
+            )]))]),
+        )])))
+    );
 }
 
 #[tokio::test]

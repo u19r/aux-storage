@@ -31,6 +31,7 @@ pub(crate) fn serialization_error_response(
             message: format!("serialize {operation} response failed: {error}"),
             transaction_message: None,
             cancellation_reasons: None,
+            item: None,
             request_id: None,
             documentation_url: None,
             retry_after_seconds: None,

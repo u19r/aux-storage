@@ -140,6 +140,7 @@ pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {
                 postgres: Some(storage_provider::PostgresSettings {
                     dsn,
                     max_pool_size: 4,
+                    background_max_pool_size: 2,
                     tls: false,
                     immediate_gsi_consistency: true,
                 }),

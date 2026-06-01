@@ -43,7 +43,10 @@ async fn single_node_sync_put_writes_stream_entry_with_committed_item_version() 
         .await
         .expect("read stream records");
     assert_eq!(response.records.len(), 1);
-    assert_eq!(response.records[0].sequence_number, "1");
+    assert_eq!(
+        response.records[0].cursor.as_deref(),
+        Some(response.records[0].sequence_number.as_str())
+    );
     assert_eq!(
         response.records[0].keys.get("pk"),
         Some(&AttributeValue::S("item#1".to_string()))
@@ -92,7 +95,11 @@ async fn single_node_sync_update_preserves_old_and_new_stream_images() {
         .expect("read stream records");
     assert_eq!(response.records.len(), 2);
     let update_record = &response.records[1];
-    assert_eq!(update_record.sequence_number, "2");
+    assert_eq!(
+        update_record.cursor.as_deref(),
+        Some(update_record.sequence_number.as_str())
+    );
+    assert!(response.records[0].sequence_number < update_record.sequence_number);
     assert_eq!(
         update_record
             .old_image
@@ -251,7 +258,10 @@ async fn single_node_sync_replays_persisted_log_after_restart_once() {
         .await
         .expect("read replayed stream records");
     assert_eq!(stream_records.records.len(), 1);
-    assert_eq!(stream_records.records[0].sequence_number, "1");
+    assert_eq!(
+        stream_records.records[0].cursor.as_deref(),
+        Some(stream_records.records[0].sequence_number.as_str())
+    );
 }
 
 #[tokio::test]

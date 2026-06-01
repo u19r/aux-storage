@@ -14,8 +14,9 @@ pub use crate::{
     provider::*,
     update_logic::{
         BoundUpdateOperation, SetFunction, UpdateOperation, apply_bound_update_operations,
-        apply_update_operations, before_update_item, parse_update_expression,
-        resolve_attribute_value, return_values_need_old_item, return_values_need_updated_fields,
-        split_operations_preserving_functions, update_item_response,
+        apply_update_operations, before_update_item, before_update_item_optional,
+        parse_update_expression, resolve_attribute_value, return_values_need_old_item,
+        return_values_need_updated_fields, split_operations_preserving_functions,
+        update_item_response, updated_attributes_for_response,
     },
 };

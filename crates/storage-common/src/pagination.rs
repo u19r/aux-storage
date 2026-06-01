@@ -19,7 +19,10 @@ pub fn normalize_limit(
 ) -> StorageResult<u32> {
     let limit = requested.unwrap_or(default_limit);
     if limit == 0 {
-        return Err(StorageError::validation("limit must be > 0"));
+        return Err(StorageError::validation(
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
+             Member must have value greater than or equal to 1",
+        ));
     }
     Ok(limit.min(max_limit))
 }

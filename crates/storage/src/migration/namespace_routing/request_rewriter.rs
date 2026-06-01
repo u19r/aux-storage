@@ -102,12 +102,14 @@ impl SharedTableRewriter {
 
     fn rewrite_update(&self, request: &mut UpdateItemRequest) -> StorageResult<()> {
         self.rewrite_key(&mut request.key)?;
-        rewrite_update_partition_assignments(
-            &self.namespace_prefix,
-            &request.update_expression,
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_mut(),
-        )?;
+        if let Some(update_expression) = request.update_expression.as_ref() {
+            rewrite_update_partition_assignments(
+                &self.namespace_prefix,
+                update_expression,
+                request.expression_attribute_names.as_ref(),
+                request.expression_attribute_values.as_mut(),
+            )?;
+        }
         rewrite_condition_partition_placeholders(
             &self.namespace_prefix,
             request.condition_expression.as_deref(),

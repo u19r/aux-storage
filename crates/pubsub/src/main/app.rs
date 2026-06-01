@@ -240,9 +240,13 @@ async fn create_postgres_pubsub_provider(
     let postgres = backends.postgres.as_ref().ok_or_else(|| {
         std::io::Error::other("postgres pubsub backend requires postgres settings")
     })?;
-    let provider =
-        PostgresStorageProvider::new_with_tls(&postgres.dsn, postgres.max_pool_size, postgres.tls)
-            .await?;
+    let provider = PostgresStorageProvider::new_with_tls(
+        &postgres.dsn,
+        postgres.max_pool_size,
+        postgres.background_max_pool_size,
+        postgres.tls,
+    )
+    .await?;
     Ok(Arc::new(provider))
 }
 

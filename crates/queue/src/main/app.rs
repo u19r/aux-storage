@@ -357,6 +357,7 @@ pub(crate) fn postgres_queue_provider_config(
     config.postgres = Some(PostgresSettings {
         dsn: postgres.dsn.clone(),
         max_pool_size: postgres.max_pool_size,
+        background_max_pool_size: postgres.background_max_pool_size,
         tls: postgres.tls,
     });
     config

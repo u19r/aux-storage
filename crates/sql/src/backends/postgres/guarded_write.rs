@@ -2,17 +2,19 @@ use std::collections::HashMap;
 
 use storage_condition::evaluate_condition;
 use storage_provider::{
-    apply_bound_update_operations, before_update_item, return_values_need_old_item,
-    split_item_into_key_and_attributes_sync, update_item_response,
+    apply_bound_update_operations, before_update_item_optional,
+    split_item_into_key_and_attributes_sync, update_item_response, updated_attributes_for_response,
 };
 use storage_types::{
     AllOld, GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedUpdateItemRequest,
-    PutItemResponse, StorageEnum, StorageError, StorageResult, UpdateItemRequest,
-    UpdateItemResponse, WireItem,
+    PutItemResponse, ReturnValuesOldNewUpdated, StorageEnum, StorageError, StorageResult,
+    UpdateItemRequest, UpdateItemResponse, WireItem,
 };
 
 use crate::{
-    backends::postgres::{PostgresStorageProvider, record_write},
+    backends::postgres::{
+        PostgresStorageProvider, record_write, transaction_helpers::condition_item_ref,
+    },
     billing_metrics::{attr_map_payload_bytes, record_write_cost, serializable_payload_bytes},
 };
 
@@ -48,14 +50,16 @@ impl PostgresStorageProvider {
                 let return_values = return_values.clone();
                 let table_info = table_info.clone();
                 async move {
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    let transaction = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start guarded_put_item transaction", err)
-                    })?;
+                    let mut client = self.acquire_client("guarded_put_item").await?;
+                    let _connection_hold = self.connection_hold_timer("guarded_put_item");
+                    let transaction = self
+                        .begin_transaction(
+                            &mut client,
+                            "guarded_put_item",
+                            "start guarded_put_item transaction",
+                        )
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("guarded_put_item");
                     Self::validate_durable_guard_with_client(
                         &transaction,
                         &table_name,
@@ -129,14 +133,16 @@ impl PostgresStorageProvider {
                 let expression_attribute_values = expression_attribute_values.clone();
                 let table_info = table_info.clone();
                 async move {
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    let transaction = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start guarded_delete_item transaction", err)
-                    })?;
+                    let mut client = self.acquire_client("guarded_delete_item").await?;
+                    let _connection_hold = self.connection_hold_timer("guarded_delete_item");
+                    let transaction = self
+                        .begin_transaction(
+                            &mut client,
+                            "guarded_delete_item",
+                            "start guarded_delete_item transaction",
+                        )
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("guarded_delete_item");
                     Self::validate_durable_guard_with_client(
                         &transaction,
                         &table_name,
@@ -197,8 +203,8 @@ impl PostgresStorageProvider {
             ..
         } = request;
 
-        let (operations, condition) = before_update_item(
-            update_expression.as_str(),
+        let (operations, condition) = before_update_item_optional(
+            update_expression.as_deref(),
             condition_expression.as_deref(),
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
@@ -216,14 +222,16 @@ impl PostgresStorageProvider {
                 let table_info = table_info.clone();
                 let guard = guard.clone();
                 async move {
-                    let mut client = self
-                        .pool
-                        .get()
-                        .await
-                        .map_err(Self::map_postgres_client_acquire_error)?;
-                    let transaction = client.transaction().await.map_err(|err| {
-                        Self::map_postgres_write_error("start guarded_update_item transaction", err)
-                    })?;
+                    let mut client = self.acquire_client("guarded_update_item").await?;
+                    let _connection_hold = self.connection_hold_timer("guarded_update_item");
+                    let transaction = self
+                        .begin_transaction(
+                            &mut client,
+                            "guarded_update_item",
+                            "start guarded_update_item transaction",
+                        )
+                        .await?;
+                    let _transaction_hold = self.transaction_hold_timer("guarded_update_item");
                     Self::validate_durable_guard_with_client(
                         &transaction,
                         &table_name,
@@ -242,29 +250,34 @@ impl PostgresStorageProvider {
                         .await?
                         .map(WireItem::into_attribute_map)
                         .transpose()?;
-                    if let Some(condition) = &condition {
-                        let empty_item = HashMap::new();
-                        let old_item_for_condition = existing_item.as_ref().unwrap_or(&empty_item);
-                        if !evaluate_condition(old_item_for_condition, condition) {
-                            return Err(StorageEnum::ConditionalCheckFailed.into());
-                        }
+                    if let Some(condition) = &condition
+                        && !evaluate_condition(
+                            condition_item_ref(existing_item.as_ref()),
+                            condition,
+                        )
+                    {
+                        return Err(StorageEnum::ConditionalCheckFailed.into());
                     }
 
+                    let old_item_for_write = existing_item.clone();
                     let item_to_update = existing_item.unwrap_or_else(|| key.to_attribute_map());
-                    let old_item_for_response = return_values_need_old_item(return_values.as_ref())
-                        .then(|| item_to_update.clone());
-                    let updated_item = apply_bound_update_operations(item_to_update, &operations)?;
-                    self.transact_put_with_client(
+                    let old_item_for_response = match return_values.as_ref() {
+                        Some(ReturnValuesOldNewUpdated::AllOld) => Some(item_to_update.clone()),
+                        Some(ReturnValuesOldNewUpdated::UpdatedOld) => {
+                            let attributes =
+                                updated_attributes_for_response(&operations, &item_to_update);
+                            (!attributes.is_empty()).then_some(attributes)
+                        }
+                        _ => None,
+                    };
+                    let updated_item =
+                        apply_bound_update_operations(item_to_update.clone(), &operations)?;
+                    self.upsert_transact_item_with_client(
                         &transaction,
-                        storage_types::TransactPutRequest {
-                            table_name: table_name.clone(),
-                            item: updated_item.clone(),
-                            condition_expression: None,
-                            expression_attribute_names: None,
-                            expression_attribute_values: None,
-                            return_values_on_condition_check_failure: None,
-                        },
-                        None,
+                        &table_name,
+                        &table_info,
+                        updated_item.clone(),
+                        old_item_for_write.as_ref(),
                     )
                     .await?;
                     transaction.commit().await.map_err(|err| {
@@ -273,6 +286,15 @@ impl PostgresStorageProvider {
                             err,
                         )
                     })?;
+
+                    if matches!(
+                        return_values.as_ref(),
+                        Some(ReturnValuesOldNewUpdated::UpdatedOld)
+                    ) {
+                        return Ok(UpdateItemResponse {
+                            attributes: old_item_for_response.map(Into::into),
+                        });
+                    }
 
                     update_item_response(
                         &operations,

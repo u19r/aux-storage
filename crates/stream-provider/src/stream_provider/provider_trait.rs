@@ -404,8 +404,9 @@ pub trait StreamProvider: Send + Sync {
             );
 
             let stream_record = StreamRecord {
+                cursor: Some(pointer.stream_item_id.to_string()),
                 keys,
-                sequence_number: pointer.item_stream_version.to_string(),
+                sequence_number: pointer.stream_item_id.to_string(),
                 old_image: record_old_image,
                 new_image: record_new_image,
             };

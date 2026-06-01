@@ -59,19 +59,64 @@ async fn delete_item_hash_only_key() {
 
     match delete_result.unwrap() {
         Response::DeleteItem(response) => {
-            // Should return the deleted item's attributes
             assert!(
-                response.attributes.is_some(),
-                "Should return deleted item attributes"
+                response.attributes.is_none(),
+                "DeleteItem should not return deleted item attributes by default"
             );
-            let deleted_attrs = response.attributes.unwrap();
+        }
+        other => panic!("Expected DeleteItem response, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_item_return_values_all_old_returns_deleted_item() {
+    let db = create_test_db_manager().await;
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "DeleteReturnAllOld",
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("create table");
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "DeleteReturnAllOld",
+            "Item": {
+                "id": {"S": "item1"},
+                "status": {"S": "open"}
+            }
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("seed item");
+
+    let response = handle_delete_item(
+        db,
+        json!({
+            "TableName": "DeleteReturnAllOld",
+            "Key": {"id": {"S": "item1"}},
+            "ReturnValues": "ALL_OLD"
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("delete should succeed");
+
+    match response {
+        Response::DeleteItem(response) => {
+            let attributes = response.attributes.expect("deleted item attributes");
             assert_eq!(
-                deleted_attrs.get("id"),
-                Some(&AttributeValue::S("user123".to_string()))
-            );
-            assert_eq!(
-                deleted_attrs.get("name"),
-                Some(&AttributeValue::S("John Doe".to_string()))
+                attributes.get("status"),
+                Some(&AttributeValue::S("open".to_string()))
             );
         }
         other => panic!("Expected DeleteItem response, got: {other:?}"),
@@ -130,4 +175,58 @@ async fn delete_item_condition_failure_returns_dynamodb_error_code() {
         "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
     );
     assert_eq!(err.message, "The conditional request failed");
+}
+
+#[tokio::test]
+async fn delete_item_condition_failure_returns_all_old_item_when_requested() {
+    let db = create_test_db_manager().await;
+
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "DeleteConditionalAllOld",
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("create table");
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "DeleteConditionalAllOld",
+            "Item": {
+                "id": {"S": "item1"},
+                "status": {"S": "open"}
+            }
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect("seed item");
+
+    let err = handle_delete_item(
+        db,
+        json!({
+            "TableName": "DeleteConditionalAllOld",
+            "Key": {"id": {"S": "item1"}},
+            "ConditionExpression": "#status = :expected",
+            "ExpressionAttributeNames": {"#status": "status"},
+            "ExpressionAttributeValues": {":expected": {"S": "closed"}},
+            "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        })
+        .try_into()
+        .unwrap(),
+    )
+    .await
+    .expect_err("conditional delete should fail");
+
+    let item = err.item.expect("conditional failure item");
+    assert_eq!(
+        item.get("status"),
+        Some(&AttributeValue::S("open".to_string()))
+    );
 }

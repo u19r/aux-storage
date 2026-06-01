@@ -17,6 +17,8 @@ pub(crate) use core::{
 };
 
 #[cfg(test)]
+mod provider_condition_alloc_tests;
+#[cfg(test)]
 mod provider_query_decode_tests;
 #[cfg(test)]
 mod provider_tests;

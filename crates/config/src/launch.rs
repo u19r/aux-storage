@@ -21,6 +21,8 @@ struct StorageApiArgs {
     #[arg(long)]
     postgres_max_pool_size: Option<usize>,
     #[arg(long)]
+    postgres_background_max_pool_size: Option<usize>,
+    #[arg(long)]
     postgres_tls: Option<bool>,
     #[arg(short, long)]
     port: Option<String>,
@@ -132,6 +134,7 @@ impl StorageApiLaunchConfig {
 fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(String, String)>) {
     let postgres_selected_by_setting = args.postgres_dsn.is_some()
         || args.postgres_max_pool_size.is_some()
+        || args.postgres_background_max_pool_size.is_some()
         || args.postgres_tls.is_some();
     let selected_backend = args
         .storage
@@ -162,6 +165,12 @@ fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(Strin
         overrides.push((
             "features.backends.postgres.max_pool_size".to_string(),
             max_pool_size.to_string(),
+        ));
+    }
+    if let Some(background_max_pool_size) = args.postgres_background_max_pool_size {
+        overrides.push((
+            "features.backends.postgres.background_max_pool_size".to_string(),
+            background_max_pool_size.to_string(),
         ));
     }
     if let Some(tls) = args.postgres_tls {

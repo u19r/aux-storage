@@ -17,12 +17,15 @@ use tokio::sync::Notify;
 use tokio::{sync::RwLock, task::JoinHandle};
 use typed_builder::TypedBuilder;
 
+#[cfg(feature = "cache-write-planner")]
+use crate::cache_write_planner::{StorageCachePlannerLoad, StorageCacheWritePlanner};
+#[cfg(feature = "cache-write-planner")]
+use crate::namespace_routing::NamespaceStorageMode;
 use crate::{
     cache_batch_get_runtime::StorageBatchGetCacheRuntime,
     cache_coordinator::StorageCacheServices,
     cache_point_read_runtime::StoragePointReadCacheRuntime,
     cache_query_runtime::{StorageCacheQueryRuntime, StorageCacheQueryRuntimeLoad},
-    cache_write_planner::{StorageCachePlannerLoad, StorageCacheWritePlanner},
     database_manager::{
         constants::{
             CAPPED_ENTITY_COUNTER_DELTA_VALUE, CAPPED_ENTITY_COUNTER_ENTITY_TYPE_NAME,
@@ -38,8 +41,8 @@ use crate::{
     },
     namespace_routing::{
         NamespaceRequestRewriter, NamespaceRoute, NamespaceRouteRecord, NamespaceRouteResolver,
-        NamespaceStorageMode, RouteTarget, is_shared_table_enabled_namespace_route,
-        parse_namespace_route_record, reject_direct_shared_table_access,
+        RouteTarget, is_shared_table_enabled_namespace_route, parse_namespace_route_record,
+        reject_direct_shared_table_access,
     },
     newtypes::DatabaseTrait,
     tables::Tables,
@@ -407,6 +410,7 @@ pub struct DatabaseManager {
     pub(super) table_info_cache: RwLock<HashMap<TableName, Arc<StoredTableInfo>>>,
 }
 
+#[cfg(feature = "cache-write-planner")]
 impl StorageCachePlannerLoad for DatabaseManager {
     async fn get_table_info_for_cache(
         &self,
@@ -471,6 +475,7 @@ impl StorageCacheQueryRuntimeLoad for DatabaseManager {
 }
 
 impl DatabaseManager {
+    #[cfg(feature = "cache-write-planner")]
     pub(super) fn cache_write_planner(&self) -> StorageCacheWritePlanner<'_, Self> {
         StorageCacheWritePlanner::new(self, self.cache_services.query_proof_enabled())
     }
@@ -483,6 +488,7 @@ impl DatabaseManager {
         self.single_node_sync_mode
     }
 
+    #[cfg(feature = "cache-write-planner")]
     pub(super) fn cache_write_effects_enabled(&self) -> bool {
         self.cache_services.point_read_enabled() || self.cache_services.query_proof_enabled()
     }
@@ -643,6 +649,7 @@ impl DatabaseManager {
             .map(Some)
     }
 
+    #[cfg(feature = "cache-write-planner")]
     pub(super) async fn get_table_info_with_pending(
         &self,
         table_name: &TableName,
@@ -655,6 +662,7 @@ impl DatabaseManager {
             .clone())
     }
 
+    #[cfg(feature = "cache-write-planner")]
     pub(crate) async fn get_table_info_arc_with_pending(
         &self,
         table_name: &TableName,
@@ -675,6 +683,7 @@ impl DatabaseManager {
         self.get_table_info_arc(table_name).await
     }
 
+    #[cfg(feature = "cache-write-planner")]
     pub(super) async fn get_item_map_with_consistent_read_with_pending(
         &self,
         table_name: TableName,

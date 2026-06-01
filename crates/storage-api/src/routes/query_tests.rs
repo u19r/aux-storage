@@ -72,6 +72,64 @@ async fn create_test_table_hash_range(db: &DatabaseManager, table_name: &str) {
     db.create_table(&request).await.unwrap();
 }
 
+async fn create_test_table_binary_hash_range(db: &DatabaseManager, table_name: &str) {
+    let request = CreateTableRequest::new(
+        TableName::new(table_name),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::B,
+            },
+        ],
+        vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        storage_types::BillingMode::PayPerRequest,
+    );
+
+    db.create_table(&request).await.unwrap();
+}
+
+async fn create_test_table_number_hash_range(db: &DatabaseManager, table_name: &str) {
+    let request = CreateTableRequest::new(
+        TableName::new(table_name),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::N,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::N,
+            },
+        ],
+        vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        storage_types::BillingMode::PayPerRequest,
+    );
+
+    db.create_table(&request).await.unwrap();
+}
+
 async fn create_test_table_hash_range_with_gsi(db: &DatabaseManager, table_name: &str) {
     let request = CreateTableRequest::new(
         TableName::new(table_name),
@@ -143,6 +201,56 @@ async fn put_test_item(db: &DatabaseManager, table_name: &str, pk: &str, name: &
     .unwrap();
 }
 
+async fn put_nested_query_item(db: &DatabaseManager, table_name: &str) {
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("item-1".to_string())),
+        (
+            "status".to_string(),
+            AttributeValue::S("active".to_string()),
+        ),
+        (
+            "tags".to_string(),
+            AttributeValue::L(vec![
+                AttributeValue::S("red".to_string()),
+                AttributeValue::S("blue".to_string()),
+            ]),
+        ),
+        (
+            "profile".to_string(),
+            AttributeValue::M(HashMap::from([
+                ("name".to_string(), AttributeValue::S("Ada".to_string())),
+                ("age".to_string(), AttributeValue::N("37".to_string())),
+                ("city".to_string(), AttributeValue::S("London".to_string())),
+            ])),
+        ),
+        (
+            "nested".to_string(),
+            AttributeValue::M(HashMap::from([(
+                "list".to_string(),
+                AttributeValue::L(vec![
+                    AttributeValue::M(HashMap::from([
+                        ("v".to_string(), AttributeValue::S("first".to_string())),
+                        ("x".to_string(), AttributeValue::S("drop".to_string())),
+                    ])),
+                    AttributeValue::M(HashMap::from([(
+                        "v".to_string(),
+                        AttributeValue::S("second".to_string()),
+                    )])),
+                ]),
+            )])),
+        ),
+    ]);
+
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(TableName::new(table_name))
+            .item(item)
+            .build(),
+    )
+    .await
+    .unwrap();
+}
+
 async fn put_test_item_hash_range(
     db: &DatabaseManager,
     table_name: &str,
@@ -154,6 +262,27 @@ async fn put_test_item_hash_range(
     item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
     item.insert("sk".to_string(), AttributeValue::S(sk.to_string()));
     item.insert("data".to_string(), AttributeValue::S(data.to_string()));
+
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(TableName::new(table_name))
+            .item(item)
+            .build(),
+    )
+    .await
+    .unwrap();
+}
+
+async fn put_test_item_binary_hash_range(
+    db: &DatabaseManager,
+    table_name: &str,
+    pk: &str,
+    sk: &str,
+) {
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
+    item.insert("sk".to_string(), AttributeValue::B(sk.to_string()));
+    item.insert("data".to_string(), AttributeValue::S("binary".to_string()));
 
     db.put_item(
         PutItemInput::builder()
@@ -582,6 +711,39 @@ async fn query_with_malformed_exclusive_start_key_returns_dynamodb_error() {
 }
 
 #[tokio::test]
+async fn query_rejects_exclusive_start_key_with_wrong_key_type() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_test_table_hash_range(db.as_ref(), "WrongTypeStartKeyTable").await;
+
+        let payload = json!({
+            "TableName": "WrongTypeStartKeyTable",
+            "KeyConditionExpression": "pk = :pk_val",
+            "ExpressionAttributeValues": {":pk_val": {"S": "U#1"}},
+            "ExclusiveStartKey": {
+                "pk": {"N": "1"},
+                "sk": {"S": "item#001"}
+            }
+        });
+
+        let error = handle_query(db, payload.try_into().unwrap())
+            .await
+            .expect_err("wrong type start key should fail");
+        assert_eq!(error.status_code, 400, "{}", backend.name);
+        assert_eq!(
+            error.error_type, "com.amazon.coral.validate#ValidationException",
+            "{}",
+            backend.name
+        );
+        assert_eq!(
+            error.message, "The provided starting key is invalid",
+            "{}",
+            backend.name
+        );
+    }
+}
+
+#[tokio::test]
 async fn query_gsi_with_malformed_exclusive_start_key_returns_dynamodb_error() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
@@ -617,6 +779,130 @@ async fn query_gsi_with_malformed_exclusive_start_key_returns_dynamodb_error() {
         );
         assert_eq!(
             error.message, "The provided starting key is invalid",
+            "{}",
+            backend.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn query_validates_key_condition_values_against_key_limits() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_test_table_hash_range(db.as_ref(), "StringKeyLimitTable").await;
+        create_test_table_binary_hash_range(db.as_ref(), "BinaryKeyLimitTable").await;
+        create_test_table_number_hash_range(db.as_ref(), "NumberKeyLimitTable").await;
+
+        for (case_name, payload, expected_message) in [
+            (
+                "empty string begins_with sort key",
+                json!({
+                    "TableName": "StringKeyLimitTable",
+                    "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+                    "ExpressionAttributeValues": {
+                        ":pk": {"S": "tenant"},
+                        ":prefix": {"S": ""}
+                    }
+                }),
+                "One or more parameter values are not valid. The AttributeValue for a key \
+                 attribute cannot contain an empty string value. Key: sk",
+            ),
+            (
+                "oversized binary sort key",
+                json!({
+                    "TableName": "BinaryKeyLimitTable",
+                    "KeyConditionExpression": "pk = :pk AND sk = :sk",
+                    "ExpressionAttributeValues": {
+                        ":pk": {"S": "tenant"},
+                        ":sk": {"B": zero_binary_base64(storage_types::MAX_SORT_KEY_BYTES + 1)}
+                    },
+                    "Select": "COUNT"
+                }),
+                "One or more parameter values were invalid: Aggregated size of all range keys has \
+                 exceeded the size limit of 1024 bytes",
+            ),
+            (
+                "empty number hash key",
+                json!({
+                    "TableName": "NumberKeyLimitTable",
+                    "KeyConditionExpression": "pk = :pk",
+                    "ExpressionAttributeValues": {
+                        ":pk": {"N": ""}
+                    },
+                    "Select": "COUNT"
+                }),
+                "The parameter cannot be converted to a numeric value: ",
+            ),
+            (
+                "number sort key underflow",
+                json!({
+                    "TableName": "NumberKeyLimitTable",
+                    "KeyConditionExpression": "pk = :pk AND sk = :sk",
+                    "ExpressionAttributeValues": {
+                        ":pk": {"N": "1"},
+                        ":sk": {"N": "1E-131"}
+                    },
+                    "Select": "COUNT"
+                }),
+                "Number underflow. Attempting to store a number with magnitude smaller than \
+                 supported range",
+            ),
+        ] {
+            let error = handle_query(db.clone(), payload.try_into().unwrap())
+                .await
+                .expect_err(&format!("{case_name} should fail"));
+            assert_eq!(error.status_code, 400, "{}: {case_name}", backend.name);
+            assert_eq!(
+                error.error_type, "com.amazon.coral.validate#ValidationException",
+                "{}: {case_name}",
+                backend.name
+            );
+            assert_eq!(
+                error.message, expected_message,
+                "{}: {case_name}",
+                backend.name
+            );
+        }
+    }
+}
+
+fn zero_binary_base64(len: usize) -> String {
+    let full_chunks = len / 3;
+    let remainder = len % 3;
+    let mut encoded = "AAAA".repeat(full_chunks);
+    match remainder {
+        0 => {}
+        1 => encoded.push_str("AA=="),
+        2 => encoded.push_str("AAA="),
+        _ => unreachable!("modulo 3 remainder is always 0..=2"),
+    }
+    encoded
+}
+
+#[tokio::test]
+async fn query_gsi_consistent_read_returns_dynamodb_validation_error_type() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_test_table_hash_range_with_gsi(db.as_ref(), "ConsistentReadGsiTable").await;
+
+        let payload = json!({
+            "TableName": "ConsistentReadGsiTable",
+            "IndexName": "ByGsi",
+            "KeyConditionExpression": "gpk = :gpk",
+            "ExpressionAttributeValues": {":gpk": {"S": "G#1"}},
+            "ConsistentRead": true
+        });
+
+        let result = handle_query(db, payload.try_into().unwrap()).await;
+        let error = result.expect_err("consistent GSI query should fail");
+        assert_eq!(error.status_code, 400, "{}", backend.name);
+        assert_eq!(
+            error.error_type, "com.amazon.coral.validate#ValidationException",
+            "{}",
+            backend.name
+        );
+        assert_eq!(
+            error.message, "Consistent reads are not supported on global secondary indexes",
             "{}",
             backend.name
         );
@@ -683,6 +969,325 @@ async fn query_with_projection_expression() {
     assert!(item.contains_key("pk"));
     assert!(item.contains_key("name"));
     assert!(!item.contains_key("age")); // Should be excluded by projection
+}
+
+#[tokio::test]
+async fn query_filter_expression_uses_full_condition_expression_engine() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "FullFilterTable").await;
+    put_nested_query_item(db.as_ref(), "FullFilterTable").await;
+
+    let payload = json!({
+        "TableName": "FullFilterTable",
+        "KeyConditionExpression": "pk = :pk",
+        "FilterExpression": "contains(tags, :tag) AND profile.age >= :minAge",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"},
+            ":tag": {"S": "red"},
+            ":minAge": {"N": "30"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_filter_expression_supports_or_and_attribute_not_exists() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "FullFilterOrTable").await;
+    put_nested_query_item(db.as_ref(), "FullFilterOrTable").await;
+
+    let payload = json!({
+        "TableName": "FullFilterOrTable",
+        "KeyConditionExpression": "pk = :pk",
+        "FilterExpression": "attribute_not_exists(#missing) OR #s = :status",
+        "ExpressionAttributeNames": {
+            "#missing": "missing",
+            "#s": "status"
+        },
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"},
+            ":status": {"S": "active"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_value_on_left_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "ReverseKeyConditionTable").await;
+    put_nested_query_item(db.as_ref(), "ReverseKeyConditionTable").await;
+
+    let payload = json!({
+        "TableName": "ReverseKeyConditionTable",
+        "KeyConditionExpression": ":pk = pk",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_no_space_hash_equality_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "NoSpaceKeyConditionTable").await;
+    put_nested_query_item(db.as_ref(), "NoSpaceKeyConditionTable").await;
+
+    let payload = json!({
+        "TableName": "NoSpaceKeyConditionTable",
+        "KeyConditionExpression": "pk=:pk",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_parenthesized_hash_equality_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "ParenthesizedKeyConditionTable").await;
+    put_nested_query_item(db.as_ref(), "ParenthesizedKeyConditionTable").await;
+
+    let payload = json!({
+        "TableName": "ParenthesizedKeyConditionTable",
+        "KeyConditionExpression": "(pk = :pk)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_value_on_left_sort_comparison_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table_hash_range(db.as_ref(), "ValueLeftSortConditionTable").await;
+    put_test_item_hash_range(
+        db.as_ref(),
+        "ValueLeftSortConditionTable",
+        "tenant#1",
+        "sort#001",
+        "payload",
+    )
+    .await;
+
+    let payload = json!({
+        "TableName": "ValueLeftSortConditionTable",
+        "KeyConditionExpression": "pk = :pk AND :lo <= sk",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "tenant#1"},
+            ":lo": {"S": "sort#000"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_binary_sort_begins_with_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table_binary_hash_range(db.as_ref(), "BinaryBeginsWithTable").await;
+    put_test_item_binary_hash_range(db.as_ref(), "BinaryBeginsWithTable", "tenant#1", "AQIDBA==")
+        .await;
+
+    let payload = json!({
+        "TableName": "BinaryBeginsWithTable",
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "tenant#1"},
+            ":prefix": {"B": "AQI="}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+
+    assert_eq!(response.count, 1);
+    assert_eq!(response.scanned_count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_accepts_aliases_between_and_begins_with_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table_hash_range(db.as_ref(), "AliasBetweenBeginsWithTable").await;
+    put_test_item_hash_range(
+        db.as_ref(),
+        "AliasBetweenBeginsWithTable",
+        "tenant#1",
+        "sort#001",
+        "payload",
+    )
+    .await;
+    put_test_item_hash_range(
+        db.as_ref(),
+        "AliasBetweenBeginsWithTable",
+        "tenant#1",
+        "other#001",
+        "payload",
+    )
+    .await;
+
+    let between_payload = json!({
+        "TableName": "AliasBetweenBeginsWithTable",
+        "KeyConditionExpression": "#pk = :pk AND #sk BETWEEN :lo AND :hi",
+        "ExpressionAttributeNames": {"#pk": "pk", "#sk": "sk"},
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "tenant#1"},
+            ":lo": {"S": "sort#000"},
+            ":hi": {"S": "sort#009"}
+        }
+    });
+    let between_response = expect_query_response(
+        handle_query(db.clone(), between_payload.try_into().unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(between_response.count, 1);
+
+    let begins_with_payload = json!({
+        "TableName": "AliasBetweenBeginsWithTable",
+        "KeyConditionExpression": "#pk=:pk AND begins_with(#sk,:prefix)",
+        "ExpressionAttributeNames": {"#pk": "pk", "#sk": "sk"},
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "tenant#1"},
+            ":prefix": {"S": "sort#"}
+        }
+    });
+    let begins_with_response = expect_query_response(
+        handle_query(db, begins_with_payload.try_into().unwrap())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(begins_with_response.count, 1);
+}
+
+#[tokio::test]
+async fn query_key_condition_rejects_invalid_operators_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table_hash_range(db.as_ref(), "InvalidKeyConditionTable").await;
+    put_test_item_hash_range(
+        db.as_ref(),
+        "InvalidKeyConditionTable",
+        "tenant#1",
+        "sort#001",
+        "payload",
+    )
+    .await;
+
+    for (expression, values) in [
+        (
+            "pk = :pk AND BEGINS_WITH(sk, :prefix)",
+            json!({":pk": {"S": "tenant#1"}, ":prefix": {"S": "sort#"}}),
+        ),
+        (
+            "pk = :pk OR sk = :sk",
+            json!({":pk": {"S": "tenant#1"}, ":sk": {"S": "sort#001"}}),
+        ),
+        (
+            "pk = :pk AND sk <> :sk",
+            json!({":pk": {"S": "tenant#1"}, ":sk": {"S": "sort#001"}}),
+        ),
+        (
+            "pk = :pk AND contains(sk, :prefix)",
+            json!({":pk": {"S": "tenant#1"}, ":prefix": {"S": "sort#"}}),
+        ),
+        ("sk = :sk", json!({":sk": {"S": "sort#001"}})),
+        (
+            "begins_with(pk, :prefix)",
+            json!({":prefix": {"S": "tenant#"}}),
+        ),
+    ] {
+        let payload = json!({
+            "TableName": "InvalidKeyConditionTable",
+            "KeyConditionExpression": expression,
+            "ExpressionAttributeValues": values
+        });
+        let error = handle_query(db.clone(), payload.try_into().unwrap())
+            .await
+            .expect_err("invalid key condition should fail");
+        assert_eq!(error.status_code, 400, "{expression}");
+    }
+}
+
+#[tokio::test]
+async fn query_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "NestedProjectionTable").await;
+    put_nested_query_item(db.as_ref(), "NestedProjectionTable").await;
+
+    let payload = json!({
+        "TableName": "NestedProjectionTable",
+        "KeyConditionExpression": "pk = :pk",
+        "ProjectionExpression": "pk, profile.#n, tags[0], nested.#list[0].v",
+        "ExpressionAttributeNames": {
+            "#n": "name",
+            "#list": "list"
+        },
+        "ExpressionAttributeValues": {
+            ":pk": {"S": "item-1"}
+        }
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+    let items = response.items.expect("projected items");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+
+    assert_eq!(
+        item.get("profile"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "name".to_string(),
+            AttributeValue::S("Ada".to_string()),
+        )])))
+    );
+    assert_eq!(
+        item.get("tags"),
+        Some(&AttributeValue::L(vec![AttributeValue::S(
+            "red".to_string()
+        )]))
+    );
+    assert_eq!(
+        item.get("nested"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "list".to_string(),
+            AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+                "v".to_string(),
+                AttributeValue::S("first".to_string()),
+            )]))]),
+        )])))
+    );
 }
 
 #[tokio::test]

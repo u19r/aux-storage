@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use async_trait::async_trait;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
-use storage_common::{GSI_UPDATE_JOB, normalize_limit as calc_limit};
+use storage_common::{
+    GSI_UPDATE_JOB, apply_gsi_write_pressure as apply_shared_gsi_write_pressure,
+    normalize_limit as calc_limit,
+};
 use storage_condition::{evaluate_condition, parse_condition_expression};
 use storage_provider::{
     StorageProvider, apply_bound_update_operations, before_update_item,
-    return_values_need_updated_fields, split_item_into_key_and_attributes_sync,
-    update_item_response,
+    before_update_item_optional, return_values_need_updated_fields,
+    split_item_into_key_and_attributes_sync, update_item_response,
 };
 use storage_types::{
     AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
@@ -15,8 +18,8 @@ use storage_types::{
     DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
     PreparedBatchOperation, PutItemResponse, QueryTableRequest, ReplicationMutation,
-    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, TableName,
-    TableStatus, TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName, TableStatus,
+    TimestampMillis, TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
     UpdateItemRequest, UpdateItemResponse, WireItem,
 };
 use turso::Value as TursoValue;
@@ -41,8 +44,9 @@ use crate::{
         transaction::{
             TransactionKeyPreflight, all_old, conditional_check_failed_reason,
             preflight_transact_item_key_with_table_info, transact_item_table_name,
-            transaction_canceled_for_item_error_with_len, transaction_canceled_for_preflights,
-            transaction_canceled_for_reason, validate_no_duplicate_transact_item_keys,
+            transaction_canceled_for_indexed_reasons, transaction_canceled_for_item_error_with_len,
+            transaction_canceled_for_preflights, transaction_canceled_for_reason,
+            transaction_cancellation_reason_at, validate_no_duplicate_transact_item_keys,
             validate_transact_key, validate_transact_put_item_key,
         },
         write::plan_update_from_existing_item,
@@ -50,6 +54,26 @@ use crate::{
     sql_builder::build_sql_query,
     utils::{SqliteTableRowidMode, build_gsi_creation_sqls, build_table_creation_sql},
 };
+
+fn condition_item_ref(
+    old_item: Option<&HashMap<String, AttributeValue>>,
+) -> &HashMap<String, AttributeValue> {
+    static EMPTY_ITEM: LazyLock<HashMap<String, AttributeValue>> = LazyLock::new(HashMap::new);
+    old_item.unwrap_or(&EMPTY_ITEM)
+}
+
+fn current_ms_u64() -> u64 {
+    u64::try_from(*TimestampMillis::now()).unwrap_or(0)
+}
+
+async fn apply_gsi_write_pressure(provider: &TursoStorageProvider) -> StorageResult<()> {
+    apply_shared_gsi_write_pressure(
+        provider.immediate_gsi_consistency,
+        &provider.gsi_propagation_governor,
+        current_ms_u64(),
+    )
+    .await
+}
 
 #[async_trait]
 impl StorageProvider for TursoStorageProvider {
@@ -66,6 +90,21 @@ impl StorageProvider for TursoStorageProvider {
                 let _ = this
                     .execute(conn, sql_statements::create_tables_table(), Vec::new())
                     .await?;
+                let columns = this.query_rows(conn, "PRAGMA table_info(tables)", Vec::new()).await?;
+                let has_deletion_protection_column = columns.iter().any(|row| {
+                    row.get("name").is_some_and(|value| {
+                        matches!(value, TursoValue::Text(name) if name == "deletion_protection_enabled")
+                    })
+                });
+                if !has_deletion_protection_column {
+                    let _ = this
+                        .execute(
+                            conn,
+                            sql_statements::add_deletion_protection_column(),
+                            Vec::new(),
+                        )
+                        .await?;
+                }
                 let _ = this
                     .execute(
                         conn,
@@ -202,6 +241,11 @@ impl StorageProvider for TursoStorageProvider {
                     TursoValue::Integer(0),
                     TursoValue::Integer(0),
                     option_string_to_value(metadata.stream_specification_json),
+                    TursoValue::Integer(if metadata.deletion_protection_enabled {
+                        1
+                    } else {
+                        0
+                    }),
                 ];
                 let _ = this.execute(conn, insert_sql, insert_params).await?;
 
@@ -318,6 +362,9 @@ impl StorageProvider for TursoStorageProvider {
                 let table_info = this
                     .load_table_info_uncached(conn, &table_name_clone)
                     .await?;
+                if table_info.deletion_protection_enabled {
+                    return Err(StorageError::deletion_protection_enabled(&table_name_clone));
+                }
 
                 let _ = this
                     .execute(
@@ -372,6 +419,7 @@ impl StorageProvider for TursoStorageProvider {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
+        apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
             .parse_condition(
@@ -473,6 +521,7 @@ impl StorageProvider for TursoStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
             .parse_condition(
@@ -500,6 +549,7 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: GuardedPutItemRequest,
     ) -> StorageResult<PutItemResponse> {
+        apply_gsi_write_pressure(self).await?;
         let GuardedPutItemRequest {
             table_name,
             item,
@@ -558,6 +608,7 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: GuardedDeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        apply_gsi_write_pressure(self).await?;
         let GuardedDeleteItemRequest {
             table_name,
             key,
@@ -765,6 +816,7 @@ impl StorageProvider for TursoStorageProvider {
 
         let conditions = parse_key_condition_expression(
             &request.key_condition_expression,
+            &key_schema,
             request.expression_attribute_names.as_ref(),
             request.expression_attribute_values.as_ref(),
         )?;
@@ -823,6 +875,7 @@ impl StorageProvider for TursoStorageProvider {
         request: BatchWriteItemRequest,
         _should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse> {
+        apply_gsi_write_pressure(self).await?;
         let mut prepared_ops: Vec<PreparedBatchOperation> = Vec::new();
         for (table_name, writes) in request.request_items {
             let table_info = self.get_table_info(&table_name).await?;
@@ -872,6 +925,7 @@ impl StorageProvider for TursoStorageProvider {
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {
+        apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&request.table_name).await?;
         let UpdateItemRequest {
             table_name,
@@ -896,8 +950,8 @@ impl StorageProvider for TursoStorageProvider {
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
                 Box::pin(async move {
-                    let (operations, condition) = before_update_item(
-                        &update_expression,
+                    let (operations, condition) = before_update_item_optional(
+                        update_expression.as_deref(),
                         condition_expression.as_deref(),
                         expression_attribute_names.as_ref(),
                         expression_attribute_values.as_ref(),
@@ -946,6 +1000,7 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: GuardedUpdateItemRequest,
     ) -> StorageResult<UpdateItemResponse> {
+        apply_gsi_write_pressure(self).await?;
         let GuardedUpdateItemRequest { request, guard } = request;
         let table_info = self.get_table_info(&request.table_name).await?;
         let UpdateItemRequest {
@@ -972,8 +1027,8 @@ impl StorageProvider for TursoStorageProvider {
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
                 Box::pin(async move {
-                    let (operations, condition) = before_update_item(
-                        &update_expression,
+                    let (operations, condition) = before_update_item_optional(
+                        update_expression.as_deref(),
                         condition_expression.as_deref(),
                         expression_attribute_names.as_ref(),
                         expression_attribute_values.as_ref(),
@@ -1024,6 +1079,7 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        apply_gsi_write_pressure(self).await?;
         let this = self.clone();
         self.with_transaction(true, |conn| {
             let this = this.clone();
@@ -1039,6 +1095,7 @@ impl StorageProvider for TursoStorageProvider {
                 validate_no_duplicate_transact_item_keys(&preflights)?;
 
                 let item_count = request.transact_items.len();
+                let mut cancellation_reasons = vec![None; item_count];
                 for (index, item) in request.transact_items.into_iter().enumerate() {
                     let result = async {
                         if let Some(put) = item.put {
@@ -1065,21 +1122,22 @@ impl StorageProvider for TursoStorageProvider {
                                     &put.expression_attribute_values,
                                 )
                                 .await?;
-                            if let Some(condition) = condition.as_ref() {
-                                let condition_item = old_item.clone().unwrap_or_default();
-                                if !evaluate_condition(&condition_item, condition) {
-                                    return Err(transaction_canceled_for_reason(
-                                        index,
-                                        conditional_check_failed_reason(
-                                            all_old(
-                                                put.return_values_on_condition_check_failure
-                                                    .as_ref(),
-                                            )
-                                            .then_some(old_item.as_ref())
-                                            .flatten(),
-                                        )?,
-                                    ));
-                                }
+                            if let Some(condition) = condition.as_ref()
+                                && !evaluate_condition(
+                                    condition_item_ref(old_item.as_ref()),
+                                    condition,
+                                )
+                            {
+                                return Err(transaction_canceled_for_reason(
+                                    index,
+                                    conditional_check_failed_reason(
+                                        all_old(
+                                            put.return_values_on_condition_check_failure.as_ref(),
+                                        )
+                                        .then_some(old_item.as_ref())
+                                        .flatten(),
+                                    )?,
+                                ));
                             }
                             let _ = this
                                 .put_item_txn(conn, &table_info, &put.item, None)
@@ -1102,22 +1160,24 @@ impl StorageProvider for TursoStorageProvider {
                                     &delete.expression_attribute_values,
                                 )
                                 .await?;
-                            if let Some(condition) = condition.as_ref() {
-                                let condition_item = old_item.clone().unwrap_or_default();
-                                if !evaluate_condition(&condition_item, condition) {
-                                    return Err(transaction_canceled_for_reason(
-                                        index,
-                                        conditional_check_failed_reason(
-                                            all_old(
-                                                delete
-                                                    .return_values_on_condition_check_failure
-                                                    .as_ref(),
-                                            )
-                                            .then_some(old_item.as_ref())
-                                            .flatten(),
-                                        )?,
-                                    ));
-                                }
+                            if let Some(condition) = condition.as_ref()
+                                && !evaluate_condition(
+                                    condition_item_ref(old_item.as_ref()),
+                                    condition,
+                                )
+                            {
+                                return Err(transaction_canceled_for_reason(
+                                    index,
+                                    conditional_check_failed_reason(
+                                        all_old(
+                                            delete
+                                                .return_values_on_condition_check_failure
+                                                .as_ref(),
+                                        )
+                                        .then_some(old_item.as_ref())
+                                        .flatten(),
+                                    )?,
+                                ));
                             }
                             let _ = this
                                 .delete_item_txn(conn, &table_info, &delete.key, None)
@@ -1127,7 +1187,7 @@ impl StorageProvider for TursoStorageProvider {
                         if let Some(update) = item.update {
                             let table_info = this.get_table_info(&update.table_name).await?;
                             let (operations, condition) = before_update_item(
-                                &update.update_expression,
+                                update.update_expression.as_str(),
                                 update.condition_expression.as_deref(),
                                 update.expression_attribute_names.as_ref(),
                                 update.expression_attribute_values.as_ref(),
@@ -1135,15 +1195,29 @@ impl StorageProvider for TursoStorageProvider {
                             let existing_item = this
                                 .get_item_map_by_key(conn, &table_info, &update.key)
                                 .await?;
-                            let item_to_update =
-                                existing_item.unwrap_or_else(|| update.key.to_attribute_map());
 
                             if let Some(condition) = condition.as_ref()
-                                && !evaluate_condition(&item_to_update, condition)
+                                && !evaluate_condition(
+                                    condition_item_ref(existing_item.as_ref()),
+                                    condition,
+                                )
                             {
-                                return Err(StorageEnum::ConditionalCheckFailed.into());
+                                return Err(transaction_canceled_for_reason(
+                                    index,
+                                    conditional_check_failed_reason(
+                                        all_old(
+                                            update
+                                                .return_values_on_condition_check_failure
+                                                .as_ref(),
+                                        )
+                                        .then_some(existing_item.as_ref())
+                                        .flatten(),
+                                    )?,
+                                ));
                             }
 
+                            let item_to_update =
+                                existing_item.unwrap_or_else(|| update.key.to_attribute_map());
                             let updated_item =
                                 apply_bound_update_operations(item_to_update, &operations)?;
                             let _ = this
@@ -1164,8 +1238,7 @@ impl StorageProvider for TursoStorageProvider {
                                 condition_check.expression_attribute_values.as_ref(),
                             )
                             .map_err(StorageError::validation)?;
-                            let condition_item = existing.clone().unwrap_or_default();
-                            if !evaluate_condition(&condition_item, &parsed) {
+                            if !evaluate_condition(condition_item_ref(existing.as_ref()), &parsed) {
                                 return Err(transaction_canceled_for_reason(
                                     index,
                                     conditional_check_failed_reason(
@@ -1184,10 +1257,17 @@ impl StorageProvider for TursoStorageProvider {
                     }
                     .await;
                     if let Err(error) = result {
-                        return Err(transaction_canceled_for_item_error_with_len(
-                            index, item_count, error,
-                        ));
+                        let error =
+                            transaction_canceled_for_item_error_with_len(index, item_count, error);
+                        let Some(reason) = transaction_cancellation_reason_at(&error, index) else {
+                            return Err(error);
+                        };
+                        cancellation_reasons[index] = Some(reason);
                     }
+                }
+                if let Some(error) = transaction_canceled_for_indexed_reasons(cancellation_reasons)
+                {
+                    return Err(error);
                 }
 
                 Ok(TransactWriteItemsResponse {
@@ -1203,7 +1283,22 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: storage_types::UpdateTableRequest,
     ) -> StorageResult<storage_types::UpdateTableResponse> {
-        let table_info = self.get_table_info(&request.table_name).await?;
+        let mut table_info = self.get_table_info(&request.table_name).await?;
+        if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
+            let conn = self.connect().await?;
+            let _ = self
+                .execute(
+                    &conn,
+                    sql_statements::update_deletion_protection(),
+                    vec![
+                        TursoValue::Integer(if deletion_protection_enabled { 1 } else { 0 }),
+                        TursoValue::Text(request.table_name.to_string()),
+                    ],
+                )
+                .await?;
+            self.invalidate_table_cache(&request.table_name).await;
+            table_info.deletion_protection_enabled = deletion_protection_enabled;
+        }
 
         Ok(storage_types::UpdateTableResponse {
             table_description: storage_types::TableDescription {
@@ -1245,6 +1340,7 @@ impl StorageProvider for TursoStorageProvider {
                 stream_specification: table_info.stream_specification,
                 latest_stream_arn: None,
                 latest_stream_label: None,
+                deletion_protection_enabled: table_info.deletion_protection_enabled,
             },
         })
     }
@@ -1260,8 +1356,9 @@ impl StorageProvider for TursoStorageProvider {
 
     async fn describe_time_to_live(
         &self,
-        _table_name: &TableName,
+        table_name: &TableName,
     ) -> StorageResult<storage_types::DescribeTimeToLiveResponse> {
+        let _ = self.get_table_info(table_name).await?;
         Ok(storage_types::DescribeTimeToLiveResponse {
             time_to_live_description: None,
         })

@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use bg_jobs::BackgroundJob;
 use serde::ser::SerializeMap as _;
 use storage_backfill::{GsiCatchupApplyCase, GsiCatchupOutcome, plan_gsi_catchup_apply};
-use storage_common::{GsiKeyPart, GsiWriteAction, plan_gsi_write_actions, ttl::is_ttl_index};
+use storage_common::{
+    GsiKeyPart, GsiWriteAction, observe_gsi_lag, plan_gsi_write_actions, ttl::is_ttl_index,
+};
 use storage_provider::StorageProvider as _;
 use storage_types::{
     AttributeValue, IndexName, ItemStreamVersion, KeyAttributes, Projection, ProjectionType,
@@ -155,6 +157,24 @@ fn should_log_job(last_log_ms: &AtomicU64, now_ms: u64, interval_ms: u64) -> boo
 }
 
 impl SQLiteStorageProvider {
+    async fn refresh_gsi_update_lag(
+        &self,
+        stream_name: &StreamName,
+        cursor_position: Option<StreamItemId>,
+    ) -> StorageResult<()> {
+        let page = self
+            .read_forward(stream_name.clone(), cursor_position, 1)
+            .await
+            .map_err(|e| StorageError::internal(&e.to_string()))?;
+        let now_ms = now_ms_u64();
+        observe_gsi_lag(
+            &self.gsi_propagation_governor,
+            page.items.first().map(|item| item.created_at),
+            now_ms,
+        );
+        Ok(())
+    }
+
     pub(crate) fn apply_immediate_gsi_updates(
         txn: &rusqlite::Connection,
         table_info: &StoredTableInfo,
@@ -553,6 +573,8 @@ impl SQLiteStorageProvider {
         let stream_name: StreamName = StreamName::system_table_stream();
 
         let mut cursor_position = self.ensure_gsi_cursor(&stream_name, &cursor_name).await?;
+        self.refresh_gsi_update_lag(&stream_name, cursor_position)
+            .await?;
 
         let mut table_infos: HashMap<TableName, Arc<GsiUpdateTableInfo>> = HashMap::new();
 
@@ -561,6 +583,8 @@ impl SQLiteStorageProvider {
                 .fetch_pointer_batch(&stream_name, cursor_position)
                 .await?
             else {
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
+                    .await?;
                 break;
             };
 
@@ -574,7 +598,10 @@ impl SQLiteStorageProvider {
                 .await;
             if batch_records.is_empty() {
                 run.record_empty();
-                self.advance_cursor_if(&stream_name, &cursor_name, last_item, &mut cursor_advanced)
+                cursor_position = self
+                    .advance_cursor_if(&stream_name, &cursor_name, last_item, &mut cursor_advanced)
+                    .await?;
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
                     .await?;
                 break;
             }
@@ -584,7 +611,10 @@ impl SQLiteStorageProvider {
             let batch_operations = apply_stats.total_ops();
             if batch_operations == 0 {
                 run.record_empty();
-                self.advance_cursor_if(&stream_name, &cursor_name, last_item, &mut cursor_advanced)
+                cursor_position = self
+                    .advance_cursor_if(&stream_name, &cursor_name, last_item, &mut cursor_advanced)
+                    .await?;
+                self.refresh_gsi_update_lag(&stream_name, cursor_position)
                     .await?;
                 break;
             }
@@ -592,6 +622,8 @@ impl SQLiteStorageProvider {
             run.record_ops(batch_operations);
             cursor_position = self
                 .advance_cursor_if(&stream_name, &cursor_name, last_item, &mut cursor_advanced)
+                .await?;
+            self.refresh_gsi_update_lag(&stream_name, cursor_position)
                 .await?;
             if cursor_position.is_none() {
                 break 'outer;
@@ -1272,18 +1304,44 @@ impl BackgroundJob for GsiBackfillJob {
 
 pub struct GsiUpdateJob {
     provider: std::sync::Arc<SQLiteStorageProvider>,
+    run_budget: std::time::Duration,
 }
 
 impl GsiUpdateJob {
+    #[cfg(test)]
     pub fn new(provider: std::sync::Arc<SQLiteStorageProvider>) -> Self {
-        Self { provider }
+        Self::new_with_interval(
+            provider,
+            storage_common::GsiJobConfig::default().update_interval_ms,
+        )
+    }
+
+    pub fn new_with_interval(
+        provider: std::sync::Arc<SQLiteStorageProvider>,
+        interval_ms: storage_common::JobIntervalMillis,
+    ) -> Self {
+        Self {
+            provider,
+            run_budget: std::time::Duration::from_millis(interval_ms.0.saturating_mul(95) / 100),
+        }
     }
 }
 
 #[async_trait]
 impl BackgroundJob for GsiUpdateJob {
     async fn execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let work_done = self.provider.process_gsi_updates().await?;
+        let mut work_done = false;
+        let started = std::time::Instant::now();
+        loop {
+            let progressed = self.provider.process_gsi_updates().await?;
+            work_done |= progressed;
+            if !progressed
+                || !self.provider.gsi_propagation_governor.lag_above_target()
+                || started.elapsed() >= self.run_budget
+            {
+                break;
+            }
+        }
         Ok(work_done)
     }
 }

@@ -29,6 +29,10 @@ pub struct ErrorResponse {
     /// DynamoDB transaction cancellation reasons.
     #[schema(nullable = true)]
     pub cancellation_reasons: Option<Vec<DynamoDbCancellationReason>>,
+    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+    /// DynamoDB item returned by ReturnValuesOnConditionCheckFailure.
+    #[schema(nullable = true)]
+    pub item: Option<AttributeMap>,
     #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
     /// DynamoDB transaction cancellation message field.
     #[schema(nullable = true)]
@@ -68,6 +72,7 @@ pub trait IntoApiError {
             message: self.error_message().into_owned(),
             transaction_message: None,
             cancellation_reasons: None,
+            item: None,
             request_id: None,
             documentation_url: None,
             retry_after_seconds: None,
@@ -154,6 +159,7 @@ pub struct HttpApiError {
     pub message: String,
     pub status_code: u16,
     pub cancellation_reasons: Option<Vec<DynamoDbCancellationReason>>,
+    pub item: Option<Box<AttributeMap>>,
     pub response_headers: Vec<(String, String)>,
 }
 
@@ -164,6 +170,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 400,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -174,6 +181,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 500,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -184,6 +192,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 400,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -194,6 +203,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 400,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -204,6 +214,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 429,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -214,6 +225,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 401,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -224,6 +236,7 @@ impl HttpApiError {
             message: message.into(),
             status_code: 403,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -238,6 +251,7 @@ impl HttpApiError {
             message: message.into(),
             status_code,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -264,6 +278,7 @@ impl HttpApiError {
             message: message.into(),
             status_code,
             cancellation_reasons: None,
+            item: None,
             response_headers: Vec::new(),
         }
     }
@@ -275,6 +290,12 @@ impl HttpApiError {
         value: impl Into<String>,
     ) -> Self {
         self.response_headers.push((name.into(), value.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_item(mut self, item: AttributeMap) -> Self {
+        self.item = Some(Box::new(item));
         self
     }
 }
@@ -320,6 +341,12 @@ impl From<StorageError> for HttpApiError {
                 dynamodb_validation_message(message),
                 400,
             ),
+            StorageEnum::RawValidation { message } => {
+                Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
+            }
+            StorageEnum::DeletionProtectionEnabled { message, .. } => {
+                Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
+            }
 
             StorageEnum::InternalServerError { message } => {
                 Self::dynamodb_protocol_error("InternalServerError", message.clone(), 500)
@@ -339,6 +366,12 @@ impl From<StorageError> for HttpApiError {
                 DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
                 400,
             ),
+            StorageEnum::ConditionalCheckFailedWithItem { item } => Self::dynamodb_protocol_error(
+                "ConditionalCheckFailedException",
+                DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
+                400,
+            )
+            .with_item(item.clone()),
             StorageEnum::IndexNotFound { .. } => Self::dynamodb_protocol_error(
                 "ResourceNotFoundException",
                 DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
@@ -409,6 +442,7 @@ impl From<StorageError> for HttpApiError {
                 message: message.clone(),
                 status_code: 500,
                 cancellation_reasons: None,
+                item: None,
                 response_headers: Vec::new(),
             },
         }
@@ -429,6 +463,11 @@ fn dynamodb_full_error_type(error_type: &str) -> String {
 }
 
 fn dynamodb_validation_message(message: &str) -> String {
+    if message == "The parameter cannot be converted to a numeric value" {
+        return "1 validation error detected: The parameter cannot be converted to a numeric \
+                value: "
+            .to_string();
+    }
     if message.starts_with("1 validation error detected:")
         || message.starts_with("One or more parameter values were invalid:")
         || message == "The provided key element does not match the schema"
@@ -438,6 +477,11 @@ fn dynamodb_validation_message(message: &str) -> String {
     }
 
     if message.starts_with("Invalid UpdateExpression:")
+        || message.starts_with("Invalid ConditionExpression:")
+        || message == "Attempting to store more than 38 significant digits in a Number"
+        || message
+            == "Number underflow. Attempting to store a number with magnitude smaller than \
+                supported range"
         || message.starts_with("Value provided in ExpressionAttributeValues unused in expressions:")
         || message.starts_with("Value provided in ExpressionAttributeNames unused in expressions:")
     {
@@ -470,6 +514,7 @@ impl From<HttpApiError> for (axum::http::StatusCode, axum::response::Json<ErrorR
             },
             transaction_message: error.cancellation_reasons.as_ref().map(|_| error.message),
             cancellation_reasons: error.cancellation_reasons,
+            item: error.item.map(|item| *item),
             ..Default::default()
         };
 

@@ -37,7 +37,8 @@ use super::{
 use crate::{
     backends::common::{
         KvMutation, RangeKeyDecision, RangeScanSettings, operation_requires_stream_entries,
-        plan_table_write, plan_transact_operation, table_operation_primary_key,
+        plan_table_write_preflighted, plan_transact_operation, preflight_table_write_operations,
+        table_operation_primary_key,
     },
     constants::FOUNDATIONDB_GET_READ_VERSION_LATENCY_MS_METRIC,
     helpers::increment_bytes,
@@ -1183,6 +1184,7 @@ impl FoundationDbKvStore {
         prefix: Option<&Vec<u8>>,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<FdbTableWriteExecution> {
+        preflight_table_write_operations(operations)?;
         let read_started = Instant::now();
         let current_reads = operations
             .iter()
@@ -1210,7 +1212,7 @@ impl FoundationDbKvStore {
         );
 
         let plan_started = Instant::now();
-        let plan = plan_table_write(
+        let plan = plan_table_write_preflighted(
             operations,
             current_values,
             stream_ids,

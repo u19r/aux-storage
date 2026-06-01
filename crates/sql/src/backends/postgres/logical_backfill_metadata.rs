@@ -43,6 +43,10 @@ pub(super) async fn import_table_metadata_record(
     )
     .with_global_secondary_indexes(gsis)
     .with_stream_specification(table_info.stream_specification);
+    let request = CreateTableRequest {
+        deletion_protection_enabled: Some(table_info.deletion_protection_enabled),
+        ..request
+    };
     provider.create_table(&request).await
 }
 

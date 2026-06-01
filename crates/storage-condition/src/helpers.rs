@@ -19,12 +19,3 @@ pub(crate) fn attribute_value_scalar_to_string(value: &AttributeValue) -> String
         AttributeValue::M(v) => serde_json::to_string(v).unwrap_or_default(),
     }
 }
-
-pub(crate) fn attribute_value_list_to_strings(value: &AttributeValue) -> Vec<String> {
-    match value {
-        AttributeValue::SS(v) | AttributeValue::NS(v) | AttributeValue::BS(v) => v.clone(),
-        AttributeValue::L(v) => v.iter().map(attribute_value_scalar_to_string).collect(),
-        // Fallback to single scalar
-        _ => vec![attribute_value_scalar_to_string(value)],
-    }
-}

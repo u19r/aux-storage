@@ -39,6 +39,7 @@ fn queue_postgres_builder_preserves_pool_and_tls_settings() {
     let config = postgres_queue_provider_config(&PostgresBackendConfig {
         dsn: "postgres://localhost/queue".to_string(),
         max_pool_size: 8,
+        background_max_pool_size: 2,
         tls: false,
         immediate_gsi_consistency: false,
     });

@@ -147,6 +147,7 @@ fn postgres_backend_propagates_pool_tls_and_consistency_settings_without_connect
         postgres: Some(config::PostgresBackendConfig {
             dsn: "postgres://localhost/aux_storage".to_string(),
             max_pool_size: 7,
+            background_max_pool_size: 2,
             tls: false,
             immediate_gsi_consistency: true,
         }),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -13,6 +13,8 @@ use storage::DatabaseManager;
 use storage_types::StorageError;
 
 use crate::{constants, types::AppState};
+
+const DYNAMODB_JSON_BODY_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MetricsEndpointConfig {
@@ -65,6 +67,7 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/health", get(health_status))
         .route("/", post(crate::routes::dynamodb::dynamodb_endpoint))
         .with_state(app_state)
+        .layer(DefaultBodyLimit::max(DYNAMODB_JSON_BODY_LIMIT_BYTES))
 }
 
 pub fn server_router(app_state: Arc<AppState>, enable_internal_helper_routes: bool) -> Router {
@@ -138,6 +141,7 @@ pub fn server_router_with_metrics_and_routes(
     } else {
         router
     }
+    .layer(DefaultBodyLimit::max(DYNAMODB_JSON_BODY_LIMIT_BYTES))
 }
 
 fn prometheus_metrics_router(config: PrometheusMetricsEndpointConfig) -> Router {

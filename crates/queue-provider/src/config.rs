@@ -24,6 +24,7 @@ pub enum QueueBackend {
 pub struct PostgresSettings {
     pub dsn: String,
     pub max_pool_size: usize,
+    pub background_max_pool_size: usize,
     pub tls: bool,
 }
 
@@ -31,10 +32,17 @@ impl Default for PostgresSettings {
     fn default() -> Self {
         Self {
             dsn: String::new(),
-            max_pool_size: 16,
+            max_pool_size: default_postgres_max_pool_size(),
+            background_max_pool_size: 4,
             tls: true,
         }
     }
+}
+
+fn default_postgres_max_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map_or(20, |cores| usize::from(cores) + 8)
+        .max(20)
 }
 
 #[derive(Debug, Clone, Default)]

@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use crate::{
     AttributeValue, CreateGlobalSecondaryIndex, IndexName, KeyAttributes, KeySchemaElement,
@@ -46,17 +49,6 @@ pub fn validate_attribute_name(name: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_expression_size(expression: Option<&str>, field: &str) -> Result<(), String> {
-    if let Some(expression) = expression
-        && expression.len() > MAX_EXPRESSION_BYTES
-    {
-        return Err(format!(
-            "{field} cannot exceed {MAX_EXPRESSION_BYTES} bytes"
-        ));
-    }
-    Ok(())
-}
-
 pub fn validate_item(item: &HashMap<String, AttributeValue>, field: &str) -> Result<(), String> {
     let mut size = 0;
     for (name, value) in item {
@@ -75,6 +67,27 @@ pub fn validate_attribute_value_for_write(
     field: &str,
 ) -> Result<(), String> {
     validate_attribute_value(value, 0, field)
+}
+
+pub fn normalize_dynamodb_number_for_write(value: &str) -> Cow<'_, str> {
+    expand_scientific_number(value).map_or(Cow::Borrowed(value), Cow::Owned)
+}
+
+pub fn normalize_attribute_map_numbers_for_write(
+    item: &mut HashMap<String, AttributeValue>,
+) -> bool {
+    let mut changed = false;
+    for value in item.values_mut() {
+        changed |= normalize_attribute_value_numbers_for_write(value);
+    }
+    changed
+}
+
+pub fn attribute_map_numbers_need_write_normalization(
+    item: &HashMap<String, AttributeValue>,
+) -> bool {
+    item.values()
+        .any(attribute_value_numbers_need_write_normalization)
 }
 
 pub fn validate_transaction_request_size(
@@ -100,7 +113,7 @@ pub fn validate_key_attributes_for_schema(
         let value = key
             .get(&element.attribute_name)
             .ok_or_else(StorageError::invalid_or_missing_key)?;
-        validate_key_value_size(element, value)?;
+        validate_key_attribute_value_for_schema(element, value)?;
     }
     Ok(())
 }
@@ -113,9 +126,16 @@ pub fn validate_item_key_attributes_for_schema(
         let value = item
             .get(&element.attribute_name)
             .ok_or_else(StorageError::invalid_or_missing_key)?;
-        validate_key_value_size(element, value)?;
+        validate_key_attribute_value_for_schema(element, value)?;
     }
     Ok(())
+}
+
+pub fn validate_key_attribute_value_for_schema(
+    element: &KeySchemaElement,
+    value: &AttributeValue,
+) -> Result<(), StorageError> {
+    validate_key_value_size(element, value)
 }
 
 pub fn validate_projected_attribute_limit(
@@ -145,6 +165,9 @@ fn validate_key_value_size(
     element: &KeySchemaElement,
     value: &AttributeValue,
 ) -> Result<(), StorageError> {
+    if let AttributeValue::N(value) = value {
+        validate_number(value).map_err(StorageError::validation)?;
+    }
     let size = key_value_size(value).map_err(StorageError::validation)?;
     if size == 0 {
         let value_type = match value {
@@ -208,6 +231,7 @@ fn validate_attribute_value(
     }
     match value {
         AttributeValue::SS(values) => validate_string_set(values)?,
+        AttributeValue::N(value) => validate_number(value)?,
         AttributeValue::NS(values) => validate_number_set(values)?,
         AttributeValue::BS(values) => validate_binary_set(values)?,
         AttributeValue::L(values) => {
@@ -251,6 +275,7 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
     }
     let mut seen = HashSet::with_capacity(values.len());
     for value in values {
+        validate_number(value)?;
         let key = canonical_number_set_member(value);
         if !seen.insert(key) {
             return Err(
@@ -260,6 +285,244 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_number(value: &str) -> Result<(), String> {
+    let parsed = parse_dynamodb_number(value)?;
+    if parsed.significant_digits > 38 {
+        return Err("Attempting to store more than 38 significant digits in a Number".to_string());
+    }
+    if !parsed.is_zero && parsed.adjusted_exponent < -130 {
+        return Err(
+            "Number underflow. Attempting to store a number with magnitude smaller than supported \
+             range"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bool {
+    match value {
+        AttributeValue::N(number) => match normalize_dynamodb_number_for_write(number) {
+            Cow::Borrowed(_) => false,
+            Cow::Owned(normalized) => {
+                *number = normalized;
+                true
+            }
+        },
+        AttributeValue::NS(values) => {
+            let mut changed = false;
+            for number in values {
+                if let Cow::Owned(normalized) = normalize_dynamodb_number_for_write(number) {
+                    *number = normalized;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        AttributeValue::L(values) => values
+            .iter_mut()
+            .any(normalize_attribute_value_numbers_for_write),
+        AttributeValue::M(values) => normalize_attribute_map_numbers_for_write(values),
+        _ => false,
+    }
+}
+
+fn attribute_value_numbers_need_write_normalization(value: &AttributeValue) -> bool {
+    match value {
+        AttributeValue::N(number) => number.contains(['e', 'E']),
+        AttributeValue::NS(values) => values.iter().any(|number| number.contains(['e', 'E'])),
+        AttributeValue::L(values) => values
+            .iter()
+            .any(attribute_value_numbers_need_write_normalization),
+        AttributeValue::M(values) => attribute_map_numbers_need_write_normalization(values),
+        _ => false,
+    }
+}
+
+fn expand_scientific_number(value: &str) -> Option<String> {
+    let (mantissa, exponent) = value.split_once(['e', 'E'])?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.trim_start_matches(['+', '-']);
+    let mut digits = String::new();
+    let mut fractional_digits = 0i32;
+    let mut after_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                if after_decimal {
+                    fractional_digits += 1;
+                }
+            }
+            '.' if !after_decimal => after_decimal = true,
+            _ => return None,
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+
+    let decimal_position = digits.len() as i32 - fractional_digits + exponent;
+    let expanded = if decimal_position <= 0 {
+        format!(
+            "0.{}{}",
+            "0".repeat(decimal_position.unsigned_abs() as usize),
+            digits
+        )
+    } else if decimal_position as usize >= digits.len() {
+        format!(
+            "{}{}",
+            digits,
+            "0".repeat(decimal_position as usize - digits.len())
+        )
+    } else {
+        let split = decimal_position as usize;
+        let (integer, fractional) = digits.split_at(split);
+        format!("{integer}.{fractional}")
+    };
+
+    if negative && expanded != "0" {
+        Some(format!("-{expanded}"))
+    } else {
+        Some(expanded)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedDynamoNumber {
+    significant_digits: usize,
+    adjusted_exponent: i32,
+    is_zero: bool,
+}
+
+fn parse_dynamodb_number(value: &str) -> Result<ParsedDynamoNumber, String> {
+    if value.is_empty() {
+        return Err("The parameter cannot be converted to a numeric value".to_string());
+    }
+
+    let bytes = value.as_bytes();
+    let mut index = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let mut integer_digits = 0usize;
+    let mut fractional_digits = 0usize;
+    let mut significant_digits = 0usize;
+    let mut first_significant_position = None;
+    let mut last_significant_position = None;
+    let mut saw_digit = false;
+
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                let digit = byte - b'0';
+                if digit != 0 || first_significant_position.is_some() {
+                    first_significant_position.get_or_insert(integer_digits);
+                    last_significant_position = Some(integer_digits);
+                    significant_digits += 1;
+                }
+                integer_digits += 1;
+                index += 1;
+            }
+            b'.' => {
+                index += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                let digit = byte - b'0';
+                if digit != 0 || first_significant_position.is_some() {
+                    first_significant_position.get_or_insert(integer_digits);
+                    last_significant_position = Some(integer_digits);
+                    significant_digits += 1;
+                }
+                integer_digits += 1;
+                fractional_digits += 1;
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    if !saw_digit {
+        return Err("The parameter cannot be converted to a numeric value".to_string());
+    }
+
+    let mut exponent = 0i32;
+    if matches!(bytes.get(index), Some(b'e') | Some(b'E')) {
+        index += 1;
+        let exponent_sign = match bytes.get(index) {
+            Some(b'+') => {
+                index += 1;
+                1
+            }
+            Some(b'-') => {
+                index += 1;
+                -1
+            }
+            _ => 1,
+        };
+        let exponent_start = index;
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            index += 1;
+        }
+        if exponent_start == index {
+            return Err("The parameter cannot be converted to a numeric value".to_string());
+        }
+        exponent = value
+            .get(exponent_start..index)
+            .ok_or_else(|| "The parameter cannot be converted to a numeric value".to_string())?
+            .parse::<i32>()
+            .map_err(|_| "The parameter cannot be converted to a numeric value".to_string())?
+            * exponent_sign;
+    }
+
+    if index != bytes.len() {
+        return Err("The parameter cannot be converted to a numeric value".to_string());
+    }
+
+    let Some(last_significant_position) = last_significant_position else {
+        return Ok(ParsedDynamoNumber {
+            significant_digits: 1,
+            adjusted_exponent: 0,
+            is_zero: true,
+        });
+    };
+
+    significant_digits -= trailing_zero_count(value, last_significant_position);
+    let adjusted_exponent = last_significant_position as i32 - fractional_digits as i32 + exponent;
+    Ok(ParsedDynamoNumber {
+        significant_digits,
+        adjusted_exponent,
+        is_zero: false,
+    })
+}
+
+fn trailing_zero_count(value: &str, last_significant_position: usize) -> usize {
+    let mut position = 0usize;
+    let mut trailing_zeroes = 0usize;
+    for byte in value.bytes() {
+        match byte {
+            b'0' if position <= last_significant_position => {
+                trailing_zeroes += 1;
+                position += 1;
+            }
+            b'1'..=b'9' if position <= last_significant_position => {
+                trailing_zeroes = 0;
+                position += 1;
+            }
+            b'.' | b'+' | b'-' => {}
+            _ => break,
+        }
+    }
+    trailing_zeroes
 }
 
 fn validate_binary_set(values: &[String]) -> Result<(), String> {

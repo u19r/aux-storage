@@ -68,6 +68,7 @@ fn table_info() -> GsiUpdateTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
     GsiUpdateTableInfo::from(stored)
 }
@@ -316,7 +317,12 @@ fn measure_backfill_item_plan(
 }
 
 #[test]
-fn sqlite_gsi_attributes_blob_avoids_temporary_hashmap_tests() {
+fn sqlite_process_gsi_updates_allocation_profile_tests() {
+    assert_sqlite_gsi_attributes_blob_avoids_temporary_hashmap();
+    assert_sqlite_gsi_backfill_item_plan_avoids_temporary_hashmaps();
+}
+
+fn assert_sqlite_gsi_attributes_blob_avoids_temporary_hashmap() {
     let legacy = measure_attributes_blob(
         "sqlite_gsi_attributes_blob_legacy_hashmap",
         legacy_build_attributes_blob,
@@ -333,8 +339,7 @@ fn sqlite_gsi_attributes_blob_avoids_temporary_hashmap_tests() {
     assert!(optimized.allocated_bytes < legacy.allocated_bytes);
 }
 
-#[test]
-fn sqlite_gsi_backfill_item_plan_avoids_temporary_hashmaps_tests() {
+fn assert_sqlite_gsi_backfill_item_plan_avoids_temporary_hashmaps() {
     let legacy = measure_backfill_item_plan(
         "sqlite_gsi_backfill_item_plan_legacy_hashmaps",
         legacy_backfill_item_plan,

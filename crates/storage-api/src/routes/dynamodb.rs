@@ -8,20 +8,21 @@ use axum::{
 };
 use http_error::{ErrorResponse, HttpApiError};
 use storage_types::{
-    BatchGetItemRequest, DeleteItemRequest, DescribeTimeToLiveRequest, DynamoRequestValidate,
-    GetItemRequest, PutItemRequest, QueryRequest, TransactGetItemsRequest,
-    TransactWriteItemsRequest, UpdateItemRequest, UpdateTimeToLiveRequest,
+    BatchGetItemRequest, DeleteItemRequest, DescribeStreamRequest, DescribeTimeToLiveRequest,
+    DynamoRequestValidate, GetRecordsRequest, GetShardIteratorRequest, ListStreamsRequest,
+    QueryRequest, TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
+    UpdateTimeToLiveRequest,
 };
 
 use crate::{
     errors::validation_error,
     routes::dynamodb_metrics::{
-        DynamoRouteTimer, status_label_for_manager, status_label_for_parse,
+        DynamoRouteTimer, dynamodb_operation_label, status_label_for_manager,
+        status_label_for_parse,
     },
     types::{AppState, Response as ApiResponse, UpdateContinuousBackupsRequest},
 };
 
-const UNKNOWN_OPERATION: &str = "unknown";
 pub(super) const SUCCESS_STATUS: &str = "success";
 pub(super) const ERROR_STATUS: &str = "error";
 pub(super) const JSON_DECODE_STAGE: &str = "json_decode";
@@ -111,7 +112,8 @@ pub async fn dynamodb_endpoint(
         .get("x-amz-target")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let timer = DynamoRouteTimer::new(dynamodb_operation_label(target));
+    let operation = dynamodb_operation_label(target);
+    let timer = DynamoRouteTimer::new(operation);
     let result = execute_dynamodb_operation(app_state, target, &body, &timer).await;
     timer.record_request(status_label(&result));
     result
@@ -140,12 +142,10 @@ async fn execute_dynamodb_operation(
             execute_try_into_operation!(body, timer, |request| manager.describe_table(request))
         }
         "DynamoDB_20120810.PutItem" => {
-            execute_validated_json_operation!(body, timer, PutItemRequest, |request| manager
-                .put_item(request))
+            execute_try_into_operation!(body, timer, |request| manager.put_item(request))
         }
         "DynamoDB_20120810.GetItem" => {
-            execute_validated_json_operation!(body, timer, GetItemRequest, |request| manager
-                .get_item(request))
+            execute_try_into_operation!(body, timer, |request| manager.get_item(request))
         }
         "DynamoDB_20120810.DeleteItem" => {
             execute_validated_json_operation!(body, timer, DeleteItemRequest, |request| manager
@@ -191,6 +191,26 @@ async fn execute_dynamodb_operation(
                 manager.get_stream_records(request)
             })
         }
+        "DynamoDBStreams_20120810.ListStreams" => {
+            execute_try_into_operation!(body, timer, |request: ListStreamsRequest| {
+                manager.list_streams(request)
+            })
+        }
+        "DynamoDBStreams_20120810.DescribeStream" => {
+            execute_try_into_operation!(body, timer, |request: DescribeStreamRequest| {
+                manager.describe_stream(request)
+            })
+        }
+        "DynamoDBStreams_20120810.GetShardIterator" => {
+            execute_try_into_operation!(body, timer, |request: GetShardIteratorRequest| {
+                manager.get_shard_iterator(request)
+            })
+        }
+        "DynamoDBStreams_20120810.GetRecords" => {
+            execute_try_into_operation!(body, timer, |request: GetRecordsRequest| {
+                manager.get_records(request)
+            })
+        }
         "DynamoDB_20120810.DescribeTimeToLive" => {
             execute_json_operation!(body, timer, DescribeTimeToLiveRequest, |request| manager
                 .describe_time_to_live(request))
@@ -220,6 +240,12 @@ where
     let started = Instant::now();
     let result = future.await;
     timer.record_stage(MANAGER_STAGE, status_label_for_manager(&result), started);
+    if let Err(error) = &result {
+        tracing::warn!(
+            error = ?error,
+            "dynamodb manager operation failed before protocol mapping"
+        );
+    }
     result.map_err(http_api_error_to_dynamo_error)
 }
 
@@ -283,28 +309,6 @@ fn status_label(result: &Result<AxumResponse, DynamoError>) -> &'static str {
     } else {
         ERROR_STATUS
     }
-}
-
-fn dynamodb_operation_label(target: &str) -> String {
-    target
-        .strip_prefix("DynamoDB_20120810.")
-        .map(snake_case_operation)
-        .unwrap_or_else(|| UNKNOWN_OPERATION.to_string())
-}
-
-fn snake_case_operation(operation: &str) -> String {
-    let mut label = String::with_capacity(operation.len());
-    for (idx, character) in operation.chars().enumerate() {
-        if character.is_ascii_uppercase() {
-            if idx > 0 {
-                label.push('_');
-            }
-            label.push(character.to_ascii_lowercase());
-        } else {
-            label.push(character);
-        }
-    }
-    label
 }
 
 #[expect(
@@ -372,6 +376,10 @@ pub(super) fn response_to_http(response: ApiResponse) -> AxumResponse {
         ApiResponse::UpdateTable(resp) => json_response(resp),
         ApiResponse::UpdateTimeToLive(resp) => json_response(resp),
         ApiResponse::GetStreamRecords(resp) => json_response(resp),
+        ApiResponse::ListStreams(resp) => json_response(resp),
+        ApiResponse::DescribeStream(resp) => json_response(resp),
+        ApiResponse::GetShardIterator(resp) => json_response(resp),
+        ApiResponse::GetRecords(resp) => json_response(resp),
         ApiResponse::ReplicationApply(resp) => json_response(resp),
         ApiResponse::ReplicationHeartbeat(resp) => json_response(resp),
         ApiResponse::ReplicationHealth(resp) => json_response(resp),

@@ -61,6 +61,7 @@ pub struct SortedKvDbStorageProvider<S: SortedKvStore> {
     pub(crate) job_manager: JobManager,
     pub(crate) database_jobs_enabled: bool,
     pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) gsi_propagation_governor: Arc<storage_common::GsiPropagationGovernor>,
 }
 
 impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
@@ -91,6 +92,7 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
             job_manager: JobManager::new_for_test(),
             database_jobs_enabled: true,
             immediate_gsi_consistency: false,
+            gsi_propagation_governor: Arc::new(storage_common::GsiPropagationGovernor::default()),
         }
     }
 

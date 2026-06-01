@@ -98,6 +98,7 @@ fn round_trip_pagination_token() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     // Generate last evaluated key
@@ -168,6 +169,7 @@ fn key_consistency_across_methods() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     let item = HashMap::from([
@@ -195,6 +197,73 @@ fn version_and_flags() {
     let prefix = u16::from_be_bytes([parts[0], parts[1]]);
     let version_and_flags = prefix & 0x3F; // Lower 6 bits
     assert_eq!(version_and_flags, 0); // Version 00, flags 0000
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_number_key_encoding_accepts_dynamodb_number_boundaries() {
+    for number in [
+        "99999999999999999999999999999999999999",
+        "1E-130",
+        "-1E-130",
+    ] {
+        let encoded =
+            ItemKey::serialize_attribute_value_to_bytes(&AttributeValue::N(number.to_string()))
+                .expect("valid DynamoDB number key should encode");
+
+        assert_eq!(encoded.len(), 41);
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_number_key_encoding_orders_dynamodb_numbers_numerically() {
+    let numbers = [
+        "-99999999999999999999999999999999999999",
+        "-100",
+        "-2",
+        "-1E-130",
+        "0",
+        "1E-130",
+        "2",
+        "10",
+        "99999999999999999999999999999999999999",
+    ];
+
+    let mut encoded = numbers
+        .iter()
+        .map(|number| {
+            (
+                ItemKey::serialize_attribute_value_to_bytes(&AttributeValue::N(
+                    (*number).to_string(),
+                ))
+                .expect("valid DynamoDB number key should encode"),
+                *number,
+            )
+        })
+        .collect::<Vec<_>>();
+    encoded.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let sorted_numbers = encoded
+        .into_iter()
+        .map(|(_, number)| number)
+        .collect::<Vec<_>>();
+    assert_eq!(sorted_numbers, numbers);
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_number_key_encoding_normalizes_equivalent_numbers() {
+    let canonical =
+        ItemKey::serialize_attribute_value_to_bytes(&AttributeValue::N("1".to_string()))
+            .expect("number key should encode");
+
+    for equivalent in ["1.0", "01E0", "+1.0000E+0"] {
+        let encoded =
+            ItemKey::serialize_attribute_value_to_bytes(&AttributeValue::N(equivalent.to_string()))
+                .expect("equivalent number key should encode");
+        assert_eq!(encoded, canonical);
+    }
 }
 
 #[test]
@@ -241,6 +310,7 @@ fn gsi_round_trip_hash_only() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     let last_item = HashMap::from([
@@ -346,6 +416,7 @@ fn gsi_round_trip_with_gsi_range() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     let last_item = HashMap::from([
@@ -458,6 +529,7 @@ fn gsi_round_trip_all_keys() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
 
     let last_item = HashMap::from([
@@ -551,6 +623,7 @@ fn gsi_invalid_token_parts() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     };
     let empty_token = URL_SAFE.encode([]);
     let result = ItemKey::item_key_from_next_page_token(

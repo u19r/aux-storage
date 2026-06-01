@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-#[cfg(test)]
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use deadpool_postgres::GenericClient;
 #[cfg(test)]
@@ -51,12 +49,12 @@ impl PostgresStorageProvider {
             return Ok(cached.config());
         }
 
-        #[cfg(test)]
         let started = Instant::now();
         let row = client
             .query_opt(sql_statements::get_ttl_config(), &[&table_name.as_ref()])
             .await
             .map_err(|err| Self::map_postgres_error("load ttl config", err))?;
+        self.record_transaction_phase("batch_write_item", "ttl_config_query", started.elapsed());
         #[cfg(test)]
         provider_perf::record("postgres", "ttl_config_db_lookup", started.elapsed());
         let Some(row) = row else {
@@ -278,6 +276,7 @@ impl PostgresStorageProvider {
 
         let ttl_table_name = physical_names::physical_ttl_index_table_name(&table_info.table_name);
         if let Some((ttl_value, key_token)) = old_entry {
+            let started = Instant::now();
             client
                 .execute(
                     &sql_statements::delete_ttl_index_row(&ttl_table_name),
@@ -285,8 +284,10 @@ impl PostgresStorageProvider {
                 )
                 .await
                 .map_err(|err| Self::map_postgres_error("delete ttl index row", err))?;
+            self.record_transaction_phase("batch_write_item", "ttl_delete", started.elapsed());
         }
         if let Some((ttl_value, key_token)) = new_entry {
+            let started = Instant::now();
             client
                 .execute(
                     &sql_statements::insert_ttl_index_row(&ttl_table_name),
@@ -294,6 +295,7 @@ impl PostgresStorageProvider {
                 )
                 .await
                 .map_err(|err| Self::map_postgres_error("upsert ttl index row", err))?;
+            self.record_transaction_phase("batch_write_item", "ttl_insert", started.elapsed());
         }
         Ok(())
     }

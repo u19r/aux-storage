@@ -250,9 +250,10 @@ async fn create_postgres_provider()
         .unwrap_or_else(default_postgres_test_dsn);
 
     println!("put_item_probe provider=postgres setup=connect");
-    let provider = PostgresStorageProvider::new_with_tls(&dsn, CONCURRENT_WORKERS as usize, false)
-        .await?
-        .with_immediate_gsi_consistency(true);
+    let provider =
+        PostgresStorageProvider::new_with_tls(&dsn, CONCURRENT_WORKERS as usize, 4, false)
+            .await?
+            .with_immediate_gsi_consistency(true);
     println!("put_item_probe provider=postgres setup=initialize_storage");
     provider.initialize_storage().await?;
     let uuid_text = uuid::Uuid::now_v7().to_string();
@@ -617,7 +618,7 @@ where
             ),
         ])
         .into(),
-        update_expression: "SET payload = :payload, gsi0pk = :gsi0pk".to_string(),
+        update_expression: Some("SET payload = :payload, gsi0pk = :gsi0pk".to_string()),
         attribute_updates: None,
         condition_expression: None,
         expression_attribute_names: None,

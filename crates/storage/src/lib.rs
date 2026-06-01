@@ -32,13 +32,14 @@ pub use kv::{foundationdb_operation_metrics_reset, foundationdb_operation_metric
 
 mod builder;
 pub mod cache;
+#[cfg(feature = "cache-write-planner")]
+pub(crate) use cache::write_planner as cache_write_planner;
 pub(crate) use cache::{
     batch_get_runtime as cache_batch_get_runtime, coordinator as cache_coordinator,
     point_read as point_read_cache, point_read_runtime as cache_point_read_runtime,
     point_read_store as point_read_cache_store, point_read_types as point_read_cache_types,
     query_proof as query_proof_cache, query_proof_request, query_proof_store, query_proof_types,
     query_runtime as cache_query_runtime, read_observability as cache_read_observability,
-    write_planner as cache_write_planner,
 };
 pub use cache_coordinator::StorageAuthoritativeCacheOptions;
 pub use cache_read_observability::{StorageCacheReadDiagnostics, storage_cache_read_diagnostics};

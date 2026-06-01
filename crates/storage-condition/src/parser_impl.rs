@@ -2,19 +2,16 @@ use std::collections::HashMap;
 
 use storage_types::AttributeValue;
 
-use crate::{
-    Condition, SizeComparison,
-    helpers::{attribute_value_list_to_strings, attribute_value_scalar_to_string},
-};
+use crate::{Condition, SizeComparison, helpers::attribute_value_scalar_to_string};
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token {
+enum Token<'a> {
     // Literals
-    Identifier(String),
-    AttributeName(String),  // #name
-    AttributeValue(String), // :value
+    Identifier(&'a str),
+    AttributeName(&'a str),  // #name
+    AttributeValue(&'a str), // :value
     String(String),
-    Number(String),
+    Number(&'a str),
 
     // Operators
     Equal,            // =
@@ -51,7 +48,7 @@ enum Token {
     Eof,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Lexer<'a> {
     input: &'a str,
     position: usize,
@@ -117,37 +114,35 @@ impl<'a> Lexer<'a> {
         Err("Unterminated string literal".to_string())
     }
 
-    fn read_identifier(&mut self) -> String {
-        let mut value = String::new();
+    fn read_identifier_slice(&mut self) -> &'a str {
+        let start = self.position;
 
         while let Some(ch) = self.current_char() {
             if ch.is_alphanumeric() || ch == '_' {
-                value.push(ch);
                 self.advance();
             } else {
                 break;
             }
         }
 
-        value
+        self.input.get(start..self.position).unwrap_or_default()
     }
 
-    fn read_number(&mut self) -> String {
-        let mut value = String::new();
+    fn read_number(&mut self) -> &'a str {
+        let start = self.position;
 
         while let Some(ch) = self.current_char() {
             if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' {
-                value.push(ch);
                 self.advance();
             } else {
                 break;
             }
         }
 
-        value
+        self.input.get(start..self.position).unwrap_or_default()
     }
 
-    fn next_token(&mut self) -> Result<Token, String> {
+    fn next_token(&mut self) -> Result<Token<'a>, String> {
         loop {
             match self.current_char() {
                 None => return Ok(Token::Eof),
@@ -219,14 +214,18 @@ impl<'a> Lexer<'a> {
                 }
 
                 Some('#') => {
+                    let start = self.position;
                     self.advance();
-                    let name = self.read_identifier();
+                    let _ = self.read_identifier_slice();
+                    let name = self.input.get(start..self.position).unwrap_or_default();
                     return Ok(Token::AttributeName(name));
                 }
 
                 Some(':') => {
+                    let start = self.position;
                     self.advance();
-                    let name = self.read_identifier();
+                    let _ = self.read_identifier_slice();
+                    let name = self.input.get(start..self.position).unwrap_or_default();
                     return Ok(Token::AttributeValue(name));
                 }
 
@@ -236,20 +235,27 @@ impl<'a> Lexer<'a> {
                 }
 
                 Some(ch) if ch.is_alphabetic() => {
-                    let identifier = self.read_identifier();
-                    let token = match identifier.to_uppercase().as_str() {
-                        "AND" => Token::And,
-                        "OR" => Token::Or,
-                        "NOT" => Token::Not,
-                        "BETWEEN" => Token::Between,
-                        "IN" => Token::In,
-                        "ATTRIBUTE_EXISTS" => Token::AttributeExists,
-                        "ATTRIBUTE_NOT_EXISTS" => Token::AttributeNotExists,
-                        "ATTRIBUTE_TYPE" => Token::AttributeType,
-                        "BEGINS_WITH" => Token::BeginsWith,
-                        "CONTAINS" => Token::Contains,
-                        "SIZE" => Token::Size,
-                        _ => Token::Identifier(identifier),
+                    let identifier = self.read_identifier_slice();
+                    let token = if identifier.eq_ignore_ascii_case("AND") {
+                        Token::And
+                    } else if identifier.eq_ignore_ascii_case("OR") {
+                        Token::Or
+                    } else if identifier.eq_ignore_ascii_case("NOT") {
+                        Token::Not
+                    } else if identifier.eq_ignore_ascii_case("BETWEEN") {
+                        Token::Between
+                    } else if identifier.eq_ignore_ascii_case("IN") {
+                        Token::In
+                    } else {
+                        match identifier {
+                            "attribute_exists" => Token::AttributeExists,
+                            "attribute_not_exists" => Token::AttributeNotExists,
+                            "attribute_type" => Token::AttributeType,
+                            "begins_with" => Token::BeginsWith,
+                            "contains" => Token::Contains,
+                            "size" => Token::Size,
+                            _ => Token::Identifier(identifier),
+                        }
                     };
                     return Ok(token);
                 }
@@ -302,10 +308,27 @@ fn dynamodb_attribute_value_display(value: &AttributeValue) -> String {
     }
 }
 
-#[derive(Debug)]
+fn token_is_value(token: &Token<'_>) -> bool {
+    matches!(
+        token,
+        Token::AttributeValue(_) | Token::String(_) | Token::Number(_)
+    )
+}
+
+fn attribute_value_to_in_values(value: AttributeValue) -> Vec<AttributeValue> {
+    match value {
+        AttributeValue::SS(values) => values.into_iter().map(AttributeValue::S).collect(),
+        AttributeValue::NS(values) => values.into_iter().map(AttributeValue::N).collect(),
+        AttributeValue::BS(values) => values.into_iter().map(AttributeValue::B).collect(),
+        AttributeValue::L(values) => values,
+        value => vec![value],
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Parser<'a> {
     lexer: Lexer<'a>,
-    current_token: Token,
+    current_token: Token<'a>,
 }
 
 impl<'a> Parser<'a> {
@@ -322,7 +345,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn expect_token(&mut self, expected: &Token) -> Result<(), String> {
+    fn expect_token(&mut self, expected: &Token<'_>) -> Result<(), String> {
         if self.current_token == *expected {
             self.advance()
         } else {
@@ -340,6 +363,11 @@ impl<'a> Parser<'a> {
     ) -> Result<Condition, String> {
         match &self.current_token {
             Token::LeftParen => {
+                if let Ok(condition) = self
+                    .try_parse_parenthesized_operand_comparison(attribute_names, attribute_values)
+                {
+                    return Ok(condition);
+                }
                 self.advance()?;
                 let condition = self.parse_or_expression(attribute_names, attribute_values)?;
                 self.expect_token(&Token::RightParen)?;
@@ -420,11 +448,115 @@ impl<'a> Parser<'a> {
                 self.parse_size_comparison(size_field, attribute_values)
             }
 
+            Token::AttributeValue(_) | Token::String(_) | Token::Number(_) => {
+                self.parse_value_left_comparison(attribute_names, attribute_values)
+            }
+
             _ => {
                 // Parse comparison expression (field op value)
                 let field = self.parse_attribute_path(attribute_names)?;
                 self.parse_comparison(field, attribute_names, attribute_values)
             }
+        }
+    }
+
+    fn try_parse_parenthesized_operand_comparison(
+        &mut self,
+        attribute_names: &HashMap<String, String>,
+        attribute_values: &HashMap<String, AttributeValue>,
+    ) -> Result<Condition, String> {
+        let mut parser = self.clone();
+        parser.expect_token(&Token::LeftParen)?;
+        let condition = if token_is_value(&parser.current_token) {
+            let left_value = parser.parse_attribute_value(attribute_values)?;
+            parser.expect_token(&Token::RightParen)?;
+            parser.parse_value_left_comparison_from_value(
+                left_value,
+                attribute_names,
+                attribute_values,
+            )?
+        } else {
+            let field = parser.parse_attribute_path(attribute_names)?;
+            parser.expect_token(&Token::RightParen)?;
+            parser.parse_comparison(field, attribute_names, attribute_values)?
+        };
+        *self = parser;
+        Ok(condition)
+    }
+
+    fn parse_value_left_comparison(
+        &mut self,
+        attribute_names: &HashMap<String, String>,
+        attribute_values: &HashMap<String, AttributeValue>,
+    ) -> Result<Condition, String> {
+        let left_value = self.parse_attribute_value(attribute_values)?;
+        self.parse_value_left_comparison_from_value(left_value, attribute_names, attribute_values)
+    }
+
+    fn parse_value_left_comparison_from_value(
+        &mut self,
+        left_value: AttributeValue,
+        attribute_names: &HashMap<String, String>,
+        attribute_values: &HashMap<String, AttributeValue>,
+    ) -> Result<Condition, String> {
+        match &self.current_token {
+            Token::Equal => {
+                self.advance()?;
+                if token_is_value(&self.current_token) {
+                    let right = self.parse_attribute_value(attribute_values)?;
+                    return Ok(Condition::ValueEqual {
+                        left: left_value,
+                        right,
+                    });
+                }
+                let field = self.parse_attribute_path(attribute_names)?;
+                Ok(Condition::Equal {
+                    field,
+                    value: left_value,
+                })
+            }
+            Token::NotEqual => {
+                self.advance()?;
+                if token_is_value(&self.current_token) {
+                    let right = self.parse_attribute_value(attribute_values)?;
+                    return Ok(Condition::ValueNotEqual {
+                        left: left_value,
+                        right,
+                    });
+                }
+                let field = self.parse_attribute_path(attribute_names)?;
+                Ok(Condition::NotEqual {
+                    field,
+                    value: left_value,
+                })
+            }
+            Token::LessThan => {
+                self.advance()?;
+                let field = self.parse_attribute_path(attribute_names)?;
+                let value = attribute_value_scalar_to_string(&left_value);
+                Ok(Condition::GreaterThan { field, value })
+            }
+            Token::LessThanEqual => {
+                self.advance()?;
+                let field = self.parse_attribute_path(attribute_names)?;
+                let value = attribute_value_scalar_to_string(&left_value);
+                Ok(Condition::GreaterThanEqual { field, value })
+            }
+            Token::GreaterThan => {
+                self.advance()?;
+                let field = self.parse_attribute_path(attribute_names)?;
+                let value = attribute_value_scalar_to_string(&left_value);
+                Ok(Condition::LessThan { field, value })
+            }
+            Token::GreaterThanEqual => {
+                self.advance()?;
+                let field = self.parse_attribute_path(attribute_names)?;
+                let value = attribute_value_scalar_to_string(&left_value);
+                Ok(Condition::LessThanEqual { field, value })
+            }
+            other => Err(format!(
+                "Expected comparison operator after value, found {other:?}"
+            )),
         }
     }
 
@@ -434,15 +566,14 @@ impl<'a> Parser<'a> {
     ) -> Result<String, String> {
         let mut path = match &self.current_token {
             Token::AttributeName(name) => {
-                let key = format!("#{name}");
-                let actual_name = attribute_names.get(&key).ok_or_else(|| {
-                    format!("Attribute name #{name} not found in ExpressionAttributeNames")
+                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                    format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 self.advance()?;
                 actual_name.clone()
             }
             Token::Identifier(name) => {
-                let name = name.clone();
+                let name = (*name).to_string();
                 self.advance()?;
                 name
             }
@@ -464,7 +595,7 @@ impl<'a> Parser<'a> {
                 Token::LeftBracket => {
                     self.advance()?;
                     let index = match &self.current_token {
-                        Token::Number(value) => value.clone(),
+                        Token::Number(value) => *value,
                         other => {
                             return Err(format!(
                                 "Expected list index in attribute path, found {other:?}"
@@ -474,7 +605,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     self.expect_token(&Token::RightBracket)?;
                     path.push('[');
-                    path.push_str(&index);
+                    path.push_str(index);
                     path.push(']');
                 }
                 _ => return Ok(path),
@@ -488,15 +619,14 @@ impl<'a> Parser<'a> {
     ) -> Result<String, String> {
         match &self.current_token {
             Token::AttributeName(name) => {
-                let key = format!("#{name}");
-                let actual_name = attribute_names.get(&key).ok_or_else(|| {
-                    format!("Attribute name #{name} not found in ExpressionAttributeNames")
+                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                    format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 self.advance()?;
                 Ok(actual_name.clone())
             }
             Token::Identifier(name) => {
-                let name = name.clone();
+                let name = (*name).to_string();
                 self.advance()?;
                 Ok(name)
             }
@@ -510,11 +640,10 @@ impl<'a> Parser<'a> {
         attribute_names: &HashMap<String, String>,
     ) -> Result<bool, String> {
         match &self.current_token {
-            Token::Identifier(name) => Ok(name == field),
+            Token::Identifier(name) => Ok(*name == field),
             Token::AttributeName(name) => {
-                let key = format!("#{name}");
-                let actual_name = attribute_names.get(&key).ok_or_else(|| {
-                    format!("Attribute name #{name} not found in ExpressionAttributeNames")
+                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                    format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 Ok(actual_name == field)
             }
@@ -527,10 +656,15 @@ impl<'a> Parser<'a> {
         attribute_values: &HashMap<String, AttributeValue>,
     ) -> Result<AttributeValue, String> {
         match &self.current_token {
+            Token::LeftParen => {
+                self.advance()?;
+                let value = self.parse_attribute_value(attribute_values)?;
+                self.expect_token(&Token::RightParen)?;
+                Ok(value)
+            }
             Token::AttributeValue(name) => {
-                let key = format!(":{name}");
-                let value = attribute_values.get(&key).ok_or_else(|| {
-                    format!("Attribute value :{name} not found in ExpressionAttributeValues")
+                let value = attribute_values.get(*name).ok_or_else(|| {
+                    format!("Attribute value {name} not found in ExpressionAttributeValues")
                 })?;
                 self.advance()?;
                 Ok(value.clone())
@@ -541,7 +675,7 @@ impl<'a> Parser<'a> {
                 Ok(AttributeValue::S(value))
             }
             Token::Number(value) => {
-                let value = value.clone();
+                let value = (*value).to_string();
                 self.advance()?;
                 Ok(AttributeValue::N(value))
             }
@@ -554,10 +688,15 @@ impl<'a> Parser<'a> {
         attribute_values: &HashMap<String, AttributeValue>,
     ) -> Result<String, String> {
         match &self.current_token {
+            Token::LeftParen => {
+                self.advance()?;
+                let value = self.parse_value(attribute_values)?;
+                self.expect_token(&Token::RightParen)?;
+                Ok(value)
+            }
             Token::AttributeValue(name) => {
-                let key = format!(":{name}");
-                let value = attribute_values.get(&key).ok_or_else(|| {
-                    format!("Attribute value :{name} not found in ExpressionAttributeValues")
+                let value = attribute_values.get(*name).ok_or_else(|| {
+                    format!("Attribute value {name} not found in ExpressionAttributeValues")
                 })?;
                 self.advance()?;
                 Ok(attribute_value_scalar_to_string(value))
@@ -568,7 +707,7 @@ impl<'a> Parser<'a> {
                 Ok(value)
             }
             Token::Number(value) => {
-                let value = value.clone();
+                let value = (*value).to_string();
                 self.advance()?;
                 Ok(value)
             }
@@ -579,12 +718,12 @@ impl<'a> Parser<'a> {
     fn parse_value_list(
         &mut self,
         attribute_values: &HashMap<String, AttributeValue>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<AttributeValue>, String> {
         let mut values = Vec::new();
 
         loop {
             // Value
-            let v = self.parse_value(attribute_values)?;
+            let v = self.parse_attribute_value(attribute_values)?;
             values.push(v);
 
             // Next token either comma or right paren
@@ -609,6 +748,42 @@ impl<'a> Parser<'a> {
         field: String,
         attribute_values: &HashMap<String, AttributeValue>,
     ) -> Result<Condition, String> {
+        if matches!(self.current_token, Token::Between) {
+            self.advance()?;
+            let min_value = self.parse_attribute_value(attribute_values)?;
+            self.expect_token(&Token::And)?;
+            let max_value = self.parse_attribute_value(attribute_values)?;
+            if between_upper_is_less_than_lower(&min_value, &max_value) {
+                return Err(format!(
+                    "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be \
+                     greater than or equal to lower bound; lower bound operand: {}, upper bound \
+                     operand: {}",
+                    dynamodb_attribute_value_display(&min_value),
+                    dynamodb_attribute_value_display(&max_value)
+                ));
+            }
+            let min = attribute_value_scalar_to_string(&min_value)
+                .parse::<usize>()
+                .map_err(|_| "Size must be a number")?;
+            let max = attribute_value_scalar_to_string(&max_value)
+                .parse::<usize>()
+                .map_err(|_| "Size must be a number")?;
+            return Ok(Condition::And {
+                conditions: vec![
+                    Condition::SizeCompare {
+                        field: field.clone(),
+                        operator: SizeComparison::GreaterThanEqual,
+                        size: min,
+                    },
+                    Condition::SizeCompare {
+                        field,
+                        operator: SizeComparison::LessThanEqual,
+                        size: max,
+                    },
+                ],
+            });
+        }
+
         let operator = match &self.current_token {
             Token::Equal => SizeComparison::Equal,
             Token::NotEqual => SizeComparison::NotEqual,
@@ -644,13 +819,13 @@ impl<'a> Parser<'a> {
         match &self.current_token {
             Token::Equal => {
                 self.advance()?;
-                let value = self.parse_value(attribute_values)?;
+                let value = self.parse_attribute_value(attribute_values)?;
                 Ok(Condition::Equal { field, value })
             }
 
             Token::NotEqual => {
                 self.advance()?;
-                let value = self.parse_value(attribute_values)?;
+                let value = self.parse_attribute_value(attribute_values)?;
                 Ok(Condition::NotEqual { field, value })
             }
 
@@ -707,14 +882,13 @@ impl<'a> Parser<'a> {
                 // First, check if the next token is a single attribute value placeholder.
                 let single_placeholder_name = if let Token::AttributeValue(n) = &self.current_token
                 {
-                    Some(n.clone())
+                    Some(*n)
                 } else {
                     None
                 };
 
                 if let Some(name) = single_placeholder_name {
-                    let key = format!(":{name}");
-                    let raw = attribute_values.get(&key).cloned();
+                    let raw = attribute_values.get(name).cloned();
 
                     // Consume the attribute value token to inspect what's next
                     self.advance()?;
@@ -722,11 +896,10 @@ impl<'a> Parser<'a> {
                     if matches!(self.current_token, Token::RightParen) {
                         // Single placeholder case: expand collection into list
                         let values = match raw {
-                            Some(v) => attribute_value_list_to_strings(&v),
+                            Some(v) => attribute_value_to_in_values(v),
                             None => {
                                 return Err(format!(
-                                    "Attribute value :{name} not found in \
-                                     ExpressionAttributeValues"
+                                    "Attribute value {name} not found in ExpressionAttributeValues"
                                 ));
                             }
                         };
@@ -737,11 +910,10 @@ impl<'a> Parser<'a> {
                         // with the scalar form of the first placeholder
                         let mut values = Vec::new();
                         match raw {
-                            Some(v) => values.push(attribute_value_scalar_to_string(&v)),
+                            Some(v) => values.push(v),
                             None => {
                                 return Err(format!(
-                                    "Attribute value :{name} not found in \
-                                     ExpressionAttributeValues"
+                                    "Attribute value {name} not found in ExpressionAttributeValues"
                                 ));
                             }
                         }
@@ -750,7 +922,7 @@ impl<'a> Parser<'a> {
                             match &self.current_token {
                                 Token::Comma => {
                                     self.advance()?;
-                                    let v = self.parse_value(attribute_values)?;
+                                    let v = self.parse_attribute_value(attribute_values)?;
                                     values.push(v);
                                 }
                                 Token::RightParen => break,

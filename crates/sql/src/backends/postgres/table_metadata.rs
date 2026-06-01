@@ -66,6 +66,10 @@ impl PostgresStorageProvider {
         let item_count: i64 = row
             .try_get("item_count")
             .map_err(|err| Self::map_postgres_error("row decode item_count", err))?;
+        let deletion_protection_enabled: bool =
+            row.try_get("deletion_protection_enabled").map_err(|err| {
+                Self::map_postgres_error("row decode deletion_protection_enabled", err)
+            })?;
 
         let attribute_definitions =
             Self::parse_json_required(&attribute_definitions, "attribute_definitions")?;
@@ -85,6 +89,7 @@ impl PostgresStorageProvider {
             table_size_bytes: u64::try_from(table_size_bytes).unwrap_or_default(),
             item_count: u64::try_from(item_count).unwrap_or_default(),
             stream_specification,
+            deletion_protection_enabled,
         })
     }
 
@@ -115,11 +120,8 @@ impl PostgresStorageProvider {
         if let Some(cached) = self.table_info_cache.read().await.get(table_name).cloned() {
             return Ok(cached);
         }
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
+        let client = self.acquire_client("get_table_info_cached").await?;
+        let _connection_hold = self.connection_hold_timer("get_table_info_cached");
         let table_info = Arc::new(self.get_table_info_with_client(&client, table_name).await?);
         self.table_info_cache
             .write()

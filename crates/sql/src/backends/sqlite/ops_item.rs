@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use storage_provider::{
-    before_update_item, return_values_need_updated_fields, update_item_response,
+    before_update_item_optional, return_values_need_updated_fields, update_item_response,
 };
 use storage_types::{
     AllOld, AttributeValue, KeyAttributes, StorageResult, TableName, UpdateItemRequest, WireItem,
@@ -140,8 +140,8 @@ impl SQLiteStorageProvider {
         let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
         let (old_item, new_item, response_fields) =
             with_transaction(&self.connection, move |sqlite| {
-                let (operations, condition) = before_update_item(
-                    update_expression.as_str(),
+                let (operations, condition) = before_update_item_optional(
+                    update_expression.as_deref(),
                     condition_expression.as_deref(),
                     expression_attribute_names.as_ref(),
                     expression_attribute_values.as_ref(),

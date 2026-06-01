@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::{self, Bytes},
@@ -143,6 +143,133 @@ async fn get_item_nonexistent() {
     assert!(
         json_response.get("Item").is_none() || json_response.get("Item") == Some(&json!(null)),
         "JSON should not have Item field for nonexistent items"
+    );
+}
+
+#[tokio::test]
+async fn get_item_empty_number_key_matches_dynamodb_message() {
+    let db = create_test_db_manager().await;
+    let create_table_payload = json!({
+        "TableName": "number_key_table",
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "N"},
+            {"AttributeName": "sk", "AttributeType": "N"}
+        ],
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ]
+    });
+
+    handle_create_table(db.clone(), create_table_payload.try_into().unwrap())
+        .await
+        .expect("create number key table");
+
+    let get_payload = json!({
+        "TableName": "number_key_table",
+        "Key": {
+            "pk": {"N": ""},
+            "sk": {"N": "1"}
+        }
+    });
+
+    let err = handle_get_item(db, get_payload.try_into().unwrap())
+        .await
+        .expect_err("empty number key should fail");
+
+    assert_eq!(err.status_code, 400);
+    assert_eq!(
+        err.error_type,
+        "com.amazon.coral.validate#ValidationException"
+    );
+    assert_eq!(
+        err.message,
+        "The parameter cannot be converted to a numeric value: "
+    );
+}
+
+#[tokio::test]
+async fn get_item_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
+    let db = create_test_db_manager().await;
+    let create_table_payload = json!({
+        "TableName": "NestedProjectionTable",
+        "AttributeDefinitions": [
+            {"AttributeName": "id", "AttributeType": "S"}
+        ],
+        "KeySchema": [
+            {"AttributeName": "id", "KeyType": "HASH"}
+        ]
+    });
+
+    handle_create_table(db.clone(), create_table_payload.try_into().unwrap())
+        .await
+        .expect("create table");
+
+    let put_payload = json!({
+        "TableName": "NestedProjectionTable",
+        "Item": {
+            "id": {"S": "item-1"},
+            "profile": {"M": {
+                "name": {"S": "Ada"},
+                "age": {"N": "37"},
+                "city": {"S": "London"}
+            }},
+            "tags": {"L": [{"S": "red"}, {"S": "blue"}]},
+            "nested": {"M": {
+                "list": {"L": [
+                    {"M": {"v": {"S": "first"}, "x": {"S": "drop"}}},
+                    {"M": {"v": {"S": "second"}}}
+                ]}
+            }}
+        }
+    });
+    handle_put_item(db.clone(), put_payload.try_into().unwrap())
+        .await
+        .expect("put item");
+
+    let get_payload = json!({
+        "TableName": "NestedProjectionTable",
+        "Key": {"id": {"S": "item-1"}},
+        "ProjectionExpression": "id, profile.#n, tags[0], nested.#list[0].v",
+        "ExpressionAttributeNames": {
+            "#n": "name",
+            "#list": "list"
+        }
+    });
+
+    let response = expect_get_item_response(
+        handle_get_item(db, get_payload.try_into().unwrap())
+            .await
+            .unwrap(),
+    );
+    let item = response.item.expect("projected item");
+
+    assert_eq!(
+        item.get("id"),
+        Some(&AttributeValue::S("item-1".to_string()))
+    );
+    assert_eq!(
+        item.get("profile"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "name".to_string(),
+            AttributeValue::S("Ada".to_string()),
+        )])))
+    );
+    assert_eq!(
+        item.get("tags"),
+        Some(&AttributeValue::L(vec![AttributeValue::S(
+            "red".to_string()
+        )]))
+    );
+    assert_eq!(
+        item.get("nested"),
+        Some(&AttributeValue::M(HashMap::from([(
+            "list".to_string(),
+            AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+                "v".to_string(),
+                AttributeValue::S("first".to_string()),
+            )]))]),
+        )])))
     );
 }
 

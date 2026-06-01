@@ -10,6 +10,7 @@ use http_request::reqwest::Client;
 use metrics_facade::counter;
 use rand::{RngExt as _, rng};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use storage_provider::{RemoteCredentialStrategy, RemoteStorageSettings, StorageProvider};
 use storage_sync::{SYNC_LEADER_HINT_HEADER, SYNC_NOT_LEADER_ERROR_TYPE};
 use storage_types::{
@@ -102,6 +103,47 @@ where T: Serialize + ?Sized {
 
 fn wire_items_payload_bytes(items: &[WireItem]) -> u64 {
     items.iter().map(|item| item.payload_len() as u64).sum()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RemoteRequestContext {
+    table_name: Option<String>,
+    index_name: Option<String>,
+    item_pk: Option<String>,
+    item_sk: Option<String>,
+}
+
+fn remote_request_context(body: &[u8]) -> RemoteRequestContext {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return RemoteRequestContext::default();
+    };
+
+    let table_name = value
+        .get("TableName")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let index_name = value
+        .get("IndexName")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let item_pk = dynamodb_string_attribute(&value, "Item", "pk");
+    let item_sk = dynamodb_string_attribute(&value, "Item", "sk");
+
+    RemoteRequestContext {
+        table_name,
+        index_name,
+        item_pk,
+        item_sk,
+    }
+}
+
+fn dynamodb_string_attribute(value: &Value, item_key: &str, attribute_key: &str) -> Option<String> {
+    value
+        .get(item_key)?
+        .get(attribute_key)?
+        .get("S")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Default)]
@@ -1218,13 +1260,19 @@ impl RemoteStorageProvider {
                         record_latency(&operation, endpoint.url.as_str(), outcome, start.elapsed());
 
                         if !Self::should_suppress_operation_warning(&operation, &error) {
+                            let context = remote_request_context(&body);
                             tracing::warn!(
                                 retryable,
                                 http_status = status.map(|s| s.as_u16()),
                                 error_code = code.as_deref().unwrap_or_default(),
                                 error_variant = outcome,
+                                error = %error,
                                 operation = operation.as_str(),
                                 endpoint = endpoint.url.as_str(),
+                                table_name = context.table_name.as_deref().unwrap_or_default(),
+                                index_name = context.index_name.as_deref().unwrap_or_default(),
+                                item_pk = context.item_pk.as_deref().unwrap_or_default(),
+                                item_sk = context.item_sk.as_deref().unwrap_or_default(),
                                 "remote storage request failed"
                             );
                         }
@@ -1457,3 +1505,7 @@ fn increment_remote_leader_cache(outcome: &'static str) {
         .increment(1),
     }
 }
+
+#[cfg(test)]
+#[path = "implementation_tests.rs"]
+mod implementation_tests;

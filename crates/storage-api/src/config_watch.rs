@@ -47,7 +47,7 @@ pub fn spawn(
 
     let path_clone = path.clone();
     let sender = tx.clone();
-    let handle = tokio::spawn(async move {
+    let handle = spawn_named("storage-api-config-watch", async move {
         while let Some(_event) = event_rx.recv().await {
             sleep(Duration::from_millis(200)).await;
             match config::load(path_clone.as_path()) {
@@ -68,6 +68,26 @@ pub fn spawn(
         _watcher: watcher,
         handle,
     })
+}
+
+fn spawn_named<F>(task_name: &str, fut: F) -> JoinHandle<()>
+where F: std::future::Future<Output = ()> + Send + 'static {
+    #[cfg(tokio_unstable)]
+    {
+        match tokio::task::Builder::new().name(task_name).spawn(fut) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(target: "config", error = %err, task_name, "failed to spawn named task");
+                tokio::spawn(async {})
+            }
+        }
+    }
+
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = task_name;
+        tokio::spawn(fut)
+    }
 }
 
 #[expect(

@@ -29,6 +29,24 @@ impl SQLiteStorageProvider {
         .context("initialize sqlite")?;
 
         call_sqlite_raw(&self.connection, |conn| {
+            let has_column: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('tables')
+                    WHERE name = 'deletion_protection_enabled'
+                )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_column {
+                let (sql, params) = sql_statements::add_deletion_protection_column();
+                conn.execute(sql, params)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("initialize sqlite deletion protection column")?;
+
+        call_sqlite_raw(&self.connection, |conn| {
             let (sql, params) = sql_statements::create_gsi_backfill_table();
             conn.execute(sql, params)
         })
@@ -97,29 +115,24 @@ impl SQLiteStorageProvider {
         let registrar = SqliteRegistrar {
             mgr: &self.job_manager,
         };
-        let update_job = GsiUpdateJob::new(std::sync::Arc::new(self.clone()));
+        let gsi_cfg = GsiJobConfig::default();
+        let update_job = GsiUpdateJob::new_with_interval(
+            std::sync::Arc::new(self.clone()),
+            gsi_cfg.update_interval_ms,
+        );
         let backfill_job =
             crate::process_gsi_updates::GsiBackfillJob::new(std::sync::Arc::new(self.clone()));
         if self.immediate_gsi_consistency {
             registrar
-                .register_timed_job(
-                    GSI_BACKFILL_JOB,
-                    GsiJobConfig::default().backfill_interval_ms,
-                    backfill_job,
-                )
+                .register_timed_job(GSI_BACKFILL_JOB, gsi_cfg.backfill_interval_ms, backfill_job)
                 .await
                 .map_err(|e| {
                     StorageError::internal(&format!("register gsi backfill job failed: {e}"))
                 })?;
         } else {
-            register_gsi_jobs(
-                &registrar,
-                GsiJobConfig::default(),
-                update_job,
-                backfill_job,
-            )
-            .await
-            .map_err(|e| StorageError::internal(&format!("register gsi jobs failed: {e}")))?;
+            register_gsi_jobs(&registrar, gsi_cfg, update_job, backfill_job)
+                .await
+                .map_err(|e| StorageError::internal(&format!("register gsi jobs failed: {e}")))?;
         }
 
         let ttl_job = crate::ttl_sweep::TtlSweepJob::new(std::sync::Arc::new(self.clone()));
@@ -178,6 +191,7 @@ impl SQLiteStorageProvider {
                 &metadata.key_schema_json,
                 metadata.global_secondary_indexes_json.as_deref(),
                 metadata.stream_specification_json.as_deref(),
+                metadata.deletion_protection_enabled,
             );
             conn.execute(sql, params)
         })
@@ -256,8 +270,10 @@ impl SQLiteStorageProvider {
         let table_name = table_name.clone();
         let table_name_for_sql = table_name.clone();
 
-        // Get table info to check for GSIs before deleting
-        let table_info = self.get_table_info(&table_name).await.ok();
+        let table_info = self.get_table_info(&table_name).await?;
+        if table_info.deletion_protection_enabled {
+            return Err(StorageError::deletion_protection_enabled(&table_name));
+        }
         call_sqlite_raw(&self.connection, move |conn| {
             let (delete_sql, delete_params) = sql_statements::delete_table(&table_name_for_sql);
             conn.execute(delete_sql, delete_params)?;
@@ -268,9 +284,7 @@ impl SQLiteStorageProvider {
             conn.execute(&drop_sql, drop_params)?;
 
             // Drop GSI tables if they exist
-            if let Some(table_info) = table_info
-                && let Some(gsis) = table_info.global_secondary_indexes
-            {
+            if let Some(gsis) = table_info.global_secondary_indexes {
                 for gsi in gsis {
                     let gsi_table_name = GsiPhysicalName::compose(
                         &table_name_safe,

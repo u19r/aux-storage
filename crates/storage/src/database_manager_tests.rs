@@ -439,7 +439,7 @@ async fn default_put_item_persists_exact_customer_attributes() {
 }
 
 #[tokio::test]
-async fn get_stream_records_for_table_name_uses_target_item_stream_sequence() {
+async fn get_stream_records_for_table_name_uses_stream_record_sequence() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
@@ -467,7 +467,10 @@ async fn get_stream_records_for_table_name_uses_target_item_stream_sequence() {
         .expect("read stream records");
 
     assert_eq!(response.records.len(), 1);
-    assert_eq!(response.records[0].sequence_number, "1");
+    assert_eq!(
+        response.records[0].cursor.as_deref(),
+        Some(response.records[0].sequence_number.as_str())
+    );
     assert_eq!(
         response.records[0].keys.get("pk"),
         Some(&AttributeValue::S("item#1".to_string()))

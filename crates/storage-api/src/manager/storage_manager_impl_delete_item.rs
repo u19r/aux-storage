@@ -1,10 +1,16 @@
 use http_error::HttpApiError;
 use storage::DeleteItemInput;
 use storage_sync::SyncWriteRequest;
-use storage_types::{DeleteItemRequest, DeleteItemResponse};
+use storage_types::{AllOld, DeleteItemRequest, DeleteItemResponse};
 
 use crate::{
-    manager::{StorageApiManagerImpl, storage_manager_impl_sync_write_proposer::sync_response_at},
+    manager::{
+        StorageApiManagerImpl,
+        storage_manager_impl_condition_failure::{
+            conditional_failure_with_old_item, should_return_old_item_on_condition_failure,
+        },
+        storage_manager_impl_sync_write_proposer::sync_response_at,
+    },
     types::Response,
 };
 
@@ -23,6 +29,21 @@ impl StorageApiManagerImpl {
                 ));
             }
         }
+        let old_item_on_condition_failure = if should_return_old_item_on_condition_failure(
+            request.condition_expression.as_deref(),
+            request.return_values_on_condition_check_failure.as_ref(),
+        ) {
+            self.db()
+                .get_item_map_with_consistent_read(
+                    request.table_name.clone(),
+                    request.key.clone(),
+                    true,
+                )
+                .await?
+                .map(Into::into)
+        } else {
+            None
+        };
 
         if let Some(response) = self
             .propose_sync_write_if_configured(SyncWriteRequest::DeleteItem(request.clone()))
@@ -35,6 +56,7 @@ impl StorageApiManagerImpl {
             )?));
         }
 
+        let return_deleted_item = matches!(request.return_values, Some(AllOld::AllOld));
         let deleted_item = self
             .db()
             .delete_item(DeleteItemInput {
@@ -44,10 +66,15 @@ impl StorageApiManagerImpl {
                 expression_attribute_names: request.expression_attribute_names,
                 expression_attribute_values: request.expression_attribute_values,
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                conditional_failure_with_old_item(error, old_item_on_condition_failure)
+            })?;
 
         let response = DeleteItemResponse {
-            attributes: if deleted_item.as_ref().is_some_and(|di| !di.is_empty()) {
+            attributes: if return_deleted_item
+                && deleted_item.as_ref().is_some_and(|di| !di.is_empty())
+            {
                 deleted_item.map(Into::into)
             } else {
                 None

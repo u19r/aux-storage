@@ -52,6 +52,7 @@ pub(crate) struct StorageCacheWritePlanner<'a, L> {
     pub(crate) query_proof_enabled: bool,
 }
 
+#[cfg_attr(not(feature = "cache-write-planner"), allow(dead_code))]
 impl<'a, L> StorageCacheWritePlanner<'a, L>
 where L: StorageCachePlannerLoad
 {
@@ -83,11 +84,18 @@ where L: StorageCachePlannerLoad
         ))
     }
 
+    #[cfg_attr(not(feature = "cache-write-planner"), allow(dead_code))]
     pub(crate) async fn plan_put_item_cache_effects(
         &self,
         table_name: &TableName,
         logical_item: &HashMap<String, AttributeValue>,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(RuntimeWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         let table_info = self.loader.get_table_info_for_cache(table_name).await?;
         let query_proof_key = extract_primary_key_from_item(&table_info.key_schema, logical_item)?;
         let query_proof_prewrite = self
@@ -107,6 +115,12 @@ where L: StorageCachePlannerLoad
         table_name: &TableName,
         logical_key: &KeyAttributes,
     ) -> StorageResult<StorageCacheWriteEffects> {
+        if !cfg!(feature = "cache-write-planner") {
+            return Ok(RuntimeWriteEffects {
+                point_read: Vec::new(),
+                query_proof: Vec::new(),
+            });
+        }
         let table_info = self.loader.get_table_info_for_cache(table_name).await?;
         let query_proof_prewrite = self
             .query_proof_cache_maybe_load_gsi_prewrite_image(table_name, logical_key)

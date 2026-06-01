@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    future::Future,
     hash::{Hash, Hasher},
     sync::Arc,
     time::Duration,
@@ -342,7 +343,7 @@ where C: ReplicationPeerClient + 'static
             .map(|peer| {
                 let runtime = Arc::clone(&runtime);
                 let peer = peer.clone();
-                tokio::spawn(async move {
+                spawn_named("storage-api-replication-peer", async move {
                     runtime.run_peer_loop(peer).await;
                 })
             })
@@ -1216,6 +1217,26 @@ fn deterministic_jitter(peer_region: &str, generation: u64, max_jitter: Duration
     generation.hash(&mut hasher);
     let jitter_ms = hasher.finish() % (max_jitter_ms as u64 + 1);
     Duration::from_millis(jitter_ms)
+}
+
+fn spawn_named<F>(task_name: &str, fut: F) -> JoinHandle<()>
+where F: Future<Output = ()> + Send + 'static {
+    #[cfg(tokio_unstable)]
+    {
+        match tokio::task::Builder::new().name(task_name).spawn(fut) {
+            Ok(handle) => handle,
+            Err(err) => {
+                warn!(error = %err, task_name, "failed to spawn named task");
+                tokio::spawn(async {})
+            }
+        }
+    }
+
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = task_name;
+        tokio::spawn(fut)
+    }
 }
 
 fn map_http_request_error(error: HttpRequestError) -> StorageError {

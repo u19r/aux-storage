@@ -16,4 +16,6 @@ pub use types::*;
 #[cfg(test)]
 mod evaluate_condition_tests;
 #[cfg(test)]
+mod parser_perf_tests;
+#[cfg(test)]
 mod parser_tests;

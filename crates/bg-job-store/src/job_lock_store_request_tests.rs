@@ -44,13 +44,13 @@ fn given_expired_or_missing_lock_when_building_acquire_then_writes_worker_lease_
         request.condition_expression.as_deref(),
         Some("(attribute_not_exists(lease_until_ms) OR lease_until_ms < :now)")
     );
-    assert!(request.update_expression.contains(JOB_LOCK_ATTR_LEASED_BY));
-    assert!(
-        request
-            .update_expression
-            .contains(JOB_LOCK_ATTR_LEASE_UNTIL_MS)
-    );
-    assert!(request.update_expression.contains(JOB_LOCK_ATTR_JOB_ID));
+    let update_expression = request
+        .update_expression
+        .as_deref()
+        .expect("update expression");
+    assert!(update_expression.contains(JOB_LOCK_ATTR_LEASED_BY));
+    assert!(update_expression.contains(JOB_LOCK_ATTR_LEASE_UNTIL_MS));
+    assert!(update_expression.contains(JOB_LOCK_ATTR_JOB_ID));
 
     let values = request
         .expression_attribute_values

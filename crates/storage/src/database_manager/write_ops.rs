@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use storage_provider::{
-    StorageProvider, apply_bound_update_operations, before_update_item,
+    StorageProvider, apply_bound_update_operations, before_update_item_optional,
     return_values_need_old_item, update_item_response,
 };
 use storage_sync::SyncWriteRequest;
@@ -22,12 +22,56 @@ use crate::{
         refresh_existing_updated_at_on_put_payload, stamp_updated_at_on_put_payload,
         update_item_return_values_rewritable_from_post_image, validate_update_expression_usage,
     },
-    namespace_routing::{NamespaceRequestRewriter, NamespaceStorageMode},
+    namespace_routing::{NamespaceRequestRewriter, NamespaceRoute, NamespaceStorageMode},
     updated_at_apply::inject_updated_at_into_update_expression,
 };
 
+struct PreparedPutItem {
+    table_name: TableName,
+    item: PutItemPayload,
+    logical_item: HashMap<String, AttributeValue>,
+    condition_expression: Option<String>,
+    expression_attribute_names: Option<HashMap<String, String>>,
+    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    return_values: Option<AllOld>,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
+struct PreparedDeleteItem {
+    table_name: TableName,
+    key: KeyAttributes,
+    logical_key: KeyAttributes,
+    condition_expression: Option<String>,
+    expression_attribute_names: Option<HashMap<String, String>>,
+    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
+struct PreparedUpdateItem {
+    request: UpdateItemRequest,
+    cache_enabled: bool,
+    customer_return_values: Option<ReturnValuesOldNewUpdated>,
+    response_operations: Option<Vec<String>>,
+    prepared_cache_write: Option<storage_cache::RuntimePreparedUpdateCacheWrite>,
+}
+
 impl DatabaseManager {
     pub async fn put_item(&self, input: PutItemInput) -> StorageResult<PutItemResponse> {
+        let prepared = self.prepare_put_item(input).await?;
+        if self.single_node_sync_mode_enabled() {
+            return self.put_item_single_node_sync(prepared).await;
+        }
+
+        let route = self
+            .resolve_namespace_route_for_table(&prepared.table_name)
+            .await?;
+        match route {
+            Some(route) => self.put_item_routed(prepared, route).await,
+            None => self.put_item_unrouted(prepared).await,
+        }
+    }
+
+    async fn prepare_put_item(&self, input: PutItemInput) -> StorageResult<PreparedPutItem> {
         let PutItemInput {
             table_name,
             item,
@@ -53,101 +97,188 @@ impl DatabaseManager {
             &table_info.key_schema,
             &logical_item,
         )?;
-        let cache_write_planner = self.cache_write_planner();
-        let cache_effects = cache_write_planner
+        let cache_effects = self
             .plan_put_item_cache_effects(&table_name, &logical_item)
             .await?;
-        if self.single_node_sync_mode_enabled() {
-            let request = PutItemRequest {
-                table_name: table_name.clone(),
-                item: logical_item,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                expected: None,
-                conditional_operator: None,
-                return_values,
-                return_consumed_capacity: None,
-                return_item_collection_metrics: None,
-                return_values_on_condition_check_failure: None,
-            };
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = self
-                            .run_single_node_sync_write_request(
-                                "put_item",
-                                SyncWriteRequest::PutItem(request),
-                            )
-                            .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        sync_response_at(&response, 0, PutItemResponse { attributes: None })
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
+        Ok(PreparedPutItem {
+            table_name,
+            item,
+            logical_item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            cache_effects,
+        })
+    }
 
-        let route = self.resolve_namespace_route_for_table(&table_name).await?;
-        let Some(route) = route else {
-            if let Some(response) = self
-                .try_cached_guarded_put_item(
-                    &table_name,
-                    &logical_item,
-                    cache_effects.clone(),
-                    condition_expression.clone(),
-                    expression_attribute_names.clone(),
-                    expression_attribute_values.clone(),
-                    return_values.clone(),
-                )
-                .await?
-            {
-                return Ok(response);
-            }
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = match item {
-                            PutItemPayload::AttributeMap(item) => {
-                                record_storage_operation(
-                                    "put_item",
-                                    self.storage.put_item(
-                                        table_name.clone(),
-                                        item,
-                                        condition_expression,
-                                        expression_attribute_names,
-                                        expression_attribute_values,
-                                        return_values,
-                                    ),
-                                )
-                                .await?
-                            }
-                            PutItemPayload::WireItem(item) => {
-                                record_storage_operation(
-                                    "put_item",
-                                    self.storage.put_item_encode(
-                                        table_name.clone(),
-                                        *item,
-                                        condition_expression,
-                                        expression_attribute_names,
-                                        expression_attribute_values,
-                                        return_values,
-                                    ),
-                                )
-                                .await?
-                            }
-                        };
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_put_item_cache_effects(
+        &self,
+        table_name: &TableName,
+        logical_item: &HashMap<String, AttributeValue>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        self.cache_write_planner()
+            .plan_put_item_cache_effects(table_name, logical_item)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_put_item_cache_effects(
+        &self,
+        _table_name: &TableName,
+        _logical_item: &HashMap<String, AttributeValue>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn put_item_single_node_sync(
+        &self,
+        prepared: PreparedPutItem,
+    ) -> StorageResult<PutItemResponse> {
+        let PreparedPutItem {
+            table_name,
+            logical_item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            cache_effects,
+            ..
+        } = prepared;
+        let request = PutItemRequest {
+            table_name,
+            item: logical_item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            expected: None,
+            conditional_operator: None,
+            return_values,
+            return_consumed_capacity: None,
+            return_item_collection_metrics: None,
+            return_values_on_condition_check_failure: None,
         };
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = self
+                    .run_single_node_sync_write_request(
+                        "put_item",
+                        SyncWriteRequest::PutItem(request),
+                    )
+                    .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                sync_response_at(&response, 0, PutItemResponse { attributes: None })
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn put_item_unrouted(&self, prepared: PreparedPutItem) -> StorageResult<PutItemResponse> {
+        let PreparedPutItem {
+            table_name,
+            item,
+            logical_item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            cache_effects,
+        } = prepared;
+        if let Some(response) = self
+            .try_cached_guarded_put_item(
+                &table_name,
+                &logical_item,
+                cache_effects.clone(),
+                condition_expression.clone(),
+                expression_attribute_names.clone(),
+                expression_attribute_values.clone(),
+                return_values.clone(),
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = self
+                    .execute_put_item_payload(
+                        table_name,
+                        item,
+                        condition_expression,
+                        expression_attribute_names,
+                        expression_attribute_values,
+                        return_values,
+                    )
+                    .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn execute_put_item_payload(
+        &self,
+        table_name: TableName,
+        item: PutItemPayload,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+    ) -> StorageResult<PutItemResponse> {
+        match item {
+            PutItemPayload::AttributeMap(item) => {
+                record_storage_operation(
+                    "put_item",
+                    self.storage.put_item(
+                        table_name,
+                        item,
+                        condition_expression,
+                        expression_attribute_names,
+                        expression_attribute_values,
+                        return_values,
+                    ),
+                )
+                .await
+            }
+            PutItemPayload::WireItem(item) => {
+                record_storage_operation(
+                    "put_item",
+                    self.storage.put_item_encode(
+                        table_name,
+                        *item,
+                        condition_expression,
+                        expression_attribute_names,
+                        expression_attribute_values,
+                        return_values,
+                    ),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn put_item_routed(
+        &self,
+        prepared: PreparedPutItem,
+        route: NamespaceRoute,
+    ) -> StorageResult<PutItemResponse> {
+        let PreparedPutItem {
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            cache_effects,
+            ..
+        } = prepared;
 
         let mut item_map = item.into_attribute_map()?;
         if route.storage_mode == NamespaceStorageMode::SharedTable {
@@ -227,92 +358,173 @@ impl DatabaseManager {
         &self,
         input: DeleteItemInput,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let prepared = self.prepare_delete_item(input).await?;
+        if self.single_node_sync_mode_enabled() {
+            return self.delete_item_single_node_sync(prepared).await;
+        }
+
+        let route = self
+            .resolve_namespace_route_for_table(&prepared.table_name)
+            .await?;
+        match route {
+            Some(route) => self.delete_item_routed(prepared, route).await,
+            None => self.delete_item_unrouted(prepared).await,
+        }
+    }
+
+    async fn prepare_delete_item(
+        &self,
+        input: DeleteItemInput,
+    ) -> StorageResult<PreparedDeleteItem> {
         validate_expression_attribute_usage(
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
             input.condition_expression.as_deref().into_iter(),
         )?;
         let table_name = input.table_name;
-        let mut key = input.key;
+        let key = input.key;
         let table_info = self.get_table_info_arc(&table_name).await?;
         storage_types::validate_key_attributes_for_schema(&table_info.key_schema, &key)?;
         let logical_key = key.clone();
-        let cache_write_planner = self.cache_write_planner();
-        let cache_effects = cache_write_planner
+        let cache_effects = self
             .plan_delete_item_cache_effects(&table_name, &logical_key)
             .await?;
-        let condition_expression = input.condition_expression;
-        let expression_attribute_names = input.expression_attribute_names;
-        let mut expression_attribute_values = input.expression_attribute_values;
-        if self.single_node_sync_mode_enabled() {
-            let request = storage_types::DeleteItemRequest {
-                table_name: table_name.clone(),
-                key: logical_key,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                expected: None,
-                conditional_operator: None,
-                return_values: None,
-                return_consumed_capacity: None,
-                return_item_collection_metrics: None,
-                return_values_on_condition_check_failure: None,
-            };
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        self.run_single_node_sync_write_request(
-                            "delete_item",
-                            SyncWriteRequest::DeleteItem(request),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(None)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
-        }
-        let route = self.resolve_namespace_route_for_table(&table_name).await?;
-        let Some(route) = route else {
-            if let Some(response) = self
-                .try_cached_guarded_delete_item(
-                    &table_name,
-                    &logical_key,
-                    cache_effects.clone(),
-                    condition_expression.clone(),
-                    expression_attribute_names.clone(),
-                    expression_attribute_values.clone(),
-                )
-                .await?
-            {
-                return Ok(response);
-            }
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Effects(cache_effects.clone()),
-                    || async {
-                        let response = record_storage_operation(
-                            "delete_item",
-                            self.storage.delete_item(
-                                table_name.clone(),
-                                key,
-                                condition_expression,
-                                expression_attribute_names,
-                                expression_attribute_values,
-                            ),
-                        )
-                        .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        Ok(response)
-                    },
-                    |response| async { Ok((response, cache_effects)) },
-                )
-                .await;
+        Ok(PreparedDeleteItem {
+            table_name,
+            key,
+            logical_key,
+            condition_expression: input.condition_expression,
+            expression_attribute_names: input.expression_attribute_names,
+            expression_attribute_values: input.expression_attribute_values,
+            cache_effects,
+        })
+    }
+
+    #[cfg(feature = "cache-write-planner")]
+    async fn plan_delete_item_cache_effects(
+        &self,
+        table_name: &TableName,
+        logical_key: &KeyAttributes,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        self.cache_write_planner()
+            .plan_delete_item_cache_effects(table_name, logical_key)
+            .await
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn plan_delete_item_cache_effects(
+        &self,
+        _table_name: &TableName,
+        _logical_key: &KeyAttributes,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
+    }
+
+    async fn delete_item_single_node_sync(
+        &self,
+        prepared: PreparedDeleteItem,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let PreparedDeleteItem {
+            table_name,
+            logical_key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            cache_effects,
+            ..
+        } = prepared;
+        let request = storage_types::DeleteItemRequest {
+            table_name,
+            key: logical_key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            expected: None,
+            conditional_operator: None,
+            return_values: None,
+            return_consumed_capacity: None,
+            return_item_collection_metrics: None,
+            return_values_on_condition_check_failure: None,
         };
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                self.run_single_node_sync_write_request(
+                    "delete_item",
+                    SyncWriteRequest::DeleteItem(request),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(None)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn delete_item_unrouted(
+        &self,
+        prepared: PreparedDeleteItem,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let PreparedDeleteItem {
+            table_name,
+            key,
+            logical_key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            cache_effects,
+        } = prepared;
+        if let Some(response) = self
+            .try_cached_guarded_delete_item(
+                &table_name,
+                &logical_key,
+                cache_effects.clone(),
+                condition_expression.clone(),
+                expression_attribute_names.clone(),
+                expression_attribute_values.clone(),
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+        self.execute_with_cache_effects(
+            PreparedCacheWrite::Effects(cache_effects.clone()),
+            || async {
+                let response = record_storage_operation(
+                    "delete_item",
+                    self.storage.delete_item(
+                        table_name,
+                        key,
+                        condition_expression,
+                        expression_attribute_names,
+                        expression_attribute_values,
+                    ),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                Ok(response)
+            },
+            |response| async { Ok((response, cache_effects)) },
+        )
+        .await
+    }
+
+    async fn delete_item_routed(
+        &self,
+        prepared: PreparedDeleteItem,
+        route: NamespaceRoute,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let PreparedDeleteItem {
+            mut key,
+            condition_expression,
+            expression_attribute_names,
+            mut expression_attribute_values,
+            cache_effects,
+            ..
+        } = prepared;
 
         if route.storage_mode == NamespaceStorageMode::SharedTable {
             self.request_rewriter
@@ -387,7 +599,26 @@ impl DatabaseManager {
         )
         .await
     }
+
     pub async fn update_item(&self, input: UpdateItemInput) -> StorageResult<UpdateItemResponse> {
+        let prepared = self.prepare_update_item(input).await?;
+        if self.single_node_sync_mode_enabled() {
+            return self.update_item_single_node_sync(prepared).await;
+        }
+
+        let route = self
+            .resolve_namespace_route_for_table(&prepared.request.table_name)
+            .await?;
+        match route {
+            Some(route) => self.update_item_routed(prepared, route).await,
+            None => self.update_item_unrouted(prepared).await,
+        }
+    }
+
+    async fn prepare_update_item(
+        &self,
+        input: UpdateItemInput,
+    ) -> StorageResult<PreparedUpdateItem> {
         let UpdateItemInput {
             table_name,
             key,
@@ -400,15 +631,17 @@ impl DatabaseManager {
         let mut update_expression = update_expression;
         let mut expression_attribute_names = expression_attribute_names;
         let mut expression_attribute_values = expression_attribute_values;
-        if self.single_table_mode_enabled() {
+        if self.single_table_mode_enabled() && !update_expression.trim().is_empty() {
             inject_updated_at_into_update_expression(
                 &mut update_expression,
                 &mut expression_attribute_names,
                 &mut expression_attribute_values,
             )?;
         }
+        let update_expression_for_operations =
+            (!update_expression.trim().is_empty()).then_some(update_expression.as_str());
         validate_update_expression_usage(
-            &update_expression,
+            update_expression_for_operations,
             condition_expression.as_deref(),
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
@@ -423,8 +656,8 @@ impl DatabaseManager {
                 customer_return_values.as_ref(),
             );
         let response_operations = if rewrite_return_values_for_cache {
-            let (operations, _) = before_update_item(
-                update_expression.as_str(),
+            let (operations, _) = before_update_item_optional(
+                update_expression_for_operations,
                 condition_expression.as_deref(),
                 expression_attribute_names.as_ref(),
                 expression_attribute_values.as_ref(),
@@ -446,157 +679,283 @@ impl DatabaseManager {
             customer_return_values.clone()
         };
 
-        let request = UpdateItemRequest::builder()
-            .table_name(table_name)
-            .key(key)
-            .update_expression(update_expression)
-            .condition_expression(condition_expression)
-            .expression_attribute_names(expression_attribute_names)
-            .expression_attribute_values(expression_attribute_values)
-            .return_values(provider_return_values)
-            .build();
-        let cache_write_planner = self.cache_write_planner();
-        let prepared_update_cache_write = cache_write_planner
+        let request = if update_expression.trim().is_empty() {
+            UpdateItemRequest::builder()
+                .table_name(table_name)
+                .key(key)
+                .condition_expression(condition_expression)
+                .expression_attribute_names(expression_attribute_names)
+                .expression_attribute_values(expression_attribute_values)
+                .return_values(provider_return_values)
+                .build()
+        } else {
+            UpdateItemRequest::builder()
+                .table_name(table_name)
+                .key(key)
+                .update_expression(update_expression)
+                .condition_expression(condition_expression)
+                .expression_attribute_names(expression_attribute_names)
+                .expression_attribute_values(expression_attribute_values)
+                .return_values(provider_return_values)
+                .build()
+        };
+        let prepared_cache_write = self
             .prepare_update_item_cache_write(&request.table_name, &request.key)
             .await?;
-        if self.single_node_sync_mode_enabled() {
-            return self
-                .execute_with_cache_effects(
-                    PreparedCacheWrite::Update(Box::new(prepared_update_cache_write)),
-                    || async {
-                        let response = self
-                            .run_single_node_sync_write_request(
-                                "update_item",
-                                SyncWriteRequest::UpdateItem(request),
-                            )
-                            .await?;
-                        self.maybe_pause_after_storage_write_for_test().await;
-                        self.maybe_run_gsi_maintenance().await;
-                        sync_response_at(&response, 0, UpdateItemResponse { attributes: None })
-                    },
-                    |response| async { Ok((response, self.empty_cache_write_effects())) },
-                )
-                .await;
-        }
+        Ok(PreparedUpdateItem {
+            request,
+            cache_enabled,
+            customer_return_values,
+            response_operations,
+            prepared_cache_write,
+        })
+    }
 
-        let route = self
-            .resolve_namespace_route_for_table(&request.table_name)
-            .await?;
-        let mut routed_request = request;
-        if route.is_none()
-            && let Some(response) = self
-                .try_cached_guarded_update_item(
-                    &routed_request,
-                    prepared_update_cache_write.clone(),
-                    response_operations.clone(),
-                    customer_return_values.clone(),
-                )
-                .await?
-        {
-            return Ok(response);
-        }
-        if let Some(route) = route.as_ref()
-            && route.storage_mode == NamespaceStorageMode::SharedTable
-        {
-            self.request_rewriter
-                .rewrite_update_for_shared_table(&route.namespace, &mut routed_request)?;
-        }
+    #[cfg(feature = "cache-write-planner")]
+    async fn prepare_update_item_cache_write(
+        &self,
+        table_name: &TableName,
+        key: &KeyAttributes,
+    ) -> StorageResult<Option<storage_cache::RuntimePreparedUpdateCacheWrite>> {
+        self.cache_write_planner()
+            .prepare_update_item_cache_write(table_name, key)
+            .await
+            .map(Some)
+    }
 
-        let prepared_cache =
-            PreparedCacheWrite::Update(Box::new(prepared_update_cache_write.clone()));
-        let response_operations = response_operations.clone();
+    #[cfg(not(feature = "cache-write-planner"))]
+    async fn prepare_update_item_cache_write(
+        &self,
+        _table_name: &TableName,
+        _key: &KeyAttributes,
+    ) -> StorageResult<Option<storage_cache::RuntimePreparedUpdateCacheWrite>> {
+        Ok(None)
+    }
+
+    async fn update_item_single_node_sync(
+        &self,
+        prepared: PreparedUpdateItem,
+    ) -> StorageResult<UpdateItemResponse> {
+        let PreparedUpdateItem {
+            request,
+            prepared_cache_write,
+            ..
+        } = prepared;
+        let prepared_cache = prepared_update_cache(prepared_cache_write);
         self.execute_with_cache_effects(
             prepared_cache,
             || async {
-                let response = if let Some(route) = route {
-                    let mut routed_requests = WriteTargetSet::new(
-                        route.write_targets.len(),
-                        routed_request,
-                        "update_item.request",
-                    )?;
-                    let mut response = self
-                        .execute_routed_write_targets(
-                            &route,
-                            "update_item routing produced no write targets",
-                            |provider, target, target_index, target_role| {
-                                let request_for_target = routed_requests.take(target_index);
-                                let table_name = target.table_name.clone();
-                                async move {
-                                    let mut request_for_target = request_for_target?;
-                                    request_for_target.table_name = table_name;
-                                    record_storage_operation_for_target(
-                                        "update_item",
-                                        target_role,
-                                        provider.update_item(request_for_target),
-                                    )
-                                    .await
-                                }
-                            },
-                        )
-                        .await?;
-                    if route.storage_mode == NamespaceStorageMode::SharedTable {
-                        normalize_routed_response_attributes(
-                            &self.request_rewriter,
-                            &route.namespace,
-                            &mut response.attributes,
-                        )?;
-                    }
-                    response
-                } else {
-                    let response = record_storage_operation(
+                let response = self
+                    .run_single_node_sync_write_request(
                         "update_item",
-                        self.storage.update_item(routed_request),
+                        SyncWriteRequest::UpdateItem(request),
                     )
                     .await?;
-                    self.maybe_pause_after_storage_write_for_test().await;
-                    self.maybe_run_gsi_maintenance().await;
-                    response
-                };
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
+                sync_response_at(&response, 0, UpdateItemResponse { attributes: None })
+            },
+            |response| async { Ok((response, self.empty_cache_write_effects())) },
+        )
+        .await
+    }
+
+    async fn update_item_unrouted(
+        &self,
+        prepared: PreparedUpdateItem,
+    ) -> StorageResult<UpdateItemResponse> {
+        if let Some(response) = self
+            .try_cached_guarded_update_item_for_prepared(&prepared)
+            .await?
+        {
+            return Ok(response);
+        }
+        let PreparedUpdateItem {
+            request,
+            cache_enabled,
+            customer_return_values,
+            response_operations,
+            prepared_cache_write,
+        } = prepared;
+        let prepared_cache = prepared_update_cache(prepared_cache_write.clone());
+        self.execute_with_cache_effects(
+            prepared_cache,
+            || async {
+                let response = record_storage_operation(
+                    "update_item",
+                    self.storage.update_item(request.clone()),
+                )
+                .await?;
+                self.maybe_pause_after_storage_write_for_test().await;
+                self.maybe_run_gsi_maintenance().await;
                 Ok(response)
             },
-            |mut response| async move {
-                let post_image = if cache_enabled {
-                    match self
-                        .get_item_with_consistent_read(
-                            prepared_update_cache_write.table_name.clone(),
-                            prepared_update_cache_write.key.clone(),
-                            true,
-                        )
-                        .await
-                    {
-                        Ok(item) => item,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                table_name = %prepared_update_cache_write.table_name,
-                                "update_item post-image read failed, invalidating point-read cache entry"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(operations) = response_operations.as_ref() {
-                    let new_item = match post_image.as_ref() {
-                        Some(item) => Some(item.clone().into_attribute_map()?),
-                        None => response.attributes.clone().map(Into::into),
-                    };
-                    response = update_item_response(
-                        operations,
-                        None,
-                        new_item,
-                        customer_return_values.as_ref(),
-                    )?;
-                }
-
-                let cache_effects = cache_write_planner
-                    .finalize_update_item_cache_effects(prepared_update_cache_write, post_image)?;
-                Ok((response, cache_effects))
+            |response| async move {
+                self.finalize_update_item_cache_response(
+                    response,
+                    cache_enabled,
+                    prepared_cache_write,
+                    response_operations,
+                    customer_return_values,
+                )
+                .await
             },
         )
         .await
+    }
+
+    async fn try_cached_guarded_update_item_for_prepared(
+        &self,
+        prepared: &PreparedUpdateItem,
+    ) -> StorageResult<Option<UpdateItemResponse>> {
+        let Some(prepared_cache_write) = prepared.prepared_cache_write.as_ref() else {
+            return Ok(None);
+        };
+        self.try_cached_guarded_update_item(
+            &prepared.request,
+            prepared_cache_write.clone(),
+            prepared.response_operations.clone(),
+            prepared.customer_return_values.clone(),
+        )
+        .await
+    }
+
+    async fn update_item_routed(
+        &self,
+        prepared: PreparedUpdateItem,
+        route: NamespaceRoute,
+    ) -> StorageResult<UpdateItemResponse> {
+        let PreparedUpdateItem {
+            mut request,
+            cache_enabled,
+            customer_return_values,
+            response_operations,
+            prepared_cache_write,
+        } = prepared;
+        if route.storage_mode == NamespaceStorageMode::SharedTable {
+            self.request_rewriter
+                .rewrite_update_for_shared_table(&route.namespace, &mut request)?;
+        }
+
+        let prepared_cache = prepared_update_cache(prepared_cache_write.clone());
+        self.execute_with_cache_effects(
+            prepared_cache,
+            || async {
+                let mut routed_requests =
+                    WriteTargetSet::new(route.write_targets.len(), request, "update_item.request")?;
+                let mut response = self
+                    .execute_routed_write_targets(
+                        &route,
+                        "update_item routing produced no write targets",
+                        |provider, target, target_index, target_role| {
+                            let request_for_target = routed_requests.take(target_index);
+                            let table_name = target.table_name.clone();
+                            async move {
+                                let mut request_for_target = request_for_target?;
+                                request_for_target.table_name = table_name;
+                                record_storage_operation_for_target(
+                                    "update_item",
+                                    target_role,
+                                    provider.update_item(request_for_target),
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await?;
+                if route.storage_mode == NamespaceStorageMode::SharedTable {
+                    normalize_routed_response_attributes(
+                        &self.request_rewriter,
+                        &route.namespace,
+                        &mut response.attributes,
+                    )?;
+                }
+                Ok(response)
+            },
+            |response| async move {
+                self.finalize_update_item_cache_response(
+                    response,
+                    cache_enabled,
+                    prepared_cache_write,
+                    response_operations,
+                    customer_return_values,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn finalize_update_item_cache_response(
+        &self,
+        mut response: UpdateItemResponse,
+        cache_enabled: bool,
+        prepared_update_cache_write: Option<storage_cache::RuntimePreparedUpdateCacheWrite>,
+        response_operations: Option<Vec<String>>,
+        customer_return_values: Option<ReturnValuesOldNewUpdated>,
+    ) -> StorageResult<(UpdateItemResponse, storage_cache::RuntimeWriteEffects)> {
+        let post_image = if cache_enabled {
+            if let Some(prepared_update_cache_write) = prepared_update_cache_write.as_ref() {
+                match self
+                    .get_item_with_consistent_read(
+                        prepared_update_cache_write.table_name.clone(),
+                        prepared_update_cache_write.key.clone(),
+                        true,
+                    )
+                    .await
+                {
+                    Ok(item) => item,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            table_name = %prepared_update_cache_write.table_name,
+                            "update_item post-image read failed, invalidating point-read cache entry"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(operations) = response_operations.as_ref() {
+            let new_item = match post_image.as_ref() {
+                Some(item) => Some(item.clone().into_attribute_map()?),
+                None => response.attributes.clone().map(Into::into),
+            };
+            response =
+                update_item_response(operations, None, new_item, customer_return_values.as_ref())?;
+        }
+
+        let cache_effects =
+            self.finalize_update_item_cache_effects(prepared_update_cache_write, post_image)?;
+        Ok((response, cache_effects))
+    }
+
+    #[cfg(feature = "cache-write-planner")]
+    fn finalize_update_item_cache_effects(
+        &self,
+        prepared_update_cache_write: Option<storage_cache::RuntimePreparedUpdateCacheWrite>,
+        post_image: Option<WireItem>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        if let Some(prepared_update_cache_write) = prepared_update_cache_write {
+            self.cache_write_planner()
+                .finalize_update_item_cache_effects(prepared_update_cache_write, post_image)
+        } else {
+            Ok(self.empty_cache_write_effects())
+        }
+    }
+
+    #[cfg(not(feature = "cache-write-planner"))]
+    fn finalize_update_item_cache_effects(
+        &self,
+        _prepared_update_cache_write: Option<storage_cache::RuntimePreparedUpdateCacheWrite>,
+        _post_image: Option<WireItem>,
+    ) -> StorageResult<storage_cache::RuntimeWriteEffects> {
+        Ok(self.empty_cache_write_effects())
     }
 
     #[expect(
@@ -812,8 +1171,8 @@ impl DatabaseManager {
             return Err(StorageEnum::ConditionalCheckFailed.into());
         }
 
-        let (operations, _) = before_update_item(
-            request.update_expression.as_str(),
+        let (operations, _) = before_update_item_optional(
+            request.update_expression.as_deref(),
             request.condition_expression.as_deref(),
             request.expression_attribute_names.as_ref(),
             request.expression_attribute_values.as_ref(),
@@ -859,9 +1218,8 @@ impl DatabaseManager {
         self.maybe_run_gsi_maintenance().await;
 
         let post_image = Some(WireItem::from_attribute_map(&updated_item)?);
-        let cache_effects = self
-            .cache_write_planner()
-            .finalize_update_item_cache_effects(prepared_update_cache_write, post_image)?;
+        let cache_effects =
+            self.finalize_update_item_cache_effects(Some(prepared_update_cache_write), post_image)?;
         self.cache_services
             .apply_write_effects(&cache_effects)
             .await?;
@@ -896,7 +1254,7 @@ impl DatabaseManager {
         let expression_attribute_names = expression_attribute_names.map(expr_names_to_map);
         let expression_attribute_values = expression_attribute_values.map(expr_values_to_map);
         validate_update_expression_usage(
-            &update_expression,
+            Some(&update_expression),
             condition_expression.as_deref(),
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
@@ -926,6 +1284,21 @@ fn normalize_routed_response_attributes(
     request_rewriter.normalize_item_from_shared_table(namespace, &mut item)?;
     *attributes = Some(item.into());
     Ok(())
+}
+
+fn prepared_update_cache(
+    prepared: Option<storage_cache::RuntimePreparedUpdateCacheWrite>,
+) -> PreparedCacheWrite {
+    prepared
+        .map(|prepared| PreparedCacheWrite::Update(Box::new(prepared)))
+        .unwrap_or_else(|| PreparedCacheWrite::Effects(empty_write_effects()))
+}
+
+fn empty_write_effects() -> storage_cache::RuntimeWriteEffects {
+    storage_cache::RuntimeWriteEffects {
+        point_read: Vec::new(),
+        query_proof: Vec::new(),
+    }
 }
 
 fn sync_response_at<T>(

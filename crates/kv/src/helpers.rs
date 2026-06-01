@@ -33,12 +33,9 @@ pub fn parse_hash_range_key_query<'a>(
 ) -> Option<(&'a AttributeValue, &'a AttributeValue)> {
     // Parse expressions like "pk = :pk_val AND sk = :sk_val"
     let expression_values = expression_attribute_values.as_ref()?;
-    if !key_condition_expression.contains(" AND ") {
-        return None;
-    }
 
-    let (hash_condition, range_condition) = key_condition_expression.split_once(" AND ")?;
-    if range_condition.contains(" AND ") {
+    let (hash_condition, range_condition) = split_once_logical_and(key_condition_expression)?;
+    if split_once_logical_and(range_condition).is_some() {
         return None;
     }
 
@@ -74,19 +71,16 @@ pub fn parse_hash_begins_with_query<'a>(
     let expression_values = expression_attribute_values
         .as_ref()
         .ok_or_else(|| StorageError::validation(StorageValidationKind::BeginsWithRequiresString))?;
-    if !key_condition_expression.contains(" AND ") {
-        return Ok(None);
-    }
     if !key_condition_expression.contains("begins_with(") {
         return Ok(None);
     }
 
     let Some((hash_condition, begins_with_condition)) =
-        key_condition_expression.split_once(" AND ")
+        split_once_logical_and(key_condition_expression)
     else {
         return Ok(None);
     };
-    if begins_with_condition.contains(" AND ") {
+    if split_once_logical_and(begins_with_condition).is_some() {
         return Ok(None);
     }
 
@@ -139,9 +133,7 @@ pub fn parse_hash_between_query<'a>(
     let Some(expression_values) = expression_attribute_values else {
         return None;
     };
-    if !key_condition_expression.contains(" AND ")
-        || !key_condition_expression.contains(" BETWEEN ")
-    {
+    if !key_condition_expression.contains(" BETWEEN ") {
         return None;
     }
 
@@ -152,8 +144,7 @@ pub fn parse_hash_between_query<'a>(
     let between_and_after = key_condition_expression.get(between_pos..)?.trim();
 
     // Find the last " AND " before BETWEEN to separate hash key condition
-    let last_and_pos = before_between.rfind(" AND ")?;
-    let hash_part = before_between.get(..last_and_pos)?.trim();
+    let (hash_part, _) = split_last_logical_and(before_between)?;
 
     // Parse hash key condition
     let hash_value = parse_single_condition(hash_part, expression_values)?;
@@ -188,12 +179,8 @@ pub fn parse_hash_comparison_query<'a>(
     let Some(expression_values) = expression_attribute_values else {
         return None;
     };
-    if !key_condition_expression.contains(" AND ") {
-        return None;
-    }
-
-    let (hash_condition, comparison_part) = key_condition_expression.split_once(" AND ")?;
-    if comparison_part.contains(" AND ") {
+    let (hash_condition, comparison_part) = split_once_logical_and(key_condition_expression)?;
+    if split_once_logical_and(comparison_part).is_some() {
         return None;
     }
 
@@ -236,13 +223,15 @@ pub fn parse_hash_bounded_comparison_query<'a>(
     &'a AttributeValue,
 )> {
     let expression_values = expression_attribute_values.as_ref()?;
-    let mut parts = key_condition_expression.split(" AND ");
-    let hash_condition = parts.next()?;
-    let first_range_condition = parts.next()?;
-    let second_range_condition = parts.next()?;
-    if parts.next().is_some() {
+    let parts = split_logical_and(key_condition_expression);
+    let [
+        hash_condition,
+        first_range_condition,
+        second_range_condition,
+    ] = parts.as_slice()
+    else {
         return None;
-    }
+    };
 
     let hash_value = parse_single_condition(hash_condition, expression_values)?;
     let (first_operator, first_value) =
@@ -267,6 +256,70 @@ pub fn parse_hash_bounded_comparison_query<'a>(
         )),
         _ => None,
     }
+}
+
+fn split_once_logical_and(expression: &str) -> Option<(&str, &str)> {
+    let (start, end) = logical_and_spans(expression).next()?;
+    Some((
+        expression.get(..start)?.trim(),
+        expression.get(end..)?.trim(),
+    ))
+}
+
+fn split_last_logical_and(expression: &str) -> Option<(&str, &str)> {
+    let (start, end) = logical_and_spans(expression).last()?;
+    Some((
+        expression.get(..start)?.trim(),
+        expression.get(end..)?.trim(),
+    ))
+}
+
+fn split_logical_and(expression: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    for (and_start, and_end) in logical_and_spans(expression) {
+        if let Some(part) = expression.get(start..and_start) {
+            parts.push(part.trim());
+        }
+        start = and_end;
+    }
+    if let Some(part) = expression.get(start..) {
+        parts.push(part.trim());
+    }
+    parts
+}
+
+fn logical_and_spans(expression: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    expression.match_indices("AND").filter_map(|(index, _)| {
+        let before = expression.get(..index)?.chars().next_back();
+        let after = expression.get(index + 3..)?.chars().next();
+        before
+            .is_some_and(char::is_whitespace)
+            .then_some(())
+            .filter(|_| after.is_some_and(char::is_whitespace))
+            .map(|()| {
+                let start = expression
+                    .get(..index)
+                    .and_then(|prefix| {
+                        prefix
+                            .char_indices()
+                            .rev()
+                            .find(|(_, ch)| !ch.is_whitespace())
+                            .map(|(idx, ch)| idx + ch.len_utf8())
+                    })
+                    .unwrap_or(index);
+                let end = expression
+                    .get(index + 3..)
+                    .and_then(|suffix| {
+                        suffix
+                            .char_indices()
+                            .find(|(_, ch)| !ch.is_whitespace())
+                            .map(|(idx, _)| index + 3 + idx)
+                    })
+                    .unwrap_or(index + 3);
+                (start, end)
+            })
+    })
 }
 
 fn parse_range_comparison<'a>(

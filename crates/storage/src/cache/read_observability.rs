@@ -1,4 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicU64, Ordering},
+};
+
+use metrics::{Counter, Gauge};
 
 use crate::constants::{
     STORAGE_DDB_AUTHORITATIVE_PREIMAGE_HIT_METRIC, STORAGE_DDB_AUTHORITATIVE_PREIMAGE_MISS_METRIC,
@@ -19,6 +24,90 @@ static BATCH_GET_ITEM_CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUERY_CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUERY_CACHE_HIT_PARTIAL_COUNT: AtomicU64 = AtomicU64::new(0);
 static QUERY_CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct CacheReadOutcomeMetricHandles {
+    get_item_hit: Counter,
+    get_item_miss: Counter,
+    batch_get_item_hit: Counter,
+    batch_get_item_hit_partial: Counter,
+    batch_get_item_miss: Counter,
+    query_hit: Counter,
+    query_hit_partial: Counter,
+    query_miss: Counter,
+}
+
+struct CacheHitRatioMetricHandles {
+    get_item: Gauge,
+    batch_get_item: Gauge,
+    query: Gauge,
+}
+
+struct GuardFallbackMetricHandles {
+    guard_conflict_put_item: Counter,
+    guard_conflict_delete_item: Counter,
+    guard_conflict_update_item: Counter,
+    unsupported_put_item: Counter,
+    unsupported_delete_item: Counter,
+    unsupported_update_item: Counter,
+}
+
+static CACHE_READ_OUTCOME_METRICS: LazyLock<CacheReadOutcomeMetricHandles> =
+    LazyLock::new(|| CacheReadOutcomeMetricHandles {
+        get_item_hit: metrics::counter!(STORAGE_DDB_GET_ITEM_CACHE_HIT_METRIC.name()),
+        get_item_miss: metrics::counter!(STORAGE_DDB_GET_ITEM_CACHE_MISS_METRIC.name()),
+        batch_get_item_hit: metrics::counter!(STORAGE_DDB_BATCH_GET_ITEM_CACHE_HIT_METRIC.name()),
+        batch_get_item_hit_partial: metrics::counter!(
+            STORAGE_DDB_BATCH_GET_ITEM_CACHE_HIT_PARTIAL_METRIC.name()
+        ),
+        batch_get_item_miss: metrics::counter!(STORAGE_DDB_BATCH_GET_ITEM_CACHE_MISS_METRIC.name()),
+        query_hit: metrics::counter!(STORAGE_DDB_QUERY_CACHE_HIT_METRIC.name()),
+        query_hit_partial: metrics::counter!(STORAGE_DDB_QUERY_CACHE_HIT_PARTIAL_METRIC.name()),
+        query_miss: metrics::counter!(STORAGE_DDB_QUERY_CACHE_MISS_METRIC.name()),
+    });
+
+static CACHE_HIT_RATIO_METRICS: LazyLock<CacheHitRatioMetricHandles> =
+    LazyLock::new(|| CacheHitRatioMetricHandles {
+        get_item: metrics::gauge!(
+            STORAGE_DDB_CACHE_HIT_RATIO_METRIC.name(),
+            "operation" => "get_item",
+        ),
+        batch_get_item: metrics::gauge!(
+            STORAGE_DDB_CACHE_HIT_RATIO_METRIC.name(),
+            "operation" => "batch_get_item",
+        ),
+        query: metrics::gauge!(
+            STORAGE_DDB_CACHE_HIT_RATIO_METRIC.name(),
+            "operation" => "query",
+        ),
+    });
+
+static GUARD_FALLBACK_METRICS: LazyLock<GuardFallbackMetricHandles> =
+    LazyLock::new(|| GuardFallbackMetricHandles {
+        guard_conflict_put_item: metrics::counter!(
+            STORAGE_DDB_GUARD_CONFLICT_FALLBACK_METRIC.name(),
+            "operation" => "put_item",
+        ),
+        guard_conflict_delete_item: metrics::counter!(
+            STORAGE_DDB_GUARD_CONFLICT_FALLBACK_METRIC.name(),
+            "operation" => "delete_item",
+        ),
+        guard_conflict_update_item: metrics::counter!(
+            STORAGE_DDB_GUARD_CONFLICT_FALLBACK_METRIC.name(),
+            "operation" => "update_item",
+        ),
+        unsupported_put_item: metrics::counter!(
+            STORAGE_DDB_GUARD_UNSUPPORTED_FALLBACK_METRIC.name(),
+            "operation" => "put_item",
+        ),
+        unsupported_delete_item: metrics::counter!(
+            STORAGE_DDB_GUARD_UNSUPPORTED_FALLBACK_METRIC.name(),
+            "operation" => "delete_item",
+        ),
+        unsupported_update_item: metrics::counter!(
+            STORAGE_DDB_GUARD_UNSUPPORTED_FALLBACK_METRIC.name(),
+            "operation" => "update_item",
+        ),
+    });
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
 pub struct StorageCacheReadDiagnostics {
@@ -56,42 +145,42 @@ pub fn record_storage_cache_read_outcome(
     let metric = match (operation, outcome) {
         (StorageCacheReadOperation::GetItem, StorageCacheReadOutcome::Hit) => {
             GET_ITEM_CACHE_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_GET_ITEM_CACHE_HIT_METRIC
+            &CACHE_READ_OUTCOME_METRICS.get_item_hit
         }
         (StorageCacheReadOperation::GetItem, StorageCacheReadOutcome::Miss) => {
             GET_ITEM_CACHE_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_GET_ITEM_CACHE_MISS_METRIC
+            &CACHE_READ_OUTCOME_METRICS.get_item_miss
         }
         (StorageCacheReadOperation::GetItem, StorageCacheReadOutcome::HitPartial) => {
             GET_ITEM_CACHE_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_GET_ITEM_CACHE_MISS_METRIC
+            &CACHE_READ_OUTCOME_METRICS.get_item_miss
         }
         (StorageCacheReadOperation::BatchGetItem, StorageCacheReadOutcome::Hit) => {
             BATCH_GET_ITEM_CACHE_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_BATCH_GET_ITEM_CACHE_HIT_METRIC
+            &CACHE_READ_OUTCOME_METRICS.batch_get_item_hit
         }
         (StorageCacheReadOperation::BatchGetItem, StorageCacheReadOutcome::Miss) => {
             BATCH_GET_ITEM_CACHE_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_BATCH_GET_ITEM_CACHE_MISS_METRIC
+            &CACHE_READ_OUTCOME_METRICS.batch_get_item_miss
         }
         (StorageCacheReadOperation::BatchGetItem, StorageCacheReadOutcome::HitPartial) => {
             BATCH_GET_ITEM_CACHE_HIT_PARTIAL_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_BATCH_GET_ITEM_CACHE_HIT_PARTIAL_METRIC
+            &CACHE_READ_OUTCOME_METRICS.batch_get_item_hit_partial
         }
         (StorageCacheReadOperation::Query, StorageCacheReadOutcome::Hit) => {
             QUERY_CACHE_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_QUERY_CACHE_HIT_METRIC
+            &CACHE_READ_OUTCOME_METRICS.query_hit
         }
         (StorageCacheReadOperation::Query, StorageCacheReadOutcome::Miss) => {
             QUERY_CACHE_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_QUERY_CACHE_MISS_METRIC
+            &CACHE_READ_OUTCOME_METRICS.query_miss
         }
         (StorageCacheReadOperation::Query, StorageCacheReadOutcome::HitPartial) => {
             QUERY_CACHE_HIT_PARTIAL_COUNT.fetch_add(1, Ordering::Relaxed);
-            STORAGE_DDB_QUERY_CACHE_HIT_PARTIAL_METRIC
+            &CACHE_READ_OUTCOME_METRICS.query_hit_partial
         }
     };
-    metrics_facade::counter!(metric).increment(1);
+    metric.increment(1);
     record_cache_hit_ratio(operation);
 }
 
@@ -125,16 +214,33 @@ pub fn storage_cache_read_diagnostics() -> StorageCacheReadDiagnostics {
 }
 
 fn record_cache_hit_ratio(operation: StorageCacheReadOperation) {
-    let diagnostics = storage_cache_read_diagnostics();
-    let (operation_label, ratio) = match operation {
-        StorageCacheReadOperation::GetItem => ("get_item", diagnostics.get_item_hit_ratio),
-        StorageCacheReadOperation::BatchGetItem => {
-            ("batch_get_item", diagnostics.batch_get_item_hit_ratio)
-        }
-        StorageCacheReadOperation::Query => ("query", diagnostics.query_hit_ratio),
+    let (gauge, ratio) = match operation {
+        StorageCacheReadOperation::GetItem => (
+            &CACHE_HIT_RATIO_METRICS.get_item,
+            hit_ratio(
+                GET_ITEM_CACHE_HIT_COUNT.load(Ordering::Relaxed),
+                0,
+                GET_ITEM_CACHE_MISS_COUNT.load(Ordering::Relaxed),
+            ),
+        ),
+        StorageCacheReadOperation::BatchGetItem => (
+            &CACHE_HIT_RATIO_METRICS.batch_get_item,
+            hit_ratio(
+                BATCH_GET_ITEM_CACHE_HIT_COUNT.load(Ordering::Relaxed),
+                BATCH_GET_ITEM_CACHE_HIT_PARTIAL_COUNT.load(Ordering::Relaxed),
+                BATCH_GET_ITEM_CACHE_MISS_COUNT.load(Ordering::Relaxed),
+            ),
+        ),
+        StorageCacheReadOperation::Query => (
+            &CACHE_HIT_RATIO_METRICS.query,
+            hit_ratio(
+                QUERY_CACHE_HIT_COUNT.load(Ordering::Relaxed),
+                QUERY_CACHE_HIT_PARTIAL_COUNT.load(Ordering::Relaxed),
+                QUERY_CACHE_MISS_COUNT.load(Ordering::Relaxed),
+            ),
+        ),
     };
-    metrics_facade::gauge!(STORAGE_DDB_CACHE_HIT_RATIO_METRIC, "operation" => operation_label)
-        .set(ratio);
+    gauge.set(ratio);
 }
 
 fn hit_ratio(hits: u64, partial_hits: u64, misses: u64) -> f64 {
@@ -164,9 +270,40 @@ pub fn record_authoritative_preimage_miss(purpose: &'static str) {
 }
 
 pub fn record_guard_fallback(operation: &'static str, reason: StorageGuardFallbackReason) {
+    if let Some(metric) = guard_fallback_metric(operation, reason) {
+        metric.increment(1);
+        return;
+    }
     let metric = match reason {
         StorageGuardFallbackReason::GuardConflict => STORAGE_DDB_GUARD_CONFLICT_FALLBACK_METRIC,
         StorageGuardFallbackReason::Unsupported => STORAGE_DDB_GUARD_UNSUPPORTED_FALLBACK_METRIC,
     };
     metrics_facade::counter!(metric, "operation" => operation).increment(1);
+}
+
+fn guard_fallback_metric(
+    operation: &'static str,
+    reason: StorageGuardFallbackReason,
+) -> Option<&'static Counter> {
+    match (operation, reason) {
+        ("put_item", StorageGuardFallbackReason::GuardConflict) => {
+            Some(&GUARD_FALLBACK_METRICS.guard_conflict_put_item)
+        }
+        ("delete_item", StorageGuardFallbackReason::GuardConflict) => {
+            Some(&GUARD_FALLBACK_METRICS.guard_conflict_delete_item)
+        }
+        ("update_item", StorageGuardFallbackReason::GuardConflict) => {
+            Some(&GUARD_FALLBACK_METRICS.guard_conflict_update_item)
+        }
+        ("put_item", StorageGuardFallbackReason::Unsupported) => {
+            Some(&GUARD_FALLBACK_METRICS.unsupported_put_item)
+        }
+        ("delete_item", StorageGuardFallbackReason::Unsupported) => {
+            Some(&GUARD_FALLBACK_METRICS.unsupported_delete_item)
+        }
+        ("update_item", StorageGuardFallbackReason::Unsupported) => {
+            Some(&GUARD_FALLBACK_METRICS.unsupported_update_item)
+        }
+        _ => None,
+    }
 }

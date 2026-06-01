@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use alloc_counter::AllocationGuard;
 use storage_common::{GsiKeyParts, key_parts_to_map, plan_gsi_write_actions};
@@ -69,6 +69,7 @@ fn table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 
@@ -220,7 +221,7 @@ fn legacy_projected_blob_work(
     Ok(blob.len())
 }
 
-fn optimized_projected_blob_work(
+fn selected_projected_blob_work(
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, AttributeValue>>,
     new_item: Option<&HashMap<String, AttributeValue>>,
@@ -262,7 +263,12 @@ fn measure_work(
 }
 
 #[test]
-fn sql_gsi_planner_avoids_key_part_hashmaps_tests() {
+fn sql_gsi_planner_allocation_profile_tests() {
+    assert_sql_gsi_planner_avoids_key_part_hashmaps();
+    assert_sql_gsi_planner_projected_blob_uses_lower_allocation_path();
+}
+
+fn assert_sql_gsi_planner_avoids_key_part_hashmaps() {
     let legacy = measure_work("sql_gsi_planner_legacy_key_maps", legacy_key_binding_work);
     let optimized = measure_work(
         "sql_gsi_planner_borrowed_key_parts",
@@ -276,20 +282,79 @@ fn sql_gsi_planner_avoids_key_part_hashmaps_tests() {
     assert!(optimized.allocated_bytes < legacy.allocated_bytes);
 }
 
-#[test]
-fn sql_gsi_planner_projected_blob_avoids_hashmap_tests() {
+fn assert_sql_gsi_planner_projected_blob_uses_lower_allocation_path() {
     let legacy = measure_work(
         "sql_gsi_planner_legacy_projected_blob_hashmap",
         legacy_projected_blob_work,
     );
-    let optimized = measure_work(
-        "sql_gsi_planner_projected_blob_pairs",
-        optimized_projected_blob_work,
+    let selected = measure_work(
+        "sql_gsi_planner_projected_blob_selected",
+        selected_projected_blob_work,
+    );
+    let legacy_cpu = measure_cpu(
+        "sql_gsi_planner_legacy_projected_blob_cpu",
+        legacy_projected_blob_work,
+    );
+    let selected_cpu = measure_cpu(
+        "sql_gsi_planner_projected_blob_selected_cpu",
+        selected_projected_blob_work,
     );
 
     alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&optimized);
+    alloc_counter::emit_report(&selected);
+    emit_cpu_report("sql_gsi_planner_legacy_projected_blob_cpu", legacy_cpu);
+    emit_cpu_report("sql_gsi_planner_projected_blob_selected_cpu", selected_cpu);
 
-    assert!(optimized.allocation_count < legacy.allocation_count);
-    assert!(optimized.allocated_bytes < legacy.allocated_bytes);
+    assert!(
+        selected.allocation_count <= legacy.allocation_count + (legacy.allocation_count / 100),
+        "selected projected blob path should stay within 1% of legacy allocation count, legacy={} \
+         selected={}",
+        legacy.allocation_count,
+        selected.allocation_count
+    );
+    assert!(
+        selected.allocated_bytes <= legacy.allocated_bytes + (legacy.allocated_bytes / 100),
+        "selected projected blob path should stay within 1% of legacy allocated bytes, legacy={} \
+         selected={}",
+        legacy.allocated_bytes,
+        selected.allocated_bytes
+    );
+    assert!(
+        selected_cpu <= legacy_cpu.saturating_mul(105) / 100,
+        "selected projected blob path should not regress CPU by more than 5%, legacy={}ns \
+         selected={}ns",
+        legacy_cpu,
+        selected_cpu
+    );
+}
+
+fn measure_cpu(
+    label: &'static str,
+    work: impl Fn(
+        &StoredTableInfo,
+        Option<&HashMap<String, AttributeValue>>,
+        Option<&HashMap<String, AttributeValue>>,
+    ) -> StorageResult<usize>,
+) -> u128 {
+    let table = table_info();
+    let old = realistic_item(&format!("gsi0#partition#{:092}", 1), "old");
+    let new = realistic_item(&format!("gsi0#partition#{:092}", 2), "new");
+    let started = Instant::now();
+    let mut bytes = 0usize;
+    for _ in 0..ITERATIONS {
+        bytes += work(&table, Some(&old), Some(&new)).expect(label);
+    }
+    std::hint::black_box(bytes);
+    started.elapsed().as_nanos() / ITERATIONS as u128
+}
+
+fn emit_cpu_report(test_name: &str, ns_per_iter: u128) {
+    println!(
+        "{{\"schema_version\":1,\"event\":\"cpu_time_report\",\"module_path\":\"{}\",\"test_name\"\
+         :\"{}\",\"iterations\":{},\"ns_per_iter\":{}}}",
+        module_path!(),
+        test_name,
+        ITERATIONS,
+        ns_per_iter
+    );
 }

@@ -3,12 +3,15 @@ mod storage_manager_impl_append_table_stream_record;
 mod storage_manager_impl_batch_get_item;
 mod storage_manager_impl_batch_write_item;
 mod storage_manager_impl_clear_all_tables;
+mod storage_manager_impl_condition_failure;
 mod storage_manager_impl_consumed_capacity;
 mod storage_manager_impl_create_table;
 mod storage_manager_impl_delete_item;
 mod storage_manager_impl_delete_table;
 mod storage_manager_impl_describe_table;
 mod storage_manager_impl_describe_time_to_live;
+mod storage_manager_impl_dynamodb_streams;
+mod storage_manager_impl_expression;
 mod storage_manager_impl_get_item;
 mod storage_manager_impl_get_stream_records;
 mod storage_manager_impl_list_tables;
@@ -40,6 +43,10 @@ mod storage_manager_impl_consumed_capacity_alloc_tests;
 mod storage_manager_impl_delete_table_tests;
 #[cfg(test)]
 mod storage_manager_impl_describe_table_tests;
+#[cfg(test)]
+mod storage_manager_impl_query_perf_tests;
+#[cfg(test)]
+mod storage_manager_impl_read_perf_tests;
 #[cfg(test)]
 mod storage_manager_impl_sync_write_proposer_tests;
 #[cfg(test)]

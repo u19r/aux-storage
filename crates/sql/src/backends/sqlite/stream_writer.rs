@@ -310,6 +310,13 @@ fn encode_wire_item_stream_bytes(item: &WireItem) -> Result<Vec<u8>, StorageErro
 }
 
 pub(crate) fn should_write_stream_entries(table_info: &StoredTableInfo) -> bool {
+    should_write_stream_entries_for_gsi_mode(table_info, false)
+}
+
+pub(crate) fn should_write_stream_entries_for_gsi_mode(
+    table_info: &StoredTableInfo,
+    immediate_gsi_consistency: bool,
+) -> bool {
     let stream_enabled = table_info
         .stream_specification
         .as_ref()
@@ -320,5 +327,5 @@ pub(crate) fn should_write_stream_entries(table_info: &StoredTableInfo) -> bool 
         .as_ref()
         .is_some_and(|indexes| indexes.iter().any(|idx| !is_ttl_index(&idx.index_name)));
 
-    stream_enabled || has_gsi
+    stream_enabled || (has_gsi && !immediate_gsi_consistency)
 }

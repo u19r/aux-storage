@@ -1,11 +1,11 @@
-use rust_decimal::Decimal;
-
 use crate::{
     AttributeValue, IndexKey, IndexKeyPrefix, IndexName, ItemKey, SerializesToKey, StreamItemId,
     StreamKey, StreamName, TableKey, TableName,
     item_key::{ItemKeyEnum, ItemKeyError},
-    numeric::SortableVec as _,
 };
+
+const DYNAMODB_NUMBER_KEY_EXPONENT_BIAS: i32 = 1000;
+const DYNAMODB_NUMBER_KEY_DIGITS: usize = 38;
 
 impl ItemKey {
     #[must_use]
@@ -155,17 +155,150 @@ impl ItemKey {
 fn serialize_attribute_value(attribute_value: &AttributeValue) -> Result<Vec<u8>, ItemKeyError> {
     match attribute_value {
         AttributeValue::S(s) => Ok(s.as_bytes().to_vec()),
-        AttributeValue::N(n) => {
-            // Convert string number to Decimal and encode
-            let decimal = Decimal::from_str_exact(n)
-                .map_err(|e| ItemKeyEnum::Deserialization(e.to_string()))?;
-
-            Ok(decimal.encode())
-        }
+        AttributeValue::N(n) => encode_dynamodb_number_key(n),
         AttributeValue::B(b) => Ok(b.as_bytes().to_vec()),
         _ => Err(ItemKeyEnum::Validation(
             "Only S, N, and B types are supported for keys".to_string(),
         )
         .into()),
+    }
+}
+
+fn encode_dynamodb_number_key(raw: &str) -> Result<Vec<u8>, ItemKeyError> {
+    let parsed = ParsedDynamodbNumber::parse(raw)
+        .map_err(|message| ItemKeyEnum::Deserialization(message.to_string()))?;
+    let Some(parsed) = parsed else {
+        return Ok(vec![1]);
+    };
+
+    let biased_exponent = parsed.adjusted_exponent + DYNAMODB_NUMBER_KEY_EXPONENT_BIAS;
+    let biased_exponent = u16::try_from(biased_exponent)
+        .map_err(|err| ItemKeyEnum::Deserialization(err.to_string()))?;
+    let mut payload = Vec::with_capacity(2 + DYNAMODB_NUMBER_KEY_DIGITS);
+    payload.extend_from_slice(&biased_exponent.to_be_bytes());
+    payload.extend_from_slice(parsed.digits.as_bytes());
+    payload.resize(2 + DYNAMODB_NUMBER_KEY_DIGITS, b'0');
+
+    if parsed.negative {
+        let mut encoded = Vec::with_capacity(1 + payload.len());
+        encoded.push(0);
+        encoded.extend(payload.into_iter().map(|byte| !byte));
+        Ok(encoded)
+    } else {
+        let mut encoded = Vec::with_capacity(1 + payload.len());
+        encoded.push(2);
+        encoded.extend(payload);
+        Ok(encoded)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDynamodbNumber {
+    negative: bool,
+    adjusted_exponent: i32,
+    digits: String,
+}
+
+impl ParsedDynamodbNumber {
+    fn parse(raw: &str) -> Result<Option<Self>, &'static str> {
+        let bytes = raw.as_bytes();
+        if bytes.is_empty() {
+            return Err("empty number");
+        }
+
+        let mut index = 0usize;
+        let negative = match bytes.first() {
+            Some(b'-') => {
+                index += 1;
+                true
+            }
+            Some(b'+') => {
+                index += 1;
+                false
+            }
+            _ => false,
+        };
+
+        let mut digits = String::new();
+        let mut fractional_digits = 0i32;
+        let mut saw_digit = false;
+
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            saw_digit = true;
+            digits.push(bytes[index] as char);
+            index += 1;
+        }
+
+        if bytes.get(index) == Some(&b'.') {
+            index += 1;
+            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+                saw_digit = true;
+                digits.push(bytes[index] as char);
+                fractional_digits += 1;
+                index += 1;
+            }
+        }
+
+        if !saw_digit {
+            return Err("number must contain a digit");
+        }
+
+        let mut exponent = 0i32;
+        if matches!(bytes.get(index), Some(b'e') | Some(b'E')) {
+            index += 1;
+            let exponent_sign = match bytes.get(index) {
+                Some(b'-') => {
+                    index += 1;
+                    -1
+                }
+                Some(b'+') => {
+                    index += 1;
+                    1
+                }
+                _ => 1,
+            };
+            let exponent_start = index;
+            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+                index += 1;
+            }
+            if exponent_start == index {
+                return Err("invalid exponent");
+            }
+            let exponent_value = raw
+                .get(exponent_start..index)
+                .ok_or("invalid exponent")?
+                .parse::<i32>()
+                .map_err(|_| "invalid exponent")?;
+            exponent = exponent_value * exponent_sign;
+        }
+
+        if index != bytes.len() {
+            return Err("invalid number");
+        }
+
+        let leading_zeroes = digits.bytes().take_while(|byte| *byte == b'0').count();
+        digits.drain(..leading_zeroes);
+        if digits.is_empty() {
+            return Ok(None);
+        }
+
+        let trailing_zeroes = digits
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'0')
+            .count();
+        if trailing_zeroes > 0 {
+            let new_len = digits.len() - trailing_zeroes;
+            digits.truncate(new_len);
+        }
+
+        let exponent = exponent - fractional_digits + i32::try_from(trailing_zeroes).unwrap_or(0);
+        let adjusted_exponent = i32::try_from(digits.len()).unwrap_or(i32::MAX) + exponent - 1;
+
+        Ok(Some(Self {
+            negative,
+            adjusted_exponent,
+            digits,
+        }))
     }
 }

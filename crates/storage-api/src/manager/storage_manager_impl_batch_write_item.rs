@@ -16,7 +16,7 @@ impl StorageApiManagerImpl {
             .propose_sync_write_if_configured(SyncWriteRequest::BatchWriteItem(request.clone()))
             .await?
         {
-            return Ok(Response::BatchWriteItem(sync_response_at(
+            let response = sync_response_at(
                 &response,
                 0,
                 BatchWriteItemResponse {
@@ -24,11 +24,22 @@ impl StorageApiManagerImpl {
                     item_collection_metrics: None,
                     consumed_capacity: None,
                 },
-            )?));
+            )?;
+            return Ok(Response::BatchWriteItem(normalize_batch_write_response(
+                response,
+            )));
         }
 
-        Ok(Response::BatchWriteItem(
-            self.db().batch_write_item(request).await?,
-        ))
+        let response = self.db().batch_write_item(request).await?;
+        Ok(Response::BatchWriteItem(normalize_batch_write_response(
+            response,
+        )))
     }
+}
+
+fn normalize_batch_write_response(mut response: BatchWriteItemResponse) -> BatchWriteItemResponse {
+    response
+        .unprocessed_items
+        .get_or_insert_with(std::collections::HashMap::new);
+    response
 }

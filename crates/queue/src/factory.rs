@@ -79,6 +79,7 @@ pub async fn create_queue_provider(config: QueueConfig) -> QueueResult<Box<dyn Q
             let provider = PostgresStorageProvider::new_with_tls(
                 &settings.dsn,
                 settings.max_pool_size,
+                settings.background_max_pool_size,
                 settings.tls,
             )
             .await?;

@@ -13,6 +13,7 @@ rocksdb = ["storage-types/rocksdb"]
 async-trait = { workspace = true }
 bg-jobs = { path = "../bg-jobs" }
 md5 = { workspace = true }
+metrics = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }

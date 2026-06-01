@@ -72,6 +72,8 @@ pub use crate::database_manager::{
 };
 
 #[cfg(test)]
+mod read_ops_projection_perf_tests;
+#[cfg(test)]
 mod read_ops_tests;
 #[cfg(test)]
 mod replication_ops_tests;

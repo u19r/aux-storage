@@ -189,7 +189,7 @@ fn update_request(table_name: &TableName, iteration: usize) -> UpdateItemRequest
             "pk".to_string(),
             AttributeValue::S(format!("item#{iteration:04}")),
         )])),
-        update_expression: "SET #status = :status, #payload = :payload".to_string(),
+        update_expression: Some("SET #status = :status, #payload = :payload".to_string()),
         attribute_updates: None,
         condition_expression: Some("#status = :old_status".to_string()),
         expression_attribute_names: Some(HashMap::from([

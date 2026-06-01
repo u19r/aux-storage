@@ -3,15 +3,20 @@ use std::collections::HashMap;
 use http_error::HttpApiError;
 use storage::{QueryIndexInput, QueryTableInput};
 use storage_types::{
-    AttributeValue, IndexName, QueryRequest, QueryResponse, StoredTableInfo, TableName, WireItem,
+    AttributeValue, IndexName, KeySchemaElement, QueryRequest, QueryResponse, StorageEnum,
+    StorageError, StoredTableInfo, TableName, WireItem, context::WrappedError,
     subset_expression_attribute_names_for_expression,
     subset_expression_attribute_values_for_expression, validate_expression_attribute_usage,
+    validate_key_attribute_value_for_schema,
 };
 
 use crate::{
     manager::{
         StorageApiManagerImpl,
         storage_manager_impl_consumed_capacity::calculate_consumed_capacity_from_inputs,
+        storage_manager_impl_expression::{
+            apply_filter_expression_refs, apply_projection_expression_refs,
+        },
         storage_manager_impl_read_pagination::{
             page_token_to_key_attributes, paginate_items_by_response_bytes,
             paginate_wire_items_by_response_bytes, resolve_exclusive_start_key,
@@ -57,6 +62,7 @@ impl StorageApiManagerImpl {
         );
 
         let table_info = self.db().get_table_info(&request.table_name).await?;
+        validate_query_key_condition_values(&request, &table_info)?;
         let exclusive_start_key = resolve_exclusive_start_key(
             request.exclusive_start_key.as_ref(),
             &table_info,
@@ -66,14 +72,14 @@ impl StorageApiManagerImpl {
         .map_err(HttpApiError::from)?;
         let prepared_query = PreparedQuery::from_request(
             &request,
-            exclusive_start_key,
-            key_expression_attribute_names,
-            key_expression_attribute_values,
+            exclusive_start_key.as_deref(),
+            key_expression_attribute_names.as_ref(),
+            key_expression_attribute_values.as_ref(),
         );
 
         if query_wire_fast_path_enabled(&request) {
             return self
-                .query_wire_internal(request, table_info, prepared_query)
+                .query_wire_internal(&request, table_info, prepared_query)
                 .await;
         }
 
@@ -152,9 +158,9 @@ impl StorageApiManagerImpl {
 
     async fn query_wire_internal(
         &self,
-        request: QueryRequest,
+        request: &QueryRequest,
         table_info: StoredTableInfo,
-        prepared_query: PreparedQuery,
+        prepared_query: PreparedQuery<'_>,
     ) -> Result<Response, HttpApiError> {
         let (items, last_evaluated_key) = self.query_wire_items(&prepared_query).await?;
 
@@ -193,9 +199,9 @@ impl StorageApiManagerImpl {
 
     async fn query_map_items(
         &self,
-        query: &PreparedQuery,
+        query: &PreparedQuery<'_>,
     ) -> Result<(Vec<HashMap<String, AttributeValue>>, Option<String>), HttpApiError> {
-        if let Some(index_name) = query.index_name.clone() {
+        if let Some(index_name) = query.index_name {
             return Ok(self
                 .db()
                 .query_index_map(query.index_input(index_name)?)
@@ -208,9 +214,9 @@ impl StorageApiManagerImpl {
 
     async fn query_wire_items(
         &self,
-        query: &PreparedQuery,
+        query: &PreparedQuery<'_>,
     ) -> Result<(Vec<WireItem>, Option<String>), HttpApiError> {
-        if let Some(index_name) = query.index_name.clone() {
+        if let Some(index_name) = query.index_name {
             return Ok(self
                 .db()
                 .query_index(query.index_input(index_name)?)
@@ -222,35 +228,327 @@ impl StorageApiManagerImpl {
     }
 }
 
+pub(super) fn validate_query_key_condition_values(
+    request: &QueryRequest,
+    table_info: &StoredTableInfo,
+) -> Result<(), HttpApiError> {
+    let key_schema = query_key_schema(table_info, request.index_name.as_ref())?;
+    let Some(values) = request.expression_attribute_values.as_ref() else {
+        return Ok(());
+    };
+    let tokens = tokenize_key_condition_expression(&request.key_condition_expression);
+
+    for (schema, value_token) in key_condition_value_tokens(
+        &tokens,
+        request.expression_attribute_names.as_ref(),
+        key_schema,
+    ) {
+        let Some(value) = values.get(value_token) else {
+            continue;
+        };
+        validate_key_attribute_value_for_schema(schema, value)
+            .map_err(query_key_validation_error)?;
+    }
+
+    Ok(())
+}
+
+fn query_key_schema<'a>(
+    table_info: &'a StoredTableInfo,
+    index_name: Option<&IndexName>,
+) -> Result<&'a [KeySchemaElement], HttpApiError> {
+    let Some(index_name) = index_name else {
+        return Ok(&table_info.key_schema);
+    };
+    let Some(index) = table_info
+        .global_secondary_indexes
+        .as_ref()
+        .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+    else {
+        return Ok(&table_info.key_schema);
+    };
+    Ok(&index.key_schema)
+}
+
+fn query_key_validation_error(error: StorageError) -> HttpApiError {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return HttpApiError::from(error);
+    };
+    if message == "The parameter cannot be converted to a numeric value" {
+        return HttpApiError::from(StorageError::validation(
+            "The parameter cannot be converted to a numeric value: ",
+        ));
+    }
+    if message == "Attempting to store more than 38 significant digits in a Number"
+        || message
+            == "Number underflow. Attempting to store a number with magnitude smaller than \
+                supported range"
+    {
+        return HttpApiError::from(StorageError::raw_validation(message.clone()));
+    }
+    HttpApiError::from(StorageError::validation(message.clone()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyConditionToken<'a> {
+    Identifier(&'a str),
+    Value(&'a str),
+    Function(&'a str),
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Between,
+    And,
+    LeftParen,
+    RightParen,
+    Comma,
+}
+
+pub(super) fn tokenize_key_condition_expression(expression: &str) -> Vec<KeyConditionToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut chars = expression.char_indices().peekable();
+
+    while let Some((start, ch)) = chars.next() {
+        match ch {
+            c if c.is_whitespace() => {}
+            '(' => tokens.push(KeyConditionToken::LeftParen),
+            ')' => tokens.push(KeyConditionToken::RightParen),
+            ',' => tokens.push(KeyConditionToken::Comma),
+            '=' => tokens.push(KeyConditionToken::Eq),
+            '<' => {
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(KeyConditionToken::Le);
+                } else {
+                    tokens.push(KeyConditionToken::Lt);
+                }
+            }
+            '>' => {
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(KeyConditionToken::Ge);
+                } else {
+                    tokens.push(KeyConditionToken::Gt);
+                }
+            }
+            ':' => {
+                let end = read_expression_token_end(expression, &mut chars);
+                if let Some(token) = expression.get(start..end) {
+                    tokens.push(KeyConditionToken::Value(token));
+                }
+            }
+            '#' => {
+                let end = read_expression_token_end(expression, &mut chars);
+                if let Some(token) = expression.get(start..end) {
+                    tokens.push(KeyConditionToken::Identifier(token));
+                }
+            }
+            c if is_identifier_start(c) => {
+                let end = read_expression_token_end(expression, &mut chars);
+                if let Some(word) = expression.get(start..end) {
+                    match word {
+                        "AND" | "and" => tokens.push(KeyConditionToken::And),
+                        "BETWEEN" | "between" => tokens.push(KeyConditionToken::Between),
+                        "begins_with" => tokens.push(KeyConditionToken::Function(word)),
+                        _ => tokens.push(KeyConditionToken::Identifier(word)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    tokens
+}
+
+fn read_expression_token_end(
+    expression: &str,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> usize {
+    while let Some((index, ch)) = chars.peek() {
+        if !is_identifier_continue(*ch) {
+            return *index;
+        }
+        chars.next();
+    }
+    expression.len()
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '#')
+}
+
+fn key_condition_value_tokens<'a>(
+    tokens: &'a [KeyConditionToken<'a>],
+    names: Option<&'a HashMap<String, String>>,
+    key_schema: &'a [KeySchemaElement],
+) -> Vec<(&'a KeySchemaElement, &'a str)> {
+    let mut value_tokens = Vec::with_capacity(2);
+
+    for index in 0..tokens.len() {
+        collect_comparison_key_value(tokens, index, names, key_schema, &mut value_tokens);
+        collect_between_key_values(tokens, index, names, key_schema, &mut value_tokens);
+        collect_begins_with_key_value(tokens, index, names, key_schema, &mut value_tokens);
+    }
+
+    value_tokens
+}
+
+fn collect_comparison_key_value<'a>(
+    tokens: &'a [KeyConditionToken<'a>],
+    index: usize,
+    names: Option<&'a HashMap<String, String>>,
+    key_schema: &'a [KeySchemaElement],
+    value_tokens: &mut Vec<(&'a KeySchemaElement, &'a str)>,
+) {
+    let Some(operator) = tokens.get(index + 1) else {
+        return;
+    };
+    if !matches!(
+        operator,
+        KeyConditionToken::Eq
+            | KeyConditionToken::Lt
+            | KeyConditionToken::Le
+            | KeyConditionToken::Gt
+            | KeyConditionToken::Ge
+    ) {
+        return;
+    }
+
+    match (tokens.get(index), tokens.get(index + 2)) {
+        (
+            Some(KeyConditionToken::Identifier(identifier)),
+            Some(KeyConditionToken::Value(value_token)),
+        ) => push_key_value_token(identifier, value_token, names, key_schema, value_tokens),
+        (
+            Some(KeyConditionToken::Value(value_token)),
+            Some(KeyConditionToken::Identifier(identifier)),
+        ) => push_key_value_token(identifier, value_token, names, key_schema, value_tokens),
+        _ => {}
+    }
+}
+
+fn collect_between_key_values<'a>(
+    tokens: &'a [KeyConditionToken<'a>],
+    index: usize,
+    names: Option<&'a HashMap<String, String>>,
+    key_schema: &'a [KeySchemaElement],
+    value_tokens: &mut Vec<(&'a KeySchemaElement, &'a str)>,
+) {
+    let (
+        Some(KeyConditionToken::Identifier(identifier)),
+        Some(KeyConditionToken::Between),
+        Some(KeyConditionToken::Value(lower)),
+        Some(KeyConditionToken::And),
+        Some(KeyConditionToken::Value(upper)),
+    ) = (
+        tokens.get(index),
+        tokens.get(index + 1),
+        tokens.get(index + 2),
+        tokens.get(index + 3),
+        tokens.get(index + 4),
+    )
+    else {
+        return;
+    };
+
+    push_key_value_token(identifier, lower, names, key_schema, value_tokens);
+    push_key_value_token(identifier, upper, names, key_schema, value_tokens);
+}
+
+fn collect_begins_with_key_value<'a>(
+    tokens: &'a [KeyConditionToken<'a>],
+    index: usize,
+    names: Option<&'a HashMap<String, String>>,
+    key_schema: &'a [KeySchemaElement],
+    value_tokens: &mut Vec<(&'a KeySchemaElement, &'a str)>,
+) {
+    let (
+        Some(KeyConditionToken::Function(function)),
+        Some(KeyConditionToken::LeftParen),
+        Some(KeyConditionToken::Identifier(identifier)),
+        Some(KeyConditionToken::Comma),
+        Some(KeyConditionToken::Value(value_token)),
+    ) = (
+        tokens.get(index),
+        tokens.get(index + 1),
+        tokens.get(index + 2),
+        tokens.get(index + 3),
+        tokens.get(index + 4),
+    )
+    else {
+        return;
+    };
+    if *function != "begins_with" {
+        return;
+    }
+
+    push_key_value_token(identifier, value_token, names, key_schema, value_tokens);
+}
+
+fn push_key_value_token<'a>(
+    identifier: &'a str,
+    value_token: &'a str,
+    names: Option<&'a HashMap<String, String>>,
+    key_schema: &'a [KeySchemaElement],
+    value_tokens: &mut Vec<(&'a KeySchemaElement, &'a str)>,
+) {
+    let attribute_name = resolve_expression_attribute_name(identifier, names);
+    if let Some(schema) = key_schema
+        .iter()
+        .find(|element| element.attribute_name == attribute_name)
+    {
+        value_tokens.push((schema, value_token));
+    }
+}
+
+fn resolve_expression_attribute_name<'a>(
+    identifier: &'a str,
+    names: Option<&'a HashMap<String, String>>,
+) -> &'a str {
+    if identifier.starts_with('#')
+        && let Some(name) = names.and_then(|names| names.get(identifier))
+    {
+        return name;
+    }
+    identifier
+}
+
 fn query_wire_fast_path_enabled(request: &QueryRequest) -> bool {
     request.filter_expression.is_none()
         && request.projection_expression.is_none()
         && request.select.as_deref() != Some("COUNT")
 }
 
-struct PreparedQuery {
-    table_name: TableName,
-    index_name: Option<IndexName>,
-    key_condition_expression: String,
-    expression_attribute_names: Option<HashMap<String, String>>,
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+pub(super) struct PreparedQuery<'a> {
+    table_name: &'a TableName,
+    index_name: Option<&'a IndexName>,
+    key_condition_expression: &'a str,
+    expression_attribute_names: Option<&'a HashMap<String, String>>,
+    expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
     limit: Option<u32>,
-    exclusive_start_key: Option<String>,
+    exclusive_start_key: Option<&'a str>,
     scan_index_forward: Option<bool>,
     consistent_read: bool,
 }
 
-impl PreparedQuery {
-    fn from_request(
-        request: &QueryRequest,
-        exclusive_start_key: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+impl<'a> PreparedQuery<'a> {
+    pub(super) fn from_request(
+        request: &'a QueryRequest,
+        exclusive_start_key: Option<&'a str>,
+        expression_attribute_names: Option<&'a HashMap<String, String>>,
+        expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
     ) -> Self {
         Self {
-            table_name: request.table_name.clone(),
-            index_name: request.index_name.clone(),
-            key_condition_expression: request.key_condition_expression.clone(),
+            table_name: &request.table_name,
+            index_name: request.index_name.as_ref(),
+            key_condition_expression: &request.key_condition_expression,
             expression_attribute_names,
             expression_attribute_values,
             limit: request.limit,
@@ -260,250 +558,37 @@ impl PreparedQuery {
         }
     }
 
-    fn index_input(&self, index_name: IndexName) -> Result<QueryIndexInput, HttpApiError> {
+    fn index_input(&self, index_name: &IndexName) -> Result<QueryIndexInput, HttpApiError> {
         if self.consistent_read {
-            return Err(HttpApiError::validation_error(
+            return Err(HttpApiError::dynamodb_protocol_error(
+                "ValidationException",
                 "Consistent reads are not supported on global secondary indexes",
+                400,
             ));
         }
 
         Ok(QueryIndexInput {
             table_name: self.table_name.clone(),
-            index_name,
-            key_condition_expression: self.key_condition_expression.clone(),
-            expression_attribute_names: self.expression_attribute_names.clone(),
-            expression_attribute_values: self.expression_attribute_values.clone(),
+            index_name: index_name.clone(),
+            key_condition_expression: self.key_condition_expression.to_string(),
+            expression_attribute_names: self.expression_attribute_names.cloned(),
+            expression_attribute_values: self.expression_attribute_values.cloned(),
             limit: self.limit,
-            exclusive_start_key: self.exclusive_start_key.clone(),
+            exclusive_start_key: self.exclusive_start_key.map(str::to_string),
             scan_index_forward: self.scan_index_forward,
         })
     }
 
-    fn table_input(&self) -> QueryTableInput {
+    pub(super) fn table_input(&self) -> QueryTableInput {
         QueryTableInput {
             table_name: self.table_name.clone(),
-            key_condition_expression: self.key_condition_expression.clone(),
-            expression_attribute_names: self.expression_attribute_names.clone(),
-            expression_attribute_values: self.expression_attribute_values.clone(),
+            key_condition_expression: self.key_condition_expression.to_string(),
+            expression_attribute_names: self.expression_attribute_names.cloned(),
+            expression_attribute_values: self.expression_attribute_values.cloned(),
             limit: self.limit,
-            exclusive_start_key: self.exclusive_start_key.clone(),
+            exclusive_start_key: self.exclusive_start_key.map(str::to_string),
             scan_index_forward: self.scan_index_forward,
             consistent_read: self.consistent_read,
         }
     }
-}
-
-pub(crate) fn apply_filter_expression_refs<'a>(
-    items: &'a [std::collections::HashMap<String, AttributeValue>],
-    filter_expr: &str,
-    attribute_names: Option<&std::collections::HashMap<String, String>>,
-    attribute_values: Option<&std::collections::HashMap<String, AttributeValue>>,
-) -> Result<Vec<&'a std::collections::HashMap<String, AttributeValue>>, HttpApiError> {
-    let mut filtered = Vec::with_capacity(items.len());
-    for item in items {
-        if evaluate_filter_condition(item, filter_expr, attribute_names, attribute_values)? {
-            filtered.push(item);
-        }
-    }
-    Ok(filtered)
-}
-
-#[expect(clippy::string_slice)]
-fn evaluate_filter_condition(
-    item: &std::collections::HashMap<String, AttributeValue>,
-    filter_expr: &str,
-    attribute_names: Option<&std::collections::HashMap<String, String>>,
-    attribute_values: Option<&std::collections::HashMap<String, AttributeValue>>,
-) -> Result<bool, HttpApiError> {
-    // Simple expression evaluator
-    let expr = filter_expr.trim();
-
-    // Handle expressions like "#status = :statusVal"
-    if let Some(equals_pos) = expr.find(" = ") {
-        let left = expr[..equals_pos].trim();
-        let right = expr[equals_pos + 3..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            return Ok(attribute_values_equal(item_value, &target_value));
-        }
-        return Ok(false);
-    }
-
-    // Handle expressions like "age > :minAge"
-    if let Some(gt_pos) = expr.find(" > ") {
-        let left = expr[..gt_pos].trim();
-        let right = expr[gt_pos + 3..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            return Ok(
-                compare_attribute_values(item_value, &target_value) == std::cmp::Ordering::Greater
-            );
-        }
-        return Ok(false);
-    }
-
-    // Handle expressions like "age < :maxAge"
-    if let Some(lt_pos) = expr.find(" < ") {
-        let left = expr[..lt_pos].trim();
-        let right = expr[lt_pos + 3..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            return Ok(
-                compare_attribute_values(item_value, &target_value) == std::cmp::Ordering::Less
-            );
-        }
-        return Ok(false);
-    }
-
-    // Handle expressions like "age >= :minAge"
-    if let Some(gte_pos) = expr.find(" >= ") {
-        let left = expr[..gte_pos].trim();
-        let right = expr[gte_pos + 4..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            let cmp = compare_attribute_values(item_value, &target_value);
-            return Ok(cmp == std::cmp::Ordering::Greater || cmp == std::cmp::Ordering::Equal);
-        }
-        return Ok(false);
-    }
-
-    // Handle expressions like "age <= :maxAge"
-    if let Some(lte_pos) = expr.find(" <= ") {
-        let left = expr[..lte_pos].trim();
-        let right = expr[lte_pos + 4..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            let cmp = compare_attribute_values(item_value, &target_value);
-            return Ok(cmp == std::cmp::Ordering::Less || cmp == std::cmp::Ordering::Equal);
-        }
-        return Ok(false);
-    }
-
-    // Handle expressions like "status <> :inactiveVal"
-    if let Some(ne_pos) = expr.find(" <> ") {
-        let left = expr[..ne_pos].trim();
-        let right = expr[ne_pos + 4..].trim();
-
-        let attr_name = resolve_attribute_name(left, attribute_names);
-        let target_value = resolve_attribute_value(right, attribute_values)?;
-
-        if let Some(item_value) = item.get(&attr_name) {
-            return Ok(!attribute_values_equal(item_value, &target_value));
-        }
-        return Ok(true); // If attribute doesn't exist, it's not equal to target value
-    }
-
-    Err(unsupported_filter_expression())
-}
-
-fn resolve_attribute_name(
-    name: &str,
-    attribute_names: Option<&std::collections::HashMap<String, String>>,
-) -> String {
-    if let Some(stripped) = name.strip_prefix('#') {
-        if let Some(names_map) = attribute_names
-            && let Some(resolved) = names_map.get(name)
-        {
-            return resolved.clone();
-        }
-        // If not found in map, use the name without the #
-        return stripped.to_string();
-    }
-    name.to_string()
-}
-
-fn resolve_attribute_value(
-    value: &str,
-    attribute_values: Option<&std::collections::HashMap<String, AttributeValue>>,
-) -> Result<AttributeValue, HttpApiError> {
-    if value.starts_with(':') {
-        if let Some(values_map) = attribute_values
-            && let Some(resolved) = values_map.get(value)
-        {
-            return Ok(resolved.clone());
-        }
-        return Err(missing_expression_value_error(value));
-    }
-    // For literal values, create a string attribute value
-    Ok(AttributeValue::S(value.to_string()))
-}
-
-#[cold]
-#[inline(never)]
-fn unsupported_filter_expression() -> HttpApiError {
-    HttpApiError::validation_error("Unsupported filter expression".to_string())
-}
-
-#[cold]
-#[inline(never)]
-fn missing_expression_value_error(value: &str) -> HttpApiError {
-    HttpApiError::validation_error(format!("ExpressionAttributeValues missing key {value}"))
-}
-
-fn attribute_values_equal(a: &AttributeValue, b: &AttributeValue) -> bool {
-    match (a, b) {
-        (AttributeValue::S(a_str), AttributeValue::S(b_str)) => a_str == b_str,
-        (AttributeValue::N(a_num), AttributeValue::N(b_num)) => a_num == b_num,
-        (AttributeValue::B(a_bin), AttributeValue::B(b_bin)) => a_bin == b_bin,
-        (AttributeValue::BOOL(a_bool), AttributeValue::BOOL(b_bool)) => a_bool == b_bool,
-        (AttributeValue::NULL(_), AttributeValue::NULL(_)) => true,
-        _ => false,
-    }
-}
-
-fn compare_attribute_values(a: &AttributeValue, b: &AttributeValue) -> std::cmp::Ordering {
-    match (a, b) {
-        (AttributeValue::S(a_str), AttributeValue::S(b_str)) => a_str.cmp(b_str),
-        (AttributeValue::N(a_num), AttributeValue::N(b_num)) => {
-            // Parse as f64 for numeric comparison
-            let a_val: f64 = a_num.parse().unwrap_or(0.0);
-            let b_val: f64 = b_num.parse().unwrap_or(0.0);
-            a_val
-                .partial_cmp(&b_val)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (AttributeValue::B(a_bin), AttributeValue::B(b_bin)) => a_bin.cmp(b_bin),
-        (AttributeValue::BOOL(a_bool), AttributeValue::BOOL(b_bool)) => a_bool.cmp(b_bool),
-        _ => std::cmp::Ordering::Equal,
-    }
-}
-
-pub(crate) fn apply_projection_expression_refs(
-    items: &[&std::collections::HashMap<String, AttributeValue>],
-    projection_expr: &str,
-    attribute_names: Option<&std::collections::HashMap<String, String>>,
-) -> Vec<std::collections::HashMap<String, AttributeValue>> {
-    let attributes: Vec<String> = projection_expr
-        .split(',')
-        .map(str::trim)
-        .map(|attr| resolve_attribute_name(attr, attribute_names))
-        .collect();
-    let mut projected_items = Vec::with_capacity(items.len());
-
-    for item in items {
-        let mut projected_item = std::collections::HashMap::with_capacity(attributes.len());
-        for attr_name in &attributes {
-            if let Some(value) = item.get(attr_name) {
-                projected_item.insert(attr_name.clone(), value.clone());
-            }
-        }
-        projected_items.push(projected_item);
-    }
-
-    projected_items
 }

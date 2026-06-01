@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bg_jobs::BackgroundJobName;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 use storage_common::{
-    GSI_BACKFILL_JOB, GSI_UPDATE_JOB, STREAM_TRIM_JOB, TTL_SWEEP_JOB,
+    GSI_BACKFILL_JOB, GSI_UPDATE_JOB, STREAM_TRIM_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure,
     ttl::{TtlConfigRecord, ttl_gsi_name},
 };
 use storage_condition::parse_condition_expression;
@@ -17,7 +17,7 @@ use storage_types::{
     GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes, PreparedBatchOperation,
     PutItemResponse, QueryTableRequest, ReplicationMutation, ScanTableRequest, StorageEnum,
     StorageError, StorageResult, StoredTableInfo, TableName, TableStatus, TimeToLiveDescription,
-    TimeToLiveStatus, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
+    TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
     TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
     UpdateTimeToLiveResponse, WireItem, WriteRequest,
 };
@@ -41,6 +41,10 @@ fn record_write(items: usize, bytes: usize) {
     let span = Span::current();
     span.record("items_updated", items as u64);
     span.record("bytes_written", bytes as u64);
+}
+
+fn current_ms_u64() -> u64 {
+    u64::try_from(*TimestampMillis::now()).unwrap_or(0)
 }
 
 fn compute_items_bytes(items: &[HashMap<String, AttributeValue>]) -> StorageResult<usize> {
@@ -244,6 +248,7 @@ impl StorageProvider for SQLiteStorageProvider {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
         let response = self
             .put_item_internal(
@@ -280,6 +285,7 @@ impl StorageProvider for SQLiteStorageProvider {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let bytes_written = item.payload_len();
         let response = self
             .put_item_wire_internal(
@@ -367,6 +373,7 @@ impl StorageProvider for SQLiteStorageProvider {
             record_write(0, 0);
             return Ok(None);
         }
+        self.apply_gsi_write_pressure().await?;
         let key_bytes = attr_map_payload_bytes(&key);
 
         let result = self
@@ -388,6 +395,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: GuardedPutItemRequest,
     ) -> StorageResult<PutItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let GuardedPutItemRequest {
             table_name,
             item,
@@ -430,6 +438,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: GuardedDeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        self.apply_gsi_write_pressure().await?;
         let GuardedDeleteItemRequest {
             table_name,
             key,
@@ -462,6 +471,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: GuardedUpdateItemRequest,
     ) -> StorageResult<UpdateItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let GuardedUpdateItemRequest { request, guard } = request;
         let UpdateItemRequest {
             table_name,
@@ -477,8 +487,8 @@ impl StorageProvider for SQLiteStorageProvider {
         let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
         let (old_item, new_item, response_fields) =
             with_transaction(&self.connection, move |sqlite| {
-                let (operations, condition) = storage_provider::before_update_item(
-                    update_expression.as_str(),
+                let (operations, condition) = storage_provider::before_update_item_optional(
+                    update_expression.as_deref(),
                     condition_expression.as_deref(),
                     expression_attribute_names.as_ref(),
                     expression_attribute_values.as_ref(),
@@ -577,6 +587,7 @@ impl StorageProvider for SQLiteStorageProvider {
         request: BatchWriteItemRequest,
         should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let total_reqs: usize = request.request_items.values().map(Vec::len).sum();
         let mut requested_tally = WriteCostTally::default();
         for write_requests in request.request_items.values() {
@@ -708,6 +719,7 @@ impl StorageProvider for SQLiteStorageProvider {
         )
     )]
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {
+        self.apply_gsi_write_pressure().await?;
         let billed_bytes = serializable_payload_bytes(&request);
         let response = self.update_item_internal(request).await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -748,6 +760,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        self.apply_gsi_write_pressure().await?;
         Span::current().record("action_count", request.transact_items.len() as u64);
         let mut billed_tally = WriteCostTally::default();
         for item in &request.transact_items {
@@ -778,6 +791,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: GuardedTransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        self.apply_gsi_write_pressure().await?;
         Span::current().record("action_count", request.request.transact_items.len() as u64);
         let mut billed_tally = WriteCostTally::default();
         for item in &request.request.transact_items {
@@ -818,6 +832,7 @@ impl StorageProvider for SQLiteStorageProvider {
         &self,
         request: TransactWriteItemsEncodeRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        self.apply_gsi_write_pressure().await?;
         Span::current().record("action_count", request.transact_items.len() as u64);
         let mut billed_tally = WriteCostTally::default();
         for item in &request.transact_items {
@@ -879,6 +894,19 @@ impl StorageProvider for SQLiteStorageProvider {
             .await?;
         }
 
+        if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
+            table_info.deletion_protection_enabled = deletion_protection_enabled;
+            let table_name_clone = table_name.clone();
+            call_sqlite(&self.connection, move |conn| {
+                let (sql, params) = sql_statements::update_deletion_protection(
+                    &table_name_clone,
+                    deletion_protection_enabled,
+                );
+                conn.execute(sql, params).map_err(map_sqlite_error)
+            })
+            .await?;
+        }
+
         if let Some(gsi_updates) = request.global_secondary_index_updates.clone() {
             crate::gsi_lifecycle::process_gsi_updates(
                 self,
@@ -935,6 +963,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 stream_specification: table_info.stream_specification.clone(),
                 latest_stream_arn: None,
                 latest_stream_label: None,
+                deletion_protection_enabled: table_info.deletion_protection_enabled,
             },
         };
 
@@ -1146,6 +1175,15 @@ impl StorageProvider for SQLiteStorageProvider {
 }
 
 impl SQLiteStorageProvider {
+    async fn apply_gsi_write_pressure(&self) -> StorageResult<()> {
+        apply_gsi_write_pressure(
+            self.immediate_gsi_consistency,
+            &self.gsi_propagation_governor,
+            current_ms_u64(),
+        )
+        .await
+    }
+
     async fn maybe_apply_immediate_gsi_updates(&self) -> StorageResult<()> {
         Ok(())
     }

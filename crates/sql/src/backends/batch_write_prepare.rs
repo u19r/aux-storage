@@ -1,7 +1,8 @@
 use storage_provider::split_item_into_key_and_attributes_sync;
 use storage_types::{
-    DeleteRequest, PreparedBatchOperation, PutRequest, StorageError, StorageResult,
-    StoredTableInfo, WriteRequest,
+    DeleteRequest, PreparedBatchOperation, PutRequest, StorageEnum, StorageError, StorageResult,
+    StoredTableInfo, WriteRequest, context::WrappedError as _, validate_transact_key,
+    validate_transact_put_item_key,
 };
 
 pub(crate) fn prepare_batch_operation(
@@ -21,6 +22,7 @@ pub(crate) fn prepare_batch_operation(
             }
 
             let split = split_item_into_key_and_attributes_sync(item.clone(), table_info)?;
+            validate_transact_put_item_key(table_info, item).map_err(batch_write_key_error)?;
 
             Ok(PreparedBatchOperation::Put {
                 table_name: table_info.table_name.clone(),
@@ -41,6 +43,8 @@ pub(crate) fn prepare_batch_operation(
                 ));
             }
 
+            validate_transact_key(table_info, key).map_err(batch_write_key_error)?;
+
             Ok(PreparedBatchOperation::Delete {
                 table_name: table_info.table_name.clone(),
                 table_info: table_info.clone(),
@@ -53,4 +57,21 @@ pub(crate) fn prepare_batch_operation(
             "Each WriteRequest must contain exactly one of PutRequest or DeleteRequest",
         )),
     }
+}
+
+fn batch_write_key_error(error: StorageError) -> StorageError {
+    let StorageEnum::Validation { message } = error.to_enum() else {
+        return error;
+    };
+    if message == "The parameter cannot be converted to a numeric value" {
+        return StorageError::raw_validation(message.clone());
+    }
+    if message == "Attempting to store more than 38 significant digits in a Number"
+        || message
+            == "Number underflow. Attempting to store a number with magnitude smaller than \
+                supported range"
+    {
+        return StorageError::raw_validation(message.clone());
+    }
+    error
 }

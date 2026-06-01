@@ -7,7 +7,9 @@ use storage_types::{
 };
 
 use crate::{
-    SQLiteStorageProvider, error_handler::map_sqlite_error, stream_writer::write_stream_entries,
+    SQLiteStorageProvider,
+    error_handler::map_sqlite_error,
+    stream_writer::{should_write_stream_entries_for_gsi_mode, write_stream_entries},
 };
 
 impl SQLiteStorageProvider {
@@ -31,11 +33,13 @@ impl SQLiteStorageProvider {
         // First, get the item to return it if it exists
         let existing_item = Self::do_get_item(table_name, key, sqlite)?;
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
+        let should_write_stream =
+            should_write_stream_entries_for_gsi_mode(&table_info, immediate_gsi_consistency);
 
         let item = match &existing_item {
             Some(item) => item.clone(),
             None => {
-                if condition.is_none() && replication.is_some() {
+                if condition.is_none() && replication.is_some() && should_write_stream {
                     let item_stream_version = storage_types::ItemStreamVersion::try_from(
                         Self::do_bump_item_revision(table_name, key, sqlite)?,
                     )?;
@@ -85,16 +89,17 @@ impl SQLiteStorageProvider {
             Self::do_bump_item_revision(table_name, key, sqlite)?,
         )?;
 
-        // Write to streams (with deleted flag)
-        write_stream_entries(
-            sqlite,
-            &table_info,
-            &key_item,
-            Some(&item_for_stream),
-            true,
-            item_stream_version,
-            replication,
-        )?;
+        if should_write_stream {
+            write_stream_entries(
+                sqlite,
+                &table_info,
+                &key_item,
+                Some(&item_for_stream),
+                true,
+                item_stream_version,
+                replication,
+            )?;
+        }
 
         if immediate_gsi_consistency {
             SQLiteStorageProvider::apply_immediate_gsi_updates(

@@ -347,7 +347,7 @@ fn embedded_pointer_stream_skips_item_stream_reads() {
 }
 
 #[test]
-fn embedded_pointer_stream_record_sequence_uses_target_item_version() {
+fn embedded_pointer_stream_record_sequence_uses_pointer_stream_item_id() {
     futures::executor::block_on(async {
         let pointer_stream = StreamName::new(b"pointer-stream");
         let item_stream = StreamName::new(b"item-stream");
@@ -398,9 +398,96 @@ fn embedded_pointer_stream_record_sequence_uses_target_item_version() {
             .expect("embedded pointer stream records");
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sequence_number, "2");
+        assert_eq!(records[0].sequence_number, pointer_id.to_string());
         assert_eq!(last_pointer, None);
         assert_eq!(provider.read_backward_calls(), 0);
+    });
+}
+
+#[test]
+fn pointer_stream_record_sequences_follow_stream_order_across_items() {
+    futures::executor::block_on(async {
+        let pointer_stream = StreamName::new(b"pointer-stream");
+        let first_item_stream = StreamName::new(b"first-item-stream");
+        let second_item_stream = StreamName::new(b"second-item-stream");
+        let table_name = TableName::new("cross_item_sequence_table");
+
+        let first_pointer_id = stream_item_id(7);
+        let second_pointer_id = stream_item_id(8);
+        let first_image = HashMap::from([(
+            "pk".to_string(),
+            AttributeValue::S("first-item".to_string()),
+        )]);
+        let second_image = HashMap::from([(
+            "pk".to_string(),
+            AttributeValue::S("second-item".to_string()),
+        )]);
+
+        let first_pointer = StoredStreamPointer::embedded(
+            first_item_stream,
+            table_name.clone(),
+            item_stream_version(3),
+            vec![EmbeddedStreamItem {
+                data: storage_types::storage_serde::to_bytes(&first_image).expect("first bytes"),
+                data_type: StreamDataType::DynamoDbJson,
+            }],
+        );
+        let second_pointer = StoredStreamPointer::embedded(
+            second_item_stream,
+            table_name,
+            item_stream_version(1),
+            vec![EmbeddedStreamItem {
+                data: storage_types::storage_serde::to_bytes(&second_image).expect("second bytes"),
+                data_type: StreamDataType::DynamoDbJson,
+            }],
+        );
+
+        let provider = InMemoryStreamProvider::new(
+            HashMap::from([(
+                pointer_stream.clone(),
+                vec![
+                    build_stream_item(
+                        second_pointer_id,
+                        None,
+                        storage_types::storage_serde::to_bytes(&second_pointer)
+                            .expect("second pointer bytes"),
+                        StreamDataType::StreamPointer,
+                    ),
+                    build_stream_item(
+                        first_pointer_id,
+                        None,
+                        storage_types::storage_serde::to_bytes(&first_pointer)
+                            .expect("first pointer bytes"),
+                        StreamDataType::StreamPointer,
+                    ),
+                ],
+            )]),
+            HashMap::new(),
+        );
+
+        let (records, last_pointer) = provider
+            .get_stream_records_from_pointer_stream(
+                pointer_stream,
+                &[KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                None,
+                Some(10),
+            )
+            .await
+            .expect("cross-item stream records");
+
+        let sequence_numbers = records
+            .iter()
+            .map(|record| record.sequence_number.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequence_numbers,
+            vec![first_pointer_id.to_string(), second_pointer_id.to_string()]
+        );
+        assert!(sequence_numbers[0] < sequence_numbers[1]);
+        assert_eq!(last_pointer, None);
     });
 }
 

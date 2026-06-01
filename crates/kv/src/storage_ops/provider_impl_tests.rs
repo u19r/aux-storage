@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
+use alloc_counter::AllocationGuard;
 use storage_common::ttl::TtlConfigRecord;
+use storage_condition::parse_condition_expression;
 use storage_types::{
     AttributeDefinition, AttributeValue, DeleteRequest, EncodePutRequest, EncodeWriteRequest,
     IndexName, ItemKey, KeyAttributeType, KeySchemaElement, KeyType, StoredTableInfo, TableName,
@@ -10,7 +12,9 @@ use storage_types::{
 use crate::{
     sorted_kv_store::TransactWriteOperation,
     storage_provider::{
-        encode_requests_to_write_requests, project_wire_item_table_key_and_ttl,
+        TransactConditionBindingCacheEntry, cached_transact_condition_binding,
+        encode_requests_to_write_requests, normalized_attribute_map_for_write,
+        normalized_wire_item_for_write, project_wire_item_table_key_and_ttl,
         ttl_index_direct_operations_for_wire_items, ttl_tracking_enabled,
         wire_item_key_token_from_item_key,
     },
@@ -49,6 +53,7 @@ fn table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        deletion_protection_enabled: false,
     }
 }
 
@@ -71,6 +76,164 @@ fn wire_item(pk: &str, sk: &str, ttl: Option<&str>) -> WireItem {
         item.insert("ttl".to_string(), AttributeValue::N(ttl.to_string()));
     }
     WireItem::from_attribute_map(&item).expect("wire item")
+}
+
+#[test]
+fn normalized_attribute_map_for_write_borrows_when_numbers_are_already_plain_tests() {
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("job#1".to_string())),
+        ("sk".to_string(), AttributeValue::N("12.3".to_string())),
+    ]);
+
+    assert!(matches!(
+        normalized_attribute_map_for_write(&item),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[test]
+fn normalized_attribute_map_for_write_expands_scientific_numbers_tests() {
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("job#1".to_string())),
+        ("sk".to_string(), AttributeValue::N("1E2".to_string())),
+    ]);
+
+    let normalized = normalized_attribute_map_for_write(&item);
+    assert!(matches!(normalized, std::borrow::Cow::Owned(_)));
+    assert_eq!(
+        normalized.get("sk"),
+        Some(&AttributeValue::N("100".to_string()))
+    );
+}
+
+#[test]
+fn normalized_wire_item_for_write_expands_scientific_numbers_tests() {
+    let item = WireItem::from_attribute_map(&HashMap::from([
+        ("pk".to_string(), AttributeValue::S("job#1".to_string())),
+        ("sk".to_string(), AttributeValue::N("1E-2".to_string())),
+    ]))
+    .expect("wire item");
+
+    let normalized = normalized_wire_item_for_write(&item).expect("normalize wire item");
+    assert!(matches!(normalized, std::borrow::Cow::Owned(_)));
+    assert_eq!(
+        normalized
+            .to_attribute_map()
+            .expect("normalized item map")
+            .get("sk"),
+        Some(&AttributeValue::N("0.01".to_string()))
+    );
+}
+
+const TRANSACT_CONDITION_CACHE_ITERATIONS: usize = 512;
+const TRANSACT_CONDITION_CACHE_WIDTH: usize = 25;
+type TransactConditionInput = (
+    String,
+    Option<HashMap<String, String>>,
+    Option<HashMap<String, AttributeValue>>,
+);
+
+#[test]
+fn transact_condition_binding_cache_reuses_repeated_condition_parse_tests() {
+    let baseline = measure_uncached_transact_condition_binding();
+    let cached = measure_cached_transact_condition_binding();
+
+    alloc_counter::emit_report(&baseline);
+    alloc_counter::emit_report(&cached);
+
+    assert!(
+        cached.allocation_count < baseline.allocation_count,
+        "expected cached transaction condition binding to allocate less often, baseline={} \
+         cached={}",
+        baseline.allocation_count,
+        cached.allocation_count
+    );
+    assert!(
+        cached.allocated_bytes < baseline.allocated_bytes,
+        "expected cached transaction condition binding to allocate fewer bytes, baseline={} \
+         cached={}",
+        baseline.allocated_bytes,
+        cached.allocated_bytes
+    );
+}
+
+fn measure_uncached_transact_condition_binding() -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "transact_condition_binding_uncached",
+        file!(),
+        line!(),
+        Some("uncached"),
+    );
+    for _ in 0..TRANSACT_CONDITION_CACHE_ITERATIONS {
+        for (condition, names, values) in repeated_transaction_condition_inputs() {
+            let parsed =
+                parse_condition_expression(condition.as_str(), names.as_ref(), values.as_ref())
+                    .expect("parse condition");
+            std::hint::black_box(parsed);
+        }
+    }
+    guard.finish()
+}
+
+fn measure_cached_transact_condition_binding() -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "transact_condition_binding_cached",
+        file!(),
+        line!(),
+        Some("cached"),
+    );
+    for _ in 0..TRANSACT_CONDITION_CACHE_ITERATIONS {
+        let mut cache = Vec::<TransactConditionBindingCacheEntry>::new();
+        for (condition, names, values) in repeated_transaction_condition_inputs() {
+            let parsed =
+                cached_transact_condition_binding(&mut cache, Some(condition), names, values)
+                    .expect("bind condition");
+            std::hint::black_box(parsed);
+        }
+    }
+    guard.finish()
+}
+
+fn repeated_transaction_condition_inputs() -> Vec<TransactConditionInput> {
+    let names = HashMap::from([
+        ("#status".to_string(), "status".to_string()),
+        ("#sk".to_string(), "sk".to_string()),
+        ("#tags".to_string(), "tags".to_string()),
+        ("#metrics".to_string(), "metrics".to_string()),
+        ("#count".to_string(), "count".to_string()),
+    ]);
+    let values = HashMap::from([
+        (":open".to_string(), AttributeValue::S("open".to_string())),
+        (
+            ":pending".to_string(),
+            AttributeValue::S("pending".to_string()),
+        ),
+        (
+            ":sk_prefix".to_string(),
+            AttributeValue::S("tenant#".to_string()),
+        ),
+        (
+            ":required_tag".to_string(),
+            AttributeValue::S("required".to_string()),
+        ),
+        (
+            ":number_type".to_string(),
+            AttributeValue::S("N".to_string()),
+        ),
+    ]);
+    (0..TRANSACT_CONDITION_CACHE_WIDTH)
+        .map(|_| {
+            (
+                "#status IN (:open, :pending) AND begins_with(#sk, :sk_prefix) AND \
+                 contains(#tags, :required_tag) AND attribute_type(#metrics.#count, :number_type)"
+                    .to_string(),
+                Some(names.clone()),
+                Some(values.clone()),
+            )
+        })
+        .collect()
 }
 
 #[test]

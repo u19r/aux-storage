@@ -16,6 +16,7 @@
 
 pub mod errors;
 pub mod gsi;
+pub mod gsi_lag;
 pub mod gsi_write;
 pub mod jobs;
 pub mod key_schema;
@@ -31,6 +32,11 @@ pub mod validation;
 
 pub use errors::{ensure, err_internal, err_validation};
 pub use gsi::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, GsiBackfillPhase, STREAM_TRIM_JOB, TTL_SWEEP_JOB};
+pub use gsi_lag::{
+    GSI_LAG_CRITICAL_LIMIT_MS, GSI_LAG_HARD_LIMIT_MS, GSI_LAG_SOFT_LIMIT_MS, GSI_LAG_TARGET_MS,
+    GsiLagPolicy, GsiPropagationGovernor, GsiWritePressure, apply_gsi_write_pressure,
+    emit_gsi_lag_metrics, gsi_write_throttled_error, lag_ms_from_created_at, observe_gsi_lag,
+};
 pub use gsi_write::{
     GsiKeyPart, GsiKeyParts, GsiWriteAction, key_parts, key_parts_to_map, plan_gsi_write_actions,
     require_key_parts,
@@ -70,6 +76,9 @@ mod errors_tests;
 
 #[cfg(test)]
 mod gsi_tests;
+
+#[cfg(test)]
+mod gsi_lag_tests;
 
 #[cfg(test)]
 mod newtypes_tests;

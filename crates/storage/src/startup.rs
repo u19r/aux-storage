@@ -108,6 +108,7 @@ pub fn try_storage_connection_config_from_backends(
             postgres: Some(PostgresSettings {
                 dsn: postgres.dsn.clone(),
                 max_pool_size: postgres.max_pool_size,
+                background_max_pool_size: postgres.background_max_pool_size,
                 tls: postgres.tls,
                 immediate_gsi_consistency: postgres.immediate_gsi_consistency,
             }),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
-    body::Bytes,
+    body::{self, Bytes},
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
@@ -45,6 +45,31 @@ impl SyncWriteProposer for NotLeaderProposer {
 
 #[tokio::test]
 async fn get_item_rejects_unknown_fields() {
+    assert_rejects_unknown_fields(
+        "DynamoDB_20120810.GetItem",
+        json!({
+            "TableName": "TestTable",
+            "Key": {"id": {"S": "test123"}},
+            "InvalidField": "invalid",
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_item_rejects_unknown_fields() {
+    assert_rejects_unknown_fields(
+        "DynamoDB_20120810.PutItem",
+        json!({
+            "TableName": "TestTable",
+            "Item": {"id": {"S": "test123"}},
+            "InvalidField": "invalid",
+        }),
+    )
+    .await;
+}
+
+async fn assert_rejects_unknown_fields(target: &'static str, payload: serde_json::Value) {
     let db = create_test_db().await;
     let app_state = Arc::new(AppState::new_with_manager_options(
         db,
@@ -52,16 +77,7 @@ async fn get_item_rejects_unknown_fields() {
     ));
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-amz-target",
-        HeaderValue::from_static("DynamoDB_20120810.GetItem"),
-    );
-
-    let payload = json!({
-        "TableName": "TestTable",
-        "Key": {"id": {"S": "test123"}},
-        "InvalidField": "invalid",
-    });
+    headers.insert("x-amz-target", HeaderValue::from_static(target));
 
     let body = Bytes::from(serde_json::to_vec(&payload).expect("Payload should serialize"));
 
@@ -1299,6 +1315,144 @@ async fn execute_dynamodb_json(
             let (status, _headers, body) = error.into_parts();
             (status, body)
         })
+}
+
+async fn execute_dynamodb_json_body(
+    app_state: Arc<AppState>,
+    target: &'static str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let response = execute_dynamodb_json(app_state, target, payload)
+        .await
+        .expect("request should succeed");
+    let body = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body");
+    serde_json::from_slice(&body).expect("response json")
+}
+
+#[tokio::test]
+async fn dynamodb_streams_operations_read_table_stream_records() {
+    let db = create_test_db().await;
+    let app_state = Arc::new(AppState::new_with_manager_options(
+        db,
+        StorageApiManagerOptions::default(),
+    ));
+
+    execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDB_20120810.CreateTable",
+        json!({
+            "TableName": "StreamsCompat",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "StreamSpecification": {
+                "StreamEnabled": true,
+                "StreamViewType": "NEW_AND_OLD_IMAGES"
+            }
+        }),
+    )
+    .await;
+
+    let table = execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDB_20120810.DescribeTable",
+        json!({"TableName": "StreamsCompat"}),
+    )
+    .await;
+    let stream_arn = table["Table"]["LatestStreamArn"]
+        .as_str()
+        .expect("latest stream arn")
+        .to_string();
+
+    let streams = execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDBStreams_20120810.ListStreams",
+        json!({"TableName": "StreamsCompat"}),
+    )
+    .await;
+    assert_eq!(streams["Streams"][0]["StreamArn"], stream_arn);
+
+    let description = execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDBStreams_20120810.DescribeStream",
+        json!({"StreamArn": stream_arn}),
+    )
+    .await;
+    let shard_id = description["StreamDescription"]["Shards"][0]["ShardId"]
+        .as_str()
+        .expect("shard id")
+        .to_string();
+    assert_eq!(
+        description["StreamDescription"]["TableName"],
+        "StreamsCompat"
+    );
+
+    execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDB_20120810.PutItem",
+        json!({
+            "TableName": "StreamsCompat",
+            "Item": {
+                "pk": {"S": "p1"},
+                "value": {"S": "created"}
+            }
+        }),
+    )
+    .await;
+
+    let iterator = execute_dynamodb_json_body(
+        app_state.clone(),
+        "DynamoDBStreams_20120810.GetShardIterator",
+        json!({
+            "StreamArn": stream_arn,
+            "ShardId": shard_id,
+            "ShardIteratorType": "TRIM_HORIZON"
+        }),
+    )
+    .await;
+    let shard_iterator = iterator["ShardIterator"]
+        .as_str()
+        .expect("shard iterator")
+        .to_string();
+
+    let records = execute_dynamodb_json_body(
+        app_state,
+        "DynamoDBStreams_20120810.GetRecords",
+        json!({"ShardIterator": shard_iterator, "Limit": 10}),
+    )
+    .await;
+    assert_eq!(records["Records"][0]["eventName"], "INSERT");
+    assert_eq!(records["Records"][0]["eventSource"], "aws:dynamodb");
+    assert_eq!(records["Records"][0]["dynamodb"]["Keys"]["pk"]["S"], "p1");
+    assert_eq!(
+        records["Records"][0]["dynamodb"]["StreamViewType"],
+        "NEW_AND_OLD_IMAGES"
+    );
+    assert!(records["NextShardIterator"].is_string());
+}
+
+#[tokio::test]
+async fn dynamodb_streams_get_records_rejects_invalid_iterator() {
+    let db = create_test_db().await;
+    let app_state = Arc::new(AppState::new_with_manager_options(
+        db,
+        StorageApiManagerOptions::default(),
+    ));
+
+    let (status, error) = execute_dynamodb_json(
+        app_state,
+        "DynamoDBStreams_20120810.GetRecords",
+        json!({"ShardIterator": "not-an-iterator"}),
+    )
+    .await
+    .expect_err("invalid iterator should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.0.error_type,
+        "com.amazonaws.dynamodb.v20120810#TrimmedDataAccessException"
+    );
 }
 
 #[tokio::test]

@@ -1,31 +1,33 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use axum::http::HeaderValue;
 use config::{self, StorageApiLaunchConfig, Tracing};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use storage_api::{
-    AppState, HttpReplicationPeerClient, MetricsEndpointConfig, PrometheusMetricsEndpointConfig,
-    ReplicationRuntimeConfig, ServiceRoutePaths, StorageApiManagerOptions,
-    StorageReplicationRuntime, SyncHealthReporter, SyncLearnerJoinHandler, SyncRaftRpcHandler,
-    SyncReadBarrier, SyncWriteProposer, build_sync_raft_runtime_adapter, ensure_backend_matches,
-    resolve_filter, server_router_with_metrics_and_routes, shutdown_grace_period,
-    spawn_config_watch, storage_config_from_backends,
+    AppState, HttpReplicationPeerClient, MetricsEndpointConfig, ReplicationRuntimeConfig,
+    ServiceRoutePaths, StorageApiManagerOptions, StorageReplicationRuntime, SyncHealthReporter,
+    SyncLearnerJoinHandler, SyncRaftRpcHandler, SyncReadBarrier, SyncWriteProposer,
+    build_sync_raft_runtime_adapter, ensure_backend_matches, resolve_filter,
+    server_router_with_metrics_and_routes, shutdown_grace_period, spawn_config_watch,
+    storage_config_from_backends,
 };
 pub use storage_provider::{StorageBackend, StorageConfig};
 use storage_types::{StorageEnum, StorageError, StorageResult, context::WrappedError as _};
-use tokio::{net::TcpListener, runtime::Builder, signal};
+use tokio::{net::TcpListener, runtime::Builder, signal, task::JoinHandle};
 use tower_http::cors::CorsLayer;
+#[cfg(feature = "tokio-console")]
+use tracing_subscriber::layer::Layer as _;
 use tracing_subscriber::{
     EnvFilter, fmt,
     layer::SubscriberExt,
     util::{SubscriberInitExt, TryInitError},
 };
 
+const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 const PROMETHEUS_LATENCY_MS_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
     1000.0, 2500.0, 5000.0, 10000.0,
 ];
-const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn await_shutdown_signal(grace: Duration) {
     #[cfg(unix)]
@@ -71,16 +73,23 @@ async fn await_shutdown_signal(grace: Duration) {
 }
 
 fn main() -> StorageResult<()> {
+    let launch = StorageApiLaunchConfig::from_args(std::env::args_os())
+        .map_err(|err| StorageError::internal(&format!("Failed to load launch config: {err}")))?;
+    let tracing_cfg: Tracing = launch.effective.tracing.clone();
+    let (filter, source) = resolve_filter(&tracing_cfg);
+    println!("Using log filter (source: {source}): {filter}");
+    init_tracing(filter).map_err(|err| StorageError::internal(&err.to_string()))?;
+
     let runtime = Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
         .enable_all()
         .build()
         .map_err(|err| StorageError::internal(&format!("tokio runtime: {err}")))?;
-    runtime.block_on(async_main())
+    runtime.block_on(async_main(launch))
 }
 
-async fn async_main() -> StorageResult<()> {
-    if let Err(err) = run().await {
+async fn async_main(launch: StorageApiLaunchConfig) -> StorageResult<()> {
+    if let Err(err) = run(launch).await {
         let (root, contexts) = err.recursive_context(Vec::new());
         if let StorageEnum::InternalServerError { message } = root {
             println!("Internal error detail: {message}");
@@ -105,23 +114,21 @@ fn runtime_worker_threads() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
 }
 
-async fn run() -> StorageResult<()> {
-    let launch = StorageApiLaunchConfig::from_args(std::env::args_os())
-        .map_err(|err| StorageError::internal(&format!("Failed to load launch config: {err}")))?;
+async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     let effective = launch.effective;
     let config_arc = effective.config.clone();
-    let tracing_cfg: Tracing = effective.tracing.clone();
     let replication_runtime_config =
         ReplicationRuntimeConfig::from_settings(&effective.storage_replication)?;
     let config_manager = Some(Arc::new(config::runtime::SharedConfigManager::new(
         config_arc.clone(),
     )) as Arc<dyn config::runtime::MutableConfigManager>);
-    let (filter, source) = resolve_filter(&tracing_cfg);
-    println!("Using log filter (source: {source}): {filter}");
-    init_tracing(filter).map_err(|err| StorageError::internal(&err.to_string()))?;
 
     println!("Starting DynamoDB Server Impersonation...");
     println!("Resolving storage backend configuration...");
+
+    let metrics_config = metrics_endpoint_config(&effective.metrics)
+        .map_err(|err| StorageError::internal(&format!("failed to initialize metrics: {err}")))?;
+    spawn_prometheus_upkeep(&metrics_config);
 
     ensure_backend_matches(&effective.backends)?;
     let storage_config = storage_config_from_backends(&effective.backends)?;
@@ -294,9 +301,6 @@ async fn run() -> StorageResult<()> {
             None
         };
 
-    let metrics_config = metrics_endpoint_config(&effective.metrics)
-        .map_err(|err| StorageError::internal(&format!("failed to initialize metrics: {err}")))?;
-    spawn_prometheus_upkeep(&metrics_config);
     let router = server_router_with_metrics_and_routes(
         app_state.clone(),
         effective.enable_internal_helper_routes,
@@ -341,6 +345,31 @@ fn route_public_base_url(bind_addr: &str, route: &str) -> String {
 }
 
 fn init_tracing(filter: EnvFilter) -> Result<(), TryInitError> {
+    #[cfg(feature = "tokio-console")]
+    if tokio_console_enabled() {
+        tracing_subscriber::registry()
+            .with(
+                console_subscriber::ConsoleLayer::builder()
+                    .with_default_env()
+                    .spawn(),
+            )
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_current_span(false)
+                    .with_span_list(false)
+                    .with_ansi(false)
+                    .with_writer(std::io::stdout)
+                    .with_filter(filter),
+            )
+            .try_init()?;
+        tracing::info!(
+            target = "diagnostics",
+            "tokio console enabled; connect with `tokio-console`"
+        );
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(filter)
         .with(
@@ -352,6 +381,13 @@ fn init_tracing(filter: EnvFilter) -> Result<(), TryInitError> {
                 .with_writer(std::io::stdout),
         )
         .try_init()
+}
+
+#[cfg(feature = "tokio-console")]
+fn tokio_console_enabled() -> bool {
+    std::env::var("STORAGE_API_TOKIO_CONSOLE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn metrics_endpoint_config(
@@ -367,7 +403,7 @@ fn metrics_endpoint_config(
     let handle = prometheus_builder()?.install_recorder()?;
     Ok(MetricsEndpointConfig {
         enabled: true,
-        prometheus: Some(PrometheusMetricsEndpointConfig {
+        prometheus: Some(storage_api::PrometheusMetricsEndpointConfig {
             handle,
             bearer_token: metrics.prometheus.bearer_token.clone(),
         }),
@@ -383,13 +419,33 @@ fn spawn_prometheus_upkeep(metrics_config: &MetricsEndpointConfig) {
         return;
     };
     let handle = prometheus.handle.clone();
-    tokio::spawn(async move {
+    spawn_named("storage-api-prometheus-upkeep", async move {
         let mut interval = tokio::time::interval(PROMETHEUS_UPKEEP_INTERVAL);
         loop {
             interval.tick().await;
             handle.run_upkeep();
         }
     });
+}
+
+fn spawn_named<F>(task_name: &str, fut: F) -> JoinHandle<()>
+where F: Future<Output = ()> + Send + 'static {
+    #[cfg(tokio_unstable)]
+    {
+        match tokio::task::Builder::new().name(task_name).spawn(fut) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!(target: "runtime", error = %err, task_name, "failed to spawn named task");
+                tokio::spawn(async {})
+            }
+        }
+    }
+
+    #[cfg(not(tokio_unstable))]
+    {
+        let _ = task_name;
+        tokio::spawn(fut)
+    }
 }
 
 fn cors_layer(cors: &config::Cors) -> CorsLayer {

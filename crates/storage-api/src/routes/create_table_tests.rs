@@ -138,7 +138,7 @@ async fn handle_create_table_short_table_name() {
 
     match request_result {
         Err(error) => {
-            assert!(error.contains("TableName must be between 3 and 255 characters"));
+            assert!(error.contains("Member must have length greater than or equal to 3"));
         }
         Ok(_) => panic!("Expected validation error"),
     }
@@ -166,7 +166,9 @@ async fn handle_create_table_invalid_table_name_characters() {
 
     match request_result {
         Err(error) => {
-            assert!(error.contains("TableName contains invalid characters"));
+            assert!(
+                error.contains("Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
+            );
         }
         Ok(_) => panic!("Expected validation error"),
     }

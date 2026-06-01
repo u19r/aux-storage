@@ -190,5 +190,6 @@ fn table_description(
         stream_specification: table_info.stream_specification,
         latest_stream_arn: None,
         latest_stream_label: None,
+        deletion_protection_enabled: table_info.deletion_protection_enabled,
     }
 }

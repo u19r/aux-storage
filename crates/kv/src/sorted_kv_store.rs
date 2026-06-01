@@ -197,6 +197,7 @@ pub enum TransactWriteTableOperation {
         key: KeyAttributes,
         operations: Arc<[UpdateOperation]>,
         condition: Option<Condition>,
+        return_values_on_condition_check_failure: Option<String>,
         replication: Option<ReplicationEventMetadata>,
         preserve_old_item: bool,
         transaction_validation: bool,

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use storage_types::{
     AttributeMap, AttributeValue, ExclusiveStartKey, IndexName, ItemKey, KeyAttributes,
     MAX_QUERY_SCAN_RESPONSE_BYTES, StoredTableInfo, TableName, WireItem,
+    validate_key_attributes_for_schema, validate_transact_key,
 };
 
 use crate::raw_dynamodb_response::wire_item_json_len_upper_bound;
@@ -15,6 +16,17 @@ pub(crate) fn resolve_exclusive_start_key(
 ) -> storage_types::StorageResult<Option<String>> {
     exclusive_start_key
         .map(|key| {
+            if index_name.is_none()
+                && let ExclusiveStartKey::Key(key_attributes) = key
+            {
+                validate_transact_key(table_info, key_attributes).map_err(|_| {
+                    storage_types::StorageError::validation(invalid_starting_key_message)
+                })?;
+                validate_key_attributes_for_schema(&table_info.key_schema, key_attributes)
+                    .map_err(|_| {
+                        storage_types::StorageError::validation(invalid_starting_key_message)
+                    })?;
+            }
             key.to_page_token(table_info, index_name)
                 .map_err(|_| storage_types::StorageError::validation(invalid_starting_key_message))
         })
