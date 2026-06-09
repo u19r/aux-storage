@@ -7,6 +7,7 @@ mod logical_backfill_records;
 mod provider_impl;
 mod query;
 mod resolved_sync_apply;
+pub(crate) mod stream_duration;
 mod write_helpers;
 
 pub(crate) use gsi::{GsiBackfillJob, GsiUpdateJob};
@@ -52,5 +53,12 @@ mod quint_sync_committed_stream_id_tests;
     any(feature = "rocksdb-backend", feature = "foundationdb-backend")
 ))]
 mod resolved_sync_apply_tests;
+#[cfg(all(
+    test,
+    any(feature = "rocksdb-backend", feature = "foundationdb-backend")
+))]
+mod stream_duration_perf_tests;
+#[cfg(test)]
+mod stream_duration_tests;
 #[cfg(all(test, feature = "rocksdb-backend"))]
 mod update_item_tests;

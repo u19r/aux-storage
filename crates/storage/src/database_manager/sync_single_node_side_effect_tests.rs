@@ -85,6 +85,7 @@ async fn single_node_sync_update_preserves_old_and_new_stream_images() {
             (":old".to_string(), AttributeValue::S("open".to_string())),
         ])),
         return_values: Some(storage_types::ReturnValuesOldNewUpdated::AllNew),
+        aux_item_stream_ttl_hours: None,
     })
     .await
     .expect("update through sync mode");
@@ -212,6 +213,7 @@ async fn single_node_sync_replays_persisted_log_after_restart_once() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await

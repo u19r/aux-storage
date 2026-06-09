@@ -32,6 +32,7 @@ async fn sync_apply_imports_resolved_put_and_delete() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -71,6 +72,7 @@ async fn sync_apply_imports_resolved_put_and_delete() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -110,6 +112,7 @@ async fn sync_apply_ignores_duplicate_and_stale_resolved_versions() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -137,6 +140,7 @@ async fn sync_apply_ignores_duplicate_and_stale_resolved_versions() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -193,6 +197,7 @@ async fn sync_apply_rolls_back_all_mutations_when_batch_fails() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await

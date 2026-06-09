@@ -143,6 +143,68 @@ async fn put_item_with_pipe_character() {
 }
 
 #[tokio::test]
+async fn put_item_accepts_aux_item_stream_ttl_without_storing_attribute() {
+    let db = create_test_db_manager().await;
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "RoutePutItemDuration",
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "id", "KeyType": "HASH"}
+            ]
+        })
+        .try_into()
+        .expect("valid create table request"),
+    )
+    .await
+    .expect("create table");
+
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "RoutePutItemDuration",
+            "Item": {
+                "id": {"S": "item1"},
+                "value": {"S": "stored"}
+            },
+            "AuxItemStreamTtlHours": 120
+        })
+        .try_into()
+        .expect("valid put item request"),
+    )
+    .await
+    .expect("put item with custom item stream ttl");
+
+    let item = expect_get_item_response(
+        handle_get_item(
+            db,
+            json!({
+                "TableName": "RoutePutItemDuration",
+                "Key": {"id": {"S": "item1"}},
+                "ConsistentRead": true
+            })
+            .try_into()
+            .expect("valid get item request"),
+        )
+        .await
+        .expect("get item"),
+    )
+    .item
+    .expect("item");
+    assert_eq!(
+        item.get("value"),
+        Some(&AttributeValue::S("stored".to_string()))
+    );
+    assert!(
+        !item.contains_key("AuxItemStreamTtlHours"),
+        "aux item stream ttl is request metadata, not item data"
+    );
+}
+
+#[tokio::test]
 async fn put_item_condition_failure_returns_dynamodb_error_code() {
     let db = create_test_db_manager().await;
 

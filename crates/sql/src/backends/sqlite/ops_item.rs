@@ -4,7 +4,8 @@ use storage_provider::{
     before_update_item_optional, return_values_need_updated_fields, update_item_response,
 };
 use storage_types::{
-    AllOld, AttributeValue, KeyAttributes, StorageResult, TableName, UpdateItemRequest, WireItem,
+    AllOld, AttributeValue, KeyAttributes, StorageResult, StreamRetentionDuration, TableName,
+    UpdateItemRequest, WireItem,
 };
 
 use crate::{
@@ -13,6 +14,7 @@ use crate::{
 }; // now pub(crate)
 
 impl SQLiteStorageProvider {
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_item_internal(
         &self,
         table_name: TableName,
@@ -21,6 +23,7 @@ impl SQLiteStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<storage_types::PutItemResponse> {
         let condition = parse_optional_condition(
             condition_expression,
@@ -36,6 +39,7 @@ impl SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 None,
+                aux_item_stream_ttl_hours,
             )
         })
         .await?;
@@ -49,6 +53,7 @@ impl SQLiteStorageProvider {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_item_wire_internal(
         &self,
         table_name: TableName,
@@ -57,6 +62,7 @@ impl SQLiteStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<storage_types::PutItemResponse> {
         let condition = parse_optional_condition(
             condition_expression,
@@ -74,6 +80,7 @@ impl SQLiteStorageProvider {
                 immediate_gsi_consistency,
                 should_return_old,
                 None,
+                aux_item_stream_ttl_hours,
             )
         })
         .await?;
@@ -102,6 +109,7 @@ impl SQLiteStorageProvider {
         condition_expression: Option<String>,
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let condition = parse_optional_condition(
             condition_expression,
@@ -117,6 +125,7 @@ impl SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 None,
+                aux_item_stream_ttl_hours,
             )
         })
         .await
@@ -134,6 +143,7 @@ impl SQLiteStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             ..
         } = request;
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
@@ -163,6 +173,7 @@ impl SQLiteStorageProvider {
                     &key,
                     sqlite,
                     immediate_gsi_consistency,
+                    aux_item_stream_ttl_hours,
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))
             })

@@ -8,7 +8,10 @@ use storage_common::{
     ttl::{TtlConfigRecord, ttl_gsi_name},
 };
 use storage_condition::parse_condition_expression;
-use storage_provider::{StorageProvider, return_values_need_updated_fields};
+use storage_provider::{
+    StorageProvider, StreamTrimDueMarker, StreamTrimState, StreamTrimStateWrite,
+    plan_table_stream_duration, return_values_need_updated_fields,
+};
 use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
@@ -16,10 +19,10 @@ use storage_types::{
     GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedTransactWriteItemsRequest,
     GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes, PreparedBatchOperation,
     PutItemResponse, QueryTableRequest, ReplicationMutation, ScanTableRequest, StorageEnum,
-    StorageError, StorageResult, StoredTableInfo, TableName, TableStatus, TimeToLiveDescription,
-    TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
-    UpdateTimeToLiveResponse, WireItem, WriteRequest,
+    StorageError, StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
+    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem, WriteRequest,
 };
 use tracing::{Span, field, instrument};
 
@@ -87,7 +90,14 @@ pub(crate) fn parse_optional_condition(
     Ok(Some(parsed))
 }
 use crate::{
-    backends::{prepare_batch_operation, sqlite::SQLiteStorageProvider},
+    backends::{
+        prepare_batch_operation,
+        sqlite::{
+            SQLiteStorageProvider,
+            provider_table_lifecycle::{load_sqlite_table_scope_id, next_table_policy_version},
+            stream_duration::write_stream_trim_state_tx,
+        },
+    },
     batch_write::{BatchWriteTxnState, execute_prepared_batch_operation},
     error_handler::map_sqlite_error,
     sql_statements,
@@ -103,6 +113,23 @@ impl StorageProvider for SQLiteStorageProvider {
 
     fn supports_guarded_transaction_writes(&self) -> bool {
         true
+    }
+
+    fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    async fn write_stream_trim_state(&self, state: StreamTrimState) -> StorageResult<()> {
+        self.write_stream_trim_state_sqlite(state).await
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
+        self.list_due_stream_trim_markers_sqlite(due_before, limit)
+            .await
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
@@ -258,6 +285,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 expression_attribute_names,
                 expression_attribute_values,
                 return_values,
+                None,
             )
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -295,6 +323,65 @@ impl StorageProvider for SQLiteStorageProvider {
                 expression_attribute_names,
                 expression_attribute_values,
                 return_values,
+                None,
+            )
+            .await?;
+        self.maybe_apply_immediate_gsi_updates().await?;
+        record_write(1, bytes_written);
+        record_write_cost("put_item", "put", 1, bytes_written as u64);
+        Ok(response)
+    }
+
+    async fn put_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: HashMap<String, AttributeValue>,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        self.apply_gsi_write_pressure().await?;
+        let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
+        let response = self
+            .put_item_internal(
+                table_name,
+                item,
+                condition_expression,
+                expression_attribute_names,
+                expression_attribute_values,
+                return_values,
+                aux_item_stream_ttl_hours,
+            )
+            .await?;
+        self.maybe_apply_immediate_gsi_updates().await?;
+        record_write(1, bytes_written);
+        record_write_cost("put_item", "put", 1, bytes_written as u64);
+        Ok(response)
+    }
+
+    async fn put_item_encode_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: WireItem,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        self.apply_gsi_write_pressure().await?;
+        let bytes_written = item.payload_len();
+        let response = self
+            .put_item_wire_internal(
+                table_name,
+                item,
+                condition_expression,
+                expression_attribute_names,
+                expression_attribute_values,
+                return_values,
+                aux_item_stream_ttl_hours,
             )
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -383,6 +470,38 @@ impl StorageProvider for SQLiteStorageProvider {
                 condition_expression,
                 expression_attribute_names,
                 expression_attribute_values,
+                None,
+            )
+            .await?;
+        self.maybe_apply_immediate_gsi_updates().await?;
+        record_write(usize::from(result.is_some()), 0);
+        record_write_cost("delete_item", "delete", 1, key_bytes);
+        Ok(result)
+    }
+
+    async fn delete_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        if key.is_empty() {
+            record_write(0, 0);
+            return Ok(None);
+        }
+        self.apply_gsi_write_pressure().await?;
+        let key_bytes = attr_map_payload_bytes(&key);
+        let result = self
+            .delete_item_internal(
+                table_name,
+                key,
+                condition_expression,
+                expression_attribute_names,
+                expression_attribute_values,
+                aux_item_stream_ttl_hours,
             )
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -425,6 +544,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 None,
+                None,
             )
         })
         .await?;
@@ -462,6 +582,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 None,
+                None,
             )
         })
         .await
@@ -481,6 +602,7 @@ impl StorageProvider for SQLiteStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             ..
         } = request;
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
@@ -511,6 +633,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     &key,
                     sqlite,
                     immediate_gsi_consistency,
+                    aux_item_stream_ttl_hours,
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))
             })
@@ -907,6 +1030,51 @@ impl StorageProvider for SQLiteStorageProvider {
             .await?;
         }
 
+        if request.aux_stream_duration_hours.is_some()
+            || request.aux_default_item_stream_duration_hours.is_some()
+        {
+            if let Some(table_stream_duration) = request.aux_stream_duration_hours {
+                table_info.table_stream_duration = table_stream_duration;
+            }
+            if let Some(default_item_stream_duration) =
+                request.aux_default_item_stream_duration_hours
+            {
+                table_info.default_item_stream_duration = default_item_stream_duration;
+            }
+            let table_name_clone = table_name.clone();
+            let table_stream_duration = table_info.table_stream_duration;
+            let default_item_stream_duration = table_info.default_item_stream_duration;
+            let table_scope_id = load_sqlite_table_scope_id(self, &table_name).await?;
+            let policy_version = next_table_policy_version(self, &table_scope_id).await?;
+            let table_duration_plan = plan_table_stream_duration(
+                table_name.clone(),
+                table_scope_id,
+                policy_version,
+                table_stream_duration,
+                default_item_stream_duration,
+                TimestampMillis::now(),
+            );
+            call_sqlite(&self.connection, move |conn| {
+                let tx = conn.transaction().map_err(map_sqlite_error)?;
+                let (sql, params) = sql_statements::update_stream_durations(
+                    &table_name_clone,
+                    table_stream_duration,
+                    default_item_stream_duration,
+                );
+                tx.execute(sql, params).map_err(map_sqlite_error)?;
+                write_stream_trim_state_tx(
+                    &tx,
+                    StreamTrimStateWrite {
+                        state: table_duration_plan.trim_state,
+                        next_marker: table_duration_plan.due_marker,
+                    },
+                )?;
+                tx.commit().map_err(map_sqlite_error)?;
+                Ok(())
+            })
+            .await?;
+        }
+
         if let Some(gsi_updates) = request.global_secondary_index_updates.clone() {
             crate::gsi_lifecycle::process_gsi_updates(
                 self,
@@ -985,6 +1153,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     sqlite,
                     immediate_gsi_consistency,
                     Some(&metadata),
+                    None,
                 )
                 .map(|_| ())
             })
@@ -1003,6 +1172,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 Some(&metadata),
+                None,
             )
             .map(|_| ())
         })

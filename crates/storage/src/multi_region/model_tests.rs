@@ -245,6 +245,8 @@ async fn update_table_replica_updates_persist_desired_state() {
             provisioned_throughput: None,
             on_demand_throughput: None,
             deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
             global_secondary_index_updates: None,
             replica_updates: Some(vec![
                 ReplicaUpdate {
@@ -349,6 +351,8 @@ async fn update_table_keeps_stream_updates_working_with_replica_updates() {
             provisioned_throughput: None,
             on_demand_throughput: None,
             deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
             global_secondary_index_updates: None,
             replica_updates: Some(vec![ReplicaUpdate {
                 create: Some(CreateReplicaAction {
@@ -421,6 +425,8 @@ async fn invalid_replica_updates_do_not_mutate_other_table_settings() {
             provisioned_throughput: None,
             on_demand_throughput: None,
             deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
             global_secondary_index_updates: None,
             replica_updates: Some(vec![
                 ReplicaUpdate {
@@ -484,6 +490,8 @@ async fn replica_updates_reject_empty_region_names() {
             provisioned_throughput: None,
             on_demand_throughput: None,
             deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
             global_secondary_index_updates: None,
             replica_updates: Some(vec![ReplicaUpdate {
                 create: Some(CreateReplicaAction {
@@ -975,6 +983,8 @@ async fn read_outbound_replication_batch_returns_local_origin_mutations_only() {
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: None,
         replica_updates: Some(vec![ReplicaUpdate {
             create: Some(CreateReplicaAction {
@@ -1056,6 +1066,8 @@ async fn read_outbound_replication_batch_respects_byte_cap_without_skipping_futu
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: None,
         replica_updates: Some(vec![ReplicaUpdate {
             create: Some(CreateReplicaAction {
@@ -1149,6 +1161,8 @@ async fn read_outbound_replication_batch_skips_missing_local_delete_stream_noop(
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: None,
         replica_updates: Some(vec![ReplicaUpdate {
             create: Some(CreateReplicaAction {

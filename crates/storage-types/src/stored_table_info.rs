@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{IndexName, KeyAttributeType, KeySchemaElement, TableName, TimestampMillis};
+use crate::{
+    IndexName, KeyAttributeType, KeySchemaElement, StreamRetentionDuration, TableName,
+    TimestampMillis,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StoredTableInfo {
@@ -15,8 +18,20 @@ pub struct StoredTableInfo {
     pub table_size_bytes: u64,
     pub item_count: u64,
     pub stream_specification: Option<StreamSpecification>,
+    #[serde(default = "default_table_stream_duration")]
+    pub table_stream_duration: StreamRetentionDuration,
+    #[serde(default = "default_item_stream_duration")]
+    pub default_item_stream_duration: StreamRetentionDuration,
     #[serde(default)]
     pub deletion_protection_enabled: bool,
+}
+
+fn default_table_stream_duration() -> StreamRetentionDuration {
+    StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
+}
+
+fn default_item_stream_duration() -> StreamRetentionDuration {
+    StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -38,10 +38,27 @@ impl PostgresStorageProvider {
                     "postgres deletion protection migration failed: {err}"
                 ))
             })?;
+        client
+            .batch_execute(sql_statements::add_table_stream_duration_column())
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!(
+                    "postgres table stream duration migration failed: {err}"
+                ))
+            })?;
+        client
+            .batch_execute(sql_statements::add_default_item_stream_duration_column())
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!(
+                    "postgres default item stream duration migration failed: {err}"
+                ))
+            })?;
 
         self.initialize_stream().await.map_err(|err| {
             StorageError::internal(&format!("postgres stream init failed: {err}"))
         })?;
+        self.initialize_stream_duration_tables().await?;
 
         struct PostgresRegistrar<'a> {
             mgr: &'a bg_jobs::JobManager,
@@ -110,7 +127,9 @@ impl PostgresStorageProvider {
         #[async_trait]
         impl bg_jobs::BackgroundJob for PostgresTtlSweepJob {
             async fn execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(self.provider.run_ttl_sweep_once().await?)
+                let ttl_progressed = self.provider.run_ttl_sweep_once().await?;
+                let trim_progressed = self.provider.run_custom_stream_trim_once().await?;
+                Ok(ttl_progressed || trim_progressed)
             }
         }
 
@@ -173,6 +192,16 @@ impl PostgresStorageProvider {
             let metadata = metadata.clone();
             async move {
                 let table_id = Uuid::now_v7().to_string();
+                let table_scope_id =
+                    super::stream_duration::postgres_table_scope_id(table_id.as_str());
+                let table_duration_plan = storage_provider::plan_table_stream_duration(
+                    request.table_name.clone(),
+                    table_scope_id,
+                    1,
+                    metadata.table_stream_duration,
+                    metadata.default_item_stream_duration,
+                    metadata.created_at,
+                );
                 let table_name = request.table_name.to_string();
                 let creating_status: String = String::from(&TableStatus::Creating);
                 let created_at_millis = *metadata.created_at;
@@ -198,6 +227,8 @@ impl PostgresStorageProvider {
                             &metadata.global_secondary_indexes_json,
                             &metadata.stream_specification_json,
                             &metadata.deletion_protection_enabled,
+                            &metadata.table_stream_duration.as_hours_wire_value(),
+                            &metadata.default_item_stream_duration.as_hours_wire_value(),
                         ],
                     )
                     .await
@@ -218,6 +249,14 @@ impl PostgresStorageProvider {
 
                 self.create_table_storage_with_client(&transaction, &request.table_name, &request)
                     .await?;
+                Self::write_stream_trim_state_with_client(
+                    &transaction,
+                    storage_provider::StreamTrimStateWrite {
+                        state: table_duration_plan.trim_state,
+                        next_marker: table_duration_plan.due_marker,
+                    },
+                )
+                .await?;
                 let active_status: String = String::from(&TableStatus::Active);
                 transaction
                     .execute(
@@ -450,6 +489,64 @@ impl PostgresStorageProvider {
                 )
                 .await
                 .map_err(|err| Self::map_postgres_error("update deletion protection", err))?;
+        }
+
+        if request.aux_stream_duration_hours.is_some()
+            || request.aux_default_item_stream_duration_hours.is_some()
+        {
+            if let Some(table_stream_duration) = request.aux_stream_duration_hours {
+                table_info.table_stream_duration = table_stream_duration;
+            }
+            if let Some(default_item_stream_duration) =
+                request.aux_default_item_stream_duration_hours
+            {
+                table_info.default_item_stream_duration = default_item_stream_duration;
+            }
+            let table_scope_id = self.load_postgres_table_scope_id(&table_name).await?;
+            let policy_version = self
+                .next_postgres_table_policy_version(&table_scope_id)
+                .await?;
+            let table_duration_plan = storage_provider::plan_table_stream_duration(
+                table_name.clone(),
+                table_scope_id,
+                policy_version,
+                table_info.table_stream_duration,
+                table_info.default_item_stream_duration,
+                storage_types::TimestampMillis::now(),
+            );
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            let transaction = client.transaction().await.map_err(|err| {
+                Self::map_postgres_write_error("start update stream durations transaction", err)
+            })?;
+            transaction
+                .execute(
+                    sql_statements::update_stream_durations(),
+                    &[
+                        &table_info.table_stream_duration.as_hours_wire_value(),
+                        &table_info
+                            .default_item_stream_duration
+                            .as_hours_wire_value(),
+                        &table_name.as_ref(),
+                    ],
+                )
+                .await
+                .map_err(|err| Self::map_postgres_write_error("update stream durations", err))?;
+            Self::write_stream_trim_state_with_client(
+                &transaction,
+                storage_provider::StreamTrimStateWrite {
+                    state: table_duration_plan.trim_state,
+                    next_marker: table_duration_plan.due_marker,
+                },
+            )
+            .await?;
+            transaction.commit().await.map_err(|err| {
+                Self::map_postgres_write_error("commit update stream durations", err)
+            })?;
+            self.invalidate_table_info_cache(&table_name).await;
         }
 
         if let Some(gsi_updates) = request.global_secondary_index_updates {

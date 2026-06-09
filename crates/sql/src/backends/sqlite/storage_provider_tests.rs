@@ -139,6 +139,8 @@ async fn given_deletion_protection_enabled_when_delete_table_then_rejects_until_
             provisioned_throughput: None,
             on_demand_throughput: None,
             deletion_protection_enabled: Some(false),
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
             global_secondary_index_updates: None,
             replica_updates: None,
             sse_specification: None,
@@ -303,6 +305,7 @@ async fn sqlite_durable_proof_tracks_put_update_and_delete_revisions() {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         })
         .await
         .unwrap_or_else(|err| panic!("export gsi records: {err:?}"));
@@ -1537,6 +1540,7 @@ async fn sqlite_guarded_delete_and_update_validate_present_revision() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             },
             guard: proof_guard(&present),
         })
@@ -4228,6 +4232,7 @@ async fn batch_write_item_put_operations() {
                     );
                     item
                 },
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         },
@@ -4242,6 +4247,7 @@ async fn batch_write_item_put_operations() {
                     );
                     item
                 },
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         },
@@ -4362,12 +4368,14 @@ async fn batch_write_item_delete_operations() {
             put_request: None,
             delete_request: Some(DeleteRequest {
                 key: key1.clone().into(),
+                aux_item_stream_ttl_hours: None,
             }),
         },
         WriteRequest {
             put_request: None,
             delete_request: Some(DeleteRequest {
                 key: key2.clone().into(),
+                aux_item_stream_ttl_hours: None,
             }),
         },
     ];
@@ -4444,6 +4452,7 @@ async fn batch_write_item_mixed_operations() {
                     );
                     item
                 },
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         },
@@ -4455,6 +4464,7 @@ async fn batch_write_item_mixed_operations() {
                     key.insert("id".to_string(), AttributeValue::S("to_delete".to_string()));
                     key.into()
                 },
+                aux_item_stream_ttl_hours: None,
             }),
         },
     ];
@@ -4816,6 +4826,7 @@ async fn batch_write_item_with_streams() {
                     );
                     item
                 },
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         },
@@ -4834,6 +4845,7 @@ async fn batch_write_item_with_streams() {
                     );
                     item
                 },
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         },
@@ -4912,7 +4924,10 @@ async fn batch_write_item_reuses_ttl_config_within_transaction() {
                     AttributeValue::N((Utc::now().timestamp() + 3_600 + index).to_string()),
                 );
                 WriteRequest {
-                    put_request: Some(PutRequest { item }),
+                    put_request: Some(PutRequest {
+                        item,
+                        aux_item_stream_ttl_hours: None,
+                    }),
                     delete_request: None,
                 }
             })
@@ -4960,7 +4975,10 @@ async fn batch_write_item_encode_missing_table_returns_not_found() {
         request_items: HashMap::from([(
             TableName::new("NonExistentTable"),
             vec![WriteRequest {
-                put_request: Some(PutRequest { item }),
+                put_request: Some(PutRequest {
+                    item,
+                    aux_item_stream_ttl_hours: None,
+                }),
                 delete_request: None,
             }],
         )]),

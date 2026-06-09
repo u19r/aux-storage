@@ -5,7 +5,7 @@ use bg_jobs::BackgroundJob;
 use futures::StreamExt;
 use storage_backfill::merge_protected_backfill_cursor;
 use storage_common::STREAM_TRIM_JOB;
-use storage_provider::StorageProvider;
+use storage_provider::{StorageProvider, StreamDurationTrimConfig, StreamDurationTrimWorker};
 use storage_types::{
     AttributeValue, ScanTableRequest, StorageError, StorageResult, StreamItemId, StreamName,
     TableName, TimestampMillis,
@@ -55,6 +55,15 @@ impl SQLiteStorageProvider {
     #[tracing::instrument(level = "debug", skip_all, fields(job = %STREAM_TRIM_JOB))]
     pub(crate) async fn run_stream_trim(&self) -> StorageResult<bool> {
         let job_start = std::time::Instant::now();
+        let custom_stats = StreamDurationTrimWorker::new(
+            self.clone(),
+            StreamDurationTrimConfig {
+                marker_page_size: 250,
+                stream_page_size: constants::STREAM_TRIM_READ_LIMIT as usize,
+            },
+        )
+        .run_due_page(TimestampMillis::now(), TimestampMillis::now())
+        .await?;
         let cutoff = stream_trim_cutoff();
         let protected_cursor_floor = self.oldest_protected_replication_cursor().await?;
         let mut page_token = None;
@@ -105,7 +114,7 @@ impl SQLiteStorageProvider {
             "stream trim completed"
         );
 
-        Ok(stats.deleted_groups > 0)
+        Ok(stats.deleted_groups > 0 || custom_stats.did_work())
     }
 
     async fn delete_stream_trim_groups(
@@ -182,7 +191,9 @@ impl SQLiteStorageProvider {
         .await
     }
 
-    async fn oldest_protected_replication_cursor(&self) -> StorageResult<Option<StreamItemId>> {
+    pub(crate) async fn oldest_protected_replication_cursor(
+        &self,
+    ) -> StorageResult<Option<StreamItemId>> {
         let table_name = TableName::new(MULTI_REGION_CONTROL_TABLE);
         if !<Self as StorageProvider>::table_exists(self, &table_name).await? {
             return Ok(None);

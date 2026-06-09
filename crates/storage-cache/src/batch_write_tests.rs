@@ -31,7 +31,10 @@ fn routed_batch_write_request_builder_tracks_physical_to_logical_tables() {
         },
         "conn-a".to_string(),
         vec![WriteRequest {
-            put_request: Some(PutRequest { item: item("1") }),
+            put_request: Some(PutRequest {
+                item: item("1"),
+                aux_item_stream_ttl_hours: None,
+            }),
             delete_request: None,
         }],
     );
@@ -65,6 +68,7 @@ fn routed_batch_write_encode_request_builder_tracks_physical_to_logical_tables()
         vec![EncodeWriteRequest {
             put_request: Some(EncodePutRequest {
                 item: WireItem::from_attribute_map(&item("1")).expect("wire item"),
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         }],
@@ -101,6 +105,7 @@ fn merge_unprocessed_batch_write_items_rewrites_physical_tables() {
                 put_request: None,
                 delete_request: Some(DeleteRequest {
                     key: item("1").into(),
+                    aux_item_stream_ttl_hours: None,
                 }),
             }],
         )]),
@@ -174,7 +179,10 @@ fn routed_batch_write_request_builder_keeps_primary_and_migration_dispatch_separ
         target.clone(),
         ("conn-a".to_string(), "primary".to_string()),
         vec![WriteRequest {
-            put_request: Some(PutRequest { item: item("1") }),
+            put_request: Some(PutRequest {
+                item: item("1"),
+                aux_item_stream_ttl_hours: None,
+            }),
             delete_request: None,
         }],
     );
@@ -186,7 +194,10 @@ fn routed_batch_write_request_builder_keeps_primary_and_migration_dispatch_separ
         target,
         ("conn-a".to_string(), "migration".to_string()),
         vec![WriteRequest {
-            put_request: Some(PutRequest { item: item("2") }),
+            put_request: Some(PutRequest {
+                item: item("2"),
+                aux_item_stream_ttl_hours: None,
+            }),
             delete_request: None,
         }],
     );

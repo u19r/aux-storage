@@ -148,6 +148,44 @@ async fn batch_write_duplicate_keys_reject_across_conformance_backends() {
 }
 
 #[tokio::test]
+async fn batch_write_put_accepts_aux_item_stream_ttl_without_storing_attribute() {
+    let db = crate::routes::routes_test_support::create_test_db().await;
+    create_batch_table(db.as_ref()).await;
+
+    let response = handle_batch_write_item(
+        db.clone(),
+        json!({
+            "RequestItems": {
+                "BatchWriteRouteTable": [{
+                    "PutRequest": {
+                        "Item": {
+                            "pk": {"S": "aux-item"},
+                            "payload": {"S": "stored"}
+                        },
+                        "AuxItemStreamTtlHours": 96
+                    }
+                }]
+            }
+        })
+        .try_into()
+        .expect("batch write request with aux ttl"),
+    )
+    .await
+    .expect("batch write with custom item stream ttl");
+    assert_empty_batch_write_response(&response, "default");
+
+    let item = batch_get_item(db, "aux-item", "default").await;
+    assert_eq!(
+        item.get("payload"),
+        Some(&AttributeValue::S("stored".to_string()))
+    );
+    assert!(
+        !item.contains_key("AuxItemStreamTtlHours"),
+        "aux item stream ttl is request metadata, not item data"
+    );
+}
+
+#[tokio::test]
 async fn batch_write_key_validation_priority_matches_dynamodb() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;
@@ -332,6 +370,41 @@ async fn batch_write_key_validation_priority_matches_dynamodb() {
             );
         }
     }
+}
+
+async fn batch_get_item(
+    db: std::sync::Arc<storage::DatabaseManager>,
+    key: &str,
+    backend_name: &str,
+) -> storage_types::AttributeMap {
+    let response = handle_batch_get_item(
+        db,
+        json!({
+            "RequestItems": {
+                "BatchWriteRouteTable": {
+                    "Keys": [
+                        {"pk": {"S": key}}
+                    ]
+                }
+            }
+        })
+        .try_into()
+        .expect("batch get request"),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{backend_name} batch get after batch write: {err:?}"));
+    let Response::BatchGetWire(response) = response else {
+        panic!("{backend_name} expected batch get wire response");
+    };
+    let mut response = response
+        .into_batch_get_response()
+        .unwrap_or_else(|err| panic!("{backend_name} decode batch get response: {err}"));
+    response
+        .responses
+        .as_mut()
+        .and_then(|responses| responses.remove(&TableName::new("BatchWriteRouteTable")))
+        .and_then(|mut items| items.pop())
+        .unwrap_or_else(|| panic!("{backend_name} expected batch get item for {key}"))
 }
 
 async fn create_batch_table(db: &storage::DatabaseManager) {

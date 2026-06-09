@@ -19,6 +19,7 @@ fn transact_write_request_preserves_client_request_token() {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -41,6 +42,7 @@ fn transact_write_item_can_represent_invalid_multiple_operations_for_validation_
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             update: Some(storage_types::TransactUpdateRequest {
                 table_name: TableName::new("test_table"),
@@ -50,6 +52,7 @@ fn transact_write_item_can_represent_invalid_multiple_operations_for_validation_
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],

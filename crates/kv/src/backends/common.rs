@@ -202,6 +202,7 @@ struct TableUpdateContext<'a> {
     index: usize,
     preserve_old_item: bool,
     ttl_config: Option<&'a TtlConfigRecord>,
+    item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 pub fn plan_transact_operation(
@@ -294,6 +295,7 @@ pub fn plan_table_operation(
         TableOp::Put {
             table_info,
             item,
+            item_stream_ttl_hours,
             condition,
             return_values_on_condition_check_failure,
             replication,
@@ -310,6 +312,7 @@ pub fn plan_table_operation(
                 immediate_gsi_consistency,
             },
             ttl_config.as_ref(),
+            *item_stream_ttl_hours,
             index,
         ),
         TableOp::Delete {
@@ -350,6 +353,7 @@ pub fn plan_table_operation(
             table_info,
             key,
             operations,
+            item_stream_ttl_hours,
             condition,
             return_values_on_condition_check_failure,
             replication,
@@ -372,6 +376,7 @@ pub fn plan_table_operation(
                 index,
                 preserve_old_item: *preserve_old_item,
                 ttl_config: ttl_config.as_ref(),
+                item_stream_ttl_hours: *item_stream_ttl_hours,
             },
         )
         .map_err(|error| {
@@ -584,6 +589,7 @@ fn plan_table_put(
     current_bytes: Option<&[u8]>,
     stream_context: TableStreamContext<'_>,
     ttl_config: Option<&TtlConfigRecord>,
+    item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     index: usize,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
     let item_clone = item.clone();
@@ -655,6 +661,12 @@ fn plan_table_put(
         current_bytes.is_some().then_some(&current),
         Some(&item_clone),
     )?));
+
+    mutations.extend(item_stream_duration_kv_mutations(
+        table_info,
+        &item_clone,
+        item_stream_ttl_hours,
+    )?);
 
     Ok(((Some(current), Some(item_clone)), mutations))
 }
@@ -862,7 +874,45 @@ fn plan_table_update(
         Some(&new_item),
     )?));
 
+    mutations.extend(item_stream_duration_kv_mutations(
+        table_info,
+        &new_item,
+        update_context.item_stream_ttl_hours,
+    )?);
+
     Ok(((result_old_item, Some(new_item)), mutations))
+}
+
+fn item_stream_duration_kv_mutations(
+    table_info: &StoredTableInfo,
+    item: &HashMap<String, AttributeValue>,
+    retention: Option<storage_types::StreamRetentionDuration>,
+) -> StorageResult<Vec<KvMutation>> {
+    let Some(retention) = retention else {
+        return Ok(Vec::new());
+    };
+    let key_attributes = item_key_attributes(table_info, item)?;
+    let policy_version = 0;
+    crate::storage_ops::stream_duration::item_stream_duration_kv_mutations(
+        table_info,
+        &key_attributes,
+        policy_version,
+        Some(retention),
+    )
+}
+
+fn item_key_attributes(
+    table_info: &StoredTableInfo,
+    item: &impl AttributeValueLookup,
+) -> StorageResult<KeyAttributes> {
+    let mut key_attributes = KeyAttributes::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let value = item
+            .get_attribute_value(&key.attribute_name)
+            .ok_or_else(StorageError::invalid_or_missing_key)?;
+        key_attributes.insert(key.attribute_name.clone(), value.clone());
+    }
+    Ok(key_attributes)
 }
 
 fn ttl_index_kv_mutations(mutations: Vec<TtlIndexMutation>) -> Vec<KvMutation> {

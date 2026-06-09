@@ -293,6 +293,8 @@ async fn describe_table_includes_multi_region_replica_state() {
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: None,
         replica_updates: Some(vec![ReplicaUpdate {
             create: Some(CreateReplicaAction {

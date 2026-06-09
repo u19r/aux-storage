@@ -61,6 +61,7 @@ impl StorageApiManagerImpl {
                 expression_attribute_names: request.expression_attribute_names,
                 expression_attribute_values: request.expression_attribute_values,
                 return_values: request.return_values,
+                aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
             })
             .await
             .map_err(|error| {

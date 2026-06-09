@@ -10,6 +10,7 @@ doctest = false
 [dependencies]
 async-trait = { workspace = true }
 bg-jobs = { path = "../bg-jobs" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 storage-backfill = { path = "../storage-backfill" }
 storage-condition = { path = "../storage-condition" }
@@ -18,6 +19,8 @@ storage-types = { path = "../storage-types" }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
 
 [lints]
 workspace = true

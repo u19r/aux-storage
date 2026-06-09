@@ -98,6 +98,8 @@ fn round_trip_pagination_token() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -169,6 +171,8 @@ fn key_consistency_across_methods() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -310,6 +314,8 @@ fn gsi_round_trip_hash_only() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -416,6 +422,8 @@ fn gsi_round_trip_with_gsi_range() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -529,6 +537,8 @@ fn gsi_round_trip_all_keys() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -623,6 +633,8 @@ fn gsi_invalid_token_parts() {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: crate::StreamRetentionDuration::default(),
+        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
     let empty_token = URL_SAFE.encode([]);

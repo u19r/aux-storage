@@ -28,6 +28,7 @@ fn plan_table_put_includes_ttl_index_mutation_in_same_plan() {
         &[TransactWriteTableOperation::Put {
             table_info,
             item: new_item,
+            item_stream_ttl_hours: None,
             condition: None,
             return_values_on_condition_check_failure: None,
             replication: None,
@@ -73,6 +74,7 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
                 field: "ttl".to_string().into(),
                 value: new_ttl,
             }]),
+            item_stream_ttl_hours: None,
             condition: None,
             return_values_on_condition_check_failure: None,
             replication: None,
@@ -195,6 +197,7 @@ fn plan_table_write_rejects_duplicate_transaction_item_targets() {
             TransactWriteTableOperation::Put {
                 table_info: table_info.clone(),
                 item: item_with_status("pk", "sk", "open"),
+                item_stream_ttl_hours: None,
                 condition: None,
                 return_values_on_condition_check_failure: None,
                 replication: None,
@@ -314,6 +317,8 @@ fn ttl_table_info(name: &str) -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }
@@ -332,6 +337,8 @@ fn number_table_info(name: &str) -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

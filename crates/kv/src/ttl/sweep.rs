@@ -417,6 +417,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                             put_request: None,
                             delete_request: Some(DeleteRequest {
                                 key: key.clone().into(),
+                                aux_item_stream_ttl_hours: None,
                             }),
                         });
                     }

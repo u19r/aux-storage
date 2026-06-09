@@ -7,7 +7,8 @@ use storage_condition::{
 use storage_provider::split_item_into_key_and_attributes_sync;
 use storage_types::{
     AttributeValue, KeyAttributes, KeySchemaElement, ReplicationEventMetadata, SplitDynamoItem,
-    StorageEnum, StorageError, StorageResult, TableName, WireItem, context::ErrorContext as _,
+    StorageEnum, StorageError, StorageResult, StreamRetentionDuration, TableName, WireItem,
+    context::ErrorContext as _,
 };
 
 use crate::{
@@ -55,6 +56,7 @@ fn evaluate_wire_condition_cached(
 }
 
 impl SQLiteStorageProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn do_put_wire_item(
         table_name: &TableName,
         item: &WireItem,
@@ -63,6 +65,7 @@ impl SQLiteStorageProvider {
         immediate_gsi_consistency: bool,
         should_return_old: bool,
         replication: Option<&ReplicationEventMetadata>,
+        item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let table_name_safe = table_name.sanitized_name();
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
@@ -130,6 +133,12 @@ impl SQLiteStorageProvider {
                 Some(item),
             )?;
         }
+        SQLiteStorageProvider::apply_item_stream_duration_tx(
+            sqlite,
+            &table_info,
+            &key_attributes,
+            item_stream_ttl_hours,
+        )?;
 
         if should_return_old {
             old_item.map(WireItem::into_attribute_map).transpose()
@@ -145,6 +154,7 @@ impl SQLiteStorageProvider {
         sqlite: &SqliteConn<'_>,
         immediate_gsi_consistency: bool,
         replication: Option<&ReplicationEventMetadata>,
+        item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let table_name_safe = table_name.sanitized_name();
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
@@ -235,6 +245,12 @@ impl SQLiteStorageProvider {
             ttl_config.as_ref(),
             old_item.as_ref(),
             Some(&all_attributes),
+        )?;
+        SQLiteStorageProvider::apply_item_stream_duration_tx(
+            sqlite,
+            &table_info,
+            &key_attributes,
+            item_stream_ttl_hours,
         )?;
 
         Ok(old_item)

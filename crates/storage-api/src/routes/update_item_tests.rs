@@ -6,8 +6,8 @@ use storage_types::{AttributeValue, TableName, UpdateItemRequest, UpdateItemResp
 
 use crate::{
     routes::routes_test_support::{
-        default_conformance_backends, handle_create_table, handle_get_item, handle_put_item,
-        handle_update_item,
+        create_test_db, default_conformance_backends, handle_create_table, handle_get_item,
+        handle_put_item, handle_update_item,
     },
     types::Response,
 };
@@ -252,6 +252,71 @@ async fn update_item_without_update_expression_is_noop_upsert_across_conformance
             backend.name
         );
     }
+}
+
+#[tokio::test]
+async fn update_item_accepts_aux_item_stream_ttl_without_storing_attribute() {
+    let db = create_test_db().await;
+    create_hash_table(db.clone(), "RouteUpdateItemDuration").await;
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "RouteUpdateItemDuration",
+            "Item": {
+                "pk": {"S": "item1"},
+                "value": {"S": "old"}
+            }
+        })
+        .try_into()
+        .expect("valid put item request"),
+    )
+    .await
+    .expect("seed item");
+
+    handle_update_item(
+        db.clone(),
+        json!({
+            "TableName": "RouteUpdateItemDuration",
+            "Key": {"pk": {"S": "item1"}},
+            "UpdateExpression": "SET #value = :value",
+            "ExpressionAttributeNames": {
+                "#value": "value"
+            },
+            "ExpressionAttributeValues": {
+                ":value": {"S": "updated"}
+            },
+            "AuxItemStreamTtlHours": 144
+        })
+        .try_into()
+        .expect("valid update item request"),
+    )
+    .await
+    .expect("update item with custom item stream ttl");
+
+    let item = expect_get_item_response(
+        handle_get_item(
+            db,
+            json!({
+                "TableName": "RouteUpdateItemDuration",
+                "Key": {"pk": {"S": "item1"}},
+                "ConsistentRead": true
+            })
+            .try_into()
+            .expect("valid get item request"),
+        )
+        .await
+        .expect("get item"),
+    )
+    .item
+    .expect("item");
+    assert_eq!(
+        item.get("value"),
+        Some(&AttributeValue::S("updated".to_string()))
+    );
+    assert!(
+        !item.contains_key("AuxItemStreamTtlHours"),
+        "aux item stream ttl is request metadata, not item data"
+    );
 }
 
 fn expect_get_item_response(response: Response) -> storage_types::GetItemResponse {

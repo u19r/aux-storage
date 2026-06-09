@@ -3,7 +3,7 @@ use storage_common::{
     GSI_BACKFILL_JOB, GsiJobConfig, JobIntervalMillis, RegistersJobs, STREAM_TRIM_JOB,
     TTL_SWEEP_JOB, register_gsi_jobs,
 };
-use storage_provider::StorageProvider;
+use storage_provider::{StorageProvider, StreamTrimStateWrite, plan_table_stream_duration};
 use storage_types::{
     CreateTableRequest, StorageError, StorageResult, StoredTableInfo, StreamName, TableName,
     TableStatus, context::ErrorContext,
@@ -12,6 +12,7 @@ use storage_types::{
 use super::SQLiteStorageProvider;
 use crate::{
     GsiPhysicalName,
+    backends::sqlite::stream_duration::write_stream_trim_state_tx,
     error_handler::map_sqlite_error,
     naming,
     process_gsi_updates::GsiUpdateJob,
@@ -46,6 +47,21 @@ impl SQLiteStorageProvider {
         .await
         .context("initialize sqlite deletion protection column")?;
 
+        migrate_table_integer_column(
+            self,
+            "table_stream_duration_hours",
+            sql_statements::add_table_stream_duration_column,
+            "initialize sqlite table stream duration column",
+        )
+        .await?;
+        migrate_table_integer_column(
+            self,
+            "default_item_stream_duration_hours",
+            sql_statements::add_default_item_stream_duration_column,
+            "initialize sqlite default item stream duration column",
+        )
+        .await?;
+
         call_sqlite_raw(&self.connection, |conn| {
             let (sql, params) = sql_statements::create_gsi_backfill_table();
             conn.execute(sql, params)
@@ -66,6 +82,10 @@ impl SQLiteStorageProvider {
         })
         .await
         .context("initialize sqlite item revisions")?;
+
+        self.initialize_stream_duration_tables()
+            .await
+            .context("initialize sqlite custom stream duration tables")?;
 
         let disable_background_timers = std::env::var("AUX_DISABLE_BG_TIMERS")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -181,8 +201,19 @@ impl SQLiteStorageProvider {
 
         let metadata = prepare_table_metadata(request)?;
 
+        let table_id = uuid::Uuid::now_v7().as_u128();
+        let table_scope_id = sqlite_table_scope_id(table_id);
+        let table_duration_plan = plan_table_stream_duration(
+            table_name.clone(),
+            table_scope_id,
+            1,
+            metadata.table_stream_duration,
+            metadata.default_item_stream_duration,
+            metadata.created_at,
+        );
+
         let rows_affected: usize = call_sqlite_raw(&self.connection, move |conn| {
-            let table_id = uuid::Uuid::now_v7().as_u128(); // Generate for sqlite only
+            let tx = conn.transaction()?;
             let (sql, params) = sql_statements::insert_table(
                 table_id,
                 &table_name,
@@ -192,8 +223,22 @@ impl SQLiteStorageProvider {
                 metadata.global_secondary_indexes_json.as_deref(),
                 metadata.stream_specification_json.as_deref(),
                 metadata.deletion_protection_enabled,
+                metadata.table_stream_duration,
+                metadata.default_item_stream_duration,
             );
-            conn.execute(sql, params)
+            let rows_affected = tx.execute(sql, params)?;
+            write_stream_trim_state_tx(
+                &tx,
+                StreamTrimStateWrite {
+                    state: table_duration_plan.trim_state,
+                    next_marker: table_duration_plan.due_marker,
+                },
+            )
+            .map_err(|err| {
+                crate::backends::sqlite::storage_provider::storage_error_to_rusqlite(&err)
+            })?;
+            tx.commit()?;
+            Ok(rows_affected)
         })
         .await
         .context("insert table sql")?;
@@ -345,4 +390,65 @@ impl SQLiteStorageProvider {
         self.create_table_storage_internal(table_name, request)
             .await
     }
+}
+
+pub(crate) fn sqlite_table_scope_id(table_id: u128) -> String {
+    format!("sqlite-table:{table_id}")
+}
+
+pub(crate) async fn load_sqlite_table_scope_id(
+    provider: &SQLiteStorageProvider,
+    table_name: &TableName,
+) -> StorageResult<String> {
+    let table_name = table_name.to_string();
+    call_sqlite_raw(&provider.connection, move |conn| {
+        let table_id: String = conn.query_row(
+            "SELECT id FROM tables WHERE table_name = ?1",
+            [table_name],
+            |row| row.get(0),
+        )?;
+        Ok(format!("sqlite-table:{table_id}"))
+    })
+    .await
+}
+
+pub(crate) async fn next_table_policy_version(
+    provider: &SQLiteStorageProvider,
+    table_scope_id: &str,
+) -> StorageResult<u64> {
+    let scope = storage_provider::StreamTrimScope::table(table_scope_id, TableName::new(""));
+    let current = provider.load_stream_trim_state_by_scope(&scope).await?;
+    Ok(current
+        .and_then(|state| state.policy_version.checked_add(1))
+        .unwrap_or(1))
+}
+
+async fn migrate_table_integer_column<F, P>(
+    provider: &SQLiteStorageProvider,
+    column_name: &'static str,
+    statement: F,
+    context: &'static str,
+) -> StorageResult<()>
+where
+    F: FnOnce() -> (&'static str, P) + Send + 'static,
+    P: rusqlite::Params,
+{
+    call_sqlite_raw(&provider.connection, move |conn| {
+        let has_column: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tables')
+                WHERE name = ?1
+            )",
+            [column_name],
+            |row| row.get(0),
+        )?;
+        if !has_column {
+            let (sql, params) = statement();
+            conn.execute(sql, params)?;
+        }
+        Ok(())
+    })
+    .await
+    .context(context)?;
+    Ok(())
 }

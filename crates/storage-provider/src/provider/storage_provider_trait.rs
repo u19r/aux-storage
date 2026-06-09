@@ -9,11 +9,12 @@ use storage_types::{
     DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
     GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, ItemVersionedWireItem,
     KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReplicationMutation,
-    ScanTableRequest, SplitDynamoItem, StorageError, StorageResult, StoredTableInfo, TableName,
-    TableStatus, TransactWriteItemsEncodeRequest, UpdateItemRequest, UpdateItemResponse, WireItem,
+    ScanTableRequest, SplitDynamoItem, StorageError, StorageResult, StoredTableInfo,
+    StreamRetentionDuration, TableName, TableStatus, TransactWriteItemsEncodeRequest,
+    UpdateItemRequest, UpdateItemResponse, WireItem,
 };
 
-use crate::AttributeValue;
+use crate::{AttributeValue, StreamTrimDueMarker, StreamTrimState};
 
 /// Trait for storage backends that can store `DynamoDB` table metadata
 #[async_trait]
@@ -23,6 +24,10 @@ pub trait StorageProvider: Send + Sync {
     }
 
     fn supports_guarded_transaction_writes(&self) -> bool {
+        false
+    }
+
+    fn supports_custom_stream_duration(&self) -> bool {
         false
     }
 
@@ -44,6 +49,18 @@ pub trait StorageProvider: Send + Sync {
 
     /// Get table information
     async fn get_table_info(&self, table_name: &TableName) -> StorageResult<StoredTableInfo>;
+
+    async fn write_stream_trim_state(&self, _state: StreamTrimState) -> StorageResult<()> {
+        Err(StorageError::unsupported_custom_stream_duration())
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        _due_before: storage_types::TimestampMillis,
+        _limit: usize,
+    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
+        Err(StorageError::unsupported_custom_stream_duration())
+    }
 
     /// List all tables
     async fn list_tables(
@@ -74,6 +91,31 @@ pub trait StorageProvider: Send + Sync {
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse>;
 
+    #[allow(clippy::too_many_arguments)]
+    async fn put_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: HashMap<String, AttributeValue>,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        if aux_item_stream_ttl_hours.is_some() {
+            return Err(StorageError::unsupported_custom_stream_duration());
+        }
+        self.put_item(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+        )
+        .await
+    }
+
     /// Store a wire-encoded item in a table.
     ///
     /// Backends can override this to remain wire-native end-to-end on write
@@ -90,6 +132,31 @@ pub trait StorageProvider: Send + Sync {
     ) -> StorageResult<PutItemResponse> {
         let item = item.into_attribute_map()?;
         self.put_item(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_item_encode_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: WireItem,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        if aux_item_stream_ttl_hours.is_some() {
+            return Err(StorageError::unsupported_custom_stream_duration());
+        }
+        self.put_item_encode(
             table_name,
             item,
             condition_expression,
@@ -153,6 +220,28 @@ pub trait StorageProvider: Send + Sync {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>;
+
+    async fn delete_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        if aux_item_stream_ttl_hours.is_some() {
+            return Err(StorageError::unsupported_custom_stream_duration());
+        }
+        self.delete_item(
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+        )
+        .await
+    }
 
     async fn guarded_put_item(
         &self,

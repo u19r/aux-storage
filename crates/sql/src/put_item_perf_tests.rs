@@ -638,6 +638,7 @@ where
         return_consumed_capacity: None,
         return_item_collection_metrics: None,
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     };
     provider.update_item(request).await.map(|_| ())
 }

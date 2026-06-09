@@ -186,6 +186,81 @@ async fn transact_write_items_put_operations() {
 }
 
 #[tokio::test]
+async fn transact_write_items_accepts_aux_item_stream_ttl_without_storing_attribute() {
+    let db = create_test_db_manager().await;
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "TxnRouteDuration",
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "id", "KeyType": "HASH"}
+            ]
+        })
+        .try_into()
+        .expect("create table request"),
+    )
+    .await
+    .expect("create table");
+
+    handle_transact_write_items(
+        db.clone(),
+        json!({
+            "TransactItems": [
+                {
+                    "Put": {
+                        "TableName": "TxnRouteDuration",
+                        "Item": {
+                            "id": {"S": "put-item"},
+                            "data": {"S": "created"}
+                        },
+                        "AuxItemStreamTtlHours": 120
+                    }
+                },
+                {
+                    "Update": {
+                        "TableName": "TxnRouteDuration",
+                        "Key": {"id": {"S": "update-item"}},
+                        "UpdateExpression": "SET #data = :data",
+                        "ExpressionAttributeNames": {"#data": "data"},
+                        "ExpressionAttributeValues": {
+                            ":data": {"S": "updated"}
+                        },
+                        "AuxItemStreamTtlHours": -1
+                    }
+                }
+            ]
+        })
+        .try_into()
+        .expect("transact write items request"),
+    )
+    .await
+    .expect("transaction with custom item stream ttl");
+
+    let put_item = get_txn_route_item(db.clone(), "put-item").await;
+    assert_eq!(
+        put_item.get("data"),
+        Some(&AttributeValue::S("created".to_string()))
+    );
+    assert!(
+        !put_item.contains_key("AuxItemStreamTtlHours"),
+        "transact put aux ttl is request metadata, not item data"
+    );
+
+    let update_item = get_txn_route_item(db, "update-item").await;
+    assert_eq!(
+        update_item.get("data"),
+        Some(&AttributeValue::S("updated".to_string()))
+    );
+    assert!(
+        !update_item.contains_key("AuxItemStreamTtlHours"),
+        "transact update aux ttl is request metadata, not item data"
+    );
+}
+
+#[tokio::test]
 async fn transact_write_condition_failure_returns_all_old_item_when_requested() {
     let db = create_test_db_manager().await;
     handle_create_table(
@@ -211,6 +286,7 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values: None,
+        aux_item_stream_ttl_hours: None,
     })
     .await
     .expect("seed item");
@@ -245,4 +321,17 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
         item.get("status"),
         Some(&AttributeValue::S("open".to_string()))
     );
+}
+
+async fn get_txn_route_item(
+    db: std::sync::Arc<DatabaseManager>,
+    id: &str,
+) -> std::collections::HashMap<String, AttributeValue> {
+    db.get_item_map(
+        TableName::new("TxnRouteDuration"),
+        std::collections::HashMap::from([("id".to_string(), AttributeValue::S(id.to_string()))]),
+    )
+    .await
+    .expect("get transaction item")
+    .unwrap_or_else(|| panic!("expected transaction item {id}"))
 }

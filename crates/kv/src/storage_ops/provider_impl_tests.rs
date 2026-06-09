@@ -53,6 +53,8 @@ fn table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }
@@ -387,13 +389,17 @@ fn encoded_batch_writes_preserve_put_and_delete_semantics_for_legacy_batch_apis(
 
     let converted = encode_requests_to_write_requests(&[
         EncodeWriteRequest {
-            put_request: Some(EncodePutRequest { item: put_item }),
+            put_request: Some(EncodePutRequest {
+                item: put_item,
+                aux_item_stream_ttl_hours: None,
+            }),
             delete_request: None,
         },
         EncodeWriteRequest {
             put_request: None,
             delete_request: Some(DeleteRequest {
                 key: delete_key.clone().into(),
+                aux_item_stream_ttl_hours: None,
             }),
         },
     ])

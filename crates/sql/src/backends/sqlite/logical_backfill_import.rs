@@ -397,14 +397,23 @@ impl SQLiteStorageProvider {
             .get("deletion_protection_enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let table_stream_duration_hours = payload
+            .get("table_stream_duration_hours")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(72);
+        let default_item_stream_duration_hours = payload
+            .get("default_item_stream_duration_hours")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(table_stream_duration_hours);
         sqlite
             .execute(
                 r"INSERT INTO tables (
                     id, table_name, table_status, created_at, attribute_definitions, key_schema,
                     global_secondary_indexes, table_size_bytes, item_count, stream_specification,
-                    deletion_protection_enabled
+                    deletion_protection_enabled, table_stream_duration_hours,
+                    default_item_stream_duration_hours
                   )
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                   ON CONFLICT(table_name)
                   DO UPDATE SET
                     id = excluded.id,
@@ -416,7 +425,9 @@ impl SQLiteStorageProvider {
                     table_size_bytes = excluded.table_size_bytes,
                     item_count = excluded.item_count,
                     stream_specification = excluded.stream_specification,
-                    deletion_protection_enabled = excluded.deletion_protection_enabled",
+                    deletion_protection_enabled = excluded.deletion_protection_enabled,
+                    table_stream_duration_hours = excluded.table_stream_duration_hours,
+                    default_item_stream_duration_hours = excluded.default_item_stream_duration_hours",
                 (
                     id.as_str(),
                     table_name.as_str(),
@@ -433,6 +444,8 @@ impl SQLiteStorageProvider {
                     } else {
                         0i64
                     },
+                    table_stream_duration_hours,
+                    default_item_stream_duration_hours,
                 ),
             )
             .map_err(map_sqlite_error)?;

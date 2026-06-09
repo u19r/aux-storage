@@ -232,6 +232,10 @@ impl StorageError {
         })
     }
 
+    pub fn unsupported_custom_stream_duration() -> Self {
+        Self::unsupported("custom stream duration is not supported by this storage provider")
+    }
+
     pub fn table_already_exists(name: &(impl ToString + ?Sized)) -> Self {
         Self::Base(StorageEnum::TableAlreadyExists {
             name: name.to_string(),

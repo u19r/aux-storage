@@ -20,9 +20,9 @@ use storage_provider::{StorageProvider as _, split_item_into_key_and_attributes_
 use storage_types::{
     AttributeDefinition, AttributeValue, DurablePointReadGuard, ItemKey, KeyAttributeType,
     KeyAttributes, KeySchemaElement, KeyType, ReplicationEventMetadata, SplitDynamoItem,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName,
-    TableStatus, TimestampMillis, WireItem, WireItemKeyAttributes, context::ErrorContext as _,
-    normalize_attribute_map_numbers_for_write,
+    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName,
+    StreamRetentionDuration, TableName, TableStatus, TimestampMillis, WireItem,
+    WireItemKeyAttributes, context::ErrorContext as _, normalize_attribute_map_numbers_for_write,
 };
 use stream_provider::{
     CursorName, CursorPosition, EmbeddedStreamItem, StoredStreamPointer, StreamDataType,
@@ -32,6 +32,7 @@ use tracing::instrument;
 use turso::{Builder, Connection as TursoConnection, Error as TursoError, Value as TursoValue};
 use uuid::Uuid;
 
+use super::stream_duration::TursoStreamPointerIndexEntry;
 use crate::{
     GsiPhysicalName,
     backends::turso::sql_statements,
@@ -684,6 +685,7 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         item: &HashMap<String, AttributeValue>,
         condition: Option<&Condition>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
     where
         C: TursoSqlConnection + ?Sized,
@@ -713,6 +715,13 @@ impl TursoStorageProvider {
                     item_stream_version,
                     replication: None,
                 },
+            )
+            .await?;
+            self.apply_item_stream_duration(
+                conn,
+                table_info,
+                &key_attributes,
+                aux_item_stream_ttl_hours,
             )
             .await?;
             if self.immediate_gsi_consistency {
@@ -750,6 +759,13 @@ impl TursoStorageProvider {
             },
         )
         .await?;
+        self.apply_item_stream_duration(
+            conn,
+            table_info,
+            &key_attributes,
+            aux_item_stream_ttl_hours,
+        )
+        .await?;
         if self.immediate_gsi_consistency {
             self.apply_gsi_rows_for_item_change(
                 conn,
@@ -769,12 +785,20 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         item: &HashMap<String, AttributeValue>,
         old_item: Option<&HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
     {
-        self.overwrite_item_txn_with_replication(conn, table_info, item, old_item, None)
-            .await
+        self.overwrite_item_txn_with_replication(
+            conn,
+            table_info,
+            item,
+            old_item,
+            None,
+            aux_item_stream_ttl_hours,
+        )
+        .await
     }
 
     pub(crate) async fn overwrite_item_txn_with_replication<C>(
@@ -784,6 +808,7 @@ impl TursoStorageProvider {
         item: &HashMap<String, AttributeValue>,
         old_item: Option<&HashMap<String, AttributeValue>>,
         replication: Option<&ReplicationEventMetadata>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
@@ -814,26 +839,19 @@ impl TursoStorageProvider {
             },
         )
         .await?;
+        self.apply_item_stream_duration(
+            conn,
+            table_info,
+            &key_attributes,
+            aux_item_stream_ttl_hours,
+        )
+        .await?;
         if self.immediate_gsi_consistency {
             self.apply_gsi_rows_for_item_change(conn, table_info, old_item, Some(&all_attributes))
                 .await?;
         }
 
         Ok(())
-    }
-
-    pub(crate) async fn delete_item_txn<C>(
-        &self,
-        conn: &C,
-        table_info: &StoredTableInfo,
-        key: &KeyAttributes,
-        condition: Option<&Condition>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
-    where
-        C: TursoSqlConnection + ?Sized,
-    {
-        self.delete_item_txn_with_replication(conn, table_info, key, condition, None)
-            .await
     }
 
     pub(crate) async fn delete_item_txn_with_replication<C>(
@@ -843,6 +861,7 @@ impl TursoStorageProvider {
         key: &KeyAttributes,
         condition: Option<&Condition>,
         replication: Option<&ReplicationEventMetadata>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
     where
         C: TursoSqlConnection + ?Sized,
@@ -878,6 +897,8 @@ impl TursoStorageProvider {
             },
         )
         .await?;
+        self.apply_item_stream_duration(conn, table_info, key, aux_item_stream_ttl_hours)
+            .await?;
 
         if self.immediate_gsi_consistency {
             self.apply_gsi_rows_for_item_change(conn, table_info, old_item.as_ref(), None)
@@ -931,6 +952,7 @@ impl TursoStorageProvider {
         .map_err(|err| StorageError::internal(&format!("stream item key error: {err}")))?;
         let item_stream = StreamName::table_item_stream(&table_info.table_name, &item_key)
             .map_err(|err| StorageError::internal(&format!("stream name error: {err}")))?;
+        let item_stream_name = String::from(&item_stream);
 
         let data = storage_types::storage_serde::to_bytes(item_data)?;
         let old_bytes = old_item
@@ -986,20 +1008,38 @@ impl TursoStorageProvider {
         };
         let pointer_data = storage_types::storage_serde::to_bytes(&stored_pointer)?;
 
-        for stream_name in [
-            StreamName::table_stream(&table_info.table_name),
-            StreamName::system_table_stream(),
-        ] {
-            self.insert_stream_row(
-                conn,
-                &stream_name,
-                storage_types::StreamItemId::from(Uuid::now_v7()),
-                pointer_data.clone(),
+        let table_pointer_stream_item_id = StreamItemId::from(Uuid::now_v7());
+        self.insert_stream_row(
+            conn,
+            &StreamName::table_stream(&table_info.table_name),
+            table_pointer_stream_item_id,
+            pointer_data.clone(),
+            created_at,
+            StreamDataType::StreamPointer,
+        )
+        .await?;
+        let system_pointer_stream_item_id = StreamItemId::from(Uuid::now_v7());
+        self.insert_stream_row(
+            conn,
+            &StreamName::system_table_stream(),
+            system_pointer_stream_item_id,
+            pointer_data,
+            created_at,
+            StreamDataType::StreamPointer,
+        )
+        .await?;
+        self.insert_stream_pointer_index(
+            conn,
+            TursoStreamPointerIndexEntry {
+                table_name: &table_info.table_name,
+                item_stream_name: &item_stream_name,
+                item_stream_version,
+                table_stream_item_id: table_pointer_stream_item_id,
+                system_stream_item_id: system_pointer_stream_item_id,
                 created_at,
-                StreamDataType::StreamPointer,
-            )
-            .await?;
-        }
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -1595,6 +1635,21 @@ pub(crate) fn row_to_table_info(
         u64::try_from(row_required_i64(row, "table_size_bytes")?).unwrap_or_default();
     let item_count = u64::try_from(row_required_i64(row, "item_count")?).unwrap_or_default();
     let deletion_protection_enabled = row_required_i64(row, "deletion_protection_enabled")? != 0;
+    let table_stream_duration = storage_types::StreamRetentionDuration::try_from(row_required_i64(
+        row,
+        "table_stream_duration_hours",
+    )?)
+    .map_err(|error| {
+        StorageError::validation(format!("invalid table stream duration metadata: {error}"))
+    })?;
+    let default_item_stream_duration = storage_types::StreamRetentionDuration::try_from(
+        row_required_i64(row, "default_item_stream_duration_hours")?,
+    )
+    .map_err(|error| {
+        StorageError::validation(format!(
+            "invalid default item stream duration metadata: {error}"
+        ))
+    })?;
 
     Ok(StoredTableInfo {
         table_name,
@@ -1606,6 +1661,8 @@ pub(crate) fn row_to_table_info(
         table_size_bytes,
         item_count,
         stream_specification,
+        table_stream_duration,
+        default_item_stream_duration,
         deletion_protection_enabled,
     })
 }
@@ -1863,6 +1920,21 @@ pub(crate) fn row_required_i64(
         .get(column)
         .ok_or_else(|| StorageError::internal(&format!("missing column '{column}'")))?;
     value_to_i64(value)
+}
+
+pub(crate) fn row_required_blob(
+    row: &HashMap<String, TursoValue>,
+    column: &str,
+) -> StorageResult<Vec<u8>> {
+    match row
+        .get(column)
+        .ok_or_else(|| StorageError::internal(&format!("missing column '{column}'")))?
+    {
+        TursoValue::Blob(raw) => Ok(raw.clone()),
+        _ => Err(StorageError::internal(&format!(
+            "column '{column}' is not a blob"
+        ))),
+    }
 }
 
 pub(crate) fn value_to_i64(value: &TursoValue) -> StorageResult<i64> {

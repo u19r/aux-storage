@@ -3,7 +3,8 @@ use std::sync::Arc;
 use deadpool_postgres::GenericClient;
 use serde::de::DeserializeOwned;
 use storage_types::{
-    StorageError, StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis,
+    StorageError, StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
+    TimestampMillis,
 };
 use tokio_postgres::Row;
 
@@ -70,6 +71,15 @@ impl PostgresStorageProvider {
             row.try_get("deletion_protection_enabled").map_err(|err| {
                 Self::map_postgres_error("row decode deletion_protection_enabled", err)
             })?;
+        let table_stream_duration_hours: i64 =
+            row.try_get("table_stream_duration_hours").map_err(|err| {
+                Self::map_postgres_error("row decode table_stream_duration_hours", err)
+            })?;
+        let default_item_stream_duration_hours: i64 = row
+            .try_get("default_item_stream_duration_hours")
+            .map_err(|err| {
+                Self::map_postgres_error("row decode default_item_stream_duration_hours", err)
+            })?;
 
         let attribute_definitions =
             Self::parse_json_required(&attribute_definitions, "attribute_definitions")?;
@@ -89,6 +99,18 @@ impl PostgresStorageProvider {
             table_size_bytes: u64::try_from(table_size_bytes).unwrap_or_default(),
             item_count: u64::try_from(item_count).unwrap_or_default(),
             stream_specification,
+            table_stream_duration: StreamRetentionDuration::try_from(table_stream_duration_hours)
+                .map_err(|err| {
+                StorageError::validation(format!("invalid table stream duration metadata: {err}"))
+            })?,
+            default_item_stream_duration: StreamRetentionDuration::try_from(
+                default_item_stream_duration_hours,
+            )
+            .map_err(|err| {
+                StorageError::validation(format!(
+                    "invalid default item stream duration metadata: {err}"
+                ))
+            })?,
             deletion_protection_enabled,
         })
     }

@@ -87,6 +87,8 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
         table_size_bytes: table.table_size_bytes,
         item_count: table.item_count,
         stream_specification: table.stream_specification,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: table.deletion_protection_enabled,
     }
 }
@@ -98,7 +100,7 @@ pub(super) fn build_scan_request(request: &ScanTableRequest) -> ScanRequest {
         .with_exclusive_start_key(None);
     remote_request.exclusive_start_key = request
         .exclusive_start_key
-        .as_ref()
+        .as_deref()
         .map(exclusive_start_key_from_string);
     remote_request.consistent_read = Some(request.consistent_read);
     remote_request
@@ -117,16 +119,16 @@ pub(super) fn build_query_request(request: &QueryTableRequest) -> QueryRequest {
     .with_scan_index_forward(request.scan_index_forward);
     remote_request.exclusive_start_key = request
         .exclusive_start_key
-        .as_ref()
+        .as_deref()
         .map(exclusive_start_key_from_string);
     remote_request.consistent_read = Some(request.consistent_read);
     remote_request
 }
 
-fn exclusive_start_key_from_string(value: &String) -> ExclusiveStartKey {
+fn exclusive_start_key_from_string(value: &str) -> ExclusiveStartKey {
     serde_json::from_str::<KeyAttributes>(value)
         .map(ExclusiveStartKey::Key)
-        .unwrap_or_else(|_| ExclusiveStartKey::Token(value.clone()))
+        .unwrap_or_else(|_| ExclusiveStartKey::Token(value.to_owned()))
 }
 
 pub(crate) fn record_latency(operation: &str, endpoint: &str, outcome: &str, elapsed: Duration) {

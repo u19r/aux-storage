@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use storage_condition::{Condition, evaluate_condition};
 use storage_types::{
     AttributeValue, KeyAttributes, ReplicationEventMetadata, StorageEnum, StorageError,
-    StorageResult, TableName,
+    StorageResult, StreamRetentionDuration, TableName,
 };
 
 use crate::{
@@ -20,6 +20,7 @@ impl SQLiteStorageProvider {
         sqlite: &crate::utils::SqliteConn<'_>,
         immediate_gsi_consistency: bool,
         replication: Option<&ReplicationEventMetadata>,
+        item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let table_name_safe = table_name.sanitized_name();
         let key_item = key_item_map(key);
@@ -118,6 +119,12 @@ impl SQLiteStorageProvider {
             ttl_config.as_ref(),
             existing_item.as_ref(),
             None,
+        )?;
+        SQLiteStorageProvider::apply_item_stream_duration_tx(
+            sqlite,
+            &table_info,
+            key,
+            item_stream_ttl_hours,
         )?;
 
         Ok(existing_item)

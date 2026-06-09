@@ -11,7 +11,11 @@ pub(crate) fn prepare_batch_operation(
 ) -> StorageResult<PreparedBatchOperation> {
     match write_request {
         WriteRequest {
-            put_request: Some(PutRequest { ref item }),
+            put_request:
+                Some(PutRequest {
+                    ref item,
+                    aux_item_stream_ttl_hours,
+                }),
             delete_request: None,
         } => {
             if item.is_empty() {
@@ -31,11 +35,16 @@ pub(crate) fn prepare_batch_operation(
                 key_attributes: split.key_attributes,
                 non_key_attributes: split.non_key_attributes,
                 full_item: split.all_attributes,
+                aux_item_stream_ttl_hours,
             })
         }
         WriteRequest {
             put_request: None,
-            delete_request: Some(DeleteRequest { ref key }),
+            delete_request:
+                Some(DeleteRequest {
+                    ref key,
+                    aux_item_stream_ttl_hours,
+                }),
         } => {
             if key.is_empty() {
                 return Err(StorageError::validation(
@@ -51,6 +60,7 @@ pub(crate) fn prepare_batch_operation(
                 key: key.clone(),
                 write_request,
                 existing_item: None,
+                aux_item_stream_ttl_hours,
             })
         }
         _ => Err(StorageError::validation(

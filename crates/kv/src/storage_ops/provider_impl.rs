@@ -19,7 +19,8 @@ use storage_common::{
 };
 use storage_condition::{Condition, parse_condition_expression};
 use storage_provider::{
-    StorageProvider, UpdateOperation, parse_update_expression, return_values_need_old_item,
+    StorageProvider, StreamTrimDueMarker, StreamTrimState, UpdateOperation,
+    parse_update_expression, plan_table_stream_duration, return_values_need_old_item,
     update_item_response,
 };
 use storage_types::{
@@ -30,8 +31,8 @@ use storage_types::{
     KeyAttributeType, KeyAttributes, KeysAndAttributes, Projection, PutItemResponse, PutRequest,
     QueryTableRequest, ReplicationMutation, ScanTableRequest, SerializesToKey, StorageEnum,
     StorageError, StorageResult, StorageValidationKind, StoredTableInfo, StreamItemId, StreamName,
-    TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis,
-    TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
+    StreamRetentionDuration, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
+    TimestampMillis, TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
     TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
     UpdateTimeToLiveResponse, WireItem, WriteRequest,
     attribute_map_numbers_need_write_normalization, context::WrappedError as _,
@@ -151,15 +152,23 @@ pub(crate) fn encode_requests_to_write_requests(
             } => Ok(WriteRequest {
                 put_request: Some(PutRequest {
                     item: put_request.item.clone().into_attribute_map()?,
+                    aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                 }),
                 delete_request: None,
             }),
             EncodeWriteRequest {
                 put_request: None,
-                delete_request: Some(DeleteRequest { key }),
+                delete_request:
+                    Some(DeleteRequest {
+                        key,
+                        aux_item_stream_ttl_hours,
+                    }),
             } => Ok(WriteRequest {
                 put_request: None,
-                delete_request: Some(DeleteRequest { key: key.clone() }),
+                delete_request: Some(DeleteRequest {
+                    key: key.clone(),
+                    aux_item_stream_ttl_hours: *aux_item_stream_ttl_hours,
+                }),
             }),
             _ => Err(StorageError::validation(
                 "Each WriteRequest must contain exactly one of PutRequest or DeleteRequest",
@@ -514,6 +523,7 @@ use crate::{
     sorted_kv_store::{
         BatchItem, DirectWriteOperation, TransactWriteOperation, TransactWriteTableOperation,
     },
+    storage_ops::stream_duration::stream_trim_state_write_ops,
     ttl,
 };
 
@@ -710,6 +720,23 @@ fn cached_transact_update_binding(
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvider
     for SortedKvDbStorageProvider<S>
 {
+    fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    async fn write_stream_trim_state(&self, state: StreamTrimState) -> StorageResult<()> {
+        self.write_stream_trim_state_kv(state).await
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
+        self.list_due_stream_trim_markers_kv(due_before, limit)
+            .await
+    }
+
     async fn run_job(&self, name: BackgroundJobName) -> StorageResult<()> {
         match name {
             storage_common::GSI_UPDATE_JOB => {
@@ -959,16 +986,35 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             table_size_bytes: 0,
             item_count: 0,
             stream_specification: request.stream_specification.clone(),
+            table_stream_duration: request.aux_stream_duration_hours.unwrap_or_default(),
+            default_item_stream_duration: request
+                .aux_default_item_stream_duration_hours
+                .unwrap_or_default(),
             deletion_protection_enabled: request.deletion_protection_enabled.unwrap_or(false),
         };
 
         let key = crate::keys::table_metadata_key(table_name);
         let value = storage_types::storage_serde::to_bytes(&table_info)?;
-
-        self.kv_store.put(&key, &value, None).await?;
-
-        self.update_table_status(table_name, TableStatus::Active)
-            .await?;
+        let plan = plan_table_stream_duration(
+            table_name.clone(),
+            kv_table_scope_id(table_name),
+            crate::storage_ops::stream_duration::table_stream_policy_version(
+                table_info.table_stream_duration,
+                table_info.default_item_stream_duration,
+            ),
+            table_info.table_stream_duration,
+            table_info.default_item_stream_duration,
+            created_at,
+        );
+        let mut operations = vec![DirectWriteOperation::Put { key, value }];
+        operations.extend(stream_trim_state_write_ops(
+            storage_provider::StreamTrimStateWrite {
+                state: plan.trim_state,
+                next_marker: plan.due_marker,
+            },
+        )?);
+        self.kv_store.transact_write_unchecked(operations).await?;
+        self.cache_table_metadata(table_name.clone(), Arc::new(table_info));
 
         Ok(())
     }
@@ -1179,6 +1225,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                 vec![TransactWriteTableOperation::Put {
                     table_info,
                     item,
+                    item_stream_ttl_hours: None,
                     condition,
                     return_values_on_condition_check_failure: None,
                     replication: None,
@@ -1191,6 +1238,94 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
 
         let (old_item, _new_item) = old_new_items.pop().unwrap_or((None, None));
 
+        record_write(1, bytes_written);
+        record_write_cost("put_item", "put", 1, billed_bytes);
+
+        let attributes = if let Some(return_values) = return_values
+            && return_values == AllOld::AllOld
+        {
+            old_item
+        } else {
+            None
+        };
+
+        Ok(PutItemResponse {
+            attributes: attributes.map(Into::into),
+        })
+    }
+
+    async fn put_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        mut item: HashMap<String, AttributeValue>,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        if aux_item_stream_ttl_hours.is_none() {
+            return self
+                .put_item(
+                    table_name,
+                    item,
+                    condition_expression,
+                    expression_attribute_names,
+                    expression_attribute_values,
+                    return_values,
+                )
+                .await;
+        }
+        if item.is_empty() {
+            return Err(StorageError::validation(
+                "Item must have at least one attribute",
+            ));
+        }
+        apply_gsi_write_pressure(self).await?;
+        normalize_attribute_map_numbers_for_write(&mut item);
+        let billed_bytes = attr_map_payload_bytes(&item);
+
+        let table_info = self
+            .get_table_metadata_from_name(&table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table_name.clone()))?;
+        let ttl_config = self.load_ttl_config(&table_name).await?;
+
+        let condition = if let Some(condition_expression) = condition_expression {
+            Some(
+                parse_condition_expression(
+                    &condition_expression,
+                    expression_attribute_names.as_ref(),
+                    expression_attribute_values.as_ref(),
+                )
+                .map_err(|c| {
+                    warn!(c);
+                    StorageError::validation(StorageValidationKind::InvalidConditionExpression)
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
+        let mut old_new_items = self
+            .kv_store
+            .transact_write_table(
+                vec![TransactWriteTableOperation::Put {
+                    table_info,
+                    item,
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    condition,
+                    return_values_on_condition_check_failure: None,
+                    replication: None,
+                    ttl_config,
+                }],
+                self.immediate_gsi_consistency,
+            )
+            .await
+            .map_err(normalize_conditional_transaction_error)?;
+
+        let (old_item, _new_item) = old_new_items.pop().unwrap_or((None, None));
         record_write(1, bytes_written);
         record_write_cost("put_item", "put", 1, billed_bytes);
 
@@ -1354,6 +1489,40 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+        )
+        .await
+    }
+
+    async fn put_item_encode_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: WireItem,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
+        if aux_item_stream_ttl_hours.is_none() {
+            return self
+                .put_item_encode(
+                    table_name,
+                    item,
+                    condition_expression,
+                    expression_attribute_names,
+                    expression_attribute_values,
+                    return_values,
+                )
+                .await;
+        }
+        self.put_item_with_stream_ttl(
+            table_name,
+            item.into_attribute_map()?,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            aux_item_stream_ttl_hours,
         )
         .await
     }
@@ -1627,7 +1796,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             for (index, write_request) in write_requests.iter().enumerate() {
                 match write_request {
                     WriteRequest {
-                        put_request: Some(PutRequest { item }),
+                        put_request:
+                            Some(PutRequest {
+                                item,
+                                aux_item_stream_ttl_hours,
+                            }),
                         delete_request: None,
                     } => {
                         let item = normalized_attribute_map_for_write(item);
@@ -1650,6 +1823,14 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                                 if !ttl_mutations.is_empty() {
                                     items.extend(ttl_mutations);
                                 }
+                                let policy_mutations =
+                                    crate::storage_ops::stream_duration::item_stream_duration_write_items(
+                                        &table_metadata,
+                                        &key_attributes_for_item(&table_metadata, item.as_ref())?,
+                                        TimestampMillis::now().timestamp_millis().unsigned_abs(),
+                                        *aux_item_stream_ttl_hours,
+                                    )?;
+                                items.extend(policy_mutations);
                                 table_items_updated += 1;
                                 table_bytes_written +=
                                     compute_items_bytes(std::slice::from_ref(item.as_ref()))?;
@@ -1667,7 +1848,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     }
                     WriteRequest {
                         put_request: None,
-                        delete_request: Some(DeleteRequest { key }),
+                        delete_request: Some(DeleteRequest { key, .. }),
                     } => {
                         match Self::prepare_batch_delete_item(
                             table_name,
@@ -1796,9 +1977,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     matches!(
                         request,
                         EncodeWriteRequest {
-                            put_request: Some(_),
+                            put_request: Some(put_request),
                             delete_request: None
-                        }
+                        } if put_request.aux_item_stream_ttl_hours.is_none()
                     )
                 })
             {
@@ -1839,7 +2020,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         delete_request: None,
                     } => {
                         match self
-                            .apply_batch_encode_put_item(table_name, &put_request.item)
+                            .apply_batch_encode_put_item(
+                                table_name,
+                                &put_request.item,
+                                put_request.aux_item_stream_ttl_hours,
+                            )
                             .await
                         {
                             Ok(item_bytes) => {
@@ -1856,6 +2041,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                                 unprocessed_table_items.push(WriteRequest {
                                     put_request: Some(PutRequest {
                                         item: put_request.item.clone().into_attribute_map()?,
+                                        aux_item_stream_ttl_hours: put_request
+                                            .aux_item_stream_ttl_hours,
                                     }),
                                     delete_request: None,
                                 });
@@ -1864,7 +2051,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     }
                     EncodeWriteRequest {
                         put_request: None,
-                        delete_request: Some(DeleteRequest { key }),
+                        delete_request:
+                            Some(DeleteRequest {
+                                key,
+                                aux_item_stream_ttl_hours,
+                            }),
                     } => match self.apply_batch_delete_item(table_name, key).await {
                         Ok(_) => {
                             total_items_updated += 1;
@@ -1878,7 +2069,10 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         Err(_) => {
                             unprocessed_table_items.push(WriteRequest {
                                 put_request: None,
-                                delete_request: Some(DeleteRequest { key: key.clone() }),
+                                delete_request: Some(DeleteRequest {
+                                    key: key.clone(),
+                                    aux_item_stream_ttl_hours: *aux_item_stream_ttl_hours,
+                                }),
                             });
                         }
                     },
@@ -1942,6 +2136,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             expression_attribute_values,
             return_values,
             return_values_on_condition_check_failure,
+            aux_item_stream_ttl_hours: request_item_stream_ttl_hours,
             ..
         } = request;
         let table_info = self
@@ -1950,7 +2145,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             .ok_or_else(|| StorageError::table_not_found(&table_name.clone()))?;
         let ttl_config = self.load_ttl_config(&table_name).await?;
         let preserve_old_item = return_values_need_old_item(return_values.as_ref())
-            || ttl_tracking_enabled(ttl_config.as_ref());
+            || ttl_tracking_enabled(ttl_config.as_ref())
+            || request_item_stream_ttl_hours.is_some();
 
         let operations = if let Some(update_expression) = update_expression.as_deref() {
             storage_provider::parse_update_expression(
@@ -1986,6 +2182,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         table_info: table_info_for_write,
                         key: key.clone(),
                         operations: Arc::clone(&operations),
+                        item_stream_ttl_hours: request_item_stream_ttl_hours,
                         condition,
                         return_values_on_condition_check_failure:
                             return_values_on_condition_check_failure.clone(),
@@ -2241,6 +2438,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     TransactWriteTableOperation::Put {
                         table_info,
                         item: put_request.item,
+                        item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                         condition: cached_transact_condition_binding(
                             &mut condition_binding_cache,
                             put_request.condition_expression,
@@ -2294,6 +2492,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         expression_attribute_names,
                         expression_attribute_values,
                         return_values_on_condition_check_failure,
+                        aux_item_stream_ttl_hours: update_request_item_stream_ttl_hours,
+                        ..
                     } = update_request;
                     let table_info = self
                         .get_table_metadata_cached(&mut table_info_cache, &table_name)
@@ -2302,7 +2502,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         .load_ttl_config_cached(&mut ttl_config_cache, &table_name)
                         .await?;
                     total_items_updated += 1;
-                    let preserve_old_item = ttl_tracking_enabled(ttl_config.as_ref());
+                    let preserve_old_item = ttl_tracking_enabled(ttl_config.as_ref())
+                        || update_request_item_stream_ttl_hours.is_some();
                     let (operations, condition) = cached_transact_update_binding(
                         &mut update_binding_cache,
                         update_expression,
@@ -2314,6 +2515,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                         table_info,
                         key,
                         operations,
+                        item_stream_ttl_hours: update_request_item_stream_ttl_hours,
                         condition,
                         return_values_on_condition_check_failure,
                         replication: None,
@@ -2448,6 +2650,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                 if put_request.condition_expression.is_some()
                     || put_request.expression_attribute_names.is_some()
                     || put_request.expression_attribute_values.is_some()
+                    || put_request.aux_item_stream_ttl_hours.is_some()
                 {
                     // Condition expressions require AttributeValue map semantics,
                     // so we fall back to the canonical path.
@@ -2602,6 +2805,40 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             self.cache_table_metadata(table_name.clone(), Arc::new(table_info.clone()));
         }
 
+        if request.aux_stream_duration_hours.is_some()
+            || request.aux_default_item_stream_duration_hours.is_some()
+        {
+            if let Some(duration) = request.aux_stream_duration_hours {
+                table_info.table_stream_duration = duration;
+            }
+            if let Some(duration) = request.aux_default_item_stream_duration_hours {
+                table_info.default_item_stream_duration = duration;
+            }
+            let updated_at = TimestampMillis::now();
+            let plan = plan_table_stream_duration(
+                table_name.clone(),
+                kv_table_scope_id(&table_name),
+                crate::storage_ops::stream_duration::table_stream_policy_version(
+                    table_info.table_stream_duration,
+                    table_info.default_item_stream_duration,
+                ),
+                table_info.table_stream_duration,
+                table_info.default_item_stream_duration,
+                updated_at,
+            );
+            let key = crate::keys::table_metadata_key(&table_name);
+            let value = storage_types::storage_serde::to_bytes(&table_info)?;
+            let mut operations = vec![DirectWriteOperation::Put { key, value }];
+            operations.extend(stream_trim_state_write_ops(
+                storage_provider::StreamTrimStateWrite {
+                    state: plan.trim_state,
+                    next_marker: plan.due_marker,
+                },
+            )?);
+            self.kv_store.transact_write_unchecked(operations).await?;
+            self.cache_table_metadata(table_name.clone(), Arc::new(table_info.clone()));
+        }
+
         // Process GSI updates
         if let Some(gsi_updates) = request.global_secondary_index_updates.clone() {
             for gsi_update in gsi_updates {
@@ -2740,6 +2977,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     vec![TransactWriteTableOperation::Put {
                         table_info: table_info.clone(),
                         item: new_image,
+                        item_stream_ttl_hours: None,
                         condition: None,
                         return_values_on_condition_check_failure: None,
                         replication: replication.clone(),
@@ -3037,7 +3275,22 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         table_name: &TableName,
         item: &WireItem,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<usize> {
+        if aux_item_stream_ttl_hours.is_some() {
+            let payload_len = item.payload_len();
+            self.put_item_with_stream_ttl(
+                table_name.clone(),
+                item.clone().into_attribute_map()?,
+                None,
+                None,
+                None,
+                None,
+                aux_item_stream_ttl_hours,
+            )
+            .await?;
+            return Ok(payload_len);
+        }
         let table_info = self
             .get_table_metadata_from_name(table_name)
             .await?
@@ -3316,7 +3569,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         for (index, write_request) in write_requests.iter().enumerate() {
             let key = match write_request {
                 WriteRequest {
-                    put_request: Some(PutRequest { item }),
+                    put_request: Some(PutRequest { item, .. }),
                     delete_request: None,
                 } => Some(ItemKey::from_key_schema(
                     table_info.table_name.clone(),
@@ -3325,7 +3578,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 )?),
                 WriteRequest {
                     put_request: None,
-                    delete_request: Some(DeleteRequest { key }),
+                    delete_request: Some(DeleteRequest { key, .. }),
                 } => Some(ItemKey::from_key_schema(
                     table_info.table_name.clone(),
                     &table_info.key_schema,
@@ -3474,6 +3727,24 @@ fn stream_storage_prefix(stream_name: &StreamName) -> Vec<u8> {
     let mut prefix: Vec<u8> = stream_name.into();
     prefix.push(b'/');
     prefix
+}
+
+fn kv_table_scope_id(table_name: &TableName) -> String {
+    format!("kv-table:{table_name}")
+}
+
+fn key_attributes_for_item(
+    table_info: &StoredTableInfo,
+    item: &impl storage_types::AttributeValueLookup,
+) -> StorageResult<KeyAttributes> {
+    let mut key_attributes = KeyAttributes::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let value = item
+            .get_attribute_value(&key.attribute_name)
+            .ok_or_else(StorageError::invalid_or_missing_key)?;
+        key_attributes.insert(key.attribute_name.clone(), value.clone());
+    }
+    Ok(key_attributes)
 }
 
 pub(super) fn kv_mutation_to_direct(mutation: KvMutation) -> DirectWriteOperation {

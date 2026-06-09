@@ -141,8 +141,8 @@ impl PostgresStorageProvider {
         };
         let embedded_bytes = data.len() + old_bytes.as_ref().map_or(0, std::vec::Vec::len);
         let item_stream_row_id = storage_types::StreamItemId::from(item_stream_version);
-        let table_pointer_id = storage_types::StreamItemId::from(Uuid::now_v7());
-        let system_pointer_id = storage_types::StreamItemId::from(Uuid::now_v7());
+        let table_pointer_stream_item_id = storage_types::StreamItemId::from(Uuid::now_v7());
+        let system_pointer_stream_item_id = storage_types::StreamItemId::from(Uuid::now_v7());
         let data_type = if is_deleted {
             StreamDataType::DeleteMarker
         } else {
@@ -182,8 +182,8 @@ impl PostgresStorageProvider {
         let pointer_data = storage_types::storage_serde::to_bytes(&stored_pointer)?;
 
         let item_stream_row_id = item_stream_row_id.to_string();
-        let table_pointer_id = table_pointer_id.to_string();
-        let system_pointer_id = system_pointer_id.to_string();
+        let table_pointer_id = table_pointer_stream_item_id.to_string();
+        let system_pointer_id = system_pointer_stream_item_id.to_string();
         let created_at_ms = *created_at;
         let entries = vec![
             PostgresStreamEntry::new(
@@ -209,6 +209,16 @@ impl PostgresStorageProvider {
             ),
         ];
         self.insert_stream_entries_with_id(client, &entries).await?;
+        Self::insert_stream_pointer_index_with_client(
+            client,
+            &table_info.table_name,
+            &item_stream,
+            item_stream_version,
+            table_pointer_stream_item_id,
+            system_pointer_stream_item_id,
+            created_at,
+        )
+        .await?;
 
         Ok(())
     }

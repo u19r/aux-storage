@@ -1,6 +1,6 @@
 # Aux-Storage Roadmap
 
-Last updated: 2026-05-23
+Last updated: 2026-06-09
 
 Status: developer-preview
 
@@ -29,7 +29,6 @@ Status: developer-preview
 
 - ReadSequence: bounded dependent reads to reduce N+1 request patterns.
 - Bounded inverted indexes: opt-in set-membership indexes for DynamoDB set attributes.
-- Custom stream duration: table stream retention and per-item stream TTL.
 - VersionAt reads: historical reads at a requested timestamp.
 - Tunable limits: knobs to relax selected AWS DynamoDB constraints while preserving bounded work.
 
@@ -48,7 +47,7 @@ Rounded benchmark-equivalent capacity, not AWS billing capacity.
 ## Planned
 
 - Accurate capacity consumption: consumed capacity remains best effort, not AWS billing-equivalent.
-- Strongly consistent multi-region writes: use async replication for distant regions; sync
+- Multi-region writes: use async replication for distant regions; sync
   replication is for low-latency quorum deployments.
 - Deprecated request parameters: legacy DynamoDB fields may remain for compatibility, but new work
   uses expressions and typed aux-storage fields.

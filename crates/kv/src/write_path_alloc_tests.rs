@@ -286,6 +286,7 @@ fn transact_update_request(table_name: &TableName, iteration: usize) -> Transact
                 expression_attribute_names: Some(names.clone()),
                 expression_attribute_values: Some(values.clone()),
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         })
@@ -310,7 +311,10 @@ fn sample_batch_write_encode_request(table_name: &TableName) -> BatchWriteItemEn
     let writes = sample_wire_items()
         .into_iter()
         .map(|item| EncodeWriteRequest {
-            put_request: Some(EncodePutRequest { item }),
+            put_request: Some(EncodePutRequest {
+                item,
+                aux_item_stream_ttl_hours: None,
+            }),
             delete_request: None,
         })
         .collect::<Vec<_>>();
@@ -333,7 +337,10 @@ fn sample_batch_write_immediate_gsi_request(table_name: &TableName) -> BatchWrit
             );
             item.insert("gsi_sk".to_string(), AttributeValue::N(index.to_string()));
             WriteRequest {
-                put_request: Some(PutRequest { item }),
+                put_request: Some(PutRequest {
+                    item,
+                    aux_item_stream_ttl_hours: None,
+                }),
                 delete_request: None,
             }
         })
@@ -745,6 +752,7 @@ fn measure_update_plan_old_item_retention(
                 table_info: table_info.clone(),
                 key: update_key.clone(),
                 operations: Arc::clone(&update_operations),
+                item_stream_ttl_hours: None,
                 condition: None,
                 return_values_on_condition_check_failure: None,
                 replication: None,
@@ -851,6 +859,7 @@ fn transaction_plan_operations(
             table_info: table_info.clone(),
             key: transaction_plan_key(index),
             operations: Arc::clone(&update_operations),
+            item_stream_ttl_hours: None,
             condition: None,
             return_values_on_condition_check_failure: None,
             replication: None,
@@ -894,6 +903,8 @@ fn update_plan_table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

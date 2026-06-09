@@ -1048,6 +1048,8 @@ impl RemoteStorageProvider {
             sse_specification: None,
             stream_specification: None,
             table_class: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
         };
         self.invoke::<_, UpdateTableResponse>("DynamoDB_20120810.UpdateTable", &request)
             .await
@@ -1096,11 +1098,23 @@ impl RemoteStorageProvider {
     }
 
     pub(super) fn should_suppress_operation_warning(operation: &str, error: &StorageError) -> bool {
+        if Self::is_normal_operation_error(error) {
+            return true;
+        }
+
         operation == "DescribeTable"
             && matches!(
                 error.to_enum(),
                 StorageEnum::TableNotFound { .. } | StorageEnum::ResourceNotFound { .. }
             )
+    }
+
+    pub(super) fn is_normal_operation_error(error: &StorageError) -> bool {
+        matches!(
+            error.to_enum(),
+            StorageEnum::ConditionalCheckFailed
+                | StorageEnum::ConditionalCheckFailedWithItem { .. }
+        )
     }
 
     pub(super) fn select_initial_endpoint(&self) -> (usize, bool) {
@@ -1257,6 +1271,7 @@ impl RemoteStorageProvider {
                         let leader_hint = attempt_error.leader_hint.clone();
                         let error = attempt_error.error;
                         let outcome = error_label(&error);
+                        let normal_operation_error = Self::is_normal_operation_error(&error);
                         record_latency(&operation, endpoint.url.as_str(), outcome, start.elapsed());
 
                         if !Self::should_suppress_operation_warning(&operation, &error) {
@@ -1277,12 +1292,17 @@ impl RemoteStorageProvider {
                             );
                         }
 
-                        let failures = endpoint.failures.fetch_add(1, Ordering::Relaxed) + 1;
-                        if failures == FAILURE_ALERT_THRESHOLD {
-                            tracing::error!(
-                                endpoint = endpoint.url.as_str(),
-                                "remote storage endpoint marked unhealthy after repeated failures"
-                            );
+                        if normal_operation_error {
+                            endpoint.failures.store(0, Ordering::Relaxed);
+                        } else {
+                            let failures = endpoint.failures.fetch_add(1, Ordering::Relaxed) + 1;
+                            if failures == FAILURE_ALERT_THRESHOLD {
+                                tracing::error!(
+                                    endpoint = endpoint.url.as_str(),
+                                    "remote storage endpoint marked unhealthy after repeated \
+                                     failures"
+                                );
+                            }
                         }
 
                         if !retryable {

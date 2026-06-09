@@ -1081,6 +1081,7 @@ async fn transact_write_encode_put_replaces_authoritative_absence_with_present_i
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             update: None,
             delete: None,
@@ -1521,6 +1522,7 @@ async fn cached_transaction_guard_conflict_falls_back_and_commits_atomically() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: None,
                 }),
                 ..TransactWriteItem::default()
             },

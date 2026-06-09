@@ -57,9 +57,11 @@ pub(super) struct PreparedPostgresPut {
     table_name: TableName,
     table_info: StoredTableInfo,
     old_item_query: PreparedGetItemQuery,
+    key_attributes: KeyAttributes,
     full_item: HashMap<String, AttributeValue>,
     combined_sql: String,
     combined_bind_values: Vec<String>,
+    aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(Clone)]
@@ -70,6 +72,7 @@ pub(super) struct PreparedPostgresDelete {
     old_item_query: PreparedGetItemQuery,
     sql: String,
     bind_values: Vec<String>,
+    aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 fn conditional_check_failed_reason_for_wire_item(
@@ -98,6 +101,7 @@ impl PostgresStorageProvider {
                 key_attributes,
                 non_key_attributes,
                 full_item,
+                aux_item_stream_ttl_hours,
                 ..
             } => {
                 let attributes_blob = if non_key_attributes.is_empty() {
@@ -175,15 +179,18 @@ impl PostgresStorageProvider {
                     table_name,
                     table_info,
                     old_item_query,
+                    key_attributes,
                     full_item,
                     combined_sql,
                     combined_bind_values: bind_values,
+                    aux_item_stream_ttl_hours,
                 }))
             }
             PreparedBatchOperation::Delete {
                 table_name,
                 table_info,
                 key,
+                aux_item_stream_ttl_hours,
                 ..
             } => {
                 let key_bindings = Self::key_column_bindings_for_schema(
@@ -206,6 +213,7 @@ impl PostgresStorageProvider {
                         old_item_query,
                         sql,
                         bind_values,
+                        aux_item_stream_ttl_hours,
                     },
                 ))
             }
@@ -309,6 +317,13 @@ impl PostgresStorageProvider {
         )
         .await?;
         self.record_transaction_phase("batch_write_item", "stream_write", stream_started.elapsed());
+        Self::apply_item_stream_duration_with_client(
+            client,
+            &prepared.table_info,
+            &prepared.key_attributes,
+            prepared.aux_item_stream_ttl_hours,
+        )
+        .await?;
         Ok(())
     }
 
@@ -394,6 +409,13 @@ impl PostgresStorageProvider {
         )
         .await?;
         self.record_transaction_phase("batch_write_item", "stream_write", stream_started.elapsed());
+        Self::apply_item_stream_duration_with_client(
+            client,
+            &prepared.table_info,
+            &prepared.key_attributes,
+            prepared.aux_item_stream_ttl_hours,
+        )
+        .await?;
         Ok(())
     }
 
@@ -441,6 +463,7 @@ impl PostgresStorageProvider {
             &table_info,
             split_item.all_attributes,
             old_item_for_condition.as_ref(),
+            request.aux_item_stream_ttl_hours,
         )
         .await
     }
@@ -452,6 +475,7 @@ impl PostgresStorageProvider {
         table_info: &StoredTableInfo,
         item: HashMap<String, AttributeValue>,
         old_item_for_condition: Option<&HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     ) -> StorageResult<()> {
         validate_transact_put_item_key(table_info, &item)?;
         let split_item = split_item_into_key_and_attributes_sync(item, table_info)?;
@@ -570,6 +594,13 @@ impl PostgresStorageProvider {
             },
         )
         .await?;
+        Self::apply_item_stream_duration_with_client(
+            client,
+            table_info,
+            &split_item.key_attributes,
+            aux_item_stream_ttl_hours,
+        )
+        .await?;
         Ok(())
     }
 
@@ -660,6 +691,13 @@ impl PostgresStorageProvider {
             },
         )
         .await?;
+        Self::apply_item_stream_duration_with_client(
+            client,
+            &table_info,
+            &key_attributes,
+            request.aux_item_stream_ttl_hours,
+        )
+        .await?;
         Ok(())
     }
 
@@ -716,6 +754,7 @@ impl PostgresStorageProvider {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
             },
             None,
         )

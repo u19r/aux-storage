@@ -213,6 +213,7 @@ fn update_request(table_name: &TableName, iteration: usize) -> UpdateItemRequest
         return_consumed_capacity: None,
         return_item_collection_metrics: None,
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn transact_write_request(table_name: &TableName, iteration: usize) -> TransactW
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: None,
                 }),
                 update: None,
                 delete: None,
@@ -259,6 +261,7 @@ fn transact_write_request(table_name: &TableName, iteration: usize) -> TransactW
                         (":payload".to_string(), AttributeValue::S("z".repeat(1024))),
                     ])),
                     return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: None,
                 }),
                 delete: None,
                 condition_check: None,
@@ -283,6 +286,7 @@ fn batch_write_request(table_name: &TableName, iteration: usize) -> BatchWriteIt
                     ),
                     ("payload".to_string(), AttributeValue::S("x".repeat(1024))),
                 ]),
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         });

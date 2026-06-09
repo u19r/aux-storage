@@ -121,6 +121,7 @@ pub(crate) fn realistic_gsi_profile_batches(
                 .map(|index| WriteRequest {
                     put_request: Some(PutRequest {
                         item: realistic_gsi_profile_item(index),
+                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 })

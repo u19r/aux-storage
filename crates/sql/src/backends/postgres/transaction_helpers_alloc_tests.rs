@@ -698,6 +698,7 @@ fn realistic_transact_write_request_for_table(table_name: &TableName) -> Transac
                         ),
                     ])),
                     return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: None,
                 }),
                 ..TransactWriteItem::default()
             })

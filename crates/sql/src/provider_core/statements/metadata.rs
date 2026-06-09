@@ -36,7 +36,9 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
     table_size_bytes INTEGER DEFAULT 0,
     item_count INTEGER DEFAULT 0,
     stream_specification TEXT,
-    deletion_protection_enabled INTEGER NOT NULL DEFAULT 0
+    deletion_protection_enabled INTEGER NOT NULL DEFAULT 0,
+    table_stream_duration_hours INTEGER NOT NULL DEFAULT 72,
+    default_item_stream_duration_hours INTEGER NOT NULL DEFAULT 72
 )"
         }
         SqlDialectKind::Postgres => {
@@ -51,8 +53,35 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
         table_size_bytes BIGINT DEFAULT 0,
         item_count BIGINT DEFAULT 0,
         stream_specification TEXT,
-        deletion_protection_enabled BOOLEAN NOT NULL DEFAULT FALSE
+        deletion_protection_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        table_stream_duration_hours BIGINT NOT NULL DEFAULT 72,
+        default_item_stream_duration_hours BIGINT NOT NULL DEFAULT 72
     )"
+        }
+    })
+}
+
+pub(crate) fn add_table_stream_duration_column(dialect: &dyn SqlDialect) -> SqlStatement {
+    SqlStatement::static_sql(match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "ALTER TABLE tables ADD COLUMN table_stream_duration_hours INTEGER NOT NULL DEFAULT 72"
+        }
+        SqlDialectKind::Postgres => {
+            "ALTER TABLE tables ADD COLUMN IF NOT EXISTS table_stream_duration_hours BIGINT NOT \
+             NULL DEFAULT 72"
+        }
+    })
+}
+
+pub(crate) fn add_default_item_stream_duration_column(dialect: &dyn SqlDialect) -> SqlStatement {
+    SqlStatement::static_sql(match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "ALTER TABLE tables ADD COLUMN default_item_stream_duration_hours INTEGER NOT NULL \
+             DEFAULT 72"
+        }
+        SqlDialectKind::Postgres => {
+            "ALTER TABLE tables ADD COLUMN IF NOT EXISTS default_item_stream_duration_hours BIGINT \
+             NOT NULL DEFAULT 72"
         }
     })
 }
@@ -162,13 +191,15 @@ pub(crate) fn get_table_info(
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+       table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables WHERE table_name = ?1"
             }
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+        table_stream_duration_hours, default_item_stream_duration_hours
      FROM tables WHERE table_name = $1"
             }
         },
@@ -187,21 +218,25 @@ pub(crate) fn insert_table(
     global_secondary_indexes: Option<String>,
     stream_specification: Option<String>,
     deletion_protection_enabled: bool,
+    table_stream_duration_hours: i64,
+    default_item_stream_duration_hours: i64,
 ) -> SqlStatement {
     let sql = match dialect.kind() {
         SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
             r"INSERT INTO tables (
     id, table_name, table_status, created_at,
     attribute_definitions, key_schema, global_secondary_indexes,
-    table_size_bytes, item_count, stream_specification, deletion_protection_enabled
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+    table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+    table_stream_duration_hours, default_item_stream_duration_hours
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         }
         SqlDialectKind::Postgres => {
             "INSERT INTO tables (
         id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9)"
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+        table_stream_duration_hours, default_item_stream_duration_hours
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9, $10, $11)"
         }
     };
     let mut params = vec![
@@ -225,6 +260,8 @@ pub(crate) fn insert_table(
         None => params.push(SqlParam::null()),
     }
     params.push(SqlParam::boolean(deletion_protection_enabled));
+    params.push(SqlParam::integer(table_stream_duration_hours));
+    params.push(SqlParam::integer(default_item_stream_duration_hours));
     SqlStatement::with_params(sql, params)
 }
 
@@ -250,7 +287,8 @@ pub(crate) fn list_all_tables(dialect: &dyn SqlDialect, limit: u32) -> SqlStatem
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+       table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables
 ORDER BY table_name ASC
 LIMIT ?1"
@@ -258,7 +296,8 @@ LIMIT ?1"
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+        table_stream_duration_hours, default_item_stream_duration_hours
     FROM tables
     ORDER BY table_name ASC
     LIMIT $1"
@@ -278,7 +317,8 @@ pub(crate) fn list_tables_after(
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+       table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables
 WHERE table_name > ?1
 ORDER BY table_name ASC
@@ -287,7 +327,8 @@ LIMIT ?2"
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
         attribute_definitions, key_schema, global_secondary_indexes,
-        table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+        table_stream_duration_hours, default_item_stream_duration_hours
     FROM tables
     WHERE table_name > $1
     ORDER BY table_name ASC
@@ -317,6 +358,31 @@ pub(crate) fn update_deletion_protection(
         },
         vec![
             SqlParam::boolean(deletion_protection_enabled),
+            SqlParam::text(table_name),
+        ],
+    )
+}
+
+pub(crate) fn update_stream_durations(
+    dialect: &dyn SqlDialect,
+    table_stream_duration_hours: i64,
+    default_item_stream_duration_hours: i64,
+    table_name: impl Into<String>,
+) -> SqlStatement {
+    SqlStatement::with_params(
+        match dialect.kind() {
+            SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+                "UPDATE tables SET table_stream_duration_hours = ?1, \
+                 default_item_stream_duration_hours = ?2 WHERE table_name = ?3"
+            }
+            SqlDialectKind::Postgres => {
+                "UPDATE tables SET table_stream_duration_hours = $1, \
+                 default_item_stream_duration_hours = $2 WHERE table_name = $3"
+            }
+        },
+        vec![
+            SqlParam::integer(table_stream_duration_hours),
+            SqlParam::integer(default_item_stream_duration_hours),
             SqlParam::text(table_name),
         ],
     )

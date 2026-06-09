@@ -5,6 +5,19 @@
 
 mod config;
 mod provider;
+#[cfg(test)]
+mod quint_custom_stream_duration_api_tests;
+#[cfg(test)]
+mod quint_custom_stream_duration_tests;
+mod stream_duration_planner;
+#[cfg(test)]
+mod stream_duration_planner_tests;
+mod stream_duration_trim;
+#[cfg(test)]
+mod stream_duration_trim_tests;
+mod stream_duration_worker;
+#[cfg(test)]
+mod stream_duration_worker_tests;
 mod update_logic;
 
 pub use storage_types::AttributeValue;
@@ -12,6 +25,9 @@ pub use storage_types::AttributeValue;
 pub use crate::{
     config::*,
     provider::*,
+    stream_duration_planner::*,
+    stream_duration_trim::*,
+    stream_duration_worker::*,
     update_logic::{
         BoundUpdateOperation, SetFunction, UpdateOperation, apply_bound_update_operations,
         apply_update_operations, before_update_item, before_update_item_optional,

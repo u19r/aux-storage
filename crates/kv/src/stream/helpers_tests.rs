@@ -34,6 +34,9 @@ fn extract_pointer_and_image_items(
     let mut image_item = None;
 
     for (_, value) in entries {
+        if value.is_empty() {
+            continue;
+        }
         let stream_item = decode_stream_item(value.as_slice());
         if stream_item.data_type == StreamDataType::StreamPointer {
             pointer_items.push(stream_item);
@@ -66,7 +69,7 @@ fn wire_encoded_stream_entries_use_pointer_envelope_for_insert_tests() {
     )
     .expect("create stream entries");
 
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 5);
     let (pointer_items, image_item) = extract_pointer_and_image_items(&entries);
     assert_eq!(pointer_items.len(), 2);
     assert_eq!(image_item.data, item_bytes);
@@ -110,7 +113,7 @@ fn wire_encoded_stream_entries_embed_old_and_new_images_for_updates_tests() {
     )
     .expect("create stream entries");
 
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 5);
     let (pointer_items, image_item) = extract_pointer_and_image_items(&entries);
     assert_eq!(pointer_items.len(), 2);
     assert_eq!(image_item.data, new_item);

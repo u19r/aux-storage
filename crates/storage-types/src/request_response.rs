@@ -9,8 +9,8 @@ use crate::{
     AttributeDefinition, AttributeMap, AttributeValue, GlobalSecondaryIndex, IndexName, ItemKey,
     ItemStreamVersion, KeyAttributes, KeySchemaElement, MultiRegionConsistency, Projection,
     ReplicaDescription, ReplicaUpdate, StorageError, StoredTableInfo, StreamRecord,
-    StreamSpecification, StreamViewType, TableName, TableStatus, TimestampSecondsFractional,
-    WireItem,
+    StreamRetentionDuration, StreamSpecification, StreamViewType, TableName, TableStatus,
+    TimestampSecondsFractional, WireItem,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -119,6 +119,20 @@ pub struct CreateTableRequest {
     /// Protects the table from accidental `DeleteTable` calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_protection_enabled: Option<bool>,
+
+    /// Aux-storage extension: table stream retention duration in hours.
+    #[serde(
+        rename = "AuxStreamDurationHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_stream_duration_hours: Option<StreamRetentionDuration>,
+
+    /// Aux-storage extension: default item stream retention duration in hours.
+    #[serde(
+        rename = "AuxDefaultItemStreamDurationHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_default_item_stream_duration_hours: Option<StreamRetentionDuration>,
 }
 
 impl CreateTableRequest {
@@ -144,6 +158,8 @@ impl CreateTableRequest {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
         }
     }
 
@@ -541,6 +557,13 @@ pub struct PutItemRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl PutItemRequest {
@@ -558,6 +581,7 @@ impl PutItemRequest {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }
     }
 
@@ -862,6 +886,13 @@ pub struct DeleteItemRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl DeleteItemRequest {
@@ -879,6 +910,7 @@ impl DeleteItemRequest {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }
     }
 
@@ -974,6 +1006,14 @@ pub struct UpdateItemRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[builder(default)]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1351,6 +1391,20 @@ pub struct UpdateTableRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_specification: Option<StreamSpecification>,
 
+    /// Aux-storage extension: table stream retention duration in hours.
+    #[serde(
+        rename = "AuxStreamDurationHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_stream_duration_hours: Option<StreamRetentionDuration>,
+
+    /// Aux-storage extension: default item stream retention duration in hours.
+    #[serde(
+        rename = "AuxDefaultItemStreamDurationHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_default_item_stream_duration_hours: Option<StreamRetentionDuration>,
+
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_class: Option<TableClass>,
@@ -1477,6 +1531,13 @@ pub struct WriteRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct PutRequest {
     pub item: HashMap<String, AttributeValue>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1498,12 +1559,26 @@ pub struct TransactPutRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct DeleteRequest {
     pub key: KeyAttributes,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1525,6 +1600,13 @@ pub struct TransactDeleteRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1635,6 +1717,7 @@ pub enum PreparedBatchOperation {
         key_attributes: KeyAttributes,
         non_key_attributes: HashMap<String, AttributeValue>,
         full_item: HashMap<String, AttributeValue>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     },
     Delete {
         table_name: TableName,
@@ -1642,6 +1725,7 @@ pub enum PreparedBatchOperation {
         write_request: WriteRequest,
         key: KeyAttributes,
         existing_item: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     },
 }
 
@@ -1731,6 +1815,13 @@ pub struct TransactUpdateRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
+
+    /// Aux-storage extension: item stream retention duration in hours.
+    #[serde(
+        rename = "AuxItemStreamTtlHours",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

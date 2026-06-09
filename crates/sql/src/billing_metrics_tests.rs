@@ -19,6 +19,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
     tally.record_write_request(&WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
     });
@@ -27,6 +28,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
         delete_request: Some(DeleteRequest {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#2".to_string()))])
                 .into(),
+            aux_item_stream_ttl_hours: None,
         }),
     });
 
@@ -46,6 +48,7 @@ fn write_cost_tally_tracks_encode_batch_puts_and_deletes() {
                 AttributeValue::S("tenant#1".to_string()),
             )]))
             .expect("wire item"),
+            aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
     });
@@ -54,6 +57,7 @@ fn write_cost_tally_tracks_encode_batch_puts_and_deletes() {
         delete_request: Some(DeleteRequest {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#2".to_string()))])
                 .into(),
+            aux_item_stream_ttl_hours: None,
         }),
     });
 
@@ -77,6 +81,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             AttributeValue::S("next".to_string()),
         )])),
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     };
     let check_request = TransactConditionCheckRequest {
         table_name: TableName::new("tenant_t1"),
@@ -94,6 +99,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(update_request.clone()),
         delete: Some(TransactDeleteRequest {
@@ -104,6 +110,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: Some(check_request.clone()),
     });
@@ -136,6 +143,7 @@ fn write_cost_tally_tracks_transact_encode_item_kinds() {
             AttributeValue::S("next".to_string()),
         )])),
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     };
     let check_request = TransactConditionCheckRequest {
         table_name: TableName::new("tenant_t1"),
@@ -158,6 +166,7 @@ fn write_cost_tally_tracks_transact_encode_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(update_request.clone()),
         delete: Some(TransactDeleteRequest {
@@ -168,6 +177,7 @@ fn write_cost_tally_tracks_transact_encode_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: Some(check_request.clone()),
     });
@@ -197,6 +207,7 @@ fn subtract_removes_unprocessed_write_cost() {
     requested.record_write_request(&WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: put_item.clone(),
+            aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
     });
@@ -204,12 +215,14 @@ fn subtract_removes_unprocessed_write_cost() {
         put_request: None,
         delete_request: Some(DeleteRequest {
             key: delete_key.clone().into(),
+            aux_item_stream_ttl_hours: None,
         }),
     });
     unprocessed.record_write_request(&WriteRequest {
         put_request: None,
         delete_request: Some(DeleteRequest {
             key: delete_key.into(),
+            aux_item_stream_ttl_hours: None,
         }),
     });
 

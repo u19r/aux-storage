@@ -15,7 +15,9 @@ fn sqlite_and_turso_metadata_sql_matches_when_dialect_has_no_override() {
         metadata::create_item_revisions_table(&sqlite),
         metadata::table_exists(&sqlite, "users"),
         metadata::get_table_info(&sqlite, "users"),
-        metadata::insert_table(&sqlite, "1", "users", 42, "[]", "[]", None, None, false),
+        metadata::insert_table(
+            &sqlite, "1", "users", 42, "[]", "[]", None, None, false, 72, 72,
+        ),
         metadata::update_table_status(&sqlite, "ACTIVE", "users"),
         metadata::list_all_tables(&sqlite, 10),
         metadata::list_tables_after(&sqlite, 10, "accounts"),
@@ -28,7 +30,9 @@ fn sqlite_and_turso_metadata_sql_matches_when_dialect_has_no_override() {
         metadata::create_item_revisions_table(&turso),
         metadata::table_exists(&turso, "users"),
         metadata::get_table_info(&turso, "users"),
-        metadata::insert_table(&turso, "1", "users", 42, "[]", "[]", None, None, false),
+        metadata::insert_table(
+            &turso, "1", "users", 42, "[]", "[]", None, None, false, 72, 72,
+        ),
         metadata::update_table_status(&turso, "ACTIVE", "users"),
         metadata::list_all_tables(&turso, 10),
         metadata::list_tables_after(&turso, 10, "accounts"),

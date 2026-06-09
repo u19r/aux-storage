@@ -30,6 +30,16 @@ pub fn add_deletion_protection_column() -> &'static str {
 }
 
 #[must_use]
+pub fn add_table_stream_duration_column() -> &'static str {
+    metadata::add_table_stream_duration_column(&TursoDialect).sql
+}
+
+#[must_use]
+pub fn add_default_item_stream_duration_column() -> &'static str {
+    metadata::add_default_item_stream_duration_column(&TursoDialect).sql
+}
+
+#[must_use]
 pub fn create_gsi_backfill_table() -> &'static str {
     metadata::create_gsi_backfill_table(&TursoDialect).sql
 }
@@ -58,13 +68,14 @@ pub fn get_table_info() -> &'static str {
 pub fn list_table_infos() -> &'static str {
     r"SELECT id, table_name, table_status, created_at,
        attribute_definitions, key_schema, global_secondary_indexes,
-       table_size_bytes, item_count, stream_specification, deletion_protection_enabled
+       table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
+       table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables"
 }
 
 #[must_use]
 pub fn insert_table() -> &'static str {
-    metadata::insert_table(&TursoDialect, "", "", 0, "", "", None, None, false).sql
+    metadata::insert_table(&TursoDialect, "", "", 0, "", "", None, None, false, 72, 72).sql
 }
 
 #[must_use]
@@ -90,6 +101,11 @@ pub fn delete_table_metadata() -> &'static str {
 #[must_use]
 pub fn update_deletion_protection() -> &'static str {
     metadata::update_deletion_protection(&TursoDialect, false, "").sql
+}
+
+#[must_use]
+pub fn update_stream_durations() -> &'static str {
+    metadata::update_stream_durations(&TursoDialect, 72, 72, "").sql
 }
 
 #[must_use]

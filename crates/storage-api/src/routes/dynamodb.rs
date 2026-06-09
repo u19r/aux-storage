@@ -241,12 +241,25 @@ where
     let result = future.await;
     timer.record_stage(MANAGER_STAGE, status_label_for_manager(&result), started);
     if let Err(error) = &result {
-        tracing::warn!(
-            error = ?error,
-            "dynamodb manager operation failed before protocol mapping"
-        );
+        if is_conditional_check_failed_api_error(error) {
+            tracing::info!(
+                error = ?error,
+                "dynamodb manager operation failed before protocol mapping"
+            );
+        } else {
+            tracing::warn!(
+                error = ?error,
+                "dynamodb manager operation failed before protocol mapping"
+            );
+        }
     }
     result.map_err(http_api_error_to_dynamo_error)
+}
+
+fn is_conditional_check_failed_api_error(error: &HttpApiError) -> bool {
+    error
+        .error_type
+        .ends_with("ConditionalCheckFailedException")
 }
 
 fn parse_try_into_request_timed<T>(
@@ -426,4 +439,26 @@ fn error_headers(error: &HttpApiError) -> HeaderMap {
         }
     }
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use http_error::HttpApiError;
+    use storage_types::{DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, StorageEnum, StorageError};
+
+    use super::is_conditional_check_failed_api_error;
+
+    #[test]
+    fn conditional_check_failed_api_errors_are_expected_operation_errors() {
+        let storage_error: StorageError = StorageEnum::ConditionalCheckFailed.into();
+        let conditional_error: HttpApiError = storage_error.into();
+        let validation_error = HttpApiError::validation_error("bad request");
+
+        assert_eq!(
+            conditional_error.message,
+            DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE
+        );
+        assert!(is_conditional_check_failed_api_error(&conditional_error));
+        assert!(!is_conditional_check_failed_api_error(&validation_error));
+    }
 }

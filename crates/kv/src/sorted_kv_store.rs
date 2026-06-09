@@ -173,6 +173,7 @@ pub enum TransactWriteTableOperation {
     Put {
         table_info: StoredTableInfo,
         item: HashMap<String, AttributeValue>,
+        item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
         condition: Option<Condition>,
         return_values_on_condition_check_failure: Option<String>,
         replication: Option<ReplicationEventMetadata>,
@@ -196,6 +197,7 @@ pub enum TransactWriteTableOperation {
         table_info: StoredTableInfo,
         key: KeyAttributes,
         operations: Arc<[UpdateOperation]>,
+        item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
         condition: Option<Condition>,
         return_values_on_condition_check_failure: Option<String>,
         replication: Option<ReplicationEventMetadata>,

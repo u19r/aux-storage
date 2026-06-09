@@ -94,6 +94,8 @@ fn sample_table_info() -> StoredTableInfo {
             stream_enabled: true,
             stream_view_type: Some(StreamViewType::NewAndOldImages),
         }),
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

@@ -15,17 +15,21 @@ use futures::{StreamExt, TryStreamExt, stream};
 use metrics_exporter_prometheus::PrometheusHandle;
 use storage_common::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, TTL_SWEEP_JOB};
 use storage_condition::Condition;
-use storage_provider::StorageProvider;
+use storage_provider::{
+    StorageProvider, StreamDurationTrimBackend, StreamTrimDueMarker, StreamTrimScope,
+    StreamTrimState, StreamTrimStateWrite,
+};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateGlobalSecondaryIndex,
     CreateTableRequest, HIDDEN_TTL_INDEX_PREFIX, IndexName, ItemKey, KeyAttributeType,
     KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, QueryTableRequest,
     ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
     ReplicationWriteSource, ScanTableRequest, SerializesToKey, StorageEnum, StorageError,
-    StorageResult, StreamItemId, StreamKey, StreamName, TTL_PARTITION_ATTRIBUTE, TableName,
-    TimeToLiveSpecification, TimeToLiveStatus, TimestampMillis, TransactConditionCheckRequest,
-    TransactDeleteRequest, TransactPutRequest, TransactUpdateRequest, TransactWriteItem,
-    TransactWriteItemsRequest, UpdateTimeToLiveRequest, WireItem,
+    StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration,
+    TTL_PARTITION_ATTRIBUTE, TableName, TimeToLiveSpecification, TimeToLiveStatus, TimestampMillis,
+    TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
+    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateTableRequest,
+    UpdateTimeToLiveRequest, WireItem,
 };
 use stream_provider::{StoredStreamPointer, StreamDataType, StreamItem, StreamProvider};
 use tracing_test::traced_test;
@@ -1090,6 +1094,8 @@ async fn update_table_creates_gsi_and_backfills_kv() {
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: Some(vec![storage_types::GlobalSecondaryIndexUpdate {
             create: Some(storage_types::CreateGlobalSecondaryIndex {
                 index_name: IndexName::new("G1"),
@@ -1186,6 +1192,8 @@ async fn kv_backfill_crash_resume() {
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: Some(vec![storage_types::GlobalSecondaryIndexUpdate {
             create: Some(storage_types::CreateGlobalSecondaryIndex {
                 index_name: IndexName::new("GCrash"),
@@ -1432,6 +1440,7 @@ async fn kv_immediate_gsi_consistency_batch_write_updates_indexes_inline() {
                                     ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
                                     ("gsi_sk".to_string(), AttributeValue::N("1".to_string())),
                                 ]),
+                                aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
                         },
@@ -1443,6 +1452,7 @@ async fn kv_immediate_gsi_consistency_batch_write_updates_indexes_inline() {
                                     ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
                                     ("gsi_sk".to_string(), AttributeValue::N("2".to_string())),
                                 ]),
+                                aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
                         },
@@ -1495,6 +1505,8 @@ async fn kv_backfill_concurrent_writes() {
         provisioned_throughput: None,
         on_demand_throughput: None,
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_index_updates: Some(vec![storage_types::GlobalSecondaryIndexUpdate {
             create: Some(storage_types::CreateGlobalSecondaryIndex {
                 index_name: IndexName::new("GConc"),
@@ -5644,6 +5656,7 @@ async fn idempotency_token_ttl_support() {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -6208,11 +6221,17 @@ async fn batch_stream_entries_created() {
         TableName::new(table_name),
         vec![
             WriteRequest {
-                put_request: Some(PutRequest { item: item1 }),
+                put_request: Some(PutRequest {
+                    item: item1,
+                    aux_item_stream_ttl_hours: None,
+                }),
                 delete_request: None,
             },
             WriteRequest {
-                put_request: Some(PutRequest { item: item2 }),
+                put_request: Some(PutRequest {
+                    item: item2,
+                    aux_item_stream_ttl_hours: None,
+                }),
                 delete_request: None,
             },
         ],
@@ -6255,7 +6274,10 @@ async fn batch_write_item_missing_table_returns_not_found_with_streams() {
         request_items: HashMap::from([(
             TableName::new("NonExistentTable"),
             vec![WriteRequest {
-                put_request: Some(PutRequest { item }),
+                put_request: Some(PutRequest {
+                    item,
+                    aux_item_stream_ttl_hours: None,
+                }),
                 delete_request: None,
             }],
         )]),
@@ -6308,6 +6330,57 @@ async fn create_test_table_with_stream(
 
     provider.create_table(&request).await?;
     Ok(())
+}
+
+async fn create_custom_duration_stream_table<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table_name: TableName,
+    table_retention: StreamRetentionDuration,
+    default_item_retention: StreamRetentionDuration,
+) {
+    let mut request = CreateTableRequest::new(
+        table_name,
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![key_schema_pk(), key_schema_sk()],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_stream_specification(Some(storage_types::StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+    }));
+    request.aux_stream_duration_hours = Some(table_retention);
+    request.aux_default_item_stream_duration_hours = Some(default_item_retention);
+    provider.create_table(&request).await.expect("create");
+}
+
+fn update_table_duration_request(
+    table_name: TableName,
+    retention: StreamRetentionDuration,
+) -> UpdateTableRequest {
+    UpdateTableRequest {
+        table_name,
+        attribute_definitions: None,
+        billing_mode: None,
+        provisioned_throughput: None,
+        on_demand_throughput: None,
+        deletion_protection_enabled: None,
+        global_secondary_index_updates: None,
+        replica_updates: None,
+        sse_specification: None,
+        stream_specification: None,
+        aux_stream_duration_hours: Some(retention),
+        aux_default_item_stream_duration_hours: None,
+        table_class: None,
+    }
 }
 
 fn stream_test_item(pk: &str, sk: &str) -> HashMap<String, AttributeValue> {
@@ -6371,7 +6444,7 @@ fn build_pointer_stream_item(
     let stored_pointer = StoredStreamPointer::pointer(
         item_stream,
         table_name.clone(),
-        storage_types::ItemStreamVersion::new(1),
+        storage_types::ItemStreamVersion::from(stream_item_id),
     );
     StreamItem {
         id: stream_item_id,
@@ -6397,8 +6470,8 @@ fn build_item_stream_item(
     }
 }
 
-async fn insert_stream_item(
-    provider: &TestProvider,
+async fn insert_stream_item<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
     stream_name: &StreamName,
     stream_item: &StreamItem,
 ) {
@@ -6409,6 +6482,784 @@ async fn insert_stream_item(
         .put(key.as_ref(), &bytes, None)
         .await
         .expect("stream insert");
+}
+
+async fn insert_stream_pointer_index<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table_name: &TableName,
+    item_stream: &StreamName,
+    stream_item_id: StreamItemId,
+) {
+    provider
+        .kv_store
+        .put(
+            &super::stream_duration::stream_pointer_index_key(
+                table_name,
+                item_stream,
+                stream_item_id,
+            ),
+            b"",
+            None,
+        )
+        .await
+        .expect("item pointer index insert");
+    provider
+        .kv_store
+        .put(
+            &super::stream_duration::stream_pointer_table_key(table_name, stream_item_id),
+            b"",
+            None,
+        )
+        .await
+        .expect("table pointer index insert");
+}
+
+async fn write_due_table_trim_state<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table_name: &TableName,
+    due_at: TimestampMillis,
+) {
+    provider
+        .write_stream_trim_state_kv(StreamTrimState {
+            scope: StreamTrimScope::table(format!("kv-table:{table_name}"), table_name.clone()),
+            policy_version: 1,
+            retention: StreamRetentionDuration::FiniteHours(1),
+            effective_retention: StreamRetentionDuration::FiniteHours(1),
+            next_due_at: Some(due_at),
+            oldest_retained_version: None,
+            oldest_retained_timestamp: None,
+            latest_version: None,
+            latest_timestamp: None,
+            updated_at: due_at,
+        })
+        .await
+        .expect("write table trim state");
+}
+
+async fn write_due_item_trim_state<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table_name: &TableName,
+    item_stream: &StreamName,
+    due_at: TimestampMillis,
+) {
+    let scope_id = super::stream_duration::item_stream_scope_id(item_stream);
+    provider
+        .write_stream_trim_state_kv(StreamTrimState {
+            scope: StreamTrimScope::item(scope_id.clone(), table_name.clone(), scope_id),
+            policy_version: 1,
+            retention: StreamRetentionDuration::FiniteHours(1),
+            effective_retention: StreamRetentionDuration::FiniteHours(1),
+            next_due_at: Some(due_at),
+            oldest_retained_version: None,
+            oldest_retained_timestamp: None,
+            latest_version: None,
+            latest_timestamp: None,
+            updated_at: due_at,
+        })
+        .await
+        .expect("write item trim state");
+}
+
+#[tokio::test]
+async fn custom_stream_duration_trims_bounded_table_stream_page() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationTableTrim");
+    create_test_table_with_stream(&provider, "CustomDurationTableTrim")
+        .await
+        .unwrap();
+
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let now = TimestampMillis::now();
+    let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+    let recent_created_at = now;
+
+    let old_id = stream_id_from_u64(30);
+    let recent_id = stream_id_from_u64(31);
+    let old_pointer =
+        build_pointer_stream_item(old_id, old_created_at, &table_name, item_stream.clone());
+    let recent_pointer = build_pointer_stream_item(
+        recent_id,
+        recent_created_at,
+        &table_name,
+        item_stream.clone(),
+    );
+
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &old_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, old_id).await;
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &recent_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, recent_id).await;
+    write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(table_page.items.len(), 1);
+    assert_eq!(table_page.items[0].id, recent_id);
+
+    let old_table_pointer = provider
+        .kv_store
+        .get(
+            &super::stream_duration::stream_pointer_table_key(&table_name, old_id),
+            true,
+        )
+        .await
+        .expect("old table pointer read");
+    assert!(old_table_pointer.is_none());
+}
+
+#[tokio::test]
+async fn custom_stream_duration_item_trim_waits_for_retained_table_pointer() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationItemTrim");
+    create_test_table_with_stream(&provider, "CustomDurationItemTrim")
+        .await
+        .unwrap();
+
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let item = stream_test_item("pk1", "sk1");
+    let now = TimestampMillis::now();
+    let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+
+    let deleted_id = stream_id_from_u64(40);
+    let retained_pointer_id = stream_id_from_u64(41);
+    let latest_id = stream_id_from_u64(42);
+    let deleted_item =
+        build_item_stream_item(deleted_id, old_created_at, item_stream.clone(), &item);
+    let retained_item = build_item_stream_item(
+        retained_pointer_id,
+        old_created_at,
+        item_stream.clone(),
+        &item,
+    );
+    let latest_item = build_item_stream_item(latest_id, now, item_stream.clone(), &item);
+    let retained_pointer =
+        build_pointer_stream_item(retained_pointer_id, now, &table_name, item_stream.clone());
+
+    insert_stream_item(&provider, &item_stream, &deleted_item).await;
+    insert_stream_item(&provider, &item_stream, &retained_item).await;
+    insert_stream_item(&provider, &item_stream, &latest_item).await;
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &retained_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, retained_pointer_id).await;
+    write_due_item_trim_state(
+        &provider,
+        &table_name,
+        &item_stream,
+        now - constants::MILLIS_PER_HOUR,
+    )
+    .await;
+    let scope_id = super::stream_duration::item_stream_scope_id(&item_stream);
+    let item_scope = StreamTrimScope::item(scope_id.clone(), table_name.clone(), scope_id);
+    let markers = StorageProvider::list_due_stream_trim_markers(&provider, now, 10)
+        .await
+        .expect("due marker list");
+    assert!(
+        markers
+            .iter()
+            .any(|marker| marker.scope.scope_id == item_scope.scope_id)
+    );
+    let boundaries = provider
+        .load_stream_trim_boundaries(&item_scope)
+        .await
+        .expect("load item trim boundaries");
+    assert_eq!(boundaries.latest_item_id, Some(latest_id));
+    assert_eq!(
+        boundaries
+            .retained_table_pointer_boundary
+            .map(|boundary| boundary.item_id),
+        Some(retained_pointer_id)
+    );
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let item_page = StreamProvider::read_forward(&provider, item_stream.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        item_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![retained_pointer_id, latest_id]
+    );
+}
+
+#[tokio::test]
+async fn custom_table_trim_drives_item_cleanup_from_deleted_pointers() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationTableDrivenItemTrim");
+    let mut create = CreateTableRequest::new(
+        table_name.clone(),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![key_schema_pk(), key_schema_sk()],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_stream_specification(Some(storage_types::StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+    }));
+    create.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(1));
+    create.aux_default_item_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(1));
+    provider.create_table(&create).await.expect("create");
+
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let item = stream_test_item("pk1", "sk1");
+    let now = TimestampMillis::now();
+    let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+
+    let deleted_id = stream_id_from_u64(60);
+    let retained_pointer_id = stream_id_from_u64(61);
+    let latest_id = stream_id_from_u64(62);
+    let deleted_pointer =
+        build_pointer_stream_item(deleted_id, old_created_at, &table_name, item_stream.clone());
+    let retained_pointer =
+        build_pointer_stream_item(retained_pointer_id, now, &table_name, item_stream.clone());
+    let deleted_item =
+        build_item_stream_item(deleted_id, old_created_at, item_stream.clone(), &item);
+    let retained_item = build_item_stream_item(
+        retained_pointer_id,
+        old_created_at,
+        item_stream.clone(),
+        &item,
+    );
+    let latest_item = build_item_stream_item(latest_id, now, item_stream.clone(), &item);
+
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &deleted_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, deleted_id).await;
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &retained_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, retained_pointer_id).await;
+    insert_stream_item(&provider, &item_stream, &deleted_item).await;
+    insert_stream_item(&provider, &item_stream, &retained_item).await;
+    insert_stream_item(&provider, &item_stream, &latest_item).await;
+    write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        table_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![retained_pointer_id]
+    );
+
+    let item_page = StreamProvider::read_forward(&provider, item_stream.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        item_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![retained_pointer_id, latest_id]
+    );
+}
+
+#[tokio::test]
+async fn custom_table_duration_updates_cover_shrink_expansion_and_forever() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationUpdates");
+    create_custom_duration_stream_table(
+        &provider,
+        table_name.clone(),
+        StreamRetentionDuration::FiniteHours(3),
+        StreamRetentionDuration::FiniteHours(3),
+    )
+    .await;
+
+    provider
+        .update_table(update_table_duration_request(
+            table_name.clone(),
+            StreamRetentionDuration::FiniteHours(1),
+        ))
+        .await
+        .expect("shrink table duration");
+    let table_info = provider
+        .get_table_info(&table_name)
+        .await
+        .expect("table info");
+    assert_eq!(
+        table_info.table_stream_duration,
+        StreamRetentionDuration::FiniteHours(1)
+    );
+    let shrink_markers = StorageProvider::list_due_stream_trim_markers(
+        &provider,
+        TimestampMillis::now() + constants::MILLIS_PER_HOUR,
+        10,
+    )
+    .await
+    .expect("shrink markers");
+    assert!(shrink_markers.iter().any(|marker| {
+        marker.scope.table_name == table_name
+            && marker.scope.kind == storage_provider::StreamTrimScopeKind::Table
+    }));
+
+    provider
+        .update_table(update_table_duration_request(
+            table_name.clone(),
+            StreamRetentionDuration::FiniteHours(4),
+        ))
+        .await
+        .expect("expand table duration");
+    let table_info = provider
+        .get_table_info(&table_name)
+        .await
+        .expect("table info");
+    assert_eq!(
+        table_info.table_stream_duration,
+        StreamRetentionDuration::FiniteHours(4)
+    );
+
+    provider
+        .update_table(update_table_duration_request(
+            table_name.clone(),
+            StreamRetentionDuration::Forever,
+        ))
+        .await
+        .expect("set table duration forever");
+    let table_info = provider
+        .get_table_info(&table_name)
+        .await
+        .expect("table info");
+    assert_eq!(
+        table_info.table_stream_duration,
+        StreamRetentionDuration::Forever
+    );
+}
+
+#[tokio::test]
+async fn custom_forever_table_trim_marker_does_not_delete_stream_rows() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationForeverTrim");
+    create_custom_duration_stream_table(
+        &provider,
+        table_name.clone(),
+        StreamRetentionDuration::FiniteHours(1),
+        StreamRetentionDuration::FiniteHours(1),
+    )
+    .await;
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let now = TimestampMillis::now();
+    let old_id = stream_id_from_u64(90);
+    let old_pointer = build_pointer_stream_item(
+        old_id,
+        now - (2 * constants::MILLIS_PER_HOUR),
+        &table_name,
+        item_stream.clone(),
+    );
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &old_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, old_id).await;
+
+    let scope = StreamTrimScope::table(format!("kv-table:{table_name}"), table_name.clone());
+    let marker = StreamTrimDueMarker::new(now - constants::MILLIS_PER_HOUR, scope.clone(), 1);
+    provider
+        .write_stream_trim_state_with_marker(StreamTrimStateWrite {
+            state: StreamTrimState {
+                scope,
+                policy_version: 1,
+                retention: StreamRetentionDuration::Forever,
+                effective_retention: StreamRetentionDuration::Forever,
+                next_due_at: None,
+                oldest_retained_version: None,
+                oldest_retained_timestamp: None,
+                latest_version: None,
+                latest_timestamp: None,
+                updated_at: now,
+            },
+            next_marker: Some(marker),
+        })
+        .await
+        .expect("write forever marker");
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(table_page.items.len(), 1);
+    assert_eq!(table_page.items[0].id, old_id);
+
+    let markers = StorageProvider::list_due_stream_trim_markers(&provider, now, 10)
+        .await
+        .expect("markers after forever trim");
+    assert!(
+        !markers
+            .iter()
+            .any(|marker| marker.scope.table_name == table_name)
+    );
+}
+
+#[tokio::test]
+async fn custom_table_trim_respects_protected_replication_boundary() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationProtectedTrim");
+    create_custom_duration_stream_table(
+        &provider,
+        table_name.clone(),
+        StreamRetentionDuration::FiniteHours(1),
+        StreamRetentionDuration::FiniteHours(1),
+    )
+    .await;
+    create_test_table(&provider, &TableName::new("sys_storage_replication"), false).await;
+
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let now = TimestampMillis::now();
+    let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+    let old_id = stream_id_from_u64(100);
+    let protected_id = stream_id_from_u64(101);
+    let old_pointer =
+        build_pointer_stream_item(old_id, old_created_at, &table_name, item_stream.clone());
+    let protected_pointer = build_pointer_stream_item(
+        protected_id,
+        old_created_at,
+        &table_name,
+        item_stream.clone(),
+    );
+
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &old_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, old_id).await;
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &protected_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, protected_id).await;
+    write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
+
+    provider
+        .put_item(
+            TableName::new("sys_storage_replication"),
+            HashMap::from([
+                (
+                    "pk".to_string(),
+                    AttributeValue::S("catchup#learner-custom".to_string()),
+                ),
+                ("sk".to_string(), AttributeValue::S("session".to_string())),
+                (
+                    "payload".to_string(),
+                    AttributeValue::S(
+                        serde_json::json!({
+                            "protected_stream_cursor": protected_id,
+                            "updated_at": TimestampMillis::now(),
+                        })
+                        .to_string(),
+                    ),
+                ),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        table_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![protected_id]
+    );
+}
+
+#[cfg(feature = "foundationdb-backend")]
+#[tokio::test]
+#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
+async fn foundationdb_custom_duration_trim_uses_range_clear_and_bounds_item_cleanup() {
+    use std::time::Duration;
+
+    use uuid::Uuid;
+
+    let _guard = foundationdb_live_test_guard().await;
+    if !foundationdb_live_port_available().await {
+        eprintln!("Skipping FoundationDB custom duration trim test: 127.0.0.1:4689 is unavailable");
+        return;
+    }
+    let store =
+        match crate::FoundationDbKvStore::connect(crate::backends::fdb::FoundationDbConfig {
+            subspace_prefix: Some(format!("tests/kv/{}/", Uuid::now_v7()).into_bytes()),
+            ..Default::default()
+        }) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("Skipping FoundationDB custom duration trim test: {error}");
+                return;
+            }
+        };
+    let provider = SortedKvDbStorageProvider::new(store);
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        provider.initialize_storage().await.unwrap();
+        provider.initialize_stream().await.unwrap();
+
+        let table_name = TableName::new("FdbCustomDurationTrim");
+        let mut create = CreateTableRequest::new(
+            table_name.clone(),
+            vec![
+                AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: KeyAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "sk".to_string(),
+                    attribute_type: KeyAttributeType::S,
+                },
+            ],
+            vec![key_schema_pk(), key_schema_sk()],
+            storage_types::BillingMode::PayPerRequest,
+        )
+        .with_stream_specification(Some(storage_types::StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+        }));
+        create.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(1));
+        create.aux_default_item_stream_duration_hours =
+            Some(StreamRetentionDuration::FiniteHours(1));
+        provider.create_table(&create).await.expect("create");
+
+        let item_key = ItemKey::table_key(
+            table_name.clone(),
+            AttributeValue::S("pk1".to_string()),
+            Some(AttributeValue::S("sk1".to_string())),
+        );
+        let item_stream =
+            StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+        let item = stream_test_item("pk1", "sk1");
+        let now = TimestampMillis::now();
+        let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+        let deleted_id = stream_id_from_u64(70);
+        let retained_pointer_id = stream_id_from_u64(71);
+        let latest_id = stream_id_from_u64(72);
+
+        let deleted_pointer =
+            build_pointer_stream_item(deleted_id, old_created_at, &table_name, item_stream.clone());
+        let retained_pointer =
+            build_pointer_stream_item(retained_pointer_id, now, &table_name, item_stream.clone());
+        let deleted_item =
+            build_item_stream_item(deleted_id, old_created_at, item_stream.clone(), &item);
+        let retained_item = build_item_stream_item(
+            retained_pointer_id,
+            old_created_at,
+            item_stream.clone(),
+            &item,
+        );
+        let latest_item = build_item_stream_item(latest_id, now, item_stream.clone(), &item);
+
+        insert_stream_item(
+            &provider,
+            &StreamName::table_stream(&table_name),
+            &deleted_pointer,
+        )
+        .await;
+        insert_stream_pointer_index(&provider, &table_name, &item_stream, deleted_id).await;
+        insert_stream_item(
+            &provider,
+            &StreamName::table_stream(&table_name),
+            &retained_pointer,
+        )
+        .await;
+        insert_stream_pointer_index(&provider, &table_name, &item_stream, retained_pointer_id)
+            .await;
+        insert_stream_item(&provider, &item_stream, &deleted_item).await;
+        insert_stream_item(&provider, &item_stream, &retained_item).await;
+        insert_stream_item(&provider, &item_stream, &latest_item).await;
+        write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
+
+        crate::backends::fdb::foundationdb_operation_metrics_reset();
+        let trim_provider = provider.clone();
+        let write_provider = provider.clone();
+        let write_table = table_name.clone();
+        let (trim_result, write_result) = tokio::join!(
+            async move { trim_provider.run_job(storage_common::STREAM_TRIM_JOB).await },
+            async move {
+                write_provider
+                    .put_item(
+                        write_table,
+                        stream_test_item("pk2", "sk1"),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        );
+        trim_result.unwrap();
+        write_result.unwrap();
+        let metrics = crate::backends::fdb::foundationdb_operation_metrics_snapshot();
+        assert!(
+            fdb_operation_metric(&metrics, "transact_write_unchecked", "range_clear") >= 1,
+            "custom duration trim should use a FoundationDB range clear\n{metrics}"
+        );
+
+        let table_page = StreamProvider::read_forward(
+            &provider,
+            StreamName::table_stream(&table_name),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let table_ids = table_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(table_ids.len(), 2);
+        assert_eq!(table_ids[0], retained_pointer_id);
+        assert!(
+            table_ids[1] > retained_pointer_id,
+            "custom duration trim must not delete a concurrent table-stream write"
+        );
+
+        let item_page = StreamProvider::read_forward(&provider, item_stream.clone(), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            item_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![retained_pointer_id, latest_id]
+        );
+    })
+    .await;
+    if result.is_err() {
+        eprintln!("Skipping FoundationDB custom duration trim test: timed out");
+    }
+}
+
+#[cfg(feature = "foundationdb-backend")]
+fn fdb_operation_metric(metrics: &str, path: &str, operation: &str) -> u64 {
+    let needle = format!("path=\"{path}\",operation=\"{operation}\"");
+    metrics
+        .lines()
+        .find(|line| line.contains(&needle))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[tokio::test]
@@ -7117,6 +7968,7 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
+                        aux_item_stream_ttl_hours: None,
                     }),
                     ..Default::default()
                 },
@@ -7142,6 +7994,7 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
                             AttributeValue::S("after-update".to_string()),
                         )])),
                         return_values_on_condition_check_failure: None,
+                        aux_item_stream_ttl_hours: None,
                     }),
                     ..Default::default()
                 },
@@ -7160,6 +8013,7 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
+                        aux_item_stream_ttl_hours: None,
                     }),
                     ..Default::default()
                 },

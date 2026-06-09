@@ -99,7 +99,8 @@ fn load_gsi_table_infos(
             .prepare(
                 "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                  key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                 stream_specification FROM tables WHERE table_name = ?1 AND \
+                 stream_specification, deletion_protection_enabled, table_stream_duration_hours, \
+                 default_item_stream_duration_hours FROM tables WHERE table_name = ?1 AND \
                  global_secondary_indexes IS NOT NULL ORDER BY table_name",
             )
             .map_err(map_sqlite_error)?;
@@ -113,8 +114,9 @@ fn load_gsi_table_infos(
             .prepare(
                 "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                  key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                 stream_specification FROM tables WHERE global_secondary_indexes IS NOT NULL \
-                 ORDER BY table_name",
+                 stream_specification, deletion_protection_enabled, table_stream_duration_hours, \
+                 default_item_stream_duration_hours FROM tables WHERE global_secondary_indexes IS \
+                 NOT NULL ORDER BY table_name",
             )
             .map_err(map_sqlite_error)?;
         let rows = stmt

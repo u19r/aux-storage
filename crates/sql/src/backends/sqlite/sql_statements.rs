@@ -4,8 +4,8 @@ use core::str;
 
 use queue_provider::{MessageId, ReceiptHandle};
 use storage_types::{
-    DurationSeconds, IndexName, StreamItemId, StreamName, TableName, TableStatus, TimestampMillis,
-    UserStreamName,
+    DurationSeconds, IndexName, StreamItemId, StreamName, StreamRetentionDuration, TableName,
+    TableStatus, TimestampMillis, UserStreamName,
 };
 use stream_provider::{CursorName, ReadDirection, StreamDataType};
 
@@ -23,6 +23,22 @@ pub fn create_tables_table() -> (&'static str, impl rusqlite::Params) {
 pub fn add_deletion_protection_column() -> (&'static str, impl rusqlite::Params) {
     (
         metadata::add_deletion_protection_column(&SqliteDialect).sql,
+        (),
+    )
+}
+
+#[must_use]
+pub fn add_table_stream_duration_column() -> (&'static str, impl rusqlite::Params) {
+    (
+        metadata::add_table_stream_duration_column(&SqliteDialect).sql,
+        (),
+    )
+}
+
+#[must_use]
+pub fn add_default_item_stream_duration_column() -> (&'static str, impl rusqlite::Params) {
+    (
+        metadata::add_default_item_stream_duration_column(&SqliteDialect).sql,
         (),
     )
 }
@@ -168,8 +184,12 @@ pub fn insert_table(
     global_secondary_indexes: Option<&str>,
     stream_specification: Option<&str>,
     deletion_protection_enabled: bool,
+    table_stream_duration: StreamRetentionDuration,
+    default_item_stream_duration: StreamRetentionDuration,
 ) -> (&'static str, impl rusqlite::Params) {
     let table_id = table_id.to_string();
+    let table_stream_duration_hours = table_stream_duration.as_hours_wire_value();
+    let default_item_stream_duration_hours = default_item_stream_duration.as_hours_wire_value();
     (
         metadata::insert_table(
             &SqliteDialect,
@@ -181,6 +201,8 @@ pub fn insert_table(
             global_secondary_indexes.map(str::to_owned),
             stream_specification.map(str::to_owned),
             deletion_protection_enabled,
+            table_stream_duration_hours,
+            default_item_stream_duration_hours,
         )
         .sql,
         (
@@ -199,6 +221,8 @@ pub fn insert_table(
             } else {
                 0i64
             },
+            table_stream_duration_hours,
+            default_item_stream_duration_hours,
         ),
     )
 }
@@ -234,6 +258,30 @@ pub fn update_deletion_protection(
             } else {
                 0i64
             },
+            table_name.as_ref(),
+        ),
+    )
+}
+
+#[must_use]
+pub fn update_stream_durations(
+    table_name: &TableName,
+    table_stream_duration: StreamRetentionDuration,
+    default_item_stream_duration: StreamRetentionDuration,
+) -> (&'static str, impl rusqlite::Params) {
+    let table_stream_duration_hours = table_stream_duration.as_hours_wire_value();
+    let default_item_stream_duration_hours = default_item_stream_duration.as_hours_wire_value();
+    (
+        metadata::update_stream_durations(
+            &SqliteDialect,
+            table_stream_duration_hours,
+            default_item_stream_duration_hours,
+            table_name.as_ref(),
+        )
+        .sql,
+        (
+            table_stream_duration_hours,
+            default_item_stream_duration_hours,
             table_name.as_ref(),
         ),
     )

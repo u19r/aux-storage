@@ -471,6 +471,7 @@ impl SQLiteStorageProvider {
                         put_request: None,
                         delete_request: Some(DeleteRequest {
                             key: key_map.into(),
+                            aux_item_stream_ttl_hours: None,
                         }),
                     });
                     last_processed_watermark = Some(row.ttl_value);

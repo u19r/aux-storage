@@ -1309,6 +1309,7 @@ pub struct GsiUpdateJob {
 
 impl GsiUpdateJob {
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn new(provider: std::sync::Arc<SQLiteStorageProvider>) -> Self {
         Self::new_with_interval(
             provider,

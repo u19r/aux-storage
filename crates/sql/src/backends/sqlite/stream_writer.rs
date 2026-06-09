@@ -8,7 +8,9 @@ use storage_types::{
 use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
 use uuid::Uuid;
 
-use crate::{error_handler::map_sqlite_error, sql_statements, utils::SqliteConn};
+use crate::{
+    SQLiteStorageProvider, error_handler::map_sqlite_error, sql_statements, utils::SqliteConn,
+};
 
 const STREAM_EMBEDDED_MAX_BYTES: usize = 1024;
 
@@ -118,14 +120,14 @@ pub fn write_stream_entries(
             });
         }
         StoredStreamPointer::embedded(
-            item_stream,
+            item_stream.clone(),
             table_info.table_name.clone(),
             item_stream_version,
             items,
         )
     } else {
         StoredStreamPointer::pointer(
-            item_stream,
+            item_stream.clone(),
             table_info.table_name.clone(),
             item_stream_version,
         )
@@ -138,8 +140,12 @@ pub fn write_stream_entries(
 
     let pointer_data = storage_types::storage_serde::to_bytes(&stored_pointer)?;
 
-    for stream_name in [table_stream_name, system_stream_name] {
-        let pointer_stream_item_id = Uuid::now_v7().into();
+    let table_pointer_stream_item_id = Uuid::now_v7().into();
+    let system_pointer_stream_item_id = Uuid::now_v7().into();
+    for (stream_name, pointer_stream_item_id) in [
+        (table_stream_name, table_pointer_stream_item_id),
+        (system_stream_name, system_pointer_stream_item_id),
+    ] {
         let pointer_data = pointer_data.clone();
         let (sql, params) = sql_statements::insert_stream_entry(
             &stream_name,
@@ -161,6 +167,15 @@ pub fn write_stream_entries(
             map_sqlite_error(err)
         })?;
     }
+    SQLiteStorageProvider::insert_stream_pointer_index_tx(
+        sqlite,
+        &table_info.table_name,
+        &item_stream,
+        item_stream_version,
+        table_pointer_stream_item_id,
+        system_pointer_stream_item_id,
+        created_at,
+    )?;
 
     Ok(())
 }
@@ -252,14 +267,14 @@ pub fn write_stream_entries_wire(
             });
         }
         StoredStreamPointer::embedded(
-            item_stream,
+            item_stream.clone(),
             table_info.table_name.clone(),
             item_stream_version,
             items,
         )
     } else {
         StoredStreamPointer::pointer(
-            item_stream,
+            item_stream.clone(),
             table_info.table_name.clone(),
             item_stream_version,
         )
@@ -272,8 +287,12 @@ pub fn write_stream_entries_wire(
 
     let pointer_data = storage_types::storage_serde::to_bytes(&stored_pointer)?;
 
-    for stream_name in [table_stream_name, system_stream_name] {
-        let pointer_stream_item_id = Uuid::now_v7().into();
+    let table_pointer_stream_item_id = Uuid::now_v7().into();
+    let system_pointer_stream_item_id = Uuid::now_v7().into();
+    for (stream_name, pointer_stream_item_id) in [
+        (table_stream_name, table_pointer_stream_item_id),
+        (system_stream_name, system_pointer_stream_item_id),
+    ] {
         let pointer_data = pointer_data.clone();
         let (sql, params) = sql_statements::insert_stream_entry(
             &stream_name,
@@ -293,6 +312,15 @@ pub fn write_stream_entries_wire(
             map_sqlite_error(err)
         })?;
     }
+    SQLiteStorageProvider::insert_stream_pointer_index_tx(
+        sqlite,
+        &table_info.table_name,
+        &item_stream,
+        item_stream_version,
+        table_pointer_stream_item_id,
+        system_pointer_stream_item_id,
+        created_at,
+    )?;
 
     Ok(())
 }

@@ -39,6 +39,7 @@ const PUT_ITEM_FIELDS: &[&str] = &[
     "ReturnConsumedCapacity",
     "ReturnItemCollectionMetrics",
     "ReturnValuesOnConditionCheckFailure",
+    "AuxItemStreamTtlHours",
 ];
 const GET_ITEM_FIELDS: &[&str] = &[
     "TableName",
@@ -61,6 +62,7 @@ const DELETE_ITEM_FIELDS: &[&str] = &[
     "ReturnConsumedCapacity",
     "ReturnItemCollectionMetrics",
     "ReturnValuesOnConditionCheckFailure",
+    "AuxItemStreamTtlHours",
 ];
 const UPDATE_ITEM_FIELDS: &[&str] = &[
     "TableName",
@@ -76,6 +78,7 @@ const UPDATE_ITEM_FIELDS: &[&str] = &[
     "ReturnConsumedCapacity",
     "ReturnItemCollectionMetrics",
     "ReturnValuesOnConditionCheckFailure",
+    "AuxItemStreamTtlHours",
 ];
 const QUERY_FIELDS: &[&str] = &[
     "TableName",

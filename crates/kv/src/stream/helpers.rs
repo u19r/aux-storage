@@ -73,6 +73,12 @@ pub fn create_item_update_stream_entries_wire_encoded(
     let table_stream_prefix = stream_name_prefix(&StreamName::table_stream(table_name));
     let table_item_stream_name = StreamName::table_item_stream(table_name, item_key)?;
     let item_stream_prefix = stream_name_prefix(&table_item_stream_name);
+    let pointer_index_prefix = crate::storage_ops::stream_duration::stream_pointer_item_prefix(
+        table_name,
+        &table_item_stream_name,
+    );
+    let table_pointer_index_prefix =
+        crate::storage_ops::stream_duration::stream_pointer_table_prefix(table_name);
 
     let created_at = TimestampMillis::now();
     let stored_pointer = if should_embed_stream_items(item_bytes, old_item_bytes) {
@@ -148,8 +154,16 @@ pub fn create_item_update_stream_entries_wire_encoded(
             pointer_bytes,
         ),
         (
-            KeyTemplate::placeholder(item_stream_prefix, Vec::new(), binding),
+            KeyTemplate::placeholder(item_stream_prefix, Vec::new(), binding.clone()),
             stream_bytes,
+        ),
+        (
+            KeyTemplate::placeholder(pointer_index_prefix, Vec::new(), binding.clone()),
+            Vec::new(),
+        ),
+        (
+            KeyTemplate::placeholder(table_pointer_index_prefix, Vec::new(), binding),
+            Vec::new(),
         ),
     ])
 }

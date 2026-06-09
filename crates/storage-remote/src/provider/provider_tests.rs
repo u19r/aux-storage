@@ -107,6 +107,28 @@ fn suppresses_describe_table_not_found_warnings() {
 }
 
 #[test]
+fn suppresses_conditional_check_failed_warnings_for_all_operations() {
+    let error = StorageError::Base(StorageEnum::ConditionalCheckFailed);
+    assert!(RemoteStorageProvider::should_suppress_operation_warning(
+        "PutItem", &error
+    ));
+    assert!(RemoteStorageProvider::is_normal_operation_error(&error));
+}
+
+#[test]
+fn treats_conditional_check_failed_with_item_as_normal_operation_error() {
+    let error = StorageError::Base(StorageEnum::ConditionalCheckFailedWithItem {
+        item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]).into(),
+    });
+
+    assert!(RemoteStorageProvider::should_suppress_operation_warning(
+        "UpdateItem",
+        &error
+    ));
+    assert!(RemoteStorageProvider::is_normal_operation_error(&error));
+}
+
+#[test]
 fn retries_expected_point_in_time_recovery_errors() {
     let pitr_unavailable = StorageError::Base(StorageEnum::AwsService {
         code: Some("ContinuousBackupsUnavailableException".to_string()),
@@ -125,6 +147,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
     tally.record_write_request(&storage_types::WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
     });
@@ -133,6 +156,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
         delete_request: Some(storage_types::DeleteRequest {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#2".to_string()))])
                 .into(),
+            aux_item_stream_ttl_hours: None,
         }),
     });
 
@@ -153,6 +177,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(storage_types::TransactUpdateRequest {
             table_name: TableName::new("tenant_t1"),
@@ -169,6 +194,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
                 AttributeValue::S("next".to_string()),
             )])),
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(storage_types::TransactDeleteRequest {
             table_name: TableName::new("tenant_t1"),
@@ -178,6 +204,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: Some(storage_types::TransactConditionCheckRequest {
             table_name: TableName::new("tenant_t1"),

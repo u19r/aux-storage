@@ -26,6 +26,7 @@ impl PostgresStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             ..
         } = request;
 
@@ -99,6 +100,7 @@ impl PostgresStorageProvider {
                         &table_info,
                         updated_item.clone(),
                         old_item_for_write.as_ref(),
+                        aux_item_stream_ttl_hours,
                     )
                     .await?;
                     self.record_transaction_phase(

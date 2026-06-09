@@ -28,6 +28,8 @@ pub struct EncodeWriteRequest {
 pub struct EncodePutRequest {
     #[builder(setter(!strip_option))]
     pub item: WireItem,
+    #[builder(default, setter(strip_option))]
+    pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
 
 impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
@@ -41,6 +43,7 @@ impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
                 let put_request = match write_request.put_request {
                     Some(put_request) => Some(PutRequest {
                         item: put_request.item.into_attribute_map()?,
+                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     }),
                     None => None,
                 };
@@ -72,6 +75,7 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
                 let put_request = match write_request.put_request {
                     Some(put_request) => Some(EncodePutRequest {
                         item: WireItem::from_attribute_map(&put_request.item)?,
+                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     }),
                     None => None,
                 };
@@ -122,6 +126,7 @@ pub struct TransactEncodePutRequest {
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub return_values_on_condition_check_failure: Option<String>,
+    pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
 
 impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
@@ -139,6 +144,7 @@ impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
                     expression_attribute_values: put_request.expression_attribute_values,
                     return_values_on_condition_check_failure: put_request
                         .return_values_on_condition_check_failure,
+                    aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                 }),
                 None => None,
             };

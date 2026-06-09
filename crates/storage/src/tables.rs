@@ -372,6 +372,8 @@ async fn ensure_table_stream_enabled(
         sse_specification: None,
         stream_specification: Some(system_table_stream_specification()),
         table_class: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
     })
     .await?;
     wait_for_table_active(db, table_name).await?;
@@ -404,6 +406,8 @@ async fn ensure_raw_table_stream_enabled(
             sse_specification: None,
             stream_specification: Some(system_table_stream_specification()),
             table_class: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
         })
         .await?;
     wait_for_raw_table_active(db, table_name).await?;

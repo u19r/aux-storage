@@ -53,6 +53,6 @@ pub(crate) const UPDATED_AT_NAME_PLACEHOLDER_BASE: &str = "#__updated_at";
 /// `updated_at`.
 pub(crate) const UPDATED_AT_VALUE_PLACEHOLDER_BASE: &str = ":__updated_at";
 
-/// Startup reachability timeout for a local FoundationDB provider.
+/// Startup reachability timeout for a FoundationDB provider.
 #[cfg(feature = "foundationdb")]
-pub const FOUNDATIONDB_STARTUP_REACHABILITY_TIMEOUT_SECS: u64 = 5;
+pub const FOUNDATIONDB_STARTUP_REACHABILITY_TIMEOUT_SECS: u64 = 30;

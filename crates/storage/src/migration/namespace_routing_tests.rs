@@ -1137,6 +1137,7 @@ async fn shared_table_routing_rewrites_partition_assignments_inside_if_not_exist
                 ),
             ])),
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         ..Default::default()
     };

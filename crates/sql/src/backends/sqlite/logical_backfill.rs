@@ -73,8 +73,9 @@ impl SQLiteStorageProvider {
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                          key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification, deletion_protection_enabled FROM tables WHERE \
-                         table_name = ?1 ORDER BY table_name LIMIT ?2",
+                         stream_specification, deletion_protection_enabled, \
+                         table_stream_duration_hours, default_item_stream_duration_hours FROM \
+                         tables WHERE table_name = ?1 ORDER BY table_name LIMIT ?2",
                     )
                     .map_err(map_sqlite_error)?;
                 let rows = stmt
@@ -88,8 +89,9 @@ impl SQLiteStorageProvider {
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
                          key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification, deletion_protection_enabled FROM tables ORDER BY \
-                         table_name LIMIT ?1",
+                         stream_specification, deletion_protection_enabled, \
+                         table_stream_duration_hours, default_item_stream_duration_hours FROM \
+                         tables ORDER BY table_name LIMIT ?1",
                     )
                     .map_err(map_sqlite_error)?;
                 let rows = stmt
@@ -413,6 +415,8 @@ fn table_metadata_record_from_row(
     let item_count: i64 = row.get(8)?;
     let stream_specification: Option<String> = row.get(9)?;
     let deletion_protection_enabled: bool = row.get(10)?;
+    let table_stream_duration_hours: i64 = row.get(11)?;
+    let default_item_stream_duration_hours: i64 = row.get(12)?;
     let payload_json = serde_json::json!({
         "id": id,
         "table_name": table_name,
@@ -425,6 +429,8 @@ fn table_metadata_record_from_row(
         "item_count": item_count,
         "stream_specification": stream_specification,
         "deletion_protection_enabled": deletion_protection_enabled,
+        "table_stream_duration_hours": table_stream_duration_hours,
+        "default_item_stream_duration_hours": default_item_stream_duration_hours,
     })
     .to_string();
     Ok(LogicalBackfillRecord::DomainRecord {

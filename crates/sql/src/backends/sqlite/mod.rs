@@ -28,6 +28,9 @@ pub(crate) mod put_item_impl;
 pub(crate) mod queue_provider;
 pub(crate) mod sql_statements;
 pub(crate) mod storage_provider;
+pub(crate) mod stream_duration;
+#[cfg(test)]
+mod stream_duration_tests;
 pub(crate) mod stream_provider;
 pub(crate) mod stream_trim;
 pub(crate) mod stream_writer;

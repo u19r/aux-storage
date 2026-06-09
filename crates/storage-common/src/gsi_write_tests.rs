@@ -52,6 +52,8 @@ fn table_info(projection: Projection) -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

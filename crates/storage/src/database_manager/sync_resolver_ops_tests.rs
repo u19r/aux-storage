@@ -35,6 +35,7 @@ async fn sync_resolver_resolves_put_item_without_writing() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -91,6 +92,7 @@ async fn sync_resolver_uses_durable_item_revision_for_target_version() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -135,6 +137,7 @@ async fn sync_resolver_reuses_condition_expression_semantics() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -162,6 +165,7 @@ async fn sync_resolver_batch_write_uses_overlay_for_later_operations() {
                         WriteRequest {
                             put_request: Some(PutRequest {
                                 item: item("item#1", "open"),
+                                aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
                         },
@@ -173,6 +177,7 @@ async fn sync_resolver_batch_write_uses_overlay_for_later_operations() {
                                     AttributeValue::S("item#1".to_string()),
                                 )])
                                 .into(),
+                                aux_item_stream_ttl_hours: None,
                             }),
                         },
                     ],

@@ -414,6 +414,11 @@ pub(crate) fn sql_row_to_stored_stable_info(
             .map(|ss| serde_json::from_str(&ss))
             .transpose()
             .map_err(rusqlite_type_err)?,
+        table_stream_duration: stream_duration_from_row(row, "table_stream_duration_hours")?,
+        default_item_stream_duration: stream_duration_from_row(
+            row,
+            "default_item_stream_duration_hours",
+        )?,
         deletion_protection_enabled: row.get("deletion_protection_enabled")?,
     })
 }
@@ -425,6 +430,16 @@ pub(crate) fn rusqlite_type_err(e: serde_json::Error) -> rusqlite::Error {
 fn row_non_negative_u64(row: &rusqlite::Row, column: &str) -> rusqlite::Result<u64> {
     let value: i64 = row.get(column)?;
     u64::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(err))
+    })
+}
+
+fn stream_duration_from_row(
+    row: &rusqlite::Row,
+    column: &str,
+) -> rusqlite::Result<storage_types::StreamRetentionDuration> {
+    let value: i64 = row.get(column)?;
+    storage_types::StreamRetentionDuration::try_from(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(err))
     })
 }

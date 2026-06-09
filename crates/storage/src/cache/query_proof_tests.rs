@@ -136,6 +136,8 @@ fn base_table_info(table_name: &TableName) -> storage_types::StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }
@@ -1457,6 +1459,7 @@ async fn transact_write_items_encode_put_refreshes_previously_empty_gsi_query_pr
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -1858,6 +1861,7 @@ async fn database_manager_update_rewrites_gsi_sort_order_after_refresh() {
             AttributeValue::S("001".to_string()),
         )])),
         return_values: None,
+        aux_item_stream_ttl_hours: None,
     })
     .await
     .expect("rewrite gsi sort key");
@@ -1922,6 +1926,7 @@ async fn database_manager_batch_write_moves_gsi_membership_without_invalidating_
             vec![WriteRequest {
                 put_request: Some(PutRequest {
                     item: gsi_item("item#0", "sk#1", "team#2", "001", "moved"),
+                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -2012,6 +2017,7 @@ async fn database_manager_batch_write_encode_moves_gsi_membership_without_invali
                         "item#0", "sk#1", "team#2", "001", "moved",
                     ))
                     .expect("encode put item"),
+                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -2102,6 +2108,7 @@ async fn database_manager_transact_update_rewrites_gsi_sort_order_without_invali
                     AttributeValue::S("001".to_string()),
                 )])),
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             delete: None,
             condition_check: None,
@@ -2188,6 +2195,7 @@ async fn database_manager_transact_write_items_encode_put_moves_gsi_membership_w
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             update: None,
             delete: None,

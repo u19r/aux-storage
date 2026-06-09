@@ -40,6 +40,7 @@ whether a metric has been observed since process start.
 | TTL sweep                                         | Counter, histogram                  | `ttl.sweep.items.deleted`, `ttl.sweep.runtime.ms`, `ttl.sweep.tables.checked`, `ttl.sweep.shards.checked`, `ttl.sweep.retry.batches`, `ttl.sweep.retry.attempts`, `ttl.sweep.retry.failures`, `ttl.sweep.throttled.count`, `ttl.sweep.expired.lock.found.count`                                                                                                                                                                                     | Bounded job/table scope labels are used by the sweep implementations.                                                                                                                                             |
 | Stream TTL cleanup                                | Counter, histogram                  | `stream.ttl.cleanup.items.deleted.total`, `stream.ttl.cleanup.runtime.ms`, `stream.ttl.cleanup.runs.total`, `stream.ttl.cleanup.streams.scanned.total`                                                                                                                                                                                                                                                                                              | No labels.                                                                                                                                                                                                        |
 | Stream trim                                       | Counter, histogram                  | `stream.trim.runtime.ms`, `stream.trim.pages.scanned`, `stream.trim.items.scanned`, `stream.trim.groups.deleted`, `stream.trim.delete.batches`, `stream.trim.groups.protected.by.replication`, `stream.trim.decode.failures`                                                                                                                                                                                                                        | No labels.                                                                                                                                                                                                        |
+| Custom stream duration trim                       | Counter, histogram                  | Shared stream-trim metrics plus worker stats for due markers scanned, stale markers skipped, forever scopes skipped, protected markers, rows deleted, state writes, runtime, and marker page fullness. Manual provider profile counters include `custom_stream_duration_rows_deleted`, `custom_stream_duration_range_deletes`, and `custom_stream_duration_point_deletes`.                                                                                  | Runtime metrics avoid table, item key, tenant, or stream-name labels. Manual profile counters are local test/process counters and are not exported as tenant-specific metrics.                                   |
 | Background job manager                            | Counter, gauge, histogram           | `bg.jobs.runs.total`, `bg.jobs.run.errors.total`, `bg.jobs.lock.skips.total`, `bg.jobs.running.count`, `bg.jobs.run.duration.ms`                                                                                                                                                                                                                                                                                                                    | `job_id` is a bounded registered background job name.                                                                                                                                                             |
 | Background queue worker                           | Counter, histogram                  | `bg.worker.items.processed.total`, `bg.worker.lease.conflicts.total`, `bg.worker.process.errors.total`, `bg.worker.run.errors.total`, `bg.worker.run.once.ms`                                                                                                                                                                                                                                                                                       | `worker_id` is configured and should remain low-cardinality.                                                                                                                                                      |
 | Immediate job queue                               | Counter, histogram                  | `jobs.immediate.empty.receives.total`, `jobs.immediate.queue.message.delay.ms`                                                                                                                                                                                                                                                                                                                                                                      | `runner` is bounded, currently `local`.                                                                                                                                                                           |
@@ -58,6 +59,45 @@ service or backend that emits it. Prefer lowercase dot-separated domains and
 explicit unit suffixes such as `.ms`, `.micros.total`, or `.bytes.total`. Avoid
 labels that can contain unbounded user data, tenant data, credentials, tokens,
 raw key material, or payload contents.
+
+## Custom Stream Duration
+
+Custom stream duration cleanup is deliberately allowed to lag. Under load, TTL
+cleanup and stream horizon trim should do bounded work and yield rather than
+trying to synchronously drain every due marker. A healthy overloaded service can
+therefore have old due markers for hours as long as the backlog is moving when
+background capacity is available and protected boundaries explain blocked
+markers.
+
+Operator interpretation:
+
+- `marker_page_full` or a consistently full due-marker page means the trim job is
+  behind; increase background capacity only after storage write pressure is
+  healthy.
+- stale marker skips are expected after table duration or item policy changes,
+  but a growing stale-only backlog indicates marker cleanup is not completing.
+- protected markers mean replication, backfill, or another retained-history
+  workflow still needs stream rows. Do not force-delete those rows; fix or
+  expire the owning protected boundary.
+- rows deleted with low runtime and future-dated next markers means the job is
+  making bounded progress.
+- range-delete counts should appear on KV backends that support safe range
+  deletion; point-delete counts appear for pointer indexes and bounded fallback
+  paths.
+
+Runbook checks for a stuck custom-duration backlog:
+
+1. Confirm the background job manager is running and not repeatedly reporting
+   lock skips or run errors for the stream trim job.
+2. Check whether the due marker page is full and whether rows deleted increases
+   across runs.
+3. Check protected-boundary metrics and replication/backfill sessions before
+   changing retention or deleting stream data.
+4. If stale markers dominate, verify that marker completion is succeeding on the
+   backend and that the provider supports custom stream duration.
+5. If range deletes are unavailable or slow, expect bounded point-delete cleanup
+   to lag longer and size background capacity from measured rows-deleted per
+   pass.
 
 ## Alerting Guidance
 

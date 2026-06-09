@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use storage_condition::Condition;
 use storage_provider::BoundUpdateOperation;
-use storage_types::{AttributeValue, KeyAttributes, StorageResult, TableName};
+use storage_types::{
+    AttributeValue, KeyAttributes, StorageResult, StreamRetentionDuration, TableName,
+};
 
 use crate::{
     SQLiteStorageProvider, provider_core::write::plan_update_from_existing_item, utils::SqliteConn,
@@ -16,6 +18,7 @@ impl SQLiteStorageProvider {
         key: &KeyAttributes,
         sqlite: &SqliteConn<'_>,
         immediate_gsi_consistency: bool,
+        item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<(
         HashMap<String, AttributeValue>,
         HashMap<String, AttributeValue>,
@@ -33,6 +36,7 @@ impl SQLiteStorageProvider {
             sqlite,
             immediate_gsi_consistency,
             None,
+            item_stream_ttl_hours,
         )?;
 
         Ok((item_to_update, updated_item))

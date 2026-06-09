@@ -44,6 +44,10 @@ mod key_type;
 pub use key_type::KeyType;
 mod stream_record;
 pub use stream_record::StreamRecord;
+mod stream_duration;
+#[cfg(test)]
+mod stream_duration_tests;
+pub use stream_duration::*;
 mod table_namespace;
 #[cfg(test)]
 mod table_namespace_tests;
@@ -87,6 +91,8 @@ mod stream_key;
 mod stream_key_tests;
 pub use stream_key::*;
 mod stored_table_info;
+#[cfg(test)]
+mod stored_table_info_tests;
 pub use stored_table_info::*;
 mod item_key;
 pub use item_key::{IndexKey, IndexKeyPrefix, ItemKey, ItemKeyError, TableKey};

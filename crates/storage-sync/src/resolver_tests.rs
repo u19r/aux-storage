@@ -16,6 +16,7 @@ fn sync_write_request_names_supported_write_operations() {
         return_consumed_capacity: None,
         return_item_collection_metrics: None,
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     });
     let delete = SyncWriteRequest::DeleteItem(DeleteItemRequest {
         table_name: TableName::new("orders"),
@@ -29,6 +30,7 @@ fn sync_write_request_names_supported_write_operations() {
         return_consumed_capacity: None,
         return_item_collection_metrics: None,
         return_values_on_condition_check_failure: None,
+        aux_item_stream_ttl_hours: None,
     });
 
     assert_eq!(put.operation_name(), "PutItem");
@@ -55,6 +57,7 @@ fn sync_write_proposal_request_carries_operation_and_id() {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
     );
 

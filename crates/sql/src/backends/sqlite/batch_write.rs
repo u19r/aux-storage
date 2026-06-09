@@ -27,6 +27,7 @@ pub(crate) fn execute_prepared_batch_operation(
             key_attributes,
             non_key_attributes,
             full_item,
+            aux_item_stream_ttl_hours,
             ..
         } => {
             let ttl_config = state.ttl_config(sqlite, table_name)?;
@@ -60,12 +61,19 @@ pub(crate) fn execute_prepared_batch_operation(
                 existing_item.as_ref(),
                 Some(full_item),
             )?;
+            SQLiteStorageProvider::apply_item_stream_duration_tx(
+                sqlite,
+                table_info,
+                key_attributes,
+                *aux_item_stream_ttl_hours,
+            )?;
         }
         PreparedBatchOperation::Delete {
             table_name,
             table_info,
             key,
             existing_item,
+            aux_item_stream_ttl_hours,
             ..
         } => {
             let ttl_config = state.ttl_config(sqlite, table_name)?;
@@ -99,6 +107,12 @@ pub(crate) fn execute_prepared_batch_operation(
                 ttl_config.as_ref(),
                 existing_item_ref,
                 None,
+            )?;
+            SQLiteStorageProvider::apply_item_stream_duration_tx(
+                sqlite,
+                table_info,
+                key,
+                *aux_item_stream_ttl_hours,
             )?;
         }
     }

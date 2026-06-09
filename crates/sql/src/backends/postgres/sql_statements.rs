@@ -413,13 +413,40 @@ pub fn add_deletion_protection_column() -> &'static str {
 }
 
 #[must_use]
+pub fn add_table_stream_duration_column() -> &'static str {
+    crate::provider_core::statements::metadata::add_table_stream_duration_column(&PostgresDialect)
+        .sql
+}
+
+#[must_use]
+pub fn add_default_item_stream_duration_column() -> &'static str {
+    crate::provider_core::statements::metadata::add_default_item_stream_duration_column(
+        &PostgresDialect,
+    )
+    .sql
+}
+
+#[must_use]
 pub fn table_exists() -> &'static str {
     metadata::table_exists(&PostgresDialect, "").sql
 }
 
 #[must_use]
 pub fn insert_table_metadata() -> &'static str {
-    metadata::insert_table(&PostgresDialect, "", "", 0, "", "", None, None, false).sql
+    metadata::insert_table(
+        &PostgresDialect,
+        "",
+        "",
+        0,
+        "",
+        "",
+        None,
+        None,
+        false,
+        72,
+        72,
+    )
+    .sql
 }
 
 #[must_use]
@@ -470,6 +497,11 @@ pub fn update_stream_specification() -> &'static str {
 #[must_use]
 pub fn update_deletion_protection() -> &'static str {
     "UPDATE tables SET deletion_protection_enabled = $1 WHERE table_name = $2"
+}
+
+#[must_use]
+pub fn update_stream_durations() -> &'static str {
+    metadata::update_stream_durations(&PostgresDialect, 72, 72, "").sql
 }
 
 #[must_use]

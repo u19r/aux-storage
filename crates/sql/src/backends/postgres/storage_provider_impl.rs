@@ -92,6 +92,36 @@ impl StorageProvider for PostgresStorageProvider {
         true
     }
 
+    fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    async fn write_stream_trim_state(
+        &self,
+        state: storage_provider::StreamTrimState,
+    ) -> StorageResult<()> {
+        let client = self.acquire_client("write_stream_trim_state").await?;
+        Self::write_stream_trim_state_with_client(
+            &client,
+            storage_provider::StreamTrimStateWrite {
+                state,
+                next_marker: None,
+            },
+        )
+        .await
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<storage_provider::StreamTrimDueMarker>> {
+        <Self as storage_provider::StreamDurationTrimBackend>::list_due_stream_trim_markers(
+            self, due_before, limit,
+        )
+        .await
+    }
+
     async fn initialize_storage(&self) -> StorageResult<()> {
         self.do_initialize_storage().await
     }
@@ -204,6 +234,28 @@ impl StorageProvider for PostgresStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
         return_values: Option<AllOld>,
+    ) -> StorageResult<PutItemResponse> {
+        self.put_item_with_stream_ttl(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            None,
+        )
+        .await
+    }
+
+    async fn put_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: HashMap<String, storage_provider::AttributeValue>,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     ) -> StorageResult<PutItemResponse> {
         let _write_permit = self.acquire_foreground_write_permit("put_item").await?;
         apply_gsi_write_pressure(self).await?;
@@ -445,6 +497,13 @@ impl StorageProvider for PostgresStorageProvider {
                         "stream_write",
                         stream_started.elapsed(),
                     );
+                    Self::apply_item_stream_duration_with_client(
+                        &transaction,
+                        &table_info,
+                        &split_item.key_attributes,
+                        aux_item_stream_ttl_hours,
+                    )
+                    .await?;
                     #[cfg(test)]
                     provider_perf::record("postgres", "stream_write", stream_started.elapsed());
                     let commit_started = Instant::now();
@@ -564,6 +623,26 @@ impl StorageProvider for PostgresStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
+        self.delete_item_with_stream_ttl(
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            None,
+        )
+        .await
+    }
+
+    async fn delete_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
         let _write_permit = self.acquire_foreground_write_permit("delete_item").await?;
         apply_gsi_write_pressure(self).await?;
         let key_bytes = attr_map_payload_bytes(&key);
@@ -665,6 +744,13 @@ impl StorageProvider for PostgresStorageProvider {
                             item_stream_version,
                             replication: None,
                         },
+                    )
+                    .await?;
+                    Self::apply_item_stream_duration_with_client(
+                        &transaction,
+                        &table_info,
+                        &key_attributes,
+                        aux_item_stream_ttl_hours,
                     )
                     .await?;
                     transaction.commit().await.map_err(|err| {

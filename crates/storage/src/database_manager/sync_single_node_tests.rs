@@ -32,6 +32,7 @@ async fn single_node_sync_write_persists_log_entry_and_applies_command() {
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
         ))
         .await
@@ -83,6 +84,7 @@ async fn single_node_sync_write_increments_persistent_log_index() {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
     ))
     .await
@@ -102,6 +104,7 @@ async fn single_node_sync_write_increments_persistent_log_index() {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
     ))
     .await
@@ -171,6 +174,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
                 (":old".to_string(), AttributeValue::S("open".to_string())),
             ])),
             return_values: None,
+            aux_item_stream_ttl_hours: None,
         })
         .await
         .expect("update item");
@@ -180,6 +184,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
                 vec![WriteRequest {
                     put_request: Some(PutRequest {
                         item: item("item#2", "batch"),
+                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 }],
@@ -204,6 +209,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: None,
                 }),
                 condition_check: None,
             }],

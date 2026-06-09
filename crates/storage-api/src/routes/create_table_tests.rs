@@ -1,7 +1,9 @@
 #[cfg(test)]
 use serde_json::json;
 use storage::DatabaseManager;
-use storage_types::{CreateTableRequest, StreamViewType, TableName, TableStatus};
+use storage_types::{
+    CreateTableRequest, StreamRetentionDuration, StreamViewType, TableName, TableStatus,
+};
 
 use crate::{
     routes::routes_support_tests::{create_test_db, handle_create_table},
@@ -47,6 +49,56 @@ async fn handle_create_table_success() {
         }
         other => panic!("Expected CreateTable response, got: {other:?}"),
     }
+
+    let table = db
+        .get_table_info(&TableName::new("ValidTable"))
+        .await
+        .expect("table metadata");
+    assert_eq!(
+        table.table_stream_duration,
+        StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
+    );
+    assert_eq!(
+        table.default_item_stream_duration,
+        StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
+    );
+}
+
+#[tokio::test]
+async fn handle_create_table_accepts_custom_stream_duration_fields() {
+    let db = create_test_db_manager().await;
+
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "RouteCreateDuration",
+            "AttributeDefinitions": [
+                {"AttributeName": "id", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "id", "KeyType": "HASH"}
+            ],
+            "AuxStreamDurationHours": 168,
+            "AuxDefaultItemStreamDurationHours": -1
+        })
+        .try_into()
+        .expect("valid create table request"),
+    )
+    .await
+    .expect("create table with custom stream duration");
+
+    let table = db
+        .get_table_info(&TableName::new("RouteCreateDuration"))
+        .await
+        .expect("table metadata");
+    assert_eq!(
+        table.table_stream_duration,
+        StreamRetentionDuration::FiniteHours(168)
+    );
+    assert_eq!(
+        table.default_item_stream_duration,
+        StreamRetentionDuration::Forever
+    );
 }
 
 #[tokio::test]

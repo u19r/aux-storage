@@ -156,6 +156,7 @@ impl ReadPerfFixture {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values: None,
+                aux_item_stream_ttl_hours: None,
             })
             .await
             .expect("seed item");

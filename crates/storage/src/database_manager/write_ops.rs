@@ -34,6 +34,7 @@ struct PreparedPutItem {
     expression_attribute_names: Option<HashMap<String, String>>,
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     return_values: Option<AllOld>,
+    aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     cache_effects: storage_cache::RuntimeWriteEffects,
 }
 
@@ -44,6 +45,7 @@ struct PreparedDeleteItem {
     condition_expression: Option<String>,
     expression_attribute_names: Option<HashMap<String, String>>,
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     cache_effects: storage_cache::RuntimeWriteEffects,
 }
 
@@ -79,6 +81,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
         } = input;
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
@@ -108,6 +111,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
         })
     }
@@ -143,6 +147,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
             ..
         } = prepared;
@@ -158,6 +163,7 @@ impl DatabaseManager {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours,
         };
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
@@ -186,19 +192,21 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
         } = prepared;
-        if let Some(response) = self
-            .try_cached_guarded_put_item(
-                &table_name,
-                &logical_item,
-                cache_effects.clone(),
-                condition_expression.clone(),
-                expression_attribute_names.clone(),
-                expression_attribute_values.clone(),
-                return_values.clone(),
-            )
-            .await?
+        if aux_item_stream_ttl_hours.is_none()
+            && let Some(response) = self
+                .try_cached_guarded_put_item(
+                    &table_name,
+                    &logical_item,
+                    cache_effects.clone(),
+                    condition_expression.clone(),
+                    expression_attribute_names.clone(),
+                    expression_attribute_values.clone(),
+                    return_values.clone(),
+                )
+                .await?
         {
             return Ok(response);
         }
@@ -213,6 +221,7 @@ impl DatabaseManager {
                         expression_attribute_names,
                         expression_attribute_values,
                         return_values,
+                        aux_item_stream_ttl_hours,
                     )
                     .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
@@ -224,6 +233,7 @@ impl DatabaseManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_put_item_payload(
         &self,
         table_name: TableName,
@@ -232,18 +242,20 @@ impl DatabaseManager {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
     ) -> StorageResult<PutItemResponse> {
         match item {
             PutItemPayload::AttributeMap(item) => {
                 record_storage_operation(
                     "put_item",
-                    self.storage.put_item(
+                    self.storage.put_item_with_stream_ttl(
                         table_name,
                         item,
                         condition_expression,
                         expression_attribute_names,
                         expression_attribute_values,
                         return_values,
+                        aux_item_stream_ttl_hours,
                     ),
                 )
                 .await
@@ -251,13 +263,14 @@ impl DatabaseManager {
             PutItemPayload::WireItem(item) => {
                 record_storage_operation(
                     "put_item",
-                    self.storage.put_item_encode(
+                    self.storage.put_item_encode_with_stream_ttl(
                         table_name,
                         *item,
                         condition_expression,
                         expression_attribute_names,
                         expression_attribute_values,
                         return_values,
+                        aux_item_stream_ttl_hours,
                     ),
                 )
                 .await
@@ -276,6 +289,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
             ..
         } = prepared;
@@ -305,6 +319,11 @@ impl DatabaseManager {
         )?;
         let mut routed_return_values =
             WriteTargetSet::new(target_count, return_values, "put_item.return_values")?;
+        let mut routed_aux_item_stream_ttl_hours = WriteTargetSet::new(
+            target_count,
+            aux_item_stream_ttl_hours,
+            "put_item.aux_item_stream_ttl_hours",
+        )?;
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
@@ -322,17 +341,20 @@ impl DatabaseManager {
                             let expression_attribute_values =
                                 routed_expression_attribute_values.take(target_index);
                             let return_values = routed_return_values.take(target_index);
+                            let aux_item_stream_ttl_hours =
+                                routed_aux_item_stream_ttl_hours.take(target_index);
                             async move {
                                 record_storage_operation_for_target(
                                     "put_item",
                                     target_role,
-                                    provider.put_item(
+                                    provider.put_item_with_stream_ttl(
                                         table_name,
                                         item?,
                                         condition_expression?,
                                         expression_attribute_names?,
                                         expression_attribute_values?,
                                         return_values?,
+                                        aux_item_stream_ttl_hours?,
                                     ),
                                 )
                                 .await
@@ -396,6 +418,7 @@ impl DatabaseManager {
             condition_expression: input.condition_expression,
             expression_attribute_names: input.expression_attribute_names,
             expression_attribute_values: input.expression_attribute_values,
+            aux_item_stream_ttl_hours: input.aux_item_stream_ttl_hours,
             cache_effects,
         })
     }
@@ -430,6 +453,7 @@ impl DatabaseManager {
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
             ..
         } = prepared;
@@ -445,6 +469,7 @@ impl DatabaseManager {
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours,
         };
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
@@ -474,6 +499,7 @@ impl DatabaseManager {
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
         } = prepared;
         if let Some(response) = self
@@ -494,12 +520,13 @@ impl DatabaseManager {
             || async {
                 let response = record_storage_operation(
                     "delete_item",
-                    self.storage.delete_item(
+                    self.storage.delete_item_with_stream_ttl(
                         table_name,
                         key,
                         condition_expression,
                         expression_attribute_names,
                         expression_attribute_values,
+                        aux_item_stream_ttl_hours,
                     ),
                 )
                 .await?;
@@ -522,6 +549,7 @@ impl DatabaseManager {
             condition_expression,
             expression_attribute_names,
             mut expression_attribute_values,
+            aux_item_stream_ttl_hours,
             cache_effects,
             ..
         } = prepared;
@@ -574,12 +602,13 @@ impl DatabaseManager {
                                 record_storage_operation_for_target(
                                     "delete_item",
                                     target_role,
-                                    provider.delete_item(
+                                    provider.delete_item_with_stream_ttl(
                                         table_name,
                                         key?,
                                         condition_expression?,
                                         expression_attribute_names?,
                                         expression_attribute_values?,
+                                        aux_item_stream_ttl_hours,
                                     ),
                                 )
                                 .await
@@ -627,6 +656,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
         } = input;
         let mut update_expression = update_expression;
         let mut expression_attribute_names = expression_attribute_names;
@@ -687,6 +717,7 @@ impl DatabaseManager {
                 .expression_attribute_names(expression_attribute_names)
                 .expression_attribute_values(expression_attribute_values)
                 .return_values(provider_return_values)
+                .aux_item_stream_ttl_hours(aux_item_stream_ttl_hours)
                 .build()
         } else {
             UpdateItemRequest::builder()
@@ -697,6 +728,7 @@ impl DatabaseManager {
                 .expression_attribute_names(expression_attribute_names)
                 .expression_attribute_values(expression_attribute_values)
                 .return_values(provider_return_values)
+                .aux_item_stream_ttl_hours(aux_item_stream_ttl_hours)
                 .build()
         };
         let prepared_cache_write = self
@@ -811,6 +843,9 @@ impl DatabaseManager {
         let Some(prepared_cache_write) = prepared.prepared_cache_write.as_ref() else {
             return Ok(None);
         };
+        if prepared.request.aux_item_stream_ttl_hours.is_some() {
+            return Ok(None);
+        }
         self.try_cached_guarded_update_item(
             &prepared.request,
             prepared_cache_write.clone(),
@@ -1267,6 +1302,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours: None,
         })
         .await
     }

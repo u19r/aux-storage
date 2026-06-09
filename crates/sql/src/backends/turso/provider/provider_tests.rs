@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-use storage_provider::StorageProvider;
+use storage_common::TTL_SWEEP_JOB;
+use storage_provider::{
+    StorageProvider, StreamTrimDueMarker, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
+};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchWriteItemRequest, BillingMode,
     CreateGlobalSecondaryIndex, CreateTableRequest, DeleteRequest, IndexName, KeyAttributeType,
     KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest, QueryTableRequest,
-    StorageEnum, StreamItemId, StreamName, StreamSpecification, StreamViewType, TableName,
-    UserStreamName, WriteRequest,
+    StorageEnum, StreamItemId, StreamName, StreamRetentionDuration, StreamSpecification,
+    StreamViewType, TableName, TimestampMillis, UserStreamName, WriteRequest,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamEnum, StreamProvider,
@@ -667,6 +670,104 @@ async fn turso_put_update_delete_write_dynamodb_storage_stream_records() {
 }
 
 #[tokio::test]
+async fn turso_custom_stream_duration_trim_backend_deletes_table_stream_page() {
+    let provider = create_test_provider().await;
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage tables");
+
+    let table_name = TableName::new("turso_custom_duration_trim");
+    let mut request = basic_create_table_request(&table_name).with_stream_specification(Some(
+        StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewAndOldImages),
+        },
+    ));
+    request.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(1));
+    provider.create_table(&request).await.expect("create table");
+
+    provider
+        .put_item(
+            table_name.clone(),
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("user-1".to_string())),
+                ("name".to_string(), AttributeValue::S("Ada".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("insert row");
+
+    let conn = provider.connect().await.expect("connect");
+    let _ = provider
+        .execute(
+            &conn,
+            "UPDATE sys_stream_items SET created_at = ?1",
+            vec![TursoValue::Integer(0)],
+        )
+        .await
+        .expect("age stream rows");
+    let _ = provider
+        .execute(
+            &conn,
+            "UPDATE sys_stream_pointer_index SET created_at = ?1",
+            vec![TursoValue::Integer(0)],
+        )
+        .await
+        .expect("age pointer index rows");
+    let scope = StreamTrimScope::table("test-table-scope", table_name.clone());
+    let marker = StreamTrimDueMarker::new(TimestampMillis::from_timestamp(0), scope.clone(), 2);
+    provider
+        .write_stream_trim_state(
+            &conn,
+            StreamTrimStateWrite {
+                state: StreamTrimState {
+                    scope,
+                    policy_version: 2,
+                    retention: StreamRetentionDuration::FiniteHours(1),
+                    effective_retention: StreamRetentionDuration::FiniteHours(1),
+                    next_due_at: Some(TimestampMillis::from_timestamp(0)),
+                    oldest_retained_version: None,
+                    oldest_retained_timestamp: None,
+                    latest_version: None,
+                    latest_timestamp: None,
+                    updated_at: TimestampMillis::from_timestamp(0),
+                },
+                next_marker: Some(marker),
+            },
+        )
+        .await
+        .expect("write due trim state");
+    drop(conn);
+
+    provider
+        .run_job(TTL_SWEEP_JOB)
+        .await
+        .expect("run custom stream trim job");
+
+    let table_page = provider
+        .read_forward(StreamName::table_stream(&table_name), None, 10)
+        .await
+        .expect("read table stream");
+    assert!(table_page.items.is_empty());
+
+    let conn = provider.connect().await.expect("connect");
+    let pointer_rows = provider
+        .query_rows(
+            &conn,
+            "SELECT table_stream_item_id FROM sys_stream_pointer_index",
+            Vec::new(),
+        )
+        .await
+        .expect("read pointer index");
+    assert!(pointer_rows.is_empty());
+}
+
+#[tokio::test]
 async fn turso_list_tables_respects_exclusive_start_key() {
     let provider = create_test_provider().await;
     provider
@@ -734,6 +835,7 @@ async fn turso_batch_write_item_rolls_back_on_validation_error() {
                                     ("pk".to_string(), AttributeValue::S("user-1".to_string())),
                                     ("name".to_string(), AttributeValue::S("Ada".to_string())),
                                 ]),
+                                aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
                         },
@@ -743,6 +845,7 @@ async fn turso_batch_write_item_rolls_back_on_validation_error() {
                                     "pk".to_string(),
                                     AttributeValue::S("invalid".to_string()),
                                 )]),
+                                aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: Some(DeleteRequest {
                                 key: HashMap::from([(
@@ -750,6 +853,7 @@ async fn turso_batch_write_item_rolls_back_on_validation_error() {
                                     AttributeValue::S("invalid".to_string()),
                                 )])
                                 .into(),
+                                aux_item_stream_ttl_hours: None,
                             }),
                         },
                     ],
@@ -801,6 +905,7 @@ async fn turso_gsi_updates_are_delayed_by_default() {
                                 ("pk".to_string(), AttributeValue::S("user-1".to_string())),
                                 ("gpk".to_string(), AttributeValue::S("group-1".to_string())),
                             ]),
+                            aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
                     }],
@@ -874,6 +979,7 @@ async fn turso_gsi_update_job_drains_write_burst() {
                             AttributeValue::S("group-burst".to_string()),
                         ),
                     ]),
+                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             })

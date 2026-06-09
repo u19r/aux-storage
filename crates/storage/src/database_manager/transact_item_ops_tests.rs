@@ -26,6 +26,7 @@ fn transaction_table_name_uses_the_operation_present_on_the_item() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         ..TransactWriteItem::default()
     };
@@ -38,6 +39,7 @@ fn transaction_table_name_uses_the_operation_present_on_the_item() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         ..TransactWriteItem::default()
     };
@@ -49,6 +51,7 @@ fn transaction_table_name_uses_the_operation_present_on_the_item() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         ..TransactWriteItem::default()
     };
@@ -92,6 +95,7 @@ fn setting_transaction_table_name_updates_every_present_operation() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(TransactUpdateRequest {
             table_name: table("old_update"),
@@ -101,6 +105,7 @@ fn setting_transaction_table_name_updates_every_present_operation() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(TransactDeleteRequest {
             table_name: table("old_delete"),
@@ -109,6 +114,7 @@ fn setting_transaction_table_name_updates_every_present_operation() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: Some(TransactConditionCheckRequest {
             table_name: table("old_check"),
@@ -162,6 +168,7 @@ fn encoded_transaction_helpers_use_and_update_wire_put_table_names() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         ..TransactEncodeItem::default()
     };

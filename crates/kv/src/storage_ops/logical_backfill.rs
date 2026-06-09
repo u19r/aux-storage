@@ -313,6 +313,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             &[TransactWriteTableOperation::Put {
                 table_info,
                 item,
+                item_stream_ttl_hours: None,
                 condition: None,
                 return_values_on_condition_check_failure: None,
                 replication: None,

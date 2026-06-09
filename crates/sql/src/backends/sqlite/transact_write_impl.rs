@@ -89,6 +89,7 @@ impl SQLiteStorageProvider {
             immediate_gsi_consistency,
             false,
             None,
+            put_request.aux_item_stream_ttl_hours,
         )
         .map(|_| ())
     }
@@ -150,6 +151,7 @@ impl SQLiteStorageProvider {
             sqlite,
             immediate_gsi_consistency,
             None,
+            put_request.aux_item_stream_ttl_hours,
         )
         .map(|_| ())
     }
@@ -180,6 +182,7 @@ impl SQLiteStorageProvider {
             &update_request.key,
             sqlite,
             immediate_gsi_consistency,
+            update_request.aux_item_stream_ttl_hours,
         );
         if let Err(error) = result {
             if matches!(error.to_enum(), StorageEnum::ConditionalCheckFailed) {
@@ -259,6 +262,7 @@ impl SQLiteStorageProvider {
             sqlite,
             immediate_gsi_consistency,
             None,
+            delete_request.aux_item_stream_ttl_hours,
         )
         .map(|_| ())
     }

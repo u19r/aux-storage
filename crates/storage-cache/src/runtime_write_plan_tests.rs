@@ -49,6 +49,8 @@ fn table_info() -> StoredTableInfo {
         table_size_bytes: 0,
         item_count: 0,
         stream_specification: None,
+        table_stream_duration: storage_types::StreamRetentionDuration::default(),
+        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }
@@ -226,12 +228,18 @@ fn collect_base_writes_for_batch_write_expands_puts_and_deletes() {
             table_name.clone(),
             vec![
                 WriteRequest {
-                    put_request: Some(PutRequest { item: item() }),
+                    put_request: Some(PutRequest {
+                        item: item(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                     delete_request: None,
                 },
                 WriteRequest {
                     put_request: None,
-                    delete_request: Some(DeleteRequest { key: key() }),
+                    delete_request: Some(DeleteRequest {
+                        key: key(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                 },
             ],
         )]),
@@ -256,12 +264,18 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
             table_name.clone(),
             vec![
                 WriteRequest {
-                    put_request: Some(PutRequest { item: item() }),
+                    put_request: Some(PutRequest {
+                        item: item(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                     delete_request: None,
                 },
                 WriteRequest {
                     put_request: None,
-                    delete_request: Some(DeleteRequest { key: key() }),
+                    delete_request: Some(DeleteRequest {
+                        key: key(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                 },
             ],
         )]),
@@ -288,6 +302,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(TransactUpdateRequest {
             table_name: table_name.clone(),
@@ -300,6 +315,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
                 AttributeValue::S("y".into()),
             )])),
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(TransactDeleteRequest {
             table_name: table_name.clone(),
@@ -308,6 +324,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: None,
     }];
@@ -341,6 +358,7 @@ fn collect_point_read_mutations_for_encode_requests_preserves_wire_items() {
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
                     item: wire_item.clone(),
+                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -365,6 +383,7 @@ fn collect_point_read_mutations_for_encode_requests_preserves_wire_items() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: None,
         delete: None,
@@ -483,12 +502,18 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
             table_name.clone(),
             vec![
                 WriteRequest {
-                    put_request: Some(PutRequest { item: item() }),
+                    put_request: Some(PutRequest {
+                        item: item(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                     delete_request: None,
                 },
                 WriteRequest {
                     put_request: None,
-                    delete_request: Some(DeleteRequest { key: key() }),
+                    delete_request: Some(DeleteRequest {
+                        key: key(),
+                        aux_item_stream_ttl_hours: None,
+                    }),
                 },
             ],
         )]),
@@ -512,6 +537,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(TransactUpdateRequest {
             table_name: table_name.clone(),
@@ -524,6 +550,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
                 AttributeValue::S("y".into()),
             )])),
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(TransactDeleteRequest {
             table_name: table_name.clone(),
@@ -532,6 +559,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: None,
     }];
@@ -554,8 +582,12 @@ fn encode_query_proof_target_collectors_convert_wire_items_once() {
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
                     item: wire_item.clone(),
+                    aux_item_stream_ttl_hours: None,
                 }),
-                delete_request: Some(DeleteRequest { key: key() }),
+                delete_request: Some(DeleteRequest {
+                    key: key(),
+                    aux_item_stream_ttl_hours: None,
+                }),
             }],
         )]),
         return_consumed_capacity: None,
@@ -575,6 +607,7 @@ fn encode_query_proof_target_collectors_convert_wire_items_once() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: None,
         delete: Some(TransactDeleteRequest {
@@ -584,6 +617,7 @@ fn encode_query_proof_target_collectors_convert_wire_items_once() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: None,
     }];
@@ -645,6 +679,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: Some(TransactUpdateRequest {
             table_name: table_a.clone(),
@@ -657,6 +692,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
                 AttributeValue::S("y".into()),
             )])),
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(TransactDeleteRequest {
             table_name: table_b.clone(),
@@ -665,6 +701,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: None,
     }];
@@ -681,6 +718,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         update: None,
         delete: Some(TransactDeleteRequest {
@@ -690,6 +728,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         }),
         condition_check: None,
     }];

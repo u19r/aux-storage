@@ -25,6 +25,8 @@ fn validate_create_table_rejects_duplicate_key_schema_attribute() {
         ],
         billing_mode: Some(BillingMode::PayPerRequest),
         deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
         global_secondary_indexes: None,
         local_secondary_indexes: None,
         stream_specification: None,

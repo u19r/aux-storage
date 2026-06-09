@@ -65,6 +65,7 @@ impl StorageApiManagerImpl {
                 condition_expression: request.condition_expression,
                 expression_attribute_names: request.expression_attribute_names,
                 expression_attribute_values: request.expression_attribute_values,
+                aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
             })
             .await
             .map_err(|error| {

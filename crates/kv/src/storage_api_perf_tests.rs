@@ -559,6 +559,7 @@ async fn api_update_in_keyspace(
             return_consumed_capacity: None,
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: None,
+            aux_item_stream_ttl_hours: None,
         })
         .await
         .map(|_| ())
@@ -573,6 +574,7 @@ async fn api_batch_write(
         .map(|offset| WriteRequest {
             put_request: Some(PutRequest {
                 item: item_for("batch", id * BATCH_WRITE_WIDTH + offset),
+                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         })
@@ -604,6 +606,7 @@ async fn api_transact_write(
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
             }),
             update: None,
             delete: None,

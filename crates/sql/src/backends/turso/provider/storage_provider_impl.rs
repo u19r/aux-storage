@@ -3,13 +3,16 @@ use std::{collections::HashMap, sync::LazyLock};
 use async_trait::async_trait;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 use storage_common::{
-    GSI_UPDATE_JOB, apply_gsi_write_pressure as apply_shared_gsi_write_pressure,
+    GSI_UPDATE_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure as apply_shared_gsi_write_pressure,
     normalize_limit as calc_limit,
 };
 use storage_condition::{evaluate_condition, parse_condition_expression};
 use storage_provider::{
-    StorageProvider, apply_bound_update_operations, before_update_item,
-    before_update_item_optional, return_values_need_updated_fields,
+    StorageProvider, StreamDurationTrimBackend, StreamDurationTrimConfig,
+    StreamDurationTrimPageRequest, StreamDurationTrimPageResult, StreamDurationTrimWorker,
+    StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeBoundaries, StreamTrimState,
+    StreamTrimStateWrite, apply_bound_update_operations, before_update_item,
+    before_update_item_optional, plan_table_stream_duration, return_values_need_updated_fields,
     split_item_into_key_and_attributes_sync, update_item_response,
 };
 use storage_types::{
@@ -75,10 +78,52 @@ async fn apply_gsi_write_pressure(provider: &TursoStorageProvider) -> StorageRes
     .await
 }
 
+async fn run_custom_stream_trim_once(provider: &TursoStorageProvider) -> StorageResult<bool> {
+    let stats = StreamDurationTrimWorker::new(
+        provider.clone(),
+        StreamDurationTrimConfig {
+            marker_page_size: 250,
+            stream_page_size: 1_000,
+        },
+    )
+    .run_due_page(TimestampMillis::now(), TimestampMillis::now())
+    .await?;
+    Ok(stats.did_work())
+}
+
 #[async_trait]
 impl StorageProvider for TursoStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
         true
+    }
+
+    fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    async fn write_stream_trim_state(
+        &self,
+        state: storage_provider::StreamTrimState,
+    ) -> StorageResult<()> {
+        let conn = self.connect().await?;
+        self.write_stream_trim_state(
+            &conn,
+            storage_provider::StreamTrimStateWrite {
+                state,
+                next_marker: None,
+            },
+        )
+        .await
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<storage_provider::StreamTrimDueMarker>> {
+        let conn = self.connect().await?;
+        self.list_due_stream_trim_markers(&conn, due_before, limit)
+            .await
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
@@ -90,17 +135,39 @@ impl StorageProvider for TursoStorageProvider {
                 let _ = this
                     .execute(conn, sql_statements::create_tables_table(), Vec::new())
                     .await?;
-                let columns = this.query_rows(conn, "PRAGMA table_info(tables)", Vec::new()).await?;
-                let has_deletion_protection_column = columns.iter().any(|row| {
-                    row.get("name").is_some_and(|value| {
-                        matches!(value, TursoValue::Text(name) if name == "deletion_protection_enabled")
+                let columns = this
+                    .query_rows(conn, "PRAGMA table_info(tables)", Vec::new())
+                    .await?;
+                let has_column = |column_name: &str| {
+                    columns.iter().any(|row| {
+                        row.get("name").is_some_and(
+                            |value| matches!(value, TursoValue::Text(name) if name == column_name),
+                        )
                     })
-                });
-                if !has_deletion_protection_column {
+                };
+                if !has_column("deletion_protection_enabled") {
                     let _ = this
                         .execute(
                             conn,
                             sql_statements::add_deletion_protection_column(),
+                            Vec::new(),
+                        )
+                        .await?;
+                }
+                if !has_column("table_stream_duration_hours") {
+                    let _ = this
+                        .execute(
+                            conn,
+                            sql_statements::add_table_stream_duration_column(),
+                            Vec::new(),
+                        )
+                        .await?;
+                }
+                if !has_column("default_item_stream_duration_hours") {
+                    let _ = this
+                        .execute(
+                            conn,
+                            sql_statements::add_default_item_stream_duration_column(),
                             Vec::new(),
                         )
                         .await?;
@@ -122,6 +189,7 @@ impl StorageProvider for TursoStorageProvider {
                         Vec::new(),
                     )
                     .await?;
+                this.initialize_stream_duration_tables(conn).await?;
                 Ok(())
             })
         })
@@ -229,9 +297,18 @@ impl StorageProvider for TursoStorageProvider {
                     return Err(StorageError::table_already_exists(&table_name_for_tx));
                 }
 
+                let table_id = uuid::Uuid::now_v7().to_string();
+                let table_duration_plan = plan_table_stream_duration(
+                    table_name_for_tx.clone(),
+                    format!("turso-table:{table_id}"),
+                    1,
+                    metadata.table_stream_duration,
+                    metadata.default_item_stream_duration,
+                    metadata.created_at,
+                );
                 let insert_sql = sql_statements::insert_table();
                 let insert_params = vec![
-                    TursoValue::Text(uuid::Uuid::now_v7().to_string()),
+                    TursoValue::Text(table_id),
                     TursoValue::Text(table_name_for_tx.to_string()),
                     TursoValue::Text("CREATING".to_string()),
                     TursoValue::Integer(*metadata.created_at),
@@ -246,8 +323,20 @@ impl StorageProvider for TursoStorageProvider {
                     } else {
                         0
                     }),
+                    TursoValue::Integer(metadata.table_stream_duration.as_hours_wire_value()),
+                    TursoValue::Integer(
+                        metadata.default_item_stream_duration.as_hours_wire_value(),
+                    ),
                 ];
                 let _ = this.execute(conn, insert_sql, insert_params).await?;
+                this.write_stream_trim_state(
+                    conn,
+                    storage_provider::StreamTrimStateWrite {
+                        state: table_duration_plan.trim_state,
+                        next_marker: table_duration_plan.due_marker,
+                    },
+                )
+                .await?;
 
                 let rowid_mode = SqliteTableRowidMode::WithRowid;
                 // TODO: Enable after Turso releases support for WITHOUT ROWID.
@@ -419,6 +508,28 @@ impl StorageProvider for TursoStorageProvider {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
+        self.put_item_with_stream_ttl(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            None,
+        )
+        .await
+    }
+
+    async fn put_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        item: HashMap<String, AttributeValue>,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+    ) -> StorageResult<PutItemResponse> {
         apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
@@ -437,8 +548,14 @@ impl StorageProvider for TursoStorageProvider {
                 let item = item.clone();
                 let condition = condition.clone();
                 Box::pin(async move {
-                    this.put_item_txn(conn, &table_info, &item, condition.as_ref())
-                        .await
+                    this.put_item_txn(
+                        conn,
+                        &table_info,
+                        &item,
+                        condition.as_ref(),
+                        aux_item_stream_ttl_hours,
+                    )
+                    .await
                 })
             })
             .await?;
@@ -521,6 +638,26 @@ impl StorageProvider for TursoStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        self.delete_item_with_stream_ttl(
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            None,
+        )
+        .await
+    }
+
+    async fn delete_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
@@ -538,8 +675,15 @@ impl StorageProvider for TursoStorageProvider {
             let key = key.clone();
             let condition = condition.clone();
             Box::pin(async move {
-                this.delete_item_txn(conn, &table_info, &key, condition.as_ref())
-                    .await
+                this.delete_item_txn_with_replication(
+                    conn,
+                    &table_info,
+                    &key,
+                    condition.as_ref(),
+                    None,
+                    aux_item_stream_ttl_hours,
+                )
+                .await
             })
         })
         .await
@@ -587,7 +731,7 @@ impl StorageProvider for TursoStorageProvider {
                         &guard,
                     )
                     .await?;
-                    this.put_item_txn(conn, &table_info, &item, condition.as_ref())
+                    this.put_item_txn(conn, &table_info, &item, condition.as_ref(), None)
                         .await
                 })
             })
@@ -636,8 +780,15 @@ impl StorageProvider for TursoStorageProvider {
             Box::pin(async move {
                 this.validate_durable_guard(conn, &table_info.table_name, &key, &guard)
                     .await?;
-                this.delete_item_txn(conn, &table_info, &key, condition.as_ref())
-                    .await
+                this.delete_item_txn_with_replication(
+                    conn,
+                    &table_info,
+                    &key,
+                    condition.as_ref(),
+                    None,
+                    None,
+                )
+                .await
             })
         })
         .await
@@ -665,6 +816,7 @@ impl StorageProvider for TursoStorageProvider {
                         &new_image,
                         old_item.as_ref(),
                         Some(&metadata),
+                        None,
                     )
                     .await
                 })
@@ -685,6 +837,7 @@ impl StorageProvider for TursoStorageProvider {
                     &key,
                     None,
                     Some(&metadata),
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -935,6 +1088,7 @@ impl StorageProvider for TursoStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             ..
         } = request;
         let this = self.clone();
@@ -977,6 +1131,7 @@ impl StorageProvider for TursoStorageProvider {
                         &table_info,
                         &updated_item,
                         Some(&item_to_update),
+                        aux_item_stream_ttl_hours,
                     )
                     .await?;
 
@@ -1011,6 +1166,7 @@ impl StorageProvider for TursoStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours,
             ..
         } = request;
         let this = self.clone();
@@ -1056,6 +1212,7 @@ impl StorageProvider for TursoStorageProvider {
                         &table_info,
                         &updated_item,
                         Some(&item_to_update),
+                        aux_item_stream_ttl_hours,
                     )
                     .await?;
 
@@ -1140,7 +1297,13 @@ impl StorageProvider for TursoStorageProvider {
                                 ));
                             }
                             let _ = this
-                                .put_item_txn(conn, &table_info, &put.item, None)
+                                .put_item_txn(
+                                    conn,
+                                    &table_info,
+                                    &put.item,
+                                    None,
+                                    put.aux_item_stream_ttl_hours,
+                                )
                                 .await?;
                         }
 
@@ -1180,7 +1343,14 @@ impl StorageProvider for TursoStorageProvider {
                                 ));
                             }
                             let _ = this
-                                .delete_item_txn(conn, &table_info, &delete.key, None)
+                                .delete_item_txn_with_replication(
+                                    conn,
+                                    &table_info,
+                                    &delete.key,
+                                    None,
+                                    None,
+                                    delete.aux_item_stream_ttl_hours,
+                                )
                                 .await?;
                         }
 
@@ -1221,7 +1391,13 @@ impl StorageProvider for TursoStorageProvider {
                             let updated_item =
                                 apply_bound_update_operations(item_to_update, &operations)?;
                             let _ = this
-                                .put_item_txn(conn, &table_info, &updated_item, None)
+                                .put_item_txn(
+                                    conn,
+                                    &table_info,
+                                    &updated_item,
+                                    None,
+                                    update.aux_item_stream_ttl_hours,
+                                )
                                 .await?;
                         }
 
@@ -1299,6 +1475,64 @@ impl StorageProvider for TursoStorageProvider {
             self.invalidate_table_cache(&request.table_name).await;
             table_info.deletion_protection_enabled = deletion_protection_enabled;
         }
+        if request.aux_stream_duration_hours.is_some()
+            || request.aux_default_item_stream_duration_hours.is_some()
+        {
+            if let Some(table_stream_duration) = request.aux_stream_duration_hours {
+                table_info.table_stream_duration = table_stream_duration;
+            }
+            if let Some(default_item_stream_duration) =
+                request.aux_default_item_stream_duration_hours
+            {
+                table_info.default_item_stream_duration = default_item_stream_duration;
+            }
+            let table_name = request.table_name.clone();
+            let this = self.clone();
+            let table_stream_duration = table_info.table_stream_duration;
+            let default_item_stream_duration = table_info.default_item_stream_duration;
+            self.with_exclusive_transaction(true, |conn| {
+                let this = this.clone();
+                let table_name = table_name.clone();
+                Box::pin(async move {
+                    let table_scope_id = this.load_table_scope_id(conn, &table_name).await?;
+                    let policy_version = this
+                        .next_table_policy_version(conn, &table_scope_id)
+                        .await?;
+                    let table_duration_plan = plan_table_stream_duration(
+                        table_name.clone(),
+                        table_scope_id,
+                        policy_version,
+                        table_stream_duration,
+                        default_item_stream_duration,
+                        TimestampMillis::now(),
+                    );
+                    let _ = this
+                        .execute(
+                            conn,
+                            sql_statements::update_stream_durations(),
+                            vec![
+                                TursoValue::Integer(table_stream_duration.as_hours_wire_value()),
+                                TursoValue::Integer(
+                                    default_item_stream_duration.as_hours_wire_value(),
+                                ),
+                                TursoValue::Text(table_name.to_string()),
+                            ],
+                        )
+                        .await?;
+                    this.write_stream_trim_state(
+                        conn,
+                        storage_provider::StreamTrimStateWrite {
+                            state: table_duration_plan.trim_state,
+                            next_marker: table_duration_plan.due_marker,
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
+            self.invalidate_table_cache(&request.table_name).await;
+        }
 
         Ok(storage_types::UpdateTableResponse {
             table_description: storage_types::TableDescription {
@@ -1375,8 +1609,61 @@ impl StorageProvider for TursoStorageProvider {
                     break;
                 }
             }
+        } else if name == TTL_SWEEP_JOB {
+            let _ = run_custom_stream_trim_once(self).await?;
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl StreamDurationTrimBackend for TursoStorageProvider {
+    async fn list_due_stream_trim_markers(
+        &self,
+        due_before: TimestampMillis,
+        limit: usize,
+    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
+        let conn = self.connect().await?;
+        self.list_due_stream_trim_markers(&conn, due_before, limit)
+            .await
+    }
+
+    async fn load_stream_trim_state(
+        &self,
+        scope: &StreamTrimScope,
+    ) -> StorageResult<Option<StreamTrimState>> {
+        let conn = self.connect().await?;
+        self.load_stream_trim_state_by_scope(&conn, scope).await
+    }
+
+    async fn load_stream_trim_boundaries(
+        &self,
+        scope: &StreamTrimScope,
+    ) -> StorageResult<StreamTrimScopeBoundaries> {
+        let conn = self.connect().await?;
+        self.load_stream_trim_boundaries(&conn, scope).await
+    }
+
+    async fn trim_table_stream_page(
+        &self,
+        request: StreamDurationTrimPageRequest,
+    ) -> StorageResult<StreamDurationTrimPageResult> {
+        self.trim_stream_page(request).await
+    }
+
+    async fn trim_item_stream_page(
+        &self,
+        request: StreamDurationTrimPageRequest,
+    ) -> StorageResult<StreamDurationTrimPageResult> {
+        self.trim_stream_page(request).await
+    }
+
+    async fn finish_stream_trim_marker(
+        &self,
+        marker: StreamTrimDueMarker,
+        write: Option<StreamTrimStateWrite>,
+    ) -> StorageResult<()> {
+        self.finish_stream_trim_marker(marker, write).await
     }
 }
 
@@ -1405,14 +1692,35 @@ impl TursoStorageProvider {
                 PreparedBatchOperation::Put {
                     table_info,
                     full_item,
+                    aux_item_stream_ttl_hours,
                     ..
                 } => {
-                    let _ = self.put_item_txn(conn, table_info, full_item, None).await?;
+                    let _ = self
+                        .put_item_txn(
+                            conn,
+                            table_info,
+                            full_item,
+                            None,
+                            *aux_item_stream_ttl_hours,
+                        )
+                        .await?;
                 }
                 PreparedBatchOperation::Delete {
-                    table_info, key, ..
+                    table_info,
+                    key,
+                    aux_item_stream_ttl_hours,
+                    ..
                 } => {
-                    let _ = self.delete_item_txn(conn, table_info, key, None).await?;
+                    let _ = self
+                        .delete_item_txn_with_replication(
+                            conn,
+                            table_info,
+                            key,
+                            None,
+                            None,
+                            *aux_item_stream_ttl_hours,
+                        )
+                        .await?;
                 }
             }
         }

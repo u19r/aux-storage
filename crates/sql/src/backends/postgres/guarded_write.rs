@@ -84,6 +84,7 @@ impl PostgresStorageProvider {
                             expression_attribute_names,
                             expression_attribute_values,
                             return_values_on_condition_check_failure: None,
+                            aux_item_stream_ttl_hours: None,
                         },
                         None,
                     )
@@ -167,6 +168,7 @@ impl PostgresStorageProvider {
                             expression_attribute_names,
                             expression_attribute_values,
                             return_values_on_condition_check_failure: None,
+                            aux_item_stream_ttl_hours: None,
                         },
                         None,
                     )
@@ -278,6 +280,7 @@ impl PostgresStorageProvider {
                         &table_info,
                         updated_item.clone(),
                         old_item_for_write.as_ref(),
+                        None,
                     )
                     .await?;
                     transaction.commit().await.map_err(|err| {

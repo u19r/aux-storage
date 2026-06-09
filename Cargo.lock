@@ -5420,8 +5420,11 @@ name = "storage-provider"
 version = "0.1.0"
 dependencies = [
  "alloc-counter",
+ "anyhow",
  "async-trait",
  "bg-jobs",
+ "quint-connect",
+ "serde",
  "serde_json",
  "storage-backfill",
  "storage-condition",

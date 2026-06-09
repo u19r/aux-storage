@@ -204,6 +204,7 @@ pub struct PutItemInput {
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub return_values: Option<AllOld>,
+    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(TypedBuilder)]
@@ -229,6 +230,7 @@ pub struct DeleteItemInput {
     pub condition_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(TypedBuilder)]
@@ -331,6 +333,7 @@ pub struct UpdateItemInput {
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub return_values: Option<ReturnValuesOldNewUpdated>,
+    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(Debug)]
@@ -1107,6 +1110,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            aux_item_stream_ttl_hours: None,
         })
         .await
     }
@@ -1128,6 +1132,7 @@ impl DatabaseManager {
             expression_attribute_names: input.expression_attribute_names,
             expression_attribute_values: input.expression_attribute_values,
             return_values: input.return_values,
+            aux_item_stream_ttl_hours: None,
         })
         .await
     }

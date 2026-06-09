@@ -1,4 +1,6 @@
-use storage_types::{CreateTableRequest, StorageError, StorageResult, TimestampMillis};
+use storage_types::{
+    CreateTableRequest, StorageError, StorageResult, StreamRetentionDuration, TimestampMillis,
+};
 
 use crate::constants::MAX_GSI_COUNT;
 
@@ -10,6 +12,8 @@ pub(crate) struct PreparedTableMetadata {
     pub(crate) global_secondary_indexes_json: Option<String>,
     pub(crate) stream_specification_json: Option<String>,
     pub(crate) deletion_protection_enabled: bool,
+    pub(crate) table_stream_duration: StreamRetentionDuration,
+    pub(crate) default_item_stream_duration: StreamRetentionDuration,
 }
 
 pub(crate) fn validate_create_table_request(request: &CreateTableRequest) -> StorageResult<()> {
@@ -40,6 +44,10 @@ pub(crate) fn prepare_table_metadata(
         .map(serde_json::to_string)
         .transpose()?;
     let deletion_protection_enabled = request.deletion_protection_enabled.unwrap_or(false);
+    let table_stream_duration = request.aux_stream_duration_hours.unwrap_or_default();
+    let default_item_stream_duration = request
+        .aux_default_item_stream_duration_hours
+        .unwrap_or(table_stream_duration);
 
     Ok(PreparedTableMetadata {
         created_at,
@@ -48,6 +56,8 @@ pub(crate) fn prepare_table_metadata(
         global_secondary_indexes_json,
         stream_specification_json,
         deletion_protection_enabled,
+        table_stream_duration,
+        default_item_stream_duration,
     })
 }
 

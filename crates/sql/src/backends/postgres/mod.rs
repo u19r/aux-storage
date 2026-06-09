@@ -4,6 +4,7 @@ mod provider;
 mod row_decode;
 mod sql_key_helpers;
 mod sql_statements;
+mod stream_duration;
 mod stream_helpers;
 mod table_metadata;
 mod transaction_helpers;
