@@ -182,6 +182,8 @@ pub enum TransactWriteTableOperation {
     Delete {
         table_info: StoredTableInfo,
         key: KeyAttributes,
+        item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+        use_key_attributes_for_missing_item_condition: bool,
         condition: Option<Condition>,
         return_values_on_condition_check_failure: Option<String>,
         replication: Option<ReplicationEventMetadata>,

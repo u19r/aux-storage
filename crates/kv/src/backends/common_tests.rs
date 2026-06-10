@@ -124,6 +124,8 @@ fn plan_table_delete_accepts_equivalent_scientific_number_key() {
                 ("sk".to_string(), AttributeValue::N("1".to_string())),
             ])
             .into(),
+            item_stream_ttl_hours: None,
+            use_key_attributes_for_missing_item_condition: false,
             condition: None,
             return_values_on_condition_check_failure: None,
             replication: None,
@@ -206,6 +208,8 @@ fn plan_table_write_rejects_duplicate_transaction_item_targets() {
             TransactWriteTableOperation::Delete {
                 table_info,
                 key: key_attrs("pk", "sk").into(),
+                item_stream_ttl_hours: None,
+                use_key_attributes_for_missing_item_condition: false,
                 condition: None,
                 return_values_on_condition_check_failure: None,
                 replication: None,
@@ -243,6 +247,8 @@ fn plan_table_write_rejects_invalid_number_key_before_backend_encoding() {
                 ("sk".to_string(), AttributeValue::N("1".to_string())),
             ])
             .into(),
+            item_stream_ttl_hours: None,
+            use_key_attributes_for_missing_item_condition: false,
             condition: None,
             return_values_on_condition_check_failure: None,
             replication: None,
@@ -276,6 +282,8 @@ fn plan_table_delete_condition_on_missing_item_does_not_see_synthetic_key() {
         &[TransactWriteTableOperation::Delete {
             table_info,
             key: key_attrs("pk", "sk-missing").into(),
+            item_stream_ttl_hours: None,
+            use_key_attributes_for_missing_item_condition: false,
             condition: Some(condition),
             return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
             replication: None,

@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use storage_provider::StorageProvider;
 use storage_types::{
-    AttributeDefinition, AttributeValue, CreateTableRequest,
-    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, ItemKey, KeyAttributeType, KeySchemaElement,
-    KeyType, SerializesToKey, StorageEnum, TableName,
+    AttributeDefinition, AttributeValue, BatchWriteItemRequest, CreateTableRequest,
+    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DeleteRequest, ItemKey, KeyAttributeType,
+    KeySchemaElement, KeyType, SerializesToKey, StorageEnum, StreamRetentionDuration, TableName,
+    TimestampMillis, TransactDeleteRequest, TransactWriteItem, TransactWriteItemsRequest,
+    WriteRequest,
 };
 use tracing::info;
 
@@ -264,4 +266,189 @@ async fn kv_delete_condition_failure_returns_conditional_check_failed() {
 
     assert!(matches!(err.as_ref(), StorageEnum::ConditionalCheckFailed));
     assert_eq!(err.to_string(), DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE);
+}
+
+#[tokio::test]
+async fn kv_delete_item_with_stream_ttl_writes_item_duration_marker() {
+    let provider = test_provider("kv-delete-custom-duration");
+    let table = TableName::new("delete_custom_duration_table");
+    provider
+        .create_table(&hash_table_request(table.clone()))
+        .await
+        .expect("create");
+    provider
+        .put_item(table.clone(), item("A", "open"), None, None, None, None)
+        .await
+        .expect("seed");
+
+    provider
+        .delete_item_with_stream_ttl(
+            table.clone(),
+            key("A"),
+            None,
+            None,
+            None,
+            Some(StreamRetentionDuration::FiniteHours(1)),
+        )
+        .await
+        .expect("delete");
+
+    assert_eq!(item_duration_marker_count(&provider, &table).await, 1);
+}
+
+#[tokio::test]
+async fn kv_failed_conditional_delete_does_not_write_item_duration_marker() {
+    let provider = test_provider("kv-delete-custom-duration-condition-failure");
+    let table = TableName::new("delete_custom_duration_failure_table");
+    provider
+        .create_table(&hash_table_request(table.clone()))
+        .await
+        .expect("create");
+    provider
+        .put_item(table.clone(), item("A", "open"), None, None, None, None)
+        .await
+        .expect("seed");
+
+    provider
+        .delete_item_with_stream_ttl(
+            table.clone(),
+            key("A"),
+            Some("#state = :expected".to_string()),
+            Some(HashMap::from([("#state".to_string(), "state".to_string())])),
+            Some(HashMap::from([(
+                ":expected".to_string(),
+                AttributeValue::S("closed".to_string()),
+            )])),
+            Some(StreamRetentionDuration::FiniteHours(1)),
+        )
+        .await
+        .expect_err("delete should fail condition");
+
+    assert_eq!(item_duration_marker_count(&provider, &table).await, 0);
+}
+
+#[tokio::test]
+async fn kv_batch_write_delete_applies_item_stream_duration_marker() {
+    let provider = test_provider("kv-batch-delete-custom-duration");
+    let table = TableName::new("batch_delete_custom_duration_table");
+    provider
+        .create_table(&hash_table_request(table.clone()))
+        .await
+        .expect("create");
+    provider
+        .put_item(table.clone(), item("A", "open"), None, None, None, None)
+        .await
+        .expect("seed");
+
+    provider
+        .batch_write_item(
+            BatchWriteItemRequest {
+                request_items: HashMap::from([(
+                    table.clone(),
+                    vec![WriteRequest {
+                        put_request: None,
+                        delete_request: Some(DeleteRequest {
+                            key: key("A"),
+                            aux_item_stream_ttl_hours: Some(StreamRetentionDuration::FiniteHours(
+                                2,
+                            )),
+                        }),
+                    }],
+                )]),
+                return_consumed_capacity: None,
+                return_item_collection_metrics: None,
+            },
+            true,
+        )
+        .await
+        .expect("batch write");
+
+    assert_eq!(item_duration_marker_count(&provider, &table).await, 1);
+}
+
+#[tokio::test]
+async fn kv_transact_delete_applies_item_stream_duration_marker() {
+    let provider = test_provider("kv-transact-delete-custom-duration");
+    let table = TableName::new("transact_delete_custom_duration_table");
+    provider
+        .create_table(&hash_table_request(table.clone()))
+        .await
+        .expect("create");
+    provider
+        .put_item(table.clone(), item("A", "open"), None, None, None, None)
+        .await
+        .expect("seed");
+
+    provider
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                put: None,
+                update: None,
+                delete: Some(TransactDeleteRequest {
+                    table_name: table.clone(),
+                    key: key("A"),
+                    condition_expression: None,
+                    expression_attribute_names: None,
+                    expression_attribute_values: None,
+                    return_values_on_condition_check_failure: None,
+                    aux_item_stream_ttl_hours: Some(StreamRetentionDuration::FiniteHours(3)),
+                }),
+                condition_check: None,
+            }],
+            client_request_token: None,
+            return_consumed_capacity: None,
+            return_item_collection_metrics: None,
+        })
+        .await
+        .expect("transaction");
+
+    assert_eq!(item_duration_marker_count(&provider, &table).await, 1);
+}
+
+async fn item_duration_marker_count(
+    provider: &crate::SortedKvDbStorageProvider<crate::RocksDbKvStore>,
+    table: &TableName,
+) -> usize {
+    provider
+        .list_due_stream_trim_markers(TimestampMillis::now() + 73 * 60 * 60 * 1000, 25)
+        .await
+        .expect("list markers")
+        .into_iter()
+        .filter(|marker| {
+            marker.scope.table_name == *table
+                && marker.scope.kind == storage_provider::StreamTrimScopeKind::Item
+        })
+        .count()
+}
+
+fn test_provider(label: &str) -> crate::SortedKvDbStorageProvider<crate::RocksDbKvStore> {
+    let store = crate::RocksDbKvStore::new(crate::kv_support_tests::rocksdb_test_path(label))
+        .expect("rocksdb store");
+    crate::SortedKvDbStorageProvider::new(store)
+}
+
+fn hash_table_request(table: TableName) -> CreateTableRequest {
+    CreateTableRequest::new(
+        table,
+        vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: KeyAttributeType::S,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        storage_types::BillingMode::PayPerRequest,
+    )
+}
+
+fn item(pk: &str, state: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".to_string(), AttributeValue::S(pk.to_string())),
+        ("state".to_string(), AttributeValue::S(state.to_string())),
+    ])
+}
+
+fn key(pk: &str) -> storage_types::KeyAttributes {
+    HashMap::from([("pk".to_string(), AttributeValue::S(pk.to_string()))]).into()
 }

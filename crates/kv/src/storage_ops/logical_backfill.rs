@@ -361,6 +361,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             &[TransactWriteTableOperation::Delete {
                 table_info,
                 key: key.clone(),
+                item_stream_ttl_hours: None,
+                use_key_attributes_for_missing_item_condition: false,
                 condition: None,
                 return_values_on_condition_check_failure: None,
                 replication: None,

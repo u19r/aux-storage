@@ -1545,59 +1545,35 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        if key.is_empty() {
-            record_write(0, 0);
-            return Ok(None);
-        }
-        apply_gsi_write_pressure(self).await?;
-        let billed_bytes = attr_map_payload_bytes(&key);
-        let table_info = self
-            .get_table_metadata_from_name(&table_name)
-            .await?
-            .ok_or_else(|| StorageError::table_not_found(&table_name.clone()))?;
-        let ttl_config = self.load_ttl_config(&table_name).await?;
+        self.execute_delete_item(
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            None,
+        )
+        .await
+    }
 
-        let condition = if let Some(condition_expression) = condition_expression {
-            Some(
-                parse_condition_expression(
-                    &condition_expression,
-                    expression_attribute_names.as_ref(),
-                    expression_attribute_values.as_ref(),
-                )
-                .map_err(|c| {
-                    warn!(c);
-                    StorageError::validation(StorageValidationKind::InvalidConditionExpression)
-                })?,
-            )
-        } else {
-            None
-        };
-
-        let mut old_new_items = self
-            .kv_store
-            .transact_write_table(
-                vec![TransactWriteTableOperation::Delete {
-                    table_info,
-                    key,
-                    condition,
-                    return_values_on_condition_check_failure: None,
-                    replication: None,
-                    ttl_config,
-                }],
-                self.immediate_gsi_consistency,
-            )
-            .await
-            .map_err(normalize_conditional_transaction_error)?;
-
-        let Some((old_item, _)) = old_new_items.pop() else {
-            record_write(0, 0);
-            record_write_cost("delete_item", "delete", 1, billed_bytes);
-            return Ok(None);
-        };
-        record_write(usize::from(old_item.is_some()), 0);
-        record_write_cost("delete_item", "delete", 1, billed_bytes);
-
-        Ok(old_item)
+    async fn delete_item_with_stream_ttl(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        self.execute_delete_item(
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            aux_item_stream_ttl_hours,
+        )
+        .await
     }
 
     #[instrument(
@@ -1848,7 +1824,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     }
                     WriteRequest {
                         put_request: None,
-                        delete_request: Some(DeleteRequest { key, .. }),
+                        delete_request:
+                            Some(DeleteRequest {
+                                key,
+                                aux_item_stream_ttl_hours,
+                            }),
                     } => {
                         match Self::prepare_batch_delete_item(
                             table_name,
@@ -1869,6 +1849,14 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                                 if !ttl_mutations.is_empty() {
                                     items.extend(ttl_mutations);
                                 }
+                                let policy_mutations =
+                                    crate::storage_ops::stream_duration::item_stream_duration_write_items(
+                                        &table_metadata,
+                                        key,
+                                        TimestampMillis::now().timestamp_millis().unsigned_abs(),
+                                        *aux_item_stream_ttl_hours,
+                                    )?;
+                                items.extend(policy_mutations);
                                 table_items_updated += 1;
                                 batch_items.append(&mut items);
                             }
@@ -2056,7 +2044,10 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                                 key,
                                 aux_item_stream_ttl_hours,
                             }),
-                    } => match self.apply_batch_delete_item(table_name, key).await {
+                    } => match self
+                        .apply_batch_delete_item(table_name, key, *aux_item_stream_ttl_hours)
+                        .await
+                    {
                         Ok(_) => {
                             total_items_updated += 1;
                         }
@@ -2468,6 +2459,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                     TransactWriteTableOperation::Delete {
                         table_info,
                         key: delete_request.key,
+                        item_stream_ttl_hours: delete_request.aux_item_stream_ttl_hours,
+                        use_key_attributes_for_missing_item_condition: false,
                         condition: cached_transact_condition_binding(
                             &mut condition_binding_cache,
                             delete_request.condition_expression,
@@ -2994,6 +2987,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
                 vec![TransactWriteTableOperation::Delete {
                     table_info,
                     key: mutation.key,
+                    item_stream_ttl_hours: None,
+                    use_key_attributes_for_missing_item_condition: false,
                     condition: None,
                     return_values_on_condition_check_failure: None,
                     replication,
@@ -3182,6 +3177,70 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let config = self.load_ttl_config(table_name).await?;
         cache.insert(table_name.clone(), config.clone());
         Ok(config)
+    }
+
+    async fn execute_delete_item(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        if key.is_empty() {
+            record_write(0, 0);
+            return Ok(None);
+        }
+        apply_gsi_write_pressure(self).await?;
+        let billed_bytes = attr_map_payload_bytes(&key);
+        let table_info = self
+            .get_table_metadata_from_name(&table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table_name.clone()))?;
+        let ttl_config = self.load_ttl_config(&table_name).await?;
+
+        let condition = condition_expression
+            .map(|condition_expression| {
+                parse_condition_expression(
+                    &condition_expression,
+                    expression_attribute_names.as_ref(),
+                    expression_attribute_values.as_ref(),
+                )
+                .map_err(|error| {
+                    warn!(error);
+                    StorageError::validation(StorageValidationKind::InvalidConditionExpression)
+                })
+            })
+            .transpose()?;
+
+        let mut old_new_items = self
+            .kv_store
+            .transact_write_table(
+                vec![TransactWriteTableOperation::Delete {
+                    table_info,
+                    key,
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    use_key_attributes_for_missing_item_condition: true,
+                    condition,
+                    return_values_on_condition_check_failure: None,
+                    replication: None,
+                    ttl_config,
+                }],
+                self.immediate_gsi_consistency,
+            )
+            .await
+            .map_err(normalize_conditional_transaction_error)?;
+
+        let Some((old_item, _)) = old_new_items.pop() else {
+            record_write(0, 0);
+            record_write_cost("delete_item", "delete", 1, billed_bytes);
+            return Ok(None);
+        };
+        record_write(usize::from(old_item.is_some()), 0);
+        record_write_cost("delete_item", "delete", 1, billed_bytes);
+
+        Ok(old_item)
     }
 
     pub(crate) fn requires_immediate_gsi_updates(&self, table_info: &StoredTableInfo) -> bool {
@@ -3501,6 +3560,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         table_name: &TableName,
         key: &KeyAttributes,
+        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<()> {
         if key.is_empty() {
             return Ok(());
@@ -3517,6 +3577,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 vec![TransactWriteTableOperation::Delete {
                     table_info,
                     key: key.clone(),
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    use_key_attributes_for_missing_item_condition: false,
                     condition: None,
                     return_values_on_condition_check_failure: None,
                     replication: None,

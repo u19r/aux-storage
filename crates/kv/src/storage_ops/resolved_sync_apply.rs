@@ -95,6 +95,8 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                     &[TransactWriteTableOperation::Delete {
                         table_info,
                         key: key_attributes.clone(),
+                        item_stream_ttl_hours: None,
+                        use_key_attributes_for_missing_item_condition: false,
                         condition: None,
                         return_values_on_condition_check_failure: None,
                         replication: None,

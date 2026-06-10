@@ -318,6 +318,8 @@ pub fn plan_table_operation(
         TableOp::Delete {
             table_info,
             key,
+            item_stream_ttl_hours,
+            use_key_attributes_for_missing_item_condition,
             condition,
             return_values_on_condition_check_failure,
             replication,
@@ -325,6 +327,8 @@ pub fn plan_table_operation(
         } => plan_table_delete(
             table_info,
             key,
+            *item_stream_ttl_hours,
+            *use_key_attributes_for_missing_item_condition,
             condition.as_ref(),
             return_values_on_condition_check_failure.as_ref(),
             current_bytes,
@@ -675,6 +679,8 @@ fn plan_table_put(
 fn plan_table_delete(
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
+    item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+    use_key_attributes_for_missing_item_condition: bool,
     condition: Option<&Condition>,
     return_values_on_condition_check_failure: Option<&String>,
     current_bytes: Option<&[u8]>,
@@ -695,10 +701,16 @@ fn plan_table_delete(
         merge_key_attributes(&mut current, key, table_info)?;
     }
     if let Some(condition) = condition {
+        let condition_item =
+            if current_bytes.is_none() && use_key_attributes_for_missing_item_condition {
+                &key_item
+            } else {
+                &current
+            };
         ensure_condition_for_table(
             index,
             condition,
-            &current,
+            condition_item,
             return_values_on_condition_check_failure,
             table_info,
         )?;
@@ -744,6 +756,15 @@ fn plan_table_delete(
         current_bytes.is_some().then_some(&current),
         None,
     )?));
+
+    mutations.extend(
+        crate::storage_ops::stream_duration::item_stream_duration_kv_mutations(
+            table_info,
+            key,
+            0,
+            item_stream_ttl_hours,
+        )?,
+    );
 
     Ok(((Some(current), None), mutations))
 }

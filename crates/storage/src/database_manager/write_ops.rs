@@ -502,16 +502,17 @@ impl DatabaseManager {
             aux_item_stream_ttl_hours,
             cache_effects,
         } = prepared;
-        if let Some(response) = self
-            .try_cached_guarded_delete_item(
-                &table_name,
-                &logical_key,
-                cache_effects.clone(),
-                condition_expression.clone(),
-                expression_attribute_names.clone(),
-                expression_attribute_values.clone(),
-            )
-            .await?
+        if aux_item_stream_ttl_hours.is_none()
+            && let Some(response) = self
+                .try_cached_guarded_delete_item(
+                    &table_name,
+                    &logical_key,
+                    cache_effects.clone(),
+                    condition_expression.clone(),
+                    expression_attribute_names.clone(),
+                    expression_attribute_values.clone(),
+                )
+                .await?
         {
             return Ok(response);
         }
