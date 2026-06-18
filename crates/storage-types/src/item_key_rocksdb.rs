@@ -69,6 +69,35 @@ impl ItemKey {
         let stream_item_key: StreamKey = &stream_name + stream_item_id;
         Ok(stream_item_key)
     }
+
+    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
+        match self {
+            ItemKey::Table(key) => key.sorted_storage_suffix(),
+            ItemKey::Index(key) => key.sorted_storage_suffix(),
+            ItemKey::IndexPrefix(key) => key.sorted_storage_suffix(),
+        }
+    }
+}
+
+impl TableKey {
+    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
+        serialize_key_part_values(&self.hash_key, self.range_key.as_ref())
+    }
+}
+
+impl IndexKeyPrefix {
+    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
+        serialize_key_part_values(&self.hash_key, self.range_key.as_ref())
+    }
+}
+
+impl IndexKey {
+    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
+        let mut key_parts = serialize_key_part_values(&self.hash_key, self.range_key.as_ref())?;
+        let table_key_bytes = self.table_key.sorted_storage_suffix()?;
+        ItemKey::add_length_prefixed_part_rocksdb(&mut key_parts, &table_key_bytes);
+        Ok(key_parts)
+    }
 }
 
 impl SerializesToKey for ItemKey {

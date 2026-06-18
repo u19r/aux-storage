@@ -162,6 +162,41 @@ pub(crate) fn create_stream_cursors_table(dialect: &dyn SqlDialect) -> &'static 
     }
 }
 
+pub(crate) fn create_change_index_table(dialect: &dyn SqlDialect) -> &'static str {
+    match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            r"CREATE TABLE IF NOT EXISTS sys_change_index (
+    slot INTEGER NOT NULL,
+    versionstamp TEXT NOT NULL,
+    table_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (slot, versionstamp, table_id)
+)"
+        }
+        SqlDialectKind::Postgres => {
+            "CREATE TABLE IF NOT EXISTS sys_change_index (
+        slot INTEGER NOT NULL,
+        versionstamp TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        PRIMARY KEY (slot, versionstamp, table_id)
+    )"
+        }
+    }
+}
+
+pub(crate) fn create_change_index_created_at_index(dialect: &dyn SqlDialect) -> &'static str {
+    match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "CREATE INDEX IF NOT EXISTS idx_change_index_created_at ON sys_change_index(created_at)"
+        }
+        SqlDialectKind::Postgres => {
+            "CREATE INDEX IF NOT EXISTS idx_change_index_created_at
+        ON sys_change_index(created_at)"
+        }
+    }
+}
+
 pub(crate) fn create_stream_items_internal_time_index(dialect: &dyn SqlDialect) -> &'static str {
     match dialect.kind() {
         SqlDialectKind::Sqlite => {
@@ -215,6 +250,41 @@ pub(crate) fn insert_stream_entry(dialect: &dyn SqlDialect) -> &'static str {
             "INSERT INTO sys_stream_items (stream_name, item_id, data, created_at, data_type) \
              VALUES ($1, $2, $3, $4, $5)"
         }
+    }
+}
+
+pub(crate) fn insert_change_index_marker(dialect: &dyn SqlDialect) -> &'static str {
+    match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "INSERT OR IGNORE INTO sys_change_index (slot, versionstamp, table_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4)"
+        }
+        SqlDialectKind::Postgres => {
+            "INSERT INTO sys_change_index (slot, versionstamp, table_id, created_at) VALUES ($1, \
+             $2, $3, $4) ON CONFLICT DO NOTHING"
+        }
+    }
+}
+
+pub(crate) fn list_change_index_markers(dialect: &dyn SqlDialect) -> &'static str {
+    match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "SELECT slot, versionstamp, table_id FROM sys_change_index WHERE slot = ?1 AND \
+             versionstamp > ?2 ORDER BY versionstamp, table_id LIMIT ?3"
+        }
+        SqlDialectKind::Postgres => {
+            "SELECT slot, versionstamp, table_id FROM sys_change_index WHERE slot = $1 AND \
+             versionstamp > $2 ORDER BY versionstamp, table_id LIMIT $3"
+        }
+    }
+}
+
+pub(crate) fn trim_change_index_markers_older_than(dialect: &dyn SqlDialect) -> &'static str {
+    match dialect.kind() {
+        SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
+            "DELETE FROM sys_change_index WHERE created_at < ?1"
+        }
+        SqlDialectKind::Postgres => "DELETE FROM sys_change_index WHERE created_at < $1",
     }
 }
 

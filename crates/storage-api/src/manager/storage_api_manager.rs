@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use http_error::HttpApiError;
 use storage::{DatabaseManager, ReplicationMutationApplyOutcome};
+use storage_provider::ListChangeIndexMarkersRequest;
 use storage_types::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
     DeleteTableRequest, DescribeStreamRequest, DescribeTableRequest, DescribeTimeToLiveRequest,
@@ -351,6 +352,10 @@ pub trait StorageApiManager: Send + Sync {
         &self,
         request: UpdateContinuousBackupsRequest,
     ) -> Result<Response, HttpApiError>;
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> Result<Response, HttpApiError>;
     async fn get_stream_records(
         &self,
         request: GetStreamRecordsRequest,
@@ -494,6 +499,13 @@ impl StorageApiManager for StorageApiManagerImpl {
             "UpdateContinuousBackups is not yet supported on the AuxFn storage compatibility \
              surface",
         ))
+    }
+
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.list_change_index_markers_internal(request).await
     }
 
     async fn get_stream_records(

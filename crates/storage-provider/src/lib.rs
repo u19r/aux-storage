@@ -3,6 +3,7 @@
 //! Downstream libraries should depend on this crate for embedded storage
 //! abstractions instead of backend implementation crates.
 
+mod change_index;
 mod config;
 mod provider;
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod update_logic;
 pub use storage_types::AttributeValue;
 
 pub use crate::{
+    change_index::*,
     config::*,
     provider::*,
     stream_duration_planner::*,

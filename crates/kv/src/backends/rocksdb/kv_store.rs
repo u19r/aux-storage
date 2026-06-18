@@ -54,7 +54,10 @@ pub struct RocksDbKvStore {
 }
 
 static NEXT_ROCKSDB_STREAM_ITEM_VERSION: AtomicU64 = AtomicU64::new(0);
-pub(crate) const ROCKSDB_STREAM_HIGH_WATER_KEY: &[u8] = b"sys/streams/rocksdb/high-water";
+
+pub(crate) fn rocksdb_stream_high_water_key() -> Vec<u8> {
+    crate::keyspace::compact::stream_high_water_key()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RocksDbDurabilityPolicy {
@@ -504,11 +507,12 @@ impl SortedKvStore for RocksDbKvStore {
         let db_guard = self.db.read().await;
         let opts = write_options_sync();
         let next_byte = increment_bytes(prefix.clone());
-        let cf = default_cf_handle(&db_guard)?;
-
-        db_guard
-            .delete_range_cf_opt(&cf, prefix, next_byte, &opts)
-            .map_err(|e| StorageError::internal(&format!("delete prefix failed: {e}")))
+        for key in range_keys(&db_guard, &prefix, &next_byte)? {
+            db_guard
+                .delete_opt(key, &opts)
+                .map_err(|e| StorageError::internal(&format!("delete prefix key failed: {e}")))?;
+        }
+        Ok(())
     }
 
     async fn get_range(
@@ -708,8 +712,9 @@ fn allocate_rocksdb_stream_item_id(
     txn: &Transaction<OptimisticTransactionDB>,
     fallback_item_id: StreamItemId,
 ) -> StorageResult<StreamItemId> {
+    let high_water_key = rocksdb_stream_high_water_key();
     let current = txn
-        .get_for_update(ROCKSDB_STREAM_HIGH_WATER_KEY, true)
+        .get_for_update(&high_water_key, true)
         .map_err(generic_err)?
         .as_deref()
         .map(StreamItemId::try_from)
@@ -722,20 +727,13 @@ fn allocate_rocksdb_stream_item_id(
     let allocated = current
         .map(|current| current.increment().max(fallback_item_id))
         .unwrap_or(fallback_item_id);
-    txn.put(ROCKSDB_STREAM_HIGH_WATER_KEY, allocated.as_bytes())
+    txn.put(&high_water_key, allocated.as_bytes())
         .map_err(|error| {
             StorageError::internal(&format!(
                 "persist rocksdb stream high-water id failed: {error}"
             ))
         })?;
     Ok(allocated)
-}
-
-fn default_cf_handle(
-    db: &OptimisticTransactionDB,
-) -> StorageResult<Arc<rocksdb::BoundColumnFamily<'_>>> {
-    db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME)
-        .ok_or_else(|| StorageError::internal("get default column family handle failed"))
 }
 
 fn range_keys(

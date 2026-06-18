@@ -36,6 +36,7 @@ use super::stream_duration::TursoStreamPointerIndexEntry;
 use crate::{
     GsiPhysicalName,
     backends::turso::sql_statements,
+    change_index,
     constants::{BASE_BACKOFF_MS, MAX_PUT_ITEM_ATTEMPTS},
     provider_core::gsi_write::{
         GsiAttributesBlobStyle, GsiSqlPlanOptions, GsiUpsertStyle, PlaceholderNumbering,
@@ -1040,7 +1041,36 @@ impl TursoStorageProvider {
             },
         )
         .await?;
+        self.insert_change_index_marker(conn, table_info, table_pointer_stream_item_id, created_at)
+            .await?;
 
+        Ok(())
+    }
+
+    async fn insert_change_index_marker<C>(
+        &self,
+        conn: &C,
+        table_info: &StoredTableInfo,
+        pointer_stream_item_id: storage_types::StreamItemId,
+        created_at: TimestampMillis,
+    ) -> StorageResult<()>
+    where
+        C: TursoSqlConnection + ?Sized,
+    {
+        let slot = change_index::slot_for_table(&table_info.table_name);
+        let versionstamp = change_index::sortable_version(pointer_stream_item_id);
+        let _ = self
+            .execute(
+                conn,
+                sql_statements::insert_change_index_marker(),
+                vec![
+                    TursoValue::Integer(i64::from(slot)),
+                    TursoValue::Text(versionstamp),
+                    TursoValue::Text(table_info.table_name.as_ref().to_owned()),
+                    TursoValue::Integer(created_at.timestamp_millis()),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -1392,12 +1422,14 @@ impl TursoStorageProvider {
                     StorageError::internal(&format!("turso gsi stream read failed: {error}"))
                 })?;
 
-            let had_more = records_result.last_evaluated_key.is_some();
+            let had_more = records_result.has_more;
             let last_item = records_result.last_evaluated_key.or_else(|| {
-                records_result
-                    .records
-                    .last()
-                    .map(|(pointer, _)| pointer.stream_item_id)
+                records_result.last_scanned_key.or_else(|| {
+                    records_result
+                        .records
+                        .last()
+                        .map(|(pointer, _)| pointer.stream_item_id)
+                })
             });
             let records = records_result.records;
 

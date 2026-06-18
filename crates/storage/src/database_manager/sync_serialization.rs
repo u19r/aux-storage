@@ -20,7 +20,7 @@ impl Serialize for SortedAttributeMap<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
         let mut entries = self.0.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_unstable_by_key(|(left, _)| *left);
 
         let mut map = serializer.serialize_map(Some(entries.len()))?;
         for (key, value) in entries {

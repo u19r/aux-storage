@@ -88,7 +88,7 @@ impl StreamProvider for InMemoryStreamProvider {
             .cloned()
             .unwrap_or_default();
 
-        items.sort_by(|a, b| a.id.cmp(&b.id));
+        items.sort_by_key(|a| a.id);
         let filtered = match exclusive_start_key {
             Some(start) => items.into_iter().filter(|item| item.id > start).collect(),
             None => items,
@@ -119,14 +119,14 @@ impl StreamProvider for InMemoryStreamProvider {
             .cloned()
             .unwrap_or_default();
 
-        items.sort_by(|a, b| a.id.cmp(&b.id));
+        items.sort_by_key(|a| a.id);
         let filtered = match exclusive_start_key {
             Some(start) => items.into_iter().filter(|item| item.id < start).collect(),
             None => items,
         };
 
         let mut filtered: Vec<StreamItem> = filtered;
-        filtered.sort_by(|a, b| b.id.cmp(&a.id));
+        filtered.sort_by_key(|item| std::cmp::Reverse(item.id));
         let has_more = filtered.len() > limit as usize;
         filtered.truncate(limit as usize);
         let last_evaluated_key = filtered.last().map(|item| item.id);
@@ -540,9 +540,110 @@ fn pointer_stream_omits_last_evaluated_key_on_terminal_page() {
             .expect("pointer stream read");
 
         assert_eq!(result.records.len(), 1);
+        assert_eq!(result.last_scanned_key, Some(stream_item_id(2)));
+        assert!(!result.has_more);
         assert!(
             result.last_evaluated_key.is_none(),
             "terminal pointer page should not emit a follow-up token"
+        );
+    });
+}
+
+#[test]
+fn pointer_stream_reports_last_scanned_key_when_terminal_page_decodes_no_records() {
+    futures::executor::block_on(async {
+        let pointer_stream = StreamName::new(b"pointer-stream");
+        let item_stream = StreamName::new(b"item-stream");
+        let table_name = TableName::new("terminal_empty_page_table");
+        let pointer_id = stream_item_id(3);
+
+        let pointer_stream_item = build_stream_item(
+            pointer_id,
+            None,
+            storage_types::storage_serde::to_bytes(&StoredStreamPointer::embedded(
+                item_stream,
+                table_name,
+                item_stream_version(1),
+                vec![EmbeddedStreamItem {
+                    data: Vec::new(),
+                    data_type: StreamDataType::DeleteMarker,
+                }],
+            ))
+            .expect("pointer bytes"),
+            StreamDataType::StreamPointer,
+        );
+
+        let provider = InMemoryStreamProvider::new(
+            HashMap::from([(pointer_stream.clone(), vec![pointer_stream_item])]),
+            HashMap::new(),
+        );
+
+        let (records, last_pointer) = provider
+            .get_stream_records_from_pointer_stream(
+                pointer_stream,
+                &[KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                None,
+                Some(10),
+            )
+            .await
+            .expect("stream records");
+
+        assert!(records.is_empty());
+        assert_eq!(
+            last_pointer,
+            Some(pointer_id),
+            "durable pollers need a checkpoint cursor even when a terminal page only contains \
+             skipped pointers"
+        );
+    });
+}
+
+#[test]
+fn pointer_stream_reports_last_scanned_key_when_pointer_target_image_is_missing() {
+    futures::executor::block_on(async {
+        let pointer_stream = StreamName::new(b"pointer-stream");
+        let item_stream = StreamName::new(b"missing-item-stream");
+        let table_name = TableName::new("missing_image_page_table");
+        let pointer_id = stream_item_id(4);
+
+        let pointer_stream_item = build_stream_item(
+            pointer_id,
+            None,
+            storage_types::storage_serde::to_bytes(&StoredStreamPointer::pointer(
+                item_stream,
+                table_name,
+                item_stream_version(1),
+            ))
+            .expect("pointer bytes"),
+            StreamDataType::StreamPointer,
+        );
+
+        let provider = InMemoryStreamProvider::new(
+            HashMap::from([(pointer_stream.clone(), vec![pointer_stream_item])]),
+            HashMap::new(),
+        );
+
+        let (records, last_pointer) = provider
+            .get_stream_records_from_pointer_stream(
+                pointer_stream,
+                &[KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                None,
+                Some(10),
+            )
+            .await
+            .expect("stream records");
+
+        assert!(records.is_empty());
+        assert_eq!(
+            last_pointer,
+            Some(pointer_id),
+            "missing pointer target images must not permanently strand a source-polling checkpoint"
         );
     });
 }

@@ -35,6 +35,10 @@ impl StreamProvider for SQLiteStorageProvider {
                 conn.execute(sql, params)
                     .map_err(crate::error_handler::map_sqlite_error)?;
 
+                let (sql, params) = sql_statements::create_change_index_table();
+                conn.execute(sql, params)
+                    .map_err(crate::error_handler::map_sqlite_error)?;
+
                 let (sql, params) = sql_statements::create_stream_format_metadata_table();
                 conn.execute(sql, params)
                     .map_err(crate::error_handler::map_sqlite_error)?;
@@ -46,6 +50,10 @@ impl StreamProvider for SQLiteStorageProvider {
                     .map_err(crate::error_handler::map_sqlite_error)?;
 
                 let (sql, params) = sql_statements::create_stream_cursors_internal_index();
+                conn.execute(sql, params)
+                    .map_err(crate::error_handler::map_sqlite_error)?;
+
+                let (sql, params) = sql_statements::create_change_index_created_at_index();
                 conn.execute(sql, params)
                     .map_err(crate::error_handler::map_sqlite_error)?;
 

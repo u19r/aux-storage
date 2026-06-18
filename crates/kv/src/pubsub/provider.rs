@@ -12,14 +12,26 @@ use pubsub_provider::{
 use storage_types::{StorageError, TimestampMillis};
 
 use crate::{
-    pubsub::constants::{
-        CLAIM_SCAN_MAX_LIMIT, CLAIM_SCAN_MULTIPLIER, DELIVERY_CLAIM_PREFIX, DELIVERY_PREFIX,
-        DELIVERY_SUBSCRIPTION_PREFIX, SUBSCRIPTION_DEDUPE_PREFIX, SUBSCRIPTION_PREFIX,
-        SUBSCRIPTION_TOPIC_PREFIX, TOPIC_NAME_PREFIX, TOPIC_PREFIX,
-    },
+    keyspace::compact::{self, PubsubRecordKind, U48},
+    pubsub::constants::{CLAIM_SCAN_MAX_LIMIT, CLAIM_SCAN_MULTIPLIER},
     sorted_kv::SortedKvDbStorageProvider,
     sorted_kv_store::{DirectWriteOperation, SortedKvStore},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PubsubStorageId(U48);
+
+impl PubsubStorageId {
+    fn new(value: u64) -> PubsubResult<Self> {
+        U48::new(value)
+            .map(Self)
+            .map_err(|error| PubsubError::storage(format!("invalid pubsub storage id: {error}")))
+    }
+
+    const fn get(self) -> U48 {
+        self.0
+    }
+}
 
 #[async_trait]
 impl<S> PubsubProvider for SortedKvDbStorageProvider<S>
@@ -40,11 +52,20 @@ where S: SortedKvStore + 'static
             display_name: request.attributes.get("DisplayName").cloned(),
             created_at: TimestampMillis::now(),
         };
-        let topic_key = topic_key(&topic.topic_arn);
+        let topic_id = self
+            .allocate_pubsub_id(compact::topic_id_allocator_key())
+            .await?;
+        let topic_key = topic_key_for_id(topic_id);
+        let arn_key = topic_arn_lookup_key(&topic.topic_arn);
         let name_key = topic_name_key(&topic.name);
+        let topic_id_bytes = encode_pubsub_storage_id(topic_id);
         let operations = vec![
             DirectWriteOperation::CheckValue {
                 key: name_key.clone(),
+                expected_value: None,
+            },
+            DirectWriteOperation::CheckValue {
+                key: arn_key.clone(),
                 expected_value: None,
             },
             DirectWriteOperation::Put {
@@ -52,8 +73,12 @@ where S: SortedKvStore + 'static
                 value: encode_pubsub(&topic)?,
             },
             DirectWriteOperation::Put {
+                key: arn_key,
+                value: topic_id_bytes.clone(),
+            },
+            DirectWriteOperation::Put {
                 key: name_key,
-                value: topic.topic_arn.as_str().as_bytes().to_vec(),
+                value: topic_id_bytes,
             },
         ];
 
@@ -78,7 +103,7 @@ where S: SortedKvStore + 'static
             .subscriptions;
         let mut operations = vec![
             DirectWriteOperation::Delete {
-                key: topic_key(topic_arn),
+                key: topic_arn_lookup_key(topic_arn),
             },
             DirectWriteOperation::Delete {
                 key: topic_name_key(&topic.name),
@@ -96,7 +121,10 @@ where S: SortedKvStore + 'static
     }
 
     async fn get_topic(&self, topic_arn: &TopicArn) -> PubsubResult<Option<Topic>> {
-        self.get_record(&topic_key(topic_arn)).await
+        let Some(topic_id) = self.id_from_lookup(topic_arn_lookup_key(topic_arn)).await? else {
+            return Ok(None);
+        };
+        self.get_record(&topic_key_for_id(topic_id)).await
     }
 
     async fn get_topic_attributes(
@@ -122,8 +150,12 @@ where S: SortedKvStore + 'static
         if let Some(value) = request.attributes.get("DisplayName") {
             topic.display_name = Some(value.clone());
         }
+        let topic_id = self
+            .id_from_lookup(topic_arn_lookup_key(&topic.topic_arn))
+            .await?
+            .ok_or_else(|| PubsubError::topic_not_found(topic.topic_arn.to_string()))?;
         self.kv_store
-            .put(&topic_key(&topic.topic_arn), &encode_pubsub(&topic)?, None)
+            .put(&topic_key_for_id(topic_id), &encode_pubsub(&topic)?, None)
             .await
             .map_err(map_storage_error)?;
         Ok(topic)
@@ -132,7 +164,12 @@ where S: SortedKvStore + 'static
     async fn list_topics(&self, _request: ListTopicsRequest) -> PubsubResult<ListTopicsResponse> {
         let range = self
             .kv_store
-            .get_prefix(TOPIC_PREFIX, true, None, true)
+            .get_prefix(
+                &compact::pubsub_kind_prefix(PubsubRecordKind::Topic).start,
+                true,
+                None,
+                true,
+            )
             .await
             .map_err(map_storage_error)?;
         let mut topics = Vec::with_capacity(range.items.len());
@@ -168,30 +205,41 @@ where S: SortedKvStore + 'static
             extra_json: request.extra_json,
             created_at: TimestampMillis::now(),
         };
-        let dedupe_key = subscription_dedupe_key(
-            &subscription.topic_arn,
-            subscription.protocol,
-            &subscription.endpoint,
-        );
+        let topic_id = self
+            .id_from_lookup(topic_arn_lookup_key(&subscription.topic_arn))
+            .await?
+            .ok_or_else(|| PubsubError::topic_not_found(subscription.topic_arn.to_string()))?;
+        let subscription_id = self
+            .allocate_pubsub_id(compact::subscription_id_allocator_key())
+            .await?;
+        let dedupe_key =
+            subscription_dedupe_key_for_id(topic_id, subscription.protocol, &subscription.endpoint);
+        let arn_key = subscription_arn_lookup_key(&subscription.subscription_arn);
+        let subscription_id_bytes = encode_pubsub_storage_id(subscription_id);
         let operations = vec![
             DirectWriteOperation::CheckValue {
                 key: dedupe_key.clone(),
                 expected_value: None,
             },
+            DirectWriteOperation::CheckValue {
+                key: arn_key.clone(),
+                expected_value: None,
+            },
             DirectWriteOperation::Put {
-                key: subscription_key(&subscription.subscription_arn),
+                key: subscription_key_for_id(subscription_id),
                 value: encode_pubsub(&subscription)?,
             },
             DirectWriteOperation::Put {
-                key: subscription_topic_key(
-                    &subscription.topic_arn,
-                    &subscription.subscription_arn,
-                ),
-                value: encode_pubsub(&subscription)?,
+                key: subscription_topic_key_for_id(topic_id, subscription_id),
+                value: subscription_id_bytes.clone(),
+            },
+            DirectWriteOperation::Put {
+                key: arn_key,
+                value: subscription_id_bytes.clone(),
             },
             DirectWriteOperation::Put {
                 key: dedupe_key,
-                value: subscription.subscription_arn.as_str().as_bytes().to_vec(),
+                value: subscription_id_bytes,
             },
         ];
 
@@ -246,7 +294,14 @@ where S: SortedKvStore + 'static
         &self,
         subscription_arn: &SubscriptionArn,
     ) -> PubsubResult<Option<Subscription>> {
-        self.get_record(&subscription_key(subscription_arn)).await
+        let Some(subscription_id) = self
+            .id_from_lookup(subscription_arn_lookup_key(subscription_arn))
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.get_record(&subscription_key_for_id(subscription_id))
+            .await
     }
 
     async fn set_subscription_attributes(
@@ -288,7 +343,12 @@ where S: SortedKvStore + 'static
         } else {
             let range = self
                 .kv_store
-                .get_prefix(SUBSCRIPTION_PREFIX, true, None, true)
+                .get_prefix(
+                    &compact::pubsub_kind_prefix(PubsubRecordKind::Subscription).start,
+                    true,
+                    None,
+                    true,
+                )
                 .await
                 .map_err(map_storage_error)?;
             let mut found = Vec::with_capacity(range.items.len());
@@ -316,22 +376,29 @@ where S: SortedKvStore + 'static
         if records.is_empty() {
             return Ok(());
         }
-        let keys = records
-            .iter()
-            .map(|record| delivery_key(&record.id))
-            .collect::<Vec<_>>();
-        let previous_values = self
-            .kv_store
-            .multi_get(keys, true)
-            .await
-            .map_err(map_storage_error)?;
         let mut operations = Vec::with_capacity(records.len() * 4);
-        for (record, previous_value) in records.into_iter().zip(previous_values) {
-            let previous = previous_value
-                .as_deref()
-                .map(decode_pubsub::<DeliveryRecord>)
-                .transpose()?;
-            push_delivery_record_operations(record, previous, &mut operations)?;
+        for record in records {
+            let previous = self.get_delivery_record(&record.id).await?;
+            let delivery_id = match self
+                .id_from_lookup(delivery_record_lookup_key(&record.id))
+                .await?
+            {
+                Some(id) => id,
+                None => {
+                    self.allocate_pubsub_id(compact::delivery_id_allocator_key())
+                        .await?
+                }
+            };
+            let subscription_id = self
+                .ensure_subscription_id_for_arn(&record.subscription_arn)
+                .await?;
+            push_delivery_record_operations(
+                record,
+                previous,
+                delivery_id,
+                subscription_id,
+                &mut operations,
+            )?;
         }
         self.kv_store
             .transact_write_unchecked(operations)
@@ -364,16 +431,22 @@ where S: SortedKvStore + 'static
                     continue;
                 }
                 let old_record = encode_pubsub(&record)?;
+                let Some(delivery_id) = self
+                    .id_from_lookup(delivery_record_lookup_key(&record.id))
+                    .await?
+                else {
+                    continue;
+                };
                 record.lease_owner = Some(request.owner.clone());
                 record.lease_expires_at = Some(request.lease_expires_at);
                 record.updated_at = request.now;
                 let operations = vec![
                     DirectWriteOperation::CheckValue {
-                        key: delivery_key(&record.id),
+                        key: delivery_key_for_id(delivery_id),
                         expected_value: Some(old_record),
                     },
                     DirectWriteOperation::Put {
-                        key: delivery_key(&record.id),
+                        key: delivery_key_for_id(delivery_id),
                         value: encode_pubsub(&record)?,
                     },
                 ];
@@ -399,13 +472,85 @@ where S: SortedKvStore + 'static
         &self,
         record_id: &DeliveryRecordId,
     ) -> PubsubResult<Option<DeliveryRecord>> {
-        self.get_record(&delivery_key(record_id)).await
+        let Some(delivery_id) = self
+            .id_from_lookup(delivery_record_lookup_key(record_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.get_record(&delivery_key_for_id(delivery_id)).await
     }
 }
 
 impl<S> SortedKvDbStorageProvider<S>
 where S: SortedKvStore + 'static
 {
+    async fn allocate_pubsub_id(&self, allocator_key: Vec<u8>) -> PubsubResult<PubsubStorageId> {
+        let allocator_value = self
+            .kv_store
+            .get(&allocator_key, true)
+            .await
+            .map_err(map_storage_error)?;
+        let id = match allocator_value.as_deref() {
+            Some(bytes) => decode_pubsub_storage_id(bytes)?,
+            None => PubsubStorageId::new(1)?,
+        };
+        let next_id = PubsubStorageId::new(id.get().get().saturating_add(1))?;
+        self.kv_store
+            .transact_write_unchecked(vec![
+                DirectWriteOperation::CheckValue {
+                    key: allocator_key.clone(),
+                    expected_value: allocator_value,
+                },
+                DirectWriteOperation::Put {
+                    key: allocator_key,
+                    value: encode_pubsub_storage_id(next_id),
+                },
+            ])
+            .await
+            .map_err(map_storage_error)?;
+        Ok(id)
+    }
+
+    async fn id_from_lookup(&self, key: Vec<u8>) -> PubsubResult<Option<PubsubStorageId>> {
+        self.kv_store
+            .get(&key, true)
+            .await
+            .map_err(map_storage_error)?
+            .as_deref()
+            .map(decode_pubsub_storage_id)
+            .transpose()
+    }
+
+    async fn ensure_subscription_id_for_arn(
+        &self,
+        subscription_arn: &SubscriptionArn,
+    ) -> PubsubResult<PubsubStorageId> {
+        if let Some(subscription_id) = self
+            .id_from_lookup(subscription_arn_lookup_key(subscription_arn))
+            .await?
+        {
+            return Ok(subscription_id);
+        }
+        let subscription_id = self
+            .allocate_pubsub_id(compact::subscription_id_allocator_key())
+            .await?;
+        self.kv_store
+            .transact_write_unchecked(vec![
+                DirectWriteOperation::CheckValue {
+                    key: subscription_arn_lookup_key(subscription_arn),
+                    expected_value: None,
+                },
+                DirectWriteOperation::Put {
+                    key: subscription_arn_lookup_key(subscription_arn),
+                    value: encode_pubsub_storage_id(subscription_id),
+                },
+            ])
+            .await
+            .map_err(map_storage_error)?;
+        Ok(subscription_id)
+    }
+
     async fn get_record<T>(&self, key: &[u8]) -> PubsubResult<Option<T>>
     where T: serde::de::DeserializeOwned {
         match self
@@ -420,18 +565,10 @@ where S: SortedKvStore + 'static
     }
 
     async fn get_topic_by_name(&self, name: &TopicName) -> PubsubResult<Option<Topic>> {
-        let Some(topic_arn_bytes) = self
-            .kv_store
-            .get(&topic_name_key(name), true)
-            .await
-            .map_err(map_storage_error)?
-        else {
+        let Some(topic_id) = self.id_from_lookup(topic_name_key(name)).await? else {
             return Ok(None);
         };
-        let topic_arn_text = String::from_utf8(topic_arn_bytes)
-            .map_err(|error| PubsubError::storage(format!("invalid topic name index: {error}")))?;
-        let topic_arn = TopicArn::new(topic_arn_text)?;
-        self.get_topic(&topic_arn).await
+        self.get_record(&topic_key_for_id(topic_id)).await
     }
 
     async fn find_subscription_by_dedupe(
@@ -448,41 +585,42 @@ where S: SortedKvStore + 'static
         protocol: SubscriptionProtocol,
         endpoint: &str,
     ) -> PubsubResult<Option<Subscription>> {
-        let Some(subscription_arn_bytes) = self
-            .kv_store
-            .get(
-                &subscription_dedupe_key(topic_arn, protocol, endpoint),
-                true,
-            )
-            .await
-            .map_err(map_storage_error)?
+        let Some(topic_id) = self.id_from_lookup(topic_arn_lookup_key(topic_arn)).await? else {
+            return Ok(None);
+        };
+        let Some(subscription_id) = self
+            .id_from_lookup(subscription_dedupe_key_for_id(topic_id, protocol, endpoint))
+            .await?
         else {
             return Ok(None);
         };
-        let subscription_arn_text = String::from_utf8(subscription_arn_bytes).map_err(|error| {
-            PubsubError::storage(format!("invalid subscription dedupe index: {error}"))
-        })?;
-        let subscription_arn = SubscriptionArn::new(subscription_arn_text)?;
-        self.get_subscription(&subscription_arn).await
+        self.get_record(&subscription_key_for_id(subscription_id))
+            .await
     }
 
     async fn list_subscriptions_for_topic(
         &self,
         topic_arn: &TopicArn,
     ) -> PubsubResult<Vec<Subscription>> {
+        let Some(topic_id) = self.id_from_lookup(topic_arn_lookup_key(topic_arn)).await? else {
+            return Ok(Vec::new());
+        };
         let range = self
             .kv_store
-            .get_prefix(&subscription_topic_prefix(topic_arn), true, None, true)
+            .get_prefix(
+                &subscription_topic_prefix_for_id(topic_id),
+                true,
+                None,
+                true,
+            )
             .await
             .map_err(map_storage_error)?;
         let mut subscriptions = Vec::with_capacity(range.items.len());
-        for (key, value) in range.items {
-            if let Ok(subscription) = decode_pubsub::<Subscription>(&value) {
-                subscriptions.push(subscription);
-                continue;
-            }
-            if let Some(subscription_arn) = subscription_arn_from_topic_index_key(&key)?
-                && let Some(subscription) = self.get_subscription(&subscription_arn).await?
+        for (_key, value) in range.items {
+            let subscription_id = decode_pubsub_storage_id(&value)?;
+            if let Some(subscription) = self
+                .get_record(&subscription_key_for_id(subscription_id))
+                .await?
             {
                 subscriptions.push(subscription);
             }
@@ -492,18 +630,25 @@ where S: SortedKvStore + 'static
 
     async fn write_subscription_record(&self, subscription: &Subscription) -> PubsubResult<()> {
         let encoded = encode_pubsub(subscription)?;
+        let subscription_id = self
+            .id_from_lookup(subscription_arn_lookup_key(&subscription.subscription_arn))
+            .await?
+            .ok_or_else(|| {
+                PubsubError::subscription_not_found(subscription.subscription_arn.to_string())
+            })?;
+        let topic_id = self
+            .id_from_lookup(topic_arn_lookup_key(&subscription.topic_arn))
+            .await?
+            .ok_or_else(|| PubsubError::topic_not_found(subscription.topic_arn.to_string()))?;
         self.kv_store
             .transact_write_unchecked(vec![
                 DirectWriteOperation::Put {
-                    key: subscription_key(&subscription.subscription_arn),
-                    value: encoded.clone(),
+                    key: subscription_key_for_id(subscription_id),
+                    value: encoded,
                 },
                 DirectWriteOperation::Put {
-                    key: subscription_topic_key(
-                        &subscription.topic_arn,
-                        &subscription.subscription_arn,
-                    ),
-                    value: encoded,
+                    key: subscription_topic_key_for_id(topic_id, subscription_id),
+                    value: encode_pubsub_storage_id(subscription_id),
                 },
             ])
             .await
@@ -530,24 +675,39 @@ where S: SortedKvStore + 'static
         subscription: &Subscription,
         operations: &mut Vec<DirectWriteOperation>,
     ) -> PubsubResult<()> {
+        let Some(subscription_id) = self
+            .id_from_lookup(subscription_arn_lookup_key(&subscription.subscription_arn))
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(topic_id) = self
+            .id_from_lookup(topic_arn_lookup_key(&subscription.topic_arn))
+            .await?
+        else {
+            return Ok(());
+        };
         operations.push(DirectWriteOperation::Delete {
-            key: subscription_key(&subscription.subscription_arn),
+            key: subscription_key_for_id(subscription_id),
         });
         operations.push(DirectWriteOperation::Delete {
-            key: subscription_topic_key(&subscription.topic_arn, &subscription.subscription_arn),
+            key: subscription_topic_key_for_id(topic_id, subscription_id),
         });
         operations.push(DirectWriteOperation::Delete {
-            key: subscription_dedupe_key(
-                &subscription.topic_arn,
+            key: subscription_dedupe_key_for_id(
+                topic_id,
                 subscription.protocol,
                 &subscription.endpoint,
             ),
+        });
+        operations.push(DirectWriteOperation::Delete {
+            key: subscription_arn_lookup_key(&subscription.subscription_arn),
         });
 
         let range = self
             .kv_store
             .get_prefix(
-                &delivery_subscription_prefix(&subscription.subscription_arn),
+                &delivery_subscription_prefix_for_id(subscription_id),
                 true,
                 None,
                 true,
@@ -555,16 +715,16 @@ where S: SortedKvStore + 'static
             .await
             .map_err(map_storage_error)?;
         for (key, value) in range.items {
-            let record_id_text = String::from_utf8(value.into_vec()).map_err(|error| {
-                PubsubError::storage(format!("invalid delivery subscription index: {error}"))
-            })?;
-            let record_id = DeliveryRecordId(record_id_text);
-            if let Some(record) = self.get_delivery_record(&record_id).await? {
-                if let Some(claim_key) = delivery_claim_key_for_record(&record) {
+            let delivery_id = decode_pubsub_storage_id(&value)?;
+            if let Some(record) = self.get_record(&delivery_key_for_id(delivery_id)).await? {
+                if let Some(claim_key) = delivery_claim_key_for_record(&record, delivery_id) {
                     operations.push(DirectWriteOperation::Delete { key: claim_key });
                 }
                 operations.push(DirectWriteOperation::Delete {
-                    key: delivery_key(&record.id),
+                    key: delivery_key_for_id(delivery_id),
+                });
+                operations.push(DirectWriteOperation::Delete {
+                    key: delivery_record_lookup_key(&record.id),
                 });
             }
             operations.push(DirectWriteOperation::Delete {
@@ -576,8 +736,27 @@ where S: SortedKvStore + 'static
 
     async fn upsert_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()> {
         let previous = self.get_delivery_record(&record.id).await?;
+        let delivery_id = match self
+            .id_from_lookup(delivery_record_lookup_key(&record.id))
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                self.allocate_pubsub_id(compact::delivery_id_allocator_key())
+                    .await?
+            }
+        };
+        let subscription_id = self
+            .ensure_subscription_id_for_arn(&record.subscription_arn)
+            .await?;
         let mut operations = Vec::new();
-        push_delivery_record_operations(record, previous, &mut operations)?;
+        push_delivery_record_operations(
+            record,
+            previous,
+            delivery_id,
+            subscription_id,
+            &mut operations,
+        )?;
         self.kv_store
             .transact_write_unchecked(operations)
             .await
@@ -617,11 +796,8 @@ where S: SortedKvStore + 'static
             if due_at > now {
                 break;
             }
-            let record_id_text = String::from_utf8(value.into_vec()).map_err(|error| {
-                PubsubError::storage(format!("invalid delivery claim index: {error}"))
-            })?;
-            let record_id = DeliveryRecordId(record_id_text);
-            if let Some(record) = self.get_delivery_record(&record_id).await? {
+            let delivery_id = decode_pubsub_storage_id(&value)?;
+            if let Some(record) = self.get_record(&delivery_key_for_id(delivery_id)).await? {
                 records.push(record);
             }
         }
@@ -632,95 +808,197 @@ where S: SortedKvStore + 'static
 fn push_delivery_record_operations(
     record: DeliveryRecord,
     previous: Option<DeliveryRecord>,
+    delivery_id: PubsubStorageId,
+    subscription_id: PubsubStorageId,
     operations: &mut Vec<DirectWriteOperation>,
 ) -> PubsubResult<()> {
     if let Some(previous) = previous {
-        if let Some(previous_claim_key) = delivery_claim_key_for_record(&previous) {
+        if let Some(previous_claim_key) = delivery_claim_key_for_record(&previous, delivery_id) {
             operations.push(DirectWriteOperation::Delete {
                 key: previous_claim_key,
             });
         }
         operations.push(DirectWriteOperation::Delete {
-            key: delivery_subscription_key(&previous.subscription_arn, &previous.id),
+            key: delivery_subscription_key_for_id(subscription_id, delivery_id),
         });
     }
-    if let Some(claim_key) = delivery_claim_key_for_record(&record) {
+    if let Some(claim_key) = delivery_claim_key_for_record(&record, delivery_id) {
         operations.push(DirectWriteOperation::Put {
             key: claim_key,
-            value: record.id.0.as_bytes().to_vec(),
+            value: encode_pubsub_storage_id(delivery_id),
         });
     }
     operations.push(DirectWriteOperation::Put {
-        key: delivery_subscription_key(&record.subscription_arn, &record.id),
-        value: record.id.0.as_bytes().to_vec(),
+        key: delivery_subscription_key_for_id(subscription_id, delivery_id),
+        value: encode_pubsub_storage_id(delivery_id),
     });
     operations.push(DirectWriteOperation::Put {
-        key: delivery_key(&record.id),
+        key: delivery_record_lookup_key(&record.id),
+        value: encode_pubsub_storage_id(delivery_id),
+    });
+    operations.push(DirectWriteOperation::Put {
+        key: delivery_key_for_id(delivery_id),
         value: encode_pubsub(&record)?,
     });
     Ok(())
 }
 
-fn topic_key(topic_arn: &TopicArn) -> Vec<u8> {
-    prefixed_key(TOPIC_PREFIX, topic_arn.as_str())
+fn encode_pubsub_storage_id(id: PubsubStorageId) -> Vec<u8> {
+    let bytes = id.get().get().to_be_bytes();
+    bytes[2..].to_vec()
+}
+
+fn decode_pubsub_storage_id(bytes: &[u8]) -> PubsubResult<PubsubStorageId> {
+    if bytes.len() != 6 {
+        return Err(PubsubError::storage(format!(
+            "invalid pubsub storage id width: expected 6 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut padded = [0u8; 8];
+    padded[2..].copy_from_slice(bytes);
+    PubsubStorageId::new(u64::from_be_bytes(padded))
+}
+
+fn topic_key_for_id(topic_id: PubsubStorageId) -> Vec<u8> {
+    compact::pubsub_record_key(PubsubRecordKind::Topic, topic_id.get(), None, b"")
+}
+
+fn topic_arn_lookup_key(topic_arn: &TopicArn) -> Vec<u8> {
+    compact::pubsub_global_record_key(
+        PubsubRecordKind::Topic,
+        &stable_lookup_hash(topic_arn.as_str()),
+    )
 }
 
 fn topic_name_key(topic_name: &TopicName) -> Vec<u8> {
-    prefixed_key(TOPIC_NAME_PREFIX, topic_name.as_str())
-}
-
-fn subscription_key(subscription_arn: &SubscriptionArn) -> Vec<u8> {
-    prefixed_key(SUBSCRIPTION_PREFIX, subscription_arn.as_str())
-}
-
-fn subscription_topic_prefix(topic_arn: &TopicArn) -> Vec<u8> {
-    nested_prefix(SUBSCRIPTION_TOPIC_PREFIX, topic_arn.as_str())
-}
-
-fn subscription_topic_key(topic_arn: &TopicArn, subscription_arn: &SubscriptionArn) -> Vec<u8> {
-    nested_key(
-        SUBSCRIPTION_TOPIC_PREFIX,
-        topic_arn.as_str(),
-        subscription_arn.as_str(),
+    compact::pubsub_global_record_key(
+        PubsubRecordKind::TopicName,
+        &stable_lookup_hash(topic_name.as_str()),
     )
 }
 
-fn subscription_dedupe_key(
-    topic_arn: &TopicArn,
+fn subscription_key_for_id(subscription_id: PubsubStorageId) -> Vec<u8> {
+    compact::pubsub_record_key(
+        PubsubRecordKind::Subscription,
+        subscription_id.get(),
+        None,
+        b"",
+    )
+}
+
+fn subscription_arn_lookup_key(subscription_arn: &SubscriptionArn) -> Vec<u8> {
+    compact::pubsub_global_record_key(
+        PubsubRecordKind::Subscription,
+        &stable_lookup_hash(subscription_arn.as_str()),
+    )
+}
+
+fn subscription_topic_prefix_for_id(topic_id: PubsubStorageId) -> Vec<u8> {
+    compact::pubsub_record_prefix(PubsubRecordKind::SubscriptionTopic, topic_id.get()).start
+}
+
+fn subscription_topic_key_for_id(
+    topic_id: PubsubStorageId,
+    subscription_id: PubsubStorageId,
+) -> Vec<u8> {
+    compact::pubsub_record_key(
+        PubsubRecordKind::SubscriptionTopic,
+        topic_id.get(),
+        Some(subscription_id.get()),
+        b"",
+    )
+}
+
+fn subscription_dedupe_key_for_id(
+    topic_id: PubsubStorageId,
     protocol: SubscriptionProtocol,
     endpoint: &str,
 ) -> Vec<u8> {
-    nested_key(
-        SUBSCRIPTION_DEDUPE_PREFIX,
-        topic_arn.as_str(),
-        &format!("{}:{endpoint}", protocol.as_str()),
+    compact::pubsub_record_key(
+        PubsubRecordKind::SubscriptionDedupe,
+        topic_id.get(),
+        None,
+        &stable_lookup_hash(&format!("{}:{endpoint}", protocol.as_str())),
     )
 }
 
-fn delivery_key(record_id: &DeliveryRecordId) -> Vec<u8> {
-    prefixed_key(DELIVERY_PREFIX, &record_id.0)
+fn delivery_key_for_id(delivery_id: PubsubStorageId) -> Vec<u8> {
+    compact::pubsub_record_key(PubsubRecordKind::Delivery, delivery_id.get(), None, b"")
 }
 
-fn delivery_subscription_prefix(subscription_arn: &SubscriptionArn) -> Vec<u8> {
-    nested_prefix(DELIVERY_SUBSCRIPTION_PREFIX, subscription_arn.as_str())
+fn delivery_record_lookup_key(record_id: &DeliveryRecordId) -> Vec<u8> {
+    compact::pubsub_global_record_key(
+        PubsubRecordKind::Delivery,
+        &stable_lookup_hash(&record_id.0),
+    )
 }
 
-fn delivery_subscription_key(
-    subscription_arn: &SubscriptionArn,
-    record_id: &DeliveryRecordId,
+fn delivery_subscription_prefix_for_id(subscription_id: PubsubStorageId) -> Vec<u8> {
+    compact::pubsub_record_prefix(
+        PubsubRecordKind::DeliverySubscription,
+        subscription_id.get(),
+    )
+    .start
+}
+
+fn delivery_subscription_key_for_id(
+    subscription_id: PubsubStorageId,
+    delivery_id: PubsubStorageId,
 ) -> Vec<u8> {
-    nested_key(
-        DELIVERY_SUBSCRIPTION_PREFIX,
-        subscription_arn.as_str(),
-        &record_id.0,
+    compact::pubsub_record_key(
+        PubsubRecordKind::DeliverySubscription,
+        subscription_id.get(),
+        Some(delivery_id.get()),
+        b"",
     )
 }
 
 fn delivery_claim_status_prefix(status: DeliveryStatus) -> Vec<u8> {
-    nested_prefix(DELIVERY_CLAIM_PREFIX, delivery_status_key(status))
+    compact::pubsub_record_prefix(
+        PubsubRecordKind::DeliveryClaim,
+        delivery_status_id(status).get(),
+    )
+    .start
 }
 
-fn delivery_claim_key_for_record(record: &DeliveryRecord) -> Option<Vec<u8>> {
+fn delivery_claim_key_for_id(
+    status: DeliveryStatus,
+    due_at: TimestampMillis,
+    delivery_id: PubsubStorageId,
+) -> Vec<u8> {
+    let mut suffix = due_at.timestamp_millis().to_be_bytes().to_vec();
+    suffix.extend_from_slice(&encode_pubsub_storage_id(delivery_id));
+    compact::pubsub_record_key(
+        PubsubRecordKind::DeliveryClaim,
+        delivery_status_id(status).get(),
+        Some(delivery_id.get()),
+        &suffix,
+    )
+}
+
+fn delivery_status_id(status: DeliveryStatus) -> PubsubStorageId {
+    let value = match status {
+        DeliveryStatus::Pending => 1,
+        DeliveryStatus::Delivered => 2,
+        DeliveryStatus::AcceptedByCustomSender => 3,
+        DeliveryStatus::RetryScheduled => 4,
+        DeliveryStatus::Failed => 5,
+    };
+    PubsubStorageId(compact::U48::masked(value))
+}
+
+fn stable_lookup_hash(value: &str) -> [u8; 8] {
+    let digest = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, value.as_bytes()).into_bytes();
+    [
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]
+}
+
+fn delivery_claim_key_for_record(
+    record: &DeliveryRecord,
+    delivery_id: PubsubStorageId,
+) -> Option<Vec<u8>> {
     if !matches!(
         record.status,
         DeliveryStatus::Pending | DeliveryStatus::RetryScheduled
@@ -729,71 +1007,29 @@ fn delivery_claim_key_for_record(record: &DeliveryRecord) -> Option<Vec<u8>> {
     }
     let due_at = record
         .next_attempt_at
-        .map_or(0, |timestamp| timestamp.timestamp_millis());
-    Some(nested_key(
-        DELIVERY_CLAIM_PREFIX,
-        delivery_status_key(record.status),
-        &format!("{due_at:020}:{}", record.id.0),
+        .unwrap_or_else(|| TimestampMillis::from(0));
+    Some(delivery_claim_key_for_id(
+        record.status,
+        due_at,
+        delivery_id,
     ))
 }
 
-fn subscription_arn_from_topic_index_key(key: &[u8]) -> PubsubResult<Option<SubscriptionArn>> {
-    let key_text = String::from_utf8(key.to_vec()).map_err(|error| {
-        PubsubError::storage(format!("invalid subscription topic key: {error}"))
-    })?;
-    let Some((_, subscription_arn)) = key_text.rsplit_once('/') else {
-        return Ok(None);
-    };
-    Ok(Some(SubscriptionArn::new(subscription_arn.to_string())?))
-}
-
 fn claim_due_at_from_key(key: &[u8]) -> PubsubResult<Option<TimestampMillis>> {
-    let key_text = String::from_utf8(key.to_vec())
-        .map_err(|error| PubsubError::storage(format!("invalid delivery claim key: {error}")))?;
-    let Some((_, suffix)) = key_text.rsplit_once('/') else {
+    let Ok(compact::ParsedCompactKey::PubsubRecord {
+        kind: PubsubRecordKind::DeliveryClaim,
+        suffix,
+        ..
+    }) = compact::parse_compact_key(key)
+    else {
         return Ok(None);
     };
-    let Some((due_text, _)) = suffix.split_once(':') else {
+    let Some(bytes) = suffix.get(..8) else {
         return Ok(None);
     };
-    let due_at = due_text.parse::<i64>().map_err(|error| {
-        PubsubError::storage(format!("invalid delivery claim due time: {error}"))
-    })?;
-    Ok(Some(TimestampMillis::from(due_at)))
-}
-
-fn delivery_status_key(status: DeliveryStatus) -> &'static str {
-    match status {
-        DeliveryStatus::Pending => "pending",
-        DeliveryStatus::Delivered => "delivered",
-        DeliveryStatus::AcceptedByCustomSender => "accepted_by_custom_sender",
-        DeliveryStatus::RetryScheduled => "retry_scheduled",
-        DeliveryStatus::Failed => "failed",
-    }
-}
-
-fn prefixed_key(prefix: &[u8], value: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(prefix.len() + value.len());
-    key.extend_from_slice(prefix);
-    key.extend_from_slice(value.as_bytes());
-    key
-}
-
-fn nested_key(prefix: &[u8], left: &str, right: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(prefix.len() + left.len() + 1 + right.len());
-    key.extend_from_slice(prefix);
-    key.extend_from_slice(left.as_bytes());
-    key.push(b'/');
-    key.extend_from_slice(right.as_bytes());
-    key
-}
-
-fn nested_prefix(prefix: &[u8], value: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(prefix.len() + value.len() + 1);
-    key.extend_from_slice(prefix);
-    key.extend_from_slice(value.as_bytes());
-    key.push(b'/');
-    key
+    let mut due = [0u8; 8];
+    due.copy_from_slice(bytes);
+    Ok(Some(TimestampMillis::from(i64::from_be_bytes(due))))
 }
 
 fn encode_pubsub<T>(value: &T) -> PubsubResult<Vec<u8>>

@@ -4,6 +4,40 @@ use bg_jobs::{BackgroundJob, BackgroundJobName};
 
 use crate::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, JobIntervalMillis};
 
+/// Simple configuration for registering database maintenance jobs.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseJobIntervals {
+    pub gsi_update_interval_ms: JobIntervalMillis,
+    pub gsi_backfill_interval_ms: JobIntervalMillis,
+    pub ttl_sweep_interval_ms: JobIntervalMillis,
+    pub stream_trim_interval_ms: JobIntervalMillis,
+    pub stream_ttl_cleanup_interval_ms: JobIntervalMillis,
+    pub partition_family_reconcile_interval_ms: JobIntervalMillis,
+}
+
+impl Default for DatabaseJobIntervals {
+    fn default() -> Self {
+        Self {
+            gsi_update_interval_ms: JobIntervalMillis(100),
+            gsi_backfill_interval_ms: JobIntervalMillis(30_000),
+            ttl_sweep_interval_ms: JobIntervalMillis(300_000),
+            stream_trim_interval_ms: JobIntervalMillis(3_600_000),
+            stream_ttl_cleanup_interval_ms: JobIntervalMillis(3_600_000),
+            partition_family_reconcile_interval_ms: JobIntervalMillis(30_000),
+        }
+    }
+}
+
+impl DatabaseJobIntervals {
+    #[must_use]
+    pub const fn gsi_config(self) -> GsiJobConfig {
+        GsiJobConfig {
+            update_interval_ms: self.gsi_update_interval_ms,
+            backfill_interval_ms: self.gsi_backfill_interval_ms,
+        }
+    }
+}
+
 /// Simple configuration for registering GSI related jobs.
 #[derive(Debug, Clone, Copy)]
 pub struct GsiJobConfig {

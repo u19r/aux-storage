@@ -395,6 +395,63 @@ async fn foundationdb_system_stream_split_reroutes_pointer_writes_tests() {
 
 #[tokio::test]
 #[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
+async fn foundationdb_key_ordered_stream_read_after_cursor_seeks_within_partition_tests() {
+    let Some(store) = connect_fdb_store("fdb-streams").await else {
+        eprintln!("Skipping FoundationDB stream seek test: unable to connect to local cluster");
+        return;
+    };
+
+    let provider = SortedKvDbStorageProvider::new(store.clone());
+    let test_future = async move {
+        provider
+            .initialize_storage()
+            .await
+            .expect("initialize storage");
+        provider
+            .initialize_stream()
+            .await
+            .expect("initialize stream provider");
+
+        let stream_name = provider
+            .create_stream(
+                UserStreamName::new(&format!("fdb-key-ordered-seek-{}", Uuid::now_v7())),
+                None,
+                StreamPartitioningMode::KeyOrdered,
+            )
+            .await
+            .expect("create key ordered stream");
+        let partition_key = "customer-1";
+
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(
+                provider
+                    .append_item(
+                        stream_name.clone(),
+                        format!("item-{index}").as_bytes(),
+                        Some(partition_key),
+                    )
+                    .await
+                    .expect("append stream item"),
+            );
+        }
+
+        let page = provider
+            .read_forward(stream_name.clone(), Some(ids[2]), 1)
+            .await
+            .expect("read after cursor");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, ids[3]);
+    };
+
+    timeout(Duration::from_secs(10), test_future)
+        .await
+        .expect("test should complete before timeout");
+}
+
+#[tokio::test]
+#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
 async fn foundationdb_ordered_log_reconcile_splits_hot_family_tests() {
     let Some(store) = connect_fdb_store("fdb-stream-reconcile").await else {
         eprintln!(

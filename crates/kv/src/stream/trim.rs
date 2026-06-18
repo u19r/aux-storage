@@ -3,13 +3,17 @@ use storage_backfill::merge_protected_backfill_cursor;
 use storage_common::STREAM_TRIM_JOB;
 use storage_provider::{StorageProvider, StreamDurationTrimConfig, StreamDurationTrimWorker};
 use storage_types::{
-    AttributeValue, ScanTableRequest, StorageError, StorageResult, StreamItemId, StreamKey,
-    StreamName, TableName, TimestampMillis,
+    AttributeValue, ScanTableRequest, StorageError, StorageResult, StreamItemId, StreamName,
+    TableName, TimestampMillis,
 };
 use stream_provider::{StoredStreamPointer, StreamItem, StreamProvider};
 use tracing::warn;
 
-use crate::{SortedKvDbStorageProvider, constants, sorted_kv_store::BatchItem};
+use crate::{
+    SortedKvDbStorageProvider, constants,
+    sorted_kv_store::BatchItem,
+    stream::pointer_codec::{decode_compact_pointer, item_stream_name},
+};
 
 const MULTI_REGION_CONTROL_TABLE: &str = "sys_storage_replication";
 const PAYLOAD_ATTR: &str = "payload";
@@ -59,11 +63,14 @@ fn stream_trim_cutoff() -> TimestampMillis {
     TimestampMillis::now() - (constants::STREAM_TRIM_RETENTION_HOURS * constants::MILLIS_PER_HOUR)
 }
 
-fn collect_stream_trim_groups(
+async fn collect_stream_trim_groups<
+    S: crate::partition_family::PartitionFamilyKvStore + 'static,
+>(
+    provider: &SortedKvDbStorageProvider<S>,
     items: Vec<StreamItem>,
     cutoff: TimestampMillis,
     protected_cursor_floor: Option<StreamItemId>,
-) -> StreamTrimPageOutcome {
+) -> StorageResult<StreamTrimPageOutcome> {
     let scanned_items = items.len();
     let mut groups = Vec::new();
     let mut decode_failures = 0usize;
@@ -71,23 +78,44 @@ fn collect_stream_trim_groups(
 
     for item in items {
         if item.created_at >= cutoff {
-            return StreamTrimPageOutcome {
+            return Ok(StreamTrimPageOutcome {
                 groups,
                 stop_scan: true,
                 scanned_items,
                 decode_failures,
                 protected_groups,
-            };
+            });
         }
         if protected_cursor_floor.is_some_and(|cursor| item.id >= cursor) {
             protected_groups = protected_groups.saturating_add(1);
-            return StreamTrimPageOutcome {
+            return Ok(StreamTrimPageOutcome {
                 groups,
                 stop_scan: true,
                 scanned_items,
                 decode_failures,
                 protected_groups,
+            });
+        }
+
+        if let Ok(pointer) = decode_compact_pointer(&item.data) {
+            let Some(table) = provider
+                .get_table_identity_from_id(pointer.table_id)
+                .await?
+            else {
+                decode_failures += 1;
+                warn!(
+                    table_id = pointer.table_id.get(),
+                    stream_item_id = ?item.id,
+                    "stream trim compact pointer table metadata missing"
+                );
+                continue;
             };
+            groups.push(StreamTrimGroup {
+                stream_item_id: item.id,
+                table_name: table.identity.table_name.clone(),
+                item_stream: item_stream_name(&table.identity.table_name, &pointer.item_scope),
+            });
+            continue;
         }
 
         let stored_pointer: StoredStreamPointer =
@@ -111,13 +139,13 @@ fn collect_stream_trim_groups(
         });
     }
 
-    StreamTrimPageOutcome {
+    Ok(StreamTrimPageOutcome {
         groups,
         stop_scan: false,
         scanned_items,
         decode_failures,
         protected_groups,
-    }
+    })
 }
 
 fn emit_stream_trim_metrics(stats: &StreamTrimStats, runtime_ms: u64) {
@@ -193,7 +221,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 break;
             }
 
-            let outcome = collect_stream_trim_groups(page.items, cutoff, protected_cursor_floor);
+            let outcome =
+                collect_stream_trim_groups(self, page.items, cutoff, protected_cursor_floor)
+                    .await?;
             stats.record_page(&outcome);
 
             let group_count = outcome.groups.len();
@@ -281,32 +311,45 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         for chunk in groups.chunks(constants::STREAM_TRIM_DELETE_BATCH_SIZE) {
             let mut batch_items = Vec::with_capacity(chunk.len() * 3);
             for group in chunk {
-                let sys_key = StreamKey::for_system_stream(&group.stream_item_id);
-                let table_key =
-                    StreamKey::for_table_stream(&group.table_name, &group.stream_item_id);
-                let item_key: StreamKey = &group.item_stream + &group.stream_item_id;
+                let table_identity = self
+                    .get_table_identity_from_name(&group.table_name)
+                    .await?
+                    .map(|metadata| metadata.identity.clone())
+                    .ok_or_else(|| StorageError::table_not_found(&group.table_name))?;
+                let sys_key =
+                    crate::keyspace::compact::system_stream_key(group.stream_item_id.as_bytes());
+                let table_key = crate::keyspace::compact::table_stream_key(
+                    table_identity.table_id,
+                    group.stream_item_id.as_bytes(),
+                );
+                let item_key = crate::keyspace::stream_keys::stream_row_key(
+                    &group.item_stream,
+                    Some(&table_identity),
+                    group.stream_item_id,
+                )?
+                .ok_or_else(|| StorageError::internal("stream trim item stream key is legacy"))?;
                 let pointer_index_key =
-                    crate::storage_ops::stream_duration::stream_pointer_index_key(
-                        &group.table_name,
+                    crate::keyspace::stream_keys::stream_pointer_item_key_for_stream(
+                        &table_identity,
                         &group.item_stream,
                         group.stream_item_id,
-                    );
+                    )?;
                 let table_pointer_index_key =
-                    crate::storage_ops::stream_duration::stream_pointer_table_key(
-                        &group.table_name,
+                    crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                        &table_identity,
                         group.stream_item_id,
                     );
 
                 batch_items.push(BatchItem {
-                    key: sys_key.as_ref().to_vec(),
+                    key: sys_key,
                     value: None,
                 });
                 batch_items.push(BatchItem {
-                    key: table_key.as_ref().to_vec(),
+                    key: table_key,
                     value: None,
                 });
                 batch_items.push(BatchItem {
-                    key: item_key.as_ref().to_vec(),
+                    key: item_key,
                     value: None,
                 });
                 batch_items.push(BatchItem {

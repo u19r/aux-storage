@@ -86,7 +86,7 @@ impl DatabaseManager {
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
-            condition_expression.as_deref().into_iter(),
+            condition_expression.as_deref(),
         )?;
         let mut item = item;
         if self.single_table_mode_enabled() {
@@ -401,7 +401,7 @@ impl DatabaseManager {
         validate_expression_attribute_usage(
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
-            input.condition_expression.as_deref().into_iter(),
+            input.condition_expression.as_deref(),
         )?;
         let table_name = input.table_name;
         let key = input.key;

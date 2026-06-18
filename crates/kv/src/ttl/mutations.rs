@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use storage_common::ttl::{self, TtlConfigRecord};
+use storage_common::ttl::TtlConfigRecord;
 use storage_types::{AttributeValue, StorageResult, StoredTableInfo, TableName, TimeToLiveStatus};
+
+use crate::keyspace::table_identity::TableIdentity;
 
 pub(crate) enum TtlIndexMutation {
     Delete(Vec<u8>),
@@ -9,7 +11,8 @@ pub(crate) enum TtlIndexMutation {
 }
 
 pub(crate) fn plan_ttl_index_mutations(
-    table_name: &TableName,
+    _table_name: &TableName,
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     ttl_config: Option<&TtlConfigRecord>,
     old_item: Option<&HashMap<String, AttributeValue>>,
@@ -30,13 +33,23 @@ pub(crate) fn plan_ttl_index_mutations(
 
     let old_key = old_item
         .map(|item| {
-            ttl::ttl_index_key_for_item(table_name, table_info, &config.attribute_name, item)
+            crate::ttl::compact_ttl_index_key_for_item(
+                table_identity,
+                table_info,
+                &config.attribute_name,
+                item,
+            )
         })
         .transpose()?
         .flatten();
     let new_key = new_item
         .map(|item| {
-            ttl::ttl_index_key_for_item(table_name, table_info, &config.attribute_name, item)
+            crate::ttl::compact_ttl_index_key_for_item(
+                table_identity,
+                table_info,
+                &config.attribute_name,
+                item,
+            )
         })
         .transpose()?
         .flatten();

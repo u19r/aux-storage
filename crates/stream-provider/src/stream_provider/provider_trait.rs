@@ -83,6 +83,24 @@ pub trait StreamProvider: Send + Sync {
         .await
     }
 
+    async fn read_item_stream_backward_from_pointer(
+        &self,
+        stream_name: StreamName,
+        pointer_stream_item_id: StreamItemId,
+        target_item_stream_version: ItemStreamVersion,
+        limit: u32,
+    ) -> StreamResult<StreamPage> {
+        let _ = pointer_stream_item_id;
+        let Some(next_version) = target_item_stream_version.checked_increment() else {
+            return Err(StreamError::internal_with_detail(
+                StreamInternalKind::ParseStreamPointer,
+                "item stream version overflow",
+            ));
+        };
+        self.read_item_stream_backward_from_version(stream_name, next_version, limit)
+            .await
+    }
+
     /// Create a cursor at the specified position
     async fn create_cursor(
         &self,
@@ -232,20 +250,14 @@ pub trait StreamProvider: Send + Sync {
                             target_version = %pointer.item_stream_version,
                             "stream-provider: fetching item images for pointer"
                         );
-                        let items = match pointer.item_stream_version.checked_increment() {
-                            Some(next_version) => {
-                                self.read_item_stream_backward_from_version(
-                                    pointer.stream_name.clone(),
-                                    next_version,
-                                    2,
-                                )
-                                .await
-                            }
-                            None => Err(StreamError::internal_with_detail(
-                                StreamInternalKind::ParseStreamPointer,
-                                "item stream version overflow",
-                            )),
-                        };
+                        let items = self
+                            .read_item_stream_backward_from_pointer(
+                                pointer.stream_name.clone(),
+                                pointer.stream_item_id,
+                                pointer.item_stream_version,
+                                2,
+                            )
+                            .await;
 
                         match &items {
                             Ok(page) => {
@@ -277,14 +289,13 @@ pub trait StreamProvider: Send + Sync {
         }
         let results = futures::future::join_all(tasks.into_iter().map(|t| t())).await;
 
-        let last_evaluated_key = if item_pointers.has_more {
-            item_pointers.last_evaluated_key
-        } else {
-            None
-        };
+        let last_scanned_key = item_pointers.last_evaluated_key;
+        let last_evaluated_key = item_pointers.has_more.then_some(last_scanned_key).flatten();
 
         Ok(PointerRecordsResult {
             last_evaluated_key,
+            last_scanned_key,
+            has_more: item_pointers.has_more,
             records: task_order
                 .into_iter()
                 .map(|slot| match slot {
@@ -314,6 +325,8 @@ pub trait StreamProvider: Send + Sync {
         let PointerRecordsResult {
             records: results,
             last_evaluated_key: last_evaluated_pointer,
+            last_scanned_key,
+            has_more: _,
         } = self
             .get_items_from_pointer_stream(pointer_stream_name, starting_item_id, limit)
             .await?;
@@ -414,7 +427,10 @@ pub trait StreamProvider: Send + Sync {
             image_items.push(stream_record);
         }
 
-        Ok((image_items, last_evaluated_pointer))
+        let checkpoint_pointer = last_evaluated_pointer
+            .or_else(|| image_items.is_empty().then_some(last_scanned_key).flatten());
+
+        Ok((image_items, checkpoint_pointer))
     }
 
     /// Start the background TTL cleanup task

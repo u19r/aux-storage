@@ -8,6 +8,7 @@ use storage_common::{
 };
 use storage_condition::{evaluate_condition, parse_condition_expression};
 use storage_provider::{
+    CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
     StorageProvider, StreamDurationTrimBackend, StreamDurationTrimConfig,
     StreamDurationTrimPageRequest, StreamDurationTrimPageResult, StreamDurationTrimWorker,
     StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeBoundaries, StreamTrimState,
@@ -33,7 +34,7 @@ use crate::{
         turso::{
             provider::{
                 TursoStorageProvider, gsi_table_name, option_string_to_value, row_to_table_info,
-                value_to_i64,
+                value_to_i64, value_to_string,
             },
             sql_statements,
         },
@@ -91,6 +92,24 @@ async fn run_custom_stream_trim_once(provider: &TursoStorageProvider) -> Storage
     Ok(stats.did_work())
 }
 
+impl TursoStorageProvider {
+    pub(crate) async fn trim_change_index_markers_older_than(
+        &self,
+        cutoff_created_at_ms: i64,
+    ) -> StorageResult<usize> {
+        let conn = self.connect().await?;
+        let deleted_markers = self
+            .execute(
+                &conn,
+                sql_statements::trim_change_index_markers_older_than(),
+                vec![TursoValue::Integer(cutoff_created_at_ms)],
+            )
+            .await?;
+        usize::try_from(deleted_markers)
+            .map_err(|_| StorageError::internal("turso deleted marker count exceeds usize"))
+    }
+}
+
 #[async_trait]
 impl StorageProvider for TursoStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
@@ -98,6 +117,10 @@ impl StorageProvider for TursoStorageProvider {
     }
 
     fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    fn supports_change_index(&self) -> bool {
         true
     }
 
@@ -124,6 +147,52 @@ impl StorageProvider for TursoStorageProvider {
         let conn = self.connect().await?;
         self.list_due_stream_trim_markers(&conn, due_before, limit)
             .await
+    }
+
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> StorageResult<Vec<ChangeIndexMarker>> {
+        let conn = self.connect().await?;
+        let limit = i64::try_from(request.limit)
+            .map_err(|_| StorageError::validation("change index list limit exceeds i64"))?;
+        let rows = self
+            .query_rows(
+                &conn,
+                sql_statements::list_change_index_markers(),
+                vec![
+                    TursoValue::Integer(i64::from(request.slot)),
+                    TursoValue::Text(request.after_versionstamp.unwrap_or_default()),
+                    TursoValue::Integer(limit),
+                ],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let slot = row
+                    .get("slot")
+                    .ok_or_else(|| StorageError::internal("change index row missing slot"))
+                    .and_then(value_to_i64)
+                    .and_then(|slot| {
+                        u16::try_from(slot).map_err(|_| {
+                            StorageError::internal("change index slot is outside u16 range")
+                        })
+                    })?;
+                let versionstamp = row
+                    .get("versionstamp")
+                    .ok_or_else(|| StorageError::internal("change index row missing versionstamp"))
+                    .and_then(value_to_string)?;
+                let table_id = row
+                    .get("table_id")
+                    .ok_or_else(|| StorageError::internal("change index row missing table_id"))
+                    .and_then(value_to_string)?;
+                Ok(ChangeIndexMarker {
+                    slot,
+                    versionstamp,
+                    table_id: TableName::new(&table_id),
+                })
+            })
+            .collect()
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
@@ -1610,6 +1679,11 @@ impl StorageProvider for TursoStorageProvider {
                 }
             }
         } else if name == TTL_SWEEP_JOB {
+            let cutoff_created_at_ms = TimestampMillis::now()
+                .timestamp_millis()
+                .saturating_sub(CHANGE_INDEX_MARKER_RETENTION_MS);
+            self.trim_change_index_markers_older_than(cutoff_created_at_ms)
+                .await?;
             let _ = run_custom_stream_trim_once(self).await?;
         }
         Ok(())

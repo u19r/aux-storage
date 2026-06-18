@@ -224,6 +224,11 @@ pub fn create_stream_cursors_table() -> &'static str {
 }
 
 #[must_use]
+pub fn create_change_index_table() -> &'static str {
+    stream::create_change_index_table(&TursoDialect)
+}
+
+#[must_use]
 pub fn create_stream_format_metadata_table() -> &'static str {
     stream::create_stream_format_metadata_table(&TursoDialect)
 }
@@ -269,8 +274,28 @@ pub fn create_stream_cursors_internal_index() -> &'static str {
 }
 
 #[must_use]
+pub fn create_change_index_created_at_index() -> &'static str {
+    stream::create_change_index_created_at_index(&TursoDialect)
+}
+
+#[must_use]
 pub fn insert_stream_entry() -> &'static str {
     stream::insert_stream_entry(&TursoDialect)
+}
+
+#[must_use]
+pub fn insert_change_index_marker() -> &'static str {
+    stream::insert_change_index_marker(&TursoDialect)
+}
+
+#[must_use]
+pub fn list_change_index_markers() -> &'static str {
+    stream::list_change_index_markers(&TursoDialect)
+}
+
+#[must_use]
+pub fn trim_change_index_markers_older_than() -> &'static str {
+    stream::trim_change_index_markers_older_than(&TursoDialect)
 }
 
 #[must_use]

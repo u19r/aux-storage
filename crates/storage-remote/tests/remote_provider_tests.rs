@@ -526,6 +526,11 @@ async fn not_leader_hint_promotes_leader_endpoint_and_retries() {
     assert!(exists);
     assert_eq!(provider.primary_endpoint.load(Ordering::Relaxed), 1);
 
+    // Keep this assertion about the cached primary, not probation sampling.
+    provider
+        .probation_endpoint
+        .store(provider.endpoints.len(), Ordering::Relaxed);
+
     let cached_exists = provider
         .table_exists(&table_name)
         .await

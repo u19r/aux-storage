@@ -264,12 +264,13 @@ impl DatabaseManager {
                 foundationdb: connection.foundationdb.clone(),
                 remote: connection.remote.clone(),
             };
-            let bundle =
-                create_storage_provider_bundle(config, runtime_options.enable_database_jobs)
-                    .await
-                    .with_context(|| {
-                        format!("create storage provider for connection {connection_id}")
-                    })?;
+            let bundle = create_storage_provider_bundle(
+                config,
+                runtime_options.enable_database_jobs,
+                runtime_options.database_job_intervals,
+            )
+            .await
+            .with_context(|| format!("create storage provider for connection {connection_id}"))?;
             let provider = bundle.database;
             provider
                 .initialize_storage()

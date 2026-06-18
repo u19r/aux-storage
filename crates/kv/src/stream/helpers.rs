@@ -4,12 +4,24 @@ use storage_types::{
     AttributeValue, ItemKey, ReplicationEventMetadata, StorageResult, StreamItemId, StreamName,
     TableName, TimestampMillis,
 };
-use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
+use stream_provider::{EmbeddedStreamItem, StreamDataType};
 
 use crate::{
     key_template::{KeyTemplate, PlaceholderBinding},
-    stream::{constants::STREAM_EMBEDDED_MAX_BYTES, item_codec::encode_stored_stream_item_parts},
+    keyspace::{stream_keys, table_identity::TableIdentity},
+    stream::{
+        constants::STREAM_EMBEDDED_MAX_BYTES,
+        item_codec::encode_stored_stream_item_parts,
+        pointer_codec::{CompactStoredStreamPointer, encode_compact_pointer},
+    },
 };
+
+#[derive(Clone, Copy)]
+pub struct StreamEntryContext<'a> {
+    pub table_identity: &'a TableIdentity,
+    pub table_name: &'a TableName,
+    pub item_key: &'a ItemKey,
+}
 
 /// Create stream items for item updates (put, update, delete operations).
 ///
@@ -35,8 +47,7 @@ fn should_embed_stream_items(item_bytes: &[u8], old_item_bytes: Option<&[u8]>) -
 }
 
 pub fn create_item_update_stream_entries(
-    table_name: &TableName,
-    item_key: &ItemKey,
+    context: StreamEntryContext<'_>,
     item: &HashMap<String, AttributeValue>,
     old_item: Option<&HashMap<String, AttributeValue>>,
     stream_item_id: StreamItemId,
@@ -50,8 +61,7 @@ pub fn create_item_update_stream_entries(
     };
 
     create_item_update_stream_entries_wire_encoded(
-        table_name,
-        item_key,
+        context,
         item_bytes.as_slice(),
         old_item_bytes.as_deref(),
         stream_item_id,
@@ -61,26 +71,18 @@ pub fn create_item_update_stream_entries(
 }
 
 pub fn create_item_update_stream_entries_wire_encoded(
-    table_name: &TableName,
-    item_key: &ItemKey,
+    context: StreamEntryContext<'_>,
     item_bytes: &[u8],
     old_item_bytes: Option<&[u8]>,
     stream_item_id: StreamItemId,
     is_delete: bool,
     replication: Option<&ReplicationEventMetadata>,
 ) -> StorageResult<Vec<(KeyTemplate, Vec<u8>)>> {
-    let system_stream_prefix = stream_name_prefix(&StreamName::system_table_stream());
-    let table_stream_prefix = stream_name_prefix(&StreamName::table_stream(table_name));
-    let table_item_stream_name = StreamName::table_item_stream(table_name, item_key)?;
-    let item_stream_prefix = stream_name_prefix(&table_item_stream_name);
-    let pointer_index_prefix = crate::storage_ops::stream_duration::stream_pointer_item_prefix(
-        table_name,
-        &table_item_stream_name,
-    );
-    let table_pointer_index_prefix =
-        crate::storage_ops::stream_duration::stream_pointer_table_prefix(table_name);
+    let table_item_stream_name =
+        StreamName::table_item_stream(context.table_name, context.item_key)?;
 
     let created_at = TimestampMillis::now();
+    let item_scope = stream_keys::item_stream_scope(context.item_key)?;
     let stored_pointer = if should_embed_stream_items(item_bytes, old_item_bytes) {
         // Keep update/delete old+new images co-located for small payloads so
         // stream reads can satisfy "new and old images" without extra round
@@ -100,30 +102,27 @@ pub fn create_item_update_stream_entries_wire_encoded(
                 data_type: StreamDataType::DynamoDbJson,
             });
         }
-        StoredStreamPointer::embedded(
-            table_item_stream_name.clone(),
-            table_name.clone(),
+        CompactStoredStreamPointer::embedded(
+            context.table_identity,
+            item_scope.clone(),
             storage_types::ItemStreamVersion::from(stream_item_id),
             items,
+            replication.cloned(),
         )
     } else {
-        StoredStreamPointer::pointer(
-            table_item_stream_name.clone(),
-            table_name.clone(),
+        CompactStoredStreamPointer::pointer(
+            context.table_identity,
+            item_scope.clone(),
             storage_types::ItemStreamVersion::from(stream_item_id),
+            replication.cloned(),
         )
-    };
-    let stored_pointer = if let Some(replication) = replication.cloned() {
-        stored_pointer.with_replication_metadata(replication)
-    } else {
-        stored_pointer
     };
 
     // Persist only StoredStreamItem fields (no id). Stream item id is part of
     // the key and recovered by stream readers from key bytes.
     // This keeps write-side encoding aligned with stream-provider storage rules
     // and avoids serializing duplicate id bytes per entry.
-    let pointer_payload = storage_types::storage_serde::to_bytes(&stored_pointer)?;
+    let pointer_payload = encode_compact_pointer(&stored_pointer)?;
     let pointer_bytes = encode_stored_stream_item_parts(
         None,
         pointer_payload.as_slice(),
@@ -143,33 +142,29 @@ pub fn create_item_update_stream_entries_wire_encoded(
 
     let fallback = stream_item_id.as_bytes().to_vec();
     let binding = PlaceholderBinding::unique(fallback);
+    let compact_keys =
+        stream_keys::stream_write_keys(context.table_identity, context.item_key, stream_item_id)?;
 
     Ok(vec![
         (
-            KeyTemplate::placeholder(system_stream_prefix, Vec::new(), binding.clone()),
+            KeyTemplate::placeholder(compact_keys.system_row, Vec::new(), binding.clone()),
             pointer_bytes.clone(),
         ),
         (
-            KeyTemplate::placeholder(table_stream_prefix, Vec::new(), binding.clone()),
+            KeyTemplate::placeholder(compact_keys.table_row, Vec::new(), binding.clone()),
             pointer_bytes,
         ),
         (
-            KeyTemplate::placeholder(item_stream_prefix, Vec::new(), binding.clone()),
+            KeyTemplate::placeholder(compact_keys.item_row, Vec::new(), binding.clone()),
             stream_bytes,
         ),
         (
-            KeyTemplate::placeholder(pointer_index_prefix, Vec::new(), binding.clone()),
+            KeyTemplate::placeholder(compact_keys.item_pointer, Vec::new(), binding.clone()),
             Vec::new(),
         ),
         (
-            KeyTemplate::placeholder(table_pointer_index_prefix, Vec::new(), binding),
+            KeyTemplate::placeholder(compact_keys.table_pointer, Vec::new(), binding),
             Vec::new(),
         ),
     ])
-}
-
-fn stream_name_prefix(stream_name: &StreamName) -> Vec<u8> {
-    let mut prefix: Vec<u8> = stream_name.into();
-    prefix.push(b'/');
-    prefix
 }

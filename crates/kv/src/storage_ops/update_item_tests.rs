@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use storage_provider::StorageProvider;
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateTableRequest, ItemKey, KeyAttributeType,
-    KeySchemaElement, KeyType, SerializesToKey, TableName, UpdateItemRequest,
+    KeySchemaElement, KeyType, TableName, UpdateItemRequest,
 };
 
-use crate::sorted_kv_store::SortedKvStore;
+use crate::{keyspace::table_keys, sorted_kv_store::SortedKvStore};
 
 #[tokio::test]
 async fn kv_multi_set_update_with_condition_succeeds() {
@@ -234,10 +234,13 @@ async fn kv_update_condition_injects_missing_key_attributes() {
         ("pk".to_string(), AttributeValue::S("P1".to_string())),
         ("sk".to_string(), AttributeValue::S("S1".to_string())),
     ]);
-    let item_key = ItemKey::from_key_schema(table.clone(), &create.key_schema, &key)
+    let item_key = ItemKey::from_key_schema(table.clone(), &create.key_schema, &key).unwrap();
+    let table_metadata = provider
+        .get_table_identity_from_name(&table)
+        .await
         .unwrap()
-        .serialize_to_bytes()
-        .unwrap();
+        .expect("table metadata");
+    let item_key = table_keys::item_key(&table_metadata.identity, &item_key).unwrap();
 
     let mut stored_item = HashMap::new();
     stored_item.insert("value".to_string(), AttributeValue::S("old".to_string()));

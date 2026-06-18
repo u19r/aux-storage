@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 
+use storage_common::GSI_UPDATE_JOB;
 use storage_provider::StorageProvider;
-use storage_types::{AttributeValue, StreamItemId, UserStreamName};
+use storage_types::{
+    AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndex,
+    CreateTableRequest, IndexName, KeyAttributeType, KeySchemaElement, KeyType, Projection,
+    ProjectionType, StreamItemId, TableName, UserStreamName,
+};
 use stream_provider::CursorName;
 #[cfg(test)]
 use stream_provider::{CursorPosition, StreamProvider};
@@ -809,9 +814,66 @@ async fn gsi_key_creation() {
 async fn gsi_update_job_execution() {
     let provider = create_test_provider().await;
 
-    // The GSI update job should be registered during initialization
-    // Test that process_gsi_updates doesn't panic
-    let result = provider.process_gsi_updates().await;
+    let table = TableName::new("GsiUpdateJobExecution");
+    let request = CreateTableRequest::new(
+        table.clone(),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        BillingMode::PayPerRequest,
+    )
+    .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+        index_name: IndexName::new("TestGSI"),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "gsi_pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        projection: Projection {
+            projection_type: Some(ProjectionType::All),
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+    }]));
+    provider.create_table(&request).await.unwrap();
+    provider
+        .put_item(
+            table,
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("tenant".to_string())),
+                ("sk".to_string(), AttributeValue::S("item".to_string())),
+                ("gsi_pk".to_string(), AttributeValue::S("group".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Test that the registered job path processes queued GSI work.
+    let result = provider.run_job(GSI_UPDATE_JOB).await;
     assert!(result.is_ok(), "GSI update processing failed: {result:?}");
 }
 

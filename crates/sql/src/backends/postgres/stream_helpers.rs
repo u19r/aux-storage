@@ -9,8 +9,9 @@ use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
 use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
-use crate::backends::postgres::{
-    PostgresStorageProvider, STREAM_EMBEDDED_MAX_BYTES, sql_statements,
+use crate::{
+    backends::postgres::{PostgresStorageProvider, STREAM_EMBEDDED_MAX_BYTES, sql_statements},
+    change_index,
 };
 
 #[derive(Clone, Copy)]
@@ -219,7 +220,38 @@ impl PostgresStorageProvider {
             created_at,
         )
         .await?;
+        Self::insert_change_index_marker_with_client(
+            client,
+            table_info,
+            table_pointer_stream_item_id,
+            created_at,
+        )
+        .await?;
 
+        Ok(())
+    }
+
+    async fn insert_change_index_marker_with_client<C: GenericClient + Sync>(
+        client: &C,
+        table_info: &StoredTableInfo,
+        pointer_stream_item_id: storage_types::StreamItemId,
+        created_at: TimestampMillis,
+    ) -> StorageResult<()> {
+        let slot = i32::from(change_index::slot_for_table(&table_info.table_name));
+        let versionstamp = change_index::sortable_version(pointer_stream_item_id);
+        let table_id = table_info.table_name.as_ref();
+        let created_at_ms = created_at.timestamp_millis();
+        client
+            .execute(
+                sql_statements::insert_change_index_marker(),
+                &[&slot, &versionstamp, &table_id, &created_at_ms],
+            )
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!(
+                    "postgres insert change index marker failed: {err}"
+                ))
+            })?;
         Ok(())
     }
 }

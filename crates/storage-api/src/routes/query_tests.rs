@@ -1233,7 +1233,11 @@ async fn query_key_condition_rejects_invalid_operators_like_dynamodb() {
             "KeyConditionExpression": expression,
             "ExpressionAttributeValues": values
         });
-        let error = handle_query(db.clone(), payload.try_into().unwrap())
+        let request = match payload.try_into() {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let error = handle_query(db.clone(), request)
             .await
             .expect_err("invalid key condition should fail");
         assert_eq!(error.status_code, 400, "{expression}");

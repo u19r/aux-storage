@@ -3,13 +3,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig, errors::JobError};
 use storage_types::{
-    DurationSeconds, ItemKey, StorageResult, StreamItemId, StreamKey, StreamName, TimestampMillis,
-    UserStreamName, context::ErrorContext,
+    DurationSeconds, ItemKey, ItemStreamVersion, StorageResult, StreamItemId, StreamKey,
+    StreamName, TimestampMillis, UserStreamName, context::ErrorContext,
 };
 use stream_provider::{
-    CursorName, CursorPage, CursorPosition, Stream, StreamCursor, StreamDataType, StreamError,
-    StreamItem, StreamPage, StreamPartitioningMode, StreamProvider, StreamResult,
-    StreamValidationKind, validate_limit,
+    CursorName, CursorPage, CursorPosition, PointerRecordsResult, StoredStreamPointer, Stream,
+    StreamCursor, StreamDataType, StreamError, StreamItem, StreamPage, StreamPartitioningMode,
+    StreamPointer, StreamProvider, StreamResult, StreamValidationKind, validate_limit,
 };
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use crate::{
     },
     helpers::increment_bytes,
     key_template::{KeyTemplate, PlaceholderBinding},
-    keys::{stream_cursor_key, stream_cursors_prefix, stream_metadata_key},
+    keyspace::stream_keys::{self, CompactStreamRange},
     partition_family::{
         DEFAULT_ORDERED_LOG_PARTITION_COUNT, OrderedLogSplitBoundary, PartitionFamilyKind,
         PartitionFamilyKvStore, PartitionInfo, ResolvedPartitionFamily,
@@ -35,10 +35,11 @@ use crate::{
         supports_pointer_stream_partitioning,
     },
     sorted_kv::SortedKvDbStorageProvider,
-    sorted_kv_store::TransactWriteOperation,
+    sorted_kv_store::{RangeResult, RawKey, TransactWriteOperation},
     stream::{
-        constants::STREAM_TTL_CLEANUP_SLEEP_SECONDS,
         item_codec::{decode_stream_item, encode_stream_item},
+        metadata_keys::{stream_cursor_key, stream_cursors_prefix, stream_metadata_key},
+        pointer_codec::decode_compact_pointer,
     },
 };
 
@@ -328,6 +329,12 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
     ) -> StreamResult<StreamPage> {
         validate_limit(limit)?;
 
+        if let Some(range) = self.compact_stream_range_for_name(&stream_name).await? {
+            return self
+                .read_compact_stream_forward(range, page_token, limit)
+                .await;
+        }
+
         if let Some(routing_state) = self.ordered_log_routing_state(&stream_name).await? {
             return self
                 .read_partitioned_stream(stream_name, page_token, limit, false, routing_state)
@@ -380,6 +387,12 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
         limit: u32,
     ) -> StreamResult<StreamPage> {
         validate_limit(limit)?;
+
+        if let Some(range) = self.compact_stream_range_for_name(&stream_name).await? {
+            return self
+                .read_compact_stream_backward(range, exclusive_start_key, limit)
+                .await;
+        }
 
         if let Some(routing_state) = self.ordered_log_routing_state(&stream_name).await? {
             return self
@@ -446,6 +459,62 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
             items,
             last_evaluated_key,
             has_more,
+        })
+    }
+
+    async fn read_item_stream_backward_from_pointer(
+        &self,
+        stream_name: StreamName,
+        pointer_stream_item_id: StreamItemId,
+        _target_item_stream_version: ItemStreamVersion,
+        limit: u32,
+    ) -> StreamResult<StreamPage> {
+        self.read_backward(stream_name, Some(pointer_stream_item_id.increment()), limit)
+            .await
+    }
+
+    async fn get_items_from_pointer_stream(
+        &self,
+        pointer_stream_name: StreamName,
+        starting_item_id: Option<StreamItemId>,
+        limit: Option<u32>,
+    ) -> StreamResult<PointerRecordsResult> {
+        let item_pointers = self
+            .read_forward(
+                pointer_stream_name,
+                starting_item_id,
+                limit.unwrap_or(100).clamp(1, 1000),
+            )
+            .await?;
+
+        let mut records = Vec::with_capacity(item_pointers.items.len());
+        for pointer_item in item_pointers.items {
+            match self.decode_pointer_item(&pointer_item).await? {
+                DecodedPointerItem::Embedded { pointer, items } => {
+                    records.push((pointer, items));
+                }
+                DecodedPointerItem::Pointer(pointer) => {
+                    let items = self
+                        .read_item_stream_backward_from_pointer(
+                            pointer.stream_name.clone(),
+                            pointer.stream_item_id,
+                            pointer.item_stream_version,
+                            2,
+                        )
+                        .await
+                        .map(|page| page.items)
+                        .unwrap_or_default();
+                    records.push((pointer, items));
+                }
+            }
+        }
+
+        let last_scanned_key = item_pointers.last_evaluated_key;
+        Ok(PointerRecordsResult {
+            last_evaluated_key: item_pointers.has_more.then_some(last_scanned_key).flatten(),
+            last_scanned_key,
+            has_more: item_pointers.has_more,
+            records,
         })
     }
 
@@ -576,7 +645,9 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
         let cleanup_job = TtlCleanupJob::new(std::sync::Arc::new(self.clone()));
         let config = JobConfig {
             start_immediately: true,
-            sleep_duration: std::time::Duration::from_secs(STREAM_TTL_CLEANUP_SLEEP_SECONDS),
+            sleep_duration: std::time::Duration::from_millis(
+                self.database_job_intervals.stream_ttl_cleanup_interval_ms.0,
+            ),
             jitter_percent: 10,
         };
 
@@ -687,7 +758,181 @@ enum OrderedLogRoutingState {
     Control(ResolvedPartitionFamily),
 }
 
+enum DecodedPointerItem {
+    Pointer(StreamPointer),
+    Embedded {
+        pointer: StreamPointer,
+        items: Vec<StreamItem>,
+    },
+}
+
+fn compact_range(range: CompactStreamRange) -> crate::keyspace::compact::KeyRange {
+    match range {
+        CompactStreamRange::System(range)
+        | CompactStreamRange::Table(range)
+        | CompactStreamRange::Item(range) => range,
+        CompactStreamRange::Legacy => unreachable!("legacy stream has no compact range"),
+    }
+}
+
+fn stream_page_from_compact_range(range_result: RangeResult) -> StreamResult<StreamPage> {
+    let mut items = Vec::new();
+    for (key_bytes, value_bytes) in range_result.items {
+        let Some(derived) = stream_keys::stream_item_id_from_compact_key(&key_bytes) else {
+            continue;
+        };
+        let stored = deserialize_stream_item(&value_bytes)?;
+        items.push(stored.into_stream_item(derived));
+    }
+
+    let last_evaluated_key = items.last().map(|item| item.id);
+    Ok(StreamPage {
+        items,
+        last_evaluated_key,
+        has_more: range_result.has_more,
+    })
+}
+
 impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
+    async fn decode_pointer_item(
+        &self,
+        pointer_item: &StreamItem,
+    ) -> StreamResult<DecodedPointerItem> {
+        if let Ok(pointer) = decode_compact_pointer(&pointer_item.data) {
+            let table = self
+                .get_table_identity_from_id(pointer.table_id)
+                .await?
+                .ok_or_else(|| StreamError::internal("compact stream pointer table is missing"))?;
+            let stream_pointer = pointer.stream_pointer(&table.identity, pointer_item.id)?;
+            if let Some(items) = pointer.items {
+                let items = items
+                    .into_iter()
+                    .map(|item| StreamItem {
+                        id: pointer_item.id,
+                        stream_name: None,
+                        data: item.data,
+                        data_type: item.data_type,
+                        created_at: pointer_item.created_at,
+                    })
+                    .collect();
+                return Ok(DecodedPointerItem::Embedded {
+                    pointer: stream_pointer,
+                    items,
+                });
+            }
+            return Ok(DecodedPointerItem::Pointer(stream_pointer));
+        }
+
+        let stored_pointer =
+            storage_types::storage_serde::from_bytes::<StoredStreamPointer>(&pointer_item.data)
+                .map_err(|err| {
+                    StreamError::internal_with_detail(
+                        stream_provider::StreamInternalKind::ParseStreamPointer,
+                        format_args!("pointer {}: {err}", pointer_item.id),
+                    )
+                })?;
+        match stored_pointer {
+            StoredStreamPointer::Embedded {
+                stream_name,
+                table_name,
+                item_stream_version,
+                items,
+                ..
+            } => {
+                let pointer = StreamPointer {
+                    stream_name,
+                    table_name,
+                    item_stream_version,
+                    stream_item_id: pointer_item.id,
+                };
+                let items = items
+                    .into_iter()
+                    .map(|item| StreamItem {
+                        id: pointer_item.id,
+                        stream_name: None,
+                        data: item.data,
+                        data_type: item.data_type,
+                        created_at: pointer_item.created_at,
+                    })
+                    .collect();
+                Ok(DecodedPointerItem::Embedded { pointer, items })
+            }
+            StoredStreamPointer::Pointer {
+                stream_name,
+                table_name,
+                item_stream_version,
+                ..
+            } => Ok(DecodedPointerItem::Pointer(StreamPointer {
+                stream_name,
+                table_name,
+                item_stream_version,
+                stream_item_id: pointer_item.id,
+            })),
+        }
+    }
+
+    async fn compact_stream_range_for_name(
+        &self,
+        stream_name: &StreamName,
+    ) -> StreamResult<Option<CompactStreamRange>> {
+        let table_identity =
+            if let Some(table_name) = stream_keys::table_name_for_stream(stream_name) {
+                self.get_table_identity_from_name(&table_name).await?
+            } else {
+                None
+            };
+        let range = stream_keys::compact_stream_range(
+            stream_name,
+            table_identity.as_deref().map(|metadata| &metadata.identity),
+        )?;
+        match range {
+            CompactStreamRange::Legacy => Ok(None),
+            compact => Ok(Some(compact)),
+        }
+    }
+
+    async fn read_compact_stream_forward(
+        &self,
+        range: CompactStreamRange,
+        page_token: Option<StreamItemId>,
+        limit: u32,
+    ) -> StreamResult<StreamPage> {
+        let range = compact_range(range);
+        let start = page_token
+            .map(|token| {
+                let mut start = range.start.clone();
+                start.extend_from_slice(token.increment().as_bytes());
+                start
+            })
+            .unwrap_or_else(|| range.start.clone());
+        let range_result = self
+            .kv_store
+            .get_range(&start, &range.end, Some(limit), None::<RawKey>, true)
+            .await?;
+        stream_page_from_compact_range(range_result)
+    }
+
+    async fn read_compact_stream_backward(
+        &self,
+        range: CompactStreamRange,
+        exclusive_start_key: Option<StreamItemId>,
+        limit: u32,
+    ) -> StreamResult<StreamPage> {
+        let range = compact_range(range);
+        let (range_end, page_token) = if let Some(token) = exclusive_start_key {
+            let mut end_key = range.start.clone();
+            end_key.extend_from_slice(token.as_bytes());
+            (end_key.clone(), Some(RawKey(end_key)))
+        } else {
+            (range.end.clone(), None)
+        };
+        let range_result = self
+            .kv_store
+            .get_range(&range_end, &range.start, Some(limit), page_token, true)
+            .await?;
+        stream_page_from_compact_range(range_result)
+    }
+
     async fn load_ordered_log_split_boundaries(
         &self,
         family_component: &str,
@@ -779,7 +1024,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                 family_kind,
                 family_component,
             ),
-            value: partition_family_config_bytes(&family.config)?,
+            value: partition_family_config_bytes(family_component, &family.config)?,
             condition: None,
         });
         operations.push(TransactWriteOperation::Put {
@@ -936,10 +1181,9 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         }
 
         for prefix in prefixes {
-            let range_result = self
-                .kv_store
-                .get_prefix(&prefix, !reverse, Some(limit), true)
-                .await?;
+            let range_result =
+                partitioned_stream_range(&self.kv_store, &prefix, page_token, limit, reverse)
+                    .await?;
             if range_result.has_more {
                 has_more = true;
             }
@@ -964,9 +1208,9 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         }
 
         if reverse {
-            merged.sort_unstable_by(|left, right| right.id.cmp(&left.id));
+            merged.sort_unstable_by_key(|item| std::cmp::Reverse(item.id));
         } else {
-            merged.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            merged.sort_unstable_by_key(|left| left.id);
         }
         if merged.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
             has_more = true;
@@ -986,6 +1230,21 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         stream_name: &StreamName,
         item_id: StreamItemId,
     ) -> StreamResult<bool> {
+        let table_identity =
+            if let Some(table_name) = stream_keys::table_name_for_stream(stream_name) {
+                self.get_table_identity_from_name(&table_name).await?
+            } else {
+                None
+            };
+        if let Some(key) = stream_keys::stream_row_key(
+            stream_name,
+            table_identity.as_deref().map(|metadata| &metadata.identity),
+            item_id,
+        )? && self.kv_store.get(&key, true).await?.is_some()
+        {
+            return Ok(true);
+        }
+
         if let Some(routing_state) = self.ordered_log_routing_state(stream_name).await? {
             let mut prefixes: Vec<Vec<u8>> = match routing_state {
                 OrderedLogRoutingState::Control(family) => family
@@ -1039,6 +1298,41 @@ fn stream_item_id_from_prefixed_key(
         return stream_item_id_from_key(stream_name, key);
     }
     parse_partitioned_stream_item_id(key)
+}
+
+async fn partitioned_stream_range<S: PartitionFamilyKvStore + 'static>(
+    kv_store: &S,
+    prefix: &[u8],
+    page_token: Option<StreamItemId>,
+    limit: u32,
+    reverse: bool,
+) -> StorageResult<crate::sorted_kv_store::RangeResult> {
+    let Some(token) = page_token else {
+        return kv_store
+            .get_prefix(prefix, !reverse, Some(limit), true)
+            .await;
+    };
+
+    let mut token_key = prefix.to_vec();
+    token_key.extend_from_slice(token.as_bytes());
+
+    if reverse {
+        return kv_store
+            .get_range(&token_key, prefix, Some(limit), None::<ItemKey>, true)
+            .await;
+    }
+
+    let mut start_key = prefix.to_vec();
+    start_key.extend_from_slice(token.increment().as_bytes());
+    kv_store
+        .get_range(
+            &start_key,
+            &increment_bytes(prefix.to_vec()),
+            Some(limit),
+            None::<ItemKey>,
+            true,
+        )
+        .await
 }
 
 pub(crate) fn partition_is_candidate_for_read(

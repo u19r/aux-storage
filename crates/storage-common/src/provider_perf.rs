@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     sync::{Mutex, MutexGuard, OnceLock},
     time::Duration,
@@ -67,7 +68,7 @@ pub fn snapshot_provider(provider: &'static str) -> Vec<PerfCounterSnapshot> {
             })
         })
         .collect::<Vec<_>>();
-    snapshots.sort_by(|left, right| right.total.cmp(&left.total));
+    snapshots.sort_by_key(|snapshot| Reverse(snapshot.total));
     snapshots
 }
 

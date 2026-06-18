@@ -30,6 +30,7 @@ use sql::PostgresStorageProvider;
 use sql::SQLiteStorageProvider;
 #[cfg(feature = "turso")]
 use sql::TursoStorageProvider;
+use storage_common::DatabaseJobIntervals;
 use storage_provider::{StorageBackend, StorageConfig};
 #[cfg(feature = "remote")]
 use storage_remote::RemoteStorageProvider;
@@ -50,17 +51,34 @@ pub async fn create_storage_provider(
     config: StorageConfig,
     enable_database_jobs: bool,
 ) -> StorageResult<Box<dyn DatabaseTrait>> {
-    Ok(create_storage_provider_bundle(config, enable_database_jobs)
-        .await?
-        .database)
+    Ok(create_storage_provider_bundle(
+        config,
+        enable_database_jobs,
+        DatabaseJobIntervals::default(),
+    )
+    .await?
+    .database)
 }
 
 pub async fn create_storage_provider_bundle(
     config: StorageConfig,
     enable_database_jobs: bool,
+    database_job_intervals: DatabaseJobIntervals,
 ) -> StorageResult<StorageProviderBundle> {
-    #[cfg(not(any(feature = "foundationdb", feature = "rocksdb", feature = "sqlite")))]
+    #[cfg(not(any(
+        feature = "foundationdb",
+        feature = "postgres",
+        feature = "rocksdb",
+        feature = "sqlite"
+    )))]
     let _ = enable_database_jobs;
+    #[cfg(not(any(
+        feature = "foundationdb",
+        feature = "postgres",
+        feature = "rocksdb",
+        feature = "sqlite"
+    )))]
+    let _ = database_job_intervals;
     tracing::info!(
         "Creating storage provider for backend: {:?}",
         config.backend_type
@@ -88,7 +106,8 @@ pub async fn create_storage_provider_bundle(
             };
             let provider = provider
                 .with_job_manager(job_manager)
-                .with_database_jobs_enabled(enable_database_jobs);
+                .with_database_jobs_enabled(enable_database_jobs)
+                .with_database_job_intervals(database_job_intervals);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
                 queue: Some(Arc::new(provider.clone())),
@@ -146,7 +165,9 @@ pub async fn create_storage_provider_bundle(
             let lock_store =
                 Arc::new(SysJobLockStore::new(lock_backend, default_worker_id()).await?);
             let job_manager = JobManager::new(lock_store);
-            let provider = provider.with_job_manager(job_manager);
+            let provider = provider
+                .with_job_manager(job_manager)
+                .with_database_job_intervals(database_job_intervals);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
                 queue: Some(Arc::new(provider.clone())),
@@ -180,7 +201,8 @@ pub async fn create_storage_provider_bundle(
             let job_manager = JobManager::new(lock_store);
             let provider = provider
                 .with_job_manager(job_manager)
-                .with_database_jobs_enabled(enable_database_jobs);
+                .with_database_jobs_enabled(enable_database_jobs)
+                .with_database_job_intervals(database_job_intervals);
 
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
@@ -211,7 +233,8 @@ pub async fn create_storage_provider_bundle(
             let job_manager = JobManager::new(lock_store);
             let provider = provider
                 .with_job_manager(job_manager)
-                .with_database_jobs_enabled(enable_database_jobs);
+                .with_database_jobs_enabled(enable_database_jobs)
+                .with_database_job_intervals(database_job_intervals);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
                 queue: Some(Arc::new(provider.clone())),

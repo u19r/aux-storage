@@ -11,6 +11,7 @@ use storage_types::{
 use crate::{
     helpers::increment_bytes,
     key_template::{KeyTemplate, PlaceholderId},
+    keyspace::table_identity::TableIdentity,
 };
 
 type KeyValuePair = (Box<[u8]>, Box<[u8]>);
@@ -171,6 +172,7 @@ impl From<DirectWriteOperation> for TransactWriteOperation {
 #[derive(Clone)]
 pub enum TransactWriteTableOperation {
     Put {
+        table_identity: TableIdentity,
         table_info: StoredTableInfo,
         item: HashMap<String, AttributeValue>,
         item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
@@ -180,6 +182,7 @@ pub enum TransactWriteTableOperation {
         ttl_config: Option<TtlConfigRecord>,
     },
     Delete {
+        table_identity: TableIdentity,
         table_info: StoredTableInfo,
         key: KeyAttributes,
         item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
@@ -190,12 +193,14 @@ pub enum TransactWriteTableOperation {
         ttl_config: Option<TtlConfigRecord>,
     },
     Check {
+        table_identity: TableIdentity,
         table_info: StoredTableInfo,
         key: KeyAttributes,
         condition: Condition,
         return_values_on_condition_check_failure: Option<String>,
     },
     Update {
+        table_identity: TableIdentity,
         table_info: StoredTableInfo,
         key: KeyAttributes,
         operations: Arc<[UpdateOperation]>,
@@ -216,14 +221,17 @@ impl TryFrom<&TransactWriteTableOperation> for Option<TransactWriteOperation> {
     ) -> Result<Option<TransactWriteOperation>, StorageError> {
         match table_op {
             TransactWriteTableOperation::Put {
-                table_info, item, ..
+                table_identity,
+                table_info,
+                item,
+                ..
             } => {
                 let key = storage_types::ItemKey::from_key_schema(
                     table_info.table_name.clone(),
                     &table_info.key_schema,
                     item,
-                )?
-                .serialize_to_bytes()?;
+                )?;
+                let key = crate::keyspace::table_keys::item_key(table_identity, &key)?;
                 let value = storage_types::storage_serde::to_bytes(&item)?;
                 Ok(Some(TransactWriteOperation::Put {
                     key,
@@ -232,14 +240,17 @@ impl TryFrom<&TransactWriteTableOperation> for Option<TransactWriteOperation> {
                 }))
             }
             TransactWriteTableOperation::Delete {
-                table_info, key, ..
+                table_identity,
+                table_info,
+                key,
+                ..
             } => {
                 let key = storage_types::ItemKey::from_key_schema(
                     table_info.table_name.clone(),
                     &table_info.key_schema,
                     key,
-                )?
-                .serialize_to_bytes()?;
+                )?;
+                let key = crate::keyspace::table_keys::item_key(table_identity, &key)?;
                 Ok(Some(TransactWriteOperation::Delete {
                     key,
                     condition: None,
@@ -260,6 +271,15 @@ pub type OldNewItems = (
     Option<HashMap<String, AttributeValue>>,
     Option<HashMap<String, AttributeValue>>,
 );
+
+#[derive(Clone, Debug)]
+pub struct RawKey(pub Vec<u8>);
+
+impl SerializesToKey for RawKey {
+    fn serialize_to_bytes(&self) -> Result<Vec<u8>, storage_types::ItemKeyError> {
+        Ok(self.0.clone())
+    }
+}
 
 pub struct TransactWriteOutput {
     pub items: Vec<OldNewItems>,

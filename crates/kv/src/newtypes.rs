@@ -2,7 +2,7 @@ use std::{ops::Deref, str::FromStr};
 
 use queue_provider::{MessageId, QueueError, QueueInternalKind, QueueResult};
 use serde::{Deserialize, Serialize};
-use storage_types::{ItemKeyError, SerializesToKey, TableName, TimestampMillis};
+use storage_types::TimestampMillis;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageVisibilityKey(pub String);
@@ -57,41 +57,5 @@ impl Deref for MessageVisibilityKey {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TablePageKey(pub String);
-
-impl Deref for TablePageKey {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<&str> for TablePageKey {
-    fn from(value: &str) -> Self {
-        TablePageKey(value.to_string())
-    }
-}
-
-impl From<String> for TablePageKey {
-    fn from(value: String) -> Self {
-        TablePageKey(value)
-    }
-}
-
-impl From<TableName> for TablePageKey {
-    fn from(value: TableName) -> Self {
-        TablePageKey(value.to_string())
-    }
-}
-
-impl SerializesToKey for TablePageKey {
-    fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
-        let key = format!("tables/{}", self.0);
-        Ok(key.as_bytes().to_vec())
     }
 }

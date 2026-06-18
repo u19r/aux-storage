@@ -2,15 +2,18 @@ use serde::{Deserialize, Serialize};
 use storage_backfill::{
     LogicalBackfillDomain, LogicalBackfillRecord, LogicalExportPage, LogicalExportRequest,
 };
-use storage_types::{ItemKey, StorageResult, StreamName, TableName};
+use storage_types::StorageResult;
 
 use super::logical_backfill_records::unchecked_checksum;
 use crate::{
     SortedKvDbStorageProvider,
     helpers::increment_bytes,
-    keys::{
-        STREAM_CURSORS_PREFIX, STREAMS_PREFIX, gsi_backfill_key, gsi_tombstone_prefix_from_name,
+    keyspace::{
+        compact::{self, KeyRange},
+        table_keys,
     },
+    partition_family::{PartitionFamilyKind, partition_family_kind_prefix},
+    stream::metadata_keys::{STREAM_CURSORS_PREFIX, STREAMS_PREFIX},
 };
 
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
@@ -29,23 +32,38 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         )
         .await?;
         for table_info in table_infos {
+            let metadata = self
+                .get_table_identity_from_name(&table_info.table_name)
+                .await?
+                .ok_or_else(|| {
+                    storage_types::StorageError::table_not_found(&table_info.table_name)
+                })?;
             let Some(gsis) = table_info.global_secondary_indexes.as_ref() else {
                 continue;
             };
             for gsi in gsis {
-                self.append_raw_prefix_records(
+                let Some(gsi_range) = table_keys::gsi_prefix(&metadata.identity, &gsi.index_name)
+                else {
+                    continue;
+                };
+                self.append_raw_range_records(
                     &mut records,
                     LogicalBackfillDomain::GsiRecords,
                     "physical_row",
-                    ItemKey::index_prefix_from_name(&table_info.table_name, &gsi.index_name),
+                    gsi_range,
                     request.limit,
                 )
                 .await?;
-                self.append_raw_prefix_records(
+                let Some(tombstone_range) =
+                    table_keys::gsi_tombstone_prefix(&metadata.identity, &gsi.index_name)
+                else {
+                    continue;
+                };
+                self.append_raw_range_records(
                     &mut records,
                     LogicalBackfillDomain::GsiRecords,
                     "tombstone_row",
-                    gsi_tombstone_prefix_from_name(&table_info.table_name, &gsi.index_name),
+                    tombstone_range,
                     request.limit,
                 )
                 .await?;
@@ -87,11 +105,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             request.limit,
         )
         .await?;
-        self.append_raw_prefix_records(
+        self.append_raw_range_records(
             &mut records,
             LogicalBackfillDomain::StreamRecords,
             "system_stream_item",
-            stream_item_prefix(&StreamName::system_table_stream()),
+            compact::system_stream_prefix(),
             request.limit,
         )
         .await?;
@@ -100,19 +118,25 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .filtered_table_infos(request.table_name.as_deref())
             .await?
         {
-            self.append_raw_prefix_records(
+            let metadata = self
+                .get_table_identity_from_name(&table_info.table_name)
+                .await?
+                .ok_or_else(|| {
+                    storage_types::StorageError::table_not_found(&table_info.table_name)
+                })?;
+            self.append_raw_range_records(
                 &mut records,
                 LogicalBackfillDomain::StreamRecords,
                 "table_stream_item",
-                stream_item_prefix(&StreamName::table_stream(&table_info.table_name)),
+                compact::table_stream_prefix(metadata.identity.table_id),
                 request.limit,
             )
             .await?;
-            self.append_raw_contains_records(
+            self.append_raw_range_records(
                 &mut records,
                 LogicalBackfillDomain::StreamRecords,
                 "table_item_stream_item",
-                table_stream_item_marker(&table_info.table_name),
+                compact::item_stream_prefix(metadata.identity.table_id, b""),
                 request.limit,
             )
             .await?;
@@ -125,7 +149,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             &mut records,
             LogicalBackfillDomain::StreamRecords,
             "stream_partition_control",
-            b"sys/partition-control/streams/".to_vec(),
+            partition_family_kind_prefix(PartitionFamilyKind::OrderedLog),
             request.limit,
         )
         .await?;
@@ -146,11 +170,20 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         limit: u32,
     ) -> StorageResult<()> {
         for table_info in self.filtered_table_infos(table_filter).await? {
+            let metadata = self
+                .get_table_identity_from_name(&table_info.table_name)
+                .await?
+                .ok_or_else(|| {
+                    storage_types::StorageError::table_not_found(&table_info.table_name)
+                })?;
             let Some(gsis) = table_info.global_secondary_indexes.as_ref() else {
                 continue;
             };
             for gsi in gsis {
-                let key = gsi_backfill_key(&table_info.table_name, &gsi.index_name);
+                let Some(key) = table_keys::gsi_backfill_key(&metadata.identity, &gsi.index_name)
+                else {
+                    continue;
+                };
                 if let Some(value) = self.kv_store.get(&key, true).await? {
                     records.push(raw_kv_record(
                         LogicalBackfillDomain::GsiRecords,
@@ -184,7 +217,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 &prefix,
                 &increment_bytes(prefix.clone()),
                 None,
-                None::<crate::newtypes::TablePageKey>,
+                None::<crate::sorted_kv_store::RawKey>,
                 true,
             )
             .await?;
@@ -202,12 +235,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         Ok(())
     }
 
-    async fn append_raw_contains_records(
+    async fn append_raw_range_records(
         &self,
         records: &mut Vec<LogicalBackfillRecord>,
         domain: LogicalBackfillDomain,
         record_type: &str,
-        needle: Vec<u8>,
+        range: KeyRange,
         limit: u32,
     ) -> StorageResult<()> {
         if records.len() >= limit as usize {
@@ -216,24 +249,22 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let range = self
             .kv_store
             .get_range(
-                b"",
-                &[0xFF],
+                &range.start,
+                &range.end,
                 None,
-                None::<crate::newtypes::TablePageKey>,
+                None::<crate::sorted_kv_store::RawKey>,
                 true,
             )
             .await?;
         for (key, value) in range.items {
-            if key.windows(needle.len()).any(|window| window == needle) {
-                records.push(raw_kv_record(
-                    domain,
-                    record_type,
-                    key.into_vec(),
-                    value.into_vec(),
-                )?);
-                if records.len() >= limit as usize {
-                    break;
-                }
+            records.push(raw_kv_record(
+                domain,
+                record_type,
+                key.into_vec(),
+                value.into_vec(),
+            )?);
+            if records.len() >= limit as usize {
+                break;
             }
         }
         Ok(())
@@ -260,18 +291,6 @@ fn raw_kv_record(
         .to_string(),
         payload_json: serde_json::to_string(&payload)?,
     })
-}
-
-fn stream_item_prefix(stream_name: &StreamName) -> Vec<u8> {
-    let mut prefix = Vec::<u8>::from(stream_name);
-    prefix.push(b'/');
-    prefix
-}
-
-fn table_stream_item_marker(table_name: &TableName) -> Vec<u8> {
-    let mut marker = table_name.sanitized_name().as_bytes().to_vec();
-    marker.extend(b"/stream-item/");
-    marker
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

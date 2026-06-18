@@ -1,9 +1,13 @@
-use storage_types::{AttributeValue, ItemKey, StreamItemId, StreamName, TableName};
-use stream_provider::{StoredStreamPointer, StreamDataType, StreamPointer};
+use storage_types::{AttributeValue, ItemKey, StreamItemId, TableName};
+use stream_provider::StreamDataType;
 
-use crate::stream::{
-    helpers::create_item_update_stream_entries_wire_encoded,
-    item_codec::{StoredStreamItem, decode_stream_item as decode_stored_stream_item},
+use crate::{
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
+    stream::{
+        helpers::{StreamEntryContext, create_item_update_stream_entries_wire_encoded},
+        item_codec::{StoredStreamItem, decode_stream_item as decode_stored_stream_item},
+        pointer_codec::{CompactStoredStreamPointer, decode_compact_pointer},
+    },
 };
 
 fn table_name() -> TableName {
@@ -18,13 +22,16 @@ fn item_key(table_name: &TableName) -> ItemKey {
     )
 }
 
+fn table_identity(table_name: &TableName) -> TableIdentity {
+    TableIdentity::new(TableStorageId::new(1), table_name.clone(), Vec::new())
+}
+
 fn decode_stream_item(bytes: &[u8]) -> StoredStreamItem {
     decode_stored_stream_item(bytes).expect("decode stream item")
 }
 
-fn decode_pointer(pointer_item: &StoredStreamItem) -> StoredStreamPointer {
-    storage_types::storage_serde::from_bytes(pointer_item.data.as_slice())
-        .expect("decode stored stream pointer")
+fn decode_pointer(pointer_item: &StoredStreamItem) -> CompactStoredStreamPointer {
+    decode_compact_pointer(pointer_item.data.as_slice()).expect("decode compact stream pointer")
 }
 
 fn extract_pointer_and_image_items(
@@ -57,10 +64,14 @@ fn wire_encoded_stream_entries_use_pointer_envelope_for_insert_tests() {
     let item_key = item_key(&table_name);
     let item_bytes = br#"{"pk":{"S":"ORG#1"},"sk":{"S":"ITEM#1"}}"#;
     let stream_item_id = StreamItemId::random();
+    let table_identity = table_identity(&table_name);
 
     let entries = create_item_update_stream_entries_wire_encoded(
-        &table_name,
-        &item_key,
+        StreamEntryContext {
+            table_identity: &table_identity,
+            table_name: &table_name,
+            item_key: &item_key,
+        },
         item_bytes,
         None,
         stream_item_id,
@@ -82,11 +93,12 @@ fn wire_encoded_stream_entries_use_pointer_envelope_for_insert_tests() {
         assert!(*pointer_item.created_at > 0);
         let stored_pointer = decode_pointer(&pointer_item);
         assert_eq!(
-            stored_pointer.target_item_stream_version(),
+            stored_pointer.item_stream_version,
             storage_types::ItemStreamVersion::from(stream_item_id)
         );
         let embedded = stored_pointer
-            .embedded_items()
+            .items
+            .as_deref()
             .expect("small insert should embed the new image");
         assert_eq!(embedded.len(), 1);
         assert_eq!(embedded[0].data, item_bytes);
@@ -101,10 +113,14 @@ fn wire_encoded_stream_entries_embed_old_and_new_images_for_updates_tests() {
     let new_item = br#"{"pk":{"S":"ORG#1"},"sk":{"S":"ITEM#1"},"v":{"N":"2"}}"#;
     let old_item = br#"{"pk":{"S":"ORG#1"},"sk":{"S":"ITEM#1"},"v":{"N":"1"}}"#;
     let stream_item_id = StreamItemId::random();
+    let table_identity = table_identity(&table_name);
 
     let entries = create_item_update_stream_entries_wire_encoded(
-        &table_name,
-        &item_key,
+        StreamEntryContext {
+            table_identity: &table_identity,
+            table_name: &table_name,
+            item_key: &item_key,
+        },
         new_item,
         Some(old_item),
         stream_item_id,
@@ -125,42 +141,19 @@ fn wire_encoded_stream_entries_embed_old_and_new_images_for_updates_tests() {
         assert!(*pointer_item.created_at > 0);
         let stored_pointer = decode_pointer(&pointer_item);
         assert_eq!(
-            stored_pointer.target_item_stream_version(),
+            stored_pointer.item_stream_version,
             storage_types::ItemStreamVersion::from(stream_item_id)
         );
-        let expected_stream_name =
-            StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
-        match stored_pointer {
-            StoredStreamPointer::Embedded {
-                stream_name,
-                table_name: pointer_table,
-                items,
-                ..
-            } => {
-                assert_eq!(stream_name, expected_stream_name);
-                assert_eq!(pointer_table, table_name);
-                assert_eq!(items.len(), 2);
-                assert_eq!(items[0].data, new_item);
-                assert_eq!(items[0].data_type, StreamDataType::DynamoDbJson);
-                assert_eq!(items[1].data, old_item);
-                assert_eq!(items[1].data_type, StreamDataType::DynamoDbJson);
-
-                let pointer: StreamPointer = StoredStreamPointer::Embedded {
-                    stream_name,
-                    table_name: pointer_table,
-                    item_stream_version: storage_types::ItemStreamVersion::from(stream_item_id),
-                    items,
-                    replication: None,
-                }
-                .into_stream_pointer(stream_item_id);
-                assert_eq!(
-                    pointer.stream_name,
-                    StreamName::table_item_stream(&table_name, &item_key).expect("item stream")
-                );
-            }
-            StoredStreamPointer::Pointer { .. } => {
-                panic!("expected embedded pointer for update stream entry")
-            }
-        }
+        assert_eq!(stored_pointer.table_id, table_identity.table_id);
+        assert_eq!(
+            stored_pointer.item_scope,
+            item_key.hash_range_key_part().expect("item scope")
+        );
+        let items = stored_pointer.items.expect("expected embedded pointer");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].data, new_item);
+        assert_eq!(items[0].data_type, StreamDataType::DynamoDbJson);
+        assert_eq!(items[1].data, old_item);
+        assert_eq!(items[1].data_type, StreamDataType::DynamoDbJson);
     }
 }

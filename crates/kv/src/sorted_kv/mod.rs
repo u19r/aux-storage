@@ -1,16 +1,16 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bg_jobs::JobManager;
 use lru_ttl_cache::{CacheConfig, LruTtlCache};
 use storage_common::ttl::TtlConfigRecord;
-use storage_types::{StorageResult, StoredTableInfo, TableName};
+use storage_types::{StorageError, StorageResult, StoredTableInfo, TableName};
 use uuid::Uuid;
 
 pub(crate) use crate::partition_family::PartitionFamilyCacheKey;
@@ -18,11 +18,12 @@ use crate::{
     constants::{
         PARTITION_FAMILY_CACHE_CAPACITY, PARTITION_FAMILY_CACHE_TTL_SECONDS,
         PARTITION_FAMILY_CACHE_WATCH_TIMEOUT_SECONDS, TABLE_CACHE_CAPACITY,
-        TABLE_CACHE_TTL_SECONDS, TABLE_METADATA_HOT_CACHE_CAPACITY,
-        TABLE_METADATA_HOT_CACHE_TTL_MILLIS, TTL_CONFIG_CACHE_CAPACITY,
-        TTL_CONFIG_CACHE_TTL_SECONDS,
+        TABLE_CACHE_TTL_SECONDS, TTL_CONFIG_CACHE_CAPACITY, TTL_CONFIG_CACHE_TTL_SECONDS,
     },
-    keys::table_metadata_key,
+    keyspace::{
+        compact::{self, TableStorageId},
+        table_identity::StoredTableMetadata,
+    },
     partition_family::{
         PartitionFamilyCacheEntry, PartitionFamilyKvStore, PartitionFamilyWatchRegistry,
         ResolvedPartitionFamily,
@@ -48,8 +49,8 @@ impl TtlConfigCacheEntry {
 #[derive(Clone)]
 pub struct SortedKvDbStorageProvider<S: SortedKvStore> {
     pub(crate) kv_store: S,
-    pub(crate) table_cache_lru: LruTtlCache<TableName, Arc<StoredTableInfo>>,
-    table_metadata_hot_cache: Arc<TableMetadataHotCache>,
+    pub(crate) table_identity_by_name_lru: LruTtlCache<TableName, Arc<StoredTableMetadata>>,
+    pub(crate) table_identity_by_id_lru: LruTtlCache<TableStorageId, Arc<StoredTableMetadata>>,
     pub(crate) ttl_config_cache_lru: LruTtlCache<TableName, Arc<TtlConfigCacheEntry>>,
     pub(crate) partition_family_cache_lru:
         LruTtlCache<PartitionFamilyCacheKey, Arc<PartitionFamilyCacheEntry>>,
@@ -60,6 +61,7 @@ pub struct SortedKvDbStorageProvider<S: SortedKvStore> {
     pub(crate) partition_sample_publisher_id: Arc<String>,
     pub(crate) job_manager: JobManager,
     pub(crate) database_jobs_enabled: bool,
+    pub(crate) database_job_intervals: storage_common::DatabaseJobIntervals,
     pub(crate) immediate_gsi_consistency: bool,
     pub(crate) gsi_propagation_governor: Arc<storage_common::GsiPropagationGovernor>,
 }
@@ -68,12 +70,16 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
     pub fn new(kv_store: S) -> Self {
         Self {
             kv_store,
-            table_cache_lru: LruTtlCache::new(
+            table_identity_by_name_lru: LruTtlCache::new(
                 CacheConfig::new()
                     .with_capacity(TABLE_CACHE_CAPACITY)
                     .with_ttl(Duration::from_secs(TABLE_CACHE_TTL_SECONDS)),
             ),
-            table_metadata_hot_cache: Arc::new(TableMetadataHotCache::new()),
+            table_identity_by_id_lru: LruTtlCache::new(
+                CacheConfig::new()
+                    .with_capacity(TABLE_CACHE_CAPACITY)
+                    .with_ttl(Duration::from_secs(TABLE_CACHE_TTL_SECONDS)),
+            ),
             ttl_config_cache_lru: LruTtlCache::new(
                 CacheConfig::new()
                     .with_capacity(TTL_CONFIG_CACHE_CAPACITY)
@@ -91,6 +97,7 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
             partition_sample_publisher_id: Arc::new(Uuid::now_v7().to_string()),
             job_manager: JobManager::new_for_test(),
             database_jobs_enabled: true,
+            database_job_intervals: storage_common::DatabaseJobIntervals::default(),
             immediate_gsi_consistency: false,
             gsi_propagation_governor: Arc::new(storage_common::GsiPropagationGovernor::default()),
         }
@@ -105,6 +112,15 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
     #[must_use]
     pub fn with_database_jobs_enabled(mut self, enabled: bool) -> Self {
         self.database_jobs_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_database_job_intervals(
+        mut self,
+        intervals: storage_common::DatabaseJobIntervals,
+    ) -> Self {
+        self.database_job_intervals = intervals;
         self
     }
 
@@ -129,43 +145,107 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
         &self,
         table_name: &TableName,
     ) -> StorageResult<Option<Arc<StoredTableInfo>>> {
-        if let Some(stored_table_info) = self.table_metadata_hot_cache.get(table_name) {
-            return Ok(Some(stored_table_info));
+        if let Some(metadata) = self.get_table_identity_from_name(table_name).await? {
+            return Ok(Some(Arc::new(metadata.table_info.clone())));
         }
 
-        if let Some(stored_table_info) = self.table_cache_lru.get(table_name) {
-            self.table_metadata_hot_cache
-                .insert(table_name.clone(), Arc::clone(&stored_table_info));
-            return Ok(Some(stored_table_info));
+        Ok(None)
+    }
+
+    pub(crate) async fn get_table_identity_from_name(
+        &self,
+        table_name: &TableName,
+    ) -> StorageResult<Option<Arc<StoredTableMetadata>>> {
+        if let Some(metadata) = self.table_identity_by_name_lru.get(table_name) {
+            let lookup_key = compact::table_name_lookup_key(table_name.as_ref().as_bytes());
+            let cached_table_id = metadata.identity.table_id;
+            let cache_is_durable = match self.kv_store.get(&lookup_key, true).await? {
+                Some(table_id_bytes)
+                    if decode_table_storage_id(&table_id_bytes)? == cached_table_id =>
+                {
+                    let metadata_key = compact::table_metadata_key(cached_table_id);
+                    match self.kv_store.get(&metadata_key, true).await? {
+                        Some(data) => {
+                            let stored: StoredTableMetadata =
+                                storage_types::storage_serde::from_bytes(&data)?;
+                            !stored.identity.deleted && stored.identity.table_name == *table_name
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if cache_is_durable {
+                record_table_identity_cache("name_metadata", "hit");
+                return Ok(Some(metadata));
+            }
+            record_table_identity_cache("name_metadata", "stale");
+            self.invalidate_table_metadata_cache(table_name);
+            self.table_identity_by_id_lru.remove(&cached_table_id);
         }
+        record_table_identity_cache("name_metadata", "miss");
 
-        let key = table_metadata_key(table_name);
+        let lookup_key = compact::table_name_lookup_key(table_name.as_ref().as_bytes());
+        let Some(table_id_bytes) = self.kv_store.get(&lookup_key, true).await? else {
+            record_table_identity_cache("name_lookup", "miss");
+            return Ok(None);
+        };
+        record_table_identity_cache("name_lookup", "hit");
+        let table_id = decode_table_storage_id(&table_id_bytes)?;
+        let Some(metadata) = self.get_table_identity_from_id(table_id).await? else {
+            return Err(StorageError::internal(&format!(
+                "table name lookup points to missing metadata: table={table_name}, id={}",
+                table_id.get()
+            )));
+        };
+        if metadata.identity.deleted || metadata.identity.table_name != *table_name {
+            return Err(StorageError::internal(&format!(
+                "table name lookup points to stale metadata: table={table_name}, id={}",
+                table_id.get()
+            )));
+        }
+        self.cache_table_identity(Arc::clone(&metadata));
+        Ok(Some(metadata))
+    }
 
+    pub(crate) async fn get_table_identity_from_id(
+        &self,
+        table_id: TableStorageId,
+    ) -> StorageResult<Option<Arc<StoredTableMetadata>>> {
+        if let Some(metadata) = self.table_identity_by_id_lru.get(&table_id) {
+            record_table_identity_cache("id_metadata", "hit");
+            return Ok(Some(metadata));
+        }
+        record_table_identity_cache("id_metadata", "miss");
+
+        let key = compact::table_metadata_key(table_id);
         match self.kv_store.get(&key, true).await? {
             Some(data) => {
-                let stored_table_info: StoredTableInfo =
+                let metadata: StoredTableMetadata =
                     storage_types::storage_serde::from_bytes(&data)?;
-                let stored_table_info = Arc::new(stored_table_info);
-                self.cache_table_metadata(table_name.clone(), Arc::clone(&stored_table_info));
-                Ok(Some(stored_table_info))
+                let metadata = Arc::new(metadata);
+                self.cache_table_identity(Arc::clone(&metadata));
+                Ok(Some(metadata))
             }
             None => Ok(None),
         }
     }
 
-    pub(crate) fn cache_table_metadata(
-        &self,
-        table_name: TableName,
-        table_info: Arc<StoredTableInfo>,
-    ) {
-        self.table_metadata_hot_cache
-            .insert(table_name.clone(), Arc::clone(&table_info));
-        self.table_cache_lru.insert(table_name, table_info);
+    pub(crate) fn cache_table_identity(&self, metadata: Arc<StoredTableMetadata>) {
+        if metadata.identity.deleted {
+            self.invalidate_table_metadata_cache(&metadata.identity.table_name);
+            self.table_identity_by_id_lru
+                .insert(metadata.identity.table_id, metadata);
+            return;
+        }
+        self.table_identity_by_name_lru
+            .insert(metadata.identity.table_name.clone(), Arc::clone(&metadata));
+        self.table_identity_by_id_lru
+            .insert(metadata.identity.table_id, Arc::clone(&metadata));
     }
 
     pub(crate) fn invalidate_table_metadata_cache(&self, table_name: &TableName) {
-        self.table_metadata_hot_cache.remove(table_name);
-        self.table_cache_lru.remove(table_name);
+        self.table_identity_by_name_lru.remove(table_name);
     }
 
     pub(crate) fn invalidate_partition_family_cache(&self, key: &PartitionFamilyCacheKey) {
@@ -182,66 +262,6 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
                 self.partition_family_watch_registry.remove(key);
             }
         }
-    }
-}
-
-pub(crate) struct TableMetadataHotCache {
-    entries: RwLock<Vec<TableMetadataHotCacheEntry>>,
-}
-
-struct TableMetadataHotCacheEntry {
-    table_name: TableName,
-    table_info: Arc<StoredTableInfo>,
-    expires_at: Instant,
-}
-
-impl TableMetadataHotCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: RwLock::new(Vec::with_capacity(TABLE_METADATA_HOT_CACHE_CAPACITY)),
-        }
-    }
-
-    pub(crate) fn get(&self, table_name: &TableName) -> Option<Arc<StoredTableInfo>> {
-        let now = Instant::now();
-        let entries = match self.entries.read() {
-            Ok(entries) => entries,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        entries
-            .iter()
-            .find(|entry| &entry.table_name == table_name && entry.expires_at > now)
-            .map(|entry| Arc::clone(&entry.table_info))
-    }
-
-    pub(crate) fn insert(&self, table_name: TableName, table_info: Arc<StoredTableInfo>) {
-        let now = Instant::now();
-        let expires_at = now + Duration::from_millis(TABLE_METADATA_HOT_CACHE_TTL_MILLIS);
-        let mut entries = match self.entries.write() {
-            Ok(entries) => entries,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        entries.retain(|entry| entry.table_name != table_name && entry.expires_at > now);
-        if entries.len() >= TABLE_METADATA_HOT_CACHE_CAPACITY {
-            entries.remove(0);
-        }
-
-        entries.push(TableMetadataHotCacheEntry {
-            table_name,
-            table_info,
-            expires_at,
-        });
-    }
-
-    pub(crate) fn remove(&self, table_name: &TableName) {
-        let mut entries = match self.entries.write() {
-            Ok(entries) => entries,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        entries.retain(|entry| &entry.table_name != table_name);
     }
 }
 
@@ -301,4 +321,29 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             }
         });
     }
+}
+
+pub(crate) fn encode_table_storage_id(table_id: TableStorageId) -> Vec<u8> {
+    table_id.get().to_be_bytes().to_vec()
+}
+
+pub(crate) fn decode_table_storage_id(bytes: &[u8]) -> StorageResult<TableStorageId> {
+    if bytes.len() != 4 {
+        return Err(StorageError::internal(&format!(
+            "invalid table storage id width: expected 4 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(TableStorageId::new(u32::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ])))
+}
+
+fn record_table_identity_cache(cache: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "storage.table_identity.cache.total",
+        "cache" => cache,
+        "outcome" => outcome,
+    )
+    .increment(1);
 }

@@ -1,9 +1,13 @@
 use std::time::Instant;
 
-use crate::storage_ops::imports::{
-    AttributeValue, ItemKey, KeyType, QueryTableRequest, SerializesToKey,
-    SortedKvDbStorageProvider, Span, StorageEnum, StorageError, StorageResult, WireItem, helpers,
-    key_schema_for_gsi, record_provider_stage, record_query_result,
+use crate::{
+    keyspace::table_keys,
+    sorted_kv_store::RawKey,
+    storage_ops::imports::{
+        AttributeValue, ItemKey, KeyType, QueryTableRequest, SortedKvDbStorageProvider, Span,
+        StorageEnum, StorageError, StorageResult, WireItem, helpers, key_schema_for_gsi,
+        record_provider_stage, record_query_result,
+    },
 };
 
 impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
@@ -23,13 +27,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         let _span = storage_common::start_op_span("query", request.table_name.as_ref());
         storage_common::record_limit(request.limit.unwrap_or(0), request.limit);
         let table_name = request.table_name.clone();
-        let table_info = self
-            .get_table_metadata_from_name_arc(&table_name)
+        let table_metadata = self
+            .get_table_identity_from_name(&table_name)
             .await?
             .ok_or_else(|| StorageError::table_not_found(&table_name))?;
+        let table_info = &table_metadata.table_info;
 
         let key_schema = if let Some(index_name) = &request.index_name {
-            key_schema_for_gsi(&table_info, index_name).ok_or_else(|| {
+            key_schema_for_gsi(table_info, index_name).ok_or_else(|| {
                 StorageEnum::ResourceNotFound {
                     resource_type: "Index",
                     resource_id: index_name.as_ref().to_string(),
@@ -51,10 +56,21 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
             .exclusive_start_key
             .as_ref()
             .and_then(|page_token| {
-                ItemKey::item_key_from_next_page_token(page_token, &table_info, &request.index_name)
+                ItemKey::item_key_from_next_page_token(page_token, table_info, &request.index_name)
                     .ok()
             })
             .flatten();
+        let page_token = page_token
+            .as_ref()
+            .map(|token| table_keys::item_key(&table_metadata.identity, token))
+            .transpose()?
+            .map(RawKey);
+
+        let encode_key = |key: &ItemKey| table_keys::item_key(&table_metadata.identity, key);
+        let increment_key =
+            |key: &ItemKey| table_keys::item_key_increment(&table_metadata.identity, key);
+        let decrement_key =
+            |key: &ItemKey| table_keys::item_key_decrement(&table_metadata.identity, key);
 
         let build_hash_key_prefix = |hash_value: &AttributeValue| -> ItemKey {
             Self::build_hash_key_prefix(
@@ -81,14 +97,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     &request.expression_attribute_values,
                 ) {
                     let key = build_full_key(hash_value, range_value);
-                    let end_key = key.increment_bytes_and_serialize()?;
+                    let end_key = increment_key(&key)?;
 
                     return self
                         .read_query_range(
-                            key.serialize_to_bytes()?,
+                            encode_key(&key)?,
                             end_key,
                             request,
-                            &table_info,
+                            table_info,
                             page_token,
                         )
                         .await;
@@ -107,10 +123,10 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     if scan_forward {
                         return self
                             .read_query_range(
-                                start_key.serialize_to_bytes()?,
-                                end_key.increment_bytes_and_serialize()?,
+                                encode_key(&start_key)?,
+                                increment_key(&end_key)?,
                                 request,
-                                &table_info,
+                                table_info,
                                 page_token,
                             )
                             .await;
@@ -118,10 +134,10 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
 
                     return self
                         .read_query_range(
-                            end_key.serialize_to_bytes()?,
-                            start_key.decrement_bytes_and_serialize()?,
+                            encode_key(&end_key)?,
+                            decrement_key(&start_key)?,
                             request,
-                            &table_info,
+                            table_info,
                             page_token,
                         )
                         .await;
@@ -142,8 +158,8 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
 
                     let (start, end) = if scan_forward {
                         let start_key = match lower_operator {
-                            ">" => lower_key.increment_bytes_and_serialize()?,
-                            ">=" => lower_key.serialize_to_bytes()?,
+                            ">" => increment_key(&lower_key)?,
+                            ">=" => encode_key(&lower_key)?,
                             _ => {
                                 return Err(StorageError::validation(format!(
                                     "unsupported lower bound operator: {lower_operator}"
@@ -151,8 +167,8 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             }
                         };
                         let end_key = match upper_operator {
-                            "<" => upper_key.serialize_to_bytes()?,
-                            "<=" => upper_key.increment_bytes_and_serialize()?,
+                            "<" => encode_key(&upper_key)?,
+                            "<=" => increment_key(&upper_key)?,
                             _ => {
                                 return Err(StorageError::validation(format!(
                                     "unsupported upper bound operator: {upper_operator}"
@@ -162,8 +178,8 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         (start_key, end_key)
                     } else {
                         let start_key = match upper_operator {
-                            "<" => upper_key.decrement_bytes_and_serialize()?,
-                            "<=" => upper_key.serialize_to_bytes()?,
+                            "<" => decrement_key(&upper_key)?,
+                            "<=" => encode_key(&upper_key)?,
                             _ => {
                                 return Err(StorageError::validation(format!(
                                     "unsupported upper bound operator: {upper_operator}"
@@ -171,8 +187,8 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             }
                         };
                         let end_key = match lower_operator {
-                            ">" => lower_key.serialize_to_bytes()?,
-                            ">=" => lower_key.decrement_bytes_and_serialize()?,
+                            ">" => encode_key(&lower_key)?,
+                            ">=" => decrement_key(&lower_key)?,
                             _ => {
                                 return Err(StorageError::validation(format!(
                                     "unsupported lower bound operator: {lower_operator}"
@@ -183,7 +199,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     };
 
                     return self
-                        .read_query_range(start, end, request, &table_info, page_token)
+                        .read_query_range(start, end, request, table_info, page_token)
                         .await;
                 }
 
@@ -199,63 +215,63 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         "<" => {
                             let end_key = build_full_key(hash_value, comparison_value);
                             let start_key = {
-                                let mut start_bytes = hash_prefix.clone().serialize_to_bytes()?;
+                                let mut start_bytes = encode_key(&hash_prefix)?;
                                 start_bytes.push(0x00);
                                 start_bytes
                             };
 
                             let (start, end) = if scan_forward {
-                                (start_key, end_key.serialize_to_bytes()?)
+                                (start_key, encode_key(&end_key)?)
                             } else {
-                                (end_key.decrement_bytes_and_serialize()?, start_key)
+                                (decrement_key(&end_key)?, start_key)
                             };
 
                             return self
-                                .read_query_range(start, end, request, &table_info, page_token)
+                                .read_query_range(start, end, request, table_info, page_token)
                                 .await;
                         }
                         "<=" => {
                             let end_key = build_full_key(hash_value, comparison_value);
-                            let mut start_key = hash_prefix.clone().serialize_to_bytes()?;
+                            let mut start_key = encode_key(&hash_prefix)?;
 
                             start_key.push(0x00);
 
                             let (start, end) = if scan_forward {
-                                (start_key, end_key.increment_bytes_and_serialize()?)
+                                (start_key, increment_key(&end_key)?)
                             } else {
-                                (end_key.serialize_to_bytes()?, start_key)
+                                (encode_key(&end_key)?, start_key)
                             };
 
                             return self
-                                .read_query_range(start, end, request, &table_info, page_token)
+                                .read_query_range(start, end, request, table_info, page_token)
                                 .await;
                         }
                         ">" => {
                             let start_key = build_full_key(hash_value, comparison_value);
-                            let end_key = hash_prefix.clone().increment_bytes_and_serialize()?;
+                            let end_key = increment_key(&hash_prefix)?;
 
                             let (start, end) = if scan_forward {
-                                (start_key.increment_bytes_and_serialize()?, end_key)
+                                (increment_key(&start_key)?, end_key)
                             } else {
-                                (end_key, start_key.serialize_to_bytes()?)
+                                (end_key, encode_key(&start_key)?)
                             };
 
                             return self
-                                .read_query_range(start, end, request, &table_info, page_token)
+                                .read_query_range(start, end, request, table_info, page_token)
                                 .await;
                         }
                         ">=" => {
                             let start_key = build_full_key(hash_value, comparison_value);
-                            let end_key = hash_prefix.clone().increment_bytes_and_serialize()?;
+                            let end_key = increment_key(&hash_prefix)?;
 
                             let (start, end) = if scan_forward {
-                                (start_key.serialize_to_bytes()?, end_key)
+                                (encode_key(&start_key)?, end_key)
                             } else {
-                                (end_key, start_key.decrement_bytes_and_serialize()?)
+                                (end_key, decrement_key(&start_key)?)
                             };
 
                             return self
-                                .read_query_range(start, end, request, &table_info, page_token)
+                                .read_query_range(start, end, request, table_info, page_token)
                                 .await;
                         }
                         _ => {
@@ -272,16 +288,16 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                 ) {
                     Ok(Some((hash_value, prefix_value))) => {
                         let start_key = build_full_key(hash_value, prefix_value);
-                        let end_key = start_key.clone().increment_bytes_and_serialize()?;
+                        let end_key = increment_key(&start_key)?;
 
                         let (start, end) = if scan_forward {
-                            (start_key.serialize_to_bytes()?, end_key)
+                            (encode_key(&start_key)?, end_key)
                         } else {
-                            (end_key, start_key.serialize_to_bytes()?)
+                            (end_key, encode_key(&start_key)?)
                         };
 
                         return self
-                            .read_query_range(start, end, request, &table_info, page_token)
+                            .read_query_range(start, end, request, table_info, page_token)
                             .await;
                     }
                     Err(e) => return Err(e),
@@ -295,18 +311,15 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     let hash_prefix = build_hash_key_prefix(hash_value);
 
                     let (start, end) = if scan_forward {
-                        (
-                            hash_prefix.serialize_to_bytes()?,
-                            hash_prefix.increment_bytes_and_serialize()?,
-                        )
+                        (encode_key(&hash_prefix)?, increment_key(&hash_prefix)?)
                     } else {
-                        let end_bytes = hash_prefix.serialize_to_bytes()?;
-                        let start_bytes = hash_prefix.increment_bytes_and_serialize()?;
+                        let end_bytes = encode_key(&hash_prefix)?;
+                        let start_bytes = increment_key(&hash_prefix)?;
                         (start_bytes, end_bytes)
                     };
 
                     return self
-                        .read_query_range(start, end, request, &table_info, page_token)
+                        .read_query_range(start, end, request, table_info, page_token)
                         .await;
                 }
             }
@@ -322,19 +335,13 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     );
 
                     let (start, end) = if scan_forward {
-                        (
-                            hash_prefix.serialize_to_bytes()?,
-                            hash_prefix.increment_bytes_and_serialize()?,
-                        )
+                        (encode_key(&hash_prefix)?, increment_key(&hash_prefix)?)
                     } else {
-                        (
-                            hash_prefix.serialize_to_bytes()?,
-                            hash_prefix.decrement_bytes_and_serialize()?,
-                        )
+                        (encode_key(&hash_prefix)?, decrement_key(&hash_prefix)?)
                     };
 
                     return self
-                        .read_query_range(start, end, request, &table_info, page_token)
+                        .read_query_range(start, end, request, table_info, page_token)
                         .await;
                 }
             }
@@ -351,7 +358,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         start: &[u8],
         exclusive_end: &[u8],
         limit: Option<u32>,
-        page_token: Option<ItemKey>,
+        page_token: Option<RawKey>,
         consistent_read: bool,
     ) -> StorageResult<crate::sorted_kv_store::RangeValuesResult> {
         let started = Instant::now();
@@ -369,7 +376,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         exclusive_end: Vec<u8>,
         request: &QueryTableRequest,
         table_info: &storage_types::StoredTableInfo,
-        page_token: Option<ItemKey>,
+        page_token: Option<RawKey>,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
         let range_result = self
             .query_range_values(

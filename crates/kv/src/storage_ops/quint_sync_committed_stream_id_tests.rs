@@ -5,9 +5,11 @@ use serde::Deserialize;
 use storage_types::{AttributeValue, ItemKey, ItemStreamVersion, StreamItemId, TableName};
 
 use crate::{
-    backends::common::KvMutation, sorted_kv_store::DirectWriteOperation,
+    backends::common::KvMutation,
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
+    sorted_kv_store::DirectWriteOperation,
     storage_ops::provider_impl::kv_mutation_to_direct_with_literal_templates,
-    stream::helpers::create_item_update_stream_entries_wire_encoded,
+    stream::helpers::{StreamEntryContext, create_item_update_stream_entries_wire_encoded},
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -100,9 +102,13 @@ fn materialized_stream_id(target_version: i64) -> Result<(i64, bool)> {
         AttributeValue::S("pk#1".to_string()),
         None,
     );
+    let table_identity = TableIdentity::new(TableStorageId::new(1), table_name.clone(), Vec::new());
     let entries = create_item_update_stream_entries_wire_encoded(
-        &table_name,
-        &item_key,
+        StreamEntryContext {
+            table_identity: &table_identity,
+            table_name: &table_name,
+            item_key: &item_key,
+        },
         br#"{"pk":{"S":"pk#1"}}"#,
         None,
         target,

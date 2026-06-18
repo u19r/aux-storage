@@ -19,7 +19,10 @@ use storage_types::{
 };
 use stream_provider::StreamProvider;
 
-use crate::{SortedKvDbStorageProvider, kv_support_tests::create_test_store};
+use crate::{
+    SortedKvDbStorageProvider, keyspace::compact, kv_support_tests::create_test_store,
+    sorted_kv_store::SortedKvStore,
+};
 
 #[tokio::test]
 async fn rocksdb_logical_item_export_import_preserves_target_revision() {
@@ -35,6 +38,21 @@ async fn rocksdb_logical_item_export_import_preserves_target_revision() {
         .await
         .expect("create destination table");
     apply_sync_put(&source, &table_name, "item#1", "open", 7).await;
+    let compact_revisions = source
+        .kv_store
+        .get_prefix(&compact::item_revision_prefix(), true, None, true)
+        .await
+        .expect("read compact revision prefix");
+    assert_eq!(compact_revisions.items.len(), 1);
+    let legacy_revisions = source
+        .kv_store
+        .get_prefix(b"sys/sync/item-revisions/", true, None, true)
+        .await
+        .expect("read legacy revision prefix");
+    assert!(
+        legacy_revisions.items.is_empty(),
+        "durable revisions should not write legacy sys/sync/item-revisions keys"
+    );
 
     let page = source
         .export_logical_backfill_page(LogicalExportRequest {

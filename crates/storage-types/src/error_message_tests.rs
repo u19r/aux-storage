@@ -1,4 +1,5 @@
-//! Tests asserting that StorageEnum Display strings match DynamoDB canonical messages.
+//! Tests asserting that StorageEnum Display strings match DynamoDB canonical
+//! messages.
 
 use crate::{
     DYNAMODB_ACCESS_DENIED_MESSAGE, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
@@ -53,10 +54,7 @@ fn transaction_in_progress_message() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(
-        display(err),
-        DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE
-    );
+    assert_eq!(display(err), DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE);
 }
 
 #[test]
@@ -94,7 +92,10 @@ fn provisioned_throughput_message_canonical() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE);
+    assert_eq!(
+        display(err),
+        DYNAMODB_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE
+    );
 }
 
 #[test]

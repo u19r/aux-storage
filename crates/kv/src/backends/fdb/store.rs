@@ -43,6 +43,7 @@ use crate::{
     constants::FOUNDATIONDB_GET_READ_VERSION_LATENCY_MS_METRIC,
     helpers::increment_bytes,
     key_template::{KeyTemplate, PlaceholderBinding, PlaceholderId},
+    keyspace::compact,
     partition_family::{
         DEFAULT_ORDERED_LOG_PARTITION_COUNT, OrderedLogSplitMarker, PartitionFamilyKind,
         PartitionFamilyKvStore, PartitionLoadSample, ResolvedPartitionFamily,
@@ -78,13 +79,13 @@ pub struct FoundationDbConfig {
 }
 
 struct FoundationDbNetworkInner {
-    _guard: Mutex<Option<NetworkAutoStop>>,
+    guard: Mutex<Option<NetworkAutoStop>>,
 }
 
 impl FoundationDbNetworkInner {
     fn new(guard: NetworkAutoStop) -> Self {
         Self {
-            _guard: Mutex::new(Some(guard)),
+            guard: Mutex::new(Some(guard)),
         }
     }
 }
@@ -92,6 +93,19 @@ impl FoundationDbNetworkInner {
 static NETWORK_HANDLE: OnceLock<Arc<FoundationDbNetworkInner>> = OnceLock::new();
 static NETWORK_POLICY: OnceLock<FoundationDbNetworkPolicy> = OnceLock::new();
 static NETWORK_INIT: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
+extern "C" fn shutdown_foundationdb_network_at_exit() {
+    let Some(network) = NETWORK_HANDLE.get() else {
+        return;
+    };
+    if let Ok(mut guard) = network.guard.lock() {
+        drop(guard.take());
+    }
+}
 
 type OrderedLogFamilyCache = HashMap<String, ResolvedPartitionFamily>;
 
@@ -190,6 +204,12 @@ fn init_network(config: &FoundationDbConfig) -> StorageResult<Arc<FoundationDbNe
     NETWORK_HANDLE
         .set(Arc::clone(&network))
         .map_err(|_| StorageError::internal("FoundationDB network already initialized"))?;
+    let registered = unsafe { atexit(shutdown_foundationdb_network_at_exit) };
+    if registered != 0 {
+        return Err(StorageError::internal(
+            "failed to register FoundationDB network shutdown hook",
+        ));
+    }
 
     Ok(network)
 }
@@ -647,7 +667,10 @@ impl FoundationDbKvStore {
             prefix,
             &crate::partition_family::partition_family_config_key(family_kind, family_component),
         );
-        trx.set(&config_key, &partition_family_config_bytes(&family.config)?);
+        trx.set(
+            &config_key,
+            &partition_family_config_bytes(family_component, &family.config)?,
+        );
         let epoch_key = Self::prefix_bytes(
             prefix,
             &crate::partition_family::partition_family_epoch_key(family_kind, family_component),
@@ -956,9 +979,13 @@ impl FoundationDbKvStore {
         if template_prefix.is_empty() {
             return Ok((template.clone(), None));
         }
-        let family_name = storage_types::StreamName::from(
-            &template_prefix[..template_prefix.len().saturating_sub(1)],
-        );
+        let family_name = if template_prefix == compact::system_stream_prefix().start {
+            storage_types::StreamName::system_table_stream()
+        } else {
+            storage_types::StreamName::from(
+                &template_prefix[..template_prefix.len().saturating_sub(1)],
+            )
+        };
         if !supports_pointer_stream_partitioning(&family_name) {
             return Ok((template.clone(), None));
         }
@@ -1781,14 +1808,14 @@ impl QueueKvStore for FoundationDbKvStore {
                         .map_err(|error| StorageError::internal(&error.to_string()))?;
                     let message_id_hex = message_id.to_string();
                     let state_key = crate::partition_family::queue_state_key_with_slot(
-                        &range.queue_url,
+                        range.queue_id,
                         range.placement_slot,
                         range.partition_id,
                         &message_id_hex,
                     );
                     let prefixed_state_key = Self::prefix_bytes(prefix.as_ref(), &state_key);
                     let payload_key = crate::partition_family::queue_payload_key_with_slot(
-                        &range.queue_url,
+                        range.queue_id,
                         range.placement_slot,
                         range.partition_id,
                         &message_id_hex,
@@ -1865,10 +1892,13 @@ impl QueueKvStore for FoundationDbKvStore {
                     state.visibility_timestamp = now + visibility_timeout;
                     state.claim_nonce = Some(Uuid::now_v7().to_string());
                     let new_visibility_key = crate::newtypes::MessageVisibilityKey(
-                        crate::keys::visibility_key(state.visibility_timestamp, &message_id),
+                        crate::queue_provider::visibility_key(
+                            state.visibility_timestamp,
+                            &message_id,
+                        ),
                     );
                     let new_ready_key = crate::partition_family::queue_ready_key_with_slot(
-                        &range.queue_url,
+                        range.queue_id,
                         range.placement_slot,
                         range.partition_id,
                         &new_visibility_key,
@@ -2563,11 +2593,11 @@ impl SortedKvStore for FoundationDbKvStore {
                         on_error_started.elapsed(),
                     );
                     match retry_result {
-                        Ok(mut new_trx) => {
+                        Ok(diagnostic_trx) => {
                             let candidate_keys =
                                 Self::collect_unchecked_write_keys(prefix.as_ref(), &operations);
                             self.log_conflict_details(
-                                &new_trx,
+                                &diagnostic_trx,
                                 "transact_write_unchecked",
                                 attempt,
                                 retryable,
@@ -2575,8 +2605,7 @@ impl SortedKvStore for FoundationDbKvStore {
                                 &candidate_keys,
                             )
                             .await;
-                            new_trx.reset();
-                            trx = new_trx;
+                            trx = self.create_transaction()?;
                         }
                         Err(retry_err) => {
                             return Err(map_fdb_error(

@@ -101,6 +101,125 @@ async fn create_revision_test_table(table_name: &str) -> SQLiteStorageProvider {
 }
 
 #[tokio::test]
+async fn given_change_index_rows_when_ttl_trim_runs_then_old_markers_are_removed() {
+    let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
+    provider.initialize_stream().await.unwrap();
+    let old_created_at = TimestampMillis::from(1_000);
+    let recent_created_at = TimestampMillis::from(30_000_000);
+
+    call_sqlite(&provider.connection, move |conn| {
+        for (versionstamp, table_id, created_at) in [
+            ("00000000000000000001", "orders", old_created_at),
+            ("00000000000000000002", "users", old_created_at),
+            ("00000000000000000003", "orders", recent_created_at),
+        ] {
+            let (sql, params) =
+                sql_statements::insert_change_index_marker(7, versionstamp, table_id, &created_at);
+            conn.execute(sql, params)
+                .map_err(crate::error_handler::map_sqlite_error)?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let markers = provider
+        .list_change_index_markers(storage_provider::ListChangeIndexMarkersRequest {
+            slot: 7,
+            after_versionstamp: Some("00000000000000000001".to_string()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(markers.len(), 2);
+    assert_eq!(markers[0].versionstamp, "00000000000000000002");
+    assert_eq!(markers[0].table_id, TableName::new("users"));
+
+    let deleted_markers = provider
+        .trim_change_index_markers_older_than(10_000)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted_markers, 2);
+
+    let remaining = provider
+        .list_change_index_markers(storage_provider::ListChangeIndexMarkersRequest {
+            slot: 7,
+            after_versionstamp: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].versionstamp, "00000000000000000003");
+}
+
+#[tokio::test]
+async fn given_two_keys_are_written_when_change_index_is_listed_then_both_table_markers_remain() {
+    let table_name = TableName::new("ChangeIndexMultiKey");
+    let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+    provider
+        .create_table(
+            &CreateTableRequest::new(
+                table_name.clone(),
+                vec![AttributeDefinition {
+                    attribute_name: "pk".to_string(),
+                    attribute_type: KeyAttributeType::S,
+                }],
+                vec![KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                storage_types::BillingMode::PayPerRequest,
+            )
+            .with_stream_specification(Some(StreamSpecification {
+                stream_enabled: true,
+                stream_view_type: Some(StreamViewType::NewAndOldImages),
+            })),
+        )
+        .await
+        .unwrap();
+
+    for pk in ["first", "second"] {
+        provider
+            .put_item(
+                table_name.clone(),
+                HashMap::from([
+                    ("pk".to_string(), AttributeValue::S(pk.to_string())),
+                    (
+                        "value".to_string(),
+                        AttributeValue::S(format!("value-{pk}")),
+                    ),
+                ]),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let markers = provider
+        .list_change_index_markers(storage_provider::ListChangeIndexMarkersRequest {
+            slot: crate::change_index::slot_for_table(&table_name),
+            after_versionstamp: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(markers.len(), 2);
+    assert_eq!(markers[0].table_id, table_name);
+    assert_eq!(markers[1].table_id, table_name);
+    assert!(markers[0].versionstamp < markers[1].versionstamp);
+}
+
+#[tokio::test]
 async fn given_deletion_protection_enabled_when_delete_table_then_rejects_until_disabled() {
     let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
     provider.initialize_storage().await.unwrap();

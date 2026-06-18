@@ -106,14 +106,14 @@ fn wire_items_payload_bytes(items: &[WireItem]) -> u64 {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct RemoteRequestContext {
-    table_name: Option<String>,
-    index_name: Option<String>,
-    item_pk: Option<String>,
-    item_sk: Option<String>,
+pub(super) struct RemoteRequestContext {
+    pub(super) table_name: Option<String>,
+    pub(super) index_name: Option<String>,
+    pub(super) item_pk: Option<String>,
+    pub(super) item_sk: Option<String>,
 }
 
-fn remote_request_context(body: &[u8]) -> RemoteRequestContext {
+pub(super) fn remote_request_context(body: &[u8]) -> RemoteRequestContext {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return RemoteRequestContext::default();
     };
@@ -1525,7 +1525,3 @@ fn increment_remote_leader_cache(outcome: &'static str) {
         .increment(1),
     }
 }
-
-#[cfg(test)]
-#[path = "implementation_tests.rs"]
-mod implementation_tests;

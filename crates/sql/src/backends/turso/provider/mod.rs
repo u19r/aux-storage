@@ -10,6 +10,7 @@ pub(crate) use core::{
     TursoSqlConnection, TursoWriteStreamEntriesInput, build_key_where_clause,
     canonical_revision_key, gsi_table_name, option_string_to_value, row_optional_text,
     row_required_blob, row_required_i64, row_required_text, row_to_table_info, value_to_i64,
+    value_to_string,
 };
 #[cfg(test)]
 pub(crate) use core::{

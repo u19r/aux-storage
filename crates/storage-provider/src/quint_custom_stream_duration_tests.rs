@@ -371,14 +371,8 @@ fn item_version(item_id: StreamItemId) -> u64 {
 
 fn block_on<F>(future: F) -> F::Output
 where F: std::future::Future {
-    struct NoopWaker;
-
-    impl std::task::Wake for NoopWaker {
-        fn wake(self: std::sync::Arc<Self>) {}
-    }
-
-    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
-    let mut context = std::task::Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
     let mut future = Box::pin(future);
     loop {
         match future.as_mut().poll(&mut context) {

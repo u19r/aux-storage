@@ -1,4 +1,4 @@
-use super::remote_request_context;
+use crate::provider::implementation::remote_request_context;
 
 #[test]
 fn given_query_body_when_remote_request_context_read_then_table_and_index_are_returned() {

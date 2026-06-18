@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use metrics_facade::MetricsFacade;
+use storage_common::DatabaseJobIntervals;
 
 #[cfg(test)]
 use super::DatabaseManagerTestPauseHandle;
@@ -20,6 +21,7 @@ pub struct DatabaseManagerRuntimeOptions {
     /// want raw DynamoDB-compatible writes to receive single-table metadata.
     pub enable_single_table_mode: bool,
     pub run_gsi_maintenance_after_write: Option<bool>,
+    pub database_job_intervals: DatabaseJobIntervals,
     pub authoritative_cache_options: StorageAuthoritativeCacheOptions,
     pub metrics_facade: Option<Arc<dyn MetricsFacade>>,
     #[cfg(test)]
@@ -35,6 +37,7 @@ impl Default for DatabaseManagerRuntimeOptions {
             enable_single_node_sync_mode: false,
             enable_single_table_mode: false,
             run_gsi_maintenance_after_write: None,
+            database_job_intervals: DatabaseJobIntervals::default(),
             authoritative_cache_options: StorageAuthoritativeCacheOptions::default(),
             metrics_facade: None,
             #[cfg(test)]
@@ -98,6 +101,12 @@ impl DatabaseManagerRuntimeOptionsBuilder {
         run_gsi_maintenance_after_write: Option<bool>,
     ) -> Self {
         self.options.run_gsi_maintenance_after_write = run_gsi_maintenance_after_write;
+        self
+    }
+
+    #[must_use]
+    pub fn database_job_intervals(mut self, database_job_intervals: DatabaseJobIntervals) -> Self {
+        self.options.database_job_intervals = database_job_intervals;
         self
     }
 

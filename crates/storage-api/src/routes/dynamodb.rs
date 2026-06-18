@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Json, Response as AxumResponse},
 };
 use http_error::{ErrorResponse, HttpApiError};
+use storage_provider::ListChangeIndexMarkersRequest;
 use storage_types::{
     BatchGetItemRequest, DeleteItemRequest, DescribeStreamRequest, DescribeTimeToLiveRequest,
     DynamoRequestValidate, GetRecordsRequest, GetShardIteratorRequest, ListStreamsRequest,
@@ -220,6 +221,11 @@ async fn execute_dynamodb_operation(
                 manager.update_continuous_backups(request)
             })
         }
+        "DynamoDB_20120810.ListChangeIndexMarkers" => {
+            execute_json_operation!(body, timer, ListChangeIndexMarkersRequest, |request| {
+                manager.list_change_index_markers(request)
+            })
+        }
         _ => {
             return Err(with_empty_error_headers(validation_error(format!(
                 "Unknown operation: {target}"
@@ -256,7 +262,7 @@ where
     result.map_err(http_api_error_to_dynamo_error)
 }
 
-fn is_conditional_check_failed_api_error(error: &HttpApiError) -> bool {
+pub(super) fn is_conditional_check_failed_api_error(error: &HttpApiError) -> bool {
     error
         .error_type
         .ends_with("ConditionalCheckFailedException")
@@ -398,6 +404,7 @@ pub(super) fn response_to_http(response: ApiResponse) -> AxumResponse {
         ApiResponse::ReplicationHealth(resp) => json_response(resp),
         ApiResponse::SyncHealth(resp) => json_response(resp),
         ApiResponse::DescribeTimeToLive(resp) => json_response(resp),
+        ApiResponse::ListChangeIndexMarkers(resp) => json_response(resp),
         ApiResponse::Raw(value) => json_response(value),
     }
 }
@@ -439,26 +446,4 @@ fn error_headers(error: &HttpApiError) -> HeaderMap {
         }
     }
     headers
-}
-
-#[cfg(test)]
-mod tests {
-    use http_error::HttpApiError;
-    use storage_types::{DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, StorageEnum, StorageError};
-
-    use super::is_conditional_check_failed_api_error;
-
-    #[test]
-    fn conditional_check_failed_api_errors_are_expected_operation_errors() {
-        let storage_error: StorageError = StorageEnum::ConditionalCheckFailed.into();
-        let conditional_error: HttpApiError = storage_error.into();
-        let validation_error = HttpApiError::validation_error("bad request");
-
-        assert_eq!(
-            conditional_error.message,
-            DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE
-        );
-        assert!(is_conditional_check_failed_api_error(&conditional_error));
-        assert!(!is_conditional_check_failed_api_error(&validation_error));
-    }
 }

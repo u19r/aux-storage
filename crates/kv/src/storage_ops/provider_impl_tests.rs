@@ -10,6 +10,7 @@ use storage_types::{
 };
 
 use crate::{
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
     sorted_kv_store::TransactWriteOperation,
     storage_provider::{
         TransactConditionBindingCacheEntry, cached_transact_condition_binding,
@@ -19,6 +20,10 @@ use crate::{
         wire_item_key_token_from_item_key,
     },
 };
+
+fn table_identity() -> TableIdentity {
+    TableIdentity::new(TableStorageId::new(1), TableName::new("jobs"), Vec::new())
+}
 
 fn table_info() -> StoredTableInfo {
     StoredTableInfo {
@@ -316,6 +321,7 @@ fn wire_item_key_tokens_round_trip_through_the_item_key_parser() {
 fn ttl_index_direct_operations_are_empty_when_ttl_tracking_is_not_active() {
     let operations = ttl_index_direct_operations_for_wire_items(
         &TableName::new("jobs"),
+        &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Disabled)),
         Some(&wire_item("JOB#1", "42", Some("1700000500"))),
@@ -339,6 +345,7 @@ fn ttl_index_direct_operations_skip_writes_when_the_expiration_bucket_is_unchang
 
     let operations = ttl_index_direct_operations_for_wire_items(
         &TableName::new("jobs"),
+        &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Enabled)),
         Some(&old_item),
@@ -362,6 +369,7 @@ fn ttl_index_direct_operations_delete_old_bucket_and_put_new_bucket_when_ttl_cha
 
     let operations = ttl_index_direct_operations_for_wire_items(
         &TableName::new("jobs"),
+        &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Enabled)),
         Some(&old_item),

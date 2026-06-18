@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use serde::Serialize;
 use storage_provider::StorageProvider;
+#[cfg(feature = "foundationdb")]
+use storage_provider::{FoundationDbSettings, StorageBackend, StorageConfig};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
     CreateGlobalSecondaryIndex, CreateTableRequest, EncodePutRequest, EncodeWriteRequest,
@@ -16,6 +18,9 @@ use crate::{
     CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,
     DeleteCappedEntityInput, QueryIndexInput, QueryTableInput, Tables,
 };
+
+#[cfg(feature = "foundationdb")]
+const LOCAL_FDB_CLUSTER_FILE: &str = "/usr/local/etc/foundationdb/fdb.cluster";
 
 async fn create_hash_table(db: &DatabaseManager, table_name: &TableName) {
     let request = CreateTableRequest::new(
@@ -89,6 +94,56 @@ async fn create_single_table_mode_db() -> DatabaseManager {
     )
     .await
     .expect("create single-table mode database manager")
+}
+
+#[cfg(feature = "foundationdb")]
+#[tokio::test]
+#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
+async fn foundationdb_database_manager_bootstraps_system_tables() {
+    if !std::path::Path::new(LOCAL_FDB_CLUSTER_FILE).is_file() {
+        eprintln!("Skipping FoundationDB manager bootstrap test: cluster file missing");
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let config = StorageConfig {
+        backend_type: StorageBackend::FoundationDb,
+        connection_string: None,
+        file_path: None,
+        sqlite: None,
+        postgres: None,
+        turso: None,
+        rocksdb: None,
+        foundationdb: Some(FoundationDbSettings {
+            cluster_file: Some(LOCAL_FDB_CLUSTER_FILE.to_string()),
+            tenant_name: None,
+            subspace_prefix: Some(format!("tests/storage-manager-bootstrap/{nanos}/")),
+            cache_read_version_ms: 0,
+            immediate_gsi_consistency: true,
+        }),
+        remote: None,
+    };
+
+    let db = DatabaseManager::new_with_config_and_runtime_options(
+        config,
+        DatabaseManagerRuntimeOptions::builder()
+            .enable_database_jobs(false)
+            .enable_background_refresh(false)
+            .enable_background_watchers(false)
+            .run_gsi_maintenance_after_write(None)
+            .build(),
+    )
+    .await
+    .expect("foundationdb manager should bootstrap system tables");
+
+    assert!(
+        db.table_exists(&Tables::sys_namespaces())
+            .await
+            .expect("query system namespaces table"),
+        "system namespaces table should exist after manager construction"
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -481,6 +536,54 @@ async fn get_stream_records_for_table_name_uses_stream_record_sequence() {
             .as_ref()
             .and_then(|item| item.get("payload")),
         Some(&AttributeValue::S("customer-value".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn get_stream_records_after_empty_page_does_not_skip_future_writes() {
+    let db = DatabaseManager::new_for_test()
+        .await
+        .expect("create test database manager");
+    let table_name = TableName::new("default_stream_records_empty_then_future");
+    create_hash_table_with_stream(&db, &table_name).await;
+
+    let empty_response = db
+        .get_stream_records_for_table_name(&table_name, None, Some(10))
+        .await
+        .expect("read empty stream records");
+    assert!(empty_response.records.is_empty());
+
+    db.put_item(
+        crate::PutItemInput::builder()
+            .table_name(table_name.clone())
+            .item(HashMap::from([
+                (
+                    "pk".to_string(),
+                    AttributeValue::S("item#future".to_string()),
+                ),
+                (
+                    "payload".to_string(),
+                    AttributeValue::S("future-value".to_string()),
+                ),
+            ]))
+            .build(),
+    )
+    .await
+    .expect("put future item");
+
+    let future_response = db
+        .get_stream_records_for_table_name(
+            &table_name,
+            empty_response.last_evaluated_key.as_deref(),
+            Some(10),
+        )
+        .await
+        .expect("read future stream records");
+
+    assert_eq!(future_response.records.len(), 1);
+    assert_eq!(
+        future_response.records[0].keys.get("pk"),
+        Some(&AttributeValue::S("item#future".to_string()))
     );
 }
 

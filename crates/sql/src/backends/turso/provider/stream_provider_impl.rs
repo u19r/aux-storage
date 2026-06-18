@@ -59,11 +59,25 @@ impl StreamProvider for TursoStorageProvider {
                 let _ = this
                     .execute(
                         conn,
+                        sql_statements::create_change_index_table(),
+                        Vec::new(),
+                    )
+                    .await?;
+                let _ = this
+                    .execute(
+                        conn,
                         sql_statements::create_stream_format_metadata_table(),
                         Vec::new(),
                     )
                     .await?;
                 this.ensure_item_versioned_stream_format_metadata(conn)
+                    .await?;
+                let _ = this
+                    .execute(
+                        conn,
+                        sql_statements::create_change_index_created_at_index(),
+                        Vec::new(),
+                    )
                     .await?;
                 Ok(())
             })

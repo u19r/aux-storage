@@ -1,9 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use storage_common::{
-    GSI_UPDATE_JOB, GsiJobConfig, JobIntervalMillis, RegistersJobs, TTL_SWEEP_JOB,
-};
+use storage_common::{GSI_UPDATE_JOB, JobIntervalMillis, RegistersJobs, TTL_SWEEP_JOB};
 use storage_provider::StorageProvider;
 use storage_types::{
     CreateTableRequest, ScanTableRequest, StorageError, StorageResult, StoredTableInfo, StreamName,
@@ -137,7 +135,7 @@ impl PostgresStorageProvider {
             mgr: &self.job_manager,
         };
         if !self.immediate_gsi_consistency {
-            let gsi_cfg = GsiJobConfig::default();
+            let gsi_cfg = self.database_job_intervals.gsi_config();
             registrar
                 .register_timed_job(
                     GSI_UPDATE_JOB,
@@ -152,7 +150,7 @@ impl PostgresStorageProvider {
         registrar
             .register_timed_job(
                 TTL_SWEEP_JOB,
-                JobIntervalMillis(crate::constants::TTL_SWEEP_INTERVAL_MINUTES * 60_000),
+                self.database_job_intervals.ttl_sweep_interval_ms,
                 PostgresTtlSweepJob {
                     provider: self.clone(),
                 },

@@ -6,6 +6,9 @@
 
 mod backends;
 mod billing_metrics;
+mod change_index;
+#[cfg(test)]
+mod change_index_tests;
 mod constants;
 pub mod dialect;
 pub mod driver;
@@ -54,10 +57,14 @@ mod gsi_lifecycle_alloc_tests;
 mod gsi_lifecycle_tests;
 #[cfg(all(test, any(feature = "postgres-backend", feature = "turso-backend")))]
 mod gsi_profile_support_tests;
+#[cfg(test)]
+mod pagination_tests;
 #[cfg(all(test, feature = "turso-backend"))]
 mod put_item_perf_tests;
 #[cfg(test)]
 mod shared_module_guard_tests;
+#[cfg(test)]
+mod sql_builder_tests;
 #[cfg(test)]
 mod utils_tests;
 

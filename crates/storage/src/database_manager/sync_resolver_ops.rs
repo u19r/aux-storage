@@ -210,7 +210,7 @@ impl<'a> SyncWriteResolver<'a> {
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
-            condition_expression.as_deref().into_iter(),
+            condition_expression.as_deref(),
         )?;
         let table_info = self
             .db
@@ -279,7 +279,7 @@ impl<'a> SyncWriteResolver<'a> {
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
-            condition_expression.as_deref().into_iter(),
+            condition_expression.as_deref(),
         )?;
         let key_json = stable_key_json(&key)?;
         let old_state = self.current_item(&table_name, &key, &key_json).await?;

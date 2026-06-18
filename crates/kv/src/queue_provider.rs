@@ -7,19 +7,13 @@ use queue_provider::{
     QueueMessage, QueueProvider, QueueResult, QueueValidationKind, ReceiptHandle,
 };
 use serde::{Deserialize, Serialize};
-use storage_types::{
-    AttributeValue, DurationSeconds, StorageEnum, StorageError, StorageResult, TimestampMillis,
-};
+use storage_types::{DurationSeconds, StorageEnum, StorageError, StorageResult, TimestampMillis};
 use uuid::Uuid;
 
 use crate::{
     SortedKvDbStorageProvider,
     constants::PARTITION_ROUTING_RETRIES_TOTAL_METRIC,
-    helpers::deserialize_item_from_bytes,
-    keys::{
-        key_queue_root, key_receipt_checkpoint_uuid, key_receipt_handle, queue_message_prefix,
-        queue_message_storage_key, queue_visibility_storage_key, visibility_key,
-    },
+    keyspace::compact::{self, QueueStorageId, U48},
     newtypes::MessageVisibilityKey,
     partition_family::{
         DEFAULT_STANDARD_QUEUE_PARTITION_COUNT, PartitionFamilyKind, QueueReceiptHandleData,
@@ -38,14 +32,18 @@ use crate::{
             PARTITIONED_QUEUE_RECEIVE_SCAN_OVERFETCH_MULTIPLIER,
             PARTITIONED_QUEUE_RECEIVE_SCAN_SHARDS, PARTITIONED_QUEUE_SEND_MAX_ATTEMPTS,
             QUEUE_PREWARM_MESSAGE_ID, RECEIVE_SCAN_MAX_LIMIT, RECEIVE_SCAN_MIN_LIMIT,
-            VISIBILITY_RECORD_ACTIVE_STATE, VISIBILITY_RECORD_RECEIPT_HANDLE_FIELD,
-            VISIBILITY_RECORD_STATE_FIELD,
         },
         record_queue_storage_operation, set_queue_storage_gauge,
         storage::{queue_payload_delete_range, queue_payload_is_chunk_key},
     },
-    sorted_kv_store::{DirectWriteOperation, TransactWriteOperation},
+    sorted_kv_store::{DirectWriteOperation, RawKey},
 };
+
+#[inline]
+#[must_use]
+pub(crate) fn visibility_key(timestamp: TimestampMillis, message_id: &MessageId) -> String {
+    format!("{:013}:{message_id}", *timestamp)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PartitionedQueueBody {
@@ -70,6 +68,12 @@ struct QueueDeleteLedgerEntry {
     created_at: TimestampMillis,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredQueueIdentity {
+    queue_id: QueueStorageId,
+    queue: Queue,
+}
+
 fn partitioned_body_bytes(
     body: String,
     message_attributes: Option<HashMap<String, MessageAttributeValue>>,
@@ -87,42 +91,87 @@ fn record_deferred_payload_cleanup(count: u64) {
     record_queue_storage_operation("queue_payload_orphan", "created", count);
 }
 
-fn queue_delete_ledger_prefix(queue_url: &str) -> Vec<u8> {
-    format!("qdata/{}/delete_ledger/", queue_family_component(queue_url)).into_bytes()
+fn queue_delete_ledger_prefix_for_id(queue_id: QueueStorageId) -> Vec<u8> {
+    compact::queue_record_key(
+        crate::partition_family::queue_data_bucket(0),
+        queue_id,
+        0,
+        compact::QueueRecordKind::DeleteLedger,
+        b"",
+    )
 }
 
 pub(crate) fn queue_delete_ledger_key(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     message_id_hex: &str,
 ) -> Vec<u8> {
-    let mut key = queue_delete_ledger_prefix(queue_url);
-    key.extend_from_slice(format!("{placement_slot:04x}:{partition_id:04x}:").as_bytes());
-    key.extend_from_slice(message_id_hex.as_bytes());
-    key
+    let mut suffix = Vec::with_capacity(4 + message_id_hex.len());
+    suffix.extend_from_slice(&placement_slot.to_be_bytes());
+    suffix.extend_from_slice(&partition_id.to_be_bytes());
+    suffix.extend_from_slice(message_id_hex.as_bytes());
+    compact::queue_record_key(
+        crate::partition_family::queue_data_bucket(0),
+        queue_id,
+        0,
+        compact::QueueRecordKind::DeleteLedger,
+        &suffix,
+    )
 }
 
 fn queue_delete_ledger_entry_bytes(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     route: QueuePartitionRoute,
     message_id_hex: &str,
 ) -> StorageResult<Vec<u8>> {
     storage_types::storage_serde::to_bytes(&QueueDeleteLedgerEntry {
         payload_key: queue_payload_key_with_slot(
-            queue_url,
+            queue_id,
             route.placement_slot,
             route.partition_id,
             message_id_hex,
         ),
         state_key: queue_state_key_with_slot(
-            queue_url,
+            queue_id,
             route.placement_slot,
             route.partition_id,
             message_id_hex,
         ),
         created_at: TimestampMillis::now(),
     })
+}
+
+fn encode_queue_storage_id(queue_id: QueueStorageId) -> Vec<u8> {
+    let bytes = queue_id.get().to_be_bytes();
+    bytes[2..].to_vec()
+}
+
+fn decode_queue_storage_id(bytes: &[u8]) -> StorageResult<QueueStorageId> {
+    if bytes.len() != 6 {
+        return Err(StorageError::internal(&format!(
+            "invalid queue storage id width: expected 6 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut padded = [0u8; 8];
+    padded[2..].copy_from_slice(bytes);
+    U48::new(u64::from_be_bytes(padded))
+        .map(QueueStorageId::from)
+        .map_err(|err| StorageError::internal(&format!("invalid queue storage id: {err}")))
+}
+
+fn queue_storage_id(value: u64) -> StorageResult<QueueStorageId> {
+    QueueStorageId::new(value)
+        .map_err(|err| StorageError::internal(&format!("invalid queue storage id: {err}")))
+}
+
+fn encode_queue_identity(identity: &StoredQueueIdentity) -> StorageResult<Vec<u8>> {
+    storage_types::storage_serde::to_bytes(identity)
+}
+
+fn decode_queue_identity(bytes: &[u8]) -> QueueResult<StoredQueueIdentity> {
+    storage_types::storage_serde::from_bytes(bytes).map_err(QueueError::from)
 }
 
 fn parse_ready_hint_value(value: &[u8]) -> Option<(u16, TimestampMillis)> {
@@ -192,10 +241,6 @@ struct PreparedPartitionedQueueMessage {
 impl<S> SortedKvDbStorageProvider<S>
 where S: QueueKvStore + 'static
 {
-    fn queue_key_prefix(queue_url: &str) -> Vec<u8> {
-        format!("sys/queues/{queue_url}/").into_bytes()
-    }
-
     fn record_queue_partition_load(
         &self,
         queue_url: &str,
@@ -279,26 +324,10 @@ where S: QueueKvStore + 'static
         }
     }
 
-    async fn queue_roots_for_payload_cleanup(&self) -> StorageResult<Vec<String>> {
-        let items = self
-            .kv_store
-            .get_prefix(b"sys/queues/", true, None, true)
-            .await?;
-        let mut queue_urls = Vec::new();
-        for (key, value) in items.items {
-            let key_text = String::from_utf8_lossy(&key);
-            if key_text.contains("/messages/")
-                || key_text.contains("/visibility/")
-                || key_text.contains("/receipt_handles/")
-            {
-                continue;
-            }
-            let Ok(queue) = storage_types::storage_serde::from_bytes::<Queue>(&value) else {
-                continue;
-            };
-            queue_urls.push(queue.queue_url);
-        }
-        Ok(queue_urls)
+    async fn queue_roots_for_payload_cleanup(&self) -> StorageResult<Vec<StoredQueueIdentity>> {
+        self.list_queue_identities()
+            .await
+            .map_err(|error| StorageError::internal(&error.to_string()))
     }
 
     pub(crate) async fn cleanup_queue_payload_orphans(&self, limit: u32) -> StorageResult<u64> {
@@ -313,14 +342,16 @@ where S: QueueKvStore + 'static
         let mut pending_deletes = Vec::new();
         let mut ledger_scanned = 0u64;
 
-        for queue_url in self.queue_roots_for_payload_cleanup().await? {
+        for identity in self.queue_roots_for_payload_cleanup().await? {
             if remaining == 0 {
                 break;
             }
+            let queue_url = identity.queue.queue_url;
+            let queue_id = identity.queue_id;
             let ledger_entries = self
                 .kv_store
                 .get_prefix(
-                    &queue_delete_ledger_prefix(&queue_url),
+                    &queue_delete_ledger_prefix_for_id(queue_id),
                     true,
                     Some(remaining),
                     false,
@@ -374,11 +405,8 @@ where S: QueueKvStore + 'static
                 if remaining == 0 {
                     break;
                 }
-                let payload_prefix = queue_body_prefix_with_slot(
-                    &queue_url,
-                    route.placement_slot,
-                    route.partition_id,
-                );
+                let payload_prefix =
+                    queue_body_prefix_with_slot(queue_id, route.placement_slot, route.partition_id);
                 let payloads = self
                     .kv_store
                     .get_prefix(&payload_prefix, true, Some(remaining), false)
@@ -406,7 +434,7 @@ where S: QueueKvStore + 'static
                             return None;
                         }
                         let state_key = queue_state_key_with_slot(
-                            &queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &message_id_hex,
@@ -443,7 +471,7 @@ where S: QueueKvStore + 'static
                             &message_id,
                         ));
                         let ready_key = queue_ready_key_with_slot(
-                            &queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &visibility_key,
@@ -526,6 +554,7 @@ where S: QueueKvStore + 'static
     async fn queue_receive_hinted_route_window(
         &self,
         queue_url: &str,
+        queue_id: QueueStorageId,
         routes: &[QueuePartitionRoute],
         scan_shards: usize,
         now: TimestampMillis,
@@ -550,7 +579,7 @@ where S: QueueKvStore + 'static
             .collect::<Vec<_>>();
         let hint_keys = sampled_routes
             .iter()
-            .map(|route| queue_ready_hint_key(queue_url, route.placement_slot, route.partition_id))
+            .map(|route| queue_ready_hint_key(queue_id, route.placement_slot, route.partition_id))
             .collect::<Vec<_>>();
         let hints = self.kv_store.multi_get(hint_keys, false).await?;
         let mut ready_routes = Vec::with_capacity(ready_limit);
@@ -640,56 +669,18 @@ where S: QueueKvStore + 'static
         )
     }
 
-    fn visibility_record_bytes(receipt_handle: Option<&ReceiptHandle>) -> QueueResult<Vec<u8>> {
-        let mut item = HashMap::from([(
-            VISIBILITY_RECORD_STATE_FIELD.to_string(),
-            AttributeValue::S(VISIBILITY_RECORD_ACTIVE_STATE.to_string()),
-        )]);
-        if let Some(receipt_handle) = receipt_handle {
-            item.insert(
-                VISIBILITY_RECORD_RECEIPT_HANDLE_FIELD.to_string(),
-                AttributeValue::S(receipt_handle.to_string()),
-            );
-        }
-        Ok(storage_types::storage_serde::to_bytes(&item)?)
+    fn invalid_receipt_handle(receipt_handle: &ReceiptHandle) -> QueueError {
+        QueueError::validation_with_detail(
+            QueueValidationKind::MessageNotFound,
+            format!("receipt handle is invalid or expired: {receipt_handle}"),
+        )
     }
 
-    fn receipt_mapping_bytes(visibility_key: &MessageVisibilityKey) -> QueueResult<Vec<u8>> {
-        Ok(storage_types::storage_serde::to_bytes(&HashMap::from([(
-            "visibility_key".to_string(),
-            AttributeValue::S(visibility_key.to_string()),
-        )]))?)
-    }
-
-    async fn fetch_receipt_from_db(
-        &self,
-        queue_url: &str,
+    fn decode_receipt_handle(
         receipt_handle: &ReceiptHandle,
-    ) -> QueueResult<(MessageVisibilityKey, MessageId)> {
-        let receipt_handle_key = key_receipt_handle(queue_url, receipt_handle);
-        let Some(raw) = self
-            .kv_store
-            .get(receipt_handle_key.as_bytes(), true)
-            .await?
-        else {
-            return Err(QueueError::ResourceNotFound {
-                resource_type: "receipt_handle",
-                resource_id: receipt_handle.0.clone(),
-            });
-        };
-
-        let vis = deserialize_item_from_bytes(&raw)?;
-        let visibility_key = match vis.get("visibility_key") {
-            Some(AttributeValue::S(vis_key)) => MessageVisibilityKey(vis_key.clone()),
-            _ => {
-                return Err(QueueError::internal(
-                    QueueInternalKind::InvalidMessageVisibilityKeyFormat,
-                ));
-            }
-        };
-        let message_id = visibility_key.get_message_id()?;
-
-        Ok((visibility_key, message_id))
+    ) -> QueueResult<QueueReceiptHandleData> {
+        QueueReceiptHandleData::decode(receipt_handle.as_str())
+            .map_err(|_| Self::invalid_receipt_handle(receipt_handle))
     }
 
     async fn load_queue_family_state(
@@ -769,6 +760,7 @@ where S: QueueKvStore + 'static
 
     fn partitioned_queue_write_for_route(
         prepared: &PreparedPartitionedQueueMessage,
+        queue_id: QueueStorageId,
         route: QueuePartitionRoute,
         wake_key: &[u8],
         wake_bytes: &[u8],
@@ -779,27 +771,27 @@ where S: QueueKvStore + 'static
         ));
         PartitionedQueueMessageWrite {
             state_key: queue_state_key_with_slot(
-                &prepared.queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &prepared.message_id_hex,
             ),
             state_bytes: prepared.state_bytes.clone(),
             payload_key: queue_payload_key_with_slot(
-                &prepared.queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &prepared.message_id_hex,
             ),
             payload_bytes: prepared.payload_bytes.clone(),
             ready_key: queue_ready_key_with_slot(
-                &prepared.queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &visibility_key,
             ),
             ready_hint_key: queue_ready_hint_key(
-                &prepared.queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
             ),
@@ -838,14 +830,21 @@ where S: QueueKvStore + 'static
                 "send_messages requires all messages to target the same queue_url",
             ));
         }
-
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
         self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
             .await?;
         let cache_key = crate::sorted_kv::PartitionFamilyCacheKey::new(
             PartitionFamilyKind::StandardQueue,
             &queue_family_component(queue_url),
         );
-        let wake_key = queue_wake_key(queue_url);
+        let wake_key = queue_wake_key(queue_id);
         let wake_bytes = wake_value_bytes()?;
         for attempt in 0..PARTITIONED_QUEUE_SEND_MAX_ATTEMPTS {
             let routing_state = match self.queue_routing_state(queue_url).await? {
@@ -877,6 +876,7 @@ where S: QueueKvStore + 'static
                     .saturating_add(u64::try_from(prepared.state_bytes.len()).unwrap_or(u64::MAX));
                 send_messages.push(Self::partitioned_queue_write_for_route(
                     prepared,
+                    queue_id,
                     route,
                     &wake_key,
                     &wake_bytes,
@@ -960,6 +960,14 @@ where S: QueueKvStore + 'static
         let now = TimestampMillis::now();
         let mut scanned_partitions = 0usize;
         let mut claim_ranges = Vec::new();
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
 
         let routes = queue_partition_routes(routing_state);
         let receive_scan_shards = max_messages.max(1);
@@ -968,7 +976,7 @@ where S: QueueKvStore + 'static
             .clamp(1, PARTITIONED_QUEUE_RECEIVE_SCAN_SHARDS)
             .min(routes.len());
         let route_window = self
-            .queue_receive_hinted_route_window(queue_url, &routes, scan_shards, now)
+            .queue_receive_hinted_route_window(queue_url, queue_id, &routes, scan_shards, now)
             .await?;
 
         for route in route_window {
@@ -978,7 +986,7 @@ where S: QueueKvStore + 'static
             scanned_partitions = scanned_partitions.saturating_add(1);
 
             let ready_start = queue_ready_key_with_slot(
-                queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &MessageVisibilityKey(visibility_key(
@@ -987,19 +995,19 @@ where S: QueueKvStore + 'static
                 )),
             );
             let ready_end = queue_ready_key_with_slot(
-                queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &MessageVisibilityKey(visibility_key(now + 1, &MessageId::default())),
             );
             claim_ranges.push(QueueClaimRange {
-                queue_url: queue_url.to_string(),
+                queue_id,
                 placement_slot: route.placement_slot,
                 partition_id: route.partition_id,
                 ready_start,
                 ready_end,
                 ready_hint_key: queue_ready_hint_key(
-                    queue_url,
+                    queue_id,
                     route.placement_slot,
                     route.partition_id,
                 ),
@@ -1091,6 +1099,14 @@ where S: QueueKvStore + 'static
         wait_time_seconds: DurationSeconds,
         routing_state: QueueRoutingState,
     ) -> QueueResult<Vec<MessageResponse>> {
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(u64::from(*wait_time_seconds));
         let mut messages = Vec::new();
@@ -1134,7 +1150,7 @@ where S: QueueKvStore + 'static
             ));
             let _ = self
                 .kv_store
-                .wait_for_change(&queue_wake_key(queue_url), sample_delay)
+                .wait_for_change(&queue_wake_key(queue_id), sample_delay)
                 .await?;
         }
     }
@@ -1143,7 +1159,12 @@ where S: QueueKvStore + 'static
         &self,
         queue_url: &str,
         handle: &QueueReceiptHandleData,
-    ) -> QueueResult<(PartitionedQueueState, MessageId, QueuePartitionRoute)> {
+    ) -> QueueResult<(
+        PartitionedQueueState,
+        MessageId,
+        QueuePartitionRoute,
+        QueueStorageId,
+    )> {
         let message_id = handle
             .message_id_hex
             .parse::<MessageId>()
@@ -1159,8 +1180,16 @@ where S: QueueKvStore + 'static
             .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
         let route = queue_partition_route_for_id(&routing_state, handle.partition_id)
             .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
         let state_key = queue_state_key_with_slot(
-            queue_url,
+            queue_id,
             route.placement_slot,
             route.partition_id,
             &handle.message_id_hex,
@@ -1194,7 +1223,7 @@ where S: QueueKvStore + 'static
                 resource_id: handle.message_id_hex.clone(),
             });
         }
-        Ok((state, message_id, route))
+        Ok((state, message_id, route, queue_id))
     }
 
     async fn delete_partitioned_message_with_state(
@@ -1204,7 +1233,8 @@ where S: QueueKvStore + 'static
         started_at: Instant,
     ) -> QueueResult<()> {
         let now = TimestampMillis::now();
-        let (state, message_id, route) = self.load_partitioned_state(queue_url, handle).await?;
+        let (state, message_id, route, queue_id) =
+            self.load_partitioned_state(queue_url, handle).await?;
         if state.visibility_timestamp < now {
             return Err(QueueError::validation(
                 QueueValidationKind::CannotOperateVisibleMessage,
@@ -1213,7 +1243,7 @@ where S: QueueKvStore + 'static
         let visibility_key =
             MessageVisibilityKey(visibility_key(state.visibility_timestamp, &message_id));
         let ready_key = queue_ready_key_with_slot(
-            queue_url,
+            queue_id,
             route.placement_slot,
             route.partition_id,
             &visibility_key,
@@ -1227,13 +1257,13 @@ where S: QueueKvStore + 'static
                 DirectWriteOperation::Delete { key: ready_key },
                 DirectWriteOperation::Put {
                     key: queue_delete_ledger_key(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &handle.message_id_hex,
                     ),
                     value: queue_delete_ledger_entry_bytes(
-                        queue_url,
+                        queue_id,
                         route,
                         &handle.message_id_hex,
                     )?,
@@ -1251,37 +1281,78 @@ where S: QueueKvStore + 'static
         Ok(())
     }
 
-    async fn find_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
-        let queues = self
+    async fn queue_identity_by_id(
+        &self,
+        queue_id: QueueStorageId,
+    ) -> QueueResult<Option<StoredQueueIdentity>> {
+        self.kv_store
+            .get(&compact::queue_metadata_key(queue_id), true)
+            .await?
+            .map(|value| decode_queue_identity(&value))
+            .transpose()
+    }
+
+    async fn queue_identity_by_url(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<StoredQueueIdentity>> {
+        let Some(queue_id_bytes) = self
             .kv_store
-            .get_prefix(b"sys/queues/", true, None, true)
+            .get(&compact::queue_url_lookup_key(queue_url), true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let queue_id = decode_queue_storage_id(&queue_id_bytes)?;
+        self.queue_identity_by_id(queue_id).await
+    }
+
+    async fn find_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
+        let Some(queue_id_bytes) = self
+            .kv_store
+            .get(&compact::queue_name_lookup_key(queue_name), true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let queue_id = decode_queue_storage_id(&queue_id_bytes)?;
+        Ok(self
+            .queue_identity_by_id(queue_id)
+            .await?
+            .map(|identity| identity.queue))
+    }
+
+    async fn list_queue_identities(&self) -> QueueResult<Vec<StoredQueueIdentity>> {
+        let range = compact::queue_metadata_prefix();
+        let items = self
+            .kv_store
+            .get_range(&range.start, &range.end, None, None::<RawKey>, true)
             .await?;
-
-        for (key, value) in queues.items {
-            let key_text = String::from_utf8_lossy(&key);
-            if key_text.contains("/messages/")
-                || key_text.contains("/visibility/")
-                || key_text.contains("/receipt_handles/")
-            {
-                continue;
-            }
-
-            let queue: Queue = match storage_types::storage_serde::from_bytes(&value) {
-                Ok(queue) => queue,
-                Err(_) => continue,
-            };
-            if queue.queue_name == queue_name {
-                return Ok(Some(queue));
-            }
-        }
-
-        Ok(None)
+        items
+            .items
+            .into_iter()
+            .map(|(_key, value)| decode_queue_identity(&value))
+            .collect()
     }
 }
 
 pub(crate) fn partitioned_ready_visibility_key(
     storage_key: &[u8],
 ) -> QueueResult<MessageVisibilityKey> {
+    if let Ok(compact::ParsedCompactKey::PartitionedQueueData {
+        kind: compact::QueueRecordKind::Ready,
+        suffix,
+        ..
+    }) = compact::parse_compact_key(storage_key)
+    {
+        let visibility_key = std::str::from_utf8(suffix).map_err(|error| {
+            QueueError::internal_with_detail(
+                QueueInternalKind::InvalidMessageVisibilityKeyFormat,
+                error,
+            )
+        })?;
+        return Ok(MessageVisibilityKey(visibility_key.to_string()));
+    }
     let key_text = String::from_utf8(storage_key.to_vec()).map_err(|error| {
         QueueError::internal_with_detail(
             QueueInternalKind::InvalidMessageVisibilityKeyFormat,
@@ -1344,9 +1415,51 @@ where S: QueueKvStore + 'static
     }
 
     async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
-        let key = key_queue_root(&queue.queue_url);
-        let value = storage_types::storage_serde::to_bytes(&queue)?;
-        self.kv_store.put(key.as_bytes(), &value, None).await?;
+        let allocator_key = compact::queue_id_allocator_key();
+        let allocator_value = self.kv_store.get(&allocator_key, true).await?;
+        let queue_id = match allocator_value.as_deref() {
+            Some(bytes) => decode_queue_storage_id(bytes)?,
+            None => queue_storage_id(1)?,
+        };
+        let next_queue_id = queue_storage_id(queue_id.get().saturating_add(1))?;
+        let identity = StoredQueueIdentity {
+            queue_id,
+            queue: queue.clone(),
+        };
+        let queue_id_bytes = encode_queue_storage_id(queue_id);
+        self.kv_store
+            .transact_write_unchecked(vec![
+                DirectWriteOperation::CheckValue {
+                    key: allocator_key.clone(),
+                    expected_value: allocator_value,
+                },
+                DirectWriteOperation::CheckValue {
+                    key: compact::queue_url_lookup_key(&queue.queue_url),
+                    expected_value: None,
+                },
+                DirectWriteOperation::CheckValue {
+                    key: compact::queue_name_lookup_key(&queue.queue_name),
+                    expected_value: None,
+                },
+                DirectWriteOperation::Put {
+                    key: allocator_key,
+                    value: encode_queue_storage_id(next_queue_id),
+                },
+                DirectWriteOperation::Put {
+                    key: compact::queue_url_lookup_key(&queue.queue_url),
+                    value: queue_id_bytes.clone(),
+                },
+                DirectWriteOperation::Put {
+                    key: compact::queue_name_lookup_key(&queue.queue_name),
+                    value: queue_id_bytes,
+                },
+                DirectWriteOperation::Put {
+                    key: compact::queue_metadata_key(queue_id),
+                    value: encode_queue_identity(&identity)?,
+                },
+            ])
+            .await
+            .map_err(QueueError::TransactWrite)?;
         if self.kv_store.supports_partition_families() {
             let family = self
                 .ensure_queue_family_state(&queue.queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
@@ -1357,7 +1470,7 @@ where S: QueueKvStore + 'static
                     placement_slot: route.placement_slot,
                     partition_id: route.partition_id,
                     marker_key: queue_state_key_with_slot(
-                        &queue.queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         QUEUE_PREWARM_MESSAGE_ID,
@@ -1376,25 +1489,17 @@ where S: QueueKvStore + 'static
                 )
                 .await?;
             self.kv_store
-                .put(
-                    &queue_wake_key(&queue.queue_url),
-                    &wake_value_bytes()?,
-                    None,
-                )
+                .put(&queue_wake_key(queue_id), &wake_value_bytes()?, None)
                 .await?;
         }
         Ok(())
     }
 
     async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {
-        let key = key_queue_root(queue_url);
-        match self.kv_store.get(key.as_bytes(), true).await? {
-            Some(value) => {
-                let queue: Queue = storage_types::storage_serde::from_bytes(&value)?;
-                Ok(Some(queue))
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .map(|identity| identity.queue))
     }
 
     async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
@@ -1402,65 +1507,54 @@ where S: QueueKvStore + 'static
     }
 
     async fn list_queues(&self, queue_name_prefix: Option<&str>) -> QueueResult<Vec<Queue>> {
-        let items = self
-            .kv_store
-            .get_prefix(b"sys/queues/", true, None, true)
-            .await?;
-        let mut queues = Vec::new();
-        for (key, value) in items.items {
-            let key_text = String::from_utf8_lossy(&key);
-            if key_text.contains("/messages/")
-                || key_text.contains("/visibility/")
-                || key_text.contains("/receipt_handles/")
-            {
-                continue;
-            }
-
-            let queue: Queue = match storage_types::storage_serde::from_bytes(&value) {
-                Ok(queue) => queue,
-                Err(_) => continue,
-            };
-            if queue_name_prefix.is_none_or(|prefix| queue.queue_name.starts_with(prefix)) {
-                queues.push(queue);
-            }
-        }
-        Ok(queues)
+        Ok(self
+            .list_queue_identities()
+            .await?
+            .into_iter()
+            .map(|identity| identity.queue)
+            .filter(|queue| {
+                queue_name_prefix.is_none_or(|prefix| queue.queue_name.starts_with(prefix))
+            })
+            .collect())
     }
 
     async fn delete_queue(&self, queue_url: &str) -> QueueResult<()> {
+        let identity = self.queue_identity_by_url(queue_url).await?;
         if let Some(family) = self.load_queue_family_state(queue_url).await? {
             for route in queue_partition_routes(&QueueRoutingState::Control(family)) {
-                self.kv_store
-                    .delete_prefix(queue_ready_prefix_with_slot(
-                        queue_url,
-                        route.placement_slot,
-                        route.partition_id,
-                    ))
-                    .await?;
-                self.kv_store
-                    .delete_prefix(queue_state_key_with_slot(
-                        queue_url,
-                        route.placement_slot,
-                        route.partition_id,
-                        "",
-                    ))
-                    .await?;
-                self.kv_store
-                    .delete_prefix(queue_body_prefix_with_slot(
-                        queue_url,
-                        route.placement_slot,
-                        route.partition_id,
-                    ))
-                    .await?;
-                record_queue_storage_operation("queue_payload_cleanup", "prefix_delete", 1);
-                self.kv_store
-                    .delete_prefix(queue_checkpoint_key_with_slot(
-                        queue_url,
-                        route.placement_slot,
-                        route.partition_id,
-                        "",
-                    ))
-                    .await?;
+                if let Some(identity) = &identity {
+                    self.kv_store
+                        .delete_prefix(queue_ready_prefix_with_slot(
+                            identity.queue_id,
+                            route.placement_slot,
+                            route.partition_id,
+                        ))
+                        .await?;
+                    self.kv_store
+                        .delete_prefix(queue_state_key_with_slot(
+                            identity.queue_id,
+                            route.placement_slot,
+                            route.partition_id,
+                            "",
+                        ))
+                        .await?;
+                    self.kv_store
+                        .delete_prefix(queue_body_prefix_with_slot(
+                            identity.queue_id,
+                            route.placement_slot,
+                            route.partition_id,
+                        ))
+                        .await?;
+                    record_queue_storage_operation("queue_payload_cleanup", "prefix_delete", 1);
+                    self.kv_store
+                        .delete_prefix(queue_checkpoint_key_with_slot(
+                            identity.queue_id,
+                            route.placement_slot,
+                            route.partition_id,
+                            "",
+                        ))
+                        .await?;
+                }
             }
             self.delete_partition_family_state(
                 PartitionFamilyKind::StandardQueue,
@@ -1471,29 +1565,52 @@ where S: QueueKvStore + 'static
         self.kv_store
             .delete(&queue_partition_marker_key(queue_url))
             .await?;
-        let _ = self.kv_store.delete(&queue_wake_key(queue_url)).await;
-        self.kv_store
-            .delete_prefix(Self::queue_key_prefix(queue_url))
-            .await?;
-        self.kv_store
-            .delete(key_queue_root(queue_url).as_bytes())
-            .await?;
+        if let Some(identity) = &identity {
+            let _ = self
+                .kv_store
+                .delete(&queue_wake_key(identity.queue_id))
+                .await;
+        }
+        if let Some(identity) = identity {
+            self.kv_store
+                .transact_write_unchecked(vec![
+                    DirectWriteOperation::Delete {
+                        key: compact::queue_metadata_key(identity.queue_id),
+                    },
+                    DirectWriteOperation::Delete {
+                        key: compact::queue_url_lookup_key(&identity.queue.queue_url),
+                    },
+                    DirectWriteOperation::Delete {
+                        key: compact::queue_name_lookup_key(&identity.queue.queue_name),
+                    },
+                ])
+                .await
+                .map_err(QueueError::TransactWrite)?;
+        }
         Ok(())
     }
 
     async fn purge_queue(&self, queue_url: &str) -> QueueResult<()> {
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
         if let Some(family) = self.load_queue_family_state(queue_url).await? {
             for route in queue_partition_routes(&QueueRoutingState::Control(family)) {
                 self.kv_store
                     .delete_prefix(queue_ready_prefix_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                     ))
                     .await?;
                 self.kv_store
                     .delete_prefix(queue_state_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         "",
@@ -1501,7 +1618,7 @@ where S: QueueKvStore + 'static
                     .await?;
                 self.kv_store
                     .delete_prefix(queue_body_prefix_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                     ))
@@ -1509,7 +1626,7 @@ where S: QueueKvStore + 'static
                 record_queue_storage_operation("queue_payload_cleanup", "prefix_delete", 1);
                 self.kv_store
                     .delete_prefix(queue_checkpoint_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         "",
@@ -1517,15 +1634,6 @@ where S: QueueKvStore + 'static
                     .await?;
             }
         }
-        self.kv_store
-            .delete_prefix(queue_message_prefix(queue_url))
-            .await?;
-        self.kv_store
-            .delete_prefix(format!("sys/queues/{queue_url}/visibility/").into_bytes())
-            .await?;
-        self.kv_store
-            .delete_prefix(format!("sys/queues/{queue_url}/receipt_handles/").into_bytes())
-            .await?;
         Ok(())
     }
 
@@ -1541,9 +1649,24 @@ where S: QueueKvStore + 'static
             });
         };
         queue.attributes = attributes;
-        let key = key_queue_root(queue_url);
-        let value = storage_types::storage_serde::to_bytes(&queue)?;
-        self.kv_store.put(key.as_bytes(), &value, None).await?;
+        let identity = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?;
+        let updated_identity = StoredQueueIdentity {
+            queue_id: identity.queue_id,
+            queue,
+        };
+        self.kv_store
+            .put(
+                &compact::queue_metadata_key(updated_identity.queue_id),
+                &encode_queue_identity(&updated_identity)?,
+                None,
+            )
+            .await?;
         Ok(())
     }
 
@@ -1586,9 +1709,8 @@ where S: QueueKvStore + 'static
         receipt_handle: ReceiptHandle,
     ) -> QueueResult<()> {
         let started_at = Instant::now();
-        if let Some(routing_state) = self.queue_routing_state(queue_url).await?
-            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
-        {
+        let handle = Self::decode_receipt_handle(&receipt_handle)?;
+        if let Some(routing_state) = self.queue_routing_state(queue_url).await? {
             let now = TimestampMillis::now();
             let message_id = handle
                 .message_id_hex
@@ -1609,10 +1731,18 @@ where S: QueueKvStore + 'static
                 .ok_or_else(|| {
                     QueueError::internal(QueueInternalKind::MissingQueuePartitionState)
                 })?;
+            let queue_id = self
+                .queue_identity_by_url(queue_url)
+                .await?
+                .ok_or_else(|| QueueError::ResourceNotFound {
+                    resource_type: "queue",
+                    resource_id: queue_url.to_string(),
+                })?
+                .queue_id;
             let visibility_key =
                 MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));
             let ready_key = queue_ready_key_with_slot(
-                queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &visibility_key,
@@ -1627,13 +1757,13 @@ where S: QueueKvStore + 'static
                     DirectWriteOperation::Delete { key: ready_key },
                     DirectWriteOperation::Put {
                         key: queue_delete_ledger_key(
-                            queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &handle.message_id_hex,
                         ),
                         value: queue_delete_ledger_entry_bytes(
-                            queue_url,
+                            queue_id,
                             route,
                             &handle.message_id_hex,
                         )?,
@@ -1658,50 +1788,7 @@ where S: QueueKvStore + 'static
             );
             return Ok(());
         }
-
-        let now = TimestampMillis::now();
-        let (visibility_key_value, message_id) = self
-            .fetch_receipt_from_db(queue_url, &receipt_handle)
-            .await?;
-
-        if visibility_key_value.get_timestamp()? < now {
-            return Err(QueueError::validation(
-                QueueValidationKind::CannotOperateVisibleMessage,
-            ));
-        }
-
-        let visibility_delete_key = queue_visibility_storage_key(
-            queue_url,
-            visibility_key_value.get_timestamp()?,
-            &message_id,
-        );
-        let message_key = queue_message_storage_key(queue_url, &message_id);
-        let receipt_handle_key = key_receipt_handle(queue_url, &receipt_handle);
-        let checkpoint_key = key_receipt_checkpoint_uuid(queue_url, &receipt_handle);
-
-        self.kv_store
-            .transact_write(vec![
-                TransactWriteOperation::Delete {
-                    key: visibility_delete_key,
-                    condition: None,
-                },
-                TransactWriteOperation::Delete {
-                    key: message_key,
-                    condition: None,
-                },
-                TransactWriteOperation::Delete {
-                    key: receipt_handle_key.into_bytes(),
-                    condition: None,
-                },
-                TransactWriteOperation::Delete {
-                    key: checkpoint_key.into_bytes(),
-                    condition: None,
-                },
-            ])
-            .await
-            .map_err(QueueError::TransactWrite)?;
-
-        Ok(())
+        Err(Self::invalid_receipt_handle(&receipt_handle))
     }
 
     async fn delete_messages(
@@ -1709,34 +1796,48 @@ where S: QueueKvStore + 'static
         queue_url: &str,
         receipt_handles: Vec<ReceiptHandle>,
     ) -> QueueResult<Vec<QueueResult<()>>> {
-        let Some(routing_state) = self.queue_routing_state(queue_url).await? else {
-            let mut results = Vec::with_capacity(receipt_handles.len());
-            for receipt_handle in receipt_handles {
-                results.push(self.delete_message(queue_url, receipt_handle).await);
-            }
-            return Ok(results);
-        };
-
-        let mut decoded_handles = Vec::with_capacity(receipt_handles.len());
-        for receipt_handle in &receipt_handles {
-            let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str()) else {
-                let mut results = Vec::with_capacity(receipt_handles.len());
-                for receipt_handle in receipt_handles {
-                    results.push(self.delete_message(queue_url, receipt_handle).await);
-                }
-                return Ok(results);
-            };
-            decoded_handles.push(handle);
-        }
-
         let now = TimestampMillis::now();
         let mut results = std::iter::repeat_with(|| None)
-            .take(decoded_handles.len())
+            .take(receipt_handles.len())
             .collect::<Vec<Option<QueueResult<()>>>>();
+        let routing_state = self.queue_routing_state(queue_url).await?;
+        let mut decoded_handles = Vec::with_capacity(receipt_handles.len());
+        for (index, receipt_handle) in receipt_handles.iter().enumerate() {
+            match Self::decode_receipt_handle(receipt_handle) {
+                Ok(handle) => decoded_handles.push(Some(handle)),
+                Err(error) => {
+                    results[index] = Some(Err(error));
+                    decoded_handles.push(None);
+                }
+            }
+        }
+        let Some(routing_state) = routing_state else {
+            return Ok(results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.unwrap_or_else(|| {
+                        Err(Self::invalid_receipt_handle(&receipt_handles[index]))
+                    })
+                })
+                .collect());
+        };
+
         let mut operations = Vec::with_capacity(decoded_handles.len().saturating_mul(2));
         let mut deferred_payload_cleanup = 0u64;
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
 
         for (index, handle) in decoded_handles.iter().enumerate() {
+            let Some(handle) = handle else {
+                continue;
+            };
             let message_id = match handle.message_id_hex.parse::<MessageId>() {
                 Ok(message_id) => message_id,
                 Err(error) => {
@@ -1765,7 +1866,7 @@ where S: QueueKvStore + 'static
             let visibility_key =
                 MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));
             let ready_key = queue_ready_key_with_slot(
-                queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &visibility_key,
@@ -1778,13 +1879,13 @@ where S: QueueKvStore + 'static
                 DirectWriteOperation::Delete { key: ready_key },
                 DirectWriteOperation::Put {
                     key: queue_delete_ledger_key(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &handle.message_id_hex,
                     ),
                     value: queue_delete_ledger_entry_bytes(
-                        queue_url,
+                        queue_id,
                         route,
                         &handle.message_id_hex,
                     )?,
@@ -1802,15 +1903,18 @@ where S: QueueKvStore + 'static
                 StorageEnum::ConditionalCheckFailed | StorageEnum::TransactionCanceled { .. }
             ) {
                 let mut fallback_results = Vec::with_capacity(decoded_handles.len());
-                for handle in decoded_handles {
-                    fallback_results.push(
-                        self.delete_partitioned_message_with_state(
-                            queue_url,
-                            &handle,
-                            Instant::now(),
-                        )
-                        .await,
-                    );
+                for (index, handle) in decoded_handles.into_iter().enumerate() {
+                    fallback_results.push(match handle {
+                        Some(handle) => {
+                            self.delete_partitioned_message_with_state(
+                                queue_url,
+                                &handle,
+                                Instant::now(),
+                            )
+                            .await
+                        }
+                        None => Err(Self::invalid_receipt_handle(&receipt_handles[index])),
+                    });
                 }
                 return Ok(fallback_results);
             }
@@ -1830,11 +1934,10 @@ where S: QueueKvStore + 'static
         receipt_handle: ReceiptHandle,
         visibility_timeout: DurationSeconds,
     ) -> QueueResult<()> {
-        if self.queue_routing_state(queue_url).await?.is_some()
-            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
-        {
+        let handle = Self::decode_receipt_handle(&receipt_handle)?;
+        if self.queue_routing_state(queue_url).await?.is_some() {
             let now = TimestampMillis::now();
-            let (mut state, message_id, route) =
+            let (mut state, message_id, route, queue_id) =
                 self.load_partitioned_state(queue_url, &handle).await?;
             if state.visibility_timestamp < now {
                 return Err(QueueError::validation(
@@ -1857,7 +1960,7 @@ where S: QueueKvStore + 'static
                 .transact_write_unchecked(vec![
                     DirectWriteOperation::CheckValue {
                         key: queue_ready_key_with_slot(
-                            queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &old_visibility_key,
@@ -1866,7 +1969,7 @@ where S: QueueKvStore + 'static
                     },
                     DirectWriteOperation::Delete {
                         key: queue_ready_key_with_slot(
-                            queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &old_visibility_key,
@@ -1874,7 +1977,7 @@ where S: QueueKvStore + 'static
                     },
                     DirectWriteOperation::Put {
                         key: queue_ready_key_with_slot(
-                            queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &new_visibility_key,
@@ -1883,7 +1986,7 @@ where S: QueueKvStore + 'static
                     },
                     DirectWriteOperation::Put {
                         key: queue_state_key_with_slot(
-                            queue_url,
+                            queue_id,
                             route.placement_slot,
                             route.partition_id,
                             &message_id_hex,
@@ -1891,7 +1994,7 @@ where S: QueueKvStore + 'static
                         value: storage_types::storage_serde::to_bytes(&state)?,
                     },
                     DirectWriteOperation::Put {
-                        key: queue_wake_key(queue_url),
+                        key: queue_wake_key(queue_id),
                         value: wake_value_bytes()?,
                     },
                 ])
@@ -1899,47 +2002,7 @@ where S: QueueKvStore + 'static
                 .map_err(QueueError::TransactWrite)?;
             return Ok(());
         }
-
-        let now = TimestampMillis::now();
-        let (old_visibility_key, message_id) = self
-            .fetch_receipt_from_db(queue_url, &receipt_handle)
-            .await?;
-
-        if old_visibility_key.get_timestamp()? < now {
-            return Err(QueueError::validation(
-                QueueValidationKind::CannotOperateVisibleMessage,
-            ));
-        }
-
-        let new_timestamp = now + visibility_timeout;
-        let new_visibility_key = MessageVisibilityKey(visibility_key(new_timestamp, &message_id));
-        let receipt_handle_key = key_receipt_handle(queue_url, &receipt_handle);
-
-        self.kv_store
-            .transact_write(vec![
-                TransactWriteOperation::Delete {
-                    key: queue_visibility_storage_key(
-                        queue_url,
-                        old_visibility_key.get_timestamp()?,
-                        &message_id,
-                    ),
-                    condition: None,
-                },
-                TransactWriteOperation::Put {
-                    key: queue_visibility_storage_key(queue_url, new_timestamp, &message_id),
-                    value: Self::visibility_record_bytes(Some(&receipt_handle))?,
-                    condition: None,
-                },
-                TransactWriteOperation::Put {
-                    key: receipt_handle_key.into_bytes(),
-                    value: Self::receipt_mapping_bytes(&new_visibility_key)?,
-                    condition: None,
-                },
-            ])
-            .await
-            .map_err(QueueError::TransactWrite)?;
-
-        Ok(())
+        Err(Self::invalid_receipt_handle(&receipt_handle))
     }
 
     async fn change_message_visibilities(
@@ -1947,44 +2010,46 @@ where S: QueueKvStore + 'static
         queue_url: &str,
         entries: Vec<(ReceiptHandle, DurationSeconds)>,
     ) -> QueueResult<Vec<QueueResult<()>>> {
-        let Some(routing_state) = self.queue_routing_state(queue_url).await? else {
-            let mut results = Vec::with_capacity(entries.len());
-            for (receipt_handle, visibility_timeout) in entries {
-                results.push(
-                    self.change_message_visibility(queue_url, receipt_handle, visibility_timeout)
-                        .await,
-                );
-            }
-            return Ok(results);
-        };
-
-        let mut decoded_entries = Vec::with_capacity(entries.len());
-        for (receipt_handle, visibility_timeout) in &entries {
-            let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str()) else {
-                let mut results = Vec::with_capacity(entries.len());
-                for (receipt_handle, visibility_timeout) in entries {
-                    results.push(
-                        self.change_message_visibility(
-                            queue_url,
-                            receipt_handle,
-                            visibility_timeout,
-                        )
-                        .await,
-                    );
-                }
-                return Ok(results);
-            };
-            decoded_entries.push((handle, *visibility_timeout));
-        }
-
         let now = TimestampMillis::now();
         let mut results = std::iter::repeat_with(|| None)
-            .take(decoded_entries.len())
+            .take(entries.len())
             .collect::<Vec<Option<QueueResult<()>>>>();
+        let routing_state = self.queue_routing_state(queue_url).await?;
+        let mut decoded_entries = Vec::with_capacity(entries.len());
+        for (index, (receipt_handle, visibility_timeout)) in entries.iter().enumerate() {
+            match Self::decode_receipt_handle(receipt_handle) {
+                Ok(handle) => decoded_entries.push((Some(handle), *visibility_timeout)),
+                Err(error) => {
+                    results[index] = Some(Err(error));
+                    decoded_entries.push((None, *visibility_timeout));
+                }
+            }
+        }
+        let Some(routing_state) = routing_state else {
+            return Ok(results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.unwrap_or_else(|| Err(Self::invalid_receipt_handle(&entries[index].0)))
+                })
+                .collect());
+        };
+
         let mut operations = Vec::with_capacity(decoded_entries.len().saturating_mul(3) + 1);
         let mut changed_any = false;
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
 
         for (index, (handle, visibility_timeout)) in decoded_entries.into_iter().enumerate() {
+            let Some(handle) = handle else {
+                continue;
+            };
             let message_id = match handle.message_id_hex.parse::<MessageId>() {
                 Ok(message_id) => message_id,
                 Err(error) => {
@@ -2003,7 +2068,7 @@ where S: QueueKvStore + 'static
                 continue;
             };
             let state_key = queue_state_key_with_slot(
-                queue_url,
+                queue_id,
                 route.placement_slot,
                 route.partition_id,
                 &handle.message_id_hex,
@@ -2059,7 +2124,7 @@ where S: QueueKvStore + 'static
             operations.extend([
                 DirectWriteOperation::CheckValue {
                     key: queue_ready_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &old_visibility_key,
@@ -2068,7 +2133,7 @@ where S: QueueKvStore + 'static
                 },
                 DirectWriteOperation::Delete {
                     key: queue_ready_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &old_visibility_key,
@@ -2076,7 +2141,7 @@ where S: QueueKvStore + 'static
                 },
                 DirectWriteOperation::Put {
                     key: queue_ready_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &new_visibility_key,
@@ -2085,7 +2150,7 @@ where S: QueueKvStore + 'static
                 },
                 DirectWriteOperation::Put {
                     key: queue_state_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &message_id_hex,
@@ -2099,7 +2164,7 @@ where S: QueueKvStore + 'static
 
         if changed_any {
             operations.push(DirectWriteOperation::Put {
-                key: queue_wake_key(queue_url),
+                key: queue_wake_key(queue_id),
                 value: wake_value_bytes()?,
             });
             self.kv_store
@@ -2120,16 +2185,16 @@ where S: QueueKvStore + 'static
         receipt_handle: ReceiptHandle,
         checkpoint_data: String,
     ) -> QueueResult<()> {
-        if self.queue_routing_state(queue_url).await?.is_some()
-            && let Ok(handle) = QueueReceiptHandleData::decode(receipt_handle.as_str())
-        {
-            let (mut state, _, route) = self.load_partitioned_state(queue_url, &handle).await?;
+        let handle = Self::decode_receipt_handle(&receipt_handle)?;
+        if self.queue_routing_state(queue_url).await?.is_some() {
+            let (mut state, _, route, queue_id) =
+                self.load_partitioned_state(queue_url, &handle).await?;
             state.checkpoint_data = Some(checkpoint_data);
             let value = storage_types::storage_serde::to_bytes(&state)?;
             self.kv_store
                 .put(
                     &queue_state_key_with_slot(
-                        queue_url,
+                        queue_id,
                         route.placement_slot,
                         route.partition_id,
                         &handle.message_id_hex,
@@ -2140,15 +2205,6 @@ where S: QueueKvStore + 'static
                 .await?;
             return Ok(());
         }
-
-        let key = key_receipt_checkpoint_uuid(queue_url, &receipt_handle);
-        let value = storage_types::storage_serde::to_bytes(&HashMap::from([(
-            "checkpoint_data".to_string(),
-            AttributeValue::S(checkpoint_data),
-        )]))?;
-        self.kv_store
-            .put(key.as_bytes(), &value, None)
-            .await
-            .map_err(Into::into)
+        Err(Self::invalid_receipt_handle(&receipt_handle))
     }
 }

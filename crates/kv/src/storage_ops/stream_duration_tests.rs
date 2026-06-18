@@ -1,61 +1,70 @@
-use storage_provider::{StreamTrimDueMarker, StreamTrimScope};
-use storage_types::{
-    StreamItemId, StreamName, StreamRetentionDuration, TableName, TimestampMillis,
-};
+use storage_provider::StreamTrimScope;
+use storage_types::{StreamItemId, StreamName, StreamRetentionDuration, TableName};
 
 use super::stream_duration::{
-    due_marker_key, item_stream_key_hash, item_stream_policy_version, item_stream_scope_id,
-    stream_name_for_scope, stream_pointer_index_key, stream_pointer_item_prefix,
-    stream_pointer_table_key, stream_pointer_table_prefix, table_stream_policy_version,
+    item_stream_key_hash, item_stream_policy_version, item_stream_scope_id, stream_name_for_scope,
+    table_stream_policy_version,
+};
+use crate::keyspace::{
+    compact::{self, TableStorageId},
+    stream_keys,
+    table_identity::TableIdentity,
 };
 
 #[test]
 fn kv_due_marker_keys_sort_by_bucket_scope_and_policy_version() {
-    let table = TableName::new("orders");
-    let early_b = marker(1_000, "scope-b", table.clone(), 1);
-    let later_a = marker(4_000_000, "scope-a", table.clone(), 1);
-    let early_a_v2 = marker(1_000, "scope-a", table.clone(), 2);
-    let early_a_v1 = marker(1_000, "scope-a", table, 1);
+    let scope_a = b"scope-a";
+    let scope_b = b"scope-b";
 
     let mut keys = [
-        due_marker_key(&early_b),
-        due_marker_key(&later_a),
-        due_marker_key(&early_a_v2),
-        due_marker_key(&early_a_v1),
+        compact::stream_trim_due_key(1_000, scope_b, 1),
+        compact::stream_trim_due_key(4_000_000, scope_a, 1),
+        compact::stream_trim_due_key(1_000, scope_a, 2),
+        compact::stream_trim_due_key(1_000, scope_a, 1),
     ];
     keys.sort();
 
-    assert_eq!(keys[0], due_marker_key(&early_a_v1));
-    assert_eq!(keys[1], due_marker_key(&early_a_v2));
-    assert_eq!(keys[2], due_marker_key(&early_b));
-    assert_eq!(keys[3], due_marker_key(&later_a));
+    assert_eq!(keys[0], compact::stream_trim_due_key(1_000, scope_a, 1));
+    assert_eq!(keys[1], compact::stream_trim_due_key(1_000, scope_a, 2));
+    assert_eq!(keys[2], compact::stream_trim_due_key(1_000, scope_b, 1));
+    assert_eq!(keys[3], compact::stream_trim_due_key(4_000_000, scope_a, 1));
 }
 
 #[test]
-fn kv_due_marker_keys_escape_scope_separators() {
-    let marker = marker(1_000, "table/with%chars", TableName::new("orders"), 1);
-    let key = due_marker_key(&marker);
-    let key = String::from_utf8(key).expect("key is ascii");
+fn kv_due_marker_keys_are_compact_binary_keys() {
+    let key = compact::stream_trim_due_key(1_000, b"table/with%chars", 1);
 
-    assert!(key.contains("table%2fwith%25chars"));
+    assert_eq!(key[0], compact::KeyFamily::StreamTrimDue.code());
+    assert!(!key.starts_with(b"sys/stream-duration/due/"));
 }
 
 #[test]
 fn kv_stream_pointer_index_keys_group_by_table_and_item_stream() {
     let table = TableName::new("orders");
+    let table_identity = TableIdentity::new(TableStorageId::new(42), table.clone(), Vec::new());
     let item_stream = StreamName::new(b"orders/stream-item/example");
     let item_id = StreamItemId::random();
 
-    let key = stream_pointer_index_key(&table, &item_stream, item_id);
-    let prefix = stream_pointer_item_prefix(&table, &item_stream);
+    let key =
+        stream_keys::stream_pointer_item_key_for_stream(&table_identity, &item_stream, item_id)
+            .expect("item pointer key");
+    let prefix = stream_keys::stream_pointer_item_prefix_for_stream(&table_identity, &item_stream)
+        .expect("item pointer prefix");
 
-    assert!(key.starts_with(&prefix));
-    assert_eq!(&key[prefix.len()..], item_id.as_bytes());
+    assert_eq!(key[0], compact::KeyFamily::StreamPointerItemIndex.code());
+    assert!(key.starts_with(&prefix.start));
+    assert_eq!(&key[prefix.start.len()..], item_id.as_bytes());
+    assert!(!key.starts_with(b"sys/stream-duration/pointer/"));
 
-    let table_key = stream_pointer_table_key(&table, item_id);
-    let table_prefix = stream_pointer_table_prefix(&table);
-    assert!(table_key.starts_with(&table_prefix));
-    assert_eq!(&table_key[table_prefix.len()..], item_id.as_bytes());
+    let table_key = stream_keys::stream_pointer_table_key_for_stream(&table_identity, item_id);
+    let table_prefix = compact::stream_pointer_table_prefix(table_identity.table_id);
+    assert_eq!(
+        table_key[0],
+        compact::KeyFamily::StreamPointerTableIndex.code()
+    );
+    assert!(table_key.starts_with(&table_prefix.start));
+    assert_eq!(&table_key[table_prefix.start.len()..], item_id.as_bytes());
+    assert!(!table_key.starts_with(b"sys/stream-duration/pointer/"));
 }
 
 #[test]
@@ -89,17 +98,4 @@ fn kv_stream_duration_policy_versions_are_stable_for_identical_duration_policy()
 
     assert_eq!(one_day_item, repeated_one_day_item);
     assert_ne!(one_day_item, forever_item);
-}
-
-fn marker(
-    due_at: i64,
-    scope_id: &str,
-    table_name: TableName,
-    policy_version: u64,
-) -> StreamTrimDueMarker {
-    StreamTrimDueMarker::new(
-        TimestampMillis::from_timestamp(due_at),
-        StreamTrimScope::table(scope_id, table_name),
-        policy_version,
-    )
 }

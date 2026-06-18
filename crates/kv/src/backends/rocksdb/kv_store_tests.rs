@@ -3,7 +3,7 @@ use storage_types::{StorageEnum, StreamItemId};
 use crate::{
     RocksDbKvStore,
     backends::rocksdb::kv_store::{
-        ROCKSDB_STREAM_HIGH_WATER_KEY, rocksdb_durability_policy, rocksdb_options,
+        rocksdb_durability_policy, rocksdb_options, rocksdb_stream_high_water_key,
     },
     key_template::{KeyTemplate, PlaceholderBinding},
     kv_support_tests::rocksdb_test_path,
@@ -73,10 +73,11 @@ async fn rocksdb_stream_id_allocation_resumes_above_durable_high_water_after_reo
     let path = rocksdb_test_path("kv-stream-high-water");
     let high_water = stream_id_from_u64(9_000);
     let next = stream_id_from_u64(9_001);
+    let high_water_key = rocksdb_stream_high_water_key();
     {
         let store = RocksDbKvStore::new(path.clone()).unwrap();
         store
-            .put(ROCKSDB_STREAM_HIGH_WATER_KEY, high_water.as_bytes(), None)
+            .put(&high_water_key, high_water.as_bytes(), None)
             .await
             .unwrap();
     }
@@ -101,12 +102,15 @@ async fn rocksdb_stream_id_allocation_resumes_above_durable_high_water_after_reo
         Some(b"payload".to_vec())
     );
     assert_eq!(
-        store
-            .get(ROCKSDB_STREAM_HIGH_WATER_KEY, true)
-            .await
-            .unwrap()
-            .as_deref(),
+        store.get(&high_water_key, true).await.unwrap().as_deref(),
         Some(next.as_bytes().as_slice())
+    );
+    assert_eq!(
+        store
+            .get(b"sys/streams/rocksdb/high-water", true)
+            .await
+            .unwrap(),
+        None
     );
 }
 

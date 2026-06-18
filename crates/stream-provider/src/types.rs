@@ -242,6 +242,8 @@ impl StoredStreamPointer {
 pub struct PointerRecordsResult {
     pub records: Vec<(StreamPointer, Vec<StreamItem>)>,
     pub last_evaluated_key: Option<StreamItemId>,
+    pub last_scanned_key: Option<StreamItemId>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

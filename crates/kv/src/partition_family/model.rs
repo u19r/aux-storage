@@ -12,15 +12,19 @@ pub use crate::constants::{
     DEFAULT_PARTITION_TARGET_CONFLICTS_PER_WINDOW, DEFAULT_PARTITION_TARGET_OLDEST_VISIBLE_AGE_MS,
     DEFAULT_PARTITION_TARGET_WRITES_PER_SECOND, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT,
 };
-use crate::{constants::PARTITION_AUTOSCALE_COOLDOWN_MS, newtypes::MessageVisibilityKey};
+use crate::{
+    constants::PARTITION_AUTOSCALE_COOLDOWN_MS,
+    keyspace::compact::{
+        self, PartitionControlKind, QueueRecordKind, QueueStorageId, StreamStorageId, U48,
+    },
+    newtypes::MessageVisibilityKey,
+};
 
-const ORDERED_LOG_DATA_PREFIX: &str = "plog";
-const STANDARD_QUEUE_DATA_PREFIX: &str = "pqueue";
-const PARTITION_CONTROL_PREFIX: &str = "sys/partition-control";
 const STREAM_TABLE_SUFFIX: &[u8] = b"/stream-table";
 const STREAM_ITEM_SEGMENT: &[u8] = b"/stream-item/";
 const SYSTEM_STREAM_NAME: &[u8] = b"system-streams/tables";
 const HASH_SPACE_SIZE: u128 = (u64::MAX as u128) + 1;
+const ORDERED_LOG_SCATTER_BUCKETS: u64 = 224;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -317,6 +321,12 @@ pub struct OrderedLogSplitBoundary {
     pub boundary: StreamItemId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPartitionFamilyConfig {
+    family_component: String,
+    config: PartitionFamilyConfig,
+}
+
 const fn default_partition_target_writes_per_second() -> u64 {
     DEFAULT_PARTITION_TARGET_WRITES_PER_SECOND
 }
@@ -462,11 +472,11 @@ pub fn partition_family_config_key(
     family_kind: PartitionFamilyKind,
     family_component: &str,
 ) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/{family_component}/config",
-        family_kind.key_component()
+    compact::partition_control_key(
+        PartitionControlKind::Config,
+        partition_family_resource_id(family_kind, family_component),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
@@ -474,20 +484,20 @@ pub fn partition_family_epoch_key(
     family_kind: PartitionFamilyKind,
     family_component: &str,
 ) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/{family_component}/epoch",
-        family_kind.key_component()
+    compact::partition_control_key(
+        PartitionControlKind::Epoch,
+        partition_family_resource_id(family_kind, family_component),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
 pub fn partition_info_prefix(family_kind: PartitionFamilyKind, family_component: &str) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/{family_component}/partition/",
-        family_kind.key_component()
+    compact::partition_control_key(
+        PartitionControlKind::PartitionInfo,
+        partition_family_resource_id(family_kind, family_component),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
@@ -497,17 +507,17 @@ pub fn partition_info_key(
     partition_id: u16,
 ) -> Vec<u8> {
     let mut key = partition_info_prefix(family_kind, family_component);
-    key.extend_from_slice(format!("{partition_id:04x}").as_bytes());
+    key.extend_from_slice(&partition_id.to_be_bytes());
     key
 }
 
 #[must_use]
 pub fn partition_family_kind_prefix(family_kind: PartitionFamilyKind) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/",
-        family_kind.key_component()
-    )
-    .into_bytes()
+    let _ = family_kind;
+    vec![
+        compact::KeyFamily::PartitionControl.code(),
+        PartitionControlKind::Config.code(),
+    ]
 }
 
 #[must_use]
@@ -565,11 +575,11 @@ pub fn partition_load_sample_prefix(
     family_kind: PartitionFamilyKind,
     family_component: &str,
 ) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/{family_component}/{PARTITION_LOAD_SAMPLE_SEGMENT}/",
-        family_kind.key_component()
+    compact::partition_control_key(
+        PartitionControlKind::LoadSample,
+        partition_family_resource_id(family_kind, family_component),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
@@ -579,7 +589,7 @@ pub fn partition_load_sample_partition_prefix(
     partition_id: u16,
 ) -> Vec<u8> {
     let mut key = partition_load_sample_prefix(family_kind, family_component);
-    key.extend_from_slice(format!("{partition_id:04x}/").as_bytes());
+    key.extend_from_slice(&partition_id.to_be_bytes());
     key
 }
 
@@ -593,17 +603,18 @@ pub fn partition_load_sample_key(
 ) -> Vec<u8> {
     let mut key =
         partition_load_sample_partition_prefix(family_kind, family_component, partition_id);
-    key.extend_from_slice(format!("{window_start_ms:013}/{publisher_id}").as_bytes());
+    key.extend_from_slice(&window_start_ms.to_be_bytes());
+    key.extend_from_slice(&stable_partition_component_hash(publisher_id.as_bytes()).to_be_bytes());
     key
 }
 
 #[must_use]
 pub fn ordered_log_split_marker_family_prefix(family_component: &str) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/{}/{family_component}/{ORDERED_LOG_SPLIT_SEGMENT}/",
-        PartitionFamilyKind::OrderedLog.key_component()
+    compact::partition_control_key(
+        PartitionControlKind::SplitMarker,
+        partition_family_resource_id(PartitionFamilyKind::OrderedLog, family_component),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
@@ -612,12 +623,18 @@ pub fn ordered_log_split_marker_prefix(
     parent_partition_id: u16,
 ) -> Vec<u8> {
     let mut key = ordered_log_split_marker_family_prefix(family_component);
-    key.extend_from_slice(format!("{parent_partition_id:04x}/").as_bytes());
+    key.extend_from_slice(&parent_partition_id.to_be_bytes());
     key
 }
 
-pub fn partition_family_config_bytes(config: &PartitionFamilyConfig) -> StorageResult<Vec<u8>> {
-    storage_types::storage_serde::to_bytes(config)
+pub fn partition_family_config_bytes(
+    family_component: &str,
+    config: &PartitionFamilyConfig,
+) -> StorageResult<Vec<u8>> {
+    storage_types::storage_serde::to_bytes(&StoredPartitionFamilyConfig {
+        family_component: family_component.to_string(),
+        config: config.clone(),
+    })
 }
 
 #[must_use]
@@ -630,7 +647,42 @@ pub fn partition_info_bytes(info: &PartitionInfo) -> StorageResult<Vec<u8>> {
 }
 
 pub fn parse_partition_family_config(bytes: &[u8]) -> StorageResult<PartitionFamilyConfig> {
+    if let Ok(stored) =
+        storage_types::storage_serde::from_bytes::<StoredPartitionFamilyConfig>(bytes)
+    {
+        return Ok(stored.config);
+    }
     storage_types::storage_serde::from_bytes(bytes)
+}
+
+pub fn parse_partition_family_component_from_config_value(
+    bytes: &[u8],
+) -> StorageResult<Option<String>> {
+    match storage_types::storage_serde::from_bytes::<StoredPartitionFamilyConfig>(bytes) {
+        Ok(stored) => Ok(Some(stored.family_component)),
+        Err(_) => Ok(None),
+    }
+}
+
+#[must_use]
+pub fn partition_family_resource_id(
+    family_kind: PartitionFamilyKind,
+    family_component: &str,
+) -> StreamStorageId {
+    let mut resource = Vec::with_capacity(1 + family_component.len());
+    resource.push(match family_kind {
+        PartitionFamilyKind::OrderedLog => b'o',
+        PartitionFamilyKind::StandardQueue => b'q',
+    });
+    resource.extend_from_slice(family_component.as_bytes());
+    StreamStorageId::from(U48::masked(stable_partition_component_hash(&resource)))
+}
+
+fn stable_partition_component_hash(bytes: &[u8]) -> u64 {
+    let digest = Uuid::new_v5(&Uuid::NAMESPACE_OID, bytes).into_bytes();
+    u64::from_be_bytes([
+        0, 0, digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
+    ])
 }
 
 pub fn parse_partition_info(bytes: &[u8]) -> StorageResult<PartitionInfo> {
@@ -703,10 +755,8 @@ pub fn parse_partition_family_component_from_config_key(
     family_kind: PartitionFamilyKind,
     key: &[u8],
 ) -> Option<String> {
-    let prefix = partition_family_kind_prefix(family_kind);
-    let suffix = b"/config";
-    let component = key.strip_prefix(prefix.as_slice())?.strip_suffix(suffix)?;
-    String::from_utf8(component.to_vec()).ok()
+    let _ = (family_kind, key);
+    None
 }
 
 #[must_use]
@@ -716,13 +766,12 @@ pub fn parse_ordered_log_split_boundary_from_key(
 ) -> Option<(u16, StreamItemId)> {
     let prefix = ordered_log_split_marker_family_prefix(family_component);
     let suffix = key.strip_prefix(prefix.as_slice())?;
-    if suffix.len() != 17 || suffix.get(4).copied()? != b'/' {
+    if suffix.len() != 14 {
         return None;
     }
 
-    let parent_partition_id =
-        u16::from_str_radix(std::str::from_utf8(&suffix[..4]).ok()?, 16).ok()?;
-    let boundary = StreamItemId::try_from(&suffix[5..]).ok()?;
+    let parent_partition_id = u16::from_be_bytes([suffix[0], suffix[1]]);
+    let boundary = StreamItemId::try_from(&suffix[2..]).ok()?;
     Some((parent_partition_id, boundary))
 }
 
@@ -890,6 +939,18 @@ pub fn ordered_log_family_component(stream_name: &StreamName) -> String {
 }
 
 #[must_use]
+pub fn ordered_log_stream_storage_id(stream_name: &StreamName) -> StreamStorageId {
+    StreamStorageId::from(U48::masked(ordered_log_hash(stream_name.as_ref())))
+}
+
+#[must_use]
+pub fn ordered_log_bucket(placement_slot: u16) -> u8 {
+    0x10u8.saturating_add(
+        (ordered_log_hash(&placement_slot.to_be_bytes()) % ORDERED_LOG_SCATTER_BUCKETS) as u8,
+    )
+}
+
+#[must_use]
 pub fn ordered_log_partition_prefix(stream_name: &StreamName, partition_id: u16) -> Vec<u8> {
     ordered_log_partition_prefix_with_slot(stream_name, partition_id, partition_id)
 }
@@ -900,11 +961,12 @@ pub fn ordered_log_partition_prefix_with_slot(
     placement_slot: u16,
     partition_id: u16,
 ) -> Vec<u8> {
-    format!(
-        "{ORDERED_LOG_DATA_PREFIX}/{placement_slot:04x}/{}/{partition_id:04x}/",
-        ordered_log_family_component(stream_name)
+    compact::ordered_log_key(
+        ordered_log_bucket(placement_slot),
+        ordered_log_stream_storage_id(stream_name),
+        partition_id,
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
@@ -944,45 +1006,66 @@ pub fn parse_partitioned_stream_item_id(key: &[u8]) -> Option<StreamItemId> {
 
 #[must_use]
 pub fn stream_partition_marker_key(stream_name: &StreamName) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/streams/{}/marker",
-        ordered_log_family_component(stream_name)
+    compact::partition_control_key(
+        PartitionControlKind::StreamMarker,
+        partition_family_resource_id(
+            PartitionFamilyKind::OrderedLog,
+            &ordered_log_family_component(stream_name),
+        ),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
 pub fn queue_partition_marker_key(queue_url: &str) -> Vec<u8> {
-    format!(
-        "{PARTITION_CONTROL_PREFIX}/queues/{}/marker",
-        queue_family_component(queue_url)
+    compact::partition_control_key(
+        PartitionControlKind::QueueMarker,
+        partition_family_resource_id(
+            PartitionFamilyKind::StandardQueue,
+            &queue_family_component(queue_url),
+        ),
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
-pub fn queue_wake_key(queue_url: &str) -> Vec<u8> {
-    format!(
-        "{STANDARD_QUEUE_DATA_PREFIX}/{}/wake",
-        queue_family_component(queue_url)
+pub fn queue_wake_key(queue_id: QueueStorageId) -> Vec<u8> {
+    compact::queue_record_key(
+        queue_data_bucket(0),
+        queue_id,
+        0,
+        QueueRecordKind::Wake,
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
-pub fn queue_ready_hint_prefix(queue_url: &str) -> Vec<u8> {
-    format!(
-        "{STANDARD_QUEUE_DATA_PREFIX}/{}/ready_hint/",
-        queue_family_component(queue_url)
+pub fn queue_ready_hint_prefix(queue_id: QueueStorageId) -> Vec<u8> {
+    compact::queue_record_key(
+        queue_data_bucket(0),
+        queue_id,
+        0,
+        QueueRecordKind::ReadyHint,
+        b"",
     )
-    .into_bytes()
 }
 
 #[must_use]
-pub fn queue_ready_hint_key(queue_url: &str, placement_slot: u16, partition_id: u16) -> Vec<u8> {
-    let mut key = queue_ready_hint_prefix(queue_url);
-    key.extend_from_slice(format!("{placement_slot:04x}:{partition_id:04x}").as_bytes());
-    key
+pub fn queue_ready_hint_key(
+    queue_id: QueueStorageId,
+    placement_slot: u16,
+    partition_id: u16,
+) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(4);
+    suffix.extend_from_slice(&placement_slot.to_be_bytes());
+    suffix.extend_from_slice(&partition_id.to_be_bytes());
+    compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::ReadyHint,
+        &suffix,
+    )
 }
 
 pub fn queue_ready_hint_bytes(partition_id: u16, next_visible_at: TimestampMillis) -> Vec<u8> {
@@ -998,130 +1081,169 @@ pub fn queue_family_component(queue_url: &str) -> String {
 }
 
 #[must_use]
-pub fn queue_partition_prefix(queue_url: &str, partition_id: u16) -> Vec<u8> {
-    queue_partition_prefix_with_slot(queue_url, partition_id, partition_id)
+pub fn queue_data_bucket(placement_slot: u16) -> u8 {
+    ordered_log_bucket(placement_slot)
+}
+
+#[must_use]
+pub fn queue_partition_prefix(queue_id: QueueStorageId, partition_id: u16) -> Vec<u8> {
+    queue_partition_prefix_with_slot(queue_id, partition_id, partition_id)
 }
 
 #[must_use]
 pub fn queue_partition_prefix_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
 ) -> Vec<u8> {
-    format!(
-        "{STANDARD_QUEUE_DATA_PREFIX}/{placement_slot:04x}/{}/{partition_id:04x}/",
-        queue_family_component(queue_url)
-    )
-    .into_bytes()
-}
-
-#[must_use]
-pub fn queue_body_key(queue_url: &str, partition_id: u16, message_id_hex: &str) -> Vec<u8> {
-    queue_body_key_with_slot(queue_url, partition_id, partition_id, message_id_hex)
-}
-
-#[must_use]
-pub fn queue_body_prefix_with_slot(
-    queue_url: &str,
-    placement_slot: u16,
-    partition_id: u16,
-) -> Vec<u8> {
-    let mut key = queue_partition_prefix_with_slot(queue_url, placement_slot, partition_id);
-    key.extend_from_slice(b"body/");
+    let mut key = compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::Ready,
+        b"",
+    );
+    key.pop();
     key
 }
 
 #[must_use]
+pub fn queue_body_key(
+    queue_id: QueueStorageId,
+    partition_id: u16,
+    message_id_hex: &str,
+) -> Vec<u8> {
+    queue_body_key_with_slot(queue_id, partition_id, partition_id, message_id_hex)
+}
+
+#[must_use]
+pub fn queue_body_prefix_with_slot(
+    queue_id: QueueStorageId,
+    placement_slot: u16,
+    partition_id: u16,
+) -> Vec<u8> {
+    compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::Body,
+        b"",
+    )
+}
+
+#[must_use]
 pub fn queue_body_key_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     message_id_hex: &str,
 ) -> Vec<u8> {
-    let mut key = queue_body_prefix_with_slot(queue_url, placement_slot, partition_id);
+    let mut key = queue_body_prefix_with_slot(queue_id, placement_slot, partition_id);
     key.extend_from_slice(message_id_hex.as_bytes());
     key
 }
 
 #[must_use]
 pub fn queue_payload_key_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     message_id_hex: &str,
 ) -> Vec<u8> {
-    queue_body_key_with_slot(queue_url, placement_slot, partition_id, message_id_hex)
+    queue_body_key_with_slot(queue_id, placement_slot, partition_id, message_id_hex)
 }
 
 #[must_use]
-pub fn queue_state_key(queue_url: &str, partition_id: u16, message_id_hex: &str) -> Vec<u8> {
-    queue_state_key_with_slot(queue_url, partition_id, partition_id, message_id_hex)
+pub fn queue_state_key(
+    queue_id: QueueStorageId,
+    partition_id: u16,
+    message_id_hex: &str,
+) -> Vec<u8> {
+    queue_state_key_with_slot(queue_id, partition_id, partition_id, message_id_hex)
 }
 
 #[must_use]
 pub fn queue_state_key_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     message_id_hex: &str,
 ) -> Vec<u8> {
-    let mut key = queue_partition_prefix_with_slot(queue_url, placement_slot, partition_id);
-    key.extend_from_slice(b"state/");
+    let mut key = compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::State,
+        b"",
+    );
     key.extend_from_slice(message_id_hex.as_bytes());
     key
 }
 
 #[must_use]
-pub fn queue_ready_prefix(queue_url: &str, partition_id: u16) -> Vec<u8> {
-    queue_ready_prefix_with_slot(queue_url, partition_id, partition_id)
+pub fn queue_ready_prefix(queue_id: QueueStorageId, partition_id: u16) -> Vec<u8> {
+    queue_ready_prefix_with_slot(queue_id, partition_id, partition_id)
 }
 
 #[must_use]
 pub fn queue_ready_prefix_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
 ) -> Vec<u8> {
-    let mut key = queue_partition_prefix_with_slot(queue_url, placement_slot, partition_id);
-    key.extend_from_slice(b"ready/");
-    key
+    compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::Ready,
+        b"",
+    )
 }
 
 #[must_use]
 pub fn queue_ready_key(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     partition_id: u16,
     visibility_key: &MessageVisibilityKey,
 ) -> Vec<u8> {
-    queue_ready_key_with_slot(queue_url, partition_id, partition_id, visibility_key)
+    queue_ready_key_with_slot(queue_id, partition_id, partition_id, visibility_key)
 }
 
 #[must_use]
 pub fn queue_ready_key_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     visibility_key: &MessageVisibilityKey,
 ) -> Vec<u8> {
-    let mut key = queue_ready_prefix_with_slot(queue_url, placement_slot, partition_id);
+    let mut key = queue_ready_prefix_with_slot(queue_id, placement_slot, partition_id);
     key.extend_from_slice(visibility_key.as_bytes());
     key
 }
 
 #[must_use]
-pub fn queue_checkpoint_key(queue_url: &str, partition_id: u16, message_id_hex: &str) -> Vec<u8> {
-    queue_checkpoint_key_with_slot(queue_url, partition_id, partition_id, message_id_hex)
+pub fn queue_checkpoint_key(
+    queue_id: QueueStorageId,
+    partition_id: u16,
+    message_id_hex: &str,
+) -> Vec<u8> {
+    queue_checkpoint_key_with_slot(queue_id, partition_id, partition_id, message_id_hex)
 }
 
 #[must_use]
 pub fn queue_checkpoint_key_with_slot(
-    queue_url: &str,
+    queue_id: QueueStorageId,
     placement_slot: u16,
     partition_id: u16,
     message_id_hex: &str,
 ) -> Vec<u8> {
-    let mut key = queue_partition_prefix_with_slot(queue_url, placement_slot, partition_id);
-    key.extend_from_slice(b"checkpoint/");
+    let mut key = compact::queue_record_key(
+        queue_data_bucket(placement_slot),
+        queue_id,
+        partition_id,
+        QueueRecordKind::Checkpoint,
+        b"",
+    );
     key.extend_from_slice(message_id_hex.as_bytes());
     key
 }

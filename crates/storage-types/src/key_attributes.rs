@@ -95,7 +95,7 @@ impl Serialize for SortedKeyAttributes<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
         let mut entries = SmallVec::<[(&str, &AttributeValue); 2]>::from_iter(self.0.iter());
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_unstable_by_key(|(left, _)| *left);
 
         let mut map = serializer.serialize_map(Some(entries.len()))?;
         for (name, value) in entries {

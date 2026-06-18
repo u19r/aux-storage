@@ -78,7 +78,7 @@ impl SyncWriteResolver<'_> {
         validate_expression_attribute_usage(
             request.expression_attribute_names.as_ref(),
             request.expression_attribute_values.as_ref(),
-            Some(request.condition_expression.as_str()).into_iter(),
+            Some(request.condition_expression.as_str()),
         )?;
         let key_json = stable_key_json(&request.key)?;
         let old_item = self

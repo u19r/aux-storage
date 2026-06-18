@@ -21,6 +21,7 @@ use crate::{
     backends::common::{
         plan_table_write, plan_table_write_preflighted, preflight_table_write_operations,
     },
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
     kv_support_tests::create_test_provider,
     sorted_kv_store::{SortedKvStore, TransactWriteOperation, TransactWriteTableOperation},
     storage_provider::{
@@ -29,6 +30,14 @@ use crate::{
         ttl_tracking_enabled, wire_item_key_token_from_item_key,
     },
 };
+
+fn table_identity(table_info: &StoredTableInfo) -> TableIdentity {
+    TableIdentity::new(
+        TableStorageId::new(1),
+        table_info.table_name.clone(),
+        Vec::new(),
+    )
+}
 
 const ITEM_COUNT: usize = 96;
 const STREAM_READ_LIMIT: u32 = 256;
@@ -470,9 +479,14 @@ async fn assert_ttl_rows_for_wire_items(
         .get_table_info(table_name)
         .await
         .expect("table info");
+    let table_metadata = provider
+        .get_table_identity_from_name(table_name)
+        .await
+        .expect("table metadata result")
+        .expect("table metadata");
     for item in items {
-        let ttl_key = storage_common::ttl::ttl_index_key_for_wire_item(
-            table_name,
+        let ttl_key = crate::ttl::compact_ttl_index_key_for_wire_item(
+            &table_metadata.identity,
             &table_info,
             TTL_ATTRIBUTE,
             item,
@@ -749,6 +763,7 @@ fn measure_update_plan_old_item_retention(
     for _ in 0..UPDATE_PLAN_ITERATIONS {
         let plan = plan_table_write(
             &[TransactWriteTableOperation::Update {
+                table_identity: table_identity(&table_info),
                 table_info: table_info.clone(),
                 key: update_key.clone(),
                 operations: Arc::clone(&update_operations),
@@ -856,6 +871,7 @@ fn transaction_plan_operations(
 ) -> Vec<TransactWriteTableOperation> {
     (0..PREFLIGHTED_PLAN_WIDTH)
         .map(|index| TransactWriteTableOperation::Update {
+            table_identity: table_identity(table_info),
             table_info: table_info.clone(),
             key: transaction_plan_key(index),
             operations: Arc::clone(&update_operations),
@@ -951,6 +967,7 @@ fn measure_put_item_encode_stream_envelope_stage() -> alloc_counter::AllocationR
     let table_info = runtime
         .block_on(provider.get_table_info(&table_name))
         .expect("table info");
+    let table_identity = table_identity(&table_info);
     let ttl_config = runtime
         .block_on(provider.load_ttl_config(&table_name))
         .expect("ttl config");
@@ -982,8 +999,11 @@ fn measure_put_item_encode_stream_envelope_stage() -> alloc_counter::AllocationR
     );
     for (item_key, value) in &contexts {
         let _entries = crate::stream::helpers::create_item_update_stream_entries_wire_encoded(
-            &table_name,
-            item_key,
+            crate::stream::helpers::StreamEntryContext {
+                table_identity: &table_identity,
+                table_name: &table_name,
+                item_key,
+            },
             value.as_slice(),
             None,
             storage_types::StreamItemId::random(),
@@ -1002,6 +1022,7 @@ fn measure_put_item_encode_ttl_ops_stage() -> alloc_counter::AllocationReport<'s
     let table_info = runtime
         .block_on(provider.get_table_info(&table_name))
         .expect("table info");
+    let table_identity = table_identity(&table_info);
     let ttl_config = runtime
         .block_on(provider.load_ttl_config(&table_name))
         .expect("ttl config");
@@ -1035,6 +1056,7 @@ fn measure_put_item_encode_ttl_ops_stage() -> alloc_counter::AllocationReport<'s
     for (item, item_key_token, projected_ttl_value) in &contexts {
         let _ttl_ops = ttl_index_direct_operations_for_wire_items(
             &table_name,
+            &table_identity,
             &table_info,
             ttl_config.as_ref(),
             None,
@@ -1054,6 +1076,7 @@ fn measure_put_item_encode_execute_stage() -> alloc_counter::AllocationReport<'s
     let table_info = runtime
         .block_on(provider.get_table_info(&table_name))
         .expect("table info");
+    let table_identity = table_identity(&table_info);
     let ttl_config = runtime
         .block_on(provider.load_ttl_config(&table_name))
         .expect("ttl config");
@@ -1077,8 +1100,11 @@ fn measure_put_item_encode_execute_stage() -> alloc_counter::AllocationReport<'s
         let mut operations = Vec::with_capacity(6);
         let stream_entries =
             crate::stream::helpers::create_item_update_stream_entries_wire_encoded(
-                &table_name,
-                &item_key,
+                crate::stream::helpers::StreamEntryContext {
+                    table_identity: &table_identity,
+                    table_name: &table_name,
+                    item_key: &item_key,
+                },
                 value.as_slice(),
                 None,
                 storage_types::StreamItemId::random(),
@@ -1096,6 +1122,7 @@ fn measure_put_item_encode_execute_stage() -> alloc_counter::AllocationReport<'s
 
         let ttl_ops = ttl_index_direct_operations_for_wire_items(
             &table_name,
+            &table_identity,
             &table_info,
             ttl_config.as_ref(),
             None,

@@ -48,6 +48,8 @@ pub(crate) use super::{
     record_read, record_write, should_log_job,
 };
 pub(crate) use crate::{
-    SortedKvDbStorageProvider, constants, helpers, helpers::increment_bytes,
-    newtypes::TablePageKey, sorted_kv_store::BatchItem, ttl,
+    SortedKvDbStorageProvider, constants, helpers,
+    helpers::increment_bytes,
+    sorted_kv_store::{BatchItem, RawKey},
+    ttl,
 };

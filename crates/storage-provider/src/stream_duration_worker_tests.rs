@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{Arc, Mutex},
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll, Waker},
 };
 
 use async_trait::async_trait;
@@ -34,16 +34,10 @@ struct FakeBackendState {
     fail_next_finish: bool,
 }
 
-struct NoopWaker;
-
-impl Wake for NoopWaker {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn block_on<F>(future: F) -> F::Output
 where F: Future {
-    let waker = Waker::from(Arc::new(NoopWaker));
-    let mut context = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
     let mut future = Box::pin(future);
     loop {
         match future.as_mut().poll(&mut context) {

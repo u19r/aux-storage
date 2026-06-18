@@ -12,7 +12,7 @@ pub(crate) fn validate_transact_write_item_expression_usage(
         validate_expression_attribute_usage(
             put.expression_attribute_names.as_ref(),
             put.expression_attribute_values.as_ref(),
-            put.condition_expression.as_deref().into_iter(),
+            put.condition_expression.as_deref(),
         )?;
     }
     if let Some(update) = &item.update {
@@ -27,7 +27,7 @@ pub(crate) fn validate_transact_write_item_expression_usage(
         validate_expression_attribute_usage(
             delete.expression_attribute_names.as_ref(),
             delete.expression_attribute_values.as_ref(),
-            delete.condition_expression.as_deref().into_iter(),
+            delete.condition_expression.as_deref(),
         )?;
     }
     if let Some(check) = &item.condition_check {
@@ -47,7 +47,7 @@ pub(crate) fn validate_transact_encode_item_expression_usage(
         validate_expression_attribute_usage(
             put.expression_attribute_names.as_ref(),
             put.expression_attribute_values.as_ref(),
-            put.condition_expression.as_deref().into_iter(),
+            put.condition_expression.as_deref(),
         )?;
     }
     if let Some(update) = &item.update {
@@ -62,7 +62,7 @@ pub(crate) fn validate_transact_encode_item_expression_usage(
         validate_expression_attribute_usage(
             delete.expression_attribute_names.as_ref(),
             delete.expression_attribute_values.as_ref(),
-            delete.condition_expression.as_deref().into_iter(),
+            delete.condition_expression.as_deref(),
         )?;
     }
     if let Some(check) = &item.condition_check {

@@ -27,6 +27,7 @@ use crate::{
         foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot,
         store::{DYNAMODB_RANGE_TARGET_BYTES, dynamodb_range_option},
     },
+    sorted_kv_store::{DirectWriteOperation, SortedKvStore},
 };
 
 #[test]
@@ -46,6 +47,37 @@ fn foundationdb_dynamodb_range_option_requests_one_mebibyte_want_all_pages() {
         foundationdb::options::StreamingMode::WantAll
     ));
     assert!(!option.reverse);
+}
+
+#[tokio::test]
+#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
+async fn foundationdb_unchecked_check_then_put_same_key_commits() {
+    let Some(store) = connect_fdb_store("fdb-unchecked-check-put").await else {
+        eprintln!(
+            "Skipping FoundationDB unchecked transaction test: unable to connect to local cluster"
+        );
+        return;
+    };
+
+    let key = b"check-then-put".to_vec();
+    store
+        .transact_write_unchecked(vec![
+            DirectWriteOperation::CheckValue {
+                key: key.clone(),
+                expected_value: None,
+            },
+            DirectWriteOperation::Put {
+                key: key.clone(),
+                value: b"written".to_vec(),
+            },
+        ])
+        .await
+        .expect("check-then-put transaction should commit");
+
+    assert_eq!(
+        store.get(&key, true).await.expect("read key"),
+        Some(b"written".to_vec())
+    );
 }
 
 #[tokio::test]

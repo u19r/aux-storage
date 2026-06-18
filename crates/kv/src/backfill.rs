@@ -5,20 +5,16 @@ use storage_backfill::{
     BackfillBatchOutcome, BackfillDriver, BackfillState, BackfillStatus, GsiBackfillDescriptor,
 };
 use storage_common::apply_gsi_projection;
-use storage_provider::StorageProvider;
 use storage_types::{
-    AttributeValue, IndexName, ItemKey, SerializesToKey, StorageError, TableName, TimeToLiveStatus,
-    TimestampMillis,
+    AttributeValue, IndexName, ItemKey, StorageError, TableName, TimeToLiveStatus, TimestampMillis,
 };
 use tracing::debug;
 
 use crate::{
     SortedKvDbStorageProvider,
-    helpers::increment_bytes,
-    keys::{self, TABLES_PREFIX},
-    newtypes::TablePageKey,
+    keyspace::{compact, table_identity::StoredTableMetadata, table_keys},
     partition_family::PartitionFamilyKvStore,
-    sorted_kv_store::BatchItem,
+    sorted_kv_store::{BatchItem, RawKey},
     storage_provider::key_schema_for_gsi,
     ttl,
 };
@@ -41,23 +37,38 @@ where S: PartitionFamilyKvStore + 'static
     async fn enumerate_states(
         &self,
     ) -> Result<Vec<(GsiBackfillDescriptor, BackfillState)>, StorageError> {
-        let prefix = TABLES_PREFIX.as_bytes();
-        let range_end = increment_bytes(prefix.to_vec());
+        let range = compact::table_metadata_prefix();
         let scan_result = self
             .kv_store
-            .get_range(prefix, &range_end, None, None::<TablePageKey>, true)
+            .get_range(&range.start, &range.end, None, None::<RawKey>, true)
             .await?;
 
         let mut records = Vec::new();
         for (raw_key, raw_value) in scan_result.items {
-            let key_str = String::from_utf8_lossy(&raw_key);
-            if let Some(stripped) = key_str.strip_prefix(TABLES_PREFIX)
-                && let Some((table_part, index_part)) = stripped.split_once("/gsi-backfill/")
-            {
-                let descriptor = GsiBackfillDescriptor::new(table_part.to_string(), index_part);
+            if raw_key.first().copied() != Some(compact::KeyFamily::TableMetadata.code()) {
+                continue;
+            }
+
+            let metadata: StoredTableMetadata =
+                storage_types::storage_serde::from_bytes(&raw_value)?;
+            if metadata.identity.deleted {
+                continue;
+            }
+
+            for index in &metadata.identity.indexes {
+                let key = compact::gsi_backfill_key(metadata.identity.table_id, index.index_id);
+                let Some(raw_record) = self.kv_store.get(&key, true).await? else {
+                    continue;
+                };
                 let record: KvBackfillRecord =
-                    storage_types::storage_serde::from_bytes(&raw_value)?;
-                records.push((descriptor, record.state));
+                    storage_types::storage_serde::from_bytes(&raw_record)?;
+                records.push((
+                    GsiBackfillDescriptor::new(
+                        metadata.identity.table_name.as_ref(),
+                        index.index_name.as_ref(),
+                    ),
+                    record.state,
+                ));
             }
         }
         Ok(records)
@@ -70,7 +81,13 @@ where S: PartitionFamilyKvStore + 'static
     ) -> Result<(), StorageError> {
         let table = TableName::new(&descriptor.table_name);
         let index = IndexName::new(&descriptor.index_name);
-        let key = keys::gsi_backfill_key(&table, &index);
+        let metadata = self
+            .get_table_identity_from_name(&table)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table))?;
+        let key = table_keys::gsi_backfill_key(&metadata.identity, &index).ok_or_else(|| {
+            StorageError::internal(&format!("missing storage identity for index {index}"))
+        })?;
         let record = KvBackfillRecord::new(state.clone());
         self.kv_store
             .put(
@@ -87,7 +104,12 @@ where S: PartitionFamilyKvStore + 'static
     ) -> Result<Option<BackfillState>, StorageError> {
         let table = TableName::new(&descriptor.table_name);
         let index = IndexName::new(&descriptor.index_name);
-        let key = keys::gsi_backfill_key(&table, &index);
+        let Some(metadata) = self.get_table_identity_from_name(&table).await? else {
+            return Ok(None);
+        };
+        let key = table_keys::gsi_backfill_key(&metadata.identity, &index).ok_or_else(|| {
+            StorageError::internal(&format!("missing storage identity for index {index}"))
+        })?;
         if let Some(bytes) = self.kv_store.get(&key, true).await? {
             let record: KvBackfillRecord = storage_types::storage_serde::from_bytes(&bytes)?;
             Ok(Some(record.state))
@@ -105,24 +127,38 @@ where S: PartitionFamilyKvStore + 'static
         let table_name = TableName::new(&descriptor.table_name);
         let index_name = IndexName::new(&descriptor.index_name);
 
-        let table_info = self.get_table_info(&table_name).await?;
-        let gsi_schema = key_schema_for_gsi(&table_info, &index_name)
+        let table_metadata = self
+            .get_table_identity_from_name(&table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table_name))?;
+        let table_info = &table_metadata.table_info;
+        let gsi_schema = key_schema_for_gsi(table_info, &index_name)
             .unwrap_or_else(|| table_info.key_schema.clone());
 
         let batch_limit = batch_size.clamp(1, 1000);
         let limit = u32::try_from(batch_limit).unwrap_or(1000);
-        let data_prefix = ItemKey::table_prefix_from_name(&table_info.table_name);
-        let range_end = increment_bytes(data_prefix.clone());
+        let data_range = table_keys::primary_item_prefix(table_metadata.identity.table_id);
 
         let page_token = state.scan_lek.as_ref().and_then(|token| {
-            ItemKey::item_key_from_next_page_token(token, &table_info, &None)
+            ItemKey::item_key_from_next_page_token(token, table_info, &None)
                 .ok()
                 .flatten()
         });
+        let page_token = page_token
+            .as_ref()
+            .map(|token| table_keys::item_key(&table_metadata.identity, token))
+            .transpose()?
+            .map(RawKey);
 
         let range = self
             .kv_store
-            .get_range(&data_prefix, &range_end, Some(limit), page_token, true)
+            .get_range(
+                &data_range.start,
+                &data_range.end,
+                Some(limit),
+                page_token,
+                true,
+            )
             .await?;
 
         if range.items.is_empty() {
@@ -139,7 +175,7 @@ where S: PartitionFamilyKvStore + 'static
             .as_ref()
             .is_some_and(|cfg| cfg.gsi_name() == index_name);
 
-        let projection = Self::find_gsi_projection(&table_info, &index_name);
+        let projection = Self::find_gsi_projection(table_info, &index_name);
         let mut batch = Vec::with_capacity(range.items.len());
         let mut last_item: Option<HashMap<String, AttributeValue>> = None;
         let mut processed = 0usize;
@@ -153,9 +189,9 @@ where S: PartitionFamilyKvStore + 'static
                 let Some(ttl_attr) = ttl_attribute_name.as_deref() else {
                     continue;
                 };
-                let Some(key) = ttl::ttl_index_key_for_item(
-                    &table_info.table_name,
-                    &table_info,
+                let Some(key) = ttl::compact_ttl_index_key_for_item(
+                    &table_metadata.identity,
+                    table_info,
                     ttl_attr,
                     &item,
                 )?
@@ -182,7 +218,7 @@ where S: PartitionFamilyKvStore + 'static
                     apply_gsi_projection(&item, projection, &table_info.key_schema, &gsi_schema);
                 let gsi_value = storage_types::storage_serde::to_bytes(&projected)?;
                 batch.push(BatchItem {
-                    key: gsi_key.serialize_to_bytes()?.into_boxed_slice().into(),
+                    key: table_keys::item_key(&table_metadata.identity, &gsi_key)?,
                     value: Some(gsi_value),
                 });
                 processed += 1;
@@ -195,7 +231,7 @@ where S: PartitionFamilyKvStore + 'static
 
         let next_token = if range.has_more {
             if let Some(item) = last_item {
-                ItemKey::last_evaluated_key_from_last_item(&item, &table_info, &None)?
+                ItemKey::last_evaluated_key_from_last_item(&item, table_info, &None)?
             } else {
                 None
             }

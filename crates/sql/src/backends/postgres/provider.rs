@@ -7,7 +7,7 @@ use std::{
 use bg_jobs::JobManager;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustls::{ClientConfig, RootCertStore};
-use storage_common::GsiPropagationGovernor;
+use storage_common::{DatabaseJobIntervals, GsiPropagationGovernor};
 use storage_types::{StorageError, StorageResult, StoredTableInfo, TableName};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_postgres::{Config, NoTls};
@@ -26,6 +26,7 @@ pub struct PostgresStorageProvider {
     pub(crate) table_info_cache: Arc<RwLock<HashMap<TableName, Arc<StoredTableInfo>>>>,
     pub(crate) ttl_config_cache: Arc<RwLock<HashMap<TableName, CachedTtlConfig>>>,
     pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) database_job_intervals: DatabaseJobIntervals,
     pub(crate) gsi_propagation_governor: Arc<GsiPropagationGovernor>,
 }
 
@@ -225,6 +226,7 @@ impl PostgresStorageProvider {
             table_info_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl_config_cache: Arc::new(RwLock::new(HashMap::new())),
             immediate_gsi_consistency: false,
+            database_job_intervals: DatabaseJobIntervals::default(),
             gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
         })
     }
@@ -244,6 +246,7 @@ impl PostgresStorageProvider {
             table_info_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl_config_cache: Arc::new(RwLock::new(HashMap::new())),
             immediate_gsi_consistency: false,
+            database_job_intervals: DatabaseJobIntervals::default(),
             gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
         }
     }
@@ -257,6 +260,12 @@ impl PostgresStorageProvider {
     #[must_use]
     pub fn with_immediate_gsi_consistency(mut self, enabled: bool) -> Self {
         self.immediate_gsi_consistency = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_database_job_intervals(mut self, intervals: DatabaseJobIntervals) -> Self {
+        self.database_job_intervals = intervals;
         self
     }
 }

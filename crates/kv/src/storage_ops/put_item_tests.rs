@@ -67,7 +67,7 @@ async fn kv_put_condition_failure_returns_conditional_check_failed() {
 
 #[tokio::test]
 async fn kv_create_table_writes_custom_stream_duration_state() {
-    let provider = test_provider("kv-create-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-create-custom-duration");
     let table = TableName::new("custom_duration_table");
     let mut create = hash_table_request(table.clone());
     create.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(2));
@@ -98,7 +98,7 @@ async fn kv_create_table_writes_custom_stream_duration_state() {
 
 #[tokio::test]
 async fn kv_put_item_with_stream_ttl_writes_item_duration_marker() {
-    let provider = test_provider("kv-put-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-put-custom-duration");
     let table = TableName::new("put_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -128,7 +128,7 @@ async fn kv_put_item_with_stream_ttl_writes_item_duration_marker() {
 
 #[tokio::test]
 async fn kv_failed_conditional_put_does_not_write_item_duration_marker() {
-    let provider = test_provider("kv-put-custom-duration-condition-failure");
+    let provider = provider_for_custom_duration_case("kv-put-custom-duration-condition-failure");
     let table = TableName::new("put_custom_duration_failure_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -164,7 +164,7 @@ async fn kv_failed_conditional_put_does_not_write_item_duration_marker() {
 
 #[tokio::test]
 async fn kv_batch_write_put_applies_item_stream_duration_markers() {
-    let provider = test_provider("kv-batch-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-batch-custom-duration");
     let table = TableName::new("batch_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -210,7 +210,7 @@ async fn kv_batch_write_put_applies_item_stream_duration_markers() {
 
 #[tokio::test]
 async fn kv_cancelled_transaction_does_not_write_item_duration_marker() {
-    let provider = test_provider("kv-transaction-custom-duration-rollback");
+    let provider = provider_for_custom_duration_case("kv-transaction-custom-duration-rollback");
     let table = TableName::new("transaction_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -278,7 +278,9 @@ async fn item_duration_marker_count(
         .count()
 }
 
-fn test_provider(label: &str) -> crate::SortedKvDbStorageProvider<crate::RocksDbKvStore> {
+fn provider_for_custom_duration_case(
+    label: &str,
+) -> crate::SortedKvDbStorageProvider<crate::RocksDbKvStore> {
     let store = crate::RocksDbKvStore::new(crate::kv_support_tests::rocksdb_test_path(label))
         .expect("rocksdb store");
     crate::SortedKvDbStorageProvider::new(store)

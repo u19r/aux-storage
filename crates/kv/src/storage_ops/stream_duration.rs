@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use storage_provider::{
     StorageProvider, StreamDurationTrimBackend, StreamDurationTrimPageRequest,
     StreamDurationTrimPageResult, StreamTrimBoundary, StreamTrimDueMarker, StreamTrimScope,
@@ -17,20 +18,41 @@ use crate::{
     backends::common::KvMutation,
     constants,
     helpers::increment_bytes,
+    keyspace::{compact, stream_keys, table_identity::TableIdentity},
     sorted_kv_store::{BatchItem, DirectWriteOperation},
-    stream::item_codec::decode_stream_item,
+    stream::{
+        item_codec::decode_stream_item,
+        pointer_codec::{decode_compact_pointer, item_stream_name},
+    },
 };
 
-const TRIM_STATE_PREFIX: &[u8] = b"sys/stream-duration/state/";
-const TRIM_DUE_MARKER_PREFIX: &[u8] = b"sys/stream-duration/due/";
-pub(crate) const STREAM_POINTER_INDEX_PREFIX: &[u8] = b"sys/stream-duration/pointer/";
 const ITEM_STREAM_SCOPE_PREFIX: &str = "kv-stream:";
 const ITEM_KEY_HASH_PREFIX: &str = "kv-key:";
-const ESCAPE_BYTE: u8 = b'%';
-const ESCAPED_SLASH: &[u8; 3] = b"%2f";
-const ESCAPED_PERCENT: &[u8; 3] = b"%25";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const FOREVER_POLICY_CODE: u32 = u32::MAX;
+const TRIM_SCOPE_TABLE: u8 = b't';
+const TRIM_SCOPE_ITEM: u8 = b'i';
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactStreamTrimState {
+    scope_key: Vec<u8>,
+    policy_version: u64,
+    retention: StreamRetentionDuration,
+    effective_retention: StreamRetentionDuration,
+    next_due_at: Option<TimestampMillis>,
+    oldest_retained_version: Option<ItemStreamVersion>,
+    oldest_retained_timestamp: Option<TimestampMillis>,
+    latest_version: Option<ItemStreamVersion>,
+    latest_timestamp: Option<TimestampMillis>,
+    updated_at: TimestampMillis,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactStreamTrimDueMarker {
+    due_bucket: TimestampMillis,
+    scope_key: Vec<u8>,
+    policy_version: u64,
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,17 +89,23 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let limit = u32::try_from(limit).map_err(|err| {
             StorageError::validation(format!("stream trim marker page limit is too large: {err}"))
         })?;
-        let start = TRIM_DUE_MARKER_PREFIX.to_vec();
-        let exclusive_end = due_marker_upper_bound(due_before);
+        let due_range = compact::stream_trim_due_prefix();
+        let exclusive_end = compact::stream_trim_due_upper_bound(due_before.timestamp_millis());
         let range = self
             .kv_store
-            .get_range(&start, &exclusive_end, Some(limit), None::<ItemKey>, true)
+            .get_range(
+                &due_range.start,
+                &exclusive_end,
+                Some(limit),
+                None::<ItemKey>,
+                true,
+            )
             .await?;
-        range
-            .items
-            .into_iter()
-            .map(|(_key, value)| decode_marker(&value))
-            .collect()
+        let mut markers = Vec::with_capacity(range.items.len());
+        for (_key, value) in range.items {
+            markers.push(self.decode_compact_trim_marker(&value).await?);
+        }
+        Ok(markers)
     }
 
     pub(crate) async fn write_stream_trim_state_with_marker(
@@ -85,7 +113,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         write: StreamTrimStateWrite,
     ) -> StorageResult<()> {
         self.kv_store
-            .transact_write_unchecked(stream_trim_state_write_ops(write)?)
+            .transact_write_unchecked(self.stream_trim_state_write_ops(write).await?)
             .await
     }
 
@@ -93,11 +121,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         scope: &StreamTrimScope,
     ) -> StorageResult<Option<StreamTrimState>> {
-        self.kv_store
-            .get(&state_key(&scope.scope_id), true)
+        let table_identity = stream_trim_table_identity(self, &scope.table_name).await?;
+        let scope_key = trim_scope_key(&table_identity, scope)?;
+        let Some(bytes) = self
+            .kv_store
+            .get(&compact::stream_trim_state_key(&scope_key), true)
             .await?
-            .map(|bytes| storage_types::storage_serde::from_bytes(&bytes))
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        self.decode_compact_trim_state(&bytes).await.map(Some)
     }
 
     #[cfg(test)]
@@ -108,8 +141,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let state_rows = self
             .kv_store
             .get_range(
-                TRIM_STATE_PREFIX,
-                &increment_bytes(TRIM_STATE_PREFIX.to_vec()),
+                &[compact::KeyFamily::StreamTrimState.code()],
+                &increment_bytes(vec![compact::KeyFamily::StreamTrimState.code()]),
                 Some(u32::MAX),
                 None::<ItemKey>,
                 true,
@@ -126,6 +159,52 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             due_markers,
         })
     }
+}
+
+pub(crate) fn stream_trim_state_write_ops_for_identity(
+    table_identity: &TableIdentity,
+    write: StreamTrimStateWrite,
+) -> StorageResult<Vec<DirectWriteOperation>> {
+    Ok(
+        stream_trim_state_write_batch_items_for_identity(table_identity, write)?
+            .into_iter()
+            .map(|item| match item.value {
+                Some(value) => DirectWriteOperation::Put {
+                    key: item.key,
+                    value,
+                },
+                None => DirectWriteOperation::Delete { key: item.key },
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn stream_trim_state_write_batch_items_for_identity(
+    table_identity: &TableIdentity,
+    write: StreamTrimStateWrite,
+) -> StorageResult<Vec<BatchItem>> {
+    let scope_key = trim_scope_key(table_identity, &write.state.scope)?;
+    let compact_state = compact_trim_state_from_public(&write.state, scope_key.clone());
+    let mut items = vec![BatchItem {
+        key: compact::stream_trim_state_key(&scope_key),
+        value: Some(storage_types::storage_serde::to_bytes(&compact_state)?),
+    }];
+    if let Some(marker) = write.next_marker {
+        let marker = CompactStreamTrimDueMarker {
+            due_bucket: marker.due_bucket,
+            scope_key: scope_key.clone(),
+            policy_version: marker.policy_version,
+        };
+        items.push(BatchItem {
+            key: compact::stream_trim_due_key(
+                marker.due_bucket.timestamp_millis(),
+                &marker.scope_key,
+                marker.policy_version,
+            ),
+            value: Some(storage_types::storage_serde::to_bytes(&marker)?),
+        });
+    }
+    Ok(items)
 }
 
 #[async_trait]
@@ -155,12 +234,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StreamDuratio
         let stream_name = stream_name_for_scope(scope)?;
         let latest_item_id = match scope.kind {
             StreamTrimScopeKind::Table => None,
-            StreamTrimScopeKind::Item => latest_stream_item_id(self, &stream_name).await?,
+            StreamTrimScopeKind::Item => {
+                let table_identity = stream_trim_table_identity(self, &scope.table_name).await?;
+                latest_stream_item_id(self, &stream_name, &table_identity).await?
+            }
         };
         let retained_table_pointer_boundary = match scope.kind {
             StreamTrimScopeKind::Table => None,
             StreamTrimScopeKind::Item => {
-                retained_item_pointer_boundary(self, &scope.table_name, &stream_name).await?
+                let table_identity = stream_trim_table_identity(self, &scope.table_name).await?;
+                retained_item_pointer_boundary(self, &table_identity, &stream_name).await?
             }
         };
         let protected_boundary = match scope.kind {
@@ -196,17 +279,26 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StreamDuratio
         marker: StreamTrimDueMarker,
         write: Option<StreamTrimStateWrite>,
     ) -> StorageResult<()> {
+        let marker_scope_key = trim_scope_key(
+            &stream_trim_table_identity(self, &marker.scope.table_name).await?,
+            &marker.scope,
+        )?;
         let mut operations = vec![DirectWriteOperation::Delete {
-            key: due_marker_key(&marker),
+            key: compact::stream_trim_due_key(
+                marker.due_bucket.timestamp_millis(),
+                &marker_scope_key,
+                marker.policy_version,
+            ),
         }];
         if let Some(write) = write {
-            operations.extend(stream_trim_state_write_ops(write)?);
+            operations.extend(self.stream_trim_state_write_ops(write).await?);
         }
         self.kv_store.transact_write_unchecked(operations).await
     }
 }
 
 pub(crate) fn item_stream_duration_write_items(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key_attributes: &KeyAttributes,
     _policy_version: u64,
@@ -236,19 +328,24 @@ pub(crate) fn item_stream_duration_write_items(
         table_info.table_stream_duration,
         TimestampMillis::now(),
     );
-    stream_trim_state_write_batch_items(StreamTrimStateWrite {
-        state: plan.trim_state,
-        next_marker: plan.due_marker,
-    })
+    stream_trim_state_write_batch_items_for_identity(
+        table_identity,
+        StreamTrimStateWrite {
+            state: plan.trim_state,
+            next_marker: plan.due_marker,
+        },
+    )
 }
 
 pub(crate) fn item_stream_duration_kv_mutations(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key_attributes: &KeyAttributes,
     policy_version: u64,
     requested_retention: Option<StreamRetentionDuration>,
 ) -> StorageResult<Vec<KvMutation>> {
     Ok(item_stream_duration_write_items(
+        table_identity,
         table_info,
         key_attributes,
         policy_version,
@@ -282,94 +379,135 @@ pub(crate) fn item_stream_policy_version(
     )
 }
 
-pub(crate) fn stream_trim_state_write_ops(
-    write: StreamTrimStateWrite,
-) -> StorageResult<Vec<DirectWriteOperation>> {
-    Ok(stream_trim_state_write_batch_items(write)?
-        .into_iter()
-        .map(|item| match item.value {
-            Some(value) => DirectWriteOperation::Put {
-                key: item.key,
-                value,
-            },
-            None => DirectWriteOperation::Delete { key: item.key },
-        })
-        .collect())
-}
-
-pub(crate) fn stream_trim_state_write_batch_items(
-    write: StreamTrimStateWrite,
-) -> StorageResult<Vec<BatchItem>> {
-    let scope_id = write.state.scope.scope_id.clone();
-    let mut items = vec![BatchItem {
-        key: state_key(&scope_id),
-        value: Some(storage_types::storage_serde::to_bytes(&write.state)?),
-    }];
-    if let Some(marker) = write.next_marker {
-        items.push(BatchItem {
-            key: due_marker_key(&marker),
-            value: Some(storage_types::storage_serde::to_bytes(&marker)?),
-        });
+impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
+    pub(crate) async fn stream_trim_state_write_ops(
+        &self,
+        write: StreamTrimStateWrite,
+    ) -> StorageResult<Vec<DirectWriteOperation>> {
+        let table_identity =
+            stream_trim_table_identity(self, &write.state.scope.table_name).await?;
+        stream_trim_state_write_ops_for_identity(&table_identity, write)
     }
-    Ok(items)
+
+    async fn decode_compact_trim_state(&self, bytes: &[u8]) -> StorageResult<StreamTrimState> {
+        let compact: CompactStreamTrimState = storage_types::storage_serde::from_bytes(bytes)?;
+        let scope = self.decode_trim_scope_key(&compact.scope_key).await?;
+        Ok(StreamTrimState {
+            scope,
+            policy_version: compact.policy_version,
+            retention: compact.retention,
+            effective_retention: compact.effective_retention,
+            next_due_at: compact.next_due_at,
+            oldest_retained_version: compact.oldest_retained_version,
+            oldest_retained_timestamp: compact.oldest_retained_timestamp,
+            latest_version: compact.latest_version,
+            latest_timestamp: compact.latest_timestamp,
+            updated_at: compact.updated_at,
+        })
+    }
+
+    async fn decode_compact_trim_marker(&self, bytes: &[u8]) -> StorageResult<StreamTrimDueMarker> {
+        let compact: CompactStreamTrimDueMarker = storage_types::storage_serde::from_bytes(bytes)?;
+        Ok(StreamTrimDueMarker {
+            due_bucket: compact.due_bucket,
+            scope: self.decode_trim_scope_key(&compact.scope_key).await?,
+            policy_version: compact.policy_version,
+        })
+    }
+
+    async fn decode_trim_scope_key(&self, scope_key: &[u8]) -> StorageResult<StreamTrimScope> {
+        let Some((&kind, payload)) = scope_key.split_first() else {
+            return Err(StorageError::internal("compact stream trim scope is empty"));
+        };
+        if payload.len() < 4 {
+            return Err(StorageError::internal(
+                "compact stream trim scope is missing table id",
+            ));
+        }
+        let mut table_id = [0u8; 4];
+        table_id.copy_from_slice(&payload[..4]);
+        let table_id = compact::TableStorageId::new(u32::from_be_bytes(table_id));
+        let table = self
+            .get_table_identity_from_id(table_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::internal(&format!(
+                    "compact stream trim scope table id {} is missing",
+                    table_id.get()
+                ))
+            })?;
+        match kind {
+            TRIM_SCOPE_TABLE => Ok(StreamTrimScope::table(
+                table_trim_scope_id(table.identity.table_id),
+                table.identity.table_name.clone(),
+            )),
+            TRIM_SCOPE_ITEM => {
+                let item_scope = &payload[4..];
+                let item_stream = item_stream_name(&table.identity.table_name, item_scope);
+                Ok(StreamTrimScope::item(
+                    item_stream_scope_id(&item_stream),
+                    table.identity.table_name.clone(),
+                    item_stream_key_hash(&item_stream),
+                ))
+            }
+            _ => Err(StorageError::internal(
+                "compact stream trim scope has invalid kind",
+            )),
+        }
+    }
 }
 
-pub(crate) fn state_key(scope_id: &str) -> Vec<u8> {
-    let mut key = TRIM_STATE_PREFIX.to_vec();
-    encode_component(scope_id, &mut key);
-    key
+fn compact_trim_state_from_public(
+    state: &StreamTrimState,
+    scope_key: Vec<u8>,
+) -> CompactStreamTrimState {
+    CompactStreamTrimState {
+        scope_key,
+        policy_version: state.policy_version,
+        retention: state.retention,
+        effective_retention: state.effective_retention,
+        next_due_at: state.next_due_at,
+        oldest_retained_version: state.oldest_retained_version,
+        oldest_retained_timestamp: state.oldest_retained_timestamp,
+        latest_version: state.latest_version,
+        latest_timestamp: state.latest_timestamp,
+        updated_at: state.updated_at,
+    }
 }
 
-pub(crate) fn due_marker_key(marker: &StreamTrimDueMarker) -> Vec<u8> {
-    let mut key = TRIM_DUE_MARKER_PREFIX.to_vec();
-    append_padded_i64(marker.due_bucket.timestamp_millis(), &mut key);
-    key.push(b'/');
-    encode_component(&marker.scope.scope_id, &mut key);
-    key.push(b'/');
-    append_padded_u64(marker.policy_version, &mut key);
-    key
+fn trim_scope_key(
+    table_identity: &TableIdentity,
+    scope: &StreamTrimScope,
+) -> StorageResult<Vec<u8>> {
+    let mut key = Vec::new();
+    match scope.kind {
+        StreamTrimScopeKind::Table => {
+            key.push(TRIM_SCOPE_TABLE);
+            key.extend_from_slice(&table_identity.table_id.get().to_be_bytes());
+        }
+        StreamTrimScopeKind::Item => {
+            key.push(TRIM_SCOPE_ITEM);
+            key.extend_from_slice(&table_identity.table_id.get().to_be_bytes());
+            let stream_name = stream_name_for_scope(scope)?;
+            let item_scope = stream_keys::compact_stream_range(&stream_name, Some(table_identity))?;
+            match item_scope {
+                stream_keys::CompactStreamRange::Item(range) => {
+                    let prefix_len = 1 + 4;
+                    key.extend_from_slice(&range.start[prefix_len..]);
+                }
+                _ => {
+                    return Err(StorageError::internal(
+                        "item stream trim scope did not resolve to item stream range",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(key)
 }
 
-pub(crate) fn stream_pointer_index_prefix(table_name: &storage_types::TableName) -> Vec<u8> {
-    let mut key = STREAM_POINTER_INDEX_PREFIX.to_vec();
-    encode_component(table_name.as_ref(), &mut key);
-    key.push(b'/');
-    key
-}
-
-pub(crate) fn stream_pointer_item_prefix(
-    table_name: &storage_types::TableName,
-    item_stream: &StreamName,
-) -> Vec<u8> {
-    let mut key = stream_pointer_index_prefix(table_name);
-    encode_component(&item_stream_scope_id(item_stream), &mut key);
-    key.push(b'/');
-    key
-}
-
-pub(crate) fn stream_pointer_table_prefix(table_name: &storage_types::TableName) -> Vec<u8> {
-    let mut key = stream_pointer_index_prefix(table_name);
-    key.extend(b"table/");
-    key
-}
-
-pub(crate) fn stream_pointer_index_key(
-    table_name: &storage_types::TableName,
-    item_stream: &StreamName,
-    item_id: storage_types::StreamItemId,
-) -> Vec<u8> {
-    let mut key = stream_pointer_item_prefix(table_name, item_stream);
-    key.extend_from_slice(item_id.as_bytes());
-    key
-}
-
-pub(crate) fn stream_pointer_table_key(
-    table_name: &storage_types::TableName,
-    item_id: storage_types::StreamItemId,
-) -> Vec<u8> {
-    let mut key = stream_pointer_table_prefix(table_name);
-    key.extend_from_slice(item_id.as_bytes());
-    key
+fn table_trim_scope_id(table_id: compact::TableStorageId) -> String {
+    format!("kv-table-id:{}", table_id.get())
 }
 
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
@@ -393,12 +531,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         Vec<TableDrivenItemCleanupTarget>,
     )> {
         let stream_name = stream_name_for_scope(&request.scope)?;
-        let prefix = stream_key_prefix(&stream_name);
+        let table_identity = stream_trim_table_identity(self, &request.scope.table_name).await?;
+        let stream_range = compact_stream_range_for_name(&stream_name, &table_identity)?;
         let range = self
             .kv_store
             .get_range(
-                &prefix,
-                &increment_bytes(prefix.clone()),
+                &stream_range.start,
+                &stream_range.end,
                 Some(u32::try_from(request.page_limit).unwrap_or(u32::MAX)),
                 None::<ItemKey>,
                 true,
@@ -412,7 +551,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let mut last_table_pointer_key = None;
         let mut item_cleanup_targets = Vec::new();
         for (key, value) in range.items {
-            let Some(item_id) = stream_item_id_from_key_prefix(&prefix, &key) else {
+            let Some(item_id) = stream_keys::stream_item_id_from_compact_key(&key) else {
                 continue;
             };
             if request
@@ -430,13 +569,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             }
             last_deleted_key = Some(key.to_vec());
             if matches!(request.scope.kind, StreamTrimScopeKind::Table) {
-                if let Some(target) =
-                    table_driven_item_cleanup_target(&request.scope.table_name, item_id, &stored)
-                {
+                if let Some(target) = table_driven_item_cleanup_target(
+                    &table_identity,
+                    &request.scope.table_name,
+                    item_id,
+                    &stored,
+                ) {
                     upsert_item_cleanup_target(&mut item_cleanup_targets, target);
                 }
                 let table_pointer_key =
-                    stream_pointer_table_key(&request.scope.table_name, item_id);
+                    stream_keys::stream_pointer_table_key_for_stream(&table_identity, item_id);
                 if first_table_pointer_key.is_none() {
                     first_table_pointer_key = Some(table_pointer_key.clone());
                 }
@@ -445,13 +587,18 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             deleted_rows = deleted_rows.saturating_add(1);
         }
         for target in &item_cleanup_targets {
+            let item_pointer_prefix = stream_keys::stream_pointer_item_prefix_for_stream(
+                &table_identity,
+                &target.item_stream,
+            )?;
+            let item_pointer_key = stream_keys::stream_pointer_item_key_for_stream(
+                &table_identity,
+                &target.item_stream,
+                target.max_item_id,
+            )?;
             deletes.push(DirectWriteOperation::DeleteRange {
-                start: stream_pointer_item_prefix(&request.scope.table_name, &target.item_stream),
-                exclusive_end: increment_bytes(stream_pointer_index_key(
-                    &request.scope.table_name,
-                    &target.item_stream,
-                    target.max_item_id,
-                )),
+                start: item_pointer_prefix.start,
+                exclusive_end: increment_bytes(item_pointer_key),
             });
         }
         if let (Some(start), Some(last)) = (first_table_pointer_key, last_table_pointer_key) {
@@ -492,7 +639,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             "custom_stream_duration_point_deletes",
             point_deletes as u64,
         );
-        let first_remaining = first_remaining_stream_item(self, &stream_name).await?;
+        let first_remaining =
+            first_remaining_stream_item(self, &stream_name, &table_identity).await?;
         Ok((
             StreamDurationTrimPageResult {
                 deleted_rows,
@@ -527,8 +675,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 let table = match &table_info {
                     Some(table) => table,
                     None => {
-                        table_info = Some(self.get_table_info(&target.table_name).await?);
-                        table_info.as_ref().expect("table info inserted")
+                        table_info.get_or_insert(self.get_table_info(&target.table_name).await?)
                     }
                 };
                 StreamRetentionDuration::effective_item_retention(
@@ -559,12 +706,23 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 }
 
 fn table_driven_item_cleanup_target(
+    table_identity: &TableIdentity,
     table_name: &storage_types::TableName,
     table_stream_item_id: StreamItemId,
     stored: &crate::stream::item_codec::StoredStreamItem,
 ) -> Option<TableDrivenItemCleanupTarget> {
     if stored.data_type != StreamDataType::StreamPointer {
         return None;
+    }
+    if let Ok(pointer) = decode_compact_pointer(&stored.data) {
+        if pointer.table_id != table_identity.table_id {
+            return None;
+        }
+        return Some(TableDrivenItemCleanupTarget {
+            table_name: table_name.clone(),
+            item_stream: item_stream_name(table_name, &pointer.item_scope),
+            max_item_id: StreamItemId::from(pointer.item_stream_version),
+        });
     }
     let pointer: StoredStreamPointer = match storage_types::storage_serde::from_bytes(&stored.data)
     {
@@ -646,22 +804,17 @@ fn cutoff_timestamp(
 async fn latest_stream_item_id<S: crate::partition_family::PartitionFamilyKvStore + 'static>(
     provider: &SortedKvDbStorageProvider<S>,
     stream_name: &StreamName,
+    table_identity: &TableIdentity,
 ) -> StorageResult<Option<StreamItemId>> {
-    let prefix = stream_key_prefix(stream_name);
+    let range = compact_stream_range_for_name(stream_name, table_identity)?;
     let range = provider
         .kv_store
-        .get_range(
-            &increment_bytes(prefix.clone()),
-            &prefix,
-            Some(1),
-            None::<ItemKey>,
-            true,
-        )
+        .get_range(&range.end, &range.start, Some(1), None::<ItemKey>, true)
         .await?;
     Ok(range
         .items
         .first()
-        .and_then(|(key, _)| stream_item_id_from_key_prefix(&prefix, key)))
+        .and_then(|(key, _)| stream_keys::stream_item_id_from_compact_key(key)))
 }
 
 async fn first_remaining_stream_item<
@@ -669,22 +822,17 @@ async fn first_remaining_stream_item<
 >(
     provider: &SortedKvDbStorageProvider<S>,
     stream_name: &StreamName,
+    table_identity: &TableIdentity,
 ) -> StorageResult<Option<stream_provider::StreamItem>> {
-    let prefix = stream_key_prefix(stream_name);
+    let range = compact_stream_range_for_name(stream_name, table_identity)?;
     let range = provider
         .kv_store
-        .get_range(
-            &prefix,
-            &increment_bytes(prefix.clone()),
-            Some(1),
-            None::<ItemKey>,
-            true,
-        )
+        .get_range(&range.start, &range.end, Some(1), None::<ItemKey>, true)
         .await?;
     let Some((key, value)) = range.items.first() else {
         return Ok(None);
     };
-    let Some(item_id) = stream_item_id_from_key_prefix(&prefix, key) else {
+    let Some(item_id) = stream_keys::stream_item_id_from_compact_key(key) else {
         return Ok(None);
     };
     Ok(Some(decode_stream_item(value)?.into_stream_item(item_id)))
@@ -694,23 +842,45 @@ async fn retained_item_pointer_boundary<
     S: crate::partition_family::PartitionFamilyKvStore + 'static,
 >(
     provider: &SortedKvDbStorageProvider<S>,
-    table_name: &storage_types::TableName,
+    table_identity: &TableIdentity,
     item_stream: &StreamName,
 ) -> StorageResult<Option<StreamTrimBoundary>> {
-    let prefix = stream_pointer_item_prefix(table_name, item_stream);
+    let range = stream_keys::stream_pointer_item_prefix_for_stream(table_identity, item_stream)?;
     let range = provider
         .kv_store
-        .get_range(
-            &prefix,
-            &increment_bytes(prefix.clone()),
-            Some(1),
-            None::<ItemKey>,
-            true,
-        )
+        .get_range(&range.start, &range.end, Some(1), None::<ItemKey>, true)
         .await?;
     Ok(range.items.first().and_then(|(key, _)| {
-        stream_item_id_from_key_prefix(&prefix, key).map(|item_id| StreamTrimBoundary { item_id })
+        stream_keys::stream_item_id_from_compact_key(key)
+            .map(|item_id| StreamTrimBoundary { item_id })
     }))
+}
+
+async fn stream_trim_table_identity<
+    S: crate::partition_family::PartitionFamilyKvStore + 'static,
+>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table_name: &storage_types::TableName,
+) -> StorageResult<TableIdentity> {
+    provider
+        .get_table_identity_from_name(table_name)
+        .await?
+        .map(|metadata| metadata.identity.clone())
+        .ok_or_else(|| StorageError::table_not_found(table_name))
+}
+
+fn compact_stream_range_for_name(
+    stream_name: &StreamName,
+    table_identity: &TableIdentity,
+) -> StorageResult<crate::keyspace::compact::KeyRange> {
+    match stream_keys::compact_stream_range(stream_name, Some(table_identity))? {
+        stream_keys::CompactStreamRange::System(range)
+        | stream_keys::CompactStreamRange::Table(range)
+        | stream_keys::CompactStreamRange::Item(range) => Ok(range),
+        stream_keys::CompactStreamRange::Legacy => Err(StorageError::internal(
+            "custom stream trim scope resolved to a non-table stream",
+        )),
+    }
 }
 
 pub(crate) fn item_stream_scope_id(stream_name: &StreamName) -> String {
@@ -774,30 +944,6 @@ fn decode_hex_nibble(byte: u8) -> StorageResult<u8> {
     }
 }
 
-fn stream_key_prefix(stream_name: &StreamName) -> Vec<u8> {
-    let mut prefix: Vec<u8> = stream_name.into();
-    prefix.push(b'/');
-    prefix
-}
-
-fn stream_item_id_from_key_prefix(prefix: &[u8], key: &[u8]) -> Option<StreamItemId> {
-    if key.len() <= prefix.len() || !key.starts_with(prefix) {
-        return None;
-    }
-    StreamItemId::try_from(&key[prefix.len()..]).ok()
-}
-
-fn due_marker_upper_bound(due_before: TimestampMillis) -> Vec<u8> {
-    let mut key = TRIM_DUE_MARKER_PREFIX.to_vec();
-    append_padded_i64(due_before.timestamp_millis(), &mut key);
-    key.push(b'0');
-    increment_bytes(key)
-}
-
-fn decode_marker(bytes: &[u8]) -> StorageResult<StreamTrimDueMarker> {
-    storage_types::storage_serde::from_bytes(bytes)
-}
-
 fn combined_duration_policy_version(
     requested: StreamRetentionDuration,
     effective: StreamRetentionDuration,
@@ -809,28 +955,5 @@ fn duration_policy_code(duration: StreamRetentionDuration) -> u32 {
     match duration {
         StreamRetentionDuration::Forever => FOREVER_POLICY_CODE,
         StreamRetentionDuration::FiniteHours(hours) => u32::from(hours),
-    }
-}
-
-fn append_padded_i64(value: i64, output: &mut Vec<u8>) {
-    append_padded_u64(u64::try_from(value).unwrap_or(0), output);
-}
-
-fn append_padded_u64(mut value: u64, output: &mut Vec<u8>) {
-    let mut digits = [b'0'; 20];
-    for digit in digits.iter_mut().rev() {
-        *digit = b'0' + (value % 10) as u8;
-        value /= 10;
-    }
-    output.extend_from_slice(&digits);
-}
-
-fn encode_component(component: &str, output: &mut Vec<u8>) {
-    for byte in component.as_bytes() {
-        match *byte {
-            b'/' => output.extend_from_slice(ESCAPED_SLASH),
-            ESCAPE_BYTE => output.extend_from_slice(ESCAPED_PERCENT),
-            other => output.push(other),
-        }
     }
 }

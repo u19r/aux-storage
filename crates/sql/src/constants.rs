@@ -44,7 +44,6 @@ pub const TTL_SWEEP_RETRY_MAX_DELAY_MS: u64 = 100;
 pub const TTL_SWEEP_HEALTH_CHECK_INTERVAL_MINUTES: u64 = 1_440;
 
 // Stream trim tuning (parity with KV backend).
-pub const STREAM_TRIM_INTERVAL_MINUTES: u64 = 60;
 pub const STREAM_TRIM_RETENTION_HOURS: i64 = 72;
 pub const MILLIS_PER_HOUR: i64 = 60 * 60 * 1000;
 pub const STREAM_TRIM_READ_LIMIT: u32 = 1_000;

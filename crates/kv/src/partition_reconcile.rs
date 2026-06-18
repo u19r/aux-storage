@@ -26,16 +26,17 @@ use crate::{
         PARTITION_FAMILY_OPEN_PARTITIONS_METRIC, PARTITION_FAMILY_PRESSURE_METRIC,
         PARTITION_FAMILY_TRANSITION_PARTITIONS_METRIC, PARTITION_LOAD_SAMPLE_RETENTION_WINDOWS,
         PARTITION_LOAD_SAMPLE_WINDOW_SECONDS, PARTITION_LOAD_SAMPLES_FLUSHED_TOTAL_METRIC,
-        PARTITION_RECONCILE_ACTIONS_TOTAL_METRIC, PARTITION_RECONCILE_INTERVAL_SECONDS,
-        PARTITION_RECONCILE_RUNS_TOTAL_METRIC, PARTITION_RECONCILE_RUNTIME_MS_METRIC,
+        PARTITION_RECONCILE_ACTIONS_TOTAL_METRIC, PARTITION_RECONCILE_RUNS_TOTAL_METRIC,
+        PARTITION_RECONCILE_RUNTIME_MS_METRIC,
     },
+    keyspace::compact::{self, QueueStorageId, U48},
     newtypes::MessageVisibilityKey,
     partition_family::{
         PartitionFamilyConfig, PartitionFamilyKind, PartitionFamilyKvStore, PartitionInfo,
         PartitionLoadSample, PartitionLoadSampleRecord, PartitionState, PiControllerState,
         ResolvedPartitionFamily, decode_hex_component, merge_partition_load, next_partition_id,
         next_placement_slot, open_partition_count,
-        parse_partition_family_component_from_config_key, parse_partition_load_sample,
+        parse_partition_family_component_from_config_value, parse_partition_load_sample,
         partition_family_kind_prefix, partition_load_sample_bytes, partition_load_sample_key,
         partition_load_sample_prefix, partition_sample_retention_cutoff_ms,
         partition_sample_window_start_ms, queue_ready_prefix_with_slot, queue_state_key_with_slot,
@@ -95,6 +96,31 @@ impl<S: PartitionFamilyKvStore + 'static> BackgroundJob for PartitionReconcileJo
 }
 
 impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
+    async fn queue_storage_id_for_url(
+        &self,
+        queue_url: &str,
+    ) -> StorageResult<Option<QueueStorageId>> {
+        let Some(bytes) = self
+            .kv_store
+            .get(&compact::queue_url_lookup_key(queue_url), true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != 6 {
+            return Err(StorageError::internal(&format!(
+                "invalid queue storage id width: expected 6 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut padded = [0u8; 8];
+        padded[2..].copy_from_slice(&bytes);
+        U48::new(u64::from_be_bytes(padded))
+            .map(QueueStorageId::from)
+            .map(Some)
+            .map_err(|error| StorageError::internal(&format!("invalid queue storage id: {error}")))
+    }
+
     pub(crate) async fn start_partition_reconcile_task(&self) -> StorageResult<()> {
         if !self.database_jobs_enabled || !self.kv_store.supports_partition_families() {
             return Ok(());
@@ -111,7 +137,11 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         let job = PartitionReconcileJob::new(Arc::new(self.clone()));
         let config = JobConfig {
             start_immediately: true,
-            sleep_duration: Duration::from_secs(PARTITION_RECONCILE_INTERVAL_SECONDS),
+            sleep_duration: Duration::from_millis(
+                self.database_job_intervals
+                    .partition_family_reconcile_interval_ms
+                    .0,
+            ),
             jitter_percent: 10,
         };
 
@@ -134,10 +164,8 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         let prefix = partition_family_kind_prefix(family_kind);
         let entries = self.kv_store.get_prefix(&prefix, true, None, true).await?;
         let mut components = BTreeSet::new();
-        for (key, _) in entries.items {
-            if let Some(component) =
-                parse_partition_family_component_from_config_key(family_kind, &key)
-            {
+        for (_key, value) in entries.items {
+            if let Some(component) = parse_partition_family_component_from_config_value(&value)? {
                 components.insert(component);
             }
         }
@@ -240,12 +268,12 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
 
     async fn queue_partition_snapshot(
         &self,
-        queue_url: &str,
+        queue_id: QueueStorageId,
         partition: &PartitionInfo,
         now_ms: i64,
     ) -> StorageResult<(PartitionLoadSample, bool)> {
         let ready_prefix = queue_ready_prefix_with_slot(
-            queue_url,
+            queue_id,
             partition.placement_slot,
             partition.partition_id,
         );
@@ -257,7 +285,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             .kv_store
             .get_prefix(
                 &queue_state_key_with_slot(
-                    queue_url,
+                    queue_id,
                     partition.placement_slot,
                     partition.partition_id,
                     "",
@@ -268,7 +296,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             )
             .await?;
         let prewarm_state_key = queue_state_key_with_slot(
-            queue_url,
+            queue_id,
             partition.placement_slot,
             partition.partition_id,
             QUEUE_PREWARM_MESSAGE_ID,
@@ -401,6 +429,9 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             String::from_utf8(decode_hex_component(family_component)?).map_err(|error| {
                 StorageError::internal(&format!("decode queue family component: {error}"))
             })?;
+        let Some(queue_id) = self.queue_storage_id_for_url(&queue_url).await? else {
+            return Ok(FamilyReconcileOutcome::default());
+        };
 
         let load = self
             .load_recent_partition_samples(
@@ -416,7 +447,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                 continue;
             }
             let (snapshot, is_empty) = self
-                .queue_partition_snapshot(&queue_url, partition, now_ms)
+                .queue_partition_snapshot(queue_id, partition, now_ms)
                 .await?;
             let entry = samples.entry(partition.partition_id).or_default();
             entry.oldest_visible_age_ms = entry

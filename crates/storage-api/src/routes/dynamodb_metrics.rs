@@ -191,6 +191,7 @@ pub(super) fn dynamodb_operation_label(target: &str) -> &'static str {
         "DynamoDB_20120810.DescribeTimeToLive" => "describe_time_to_live",
         "DynamoDB_20120810.GetItem" => "get_item",
         "DynamoDB_20120810.GetStreamRecords" => "get_stream_records",
+        "DynamoDB_20120810.ListChangeIndexMarkers" => "list_change_index_markers",
         "DynamoDBStreams_20120810.DescribeStream" => "describe_stream",
         "DynamoDBStreams_20120810.GetRecords" => "get_records",
         "DynamoDBStreams_20120810.GetShardIterator" => "get_shard_iterator",

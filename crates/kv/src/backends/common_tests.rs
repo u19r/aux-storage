@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use storage_common::ttl::{self, TtlConfigRecord};
+use storage_common::ttl::TtlConfigRecord;
 use storage_condition::parse_condition_expression;
 use storage_provider::UpdateOperation;
 use storage_types::{
@@ -11,21 +11,33 @@ use storage_types::{
 
 use crate::{
     backends::common::{KvMutation, plan_table_write},
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
     sorted_kv_store::TransactWriteTableOperation,
+    ttl,
 };
+
+fn table_identity(table_info: &StoredTableInfo) -> TableIdentity {
+    TableIdentity::new(
+        TableStorageId::new(1),
+        table_info.table_name.clone(),
+        Vec::new(),
+    )
+}
 
 #[test]
 fn plan_table_put_includes_ttl_index_mutation_in_same_plan() {
     let table_info = ttl_table_info("ttl_put_plan");
+    let table_identity = table_identity(&table_info);
     let ttl_config = ttl_config(&table_info.table_name);
     let new_item = item_with_ttl("pk", "sk", "1700000000");
     let ttl_key =
-        ttl::ttl_index_key_for_item(&table_info.table_name, &table_info, "ttl", &new_item)
+        crate::ttl::compact_ttl_index_key_for_item(&table_identity, &table_info, "ttl", &new_item)
             .expect("ttl key result")
             .expect("ttl key");
 
     let plan = plan_table_write(
         &[TransactWriteTableOperation::Put {
+            table_identity,
             table_info,
             item: new_item,
             item_stream_ttl_hours: None,
@@ -51,16 +63,17 @@ fn plan_table_put_includes_ttl_index_mutation_in_same_plan() {
 #[test]
 fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
     let table_info = ttl_table_info("ttl_update_plan");
+    let table_identity = table_identity(&table_info);
     let ttl_config = ttl_config(&table_info.table_name);
     let old_item = item_with_ttl("pk", "sk", "1700000000");
     let new_ttl = AttributeValue::N("1800000000".to_string());
     let new_item = item_with_ttl("pk", "sk", "1800000000");
     let old_ttl_key =
-        ttl::ttl_index_key_for_item(&table_info.table_name, &table_info, "ttl", &old_item)
+        crate::ttl::compact_ttl_index_key_for_item(&table_identity, &table_info, "ttl", &old_item)
             .expect("old ttl key result")
             .expect("old ttl key");
     let new_ttl_key =
-        ttl::ttl_index_key_for_item(&table_info.table_name, &table_info, "ttl", &new_item)
+        crate::ttl::compact_ttl_index_key_for_item(&table_identity, &table_info, "ttl", &new_item)
             .expect("new ttl key result")
             .expect("new ttl key");
     let current_bytes =
@@ -68,6 +81,7 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
 
     let plan = plan_table_write(
         &[TransactWriteTableOperation::Update {
+            table_identity,
             table_info,
             key: key_attrs("pk", "sk").into(),
             operations: Arc::from([UpdateOperation::Set {
@@ -118,6 +132,7 @@ fn plan_table_delete_accepts_equivalent_scientific_number_key() {
 
     let plan = plan_table_write(
         &[TransactWriteTableOperation::Delete {
+            table_identity: table_identity(&table_info),
             table_info,
             key: HashMap::from([
                 ("pk".to_string(), AttributeValue::N("1E-130".to_string())),
@@ -156,12 +171,14 @@ fn plan_table_write_collects_cancellation_reasons_after_first_failure() {
     let error = plan_table_write(
         &[
             TransactWriteTableOperation::Check {
+                table_identity: table_identity(&table_info),
                 table_info: table_info.clone(),
                 key: key_attrs("pk", "sk-1").into(),
                 condition: condition.clone(),
                 return_values_on_condition_check_failure: None,
             },
             TransactWriteTableOperation::Check {
+                table_identity: table_identity(&table_info),
                 table_info,
                 key: key_attrs("pk", "sk-2").into(),
                 condition,
@@ -197,6 +214,7 @@ fn plan_table_write_rejects_duplicate_transaction_item_targets() {
     let result = plan_table_write(
         &[
             TransactWriteTableOperation::Put {
+                table_identity: table_identity(&table_info),
                 table_info: table_info.clone(),
                 item: item_with_status("pk", "sk", "open"),
                 item_stream_ttl_hours: None,
@@ -206,6 +224,7 @@ fn plan_table_write_rejects_duplicate_transaction_item_targets() {
                 ttl_config: None,
             },
             TransactWriteTableOperation::Delete {
+                table_identity: table_identity(&table_info),
                 table_info,
                 key: key_attrs("pk", "sk").into(),
                 item_stream_ttl_hours: None,
@@ -238,6 +257,7 @@ fn plan_table_write_rejects_invalid_number_key_before_backend_encoding() {
     let table_info = number_table_info("invalid_transaction_number_key_plan");
     let result = plan_table_write(
         &[TransactWriteTableOperation::Delete {
+            table_identity: table_identity(&table_info),
             table_info,
             key: HashMap::from([
                 (
@@ -280,6 +300,7 @@ fn plan_table_delete_condition_on_missing_item_does_not_see_synthetic_key() {
         parse_condition_expression("attribute_exists(pk)", None, None).expect("condition");
     let result = plan_table_write(
         &[TransactWriteTableOperation::Delete {
+            table_identity: table_identity(&table_info),
             table_info,
             key: key_attrs("pk", "sk-missing").into(),
             item_stream_ttl_hours: None,

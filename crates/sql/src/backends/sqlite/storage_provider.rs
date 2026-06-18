@@ -9,6 +9,7 @@ use storage_common::{
 };
 use storage_condition::parse_condition_expression;
 use storage_provider::{
+    CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
     StorageProvider, StreamTrimDueMarker, StreamTrimState, StreamTrimStateWrite,
     plan_table_stream_duration, return_values_need_updated_fields,
 };
@@ -105,6 +106,20 @@ use crate::{
     utils::call_sqlite,
 };
 
+impl SQLiteStorageProvider {
+    pub(crate) async fn trim_change_index_markers_older_than(
+        &self,
+        cutoff_created_at_ms: i64,
+    ) -> StorageResult<usize> {
+        call_sqlite(&self.connection, move |conn| {
+            let (sql, params) =
+                sql_statements::trim_change_index_markers_older_than(cutoff_created_at_ms);
+            conn.execute(sql, params).map_err(map_sqlite_error)
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl StorageProvider for SQLiteStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
@@ -119,6 +134,10 @@ impl StorageProvider for SQLiteStorageProvider {
         true
     }
 
+    fn supports_change_index(&self) -> bool {
+        true
+    }
+
     async fn write_stream_trim_state(&self, state: StreamTrimState) -> StorageResult<()> {
         self.write_stream_trim_state_sqlite(state).await
     }
@@ -130,6 +149,41 @@ impl StorageProvider for SQLiteStorageProvider {
     ) -> StorageResult<Vec<StreamTrimDueMarker>> {
         self.list_due_stream_trim_markers_sqlite(due_before, limit)
             .await
+    }
+
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> StorageResult<Vec<ChangeIndexMarker>> {
+        let after_versionstamp = request.after_versionstamp.unwrap_or_default();
+        let limit = i64::try_from(request.limit)
+            .map_err(|_| StorageError::validation("change index list limit exceeds i64"))?;
+        call_sqlite(&self.connection, move |conn| {
+            let (sql, params) =
+                sql_statements::list_change_index_markers(request.slot, &after_versionstamp, limit);
+            let mut stmt = conn.prepare(sql).map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params, |row| {
+                    let slot: i64 = row.get(0)?;
+                    let versionstamp: String = row.get(1)?;
+                    let table_id: String = row.get(2)?;
+                    Ok((slot, versionstamp, table_id))
+                })
+                .map_err(map_sqlite_error)?;
+            let mut markers = Vec::new();
+            for row in rows {
+                let (slot, versionstamp, table_id) = row.map_err(map_sqlite_error)?;
+                markers.push(ChangeIndexMarker {
+                    slot: u16::try_from(slot).map_err(|_| {
+                        StorageError::internal("change index slot is outside u16 range")
+                    })?,
+                    versionstamp,
+                    table_id: TableName::new(&table_id),
+                });
+            }
+            Ok(markers)
+        })
+        .await
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
@@ -1313,6 +1367,11 @@ impl StorageProvider for SQLiteStorageProvider {
                 }
             }
             TTL_SWEEP_JOB => loop {
+                let cutoff_created_at_ms = TimestampMillis::now()
+                    .timestamp_millis()
+                    .saturating_sub(CHANGE_INDEX_MARKER_RETENTION_MS);
+                self.trim_change_index_markers_older_than(cutoff_created_at_ms)
+                    .await?;
                 let progressed = self.run_ttl_sweep().await?;
                 if !progressed {
                     break;

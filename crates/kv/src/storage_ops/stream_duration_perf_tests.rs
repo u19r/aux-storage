@@ -12,19 +12,17 @@ use storage_provider::{
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateGlobalSecondaryIndex, CreateTableRequest, IndexName,
     ItemKey, KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType,
-    StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration, TableName,
-    TimestampMillis, UpdateTableRequest,
+    StorageResult, StreamItemId, StreamName, StreamRetentionDuration, TableName, TimestampMillis,
+    UpdateTableRequest,
 };
 use stream_provider::{StoredStreamPointer, StreamDataType, StreamItem, StreamProvider};
 
 use crate::{
     constants,
+    keyspace::{stream_keys, table_identity::TableIdentity},
     kv_support_tests::{TestProvider, create_test_provider},
     sorted_kv_store::SortedKvStore,
-    storage_ops::stream_duration::{
-        self, item_stream_policy_version, stream_pointer_index_key, stream_pointer_table_key,
-        table_stream_policy_version,
-    },
+    storage_ops::stream_duration::{self, item_stream_policy_version, table_stream_policy_version},
     stream::item_codec,
 };
 
@@ -698,9 +696,11 @@ async fn insert_stream_item(
     stream_name: &StreamName,
     stream_item: &StreamItem,
 ) -> StorageResult<()> {
-    let key: StreamKey = stream_name + &stream_item.id;
+    let table_identity = stream_table_identity(provider, stream_name).await?;
+    let key = stream_keys::stream_row_key(stream_name, table_identity.as_ref(), stream_item.id)?
+        .ok_or_else(|| storage_types::StorageError::internal("profile stream key is legacy"))?;
     let bytes = item_codec::encode_stream_item(stream_item).expect("stream item bytes");
-    provider.kv_store.put(key.as_ref(), &bytes, None).await
+    provider.kv_store.put(&key, &bytes, None).await
 }
 
 async fn insert_stream_pointer_indexes(
@@ -709,18 +709,44 @@ async fn insert_stream_pointer_indexes(
     item_stream: &StreamName,
     stream_item_id: StreamItemId,
 ) -> StorageResult<()> {
+    let table_identity = provider
+        .get_table_identity_from_name(table)
+        .await?
+        .map(|metadata| metadata.identity.clone())
+        .ok_or_else(|| storage_types::StorageError::table_not_found(table))?;
     provider
         .kv_store
         .put(
-            &stream_pointer_index_key(table, item_stream, stream_item_id),
+            &stream_keys::stream_pointer_item_key_for_stream(
+                &table_identity,
+                item_stream,
+                stream_item_id,
+            )?,
             b"",
             None,
         )
         .await?;
     provider
         .kv_store
-        .put(&stream_pointer_table_key(table, stream_item_id), b"", None)
+        .put(
+            &stream_keys::stream_pointer_table_key_for_stream(&table_identity, stream_item_id),
+            b"",
+            None,
+        )
         .await
+}
+
+async fn stream_table_identity(
+    provider: &TestProvider,
+    stream_name: &StreamName,
+) -> StorageResult<Option<TableIdentity>> {
+    let Some(table_name) = stream_keys::table_name_for_stream(stream_name) else {
+        return Ok(None);
+    };
+    provider
+        .get_table_identity_from_name(&table_name)
+        .await
+        .map(|metadata| metadata.map(|metadata| metadata.identity.clone()))
 }
 
 async fn write_due_table_state(

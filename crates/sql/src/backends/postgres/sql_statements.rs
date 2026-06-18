@@ -136,10 +136,19 @@ pub fn create_stream_tables() -> &'static str {
         created_at BIGINT NOT NULL,
         PRIMARY KEY (cursor_name, stream_name)
     );
+    CREATE TABLE IF NOT EXISTS sys_change_index (
+        slot INTEGER NOT NULL,
+        versionstamp TEXT NOT NULL,
+        table_id TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        PRIMARY KEY (slot, versionstamp, table_id)
+    );
     CREATE INDEX IF NOT EXISTS idx_stream_items_internal_time
         ON sys_stream_items(stream_name, created_at);
     CREATE INDEX IF NOT EXISTS idx_stream_cursors_internal
-        ON sys_stream_cursors(stream_name);"
+        ON sys_stream_cursors(stream_name);
+    CREATE INDEX IF NOT EXISTS idx_change_index_created_at
+        ON sys_change_index(created_at);"
 }
 
 #[must_use]
@@ -215,6 +224,21 @@ pub fn get_stream() -> &'static str {
 #[must_use]
 pub fn insert_stream_entry() -> &'static str {
     stream::insert_stream_entry(&PostgresDialect)
+}
+
+#[must_use]
+pub fn insert_change_index_marker() -> &'static str {
+    stream::insert_change_index_marker(&PostgresDialect)
+}
+
+#[must_use]
+pub fn list_change_index_markers() -> &'static str {
+    stream::list_change_index_markers(&PostgresDialect)
+}
+
+#[must_use]
+pub fn trim_change_index_markers_older_than() -> &'static str {
+    stream::trim_change_index_markers_older_than(&PostgresDialect)
 }
 
 #[must_use]

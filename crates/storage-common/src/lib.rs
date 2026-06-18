@@ -41,7 +41,7 @@ pub use gsi_write::{
     GsiKeyPart, GsiKeyParts, GsiWriteAction, key_parts, key_parts_to_map, plan_gsi_write_actions,
     require_key_parts,
 };
-pub use jobs::{GsiJobConfig, RegistersJobs, register_gsi_jobs};
+pub use jobs::{DatabaseJobIntervals, GsiJobConfig, RegistersJobs, register_gsi_jobs};
 pub use newtypes::{BackfillCursor, IdempotencyToken, JobIntervalMillis, PageToken};
 pub use pagination::{DEFAULT_GENERIC_LIMIT, MAX_GENERIC_LIMIT, normalize_limit};
 pub use projection::{apply_gsi_projection, apply_projection};

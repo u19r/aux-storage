@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use queue_provider::{MessageId, QueueError, QueueInternalKind};
-use storage_types::{SerializesToKey, TableName, TimestampMillis};
+use storage_types::TimestampMillis;
 
-use crate::newtypes::{MessageVisibilityKey, TablePageKey};
+use crate::newtypes::MessageVisibilityKey;
 
 #[test]
 fn message_visibility_key_extracts_sort_timestamp_and_message_id() {
@@ -47,20 +47,6 @@ fn min_message_visibility_key_sorts_from_epoch_for_default_message_id() {
         min.get_message_id().expect("message id should parse"),
         MessageId::default()
     );
-}
-
-#[test]
-fn table_page_key_serializes_to_table_metadata_keyspace() {
-    let table_name = TableName::new("Orders");
-    let from_table_name = TablePageKey::from(table_name)
-        .serialize_to_bytes()
-        .expect("page key should serialize");
-    let from_string = TablePageKey::from("Invoices")
-        .serialize_to_bytes()
-        .expect("page key should serialize");
-
-    assert_eq!(from_table_name, b"tables/Orders");
-    assert_eq!(from_string, b"tables/Invoices");
 }
 
 fn assert_invalid_visibility_key(error: QueueError) {

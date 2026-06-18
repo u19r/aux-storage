@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use alloc_counter::AllocationGuard;
 
-use super::validate_expression_set;
-use crate::{AttributeValue, extract_expression_attribute_placeholders};
+use crate::{
+    AttributeValue, extract_expression_attribute_placeholders,
+    request_expression_validation::validate_expression_set,
+};
 
 const EXPRESSION_VALIDATION_ITERATIONS: usize = 1024;
 

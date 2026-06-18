@@ -1,13 +1,16 @@
 use std::{sync::atomic::AtomicU64, time::Instant};
 
-use crate::storage_ops::imports::{
-    AttributeValue, BackfillConfig, BackfillCoordinator, BackfillDriver, BackfillError,
-    BackfillResult, BackfillStatus, BackgroundJob, BatchItem, CursorName, CursorPosition,
-    GsiBackfillDescriptor, HashMap, HashSet, ItemKey, PointerRecordsResult, SerializesToKey,
-    SortedKvDbStorageProvider, StorageError, StorageResult, StoredTableInfo, StreamDataType,
-    StreamItem, StreamItemId, StreamName, StreamPointer, StreamProvider, TableName,
-    TimeToLiveStatus, TtlConfigRecord, async_trait, constants, info, now_ms_u64, project_gsi_item,
-    should_log_job, ttl,
+use crate::{
+    keyspace::{table_identity::StoredTableMetadata, table_keys},
+    storage_ops::imports::{
+        AttributeValue, BackfillConfig, BackfillCoordinator, BackfillDriver, BackfillError,
+        BackfillResult, BackfillStatus, BackgroundJob, BatchItem, CursorName, CursorPosition,
+        GsiBackfillDescriptor, HashMap, HashSet, ItemKey, PointerRecordsResult,
+        SortedKvDbStorageProvider, StorageError, StorageResult, StoredTableInfo, StreamDataType,
+        StreamItem, StreamItemId, StreamName, StreamPointer, StreamProvider, TableName,
+        TimeToLiveStatus, TtlConfigRecord, async_trait, constants, info, now_ms_u64,
+        project_gsi_item, should_log_job, ttl,
+    },
 };
 
 static GSI_UPDATE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -32,13 +35,16 @@ impl PointerBatch {
             return None;
         }
         let last_record = result.records.last().map(|(ptr, _)| ptr.stream_item_id);
-        let last_item = result.last_evaluated_key.or(last_record);
+        let last_item = result
+            .last_evaluated_key
+            .or(result.last_scanned_key)
+            .or(last_record);
         let stream_items = result.records.iter().map(|(_, items)| items.len()).sum();
         Some(Self {
             records: result.records,
             last_item,
             stream_items,
-            had_more_pages: result.last_evaluated_key.is_some(),
+            had_more_pages: result.has_more,
         })
     }
 }
@@ -217,25 +223,26 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     async fn gsi_operations_for_records(
         &self,
         records: Vec<(StreamPointer, Vec<StreamItem>)>,
-        table_infos: &mut HashMap<TableName, StoredTableInfo>,
+        table_infos: &mut HashMap<TableName, StoredTableMetadata>,
         ttl_configs: &mut HashMap<TableName, Option<TtlConfigRecord>>,
     ) -> StorageResult<Vec<StreamBatchWrite>> {
         let mut operations = Vec::new();
         for (stream_pointer, stream_items) in records {
             let table_name = &stream_pointer.table_name;
 
-            let table_info = if let Some(info) = table_infos.get(table_name) {
+            let table_metadata = if let Some(info) = table_infos.get(table_name) {
                 info
             } else {
-                let Ok(Some(info)) = self.get_table_metadata_from_name(table_name).await else {
+                let Ok(Some(info)) = self.get_table_identity_from_name(table_name).await else {
                     continue;
                 };
-                table_infos.insert(table_name.clone(), info);
+                table_infos.insert(table_name.clone(), (*info).clone());
                 let Some(info) = table_infos.get(table_name) else {
                     continue;
                 };
                 info
             };
+            let table_info = &table_metadata.table_info;
 
             let Some(ref gsis) = table_info.global_secondary_indexes else {
                 continue;
@@ -262,6 +269,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     .map(|cfg| cfg.attribute_name.as_str());
                 let op = Self::stream_updates_to_batch_write_item(
                     &stream_items,
+                    &table_metadata.identity,
                     table_info,
                     gsi,
                     ttl_attr,
@@ -343,7 +351,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         self.refresh_gsi_update_lag(&stream_name, cursor_position)
             .await?;
 
-        let mut table_infos: HashMap<TableName, StoredTableInfo> = HashMap::new();
+        let mut table_infos: HashMap<TableName, StoredTableMetadata> = HashMap::new();
         let mut ttl_configs: HashMap<TableName, Option<TtlConfigRecord>> = HashMap::new();
 
         'outer: loop {
@@ -429,6 +437,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
     fn stream_updates_to_batch_write_item(
         stream_item: &[StreamItem],
+        table_identity: &crate::keyspace::table_identity::TableIdentity,
         table_info: &StoredTableInfo,
         gsi: &storage_types::GlobalSecondaryIndex,
         ttl_attribute: Option<&str>,
@@ -438,10 +447,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let gsi_name = &gsi.index_name;
         let gsi_schema = &gsi.key_schema;
         let gsi_projection = &gsi.projection;
-        let tombstone_key = |index_key: Option<&Vec<u8>>| {
-            index_key.and_then(|key| {
-                crate::keys::gsi_tombstone_key_from_index_key(&table_name, gsi_name, key)
-            })
+        let tombstone_key = |index_key: Option<&ItemKey>| {
+            index_key
+                .and_then(|key| table_keys::gsi_tombstone_key(table_identity, gsi_name, key).ok())
         };
 
         let Some(si) = stream_item.first() else {
@@ -485,25 +493,26 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             item1 = prepared;
         }
 
-        let first_gsi_key = match ItemKey::from_key_schema_for_index(
+        let first_gsi_item_key = match ItemKey::from_key_schema_for_index(
             table_name.clone(),
             table_schema,
             gsi_name,
             gsi_schema,
             &item1,
-        )
-        .map(|ik| ik.map(|ik| ik.serialize_to_bytes().ok()))
-        {
-            Ok(Some(gsi_key)) => gsi_key,
+        ) {
+            Ok(Some(gsi_key)) => Some(gsi_key),
             _ => None,
         };
+        let first_gsi_key = first_gsi_item_key
+            .as_ref()
+            .and_then(|key| table_keys::item_key(table_identity, key).ok());
 
         if si.data_type == StreamDataType::DeleteMarker {
             return Ok(StreamBatchWrite {
                 put_item_value: None,
                 put_item_key: None,
                 delete_item_key: first_gsi_key.clone(),
-                put_tombstone_key: tombstone_key(first_gsi_key.as_ref()),
+                put_tombstone_key: tombstone_key(first_gsi_item_key.as_ref()),
             });
         }
 
@@ -549,18 +558,19 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             item2 = prepared;
         }
 
-        let second_gsi_key = match ItemKey::from_key_schema_for_index(
+        let second_gsi_item_key = match ItemKey::from_key_schema_for_index(
             table_name.clone(),
             table_schema,
             gsi_name,
             gsi_schema,
             &item2,
-        )
-        .map(|ik| ik.map(|ik| ik.serialize_to_bytes().ok()))
-        {
-            Ok(Some(gsi_key)) => gsi_key,
+        ) {
+            Ok(Some(gsi_key)) => Some(gsi_key),
             _ => None,
         };
+        let second_gsi_key = second_gsi_item_key
+            .as_ref()
+            .and_then(|key| table_keys::item_key(table_identity, key).ok());
 
         if let Some(gsi2) = second_gsi_key.as_ref()
             && let Some(gsi1) = first_gsi_key.as_ref()
@@ -584,7 +594,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             put_item_value: Some(put_item_value),
             put_item_key: first_gsi_key,
             delete_item_key: second_gsi_key.clone(),
-            put_tombstone_key: tombstone_key(second_gsi_key.as_ref()),
+            put_tombstone_key: tombstone_key(second_gsi_item_key.as_ref()),
         })
     }
 
@@ -593,10 +603,19 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_name: &TableName,
         index_name: &storage_types::IndexName,
     ) -> StorageResult<()> {
+        let Some(metadata) = self.get_table_identity_from_name(table_name).await? else {
+            return Ok(());
+        };
+        let Some(range) = table_keys::gsi_tombstone_prefix(&metadata.identity, index_name) else {
+            return Ok(());
+        };
         self.kv_store
-            .delete_prefix(crate::keys::gsi_tombstone_prefix_from_name(
-                table_name, index_name,
-            ))
+            .transact_write_unchecked(vec![
+                crate::sorted_kv_store::DirectWriteOperation::DeleteRange {
+                    start: range.start,
+                    exclusive_end: range.end,
+                },
+            ])
             .await
     }
 }
@@ -608,14 +627,6 @@ pub struct GsiUpdateJob<S: crate::partition_family::PartitionFamilyKvStore> {
 }
 
 impl<S: crate::partition_family::PartitionFamilyKvStore> GsiUpdateJob<S> {
-    #[cfg(test)]
-    pub fn new(provider: std::sync::Arc<SortedKvDbStorageProvider<S>>) -> Self {
-        Self::new_with_interval(
-            provider,
-            storage_common::GsiJobConfig::default().update_interval_ms,
-        )
-    }
-
     pub fn new_with_interval(
         provider: std::sync::Arc<SortedKvDbStorageProvider<S>>,
         interval_ms: storage_common::JobIntervalMillis,

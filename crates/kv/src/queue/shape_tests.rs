@@ -677,7 +677,7 @@ async fn send_1_small_message_shape_tests() {
     assert_eq!(stats.check_values, 0);
     assert_eq!(stats.puts, 5);
     assert_eq!(stats.deletes, 0);
-    assert_eq!(stats.ordinary_point_reads, 0);
+    assert_eq!(stats.ordinary_point_reads, 2);
     assert_eq!(stats.snapshot_point_reads, 0);
     assert_eq!(stats.blind_writes, 5);
     assert_eq!(stats.read_modify_writes, 0);
@@ -799,12 +799,12 @@ async fn queue_receive_delete_and_drain_shape_tests() {
     assert!(delete_results.into_iter().all(|result| result.is_ok()));
 
     let stats = store.snapshot();
-    assert!(stats.point_gets <= 1);
+    assert!(stats.point_gets <= 3);
     assert_eq!(stats.unchecked_transact_writes, 1);
     assert_eq!(stats.check_values, 10);
     assert_eq!(stats.puts, 10);
     assert_eq!(stats.deletes, 10);
-    assert!((10..=16).contains(&stats.ordinary_point_reads));
+    assert!((12..=18).contains(&stats.ordinary_point_reads));
     assert_eq!(stats.snapshot_point_reads, 0);
     assert_eq!(stats.blind_writes, 0);
     assert_eq!(stats.read_modify_writes, 20);

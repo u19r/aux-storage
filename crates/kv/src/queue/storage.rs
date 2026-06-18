@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     helpers::increment_bytes,
+    keyspace::compact::QueueStorageId,
     newtypes::MessageVisibilityKey,
     partition_family::{
         PartitionFamilyKvStore, queue_payload_key_with_slot, queue_ready_hint_bytes,
@@ -18,7 +19,7 @@ type QueueReadyEntry = (Box<[u8]>, Box<[u8]>);
 
 #[derive(Clone, Debug)]
 pub struct QueueClaimRange {
-    pub(crate) queue_url: String,
+    pub(crate) queue_id: QueueStorageId,
     pub(crate) placement_slot: u16,
     pub(crate) partition_id: u16,
     pub(crate) ready_start: Vec<u8>,
@@ -397,12 +398,12 @@ where
     state.delivery_attempt = state.delivery_attempt.saturating_add(1);
     state.visibility_timestamp = now + visibility_timeout;
     state.claim_nonce = Some(Uuid::now_v7().to_string());
-    let new_visibility_key = MessageVisibilityKey(crate::keys::visibility_key(
+    let new_visibility_key = MessageVisibilityKey(crate::queue_provider::visibility_key(
         state.visibility_timestamp,
         &candidate.message_id,
     ));
     let new_ready_key = queue_ready_key_with_slot(
-        &range.queue_url,
+        range.queue_id,
         range.placement_slot,
         range.partition_id,
         &new_visibility_key,
@@ -484,13 +485,13 @@ fn queue_claim_candidates(
         candidates.push(QueueClaimCandidate {
             ready_key: ready_key.into_vec(),
             state_key: queue_state_key_with_slot(
-                &range.queue_url,
+                range.queue_id,
                 range.placement_slot,
                 range.partition_id,
                 &message_id_hex,
             ),
             payload_key: queue_payload_key_with_slot(
-                &range.queue_url,
+                range.queue_id,
                 range.placement_slot,
                 range.partition_id,
                 &message_id_hex,

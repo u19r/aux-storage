@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs, path::Path, sync::Arc};
 use ::storage_provider::SqliteSettings;
 use bg_jobs::JobManager;
 use rusqlite::OpenFlags;
-use storage_common::GsiPropagationGovernor;
+use storage_common::{DatabaseJobIntervals, GsiPropagationGovernor};
 use storage_types::{StorageError, StorageResult, StoredTableInfo, TableName};
 use tokio_rusqlite::Connection;
 use tracing::instrument;
@@ -17,6 +17,7 @@ pub struct SQLiteStorageProvider {
     pub(crate) table_info_cache: Arc<tokio::sync::RwLock<HashMap<TableName, Arc<StoredTableInfo>>>>,
     pub(crate) immediate_gsi_consistency: bool,
     pub(crate) database_jobs_enabled: bool,
+    pub(crate) database_job_intervals: DatabaseJobIntervals,
     pub(crate) gsi_propagation_governor: Arc<GsiPropagationGovernor>,
 }
 
@@ -93,6 +94,7 @@ impl SQLiteStorageProvider {
             table_info_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             immediate_gsi_consistency: settings.immediate_gsi_consistency,
             database_jobs_enabled: true,
+            database_job_intervals: DatabaseJobIntervals::default(),
             gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
         })
     }
@@ -106,6 +108,12 @@ impl SQLiteStorageProvider {
     #[must_use]
     pub fn with_database_jobs_enabled(mut self, enabled: bool) -> Self {
         self.database_jobs_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_database_job_intervals(mut self, intervals: DatabaseJobIntervals) -> Self {
+        self.database_job_intervals = intervals;
         self
     }
 }

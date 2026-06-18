@@ -16,6 +16,7 @@ use crate::{
     backends::fdb::fdb_support_tests::{connect_fdb_store, metrics_handle, parse_metric_value},
     constants::{PARTITION_CONTROLLER_LOW_STREAK_TARGET, PARTITION_LOAD_SAMPLE_WINDOW_SECONDS},
     key_template::{KeyTemplate, PlaceholderBinding},
+    keyspace::compact::QueueStorageId,
     partition_family::{
         PartitionFamilyKind, PartitionLoadSample, PartitionLoadSampleRecord,
         ResolvedPartitionFamily, ordered_log_hash, partition_load_sample_bytes,
@@ -139,14 +140,14 @@ async fn write_hot_queue_sample(
 
 async fn queue_compact_record_count_for_partition(
     provider: &SortedKvDbStorageProvider<crate::FoundationDbKvStore>,
-    queue_url: &str,
     placement_slot: u16,
     partition_id: u16,
 ) -> usize {
+    let queue_id = QueueStorageId::new(1).expect("first queue id");
     provider
         .kv_store
         .get_prefix(
-            &queue_state_key_with_slot(queue_url, placement_slot, partition_id, ""),
+            &queue_state_key_with_slot(queue_id, placement_slot, partition_id, ""),
             true,
             None,
             true,
@@ -677,7 +678,7 @@ async fn foundationdb_partitioned_queue_send_retries_after_topology_change_tests
         assert_eq!(sent_id, message_id);
 
         let stale_key = queue_state_key_with_slot(
-            &queue_url,
+            QueueStorageId::new(1).expect("first queue id"),
             stale_slot,
             stale_partition_id,
             &message_id.to_string(),
@@ -849,7 +850,6 @@ async fn foundationdb_queue_scale_churn_stress_preserves_messages_tests() {
         {
             let compact_record_count = queue_compact_record_count_for_partition(
                 &provider,
-                &queue_url,
                 partition.placement_slot,
                 partition.partition_id,
             )
@@ -904,7 +904,6 @@ async fn foundationdb_queue_scale_churn_stress_preserves_messages_tests() {
 
         let draining_compact_record_count_after = queue_compact_record_count_for_partition(
             &provider,
-            &queue_url,
             draining_slot,
             draining_partition_id,
         )

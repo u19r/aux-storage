@@ -1844,7 +1844,3 @@ fn validation_message(message: String, prefixed: bool) -> String {
         message
     }
 }
-
-#[cfg(test)]
-#[path = "request_expression_validation_perf_tests.rs"]
-mod request_expression_validation_perf_tests;

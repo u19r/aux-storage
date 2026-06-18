@@ -392,6 +392,46 @@ pub fn insert_stream_entry(
     )
 }
 
+#[must_use]
+pub fn insert_change_index_marker(
+    slot: u16,
+    versionstamp: &str,
+    table_id: &str,
+    created_at: &TimestampMillis,
+) -> (&'static str, impl rusqlite::Params) {
+    (
+        stream::insert_change_index_marker(&SqliteDialect),
+        (
+            i64::from(slot),
+            versionstamp,
+            table_id,
+            created_at.timestamp_millis(),
+        ),
+    )
+}
+
+#[must_use]
+pub fn list_change_index_markers(
+    slot: u16,
+    after_versionstamp: &str,
+    limit: i64,
+) -> (&'static str, impl rusqlite::Params) {
+    (
+        stream::list_change_index_markers(&SqliteDialect),
+        (i64::from(slot), after_versionstamp, limit),
+    )
+}
+
+#[must_use]
+pub fn trim_change_index_markers_older_than(
+    cutoff_created_at_ms: i64,
+) -> (&'static str, impl rusqlite::Params) {
+    (
+        stream::trim_change_index_markers_older_than(&SqliteDialect),
+        (cutoff_created_at_ms,),
+    )
+}
+
 // Queue Management SQL Statements
 
 #[must_use]
@@ -593,6 +633,11 @@ pub fn create_stream_cursors_table() -> (&'static str, impl rusqlite::Params) {
 }
 
 #[must_use]
+pub fn create_change_index_table() -> (&'static str, impl rusqlite::Params) {
+    (stream::create_change_index_table(&SqliteDialect), [])
+}
+
+#[must_use]
 pub fn create_stream_format_metadata_table() -> (&'static str, impl rusqlite::Params) {
     (
         stream::create_stream_format_metadata_table(&SqliteDialect),
@@ -644,6 +689,14 @@ pub fn create_stream_items_internal_time_index() -> (&'static str, impl rusqlite
 pub fn create_stream_cursors_internal_index() -> (&'static str, impl rusqlite::Params) {
     (
         stream::create_stream_cursors_internal_index(&SqliteDialect),
+        [],
+    )
+}
+
+#[must_use]
+pub fn create_change_index_created_at_index() -> (&'static str, impl rusqlite::Params) {
+    (
+        stream::create_change_index_created_at_index(&SqliteDialect),
         [],
     )
 }

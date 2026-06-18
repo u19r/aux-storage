@@ -14,7 +14,10 @@ use storage_types::{
     UpdateItemRequest, UpdateItemResponse, WireItem,
 };
 
-use crate::{AttributeValue, StreamTrimDueMarker, StreamTrimState};
+use crate::{
+    AttributeValue, ChangeIndexMarker, ListChangeIndexMarkersRequest, StreamTrimDueMarker,
+    StreamTrimState,
+};
 
 /// Trait for storage backends that can store `DynamoDB` table metadata
 #[async_trait]
@@ -28,6 +31,10 @@ pub trait StorageProvider: Send + Sync {
     }
 
     fn supports_custom_stream_duration(&self) -> bool {
+        false
+    }
+
+    fn supports_change_index(&self) -> bool {
         false
     }
 
@@ -60,6 +67,16 @@ pub trait StorageProvider: Send + Sync {
         _limit: usize,
     ) -> StorageResult<Vec<StreamTrimDueMarker>> {
         Err(StorageError::unsupported_custom_stream_duration())
+    }
+
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> StorageResult<Vec<ChangeIndexMarker>> {
+        let _ = request;
+        Err(StorageError::unsupported(
+            "change index is not supported by this backend",
+        ))
     }
 
     /// List all tables

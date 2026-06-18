@@ -564,6 +564,12 @@
     "PostgresBackendConfig": {
       "additionalProperties": false,
       "properties": {
+        "background_max_pool_size": {
+          "default": 4,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "dsn": {
           "type": "string"
         },
@@ -572,7 +578,7 @@
           "type": "boolean"
         },
         "max_pool_size": {
-          "default": 10,
+          "default": 24,
           "format": "uint",
           "minimum": 0,
           "type": "integer"

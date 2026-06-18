@@ -12,7 +12,7 @@ mod billing_metrics;
 pub mod constants;
 pub mod helpers;
 pub mod key_template;
-pub mod keys;
+pub mod keyspace;
 pub mod newtypes;
 mod partition_family;
 pub mod partition_reconcile;
@@ -45,7 +45,7 @@ mod helpers_tests;
 #[cfg(test)]
 mod key_template_tests;
 #[cfg(test)]
-mod keys_tests;
+mod kv_key_shape_tests;
 #[cfg(test)]
 mod kv_perf_tests;
 #[cfg(test)]
@@ -53,7 +53,7 @@ mod newtypes_tests;
 #[cfg(test)]
 mod partition_reconcile_tests;
 #[cfg(test)]
-mod sorted_kv_hot_cache_tests;
+mod queue_provider_visibility_tests;
 #[cfg(test)]
 mod sorted_kv_store_tests;
 #[cfg(test)]

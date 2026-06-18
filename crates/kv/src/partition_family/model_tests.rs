@@ -2,13 +2,19 @@ use storage_types::{StreamItemId, StreamName, TableName};
 use stream_provider::StreamPartitioningMode;
 use uuid::Uuid;
 
-use crate::partition_family::{
-    OrderedLogSplitBoundary, PartitionInfo, PartitionState, QueueReceiptHandleData,
-    apply_ordered_log_split_boundaries, ordered_log_partition_for_key,
-    ordered_log_partition_prefix, ordered_log_split_marker_family_prefix,
-    parse_ordered_log_split_boundary_from_key, parse_partitioned_stream_item_id,
-    parse_queue_partition_marker, parse_stream_partition_marker, queue_partition_marker_bytes,
-    stream_partition_marker_bytes, supports_pointer_stream_partitioning,
+use crate::{
+    keyspace::compact::{ParsedCompactKey, PartitionControlKind, parse_compact_key},
+    partition_family::{
+        OrderedLogSplitBoundary, PartitionInfo, PartitionState, QueueReceiptHandleData,
+        apply_ordered_log_split_boundaries, ordered_log_bucket, ordered_log_partition_for_key,
+        ordered_log_partition_prefix, ordered_log_split_marker_family_prefix,
+        ordered_log_stream_storage_id, parse_ordered_log_split_boundary_from_key,
+        parse_partitioned_stream_item_id, parse_queue_partition_marker,
+        parse_stream_partition_marker, partition_family_config_key, partition_family_resource_id,
+        partition_info_key, partition_load_sample_key, queue_partition_marker_bytes,
+        queue_partition_marker_key, stream_partition_marker_bytes, stream_partition_marker_key,
+        supports_pointer_stream_partitioning,
+    },
 };
 
 #[test]
@@ -26,16 +32,22 @@ fn ordered_log_partition_for_key_is_stable_and_bounded_tests() {
 fn ordered_log_partition_prefix_places_slot_near_front_tests() {
     let stream_name = StreamName::from("orders/stream-table");
     let prefix = ordered_log_partition_prefix(&stream_name, 11);
-    let prefix_str = String::from_utf8(prefix).expect("partition prefix should be utf8");
 
-    assert!(prefix_str.starts_with("plog/000b/"));
-    assert!(prefix_str.ends_with("/000b/"));
+    assert_eq!(
+        parse_compact_key(&prefix).expect("compact ordered log prefix"),
+        ParsedCompactKey::OrderedLogData {
+            bucket: ordered_log_bucket(11),
+            stream_id: ordered_log_stream_storage_id(&stream_name),
+            partition_id: 11,
+            suffix: b""
+        }
+    );
 }
 
 #[test]
 fn partitioned_stream_item_id_reads_versionstamp_suffix_tests() {
     let item_id = StreamItemId::from(Uuid::now_v7());
-    let mut key = b"plog/0001/orders/0001/".to_vec();
+    let mut key = ordered_log_partition_prefix(&StreamName::from("orders/stream-table"), 1);
     key.extend_from_slice(item_id.as_bytes());
 
     assert_eq!(parse_partitioned_stream_item_id(&key), Some(item_id));
@@ -98,16 +110,110 @@ fn pointer_stream_partitioning_only_targets_system_and_table_streams_tests() {
 #[test]
 fn ordered_log_split_boundary_key_round_trip_tests() {
     let family_component = "6f7264657273";
-    let parent_partition_id = 7;
+    let parent_partition_id = 7_u16;
     let boundary = StreamItemId::from(Uuid::now_v7());
     let mut key = ordered_log_split_marker_family_prefix(family_component);
-    key.extend_from_slice(format!("{parent_partition_id:04x}/").as_bytes());
+    key.extend_from_slice(&parent_partition_id.to_be_bytes());
     key.extend_from_slice(boundary.as_bytes());
 
     assert_eq!(
         parse_ordered_log_split_boundary_from_key(family_component, &key),
         Some((parent_partition_id, boundary))
     );
+    assert!(
+        !key.windows(b"sys/partition-control".len())
+            .any(|window| window == b"sys/partition-control")
+    );
+}
+
+#[test]
+fn partition_control_keys_use_compact_resource_ids_tests() {
+    let stream_name = StreamName::from("orders/stream-table");
+    let stream_component = "6f7264657273";
+    let queue_url = "https://queue.example.test/000000000000/orders";
+    let queue_component = crate::partition_family::queue_family_component(queue_url);
+    let stream_resource = partition_family_resource_id(
+        crate::partition_family::PartitionFamilyKind::OrderedLog,
+        stream_component,
+    );
+    let queue_resource = partition_family_resource_id(
+        crate::partition_family::PartitionFamilyKind::StandardQueue,
+        &queue_component,
+    );
+
+    let examples = [
+        (
+            partition_family_config_key(
+                crate::partition_family::PartitionFamilyKind::OrderedLog,
+                stream_component,
+            ),
+            PartitionControlKind::Config,
+            stream_resource,
+            Vec::new(),
+        ),
+        (
+            partition_info_key(
+                crate::partition_family::PartitionFamilyKind::OrderedLog,
+                stream_component,
+                7,
+            ),
+            PartitionControlKind::PartitionInfo,
+            stream_resource,
+            7_u16.to_be_bytes().to_vec(),
+        ),
+        (
+            partition_load_sample_key(
+                crate::partition_family::PartitionFamilyKind::StandardQueue,
+                &queue_component,
+                3,
+                1_700_000_000_000,
+                "publisher-a",
+            ),
+            PartitionControlKind::LoadSample,
+            queue_resource,
+            {
+                let mut suffix = Vec::new();
+                suffix.extend_from_slice(&3_u16.to_be_bytes());
+                suffix.extend_from_slice(&1_700_000_000_000_i64.to_be_bytes());
+                // The publisher hash is intentionally opaque; assert only the stable prefix
+                // here.
+                suffix
+            },
+        ),
+        (
+            stream_partition_marker_key(&stream_name),
+            PartitionControlKind::StreamMarker,
+            partition_family_resource_id(
+                crate::partition_family::PartitionFamilyKind::OrderedLog,
+                &crate::partition_family::ordered_log_family_component(&stream_name),
+            ),
+            Vec::new(),
+        ),
+        (
+            queue_partition_marker_key(queue_url),
+            PartitionControlKind::QueueMarker,
+            queue_resource,
+            Vec::new(),
+        ),
+    ];
+
+    for (key, expected_kind, expected_resource, expected_suffix_prefix) in examples {
+        let ParsedCompactKey::PartitionControl {
+            kind,
+            resource_id,
+            suffix,
+        } = parse_compact_key(&key).expect("compact partition control key")
+        else {
+            panic!("expected partition control key");
+        };
+        assert_eq!(kind, expected_kind);
+        assert_eq!(resource_id, expected_resource);
+        assert!(suffix.starts_with(&expected_suffix_prefix));
+        assert!(
+            !key.windows(b"sys/partition-control".len())
+                .any(|window| window == b"sys/partition-control")
+        );
+    }
 }
 
 #[test]

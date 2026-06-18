@@ -1,0 +1,27 @@
+[test-groups.kv-gsi]
+max-threads = 1
+
+[test-groups.exclusive-profile]
+max-threads = 1
+
+[profile.default]
+
+[[profile.default.overrides]]
+filter = 'package(kv) & test(storage_ops::provider_tests)'
+test-group = 'kv-gsi'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'package(sql) & test(gsi_write_alloc_tests)'
+test-group = 'exclusive-profile'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'package(sql) & test(stream_trim)'
+test-group = 'exclusive-profile'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'package(sql) & test(stream_duration)'
+test-group = 'exclusive-profile'
+threads-required = "num-cpus"

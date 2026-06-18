@@ -32,16 +32,6 @@ pub(crate) const PARTITIONED_QUEUE_EMPTY_RECEIVE_POLL_MS: u64 = 200;
 /// no longer have an active visibility record by claim time.
 pub(crate) const PARTITIONED_QUEUE_RECEIVE_SCAN_OVERFETCH_MULTIPLIER: u32 = 8;
 
-/// Field name in the transient visibility record that stores the active marker.
-pub(crate) const VISIBILITY_RECORD_STATE_FIELD: &str = "state";
-
-/// Field name in the transient visibility record that stores the receipt
-/// handle.
-pub(crate) const VISIBILITY_RECORD_RECEIPT_HANDLE_FIELD: &str = "receipt_handle";
-
-/// Active marker value for messages that can still be claimed.
-pub(crate) const VISIBILITY_RECORD_ACTIVE_STATE: &str = "active";
-
 /// Conservative payload chunk size for queue bodies stored on key-value
 /// backends with a 100KB value limit.
 pub(crate) const QUEUE_PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;

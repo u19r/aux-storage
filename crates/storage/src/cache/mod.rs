@@ -19,9 +19,9 @@ pub(crate) mod write_planner_bulk;
 
 #[cfg(test)]
 mod coordinator_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 mod point_read_gsi_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 mod point_read_tests;
 #[cfg(all(test, feature = "cache-write-planner"))]
 mod query_proof_tests;

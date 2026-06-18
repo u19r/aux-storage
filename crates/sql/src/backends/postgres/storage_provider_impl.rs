@@ -13,7 +13,10 @@ use storage_condition::{
     Condition, condition_has_repeated_root_field, parse_condition_expression,
     try_evaluate_condition_with_cached_roots, try_evaluate_condition_with_root,
 };
-use storage_provider::{StorageProvider, split_item_into_key_and_attributes_sync};
+use storage_provider::{
+    CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
+    StorageProvider, split_item_into_key_and_attributes_sync,
+};
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
     BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof,
@@ -86,6 +89,28 @@ async fn apply_gsi_write_pressure(provider: &PostgresStorageProvider) -> Storage
     .await
 }
 
+impl PostgresStorageProvider {
+    pub(crate) async fn trim_change_index_markers_older_than(
+        &self,
+        cutoff_created_at_ms: i64,
+    ) -> StorageResult<usize> {
+        let client = self
+            .acquire_client("trim_change_index_markers_older_than")
+            .await?;
+        let deleted_markers = client
+            .execute(
+                sql_statements::trim_change_index_markers_older_than(),
+                &[&cutoff_created_at_ms],
+            )
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!("postgres trim change index markers failed: {err}"))
+            })?;
+        usize::try_from(deleted_markers)
+            .map_err(|_| StorageError::internal("postgres deleted marker count exceeds usize"))
+    }
+}
+
 #[async_trait]
 impl StorageProvider for PostgresStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
@@ -93,6 +118,10 @@ impl StorageProvider for PostgresStorageProvider {
     }
 
     fn supports_custom_stream_duration(&self) -> bool {
+        true
+    }
+
+    fn supports_change_index(&self) -> bool {
         true
     }
 
@@ -120,6 +149,41 @@ impl StorageProvider for PostgresStorageProvider {
             self, due_before, limit,
         )
         .await
+    }
+
+    async fn list_change_index_markers(
+        &self,
+        request: ListChangeIndexMarkersRequest,
+    ) -> StorageResult<Vec<ChangeIndexMarker>> {
+        let client = self.acquire_client("list_change_index_markers").await?;
+        let slot = i32::from(request.slot);
+        let after_versionstamp = request.after_versionstamp.unwrap_or_default();
+        let limit = i64::try_from(request.limit)
+            .map_err(|_| StorageError::validation("change index list limit exceeds i64"))?;
+        let rows = client
+            .query(
+                sql_statements::list_change_index_markers(),
+                &[&slot, &after_versionstamp, &limit],
+            )
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!("postgres list change index markers failed: {err}"))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                let slot: i32 = row.get(0);
+                let slot = u16::try_from(slot).map_err(|_| {
+                    StorageError::internal("change index slot is outside u16 range")
+                })?;
+                let versionstamp: String = row.get(1);
+                let table_id: String = row.get(2);
+                Ok(ChangeIndexMarker {
+                    slot,
+                    versionstamp,
+                    table_id: TableName::new(&table_id),
+                })
+            })
+            .collect()
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
@@ -1401,6 +1465,11 @@ impl StorageProvider for PostgresStorageProvider {
             }
             TTL_SWEEP_JOB => {
                 loop {
+                    let cutoff_created_at_ms = TimestampMillis::now()
+                        .timestamp_millis()
+                        .saturating_sub(CHANGE_INDEX_MARKER_RETENTION_MS);
+                    self.trim_change_index_markers_older_than(cutoff_created_at_ms)
+                        .await?;
                     let progressed = self.run_ttl_sweep_once().await?;
                     if !progressed {
                         break;
@@ -1473,12 +1542,14 @@ impl PostgresStorageProvider {
                     StorageError::internal(&format!("postgres gsi stream read failed: {err}"))
                 })?;
 
-            let had_more = records_result.last_evaluated_key.is_some();
+            let had_more = records_result.has_more;
             let last_item = records_result.last_evaluated_key.or_else(|| {
-                records_result
-                    .records
-                    .last()
-                    .map(|(pointer, _)| pointer.stream_item_id)
+                records_result.last_scanned_key.or_else(|| {
+                    records_result
+                        .records
+                        .last()
+                        .map(|(pointer, _)| pointer.stream_item_id)
+                })
             });
             let records = records_result.records;
 

@@ -245,6 +245,7 @@ pub enum Response {
     ReplicationHealth(storage_types::ReplicationHealthResponse),
     SyncHealth(storage_sync::SyncHealthResponse),
     DescribeTimeToLive(storage_types::DescribeTimeToLiveResponse),
+    ListChangeIndexMarkers(storage_provider::ListChangeIndexMarkersResponse),
     Raw(serde_json::Value),
 }
 

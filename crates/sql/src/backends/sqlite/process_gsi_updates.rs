@@ -46,13 +46,16 @@ impl PointerBatch {
             return None;
         }
         let last_record = result.records.last().map(|(ptr, _)| ptr.stream_item_id);
-        let last_item = result.last_evaluated_key.or(last_record);
+        let last_item = result
+            .last_evaluated_key
+            .or(result.last_scanned_key)
+            .or(last_record);
         let stream_items = result.records.iter().map(|(_, items)| items.len()).sum();
         Some(Self {
             records: result.records,
             last_item,
             stream_items,
-            had_more_pages: result.last_evaluated_key.is_some(),
+            had_more_pages: result.has_more,
         })
     }
 }

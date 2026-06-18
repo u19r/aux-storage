@@ -4,10 +4,11 @@ use storage_provider::StorageProvider;
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateGlobalSecondaryIndex, CreateTableRequest, IndexName,
     ItemKey, KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType,
-    QueryTableRequest, ScanTableRequest, SerializesToKey as _, TableName, TableStatus,
+    QueryTableRequest, ScanTableRequest, TableName, TableStatus,
 };
 
 use crate::{
+    keyspace::table_keys,
     kv_support_tests::{TestProvider, create_test_provider as make_test_provider},
     sorted_kv_store::SortedKvStore,
 };
@@ -861,6 +862,13 @@ async fn scan_table_with_index() {
         .await
         .unwrap()
         .unwrap();
+    let table_identity = provider
+        .get_table_identity_from_name(&table_name)
+        .await
+        .unwrap()
+        .unwrap()
+        .identity
+        .clone();
 
     for i in 1..=3 {
         let mut item = HashMap::new();
@@ -886,7 +894,9 @@ async fn scan_table_with_index() {
         provider
             .kv_store
             .put(
-                gsi_key.serialize_to_bytes().unwrap().as_slice(),
+                table_keys::item_key(&table_identity, &gsi_key)
+                    .unwrap()
+                    .as_slice(),
                 &gsi_value,
                 None,
             )

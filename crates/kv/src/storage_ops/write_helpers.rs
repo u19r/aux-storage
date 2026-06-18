@@ -5,13 +5,17 @@ use storage_types::{
 };
 
 use crate::{
+    keyspace::{table_identity::TableIdentity, table_keys},
     storage_ops::imports::{
         AttributeValue, BatchItem, HashMap, IndexName, ItemKey, KeyAttributes, KeySchemaElement,
-        Projection, ProjectionType, SerializesToKey, SortedKvDbStorageProvider, StorageError,
-        StorageResult, StoredTableInfo, TableName, TtlConfigRecord,
+        Projection, ProjectionType, SortedKvDbStorageProvider, StorageError, StorageResult,
+        StoredTableInfo, TableName, TtlConfigRecord,
     },
     ttl::{TtlIndexMutation, plan_ttl_index_mutations},
 };
+
+pub(crate) const CHANGE_INDEX_PREFIX: &str = "__change_index";
+pub(crate) const CHANGE_INDEX_SLOT_COUNT: u16 = 256;
 
 fn normalized_attribute_map_for_write(
     item: &HashMap<String, AttributeValue>,
@@ -28,27 +32,34 @@ fn normalized_attribute_map_for_write(
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
     pub(super) fn ttl_index_mutations_for_items(
         table_name: &TableName,
+        table_identity: &TableIdentity,
         table_info: &StoredTableInfo,
         ttl_config: Option<&TtlConfigRecord>,
         old_item: Option<&HashMap<String, AttributeValue>>,
         new_item: Option<&HashMap<String, AttributeValue>>,
     ) -> StorageResult<Vec<BatchItem>> {
-        Ok(
-            plan_ttl_index_mutations(table_name, table_info, ttl_config, old_item, new_item)?
-                .into_iter()
-                .map(|mutation| match mutation {
-                    TtlIndexMutation::Delete(key) => BatchItem { key, value: None },
-                    TtlIndexMutation::Put(key) => BatchItem {
-                        key,
-                        value: Some(Vec::new()),
-                    },
-                })
-                .collect(),
-        )
+        Ok(plan_ttl_index_mutations(
+            table_name,
+            table_identity,
+            table_info,
+            ttl_config,
+            old_item,
+            new_item,
+        )?
+        .into_iter()
+        .map(|mutation| match mutation {
+            TtlIndexMutation::Delete(key) => BatchItem { key, value: None },
+            TtlIndexMutation::Put(key) => BatchItem {
+                key,
+                value: Some(Vec::new()),
+            },
+        })
+        .collect())
     }
 
     pub(super) fn prepare_batch_put_item(
         table_name: &TableName,
+        table_identity: &TableIdentity,
         table_info: &StoredTableInfo,
         item: &HashMap<String, AttributeValue>,
         should_write_to_stream: bool,
@@ -64,8 +75,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let item = item.as_ref();
 
         let item_key =
-            ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, item)?
-                .serialize_to_bytes()?;
+            ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, item)?;
+        let item_key = table_keys::item_key(table_identity, &item_key)?;
 
         let value = storage_types::storage_serde::to_bytes(&item)?;
         let mut batch_items = vec![BatchItem {
@@ -76,11 +87,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         if should_write_to_stream {
             let stream_items =
                 Self::prepare_stream_entries_for_batch(table_name, table_info, item, false);
+            batch_items.extend(Self::change_index_entries_for_stream_items(
+                table_name,
+                &stream_items,
+            ));
             batch_items.extend(stream_items);
         }
 
         if immediate_gsi_consistency {
             batch_items.extend(Self::gsi_batch_mutations_for_items(
+                table_identity,
                 table_info,
                 existing_item,
                 Some(item),
@@ -92,6 +108,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
     pub(super) fn prepare_batch_delete_item(
         table_name: &TableName,
+        table_identity: &TableIdentity,
         table_info: &StoredTableInfo,
         key: &KeyAttributes,
         should_write_to_stream: bool,
@@ -105,8 +122,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         let item_key =
-            ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, key)?
-                .serialize_to_bytes()?;
+            ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, key)?;
+        let item_key = table_keys::item_key(table_identity, &item_key)?;
 
         let mut batch_items = vec![BatchItem {
             key: item_key.clone(),
@@ -116,11 +133,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         if should_write_to_stream && let Some(item) = existing_item {
             let stream_items =
                 Self::prepare_stream_entries_for_batch(table_name, table_info, item, true);
+            batch_items.extend(Self::change_index_entries_for_stream_items(
+                table_name,
+                &stream_items,
+            ));
             batch_items.extend(stream_items);
         }
 
         if immediate_gsi_consistency {
             batch_items.extend(Self::gsi_batch_mutations_for_items(
+                table_identity,
                 table_info,
                 existing_item,
                 None,
@@ -162,6 +184,27 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         stream_entries
+    }
+
+    fn change_index_entries_for_stream_items(
+        table_name: &TableName,
+        stream_items: &[BatchItem],
+    ) -> Vec<BatchItem> {
+        if stream_items.is_empty() {
+            return Vec::new();
+        }
+
+        let slot = change_index_slot(table_name);
+        stream_items
+            .iter()
+            .filter_map(|item| {
+                item.value.as_ref()?;
+                Some(BatchItem {
+                    key: change_index_key(slot, item.key.as_slice(), table_name),
+                    value: Some(Vec::new()),
+                })
+            })
+            .collect()
     }
 
     pub(super) fn create_stream_record(
@@ -228,6 +271,37 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     // Removed custom projection filtering in favor of key-aware projection helper
+}
+
+pub(crate) fn change_index_slot(table_name: &TableName) -> u16 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in table_name.as_ref().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % u64::from(CHANGE_INDEX_SLOT_COUNT)) as u16
+}
+
+pub(crate) fn change_index_key(slot: u16, stream_key: &[u8], table_name: &TableName) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        CHANGE_INDEX_PREFIX.len()
+            + "/slot/000/".len()
+            + stream_key.len()
+            + 1
+            + table_name.as_ref().len(),
+    );
+    key.extend_from_slice(CHANGE_INDEX_PREFIX.as_bytes());
+    key.extend_from_slice(b"/slot/");
+    key.extend_from_slice(slot.to_string().as_bytes());
+    key.extend_from_slice(b"/");
+    key.extend_from_slice(stream_key);
+    key.extend_from_slice(b"/");
+    key.extend_from_slice(table_name.as_ref().as_bytes());
+    key
+}
+
+pub(crate) fn change_index_slot_prefix(slot: u16) -> Vec<u8> {
+    format!("{CHANGE_INDEX_PREFIX}/slot/{slot}/").into_bytes()
 }
 
 pub(crate) fn project_gsi_item(

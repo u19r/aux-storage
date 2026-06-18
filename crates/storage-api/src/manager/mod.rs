@@ -2,6 +2,7 @@ mod storage_api_manager;
 mod storage_manager_impl_append_table_stream_record;
 mod storage_manager_impl_batch_get_item;
 mod storage_manager_impl_batch_write_item;
+mod storage_manager_impl_change_index;
 mod storage_manager_impl_clear_all_tables;
 mod storage_manager_impl_condition_failure;
 mod storage_manager_impl_consumed_capacity;

@@ -8,9 +8,8 @@ use crate::{
     SortedKvDbStorageProvider,
     backends::common::plan_table_write,
     helpers::increment_bytes,
-    newtypes::TablePageKey,
     partition_family::PartitionFamilyKvStore,
-    sorted_kv_store::{DirectWriteOperation, SortedKvStore, TransactWriteTableOperation},
+    sorted_kv_store::{DirectWriteOperation, RawKey, SortedKvStore, TransactWriteTableOperation},
 };
 
 pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 'static>(
@@ -34,9 +33,10 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
 
         match mutation {
             storage_sync::ResolvedSyncMutation::Put(mutation) => {
-                let table_info = provider
-                    .get_table_metadata_cached(&mut table_cache, &mutation.table_name)
+                let table_metadata = provider
+                    .get_table_identity_cached(&mut table_cache, &mutation.table_name)
                     .await?;
+                let table_info = table_metadata.table_info.clone();
                 let ttl_config = provider
                     .load_ttl_config_cached(&mut ttl_cache, &mutation.table_name)
                     .await?;
@@ -46,6 +46,7 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                 let current = old_item_bytes(mutation.old_item_json.as_deref())?;
                 let plan = plan_table_write(
                     &[TransactWriteTableOperation::Put {
+                        table_identity: table_metadata.identity.clone(),
                         table_info,
                         item,
                         item_stream_ttl_hours: None,
@@ -81,9 +82,10 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                 responses.push(mutation.response);
             }
             storage_sync::ResolvedSyncMutation::Delete(mutation) => {
-                let table_info = provider
-                    .get_table_metadata_cached(&mut table_cache, &mutation.table_name)
+                let table_metadata = provider
+                    .get_table_identity_cached(&mut table_cache, &mutation.table_name)
                     .await?;
+                let table_info = table_metadata.table_info.clone();
                 let ttl_config = provider
                     .load_ttl_config_cached(&mut ttl_cache, &mutation.table_name)
                     .await?;
@@ -93,6 +95,7 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                 let current = old_item_bytes(mutation.old_item_json.as_deref())?;
                 let plan = plan_table_write(
                     &[TransactWriteTableOperation::Delete {
+                        table_identity: table_metadata.identity.clone(),
                         table_info,
                         key: key_attributes.clone(),
                         item_stream_ttl_hours: None,
@@ -219,7 +222,7 @@ pub(super) async fn resolved_sync_log_entries_after<S: SortedKvStore>(
     let end = increment_bytes(prefix);
     let range = provider
         .kv_store
-        .get_range(&start, &end, Some(limit), None::<TablePageKey>, true)
+        .get_range(&start, &end, Some(limit), None::<RawKey>, true)
         .await?;
     range
         .items
@@ -268,17 +271,17 @@ fn sync_marker_value(metadata: &storage_sync::SyncCommitMetadata) -> StorageResu
 }
 
 fn sync_apply_marker_key(mutation_id: &str) -> Vec<u8> {
-    format!("sys/sync/apply/mutation/{mutation_id}").into_bytes()
+    crate::keyspace::compact::sync_apply_marker_key(mutation_id)
 }
 
 fn sync_last_applied_key() -> Vec<u8> {
-    b"sys/sync/apply/last".to_vec()
+    crate::keyspace::compact::sync_last_applied_key()
 }
 
 fn sync_log_entry_prefix() -> Vec<u8> {
-    b"sys/sync/log/".to_vec()
+    crate::keyspace::compact::sync_log_entry_prefix()
 }
 
 fn sync_log_entry_key(log_id: storage_sync::SyncLogId) -> Vec<u8> {
-    format!("sys/sync/log/{:020}/{:020}", log_id.term, log_id.index).into_bytes()
+    crate::keyspace::compact::sync_log_entry_key(log_id.term, log_id.index)
 }

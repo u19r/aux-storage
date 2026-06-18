@@ -12,11 +12,12 @@ use storage_sync::{
     SYNC_LEADER_HINT_HEADER, SYNC_NOT_LEADER_ERROR_TYPE, SyncProposalResponse,
     SyncWriteProposalRequest,
 };
+use storage_types::{DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, StorageEnum, StorageError};
 
 use crate::{
     manager::{StorageApiManagerOptions, SyncWriteProposer},
     routes::{
-        dynamodb::dynamodb_endpoint,
+        dynamodb::{dynamodb_endpoint, is_conditional_check_failed_api_error},
         routes_test_support::{create_test_db, default_conformance_backends},
     },
     types::AppState,
@@ -41,6 +42,20 @@ impl SyncWriteProposer for NotLeaderProposer {
                 .with_response_header(SYNC_LEADER_HINT_HEADER, self.leader_hint.clone()),
         )
     }
+}
+
+#[test]
+fn conditional_check_failed_api_errors_are_expected_operation_errors() {
+    let storage_error: StorageError = StorageEnum::ConditionalCheckFailed.into();
+    let conditional_error: HttpApiError = storage_error.into();
+    let validation_error = HttpApiError::validation_error("bad request");
+
+    assert_eq!(
+        conditional_error.message,
+        DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE
+    );
+    assert!(is_conditional_check_failed_api_error(&conditional_error));
+    assert!(!is_conditional_check_failed_api_error(&validation_error));
 }
 
 #[tokio::test]

@@ -1,9 +1,8 @@
 use crate::storage_ops::imports::{
-    Arc, AtomicU32, BatchWriteItemRequest, DeleteRequest, HashMap, Instrument, Ordering,
+    Arc, AtomicU32, BatchWriteItemRequest, DeleteRequest, HashMap, Instrument, Ordering, RawKey,
     RetryPolicy, SortedKvDbStorageProvider, StorageError, StorageProvider, StorageResult,
-    StoredTableInfo, StreamExt, TableName, TablePageKey, TimeToLiveStatus, TimestampMillis,
-    TtlConfigRecord, TtlSweepLock, Utc, WriteRequest, constants, execute_with_retry,
-    increment_bytes, ttl,
+    StoredTableInfo, StreamExt, TableName, TimeToLiveStatus, TimestampMillis, TtlConfigRecord,
+    TtlSweepLock, Utc, WriteRequest, constants, execute_with_retry, increment_bytes, ttl,
 };
 
 struct TtlSweepStats {
@@ -359,10 +358,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let mut retry_batches = 0_u32;
         let mut retry_attempts = 0_u32;
         let mut retry_failures = 0_u32;
-        let prefix = ttl::ttl_index_prefix(table_name);
-        let start_prefix = ttl::ttl_index_range_start(table_name);
-        let end_prefix = ttl::ttl_index_range_end(table_name, now_seconds);
-        let range_end = increment_bytes(end_prefix);
+        let table_metadata = self
+            .get_table_identity_from_name(table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(table_name))?;
+        let ttl_range = ttl::compact_ttl_index_range(&table_metadata.identity, now_seconds)?;
         let should_write_to_stream = crate::backends::common::should_write_stream_entries(
             table_info,
             self.requires_immediate_gsi_updates(table_info),
@@ -374,15 +374,15 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             jitter: true,
         };
 
-        let mut range_start = start_prefix.clone();
+        let mut range_start = ttl_range.start.clone();
         for batch_index in 0..shard_batch {
             let range = self
                 .kv_store
                 .get_range(
                     &range_start,
-                    &range_end,
+                    &ttl_range.end,
                     Some(usize_to_u32(constants::TTL_SWEEP_ITEMS_PER_SHARD)),
-                    None::<TablePageKey>,
+                    None::<RawKey>,
                     true,
                 )
                 .await?;
@@ -396,7 +396,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
             let mut delete_keys = Vec::new();
             for (key, _raw_value) in &range.items {
-                let Some((ttl_value, token)) = ttl::parse_ttl_index_key(key, &prefix) else {
+                let Some((ttl_value, token)) = ttl::parse_compact_ttl_index_key(key)? else {
                     continue;
                 };
                 if ttl_value > now_seconds {

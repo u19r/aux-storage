@@ -8,7 +8,7 @@ use storage_condition::{Condition, evaluate_condition};
 use storage_provider::{UpdateOperation, apply_update_operations};
 use storage_types::{
     AttributeValue, AttributeValueLookup, ItemKey, KeyAttributes, ReplicationEventMetadata,
-    SerializesToKey, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
+    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
     conditional_check_failed_reason, context::WrappedError as _,
     normalize_dynamodb_number_for_write, preflight_transact_put_item_key_with_table_info,
     preflight_transact_write_key_with_table_info, return_values_on_condition_check_failure_all_old,
@@ -20,11 +20,13 @@ use storage_types::{
 use crate::{
     helpers::deserialize_item_from_bytes,
     key_template::KeyTemplate,
+    keyspace::{compact::KeyFamily, table_identity::TableIdentity, table_keys},
     sorted_kv_store::{
         OldNewItems, RangeResult, RangeValuesResult, TransactWriteOperation,
         TransactWriteTableOperation,
     },
-    stream::helpers::create_item_update_stream_entries,
+    storage_ops::{change_index_key, change_index_slot},
+    stream::helpers::{StreamEntryContext, create_item_update_stream_entries},
     ttl::{TtlIndexMutation, plan_ttl_index_mutations},
 };
 
@@ -41,6 +43,18 @@ pub enum KvMutation {
     Delete {
         key: Vec<u8>,
     },
+}
+
+fn change_index_marker_mutation(
+    table_info: &StoredTableInfo,
+    stream_item_id: StreamItemId,
+) -> KvMutation {
+    let slot = change_index_slot(&table_info.table_name);
+    let versionstamp = stream_item_id.to_string();
+    KvMutation::Put {
+        key: change_index_key(slot, versionstamp.as_bytes(), &table_info.table_name),
+        value: Vec::new(),
+    }
 }
 
 pub struct TableWritePlan {
@@ -293,6 +307,7 @@ pub fn plan_table_operation(
 
     match operation {
         TableOp::Put {
+            table_identity,
             table_info,
             item,
             item_stream_ttl_hours,
@@ -301,6 +316,7 @@ pub fn plan_table_operation(
             replication,
             ttl_config,
         } => plan_table_put(
+            table_identity,
             table_info,
             item,
             condition.as_ref(),
@@ -316,6 +332,7 @@ pub fn plan_table_operation(
             index,
         ),
         TableOp::Delete {
+            table_identity,
             table_info,
             key,
             item_stream_ttl_hours,
@@ -325,6 +342,7 @@ pub fn plan_table_operation(
             replication,
             ttl_config,
         } => plan_table_delete(
+            table_identity,
             table_info,
             key,
             *item_stream_ttl_hours,
@@ -341,11 +359,13 @@ pub fn plan_table_operation(
             index,
         ),
         TableOp::Check {
+            table_identity,
             table_info,
             key,
             condition,
             return_values_on_condition_check_failure,
         } => plan_table_check(
+            table_identity,
             table_info,
             key,
             condition,
@@ -354,6 +374,7 @@ pub fn plan_table_operation(
             index,
         ),
         TableOp::Update {
+            table_identity,
             table_info,
             key,
             operations,
@@ -365,6 +386,7 @@ pub fn plan_table_operation(
             transaction_validation,
             ttl_config,
         } => plan_table_update(
+            table_identity,
             table_info,
             key,
             operations,
@@ -574,18 +596,23 @@ fn is_gsi_mutation(mutation: &KvMutation) -> bool {
     gsi_mutation_key(mutation).is_some()
 }
 
-fn gsi_mutation_key(mutation: &KvMutation) -> Option<&[u8]> {
+pub(crate) fn gsi_mutation_key(mutation: &KvMutation) -> Option<&[u8]> {
     let key = match mutation {
         KvMutation::Put { key, .. } | KvMutation::Delete { key } => key.as_slice(),
         KvMutation::PutTemplate { .. } => return None,
     };
-    key.windows(b"/index/".len())
-        .any(|window| window == b"/index/")
-        .then_some(key)
+    matches!(
+        key.first()
+            .copied()
+            .and_then(|code| KeyFamily::from_code(code).ok()),
+        Some(KeyFamily::GsiItem | KeyFamily::GsiTombstone)
+    )
+    .then_some(key)
 }
 
 #[expect(clippy::too_many_arguments)]
 fn plan_table_put(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     item: &HashMap<String, AttributeValue>,
     condition: Option<&Condition>,
@@ -602,7 +629,7 @@ fn plan_table_put(
         &table_info.key_schema,
         &item_clone,
     )?;
-    let item_key_bytes = item_key.serialize_to_bytes()?;
+    let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
     let mut current = deserialize_optional_item(current_bytes)?;
     if current_bytes.is_some() {
@@ -634,8 +661,11 @@ fn plan_table_put(
             None
         };
         let stream_entries = create_item_update_stream_entries(
-            &table_info.table_name,
-            &item_key,
+            StreamEntryContext {
+                table_identity,
+                table_name: &table_info.table_name,
+                item_key: &item_key,
+            },
             &item_clone,
             old_item,
             stream_item_id,
@@ -647,11 +677,13 @@ fn plan_table_put(
                 .into_iter()
                 .map(|(template, value)| KvMutation::PutTemplate { template, value }),
         );
+        mutations.push(change_index_marker_mutation(table_info, stream_item_id));
     }
 
     if stream_context.immediate_gsi_consistency {
         let old_item = current_bytes.is_some().then_some(&current);
         mutations.extend(plan_immediate_gsi_mutations(
+            table_identity,
             table_info,
             old_item,
             Some(&item_clone),
@@ -660,6 +692,7 @@ fn plan_table_put(
 
     mutations.extend(ttl_index_kv_mutations(plan_ttl_index_mutations(
         &table_info.table_name,
+        table_identity,
         table_info,
         ttl_config,
         current_bytes.is_some().then_some(&current),
@@ -667,6 +700,7 @@ fn plan_table_put(
     )?));
 
     mutations.extend(item_stream_duration_kv_mutations(
+        table_identity,
         table_info,
         &item_clone,
         item_stream_ttl_hours,
@@ -677,6 +711,7 @@ fn plan_table_put(
 
 #[expect(clippy::too_many_arguments)]
 fn plan_table_delete(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
     item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
@@ -694,7 +729,7 @@ fn plan_table_delete(
         &table_info.key_schema,
         key,
     )?;
-    let item_key_bytes = item_key.serialize_to_bytes()?;
+    let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
     let mut current = deserialize_optional_item(current_bytes)?;
     if current_bytes.is_some() {
@@ -729,8 +764,11 @@ fn plan_table_delete(
             None
         };
         let stream_entries = create_item_update_stream_entries(
-            &table_info.table_name,
-            &item_key,
+            StreamEntryContext {
+                table_identity,
+                table_name: &table_info.table_name,
+                item_key: &item_key,
+            },
             &key_item,
             old_item,
             stream_item_id,
@@ -742,15 +780,22 @@ fn plan_table_delete(
                 .into_iter()
                 .map(|(template, value)| KvMutation::PutTemplate { template, value }),
         );
+        mutations.push(change_index_marker_mutation(table_info, stream_item_id));
     }
 
     if stream_context.immediate_gsi_consistency {
         let old_item = current_bytes.is_some().then_some(&current);
-        mutations.extend(plan_immediate_gsi_mutations(table_info, old_item, None)?);
+        mutations.extend(plan_immediate_gsi_mutations(
+            table_identity,
+            table_info,
+            old_item,
+            None,
+        )?);
     }
 
     mutations.extend(ttl_index_kv_mutations(plan_ttl_index_mutations(
         &table_info.table_name,
+        table_identity,
         table_info,
         ttl_config,
         current_bytes.is_some().then_some(&current),
@@ -759,6 +804,7 @@ fn plan_table_delete(
 
     mutations.extend(
         crate::storage_ops::stream_duration::item_stream_duration_kv_mutations(
+            table_identity,
             table_info,
             key,
             0,
@@ -770,6 +816,7 @@ fn plan_table_delete(
 }
 
 fn plan_table_check(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
     condition: &Condition,
@@ -782,7 +829,7 @@ fn plan_table_check(
         &table_info.key_schema,
         key,
     )?;
-    let item_key_bytes = item_key.serialize_to_bytes()?;
+    let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
     // Even for check we load current item to evaluate condition
     let mut current = deserialize_optional_item(current_bytes)?;
@@ -802,7 +849,9 @@ fn plan_table_check(
     Ok(((Some(current), None), Vec::new()))
 }
 
+#[expect(clippy::too_many_arguments)]
 fn plan_table_update(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
     operations: &[UpdateOperation],
@@ -816,7 +865,7 @@ fn plan_table_update(
         &table_info.key_schema,
         key,
     )?;
-    let item_key_bytes = item_key.serialize_to_bytes()?;
+    let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
     let mut current = deserialize_optional_item(current_bytes)?;
     if current_bytes.is_some() {
@@ -860,8 +909,11 @@ fn plan_table_update(
             None
         };
         let stream_entries = create_item_update_stream_entries(
-            &table_info.table_name,
-            &item_key,
+            StreamEntryContext {
+                table_identity,
+                table_name: &table_info.table_name,
+                item_key: &item_key,
+            },
             &new_item,
             old_item,
             stream_item_id,
@@ -873,6 +925,7 @@ fn plan_table_update(
                 .into_iter()
                 .map(|(template, value)| KvMutation::PutTemplate { template, value }),
         );
+        mutations.push(change_index_marker_mutation(table_info, stream_item_id));
     }
 
     if update_context.stream.immediate_gsi_consistency {
@@ -881,6 +934,7 @@ fn plan_table_update(
             .then_some(result_old_item.as_ref())
             .flatten();
         mutations.extend(plan_immediate_gsi_mutations(
+            table_identity,
             table_info,
             old_item,
             Some(&new_item),
@@ -889,6 +943,7 @@ fn plan_table_update(
 
     mutations.extend(ttl_index_kv_mutations(plan_ttl_index_mutations(
         &table_info.table_name,
+        table_identity,
         table_info,
         update_context.ttl_config,
         ttl_old_item.as_ref(),
@@ -896,6 +951,7 @@ fn plan_table_update(
     )?));
 
     mutations.extend(item_stream_duration_kv_mutations(
+        table_identity,
         table_info,
         &new_item,
         update_context.item_stream_ttl_hours,
@@ -905,6 +961,7 @@ fn plan_table_update(
 }
 
 fn item_stream_duration_kv_mutations(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     item: &HashMap<String, AttributeValue>,
     retention: Option<storage_types::StreamRetentionDuration>,
@@ -915,6 +972,7 @@ fn item_stream_duration_kv_mutations(
     let key_attributes = item_key_attributes(table_info, item)?;
     let policy_version = 0;
     crate::storage_ops::stream_duration::item_stream_duration_kv_mutations(
+        table_identity,
         table_info,
         &key_attributes,
         policy_version,
@@ -950,6 +1008,7 @@ fn ttl_index_kv_mutations(mutations: Vec<TtlIndexMutation>) -> Vec<KvMutation> {
 }
 
 fn plan_immediate_gsi_mutations(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, AttributeValue>>,
     new_item: Option<&HashMap<String, AttributeValue>>,
@@ -963,8 +1022,9 @@ fn plan_immediate_gsi_mutations(
                 gsi_key,
                 table_key,
             } => {
-                let key = gsi_item_key_bytes(table_info, index, &gsi_key, &table_key)?
-                    .ok_or_else(|| StorageError::internal("planned GSI delete missing key"))?;
+                let key =
+                    gsi_item_key_bytes(table_identity, table_info, index, &gsi_key, &table_key)?
+                        .ok_or_else(|| StorageError::internal("planned GSI delete missing key"))?;
                 mutations.push(KvMutation::Delete { key });
             }
             GsiWriteAction::Put {
@@ -973,8 +1033,9 @@ fn plan_immediate_gsi_mutations(
                 table_key,
                 projected_item,
             } => {
-                let key = gsi_item_key_bytes(table_info, index, &gsi_key, &table_key)?
-                    .ok_or_else(|| StorageError::internal("planned GSI put missing key"))?;
+                let key =
+                    gsi_item_key_bytes(table_identity, table_info, index, &gsi_key, &table_key)?
+                        .ok_or_else(|| StorageError::internal("planned GSI put missing key"))?;
                 let value = if is_all_projection(&index.projection) {
                     if serialized_all_projection_item.is_none() {
                         serialized_all_projection_item =
@@ -1003,21 +1064,26 @@ fn is_all_projection(projection: &storage_types::Projection) -> bool {
 }
 
 fn gsi_item_key_bytes(
+    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     gsi: &storage_types::GlobalSecondaryIndex,
     gsi_key: &[GsiKeyPart],
     table_key: &[GsiKeyPart],
 ) -> StorageResult<Option<Vec<u8>>> {
     let item = GsiActionKeyLookup { gsi_key, table_key };
-    Ok(ItemKey::from_key_schema_for_index(
+    ItemKey::from_key_schema_for_index(
         table_info.table_name.clone(),
         &table_info.key_schema,
         &gsi.index_name,
         &gsi.key_schema,
         &item,
     )?
-    .map(|key| key.serialize_to_bytes())
-    .transpose()?)
+    .map(|key| table_keys::item_key(table_identity, &key))
+    .transpose()
+}
+
+fn compact_item_key(table_identity: &TableIdentity, item_key: &ItemKey) -> StorageResult<Vec<u8>> {
+    table_keys::item_key(table_identity, item_key)
 }
 
 struct GsiActionKeyLookup<'a> {
@@ -1083,27 +1149,43 @@ pub fn table_operation_primary_key(
 
     let key_bytes = match operation {
         Op::Put {
-            table_info, item, ..
-        } => storage_types::ItemKey::from_key_schema(
-            table_info.table_name.clone(),
-            &table_info.key_schema,
+            table_identity,
+            table_info,
             item,
-        )?
-        .serialize_to_bytes()?,
+            ..
+        } => {
+            let item_key = storage_types::ItemKey::from_key_schema(
+                table_info.table_name.clone(),
+                &table_info.key_schema,
+                item,
+            )?;
+            compact_item_key(table_identity, &item_key)?
+        }
         Op::Delete {
-            table_info, key, ..
+            table_identity,
+            table_info,
+            key,
+            ..
         }
         | Op::Update {
-            table_info, key, ..
+            table_identity,
+            table_info,
+            key,
+            ..
         }
         | Op::Check {
-            table_info, key, ..
-        } => storage_types::ItemKey::from_key_schema(
-            table_info.table_name.clone(),
-            &table_info.key_schema,
+            table_identity,
+            table_info,
             key,
-        )?
-        .serialize_to_bytes()?,
+            ..
+        } => {
+            let item_key = storage_types::ItemKey::from_key_schema(
+                table_info.table_name.clone(),
+                &table_info.key_schema,
+                key,
+            )?;
+            compact_item_key(table_identity, &item_key)?
+        }
     };
 
     Ok(key_bytes)

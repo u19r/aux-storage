@@ -19,12 +19,28 @@ use stream_provider::{StreamDataType, StreamProvider};
 #[cfg(feature = "rocksdb-backend")]
 use crate::kv_support_tests::rocksdb_test_path;
 use crate::{
-    SortedKvDbStorageProvider, kv_support_tests::create_test_store,
+    SortedKvDbStorageProvider, keyspace::compact, kv_support_tests::create_test_store,
     sorted_kv_store::SortedKvStore as _, ttl,
 };
 
 const SYNC_APPLY_ALLOC_BATCHES: usize = 8;
 const SYNC_APPLY_ALLOC_BATCH_SIZE: usize = 8;
+
+async fn compact_ttl_key<S: crate::partition_family::PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table: &TableName,
+    table_info: &storage_types::StoredTableInfo,
+    item: &HashMap<String, AttributeValue>,
+) -> Vec<u8> {
+    let metadata = provider
+        .get_table_identity_from_name(table)
+        .await
+        .expect("table metadata result")
+        .expect("table metadata");
+    ttl::compact_ttl_index_key_for_item(&metadata.identity, table_info, "ttl", item)
+        .expect("ttl key result")
+        .expect("ttl key")
+}
 
 #[tokio::test]
 #[cfg(feature = "rocksdb-backend")]
@@ -151,9 +167,7 @@ async fn rocksdb_resolved_sync_apply_is_crash_idempotent_and_preserves_side_effe
     assert_eq!(gsi_items.len(), 1);
 
     let table_info = restarted.get_table_info(&table).await.expect("table info");
-    let ttl_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &item)
-        .expect("ttl key result")
-        .expect("ttl key");
+    let ttl_key = compact_ttl_key(&restarted, &table, &table_info, &item).await;
     assert!(
         restarted
             .kv_store
@@ -307,9 +321,7 @@ async fn shared_kv_resolved_sync_apply_preserves_side_effects() {
     assert_eq!(gsi_items.len(), 1);
 
     let table_info = provider.get_table_info(&table).await.expect("table info");
-    let ttl_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &put_item)
-        .expect("ttl key result")
-        .expect("ttl key");
+    let ttl_key = compact_ttl_key(&provider, &table, &table_info, &put_item).await;
     assert!(
         provider
             .kv_store
@@ -326,6 +338,36 @@ async fn shared_kv_resolved_sync_apply_preserves_side_effects() {
             .await
             .expect("get log entry"),
         Some(ResolvedSyncLogEntry::new(metadata.clone(), batch.clone()))
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(
+                &compact::sync_log_entry_key(metadata.log_id.term, metadata.log_id.index),
+                true
+            )
+            .await
+            .expect("compact sync log lookup")
+            .is_some()
+    );
+    assert_eq!(
+        provider
+            .kv_store
+            .get(
+                b"sys/sync/log/00000000000000000001/00000000000000000007",
+                true
+            )
+            .await
+            .expect("legacy sync log lookup"),
+        None
+    );
+    assert_eq!(
+        provider
+            .kv_store
+            .get(b"sys/sync/apply/mutation/m-put-shared", true)
+            .await
+            .expect("legacy sync apply lookup"),
+        None
     );
     assert_eq!(
         provider

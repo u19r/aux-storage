@@ -4,13 +4,12 @@ use storage_provider::StorageProvider;
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchWriteItemRequest, CreateTableRequest,
     DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DeleteRequest, ItemKey, KeyAttributeType,
-    KeySchemaElement, KeyType, SerializesToKey, StorageEnum, StreamRetentionDuration, TableName,
-    TimestampMillis, TransactDeleteRequest, TransactWriteItem, TransactWriteItemsRequest,
-    WriteRequest,
+    KeySchemaElement, KeyType, StorageEnum, StreamRetentionDuration, TableName, TimestampMillis,
+    TransactDeleteRequest, TransactWriteItem, TransactWriteItemsRequest, WriteRequest,
 };
 use tracing::info;
 
-use crate::sorted_kv_store::SortedKvStore;
+use crate::{keyspace::table_keys, sorted_kv_store::SortedKvStore};
 
 #[tokio::test]
 #[tracing_test::traced_test]
@@ -51,10 +50,13 @@ async fn kv_delete_condition_injects_key_attributes() {
         ("pk".to_string(), AttributeValue::S("P1".to_string())),
         ("sk".to_string(), AttributeValue::S("S1".to_string())),
     ]);
-    let item_key = ItemKey::from_key_schema(table.clone(), &create.key_schema, &key)
+    let item_key = ItemKey::from_key_schema(table.clone(), &create.key_schema, &key).unwrap();
+    let table_metadata = provider
+        .get_table_identity_from_name(&table)
+        .await
         .unwrap()
-        .serialize_to_bytes()
-        .unwrap();
+        .expect("table metadata");
+    let item_key = table_keys::item_key(&table_metadata.identity, &item_key).unwrap();
 
     let mut stored_item = HashMap::new();
     stored_item.insert("value".to_string(), AttributeValue::S("old".to_string()));
@@ -270,7 +272,7 @@ async fn kv_delete_condition_failure_returns_conditional_check_failed() {
 
 #[tokio::test]
 async fn kv_delete_item_with_stream_ttl_writes_item_duration_marker() {
-    let provider = test_provider("kv-delete-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-delete-custom-duration");
     let table = TableName::new("delete_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -298,7 +300,7 @@ async fn kv_delete_item_with_stream_ttl_writes_item_duration_marker() {
 
 #[tokio::test]
 async fn kv_failed_conditional_delete_does_not_write_item_duration_marker() {
-    let provider = test_provider("kv-delete-custom-duration-condition-failure");
+    let provider = provider_for_custom_duration_case("kv-delete-custom-duration-condition-failure");
     let table = TableName::new("delete_custom_duration_failure_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -329,7 +331,7 @@ async fn kv_failed_conditional_delete_does_not_write_item_duration_marker() {
 
 #[tokio::test]
 async fn kv_batch_write_delete_applies_item_stream_duration_marker() {
-    let provider = test_provider("kv-batch-delete-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-batch-delete-custom-duration");
     let table = TableName::new("batch_delete_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -368,7 +370,7 @@ async fn kv_batch_write_delete_applies_item_stream_duration_marker() {
 
 #[tokio::test]
 async fn kv_transact_delete_applies_item_stream_duration_marker() {
-    let provider = test_provider("kv-transact-delete-custom-duration");
+    let provider = provider_for_custom_duration_case("kv-transact-delete-custom-duration");
     let table = TableName::new("transact_delete_custom_duration_table");
     provider
         .create_table(&hash_table_request(table.clone()))
@@ -421,7 +423,9 @@ async fn item_duration_marker_count(
         .count()
 }
 
-fn test_provider(label: &str) -> crate::SortedKvDbStorageProvider<crate::RocksDbKvStore> {
+fn provider_for_custom_duration_case(
+    label: &str,
+) -> crate::SortedKvDbStorageProvider<crate::RocksDbKvStore> {
     let store = crate::RocksDbKvStore::new(crate::kv_support_tests::rocksdb_test_path(label))
         .expect("rocksdb store");
     crate::SortedKvDbStorageProvider::new(store)

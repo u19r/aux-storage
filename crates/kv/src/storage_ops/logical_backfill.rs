@@ -8,7 +8,7 @@ use storage_provider::{StorageProvider, split_item_into_key_and_attributes_sync}
 use storage_types::{
     AttributeValue, DurableAbsenceProof, DurableItemRevision, DurablePointReadProof,
     DurablePointReadRequest, ItemStreamVersion, ItemVersionedWireItem, KeyAttributes,
-    ScanTableRequest, SerializesToKey, StorageError, StorageResult, StoredTableInfo, TableName,
+    ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName,
 };
 
 use super::{
@@ -23,7 +23,12 @@ use crate::{
     SortedKvDbStorageProvider,
     backends::common::plan_table_write,
     helpers::increment_bytes,
-    keys::{item_revision_key, item_revision_prefix},
+    keyspace::{
+        compact::{self, TableStorageId},
+        table_identity::{StoredTableMetadata, TABLE_ID_ALLOCATOR_KEY, TableIdentity},
+        table_keys,
+    },
+    sorted_kv::{decode_table_storage_id, encode_table_storage_id},
     sorted_kv_store::{DirectWriteOperation, TransactWriteTableOperation},
 };
 
@@ -248,14 +253,14 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         request: LogicalExportRequest,
     ) -> StorageResult<LogicalExportPage> {
-        let prefix = item_revision_prefix();
+        let prefix = compact::item_revision_prefix();
         let range = self
             .kv_store
             .get_range(
                 &prefix,
                 &increment_bytes(prefix.clone()),
                 Some(request.limit),
-                None::<crate::newtypes::TablePageKey>,
+                None::<crate::sorted_kv_store::RawKey>,
                 true,
             )
             .await?;
@@ -286,7 +291,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         item_stream_version: ItemStreamVersion,
     ) -> StorageResult<()> {
         let table_name = TableName::new(&table_name);
-        let table_info = self.get_table_info(&table_name).await?;
+        let table_metadata = self
+            .get_table_identity_from_name(&table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table_name))?;
+        let table_info = table_metadata.table_info.clone();
         let item =
             serde_json::from_str::<std::collections::HashMap<String, AttributeValue>>(item_json)?;
         let split = split_item_into_key_and_attributes_sync(item.clone(), &table_info)?;
@@ -305,12 +314,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             table_name.clone(),
             &table_info.key_schema,
             &split.key_attributes,
-        )?
-        .serialize_to_bytes()?;
+        )?;
+        let item_key = table_keys::item_key(&table_metadata.identity, &item_key)?;
         let old_item = self.kv_store.get(&item_key, true).await?;
         let ttl_config = self.load_ttl_config(&table_name).await?;
         let plan = plan_table_write(
             &[TransactWriteTableOperation::Put {
+                table_identity: table_metadata.identity.clone(),
                 table_info,
                 item,
                 item_stream_ttl_hours: None,
@@ -338,7 +348,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
     async fn import_tombstone(&self, tombstone: LogicalBackfillTombstone) -> StorageResult<()> {
         let table_name = TableName::new(&tombstone.table_name);
-        let table_info = self.get_table_info(&table_name).await?;
+        let table_metadata = self
+            .get_table_identity_from_name(&table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&table_name))?;
+        let table_info = table_metadata.table_info.clone();
         let key = serde_json::from_str::<KeyAttributes>(&tombstone.key_json)?;
         let current_version = self.current_item_stream_version(&table_name, &key).await?;
         let decision = plan_logical_import_apply(LogicalImportApplyCase::new(
@@ -353,12 +367,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             table_name.clone(),
             &table_info.key_schema,
             &key,
-        )?
-        .serialize_to_bytes()?;
+        )?;
+        let item_key = table_keys::item_key(&table_metadata.identity, &item_key)?;
         let old_item = self.kv_store.get(&item_key, true).await?;
         let ttl_config = self.load_ttl_config(&table_name).await?;
         let plan = plan_table_write(
             &[TransactWriteTableOperation::Delete {
+                table_identity: table_metadata.identity.clone(),
                 table_info,
                 key: key.clone(),
                 item_stream_ttl_hours: None,
@@ -392,9 +407,46 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         if self.table_exists(&table_info.table_name).await? {
             return Ok(());
         }
-        let key = crate::keys::table_metadata_key(&table_info.table_name);
-        let value = storage_types::storage_serde::to_bytes(&table_info)?;
-        self.kv_store.put(&key, &value, None).await
+        let allocator_value = self.kv_store.get(TABLE_ID_ALLOCATOR_KEY, true).await?;
+        let table_id = match allocator_value.as_deref() {
+            Some(bytes) => decode_table_storage_id(bytes)?,
+            None => TableStorageId::new(1),
+        };
+        let next_table_id = TableStorageId::new(table_id.get().saturating_add(1));
+        let identity = TableIdentity::user_indexes_for_table(
+            table_id,
+            &table_info.table_name,
+            table_info.global_secondary_indexes.as_deref(),
+        );
+        let metadata = StoredTableMetadata::active(identity, table_info.clone());
+        let name_lookup_key =
+            compact::table_name_lookup_key(table_info.table_name.as_ref().as_bytes());
+        self.kv_store
+            .transact_write_unchecked(vec![
+                DirectWriteOperation::CheckValue {
+                    key: TABLE_ID_ALLOCATOR_KEY.to_vec(),
+                    expected_value: allocator_value,
+                },
+                DirectWriteOperation::CheckValue {
+                    key: name_lookup_key.clone(),
+                    expected_value: None,
+                },
+                DirectWriteOperation::Put {
+                    key: TABLE_ID_ALLOCATOR_KEY.to_vec(),
+                    value: encode_table_storage_id(next_table_id),
+                },
+                DirectWriteOperation::Put {
+                    key: name_lookup_key,
+                    value: encode_table_storage_id(table_id),
+                },
+                DirectWriteOperation::Put {
+                    key: compact::table_metadata_key(table_id),
+                    value: storage_types::storage_serde::to_bytes(&metadata)?,
+                },
+            ])
+            .await?;
+        self.cache_table_identity(std::sync::Arc::new(metadata));
+        Ok(())
     }
 
     async fn import_durable_revision(&self, payload_json: &str) -> StorageResult<()> {
@@ -423,7 +475,10 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         })?;
         let Some(bytes) = self
             .kv_store
-            .get(&item_revision_key(table_name, &key_json), true)
+            .get(
+                &compact::item_revision_key(table_name.as_ref(), &key_json),
+                true,
+            )
             .await?
         else {
             return Ok(None);
@@ -435,7 +490,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     async fn put_revision_payload(&self, payload: RevisionRecordPayload) -> StorageResult<()> {
         self.kv_store
             .put(
-                &item_revision_key(&TableName::new(&payload.table_name), &payload.key_json),
+                &compact::item_revision_key(&payload.table_name, &payload.key_json),
                 &storage_types::storage_serde::to_bytes(&payload)?,
                 None,
             )
@@ -469,7 +524,7 @@ pub(crate) fn revision_put_operation(
         revision: version.get(),
     };
     Ok(DirectWriteOperation::Put {
-        key: item_revision_key(table_name, &key_json),
+        key: compact::item_revision_key(table_name.as_ref(), &key_json),
         value: storage_types::storage_serde::to_bytes(&payload)?,
     })
 }

@@ -1,7 +1,7 @@
 use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig};
 use storage_common::{
-    GSI_BACKFILL_JOB, GsiJobConfig, JobIntervalMillis, RegistersJobs, STREAM_TRIM_JOB,
-    TTL_SWEEP_JOB, register_gsi_jobs,
+    GSI_BACKFILL_JOB, JobIntervalMillis, RegistersJobs, STREAM_TRIM_JOB, TTL_SWEEP_JOB,
+    register_gsi_jobs,
 };
 use storage_provider::{StorageProvider, StreamTrimStateWrite, plan_table_stream_duration};
 use storage_types::{
@@ -135,7 +135,8 @@ impl SQLiteStorageProvider {
         let registrar = SqliteRegistrar {
             mgr: &self.job_manager,
         };
-        let gsi_cfg = GsiJobConfig::default();
+        let job_intervals = self.database_job_intervals;
+        let gsi_cfg = job_intervals.gsi_config();
         let update_job = GsiUpdateJob::new_with_interval(
             std::sync::Arc::new(self.clone()),
             gsi_cfg.update_interval_ms,
@@ -156,16 +157,14 @@ impl SQLiteStorageProvider {
         }
 
         let ttl_job = crate::ttl_sweep::TtlSweepJob::new(std::sync::Arc::new(self.clone()));
-        let ttl_interval_ms =
-            JobIntervalMillis(crate::constants::TTL_SWEEP_INTERVAL_MINUTES * 60_000);
+        let ttl_interval_ms = job_intervals.ttl_sweep_interval_ms;
         registrar
             .register_timed_job(TTL_SWEEP_JOB, ttl_interval_ms, ttl_job)
             .await
             .map_err(|e| StorageError::internal(&format!("register ttl sweep job failed: {e}")))?;
 
         let trim_job = crate::stream_trim::StreamTrimJob::new(std::sync::Arc::new(self.clone()));
-        let trim_interval_ms =
-            JobIntervalMillis(crate::constants::STREAM_TRIM_INTERVAL_MINUTES * 60_000);
+        let trim_interval_ms = job_intervals.stream_trim_interval_ms;
         registrar
             .register_timed_job(STREAM_TRIM_JOB, trim_interval_ms, trim_job)
             .await

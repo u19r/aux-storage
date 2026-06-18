@@ -287,10 +287,8 @@ fn remove_nested_path_value(
             (UpdatePathSegment::Name(name), AttributeValue::M(map)) => {
                 map.remove(name);
             }
-            (UpdatePathSegment::Index(index), AttributeValue::L(list)) => {
-                if *index < list.len() {
-                    list.remove(*index);
-                }
+            (UpdatePathSegment::Index(index), AttributeValue::L(list)) if *index < list.len() => {
+                list.remove(*index);
             }
             _ => {}
         }

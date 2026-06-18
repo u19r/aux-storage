@@ -124,6 +124,8 @@ mod user_stream_name;
 pub use user_stream_name::*;
 #[cfg(feature = "rocksdb")]
 mod item_key_rocksdb;
+#[cfg(all(test, feature = "rocksdb"))]
+mod item_key_rocksdb_tests;
 #[cfg(any(feature = "sqlite", feature = "postgres", not(feature = "rocksdb")))]
 mod item_key_sqlite;
 #[cfg(test)]
@@ -156,6 +158,8 @@ mod cacheable;
 pub use cacheable::Cacheable;
 mod validated_entity;
 pub use validated_entity::{NoopValidatedEntity, StoredEntity, ValidatedEntity};
+#[cfg(test)]
+mod error_message_tests;
 mod errors;
 #[cfg(test)]
 mod errors_tests;
@@ -166,6 +170,8 @@ mod expression_usage;
 pub use expression_usage::*;
 pub mod context;
 mod request_expression_validation;
+#[cfg(test)]
+mod request_expression_validation_perf_tests;
 mod request_response;
 pub use request_response::*;
 mod multi_region;

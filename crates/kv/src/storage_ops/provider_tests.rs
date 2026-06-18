@@ -9,7 +9,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bg_jobs::BackgroundJob;
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, stream};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -36,6 +35,11 @@ use tracing_test::traced_test;
 
 use crate::{
     constants,
+    keyspace::{
+        compact,
+        table_identity::{StoredTableMetadata, TABLE_ID_ALLOCATOR_KEY},
+        table_keys,
+    },
     kv_support_tests::{
         TestProvider, cleanup_store, create_test_provider as make_test_provider, create_test_store,
     },
@@ -44,16 +48,54 @@ use crate::{
         PartitionedQueueMessageWrite, QueueClaimBatch, QueueClaimRange, QueueKvStore,
         QueuePrewarmPartition,
     },
-    sorted_kv::SortedKvDbStorageProvider,
+    sorted_kv::{SortedKvDbStorageProvider, decode_table_storage_id},
     sorted_kv_store::{
         BatchItem, OldNewItems, RangeResult, SortedKvStore, TransactWriteOperation,
         TransactWriteOutput, TransactWriteTableOperation,
     },
+    stream::pointer_codec::decode_compact_pointer,
     ttl,
 };
 
 fn create_test_provider() -> TestProvider {
     make_test_provider()
+}
+
+async fn compact_ttl_key_for_item(
+    provider: &TestProvider,
+    table: &TableName,
+    table_info: &storage_types::StoredTableInfo,
+    ttl_attribute: &str,
+    item: &HashMap<String, AttributeValue>,
+) -> Vec<u8> {
+    let metadata = provider
+        .get_table_identity_from_name(table)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    ttl::compact_ttl_index_key_for_item(&metadata.identity, table_info, ttl_attribute, item)
+        .unwrap()
+        .expect("ttl key")
+}
+
+async fn compact_ttl_rows_for_table(provider: &TestProvider, table: &TableName) -> RangeResult {
+    let metadata = provider
+        .get_table_identity_from_name(table)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    let range = ttl::compact_ttl_index_table_range(&metadata.identity);
+    provider
+        .kv_store
+        .get_range(
+            &range.start,
+            &range.end,
+            Some(10),
+            None::<crate::sorted_kv_store::RawKey>,
+            true,
+        )
+        .await
+        .unwrap()
 }
 
 fn gsi_query_request(table_name: &TableName) -> QueryTableRequest {
@@ -75,6 +117,19 @@ fn gsi_query_request_for_partition(table_name: &TableName, partition: &str) -> Q
         scan_index_forward: Some(true),
         consistent_read: false,
     }
+}
+
+async fn compact_gsi_tombstone_range<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    table: &TableName,
+    index: &IndexName,
+) -> crate::keyspace::compact::KeyRange {
+    let metadata = provider
+        .get_table_identity_from_name(table)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    table_keys::gsi_tombstone_prefix(&metadata.identity, index).expect("gsi tombstone range")
 }
 
 #[cfg(feature = "foundationdb-backend")]
@@ -309,9 +364,7 @@ async fn seed_n_items(provider: &TestProvider, table: &TableName, n: usize) {
     .await
     .unwrap();
 
-    let provider_arc = std::sync::Arc::new(provider.clone());
-    let gsi_job = crate::storage_provider::GsiUpdateJob::new(provider_arc);
-    let _ = gsi_job.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 }
 
 #[derive(Clone)]
@@ -544,9 +597,7 @@ async fn kv_gsi_updates_add_and_ignore_missing() {
         .unwrap();
 
     // Process GSI updates
-    let provider_arc = std::sync::Arc::new(provider.clone());
-    let gsi_job = crate::storage_provider::GsiUpdateJob::new(provider_arc.clone());
-    let _ = gsi_job.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     let q = QueryTableRequest {
         table_name: table.clone(),
@@ -577,14 +628,248 @@ async fn kv_gsi_updates_add_and_ignore_missing() {
         .await
         .unwrap();
 
-    let gsi_job2 = crate::storage_provider::GsiUpdateJob::new(provider_arc);
-    let _ = gsi_job2.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     let (items2, _lek2) = provider.query_table(&q).await.unwrap();
     assert_eq!(
         items2.len(),
         2,
         "Items A and B should both be indexed after update"
+    );
+}
+
+#[tokio::test]
+async fn table_identity_metadata_uses_compact_keys_and_lookup() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("CompactIdentityKV");
+
+    create_test_table(&provider, &table, true).await;
+
+    let lookup_key = compact::table_name_lookup_key(table.as_ref().as_bytes());
+    let table_id_bytes = provider
+        .kv_store
+        .get(&lookup_key, true)
+        .await
+        .unwrap()
+        .expect("table name lookup");
+    let table_id = decode_table_storage_id(&table_id_bytes).expect("table id");
+    assert_eq!(table_id.get(), 1);
+
+    let metadata_bytes = provider
+        .kv_store
+        .get(&compact::table_metadata_key(table_id), true)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    let metadata: StoredTableMetadata =
+        storage_types::storage_serde::from_bytes(&metadata_bytes).expect("metadata decode");
+    assert_eq!(metadata.identity.table_id, table_id);
+    assert_eq!(metadata.identity.table_name, table);
+    assert!(!metadata.identity.deleted);
+    assert_eq!(metadata.identity.indexes.len(), 1);
+    assert_eq!(metadata.identity.indexes[0].index_id.get(), 1);
+    assert!(
+        provider
+            .kv_store
+            .get(format!("tables/{table}").as_bytes(), true)
+            .await
+            .unwrap()
+            .is_none(),
+        "old name-keyed table metadata must not be written"
+    );
+}
+
+#[tokio::test]
+async fn table_identity_name_lookup_invalidates_stale_cached_metadata() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("CompactIdentityCacheKV");
+
+    create_test_table(&provider, &table, true).await;
+    provider.table_identity_by_name_lru.remove(&table);
+    let lookup_key = compact::table_name_lookup_key(table.as_ref().as_bytes());
+    let table_id = decode_table_storage_id(
+        &provider
+            .kv_store
+            .get(&lookup_key, true)
+            .await
+            .unwrap()
+            .expect("table name lookup"),
+    )
+    .expect("decode table id");
+    provider.table_identity_by_id_lru.remove(&table_id);
+
+    let loaded = provider
+        .get_table_identity_from_name(&table)
+        .await
+        .unwrap()
+        .expect("storage-backed table identity lookup");
+    assert_eq!(loaded.identity.table_id, table_id);
+
+    provider.kv_store.delete(&lookup_key).await.unwrap();
+
+    let cached = provider.get_table_identity_from_name(&table).await.unwrap();
+    assert!(
+        cached.is_none(),
+        "cached table identity should not survive a missing durable name lookup"
+    );
+    assert!(provider.table_identity_by_name_lru.get(&table).is_none());
+    assert!(provider.table_identity_by_id_lru.get(&table_id).is_none());
+}
+
+#[tokio::test]
+async fn delete_and_recreate_table_name_allocates_new_table_id() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("CompactIdentityRecreateKV");
+
+    create_test_table(&provider, &table, false).await;
+    let lookup_key = compact::table_name_lookup_key(table.as_ref().as_bytes());
+    let first_id = decode_table_storage_id(
+        &provider
+            .kv_store
+            .get(&lookup_key, true)
+            .await
+            .unwrap()
+            .expect("first table id"),
+    )
+    .expect("decode first id");
+
+    provider.delete_table(&table).await.unwrap();
+
+    assert!(
+        provider
+            .kv_store
+            .get(&lookup_key, true)
+            .await
+            .unwrap()
+            .is_none(),
+        "delete removes visible table name lookup"
+    );
+    let deleted_bytes = provider
+        .kv_store
+        .get(&compact::table_metadata_key(first_id), true)
+        .await
+        .unwrap()
+        .expect("deleted metadata tombstone");
+    let deleted: StoredTableMetadata =
+        storage_types::storage_serde::from_bytes(&deleted_bytes).expect("deleted metadata");
+    assert!(deleted.identity.deleted);
+
+    create_test_table(&provider, &table, false).await;
+    let second_id = decode_table_storage_id(
+        &provider
+            .kv_store
+            .get(&lookup_key, true)
+            .await
+            .unwrap()
+            .expect("second table id"),
+    )
+    .expect("decode second id");
+
+    assert_ne!(first_id, second_id);
+    assert_eq!(second_id.get(), first_id.get() + 1);
+    assert_eq!(
+        provider
+            .kv_store
+            .get(TABLE_ID_ALLOCATOR_KEY, true)
+            .await
+            .unwrap()
+            .map(|bytes| decode_table_storage_id(&bytes).expect("allocator id").get()),
+        Some(second_id.get() + 1)
+    );
+}
+
+#[tokio::test]
+async fn ttl_config_and_backfill_state_use_compact_table_identity_keys() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("CompactTtlControlKV");
+
+    create_test_table(&provider, &table, false).await;
+    provider
+        .update_time_to_live(UpdateTimeToLiveRequest {
+            table_name: table.clone(),
+            time_to_live_specification: TimeToLiveSpecification {
+                attribute_name: "ttl".to_string(),
+                enabled: true,
+            },
+        })
+        .await
+        .unwrap();
+
+    let lookup_key = compact::table_name_lookup_key(table.as_ref().as_bytes());
+    let table_id = decode_table_storage_id(
+        &provider
+            .kv_store
+            .get(&lookup_key, true)
+            .await
+            .unwrap()
+            .expect("table id"),
+    )
+    .expect("decode table id");
+    let metadata_bytes = provider
+        .kv_store
+        .get(&compact::table_metadata_key(table_id), true)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    let metadata: StoredTableMetadata =
+        storage_types::storage_serde::from_bytes(&metadata_bytes).expect("metadata decode");
+    let config = provider
+        .load_ttl_config(&table)
+        .await
+        .unwrap()
+        .expect("ttl config");
+    let hidden_ttl_index = metadata
+        .identity
+        .indexes
+        .iter()
+        .find(|index| index.index_name == config.gsi_name())
+        .expect("hidden ttl index identity");
+
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::ttl_config_key(table_id), true)
+            .await
+            .unwrap()
+            .is_some(),
+        "ttl config must be stored under compact table id"
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(
+                &compact::gsi_backfill_key(table_id, hidden_ttl_index.index_id),
+                true
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "gsi backfill state must be stored under compact table/index ids"
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(format!("tables/{table}/ttl-config").as_bytes(), true)
+            .await
+            .unwrap()
+            .is_none(),
+        "old name-keyed ttl config must not be written"
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(
+                format!("tables/{table}/gsi-backfill/{}", config.gsi_name()).as_bytes(),
+                true
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "old name-keyed gsi backfill state must not be written"
     );
 }
 
@@ -609,9 +894,7 @@ async fn kv_gsi_updates_remove_field() {
         .unwrap();
 
     // Process index
-    let provider_arc = std::sync::Arc::new(provider.clone());
-    let gsi_job = crate::storage_provider::GsiUpdateJob::new(provider_arc.clone());
-    let _ = gsi_job.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     let q = QueryTableRequest {
         table_name: table.clone(),
@@ -644,8 +927,7 @@ async fn kv_gsi_updates_remove_field() {
         .await
         .unwrap();
 
-    let gsi_job2 = crate::storage_provider::GsiUpdateJob::new(provider_arc);
-    let _ = gsi_job2.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     let (after, _) = provider.query_table(&q).await.unwrap();
     assert_eq!(
@@ -700,11 +982,17 @@ async fn kv_gsi_tombstones_use_hidden_prefix_and_do_not_consume_query_limit() {
         .unwrap();
     provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
-    let tombstone_prefix =
-        crate::keys::gsi_tombstone_prefix_from_name(&table, &IndexName::new("TestGSI"));
+    let tombstone_range =
+        compact_gsi_tombstone_range(&provider, &table, &IndexName::new("TestGSI")).await;
     let tombstones = provider
         .kv_store
-        .get_prefix(&tombstone_prefix, true, None, true)
+        .get_range(
+            &tombstone_range.start,
+            &tombstone_range.end,
+            None,
+            None::<ItemKey>,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -777,10 +1065,22 @@ async fn kv_gsi_tombstone_cleanup_removes_hidden_prefix_without_touching_query_r
     provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     let index_name = IndexName::new("TestGSI");
-    let tombstone_prefix = crate::keys::gsi_tombstone_prefix_from_name(&table, &index_name);
+    let table_metadata = provider
+        .get_table_identity_from_name(&table)
+        .await
+        .unwrap()
+        .expect("table metadata");
+    let tombstone_range = table_keys::gsi_tombstone_prefix(&table_metadata.identity, &index_name)
+        .expect("tombstone range");
     let before_cleanup = provider
         .kv_store
-        .get_prefix(&tombstone_prefix, true, None, true)
+        .get_range(
+            &tombstone_range.start,
+            &tombstone_range.end,
+            None,
+            None::<ItemKey>,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(before_cleanup.items.len(), 1);
@@ -792,7 +1092,13 @@ async fn kv_gsi_tombstone_cleanup_removes_hidden_prefix_without_touching_query_r
 
     let after_cleanup = provider
         .kv_store
-        .get_prefix(&tombstone_prefix, true, None, true)
+        .get_range(
+            &tombstone_range.start,
+            &tombstone_range.end,
+            None,
+            None::<ItemKey>,
+            true,
+        )
         .await
         .unwrap();
     assert!(after_cleanup.items.is_empty());
@@ -876,11 +1182,17 @@ async fn foundationdb_gsi_tombstones_use_hidden_prefix_and_do_not_consume_query_
             .unwrap();
         provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
-        let tombstone_prefix =
-            crate::keys::gsi_tombstone_prefix_from_name(&table, &IndexName::new("TestGSI"));
+        let tombstone_range =
+            compact_gsi_tombstone_range(&provider, &table, &IndexName::new("TestGSI")).await;
         let tombstones = provider
             .kv_store
-            .get_prefix(&tombstone_prefix, true, None, true)
+            .get_range(
+                &tombstone_range.start,
+                &tombstone_range.end,
+                None,
+                None::<ItemKey>,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(tombstones.items.len(), 1);
@@ -977,10 +1289,16 @@ async fn foundationdb_gsi_tombstone_cleanup_removes_hidden_prefix_without_touchi
         provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
         let index_name = IndexName::new("TestGSI");
-        let tombstone_prefix = crate::keys::gsi_tombstone_prefix_from_name(&table, &index_name);
+        let tombstone_range = compact_gsi_tombstone_range(&provider, &table, &index_name).await;
         let before_cleanup = provider
             .kv_store
-            .get_prefix(&tombstone_prefix, true, None, true)
+            .get_range(
+                &tombstone_range.start,
+                &tombstone_range.end,
+                None,
+                None::<ItemKey>,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(before_cleanup.items.len(), 1);
@@ -992,7 +1310,13 @@ async fn foundationdb_gsi_tombstone_cleanup_removes_hidden_prefix_without_touchi
 
         let after_cleanup = provider
             .kv_store
-            .get_prefix(&tombstone_prefix, true, None, true)
+            .get_range(
+                &tombstone_range.start,
+                &tombstone_range.end,
+                None,
+                None::<ItemKey>,
+                true,
+            )
             .await
             .unwrap();
         assert!(after_cleanup.items.is_empty());
@@ -1674,9 +1998,8 @@ async fn ttl_sweep_removes_expired_items() {
         "ttl".to_string(),
         AttributeValue::N((Utc::now().timestamp() - 120).to_string()),
     );
-    let ttl_key_bytes = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &check_item)
-        .unwrap()
-        .unwrap();
+    let ttl_key_bytes =
+        compact_ttl_key_for_item(&provider, &table, &table_info, "ttl", &check_item).await;
     assert!(
         provider
             .kv_store
@@ -1765,9 +2088,7 @@ async fn ttl_index_removed_on_delete() {
     key_item.insert("pk".to_string(), AttributeValue::S("user".to_string()));
     key_item.insert("sk".to_string(), AttributeValue::S("session".to_string()));
     key_item.insert("ttl".to_string(), AttributeValue::N(expires_at));
-    let ttl_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &key_item)
-        .unwrap()
-        .unwrap();
+    let ttl_key = compact_ttl_key_for_item(&provider, &table, &table_info, "ttl", &key_item).await;
     assert!(
         provider
             .kv_store
@@ -1826,12 +2147,7 @@ async fn ttl_index_skips_invalid_ttl_value() {
         .await
         .unwrap();
 
-    let prefix = ttl::ttl_index_prefix(&table);
-    let range = provider
-        .kv_store
-        .get_prefix(&prefix, true, Some(10), true)
-        .await
-        .unwrap();
+    let range = compact_ttl_rows_for_table(&provider, &table).await;
     assert!(
         range.items.is_empty(),
         "invalid ttl values should not write ttl index entries"
@@ -1863,12 +2179,7 @@ async fn ttl_index_skips_missing_ttl_attribute() {
         .await
         .unwrap();
 
-    let prefix = ttl::ttl_index_prefix(&table);
-    let range = provider
-        .kv_store
-        .get_prefix(&prefix, true, Some(10), true)
-        .await
-        .unwrap();
+    let range = compact_ttl_rows_for_table(&provider, &table).await;
     assert!(
         range.items.is_empty(),
         "items without ttl should not write ttl index entries"
@@ -2378,9 +2689,8 @@ async fn ttl_sweep_skips_updated_item() {
     expired_item.insert("pk".to_string(), AttributeValue::S("user".to_string()));
     expired_item.insert("sk".to_string(), AttributeValue::S("session".to_string()));
     expired_item.insert("ttl".to_string(), AttributeValue::N(expired_at.clone()));
-    let expired_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &expired_item)
-        .unwrap()
-        .unwrap();
+    let expired_key =
+        compact_ttl_key_for_item(&provider, &table, &table_info, "ttl", &expired_item).await;
     assert!(
         provider
             .kv_store
@@ -2404,9 +2714,8 @@ async fn ttl_sweep_skips_updated_item() {
     future_item.insert("pk".to_string(), AttributeValue::S("user".to_string()));
     future_item.insert("sk".to_string(), AttributeValue::S("session".to_string()));
     future_item.insert("ttl".to_string(), AttributeValue::N(future_at.clone()));
-    let future_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &future_item)
-        .unwrap()
-        .unwrap();
+    let future_key =
+        compact_ttl_key_for_item(&provider, &table, &table_info, "ttl", &future_item).await;
     assert!(
         provider
             .kv_store
@@ -2552,12 +2861,7 @@ async fn populate_test_data(provider: &TestProvider, table_name: &TableName, wit
     }
 
     if with_gsi {
-        // Execute GSI update job to populate the GSI
-        let provider_arc = std::sync::Arc::new(provider.clone());
-        let gsi_job = crate::storage_provider::GsiUpdateJob::new(provider_arc);
-        let err = gsi_job.execute().await;
-
-        assert!(err.is_ok(), "GSI update job failed: {err:?}");
+        provider.run_job(GSI_UPDATE_JOB).await.unwrap();
     }
 }
 
@@ -5508,9 +5812,7 @@ async fn boundary_conditions_numeric_sort_keys() {
     }
 
     // Execute GSI update
-    let provider_arc = std::sync::Arc::new(provider.clone());
-    let gsi_job = crate::storage_provider::GsiUpdateJob::new(provider_arc);
-    let _ = gsi_job.execute().await.unwrap();
+    provider.run_job(GSI_UPDATE_JOB).await.unwrap();
 
     // Query boundaries
     let mut values = HashMap::new();
@@ -5682,6 +5984,22 @@ async fn idempotency_token_ttl_support() {
         serde_json::to_string(&response1).unwrap(),
         serde_json::to_string(&response2).unwrap(),
         "Idempotent requests should return identical responses"
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::idempotency_token_key("test_token_ttl_123"), true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        provider
+            .kv_store
+            .get(b"idempotency_token:test_token_ttl_123", true)
+            .await
+            .unwrap(),
+        None
     );
 
     // Fixed: TTL is now implemented - tokens are stored with expiration
@@ -5876,9 +6194,7 @@ async fn put_item_encode_updates_stream_and_ttl_side_effects() {
     );
 
     let table_info = provider.get_table_info(&table).await.unwrap();
-    let ttl_key = ttl::ttl_index_key_for_item(&table, &table_info, "ttl", &item)
-        .unwrap()
-        .expect("ttl key");
+    let ttl_key = compact_ttl_key_for_item(&provider, &table, &table_info, "ttl", &item).await;
     assert!(
         provider
             .kv_store
@@ -5923,9 +6239,15 @@ async fn stream_entries_created_with_gsi_without_stream_spec() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].data_type, StreamDataType::StreamPointer);
 
-    let stored_pointer: StoredStreamPointer =
-        storage_types::storage_serde::from_bytes(&page.items[0].data).unwrap();
-    let pointer = stored_pointer.into_stream_pointer(page.items[0].id);
+    let stored_pointer = decode_compact_pointer(&page.items[0].data).unwrap();
+    let table_metadata = provider
+        .get_table_identity_from_id(stored_pointer.table_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pointer = stored_pointer
+        .stream_pointer(&table_metadata.identity, page.items[0].id)
+        .unwrap();
     assert_eq!(
         pointer.stream_name,
         StreamName::table_item_stream(&table_name, &item_key).expect("item stream")
@@ -5958,10 +6280,9 @@ async fn large_stream_pointer_records_resolve_item_images() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
-    let stored_pointer: StoredStreamPointer =
-        storage_types::storage_serde::from_bytes(&page.items[0].data).unwrap();
+    let stored_pointer = decode_compact_pointer(&page.items[0].data).unwrap();
     assert!(
-        matches!(stored_pointer, StoredStreamPointer::Pointer { .. }),
+        stored_pointer.items.is_none(),
         "large item should use pointer-backed stream storage"
     );
 
@@ -6039,9 +6360,8 @@ async fn apply_replication_mutation_put_preserves_replication_metadata() {
     let page = StreamProvider::read_forward(&provider, StreamName::system_table_stream(), None, 10)
         .await
         .unwrap();
-    let stored_pointer: StoredStreamPointer =
-        storage_types::storage_serde::from_bytes(&page.items[0].data).unwrap();
-    assert_eq!(stored_pointer.replication_metadata(), Some(&metadata));
+    let stored_pointer = decode_compact_pointer(&page.items[0].data).unwrap();
+    assert_eq!(stored_pointer.replication.as_ref(), Some(&metadata));
 }
 
 #[tokio::test]
@@ -6075,9 +6395,8 @@ async fn apply_replication_mutation_delete_writes_tombstone_for_missing_item() {
         StreamProvider::read_forward(&provider, StreamName::system_table_stream(), None, 10)
             .await
             .unwrap();
-    let stored_pointer: StoredStreamPointer =
-        storage_types::storage_serde::from_bytes(&system_page.items[0].data).unwrap();
-    assert_eq!(stored_pointer.replication_metadata(), Some(&metadata));
+    let stored_pointer = decode_compact_pointer(&system_page.items[0].data).unwrap();
+    assert_eq!(stored_pointer.replication.as_ref(), Some(&metadata));
 
     let item_key = ItemKey::from_key_schema(
         table_name.clone(),
@@ -6126,9 +6445,8 @@ async fn local_delete_missing_item_writes_tombstone_to_streams() {
             .await
             .unwrap();
     assert_eq!(system_page.items.len(), 1);
-    let stored_pointer: StoredStreamPointer =
-        storage_types::storage_serde::from_bytes(&system_page.items[0].data).unwrap();
-    assert!(stored_pointer.replication_metadata().is_none());
+    let stored_pointer = decode_compact_pointer(&system_page.items[0].data).unwrap();
+    assert!(stored_pointer.replication.is_none());
 
     let item_key = ItemKey::from_key_schema(
         table_name.clone(),
@@ -6257,6 +6575,115 @@ async fn batch_stream_entries_created() {
             .iter()
             .all(|item| item.data_type == StreamDataType::StreamPointer)
     );
+}
+
+#[tokio::test]
+async fn encoded_batch_write_with_immediate_gsi_preserves_table_stream_entries() {
+    use storage_types::{
+        BatchWriteItemEncodeRequest, EncodePutRequest, EncodeWriteRequest, StreamSpecification,
+        StreamViewType,
+    };
+
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("EncodedBatchGsiStreamTest");
+    let request = CreateTableRequest::new(
+        table_name.clone(),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi_sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+        index_name: IndexName::new("TestGSI"),
+        key_schema: vec![
+            KeySchemaElement {
+                attribute_name: "gsi_pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gsi_sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        projection: Projection {
+            projection_type: Some(ProjectionType::All),
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+    }]))
+    .with_stream_specification(Some(StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(StreamViewType::NewAndOldImages),
+    }));
+    provider.create_table(&request).await.unwrap();
+
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("tenant".to_string())),
+        ("sk".to_string(), AttributeValue::S("wal#1".to_string())),
+        ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
+        ("gsi_sk".to_string(), AttributeValue::S("001".to_string())),
+        (
+            "data".to_string(),
+            AttributeValue::S("stream-visible".to_string()),
+        ),
+    ]);
+    let wire_item = WireItem::from_attribute_map(&item).expect("wire item");
+
+    provider
+        .batch_write_item_encode(
+            BatchWriteItemEncodeRequest {
+                request_items: HashMap::from([(
+                    table_name.clone(),
+                    vec![EncodeWriteRequest {
+                        put_request: Some(EncodePutRequest {
+                            item: wire_item,
+                            aux_item_stream_ttl_hours: None,
+                        }),
+                        delete_request: None,
+                    }],
+                )]),
+                return_consumed_capacity: None,
+                return_item_collection_metrics: None,
+            },
+            true,
+        )
+        .await
+        .expect("encoded batch write");
+
+    let page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .expect("read table stream");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].data_type, StreamDataType::StreamPointer);
 }
 
 #[tokio::test]
@@ -6475,13 +6902,46 @@ async fn insert_stream_item<S: PartitionFamilyKvStore + 'static>(
     stream_name: &StreamName,
     stream_item: &StreamItem,
 ) {
-    let key: StreamKey = stream_name + &stream_item.id;
+    let key = stream_fixture_key(provider, stream_name, stream_item.id).await;
     let bytes = crate::stream::item_codec::encode_stream_item(stream_item).expect("stream bytes");
     provider
         .kv_store
-        .put(key.as_ref(), &bytes, None)
+        .put(&key, &bytes, None)
         .await
         .expect("stream insert");
+}
+
+async fn stream_fixture_key<S: PartitionFamilyKvStore + 'static>(
+    provider: &SortedKvDbStorageProvider<S>,
+    stream_name: &StreamName,
+    stream_item_id: StreamItemId,
+) -> Vec<u8> {
+    let table_identity = if let Some(table_name) =
+        crate::keyspace::stream_keys::table_name_for_stream(stream_name)
+    {
+        provider
+            .get_table_identity_from_name(&table_name)
+            .await
+            .expect("table identity lookup")
+            .map(|metadata| metadata.identity.clone())
+    } else {
+        None
+    };
+    match crate::keyspace::stream_keys::compact_stream_range(stream_name, table_identity.as_ref())
+        .expect("compact stream range")
+    {
+        crate::keyspace::stream_keys::CompactStreamRange::System(range)
+        | crate::keyspace::stream_keys::CompactStreamRange::Table(range)
+        | crate::keyspace::stream_keys::CompactStreamRange::Item(range) => {
+            let mut key = range.start;
+            key.extend_from_slice(stream_item_id.as_bytes());
+            key
+        }
+        crate::keyspace::stream_keys::CompactStreamRange::Legacy => {
+            let key: StreamKey = stream_name + &stream_item_id;
+            key.as_ref().to_vec()
+        }
+    }
 }
 
 async fn insert_stream_pointer_index<S: PartitionFamilyKvStore + 'static>(
@@ -6490,14 +6950,22 @@ async fn insert_stream_pointer_index<S: PartitionFamilyKvStore + 'static>(
     item_stream: &StreamName,
     stream_item_id: StreamItemId,
 ) {
+    let table_identity = provider
+        .get_table_identity_from_name(table_name)
+        .await
+        .expect("table identity lookup")
+        .expect("table identity exists")
+        .identity
+        .clone();
     provider
         .kv_store
         .put(
-            &super::stream_duration::stream_pointer_index_key(
-                table_name,
+            &crate::keyspace::stream_keys::stream_pointer_item_key_for_stream(
+                &table_identity,
                 item_stream,
                 stream_item_id,
-            ),
+            )
+            .expect("item pointer key"),
             b"",
             None,
         )
@@ -6506,7 +6974,10 @@ async fn insert_stream_pointer_index<S: PartitionFamilyKvStore + 'static>(
     provider
         .kv_store
         .put(
-            &super::stream_duration::stream_pointer_table_key(table_name, stream_item_id),
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                stream_item_id,
+            ),
             b"",
             None,
         )
@@ -6620,10 +7091,20 @@ async fn custom_stream_duration_trims_bounded_table_stream_page() {
     assert_eq!(table_page.items.len(), 1);
     assert_eq!(table_page.items[0].id, recent_id);
 
+    let table_identity = provider
+        .get_table_identity_from_name(&table_name)
+        .await
+        .expect("table identity lookup")
+        .expect("table identity exists")
+        .identity
+        .clone();
     let old_table_pointer = provider
         .kv_store
         .get(
-            &super::stream_duration::stream_pointer_table_key(&table_name, old_id),
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                old_id,
+            ),
             true,
         )
         .await

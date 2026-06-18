@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-rust-version = "1.94.0"
+rust-version = "1.96.0"
 edition = "2024"
 repository = "https://github.com/u19r/aux-storage"
 readme = "README.md"
@@ -27,7 +27,11 @@ tokio = { version = "1.52.3", features = ["full", "tracing"] }
 tokio-postgres = "0.7.17"
 tokio-postgres-rustls = "0.13.0"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.23", features = [
+    "env-filter",
+    "fmt",
+    "json",
+] }
 
 ############################################
 # futures-rs (rust-lang)
@@ -83,7 +87,15 @@ cucumber = "0.23.0"
 
 ############################################
 # seanmonstar
-reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
+reqwest = { version = "0.13.3", default-features = false, features = [
+    "blocking",
+    "form",
+    "json",
+    "multipart",
+    "query",
+    "rustls",
+    "stream",
+] }
 
 ############################################
 # rust-rocksdb
@@ -118,11 +130,16 @@ tempfile = "3.27.0"
 base32 = "0.5.1"
 cargo_metadata = "0.23.1"
 #0.10.0 with fix for rust 1.91
-foundationdb = { version = "0.10.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
+foundationdb = { version = "0.10.0", features = [
+    "embedded-fdb-include",
+    "fdb-7_4",
+], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
 hostname = "0.4"
 httpmock = "0.8.3"
 ipnet = "2.12.0"
-jsonschema = { version = "0.46.4", default-features = false, features = ["resolve-file"] }
+jsonschema = { version = "0.46.4", default-features = false, features = [
+    "resolve-file",
+] }
 lz4_flex = "0.13.1"
 metrics = "0.24.5"
 metrics-exporter-prometheus = "0.18.3"
@@ -140,13 +157,13 @@ xxhash-rust = { version = "0.8.11", features = ["xxh3"] }
 
 ############################################
 # Public aux-common shared crates.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "02585330401d91ac7ef296f49192aabd6cbf500e" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
 
 ############################################
 # Local path dependencies

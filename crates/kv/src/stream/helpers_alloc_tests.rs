@@ -10,9 +10,10 @@ use storage_types::{
 use stream_provider::{StoredStreamPointer, StreamDataType};
 
 use crate::{
+    keyspace::{compact::TableStorageId, table_identity::TableIdentity},
     storage_provider::encode_wire_item_storage_bytes,
     stream::{
-        helpers::create_item_update_stream_entries_wire_encoded,
+        helpers::{StreamEntryContext, create_item_update_stream_entries_wire_encoded},
         item_codec::encode_stored_stream_item_parts,
     },
 };
@@ -81,6 +82,10 @@ fn item_key(table_name: &TableName, index: usize) -> ItemKey {
     )
 }
 
+fn table_identity(table_name: &TableName) -> TableIdentity {
+    TableIdentity::new(TableStorageId::new(1), table_name.clone(), Vec::new())
+}
+
 fn measure_stream_envelope_wire_insert_baseline() -> alloc_counter::AllocationReport<'static> {
     let table_name = TableName::new("alloc_stream_wire_baseline");
     let wire_items = sample_wire_items();
@@ -96,11 +101,15 @@ fn measure_stream_envelope_wire_insert_baseline() -> alloc_counter::AllocationRe
         line!(),
         Some("baseline"),
     );
+    let table_identity = table_identity(&table_name);
     for (index, item_bytes) in encoded.iter().enumerate() {
         let key = item_key(&table_name, index);
         let _entries = create_item_update_stream_entries_wire_encoded(
-            &table_name,
-            &key,
+            StreamEntryContext {
+                table_identity: &table_identity,
+                table_name: &table_name,
+                item_key: &key,
+            },
             item_bytes.as_slice(),
             None,
             StreamItemId::random(),
@@ -127,11 +136,15 @@ fn measure_stream_envelope_wire_update_embedded() -> alloc_counter::AllocationRe
         line!(),
         Some("component"),
     );
+    let table_identity = table_identity(&table_name);
     for (index, item_bytes) in encoded.iter().enumerate() {
         let key = item_key(&table_name, index);
         let _entries = create_item_update_stream_entries_wire_encoded(
-            &table_name,
-            &key,
+            StreamEntryContext {
+                table_identity: &table_identity,
+                table_name: &table_name,
+                item_key: &key,
+            },
             item_bytes.as_slice(),
             Some(item_bytes.as_slice()),
             StreamItemId::random(),

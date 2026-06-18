@@ -9,7 +9,8 @@ use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
 use uuid::Uuid;
 
 use crate::{
-    SQLiteStorageProvider, error_handler::map_sqlite_error, sql_statements, utils::SqliteConn,
+    SQLiteStorageProvider, change_index, error_handler::map_sqlite_error, sql_statements,
+    utils::SqliteConn,
 };
 
 const STREAM_EMBEDDED_MAX_BYTES: usize = 1024;
@@ -176,6 +177,7 @@ pub fn write_stream_entries(
         system_pointer_stream_item_id,
         created_at,
     )?;
+    insert_change_index_marker(sqlite, table_info, table_pointer_stream_item_id, created_at)?;
 
     Ok(())
 }
@@ -321,7 +323,23 @@ pub fn write_stream_entries_wire(
         system_pointer_stream_item_id,
         created_at,
     )?;
+    insert_change_index_marker(sqlite, table_info, table_pointer_stream_item_id, created_at)?;
 
+    Ok(())
+}
+
+fn insert_change_index_marker(
+    sqlite: &SqliteConn<'_>,
+    table_info: &StoredTableInfo,
+    pointer_stream_item_id: storage_types::StreamItemId,
+    created_at: TimestampMillis,
+) -> Result<(), StorageError> {
+    let slot = change_index::slot_for_table(&table_info.table_name);
+    let versionstamp = change_index::sortable_version(pointer_stream_item_id);
+    let table_id = table_info.table_name.as_ref();
+    let (sql, params) =
+        sql_statements::insert_change_index_marker(slot, &versionstamp, table_id, &created_at);
+    sqlite.execute(sql, params).map_err(map_sqlite_error)?;
     Ok(())
 }
 

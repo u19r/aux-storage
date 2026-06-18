@@ -24,7 +24,12 @@ pub(crate) use provider_impl::{
     now_ms_u64, record_provider_stage, record_query_result, record_read, record_write,
     should_log_job,
 };
-pub(crate) use write_helpers::{key_schema_for_gsi, project_gsi_item};
+#[cfg(test)]
+pub(crate) use write_helpers::CHANGE_INDEX_PREFIX;
+pub(crate) use write_helpers::{
+    change_index_key, change_index_slot, change_index_slot_prefix, key_schema_for_gsi,
+    project_gsi_item,
+};
 
 #[cfg(test)]
 mod conditional_error_tests;
@@ -62,3 +67,5 @@ mod stream_duration_perf_tests;
 mod stream_duration_tests;
 #[cfg(all(test, feature = "rocksdb-backend"))]
 mod update_item_tests;
+#[cfg(test)]
+mod write_helpers_tests;

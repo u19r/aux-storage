@@ -9,7 +9,9 @@ use storage_types::{DurationSeconds, TimestampMillis};
 use uuid::Uuid;
 
 use crate::{
-    RocksDbKvStore, SortedKvDbStorageProvider, kv_support_tests::rocksdb_test_path,
+    RocksDbKvStore, SortedKvDbStorageProvider,
+    keyspace::compact::{self, QueueStorageId},
+    kv_support_tests::rocksdb_test_path,
     sorted_kv_store::SortedKvStore,
 };
 
@@ -52,17 +54,36 @@ async fn queue_body_records(
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     provider
         .kv_store
-        .get_prefix(b"pqueue/", true, None, true)
+        .get_prefix(b"q", true, None, true)
         .await
         .expect("read queue partition records")
         .items
         .into_iter()
         .filter_map(|(key, value)| {
             let key = key.into_vec();
-            String::from_utf8_lossy(&key)
-                .contains("/body/")
-                .then(|| (key, value.into_vec()))
+            matches!(
+                compact::parse_compact_key(&key),
+                Ok(compact::ParsedCompactKey::PartitionedQueueData {
+                    kind: compact::QueueRecordKind::Body,
+                    ..
+                })
+            )
+            .then(|| (key, value.into_vec()))
         })
+        .collect()
+}
+
+async fn legacy_queue_records(
+    provider: &SortedKvDbStorageProvider<RocksDbKvStore>,
+) -> Vec<Vec<u8>> {
+    provider
+        .kv_store
+        .get_prefix(b"sys/queues/", true, None, true)
+        .await
+        .expect("read legacy queue records")
+        .items
+        .into_iter()
+        .map(|(key, _)| key.into_vec())
         .collect()
 }
 
@@ -385,6 +406,10 @@ async fn delete_and_visibility_changes_work_across_provider_clones() {
         .delete_message(queue_url, delete_handle)
         .await
         .expect("delete message with third worker");
+    assert!(
+        legacy_queue_records(&provider).await.is_empty(),
+        "active queue delete and visibility paths should not write legacy sys/queues records"
+    );
 
     let remaining = provider
         .receive_messages(
@@ -400,6 +425,48 @@ async fn delete_and_visibility_changes_work_across_provider_clones() {
     assert_eq!(
         HashSet::from([deleted_body, remaining[0].body.clone()]),
         HashSet::from(["first".to_string(), "second".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn malformed_receipt_handles_do_not_use_legacy_queue_fallbacks() {
+    let provider = create_test_provider().await;
+    provider.initialize().await.expect("initialize provider");
+
+    let queue_url = "https://queue.example.test/000000000000/malformed-handle";
+    provider
+        .create_queue(queue("malformed-handle", queue_url))
+        .await
+        .expect("create queue");
+    let receipt_handle = ReceiptHandle::from("not-a-compact-receipt-handle");
+
+    let delete_error = provider
+        .delete_message(queue_url, receipt_handle.clone())
+        .await
+        .expect_err("malformed delete handle should fail");
+    assert!(matches!(
+        delete_error,
+        queue_provider::QueueError::Validation {
+            kind: queue_provider::QueueValidationKind::MessageNotFound,
+            ..
+        }
+    ));
+
+    let visibility_error = provider
+        .change_message_visibility(queue_url, receipt_handle, DurationSeconds::from(0))
+        .await
+        .expect_err("malformed visibility handle should fail");
+    assert!(matches!(
+        visibility_error,
+        queue_provider::QueueError::Validation {
+            kind: queue_provider::QueueValidationKind::MessageNotFound,
+            ..
+        }
+    ));
+
+    assert!(
+        legacy_queue_records(&provider).await.is_empty(),
+        "malformed handles should not trigger legacy sys/queues reads or writes"
     );
 }
 
@@ -538,8 +605,12 @@ async fn payload_cleanup_discards_malformed_delete_ledger_entries() {
         .create_queue(queue("malformed-ledger", queue_url))
         .await
         .expect("create queue");
-    let ledger_key =
-        crate::queue_provider::queue_delete_ledger_key(queue_url, 0, 0, "not-a-message-id");
+    let ledger_key = crate::queue_provider::queue_delete_ledger_key(
+        QueueStorageId::new(1).expect("first queue id"),
+        0,
+        0,
+        "not-a-message-id",
+    );
     provider
         .kv_store
         .put(&ledger_key, b"not valid ledger bytes", None)
@@ -572,6 +643,31 @@ async fn queue_lookup_by_name_supports_canonical_queue_urls() {
         .await
         .expect("create queue");
 
+    let queue_id = QueueStorageId::new(1).expect("first queue id");
+    let queue_id_bytes = provider
+        .kv_store
+        .get(&compact::queue_url_lookup_key(queue_url), true)
+        .await
+        .expect("read queue url lookup")
+        .expect("queue url lookup should exist");
+    assert_eq!(queue_id_bytes.len(), 6);
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_name_lookup_key("name-lookup"), true)
+            .await
+            .expect("read queue name lookup")
+            .is_some()
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_metadata_key(queue_id), true)
+            .await
+            .expect("read queue metadata")
+            .is_some()
+    );
+
     let queue = provider
         .get_queue_by_name("name-lookup")
         .await
@@ -585,4 +681,33 @@ async fn queue_lookup_by_name_supports_canonical_queue_urls() {
     assert_eq!(queue.queue_url, queue_url);
     assert_eq!(queues.len(), 1);
     assert_eq!(queues[0].queue_url, queue_url);
+
+    provider
+        .delete_queue(queue_url)
+        .await
+        .expect("delete queue");
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_url_lookup_key(queue_url), true)
+            .await
+            .expect("read deleted queue url lookup")
+            .is_none()
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_name_lookup_key("name-lookup"), true)
+            .await
+            .expect("read deleted queue name lookup")
+            .is_none()
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_metadata_key(queue_id), true)
+            .await
+            .expect("read deleted queue metadata")
+            .is_none()
+    );
 }

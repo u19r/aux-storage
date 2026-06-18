@@ -236,43 +236,63 @@ async fn create_table_if_missing_raw(
 
 async fn create_sys_namespaces(db: &DatabaseManager) -> Result<(), StorageError> {
     let table_name = Tables::sys_namespaces();
-    if table_exists(db, &table_name).await? {
-        ensure_table_stream_enabled(db, &table_name).await?;
+    if raw_table_exists(db, &table_name).await? {
+        ensure_raw_table_stream_enabled(db, &table_name).await?;
         return Ok(());
     }
-    create_table_if_missing(
-        db,
-        &CreateTableRequest::new(
-            table_name.clone(),
-            vec![
-                AttributeDefinition {
-                    attribute_name: "pk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-                AttributeDefinition {
-                    attribute_name: "sk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-                AttributeDefinition {
-                    attribute_name: "gsi1pk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-                AttributeDefinition {
-                    attribute_name: "gsi2pk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-                AttributeDefinition {
-                    attribute_name: "gsi3pk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-                AttributeDefinition {
-                    attribute_name: "gsi3sk".to_string(),
-                    attribute_type: KeyAttributeType::S,
-                },
-            ],
-            vec![
+    create_table_if_missing_raw(db, &sys_namespaces_table_request(table_name.clone())).await?;
+    wait_for_raw_table_active(db, &table_name).await?;
+    ensure_raw_table_stream_enabled(db, &table_name).await?;
+    Ok(())
+}
+
+fn sys_namespaces_table_request(table_name: TableName) -> CreateTableRequest {
+    CreateTableRequest::new(
+        table_name,
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi1pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi2pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi3pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gsi3sk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![
+            KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".to_string(),
+                key_type: KeyType::Range,
+            },
+        ],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_global_secondary_indexes(Some(vec![
+        CreateGlobalSecondaryIndex {
+            index_name: IndexName::new("gsi1"),
+            key_schema: vec![
                 KeySchemaElement {
-                    attribute_name: "pk".to_string(),
+                    attribute_name: "gsi1pk".to_string(),
                     key_type: KeyType::Hash,
                 },
                 KeySchemaElement {
@@ -280,71 +300,51 @@ async fn create_sys_namespaces(db: &DatabaseManager) -> Result<(), StorageError>
                     key_type: KeyType::Range,
                 },
             ],
-            storage_types::BillingMode::PayPerRequest,
-        )
-        .with_global_secondary_indexes(Some(vec![
-            CreateGlobalSecondaryIndex {
-                index_name: IndexName::new("gsi1"),
-                key_schema: vec![
-                    KeySchemaElement {
-                        attribute_name: "gsi1pk".to_string(),
-                        key_type: KeyType::Hash,
-                    },
-                    KeySchemaElement {
-                        attribute_name: "sk".to_string(),
-                        key_type: KeyType::Range,
-                    },
-                ],
-                projection: Projection {
-                    projection_type: Some(storage_types::ProjectionType::All),
-                    non_key_attributes: None,
-                },
-                provisioned_throughput: None,
+            projection: Projection {
+                projection_type: Some(storage_types::ProjectionType::All),
+                non_key_attributes: None,
             },
-            CreateGlobalSecondaryIndex {
-                // sparse ST preload index (items with gsi2pk="ST#1")
-                index_name: IndexName::new("gsi2"),
-                key_schema: vec![
-                    KeySchemaElement {
-                        attribute_name: "gsi2pk".to_string(),
-                        key_type: KeyType::Hash,
-                    },
-                    KeySchemaElement {
-                        attribute_name: "sk".to_string(),
-                        key_type: KeyType::Range,
-                    },
-                ],
-                projection: Projection {
-                    projection_type: Some(storage_types::ProjectionType::All),
-                    non_key_attributes: None,
+            provisioned_throughput: None,
+        },
+        CreateGlobalSecondaryIndex {
+            // sparse ST preload index (items with gsi2pk="ST#1")
+            index_name: IndexName::new("gsi2"),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "gsi2pk".to_string(),
+                    key_type: KeyType::Hash,
                 },
-                provisioned_throughput: None,
-            },
-            CreateGlobalSecondaryIndex {
-                // cutover scheduling index (window scan by effective timestamp)
-                index_name: IndexName::new("gsi3"),
-                key_schema: vec![
-                    KeySchemaElement {
-                        attribute_name: "gsi3pk".to_string(),
-                        key_type: KeyType::Hash,
-                    },
-                    KeySchemaElement {
-                        attribute_name: "gsi3sk".to_string(),
-                        key_type: KeyType::Range,
-                    },
-                ],
-                projection: Projection {
-                    projection_type: Some(storage_types::ProjectionType::All),
-                    non_key_attributes: None,
+                KeySchemaElement {
+                    attribute_name: "sk".to_string(),
+                    key_type: KeyType::Range,
                 },
-                provisioned_throughput: None,
+            ],
+            projection: Projection {
+                projection_type: Some(storage_types::ProjectionType::All),
+                non_key_attributes: None,
             },
-        ]))
-        .with_stream_specification(Some(system_table_stream_specification())),
-    )
-    .await?;
-    wait_for_table_active(db, &table_name).await?;
-    Ok(())
+            provisioned_throughput: None,
+        },
+        CreateGlobalSecondaryIndex {
+            // cutover scheduling index (window scan by effective timestamp)
+            index_name: IndexName::new("gsi3"),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "gsi3pk".to_string(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "gsi3sk".to_string(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            projection: Projection {
+                projection_type: Some(storage_types::ProjectionType::All),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+        },
+    ]))
 }
 
 async fn ensure_table_stream_enabled(
@@ -423,10 +423,10 @@ fn system_table_stream_specification() -> StreamSpecification {
 
 async fn create_sys_analytics(db: &DatabaseManager) -> Result<(), StorageError> {
     let table_name = Tables::sys_analytics();
-    if table_exists(db, &table_name).await? {
+    if raw_table_exists(db, &table_name).await? {
         return Ok(());
     }
-    create_table_if_missing(
+    create_table_if_missing_raw(
         db,
         &CreateTableRequest::new(
             table_name.clone(),
@@ -504,16 +504,16 @@ async fn create_sys_analytics(db: &DatabaseManager) -> Result<(), StorageError> 
         ])),
     )
     .await?;
-    wait_for_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(db, &table_name).await?;
     Ok(())
 }
 
 async fn create_sys_jobs(db: &DatabaseManager) -> Result<(), StorageError> {
     let table_name = Tables::sys_jobs();
-    if table_exists(db, &table_name).await? {
+    if raw_table_exists(db, &table_name).await? {
         return Ok(());
     }
-    create_table_if_missing(
+    create_table_if_missing_raw(
         db,
         &CreateTableRequest::new(
             table_name.clone(),
@@ -545,16 +545,16 @@ async fn create_sys_jobs(db: &DatabaseManager) -> Result<(), StorageError> {
         })),
     )
     .await?;
-    wait_for_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(db, &table_name).await?;
     Ok(())
 }
 
 async fn create_sys_storage_replication(db: &DatabaseManager) -> Result<(), StorageError> {
     let table_name = Tables::sys_storage_replication();
-    if table_exists(db, &table_name).await? {
+    if raw_table_exists(db, &table_name).await? {
         return Ok(());
     }
-    create_table_if_missing(
+    create_table_if_missing_raw(
         db,
         &CreateTableRequest::new(
             table_name.clone(),
@@ -586,7 +586,7 @@ async fn create_sys_storage_replication(db: &DatabaseManager) -> Result<(), Stor
         })),
     )
     .await?;
-    wait_for_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(db, &table_name).await?;
     Ok(())
 }
 
