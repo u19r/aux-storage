@@ -119,9 +119,7 @@ pub struct PostgresBackendConfig {
 }
 
 fn default_postgres_max_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map_or(20, |cores| usize::from(cores) + 8)
-        .max(20)
+    20
 }
 
 fn default_postgres_background_max_pool_size() -> usize {

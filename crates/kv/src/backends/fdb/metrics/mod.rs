@@ -7,7 +7,7 @@ const FOUNDATIONDB_OPERATION_LATENCY_MICROS_TOTAL: &str =
 const FOUNDATIONDB_OPERATION_LATENCY_COUNT_TOTAL: &str =
     "foundationdb_operation_latency_count_total";
 
-static OPERATION_COUNTERS: [OperationCounters; 12] = [
+static OPERATION_COUNTERS: [OperationCounters; 13] = [
     OperationCounters::new("range"),
     OperationCounters::new("queue_send"),
     OperationCounters::new("queue_prewarm"),
@@ -20,9 +20,10 @@ static OPERATION_COUNTERS: [OperationCounters; 12] = [
     OperationCounters::new("multi_get"),
     OperationCounters::new("put"),
     OperationCounters::new("delete"),
+    OperationCounters::new("read_context"),
 ];
 
-static BYTE_COUNTERS: [ByteCounters; 12] = [
+static BYTE_COUNTERS: [ByteCounters; 13] = [
     ByteCounters::new("range"),
     ByteCounters::new("queue_send"),
     ByteCounters::new("queue_prewarm"),
@@ -35,9 +36,10 @@ static BYTE_COUNTERS: [ByteCounters; 12] = [
     ByteCounters::new("multi_get"),
     ByteCounters::new("put"),
     ByteCounters::new("delete"),
+    ByteCounters::new("read_context"),
 ];
 
-static LATENCY_COUNTERS: [LatencyCounters; 12] = [
+static LATENCY_COUNTERS: [LatencyCounters; 13] = [
     LatencyCounters::new("range"),
     LatencyCounters::new("queue_send"),
     LatencyCounters::new("queue_prewarm"),
@@ -50,6 +52,7 @@ static LATENCY_COUNTERS: [LatencyCounters; 12] = [
     LatencyCounters::new("multi_get"),
     LatencyCounters::new("put"),
     LatencyCounters::new("delete"),
+    LatencyCounters::new("read_context"),
 ];
 
 struct OperationCounters {
@@ -433,6 +436,7 @@ fn operation_counters(path: &str) -> Option<&'static OperationCounters> {
         "multi_get" => Some(&OPERATION_COUNTERS[9]),
         "put" => Some(&OPERATION_COUNTERS[10]),
         "delete" => Some(&OPERATION_COUNTERS[11]),
+        "read_context" => Some(&OPERATION_COUNTERS[12]),
         _ => None,
     }
 }
@@ -451,6 +455,7 @@ fn byte_counters(path: &str) -> Option<&'static ByteCounters> {
         "multi_get" => Some(&BYTE_COUNTERS[9]),
         "put" => Some(&BYTE_COUNTERS[10]),
         "delete" => Some(&BYTE_COUNTERS[11]),
+        "read_context" => Some(&BYTE_COUNTERS[12]),
         _ => None,
     }
 }
@@ -469,6 +474,7 @@ fn latency_counters(path: &str) -> Option<&'static LatencyCounters> {
         "multi_get" => Some(&LATENCY_COUNTERS[9]),
         "put" => Some(&LATENCY_COUNTERS[10]),
         "delete" => Some(&LATENCY_COUNTERS[11]),
+        "read_context" => Some(&LATENCY_COUNTERS[12]),
         _ => None,
     }
 }

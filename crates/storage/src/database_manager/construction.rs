@@ -1,7 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
-use storage_provider::{StorageBackend, StorageConfig, StorageConnectionRegistry, StorageProvider};
-use storage_types::{StorageError, StorageResult, context::ErrorContext as _};
+use storage_provider::{
+    StorageBackend, StorageConfig, StorageConnectionConfig, StorageConnectionRegistry,
+    StorageProvider,
+};
+use storage_types::{
+    ReadSequenceProviderCapabilities, StorageError, StorageResult, context::ErrorContext as _,
+};
 use stream::StreamProvider;
 use tokio::sync::RwLock;
 
@@ -245,6 +250,8 @@ impl DatabaseManager {
         let supports_multi_region_replication_control_plane = default_connection
             .backend_type
             .supports_multi_region_replication_control_plane();
+        let read_sequence_capabilities =
+            read_sequence_capabilities_for_connection(default_connection);
         let mut providers: HashMap<String, Arc<dyn DatabaseTrait>> =
             HashMap::with_capacity(registry.connections.len());
         let mut queue_providers: HashMap<String, Arc<dyn queue_provider::QueueProvider>> =
@@ -350,6 +357,7 @@ impl DatabaseManager {
             #[cfg(test)]
             pause_after_storage_write: runtime_options.pause_after_storage_write.clone(),
             supports_multi_region_replication_control_plane,
+            read_sequence_capabilities,
             table_info_cache: RwLock::new(HashMap::new()),
         };
         Tables::create_sys_namespaces_table(&manager)
@@ -395,7 +403,69 @@ impl DatabaseManager {
             #[cfg(test)]
             pause_after_storage_write: None,
             supports_multi_region_replication_control_plane: true,
+            read_sequence_capabilities: ReadSequenceProviderCapabilities::default(),
             table_info_cache: RwLock::new(HashMap::new()),
         }
+    }
+}
+
+pub(super) fn read_sequence_capabilities_for_connection(
+    connection: &StorageConnectionConfig,
+) -> ReadSequenceProviderCapabilities {
+    ReadSequenceProviderCapabilities {
+        eventual_reads: true,
+        strong_reads: true,
+        transactional_reads: !matches!(connection.backend_type, StorageBackend::Remote),
+        transactional_snapshots: connection_transactional_snapshots(connection),
+        immediate_gsi_consistency: connection_immediate_gsi_consistency(connection),
+    }
+}
+
+fn connection_transactional_snapshots(connection: &StorageConnectionConfig) -> bool {
+    match connection.backend_type {
+        StorageBackend::SQLite => sqlite_file_backed_snapshots_supported(connection),
+        StorageBackend::Postgres => true,
+        StorageBackend::Turso => true,
+        StorageBackend::RocksDB | StorageBackend::FoundationDb => true,
+        StorageBackend::Remote => false,
+    }
+}
+
+fn sqlite_file_backed_snapshots_supported(connection: &StorageConnectionConfig) -> bool {
+    let path = connection.connection_string.as_deref().unwrap_or("main.db");
+    if path == ":memory:" {
+        return false;
+    }
+    let force_file_backed = connection
+        .sqlite
+        .as_ref()
+        .is_some_and(|settings| settings.force_file_backed_database);
+    force_file_backed
+        || (!cfg!(test) && std::env::var("RUST_TEST_THREADS").is_err() && !path.contains("test"))
+}
+
+fn connection_immediate_gsi_consistency(connection: &StorageConnectionConfig) -> bool {
+    match connection.backend_type {
+        StorageBackend::SQLite => connection
+            .sqlite
+            .as_ref()
+            .is_some_and(|settings| settings.immediate_gsi_consistency),
+        StorageBackend::Turso => connection
+            .turso
+            .as_ref()
+            .is_some_and(|settings| settings.immediate_gsi_consistency),
+        StorageBackend::Postgres => connection
+            .postgres
+            .as_ref()
+            .is_some_and(|settings| settings.immediate_gsi_consistency),
+        StorageBackend::RocksDB => connection
+            .rocksdb
+            .as_ref()
+            .is_some_and(|settings| settings.immediate_gsi_consistency),
+        StorageBackend::FoundationDb => connection
+            .foundationdb
+            .as_ref()
+            .is_some_and(|settings| settings.immediate_gsi_consistency),
+        StorageBackend::Remote => false,
     }
 }

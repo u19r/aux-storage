@@ -14,7 +14,7 @@ pub mod helpers;
 pub mod key_template;
 pub mod keyspace;
 pub mod newtypes;
-mod partition_family;
+pub mod partition_family;
 pub mod partition_reconcile;
 pub mod partition_runtime_load;
 pub mod pubsub;

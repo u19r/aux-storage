@@ -1,10 +1,10 @@
-use std::time::Instant;
+use std::{collections::BTreeSet, time::Instant};
 
 use async_trait::async_trait;
 use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig, errors::JobError};
 use storage_types::{
-    DurationSeconds, ItemKey, ItemStreamVersion, StorageResult, StreamItemId, StreamKey,
-    StreamName, TimestampMillis, UserStreamName, context::ErrorContext,
+    DurationSeconds, ItemKey, ItemStreamVersion, StorageError, StorageResult, StreamItemId,
+    StreamKey, StreamName, TableName, TimestampMillis, UserStreamName, context::ErrorContext,
 };
 use stream_provider::{
     CursorName, CursorPage, CursorPosition, PointerRecordsResult, StoredStreamPointer, Stream,
@@ -20,7 +20,10 @@ use crate::{
     },
     helpers::increment_bytes,
     key_template::{KeyTemplate, PlaceholderBinding},
-    keyspace::stream_keys::{self, CompactStreamRange},
+    keyspace::{
+        compact,
+        stream_keys::{self, CompactStreamRange},
+    },
     partition_family::{
         DEFAULT_ORDERED_LOG_PARTITION_COUNT, OrderedLogSplitBoundary, PartitionFamilyKind,
         PartitionFamilyKvStore, PartitionInfo, ResolvedPartitionFamily,
@@ -29,10 +32,9 @@ use crate::{
         ordered_log_hash, ordered_log_partition_prefix_with_slot,
         ordered_log_partition_prefixes_for_infos, ordered_log_split_marker_family_prefix,
         parse_ordered_log_split_boundary_from_key, parse_ordered_log_split_marker,
-        parse_partition_family_config, parse_partition_info, parse_partitioned_stream_item_id,
-        partition_family_config_bytes, partition_family_epoch_bytes, partition_info_bytes,
-        stream_partition_marker_bytes, stream_partition_marker_key,
-        supports_pointer_stream_partitioning,
+        parse_partitioned_stream_item_id, partition_family_config_bytes,
+        partition_family_epoch_bytes, partition_info_bytes, stream_partition_marker_bytes,
+        stream_partition_marker_key, supports_pointer_stream_partitioning,
     },
     sorted_kv::SortedKvDbStorageProvider,
     sorted_kv_store::{RangeResult, RawKey, TransactWriteOperation},
@@ -46,6 +48,31 @@ use crate::{
 const TTL_CLEANUP_JOB_ID: BackgroundJobName = BackgroundJobName::Database {
     kind: bg_jobs::DatabaseJobKind::StreamTtlCleanup,
 };
+
+#[derive(Debug, Default)]
+pub struct DirectStreamPointerAudit {
+    pub table_stream_rows: u64,
+    pub table_pointer_index_rows: u64,
+    pub decoded_pointer_rows: u64,
+    pub embedded_pointer_rows: u64,
+    pub missing_system_rows: u64,
+    pub missing_table_pointer_indexes: u64,
+    pub missing_item_stream_rows: u64,
+    pub missing_item_pointer_indexes: u64,
+    pub orphaned_table_pointer_indexes: u64,
+    pub decoupled_pointer_target_rows: u64,
+}
+
+impl DirectStreamPointerAudit {
+    #[must_use]
+    pub const fn anomaly_count(&self) -> u64 {
+        self.missing_system_rows
+            + self.missing_table_pointer_indexes
+            + self.missing_item_stream_rows
+            + self.missing_item_pointer_indexes
+            + self.orphaned_table_pointer_indexes
+    }
+}
 
 /// Background job for cleaning up expired stream items based on TTL
 pub struct TtlCleanupJob<S: PartitionFamilyKvStore + 'static> {
@@ -465,12 +492,16 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
     async fn read_item_stream_backward_from_pointer(
         &self,
         stream_name: StreamName,
-        pointer_stream_item_id: StreamItemId,
-        _target_item_stream_version: ItemStreamVersion,
+        _pointer_stream_item_id: StreamItemId,
+        target_item_stream_version: ItemStreamVersion,
         limit: u32,
     ) -> StreamResult<StreamPage> {
-        self.read_backward(stream_name, Some(pointer_stream_item_id.increment()), limit)
-            .await
+        self.read_backward(
+            stream_name,
+            Some(StreamItemId::from(target_item_stream_version).increment()),
+            limit,
+        )
+        .await
     }
 
     async fn get_items_from_pointer_stream(
@@ -638,6 +669,10 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
     }
 
     async fn start_cleanup_task(&self, _parallelism: usize) -> StreamResult<()> {
+        if !self.database_jobs_enabled {
+            return Ok(());
+        }
+
         if self.job_manager.is_job_running(TTL_CLEANUP_JOB_ID).await {
             return Ok(());
         }
@@ -766,6 +801,8 @@ enum DecodedPointerItem {
     },
 }
 
+type RawRangeItem = (Box<[u8]>, Box<[u8]>);
+
 fn compact_range(range: CompactStreamRange) -> crate::keyspace::compact::KeyRange {
     match range {
         CompactStreamRange::System(range)
@@ -793,7 +830,170 @@ fn stream_page_from_compact_range(range_result: RangeResult) -> StreamResult<Str
     })
 }
 
+fn stream_item_ids_from_compact_keys(
+    items: &[RawRangeItem],
+) -> StorageResult<BTreeSet<StreamItemId>> {
+    Ok(items
+        .iter()
+        .filter_map(|(key, _)| stream_keys::stream_item_id_from_compact_key(key))
+        .collect::<BTreeSet<_>>())
+}
+
+fn item_stream_ids_from_compact_keys(items: &[RawRangeItem]) -> StorageResult<BTreeSet<Vec<u8>>> {
+    let mut out = BTreeSet::new();
+    for (key, _) in items {
+        match compact::parse_compact_key(key)
+            .map_err(|err| StorageError::internal(&err.to_string()))?
+        {
+            compact::ParsedCompactKey::ItemStreamRow { item_scope, .. }
+            | compact::ParsedCompactKey::StreamPointerItemIndex { item_scope, .. } => {
+                out.insert(item_scope.to_vec());
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
+    pub async fn audit_table_stream_pointer_integrity(
+        &self,
+        table_name: &TableName,
+        limit: u32,
+    ) -> StorageResult<DirectStreamPointerAudit> {
+        let table = self
+            .get_table_identity_from_name(table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(table_name))?;
+        let table_identity = &table.identity;
+        let limit = limit.max(1);
+        let table_range = compact::table_stream_prefix(table_identity.table_id);
+        let table_rows = self
+            .kv_store
+            .get_range(
+                &table_range.start,
+                &table_range.end,
+                Some(limit),
+                None::<RawKey>,
+                true,
+            )
+            .await?;
+        let table_pointer_range = compact::stream_pointer_table_prefix(table_identity.table_id);
+        let table_pointer_rows = self
+            .kv_store
+            .get_range(
+                &table_pointer_range.start,
+                &table_pointer_range.end,
+                Some(limit),
+                None::<RawKey>,
+                true,
+            )
+            .await?;
+        let system_range = compact::system_stream_prefix();
+        let system_rows = self
+            .kv_store
+            .get_range(
+                &system_range.start,
+                &system_range.end,
+                Some(limit),
+                None::<RawKey>,
+                true,
+            )
+            .await?;
+        let item_range = compact::item_stream_table_prefix(table_identity.table_id);
+        let item_rows = self
+            .kv_store
+            .get_range(
+                &item_range.start,
+                &item_range.end,
+                Some(limit),
+                None::<RawKey>,
+                true,
+            )
+            .await?;
+        let item_pointer_range = compact::stream_pointer_item_table_prefix(table_identity.table_id);
+        let item_pointer_rows = self
+            .kv_store
+            .get_range(
+                &item_pointer_range.start,
+                &item_pointer_range.end,
+                Some(limit),
+                None::<RawKey>,
+                true,
+            )
+            .await?;
+
+        let mut audit = DirectStreamPointerAudit::default();
+        let mut table_stream_ids = BTreeSet::new();
+        let system_stream_ids = stream_item_ids_from_compact_keys(&system_rows.items)?;
+        let table_pointer_ids = stream_item_ids_from_compact_keys(&table_pointer_rows.items)?;
+        let item_stream_ids = item_stream_ids_from_compact_keys(&item_rows.items)?;
+        let item_pointer_ids = item_stream_ids_from_compact_keys(&item_pointer_rows.items)?;
+
+        for (key, value) in &table_rows.items {
+            audit.table_stream_rows += 1;
+            let Some(pointer_id) = stream_keys::stream_item_id_from_compact_key(key) else {
+                audit.missing_table_pointer_indexes += 1;
+                continue;
+            };
+            table_stream_ids.insert(pointer_id);
+            let stored = decode_stream_item(value)?;
+            if stored.data_type != StreamDataType::StreamPointer {
+                audit.missing_table_pointer_indexes += 1;
+                continue;
+            }
+            let pointer = decode_compact_pointer(&stored.data)?;
+            audit.decoded_pointer_rows += 1;
+            if pointer.items.is_some() {
+                audit.embedded_pointer_rows += 1;
+            }
+            if pointer.table_id != table_identity.table_id {
+                audit.missing_item_stream_rows += 1;
+                continue;
+            }
+            let target_item_id = StreamItemId::from(pointer.item_stream_version);
+            if target_item_id != pointer_id {
+                audit.decoupled_pointer_target_rows += 1;
+            }
+
+            if !system_stream_ids.contains(&pointer_id) {
+                audit.missing_system_rows += 1;
+            }
+
+            if !table_pointer_ids.contains(&pointer_id) {
+                audit.missing_table_pointer_indexes += 1;
+            }
+
+            let mut item_target_key = pointer.item_scope.clone();
+            item_target_key.extend_from_slice(target_item_id.as_bytes());
+            if !item_stream_ids.contains(&item_target_key) {
+                audit.missing_item_stream_rows += 1;
+            }
+
+            if !item_pointer_ids.contains(&item_target_key) {
+                audit.missing_item_pointer_indexes += 1;
+            }
+        }
+
+        for (key, _) in table_pointer_rows.items {
+            audit.table_pointer_index_rows += 1;
+            match compact::parse_compact_key(&key)
+                .map_err(|err| StorageError::internal(&err.to_string()))?
+            {
+                compact::ParsedCompactKey::StreamPointerTableIndex { stream_item_id, .. } => {
+                    let pointer_id = StreamItemId::try_from(stream_item_id)
+                        .map_err(|err| StorageError::internal(&err.to_string()))?;
+                    if !table_stream_ids.contains(&pointer_id) {
+                        audit.orphaned_table_pointer_indexes += 1;
+                    }
+                }
+                _ => audit.orphaned_table_pointer_indexes += 1,
+            }
+        }
+
+        Ok(audit)
+    }
+
     async fn decode_pointer_item(
         &self,
         pointer_item: &StreamItem,
@@ -808,7 +1008,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                 let items = items
                     .into_iter()
                     .map(|item| StreamItem {
-                        id: pointer_item.id,
+                        id: StreamItemId::from(pointer.item_stream_version),
                         stream_name: None,
                         data: item.data,
                         data_type: item.data_type,
@@ -848,7 +1048,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                 let items = items
                     .into_iter()
                     .map(|item| StreamItem {
-                        id: pointer_item.id,
+                        id: StreamItemId::from(item_stream_version),
                         stream_name: None,
                         data: item.data,
                         data_type: item.data_type,
@@ -979,31 +1179,21 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             return Ok(Some(cached));
         }
 
-        let config_key =
-            crate::partition_family::partition_family_config_key(family_kind, family_component);
-        let Some(config_bytes) = self.kv_store.get(&config_key, true).await? else {
+        let Some(mut family) = self
+            .kv_store
+            .load_partition_family_state_raw(family_kind, family_component)
+            .await?
+        else {
             self.invalidate_partition_family_cache(&cache_key);
             return Ok(None);
         };
-        let config = parse_partition_family_config(&config_bytes)?;
 
-        let partition_prefix =
-            crate::partition_family::partition_info_prefix(family_kind, family_component);
-        let partition_entries = self
-            .kv_store
-            .get_prefix(&partition_prefix, true, None, true)
-            .await?;
-        let mut partitions = Vec::with_capacity(partition_entries.items.len());
-        for (_key, value) in partition_entries.items {
-            partitions.push(parse_partition_info(&value)?);
-        }
         if family_kind == PartitionFamilyKind::OrderedLog {
             let boundaries = self
                 .load_ordered_log_split_boundaries(family_component)
                 .await?;
-            apply_ordered_log_split_boundaries(&mut partitions, &boundaries);
+            apply_ordered_log_split_boundaries(&mut family.partitions, &boundaries);
         }
-        let mut family = ResolvedPartitionFamily { config, partitions };
         family.sort_by_hash_range();
         self.cache_partition_family(cache_key, family.clone());
 

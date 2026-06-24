@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use http_error::HttpApiError;
 use storage::{QueryIndexInput, QueryTableInput};
+use storage_provider::StorageProviderReadContext;
 use storage_types::{
     AttributeValue, IndexName, KeySchemaElement, QueryRequest, QueryResponse, StorageEnum,
     StorageError, StoredTableInfo, TableName, WireItem, context::WrappedError,
@@ -37,6 +38,24 @@ impl StorageApiManagerImpl {
     pub(super) async fn query_internal(
         &self,
         request: QueryRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.query_internal_with_context(request, QueryReadContext::Manager)
+            .await
+    }
+
+    pub(super) async fn query_internal_with_read_context(
+        &self,
+        request: QueryRequest,
+        read_context: &dyn StorageProviderReadContext,
+    ) -> Result<Response, HttpApiError> {
+        self.query_internal_with_context(request, QueryReadContext::Provider(read_context))
+            .await
+    }
+
+    async fn query_internal_with_context(
+        &self,
+        request: QueryRequest,
+        read_context: QueryReadContext<'_>,
     ) -> Result<Response, HttpApiError> {
         let mut query_expressions = vec![request.key_condition_expression.as_str()];
         if let Some(filter_expr) = request.filter_expression.as_deref() {
@@ -79,11 +98,12 @@ impl StorageApiManagerImpl {
 
         if query_wire_fast_path_enabled(&request) {
             return self
-                .query_wire_internal(&request, table_info, prepared_query)
+                .query_wire_internal(&request, table_info, prepared_query, read_context)
                 .await;
         }
 
-        let (items, last_evaluated_key) = self.query_map_items(&prepared_query).await?;
+        let (items, last_evaluated_key) =
+            self.query_map_items(&prepared_query, read_context).await?;
 
         // Apply filtering if FilterExpression is provided
         #[expect(clippy::cast_possible_truncation)]
@@ -161,8 +181,10 @@ impl StorageApiManagerImpl {
         request: &QueryRequest,
         table_info: StoredTableInfo,
         prepared_query: PreparedQuery<'_>,
+        read_context: QueryReadContext<'_>,
     ) -> Result<Response, HttpApiError> {
-        let (items, last_evaluated_key) = self.query_wire_items(&prepared_query).await?;
+        let (items, last_evaluated_key) =
+            self.query_wire_items(&prepared_query, read_context).await?;
 
         #[expect(clippy::cast_possible_truncation)]
         let scanned_count = items.len() as u32;
@@ -200,7 +222,18 @@ impl StorageApiManagerImpl {
     async fn query_map_items(
         &self,
         query: &PreparedQuery<'_>,
+        read_context: QueryReadContext<'_>,
     ) -> Result<(Vec<HashMap<String, AttributeValue>>, Option<String>), HttpApiError> {
+        if let QueryReadContext::Provider(provider_context) = read_context {
+            let (items, last_evaluated_key) =
+                provider_context.query_table(&query.request()?).await?;
+            let mut decoded = Vec::with_capacity(items.len());
+            for item in items {
+                decoded.push(item.into_attribute_map()?);
+            }
+            return Ok((decoded, last_evaluated_key));
+        }
+
         if let Some(index_name) = query.index_name {
             return Ok(self
                 .db()
@@ -215,7 +248,12 @@ impl StorageApiManagerImpl {
     async fn query_wire_items(
         &self,
         query: &PreparedQuery<'_>,
+        read_context: QueryReadContext<'_>,
     ) -> Result<(Vec<WireItem>, Option<String>), HttpApiError> {
+        if let QueryReadContext::Provider(provider_context) = read_context {
+            return Ok(provider_context.query_table(&query.request()?).await?);
+        }
+
         if let Some(index_name) = query.index_name {
             return Ok(self
                 .db()
@@ -226,6 +264,12 @@ impl StorageApiManagerImpl {
         self.ensure_sync_read_barrier(query.consistent_read).await?;
         Ok(self.db().query_table(query.table_input()).await?)
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum QueryReadContext<'a> {
+    Manager,
+    Provider(&'a dyn StorageProviderReadContext),
 }
 
 pub(super) fn validate_query_key_condition_values(
@@ -590,5 +634,12 @@ impl<'a> PreparedQuery<'a> {
             scan_index_forward: self.scan_index_forward,
             consistent_read: self.consistent_read,
         }
+    }
+
+    fn request(&self) -> Result<storage_types::QueryTableRequest, HttpApiError> {
+        if let Some(index_name) = self.index_name {
+            return Ok(self.index_input(index_name)?.into());
+        }
+        Ok(self.table_input().into())
     }
 }

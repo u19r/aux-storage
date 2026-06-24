@@ -1,9 +1,19 @@
 #[cfg(feature = "foundationdb-backend")]
+mod conflicts;
+#[cfg(feature = "foundationdb-backend")]
 mod constants;
+#[cfg(feature = "foundationdb-backend")]
+mod error;
 #[cfg(feature = "foundationdb-backend")]
 mod keyspace;
 #[cfg(feature = "foundationdb-backend")]
 mod metrics;
+#[cfg(feature = "foundationdb-backend")]
+mod network;
+#[cfg(feature = "foundationdb-backend")]
+mod range_read;
+#[cfg(feature = "foundationdb-backend")]
+mod read_context;
 #[cfg(feature = "foundationdb-backend")]
 mod store;
 

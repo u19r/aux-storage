@@ -8,16 +8,38 @@ use storage_types::{
     DurableBatchPointReadProofEntry, DurableBatchPointReadRequest, DurablePointReadProof,
     DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
     GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, ItemVersionedWireItem,
-    KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReplicationMutation,
-    ScanTableRequest, SplitDynamoItem, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, TableName, TableStatus, TransactWriteItemsEncodeRequest,
-    UpdateItemRequest, UpdateItemResponse, WireItem,
+    KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    ReplicationMutation, ScanTableRequest, SplitDynamoItem, StorageError, StorageResult,
+    StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
+    TransactWriteItemsEncodeRequest, UpdateItemRequest, UpdateItemResponse, WireItem,
 };
 
 use crate::{
     AttributeValue, ChangeIndexMarker, ListChangeIndexMarkersRequest, StreamTrimDueMarker,
     StreamTrimState,
 };
+
+/// Provider-owned read context for operations that must share one backend
+/// snapshot/read version.
+#[async_trait]
+pub trait StorageProviderReadContext: Send + Sync {
+    async fn get_item(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<WireItem>>;
+
+    async fn batch_get_item(
+        &self,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse>;
+
+    async fn query_table(
+        &self,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)>;
+}
 
 /// Trait for storage backends that can store `DynamoDB` table metadata
 #[async_trait]
@@ -36,6 +58,16 @@ pub trait StorageProvider: Send + Sync {
 
     fn supports_change_index(&self) -> bool {
         false
+    }
+
+    async fn begin_read_sequence_read_context(
+        &self,
+        consistency: ReadSequenceConsistency,
+    ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
+        let _ = consistency;
+        Err(StorageError::unsupported(
+            "read-sequence provider read contexts are not supported by this backend",
+        ))
     }
 
     /// Initialize the storage backend

@@ -297,6 +297,26 @@ impl TransactWriteOutput {
 }
 
 #[async_trait::async_trait]
+pub trait SortedKvReadContext: Send + Sync {
+    async fn get(&self, key: &[u8], consistent_read: bool) -> StorageResult<Option<Vec<u8>>>;
+
+    async fn multi_get(
+        &self,
+        keys: Vec<Vec<u8>>,
+        consistent_read: bool,
+    ) -> StorageResult<Vec<Option<Vec<u8>>>>;
+
+    async fn get_range_values(
+        &self,
+        start: &[u8],
+        exclusive_end: &[u8],
+        limit: Option<u32>,
+        page_token: Option<RawKey>,
+        consistent_read: bool,
+    ) -> StorageResult<RangeValuesResult>;
+}
+
+#[async_trait::async_trait]
 pub trait SortedKvStore: Send + Sync + Clone {
     async fn transact_write(
         &self,
@@ -317,6 +337,12 @@ pub trait SortedKvStore: Send + Sync + Clone {
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<OldNewItems>>;
     async fn batch_write(&self, items: Vec<BatchItem>) -> StorageResult<()>;
+
+    async fn begin_read_context(&self) -> StorageResult<Box<dyn SortedKvReadContext>> {
+        Err(StorageError::unsupported(
+            "sorted kv read contexts are not supported by this backend",
+        ))
+    }
 
     async fn get(&self, key: &[u8], consistent_read: bool) -> StorageResult<Option<Vec<u8>>>;
 

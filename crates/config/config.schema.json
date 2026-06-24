@@ -578,7 +578,7 @@
           "type": "boolean"
         },
         "max_pool_size": {
-          "default": 24,
+          "default": 20,
           "format": "uint",
           "minimum": 0,
           "type": "integer"

@@ -5,11 +5,12 @@ use storage_provider::{
     StorageProvider, StreamTrimDueMarker, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
 };
 use storage_types::{
-    AttributeDefinition, AttributeValue, BatchWriteItemRequest, BillingMode,
+    AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchWriteItemRequest, BillingMode,
     CreateGlobalSecondaryIndex, CreateTableRequest, DeleteRequest, IndexName, KeyAttributeType,
-    KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest, QueryTableRequest,
-    StorageEnum, StreamItemId, StreamName, StreamRetentionDuration, StreamSpecification,
-    StreamViewType, TableName, TimestampMillis, UserStreamName, WriteRequest,
+    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, PutRequest,
+    QueryTableRequest, ReadSequenceConsistency, StorageEnum, StreamItemId, StreamName,
+    StreamRetentionDuration, StreamSpecification, StreamViewType, TableName, TimestampMillis,
+    UserStreamName, WriteRequest,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamEnum, StreamProvider,
@@ -88,6 +89,154 @@ async fn turso_capabilities_advertise_durable_item_guards_without_transactions()
     let provider = create_test_provider().await;
     assert!(provider.supports_guarded_writes());
     assert!(!provider.supports_guarded_transaction_writes());
+}
+
+#[tokio::test]
+async fn turso_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_query() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("read-sequence-snapshot.db");
+    let provider = TursoStorageProvider::new(db_path.to_string_lossy().as_ref())
+        .await
+        .expect("create turso provider");
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage");
+
+    let table_name = TableName::new(&format!("turso_read_sequence_{}", uuid::Uuid::now_v7()));
+    provider
+        .create_table(&basic_create_table_request(&table_name))
+        .await
+        .expect("create table");
+    provider
+        .put_item(
+            table_name.clone(),
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("u-1".to_string())),
+                ("name".to_string(), AttributeValue::S("before".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed item");
+
+    let key = storage_types::KeyAttributes::from([(
+        "pk".to_string(),
+        AttributeValue::S("u-1".to_string()),
+    )]);
+    let read_context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await
+        .expect("begin read sequence context");
+    let initial = read_context
+        .get_item(table_name.clone(), key.clone(), true)
+        .await
+        .expect("snapshot get")
+        .expect("snapshot item")
+        .to_attribute_map()
+        .expect("decode snapshot item");
+    assert_eq!(
+        initial.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    provider
+        .put_item(
+            table_name.clone(),
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("u-1".to_string())),
+                ("name".to_string(), AttributeValue::S("after".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("update item outside snapshot");
+
+    let ordinary_read = provider
+        .get_item(table_name.clone(), key.clone(), true)
+        .await
+        .expect("ordinary get")
+        .expect("ordinary item")
+        .to_attribute_map()
+        .expect("decode ordinary item");
+    assert_eq!(
+        ordinary_read.get("name"),
+        Some(&AttributeValue::S("after".to_string()))
+    );
+
+    let snapshot_get = read_context
+        .get_item(table_name.clone(), key.clone(), true)
+        .await
+        .expect("snapshot get after update")
+        .expect("snapshot item after update")
+        .to_attribute_map()
+        .expect("decode snapshot get item");
+    assert_eq!(
+        snapshot_get.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let snapshot_batch = read_context
+        .batch_get_item(BatchGetItemRequest {
+            request_items: HashMap::from([(
+                table_name.clone(),
+                KeysAndAttributes {
+                    keys: vec![key.clone()].into(),
+                    attributes_to_get: None,
+                    projection_expression: None,
+                    expression_attribute_names: None,
+                    consistent_read: Some(true),
+                },
+            )]),
+            return_consumed_capacity: None,
+        })
+        .await
+        .expect("snapshot batch get");
+    let snapshot_batch_item = snapshot_batch
+        .responses
+        .as_ref()
+        .and_then(|responses| responses.get(&table_name))
+        .and_then(|items| items.first())
+        .expect("snapshot batch item")
+        .to_attribute_map()
+        .expect("decode snapshot batch item");
+    assert_eq!(
+        snapshot_batch_item.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let (snapshot_query, _) = read_context
+        .query_table(&QueryTableRequest {
+            table_name: table_name.clone(),
+            index_name: None,
+            key_condition_expression: "pk = :pk".to_string(),
+            expression_attribute_names: None,
+            expression_attribute_values: Some(HashMap::from([(
+                ":pk".to_string(),
+                AttributeValue::S("u-1".to_string()),
+            )])),
+            limit: Some(10),
+            exclusive_start_key: None,
+            scan_index_forward: Some(true),
+            consistent_read: true,
+        })
+        .await
+        .expect("snapshot query");
+    let snapshot_query_item = snapshot_query
+        .first()
+        .expect("snapshot query item")
+        .to_attribute_map()
+        .expect("decode snapshot query item");
+    assert_eq!(
+        snapshot_query_item.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
 }
 
 #[test]

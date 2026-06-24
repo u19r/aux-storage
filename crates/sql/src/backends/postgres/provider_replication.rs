@@ -3,7 +3,8 @@ use storage_types::{ReplicationMutation, StorageResult, WireItem};
 use tokio_postgres::types::ToSql;
 
 use crate::backends::postgres::{
-    PostgresStorageProvider, sql_statements, stream_helpers::PostgresWriteStreamEntriesInput,
+    PostgresStorageProvider, physical_names, sql_statements,
+    stream_helpers::PostgresWriteStreamEntriesInput,
 };
 
 const REPLICATION_APPLY_PARALLELISM_HINT: usize = 4;
@@ -60,7 +61,7 @@ impl PostgresStorageProvider {
                         })?
                     };
 
-                    let table_name_safe = table_name.sanitized_name();
+                    let physical_table_name = physical_names::physical_table_name(&table_name);
                     let key_columns = key_bindings
                         .iter()
                         .map(|binding| binding.column.clone())
@@ -89,7 +90,7 @@ impl PostgresStorageProvider {
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = sql_statements::upsert_main_row(
-                        &table_name_safe,
+                        &physical_table_name,
                         &columns_sql,
                         &values_placeholders,
                         &conflict_target,
@@ -187,8 +188,8 @@ impl PostgresStorageProvider {
                 )?;
                 let mut bind_values = Vec::with_capacity(key_bindings.len());
                 let where_sql = Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
-                let table_name_safe = table_name.sanitized_name();
-                let sql = sql_statements::delete_main_row(&table_name_safe, &where_sql);
+                let physical_table_name = physical_names::physical_table_name(&table_name);
+                let sql = sql_statements::delete_main_row(&physical_table_name, &where_sql);
                 let params: Vec<&(dyn ToSql + Sync)> = bind_values
                     .iter()
                     .map(|value| value as &(dyn ToSql + Sync))

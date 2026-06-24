@@ -286,7 +286,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         let entry = Arc::new(PartitionFamilyCacheEntry::new(family, generation));
         self.partition_family_cache_lru.insert(key.clone(), entry);
 
-        if !self.kv_store.supports_partition_families() {
+        if !self.database_jobs_enabled || !self.kv_store.supports_partition_families() {
             return;
         }
 

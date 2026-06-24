@@ -1,0 +1,14 @@
+[[test]]
+testTitle = "AuxStorageFdbChaosPartitionFamily"
+
+  [[test.workload]]
+  testName = "External"
+  workloadName = "partition_family"
+  libraryPath = "target/release"
+  libraryName = "aux_storage_fdb_chaos"
+  useCAPI = true
+  profile = "smoke"
+  operationCount = 0
+  activeClientCount = 1
+  historySampleLimit = 0
+  artifactRoot = "run-artifacts/fdb-chaos"

@@ -494,8 +494,8 @@ pub fn delete_table_metadata() -> &'static str {
 }
 
 #[must_use]
-pub fn drop_physical_table(table_name_safe: &str) -> String {
-    format!("DROP TABLE IF EXISTS \"table_{table_name_safe}\"")
+pub fn drop_physical_table(physical_table_name: &str) -> String {
+    format!("DROP TABLE IF EXISTS \"{physical_table_name}\"")
 }
 
 #[must_use]
@@ -535,26 +535,26 @@ pub fn update_global_secondary_indexes() -> &'static str {
 
 #[must_use]
 pub fn upsert_main_row(
-    table_name_safe: &str,
+    physical_table_name: &str,
     columns_sql: &str,
     placeholders: &str,
     conflict_target: &str,
     assignments: &str,
 ) -> String {
     format!(
-        "INSERT INTO \"table_{table_name_safe}\" ({columns_sql}) VALUES ({placeholders}) ON \
+        "INSERT INTO \"{physical_table_name}\" ({columns_sql}) VALUES ({placeholders}) ON \
          CONFLICT ({conflict_target}) DO UPDATE SET {assignments}"
     )
 }
 
 #[must_use]
-pub fn insert_main_row(table_name_safe: &str, columns_sql: &str, placeholders: &str) -> String {
-    format!("INSERT INTO \"table_{table_name_safe}\" ({columns_sql}) VALUES ({placeholders})")
+pub fn insert_main_row(physical_table_name: &str, columns_sql: &str, placeholders: &str) -> String {
+    format!("INSERT INTO \"{physical_table_name}\" ({columns_sql}) VALUES ({placeholders})")
 }
 
 #[must_use]
 pub fn upsert_main_row_returning(
-    table_name_safe: &str,
+    physical_table_name: &str,
     columns_sql: &str,
     placeholders: &str,
     conflict_target: &str,
@@ -563,7 +563,7 @@ pub fn upsert_main_row_returning(
     format!(
         "{} RETURNING 1",
         upsert_main_row(
-            table_name_safe,
+            physical_table_name,
             columns_sql,
             placeholders,
             conflict_target,
@@ -574,13 +574,13 @@ pub fn upsert_main_row_returning(
 
 #[must_use]
 pub fn insert_main_row_returning(
-    table_name_safe: &str,
+    physical_table_name: &str,
     columns_sql: &str,
     placeholders: &str,
 ) -> String {
     format!(
         "{} RETURNING 1",
-        insert_main_row(table_name_safe, columns_sql, placeholders)
+        insert_main_row(physical_table_name, columns_sql, placeholders)
     )
 }
 
@@ -594,8 +594,8 @@ pub fn bump_item_revision_with_placeholders(table_name: &str, key_json: &str) ->
 }
 
 #[must_use]
-pub fn delete_main_row(table_name_safe: &str, where_sql: &str) -> String {
-    format!("DELETE FROM \"table_{table_name_safe}\" WHERE {where_sql}")
+pub fn delete_main_row(physical_table_name: &str, where_sql: &str) -> String {
+    format!("DELETE FROM \"{physical_table_name}\" WHERE {where_sql}")
 }
 
 #[must_use]
@@ -708,8 +708,8 @@ pub fn dml_ctes_returning_last_column(statements: &[String], column: &str) -> St
 }
 
 #[must_use]
-pub fn get_item(table_name_safe: &str, select_projection: &str, where_sql: &str) -> String {
-    format!("SELECT {select_projection} FROM \"table_{table_name_safe}\" WHERE {where_sql} LIMIT 1")
+pub fn get_item(physical_table_name: &str, select_projection: &str, where_sql: &str) -> String {
+    format!("SELECT {select_projection} FROM \"{physical_table_name}\" WHERE {where_sql} LIMIT 1")
 }
 
 #[must_use]

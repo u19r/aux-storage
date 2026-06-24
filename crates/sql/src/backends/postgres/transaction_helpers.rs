@@ -16,8 +16,8 @@ use tokio_postgres::types::ToSql;
 
 use crate::{
     backends::postgres::{
-        PostgresStorageProvider, sql_key_helpers::PreparedGetItemQuery, sql_statements,
-        stream_helpers::PostgresWriteStreamEntriesInput,
+        PostgresStorageProvider, physical_names, sql_key_helpers::PreparedGetItemQuery,
+        sql_statements, stream_helpers::PostgresWriteStreamEntriesInput,
     },
     provider_core::transaction::{
         all_old, conditional_check_failed_reason, transaction_canceled_for_reason,
@@ -117,7 +117,7 @@ impl PostgresStorageProvider {
                     &key_attributes,
                     None,
                 )?;
-                let table_name_safe = table_name.sanitized_name();
+                let physical_table_name = physical_names::physical_table_name(&table_name);
                 let old_item_query =
                     Self::prepare_get_item_query(&table_name, &key_attributes, &table_info)?;
                 let key_columns = key_bindings
@@ -148,7 +148,7 @@ impl PostgresStorageProvider {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = sql_statements::upsert_main_row_returning(
-                    &table_name_safe,
+                    &physical_table_name,
                     &columns_sql,
                     &placeholders,
                     &conflict_target,
@@ -201,8 +201,8 @@ impl PostgresStorageProvider {
                 )?;
                 let mut bind_values = Vec::with_capacity(key_bindings.len());
                 let where_sql = Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
-                let table_name_safe = table_name.sanitized_name();
-                let sql = sql_statements::delete_main_row(&table_name_safe, &where_sql);
+                let physical_table_name = physical_names::physical_table_name(&table_name);
+                let sql = sql_statements::delete_main_row(&physical_table_name, &where_sql);
                 let old_item_query = Self::prepare_get_item_query(&table_name, &key, &table_info)?;
 
                 Ok(PreparedPostgresBatchOperation::Delete(
@@ -492,7 +492,7 @@ impl PostgresStorageProvider {
             &split_item.key_attributes,
             None,
         )?;
-        let table_name_safe = table_name.sanitized_name();
+        let physical_table_name = physical_names::physical_table_name(table_name);
         let key_columns = key_bindings
             .iter()
             .map(|binding| binding.column.clone())
@@ -521,7 +521,7 @@ impl PostgresStorageProvider {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = sql_statements::upsert_main_row_returning(
-            &table_name_safe,
+            &physical_table_name,
             &columns_sql,
             &placeholders,
             &conflict_target,
@@ -653,8 +653,8 @@ impl PostgresStorageProvider {
         )?;
         let mut bind_values = Vec::with_capacity(key_bindings.len());
         let where_sql = Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
-        let table_name_safe = table_name.sanitized_name();
-        let sql = sql_statements::delete_main_row(&table_name_safe, &where_sql);
+        let physical_table_name = physical_names::physical_table_name(&table_name);
+        let sql = sql_statements::delete_main_row(&physical_table_name, &where_sql);
         let params: Vec<&(dyn ToSql + Sync)> = bind_values
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))

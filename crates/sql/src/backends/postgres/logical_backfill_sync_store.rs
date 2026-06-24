@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use storage_types::{AttributeValue, KeyAttributes, StorageError, StorageResult};
 use tokio_postgres::types::ToSql;
 
-use super::{PostgresStorageProvider, logical_backfill_values::log_component_i64, sql_statements};
+use super::{
+    PostgresStorageProvider, logical_backfill_values::log_component_i64, physical_names,
+    sql_statements,
+};
 
 pub(super) async fn ensure_sync_apply_markers_table<C>(
     _provider: &PostgresStorageProvider,
@@ -166,7 +169,7 @@ where
         .collect::<Vec<_>>()
         .join(", ");
     let sql = sql_statements::upsert_main_row(
-        &table_info.table_name.sanitized_name(),
+        &physical_names::physical_table_name(&table_info.table_name),
         &columns_sql,
         &values_placeholders,
         &conflict_target,
@@ -205,7 +208,10 @@ where
     let mut bind_values = Vec::with_capacity(key_bindings.len());
     let where_sql =
         PostgresStorageProvider::where_clause_for_bindings(&key_bindings, &mut bind_values);
-    let sql = sql_statements::delete_main_row(&table_info.table_name.sanitized_name(), &where_sql);
+    let sql = sql_statements::delete_main_row(
+        &physical_names::physical_table_name(&table_info.table_name),
+        &where_sql,
+    );
     let params = bind_values
         .iter()
         .map(|value| value as &(dyn ToSql + Sync))

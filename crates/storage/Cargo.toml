@@ -23,7 +23,7 @@ postgres = [
     "storage-types/postgres",
     "stream/postgres",
 ]
-rocksdb = ["dep:kv", "storage-types/rocksdb", "stream/rocksdb"]
+rocksdb = ["dep:kv", "kv/rocksdb-backend", "storage-types/rocksdb", "stream/rocksdb"]
 foundationdb = ["dep:kv", "kv/foundationdb-backend", "stream/foundationdb"]
 remote = ["dep:storage-remote"]
 opt-loop-profiling = ["dep:opt-loop-probe"]
@@ -35,7 +35,7 @@ bg-job-store = { path = "../bg-job-store" }
 bg-jobs = { path = "../bg-jobs" }
 config = { path = "../config" }
 futures = { workspace = true }
-kv = { path = "../kv", optional = true }
+kv = { path = "../kv", optional = true, default-features = false }
 lru-ttl-cache = { workspace = true }
 metrics = { workspace = true }
 metrics-facade = { workspace = true }

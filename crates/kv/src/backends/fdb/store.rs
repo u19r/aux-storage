@@ -1,16 +1,12 @@
 use std::{
     collections::HashMap,
     convert::TryFrom,
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use foundationdb::{
-    Database, FdbError, KeySelector, RangeOption, Transaction, TransactionCommitError,
-    api::{FdbApiBuilder, NetworkAutoStop},
-    options,
-};
-use futures_util::{TryStreamExt, future::try_join_all};
+use foundationdb::{Database, FdbError, RangeOption, Transaction, TransactionCommitError, options};
+use futures_util::future::try_join_all;
 #[cfg(test)]
 use storage_common::provider_perf;
 use storage_condition::{Condition, evaluate_condition_bytes};
@@ -23,22 +19,23 @@ use tokio::time;
 use uuid::Uuid;
 
 use super::{
-    constants::{
-        CONFLICT_LOG_MAX_KEYS, CONFLICT_LOG_MAX_RANGES, CONFLICTING_KEYS_PREFIX,
-        READ_CONFLICT_RANGE_PREFIX, WRITE_CONFLICT_RANGE_PREFIX,
-    },
+    error::map_fdb_error,
     keyspace,
     metrics::{
-        record_fdb_conflict_artifacts, record_fdb_operation, record_fdb_operation_bytes,
-        record_fdb_operation_latency, record_fdb_point_read, record_fdb_range_read,
-        record_fdb_transaction_start, record_fdb_write_shape,
+        record_fdb_operation, record_fdb_operation_bytes, record_fdb_operation_latency,
+        record_fdb_point_read, record_fdb_range_read, record_fdb_transaction_start,
+        record_fdb_write_shape,
     },
+    network::{
+        FoundationDbNetworkOwnership, init_network, open_database,
+        validate_simulated_database_config,
+    },
+    read_context::FoundationDbReadContext,
 };
 use crate::{
     backends::common::{
-        KvMutation, RangeKeyDecision, RangeScanSettings, operation_requires_stream_entries,
-        plan_table_write_preflighted, plan_transact_operation, preflight_table_write_operations,
-        table_operation_primary_key,
+        KvMutation, operation_requires_stream_entries, plan_table_write_preflighted,
+        plan_transact_operation, preflight_table_write_operations, table_operation_primary_key,
     },
     constants::FOUNDATIONDB_GET_READ_VERSION_LATENCY_MS_METRIC,
     helpers::increment_bytes,
@@ -62,8 +59,8 @@ use crate::{
         storage::{queue_payload_write_operations, read_partitioned_queue_payload},
     },
     sorted_kv_store::{
-        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, SortedKvStore,
-        TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
+        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, SortedKvReadContext,
+        SortedKvStore, TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
     },
     stream::item_codec::decode_stream_item,
 };
@@ -78,144 +75,18 @@ pub struct FoundationDbConfig {
     pub report_conflicting_keys: bool,
 }
 
-struct FoundationDbNetworkInner {
-    guard: Mutex<Option<NetworkAutoStop>>,
-}
-
-impl FoundationDbNetworkInner {
-    fn new(guard: NetworkAutoStop) -> Self {
-        Self {
-            guard: Mutex::new(Some(guard)),
-        }
-    }
-}
-
-static NETWORK_HANDLE: OnceLock<Arc<FoundationDbNetworkInner>> = OnceLock::new();
-static NETWORK_POLICY: OnceLock<FoundationDbNetworkPolicy> = OnceLock::new();
-static NETWORK_INIT: Mutex<()> = Mutex::new(());
-
-unsafe extern "C" {
-    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
-}
-
-extern "C" fn shutdown_foundationdb_network_at_exit() {
-    let Some(network) = NETWORK_HANDLE.get() else {
-        return;
-    };
-    if let Ok(mut guard) = network.guard.lock() {
-        drop(guard.take());
-    }
-}
-
 type OrderedLogFamilyCache = HashMap<String, ResolvedPartitionFamily>;
 
-pub(super) const DYNAMODB_RANGE_TARGET_BYTES: usize = 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct FoundationDbNetworkPolicy {
-    pub(super) grv_cache_lag_ms: Option<u16>,
-}
-
-impl FoundationDbNetworkPolicy {
-    pub(super) fn for_config(config: &FoundationDbConfig) -> Self {
-        Self {
-            grv_cache_lag_ms: (config.cache_read_version_ms > 0)
-                .then_some(config.cache_read_version_ms),
-        }
+async fn read_fdb_keys_sequential(
+    trx: &Transaction,
+    keys: &[Vec<u8>],
+    snapshot: bool,
+) -> Result<Vec<Option<Vec<u8>>>, FdbError> {
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        values.push(trx.get(key, snapshot).await?.map(|value| value.to_vec()));
     }
-}
-
-pub(super) fn validate_network_policy(
-    existing: FoundationDbNetworkPolicy,
-    requested: FoundationDbNetworkPolicy,
-) -> StorageResult<()> {
-    match (existing.grv_cache_lag_ms, requested.grv_cache_lag_ms) {
-        (None, None) => Ok(()),
-        (Some(existing_lag_ms), Some(requested_lag_ms)) if existing_lag_ms == requested_lag_ms => {
-            Ok(())
-        }
-        (Some(_), None) => Ok(()),
-        (None, Some(requested_lag_ms)) => Err(StorageError::validation(format!(
-            "foundationdb cache_read_version_ms={requested_lag_ms} requires process-level network \
-             options on the first FoundationDB connection; this process already initialized \
-             FoundationDB without GRV caching"
-        ))),
-        (Some(existing_lag_ms), Some(requested_lag_ms)) => Err(StorageError::validation(format!(
-            "foundationdb cache_read_version_ms mismatch in one process: existing \
-             cache_read_version_ms={existing_lag_ms}, requested \
-             cache_read_version_ms={requested_lag_ms}"
-        ))),
-    }
-}
-
-fn apply_network_policy(
-    builder: foundationdb::api::NetworkBuilder,
-    policy: FoundationDbNetworkPolicy,
-) -> StorageResult<foundationdb::api::NetworkBuilder> {
-    let Some(grv_cache_lag_ms) = policy.grv_cache_lag_ms else {
-        return Ok(builder);
-    };
-
-    let builder = builder
-        .set_option(options::NetworkOption::DisableClientBypass)
-        .map_err(|err| map_fdb_error("set disable_client_bypass", err))?;
-    builder
-        .set_option(options::NetworkOption::Knob(format!(
-            "max_version_cache_lag={grv_cache_lag_ms}"
-        )))
-        .map_err(|err| map_fdb_error("set max_version_cache_lag knob", err))
-}
-
-fn init_network(config: &FoundationDbConfig) -> StorageResult<Arc<FoundationDbNetworkInner>> {
-    let requested_policy = FoundationDbNetworkPolicy::for_config(config);
-
-    if let Some(existing) = NETWORK_HANDLE.get() {
-        if let Some(existing_policy) = NETWORK_POLICY.get().copied() {
-            validate_network_policy(existing_policy, requested_policy)?;
-        }
-        return Ok(Arc::clone(existing));
-    }
-
-    let _lock = NETWORK_INIT
-        .lock()
-        .map_err(|_| StorageError::internal("foundationdb network init mutex poisoned"))?;
-
-    if let Some(existing) = NETWORK_HANDLE.get() {
-        if let Some(existing_policy) = NETWORK_POLICY.get().copied() {
-            validate_network_policy(existing_policy, requested_policy)?;
-        }
-        return Ok(Arc::clone(existing));
-    }
-
-    let builder = FdbApiBuilder::default()
-        .build()
-        .map_err(|err| map_fdb_error("initialize FoundationDB API", err))?;
-    let builder = apply_network_policy(builder, requested_policy)?;
-    let guard = unsafe {
-        builder
-            .boot()
-            .map_err(|err| map_fdb_error("start FoundationDB network", err))?
-    };
-    let network = Arc::new(FoundationDbNetworkInner::new(guard));
-
-    NETWORK_POLICY
-        .set(requested_policy)
-        .map_err(|_| StorageError::internal("FoundationDB network policy already initialized"))?;
-    NETWORK_HANDLE
-        .set(Arc::clone(&network))
-        .map_err(|_| StorageError::internal("FoundationDB network already initialized"))?;
-    let registered = unsafe { atexit(shutdown_foundationdb_network_at_exit) };
-    if registered != 0 {
-        return Err(StorageError::internal(
-            "failed to register FoundationDB network shutdown hook",
-        ));
-    }
-
-    Ok(network)
-}
-
-fn map_fdb_error(scope: &str, err: FdbError) -> StorageError {
-    StorageError::internal(&format!("{scope}: {err}"))
+    Ok(values)
 }
 
 fn queue_ready_hint_is_earlier(candidate: &[u8], existing: &[u8]) -> bool {
@@ -226,15 +97,6 @@ fn queue_ready_hint_is_earlier(candidate: &[u8], existing: &[u8]) -> bool {
         return true;
     };
     candidate_timestamp < existing_timestamp
-}
-
-fn open_database(config: &FoundationDbConfig) -> StorageResult<Database> {
-    let database = if let Some(path) = config.cluster_file_path.as_deref() {
-        Database::from_path(path)
-    } else {
-        Database::default()
-    };
-    database.map_err(|err| map_fdb_error("open FoundationDB database", err))
 }
 
 fn adjust_versionstamp_offset(bytes: &mut [u8], added_prefix_len: usize) {
@@ -271,7 +133,7 @@ fn rotate_fdb_claim_candidates<T>(items: &mut [T], seed: u64) {
 #[derive(Clone)]
 pub struct FoundationDbKvStore {
     database: Arc<Database>,
-    _network: Arc<FoundationDbNetworkInner>,
+    _network: FoundationDbNetworkOwnership,
     config: Arc<FoundationDbConfig>,
     runtime_partition_load_tracker: RuntimePartitionLoadTracker,
 }
@@ -287,6 +149,46 @@ struct PendingOrderedLogWrite {
 struct FdbTableWriteExecution {
     results: Vec<OldNewItems>,
     ordered_log_writes: Vec<PendingOrderedLogWrite>,
+}
+
+enum FdbTableWriteExecutionError {
+    Storage(StorageError),
+    Fdb {
+        scope: &'static str,
+        error: FdbError,
+    },
+}
+
+impl FdbTableWriteExecutionError {
+    const fn fdb(scope: &'static str, error: FdbError) -> Self {
+        Self::Fdb { scope, error }
+    }
+}
+
+impl From<StorageError> for FdbTableWriteExecutionError {
+    fn from(value: StorageError) -> Self {
+        Self::Storage(value)
+    }
+}
+
+enum FdbTransactionAttemptError {
+    Storage(StorageError),
+    Fdb {
+        scope: &'static str,
+        error: FdbError,
+    },
+}
+
+impl FdbTransactionAttemptError {
+    const fn fdb(scope: &'static str, error: FdbError) -> Self {
+        Self::Fdb { scope, error }
+    }
+}
+
+impl From<StorageError> for FdbTransactionAttemptError {
+    fn from(value: StorageError) -> Self {
+        Self::Storage(value)
+    }
 }
 
 impl FoundationDbKvStore {
@@ -328,11 +230,14 @@ impl FoundationDbKvStore {
         Self::connect(FoundationDbConfig::default())
     }
 
-    pub fn from_database(config: FoundationDbConfig, database: Database) -> StorageResult<Self> {
-        let network = init_network(&config)?;
+    pub fn from_database(
+        config: FoundationDbConfig,
+        database: Arc<Database>,
+    ) -> StorageResult<Self> {
+        validate_simulated_database_config(&config)?;
         Ok(Self {
-            database: Arc::new(database),
-            _network: network,
+            database,
+            _network: FoundationDbNetworkOwnership::Simulated,
             config: Arc::new(config),
             runtime_partition_load_tracker: RuntimePartitionLoadTracker::default(),
         })
@@ -348,7 +253,16 @@ impl FoundationDbKvStore {
         Arc::clone(&self.config)
     }
 
-    fn create_transaction(&self) -> StorageResult<Transaction> {
+    pub async fn direct_audit_scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: u32,
+    ) -> StorageResult<RangeResult> {
+        self.get_prefix(prefix, true, Some(limit.max(1)), true)
+            .await
+    }
+
+    pub(super) fn create_transaction(&self) -> StorageResult<Transaction> {
         let trx = self
             .database
             .create_trx()
@@ -364,7 +278,7 @@ impl FoundationDbKvStore {
         !consistent_read && self.config.cache_read_version_ms > 0
     }
 
-    fn configure_read_transaction(
+    pub(super) fn configure_read_transaction(
         &self,
         trx: &Transaction,
         debug_id: Option<&str>,
@@ -378,22 +292,53 @@ impl FoundationDbKvStore {
             .map_err(|err| map_fdb_error("enable use_grv_cache", err))
     }
 
-    async fn prepare_uncached_read_version(
+    pub(super) async fn prepare_uncached_read_version_fdb(
         &self,
         trx: &Transaction,
         consistent_read: bool,
-    ) -> StorageResult<()> {
+    ) -> Result<(), FdbError> {
         if self.uses_grv_cache(consistent_read) {
             return Ok(());
         }
 
         let started_at = Instant::now();
-        trx.get_read_version()
-            .await
-            .map_err(|err| map_fdb_error("get FoundationDB read version", err))?;
+        trx.get_read_version().await?;
         metrics_facade::histogram!(FOUNDATIONDB_GET_READ_VERSION_LATENCY_MS_METRIC)
             .record(started_at.elapsed().as_secs_f64() * 1000.0);
         Ok(())
+    }
+
+    pub(super) async fn retry_transaction_after_fdb_error(
+        &self,
+        trx: Transaction,
+        operation: &'static str,
+        scope: &'static str,
+        attempt: u32,
+        err: FdbError,
+        candidate_keys: &[Vec<u8>],
+    ) -> StorageResult<Transaction> {
+        record_fdb_operation(operation, "retry", 1);
+        let error_code = err.code();
+        let retryable = err.is_retryable();
+        let on_error_started = Instant::now();
+        let retry_result = trx.on_error(err).await;
+        record_fdb_operation_latency(operation, "on_error", on_error_started.elapsed());
+        match retry_result {
+            Ok(mut new_trx) => {
+                self.log_conflict_details(
+                    &new_trx,
+                    operation,
+                    attempt,
+                    retryable,
+                    error_code,
+                    candidate_keys,
+                )
+                .await;
+                new_trx.reset();
+                Ok(new_trx)
+            }
+            Err(retry_err) => Err(map_fdb_error(scope, retry_err)),
+        }
     }
 
     fn configure_transaction(
@@ -420,7 +365,7 @@ impl FoundationDbKvStore {
         Ok(())
     }
 
-    fn prefix_bytes(prefix: Option<&Vec<u8>>, key: &[u8]) -> Vec<u8> {
+    pub(super) fn prefix_bytes(prefix: Option<&Vec<u8>>, key: &[u8]) -> Vec<u8> {
         keyspace::prefix_bytes(prefix, key)
     }
 
@@ -434,35 +379,12 @@ impl FoundationDbKvStore {
         result.map(|_| ())
     }
 
-    fn strip_prefix<'a>(&self, key: &'a [u8]) -> &'a [u8] {
+    pub(super) fn strip_prefix<'a>(&self, key: &'a [u8]) -> &'a [u8] {
         keyspace::strip_prefix(key, self.config.subspace_prefix.as_ref())
     }
 
-    fn prefix_slice(&self, key: &[u8]) -> Vec<u8> {
+    pub(super) fn prefix_slice(&self, key: &[u8]) -> Vec<u8> {
         Self::prefix_bytes(self.config.subspace_prefix.as_ref(), key)
-    }
-
-    fn hex_encode(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-        for byte in bytes {
-            use std::fmt::Write;
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
-    }
-
-    fn format_key_with_prefix(&self, key: &[u8]) -> String {
-        if let Some(prefix) = &self.config.subspace_prefix
-            && key.starts_with(prefix)
-        {
-            let stripped = &key[prefix.len()..];
-            return format!(
-                "{} (stripped={})",
-                Self::hex_encode(key),
-                Self::hex_encode(stripped)
-            );
-        }
-        Self::hex_encode(key)
     }
 
     fn collect_transact_write_keys(
@@ -549,40 +471,6 @@ impl FoundationDbKvStore {
         keys
     }
 
-    async fn read_special_key_prefix(
-        trx: &Transaction,
-        prefix: &[u8],
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FdbError> {
-        let start = prefix.to_vec();
-        let end = increment_bytes(prefix.to_vec());
-        let mut option = RangeOption::from((start, end));
-        option.limit = Some(limit);
-        option.mode = options::StreamingMode::WantAll;
-
-        let mut iteration = 1;
-        let mut out = Vec::new();
-
-        loop {
-            let values = trx.get_range(&option, iteration, true).await?;
-            for kv in &values {
-                out.push((kv.key().to_vec(), kv.value().to_vec()));
-                if out.len() >= limit {
-                    return Ok(out);
-                }
-            }
-
-            if let Some(next) = option.next_range(&values) {
-                option = next;
-                iteration += 1;
-            } else {
-                break;
-            }
-        }
-
-        Ok(out)
-    }
-
     async fn read_key_prefix(
         trx: &Transaction,
         prefix: &[u8],
@@ -643,6 +531,47 @@ impl FoundationDbKvStore {
         let partition_entries = Self::read_key_prefix(trx, &partition_prefix, 1024)
             .await
             .map_err(|err| map_fdb_error("read partition family partitions", err))?;
+        let mut partitions = Vec::with_capacity(partition_entries.len());
+        for (_key, value) in partition_entries {
+            partitions.push(parse_partition_info(&value)?);
+        }
+        partitions.sort_unstable_by(|left, right| {
+            left.hash_start_inclusive
+                .cmp(&right.hash_start_inclusive)
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
+
+        Ok(Some(ResolvedPartitionFamily { config, partitions }))
+    }
+
+    async fn load_partition_family_state_tx_retryable(
+        trx: &Transaction,
+        prefix: Option<&Vec<u8>>,
+        family_kind: PartitionFamilyKind,
+        family_component: &str,
+    ) -> Result<Option<ResolvedPartitionFamily>, FdbTransactionAttemptError> {
+        let config_key = Self::prefix_bytes(
+            prefix,
+            &crate::partition_family::partition_family_config_key(family_kind, family_component),
+        );
+        let Some(config_bytes) = trx
+            .get(&config_key, false)
+            .await
+            .map_err(|err| FdbTransactionAttemptError::fdb("read partition family config", err))?
+        else {
+            return Ok(None);
+        };
+        let config = parse_partition_family_config(&config_bytes)?;
+
+        let partition_prefix = Self::prefix_bytes(
+            prefix,
+            &crate::partition_family::partition_info_prefix(family_kind, family_component),
+        );
+        let partition_entries = Self::read_key_prefix(trx, &partition_prefix, 1024)
+            .await
+            .map_err(|err| {
+                FdbTransactionAttemptError::fdb("read partition family partitions", err)
+            })?;
         let mut partitions = Vec::with_capacity(partition_entries.len());
         for (_key, value) in partition_entries {
             partitions.push(parse_partition_info(&value)?);
@@ -724,6 +653,40 @@ impl FoundationDbKvStore {
         Ok(family)
     }
 
+    async fn ensure_ordered_log_family_state_tx_retryable(
+        trx: &Transaction,
+        prefix: Option<&Vec<u8>>,
+        stream_name: &StreamName,
+    ) -> Result<ResolvedPartitionFamily, FdbTransactionAttemptError> {
+        let family_component = ordered_log_family_component(stream_name);
+        if let Some(existing) = Self::load_partition_family_state_tx_retryable(
+            trx,
+            prefix,
+            PartitionFamilyKind::OrderedLog,
+            &family_component,
+        )
+        .await?
+        {
+            return Ok(existing);
+        }
+
+        let family = ResolvedPartitionFamily {
+            config: default_partition_family_config(
+                PartitionFamilyKind::OrderedLog,
+                DEFAULT_ORDERED_LOG_PARTITION_COUNT,
+            ),
+            partitions: initial_partition_infos(DEFAULT_ORDERED_LOG_PARTITION_COUNT),
+        };
+        Self::save_partition_family_state_tx(
+            trx,
+            prefix,
+            PartitionFamilyKind::OrderedLog,
+            &family_component,
+            &family,
+        )?;
+        Ok(family)
+    }
+
     async fn ensure_ordered_log_family_state_cached_tx(
         trx: &Transaction,
         prefix: Option<&Vec<u8>>,
@@ -747,8 +710,8 @@ impl FoundationDbKvStore {
         family_component: &str,
         partition_id: u16,
         now_ms: i64,
-    ) -> StorageResult<bool> {
-        let Some(mut family) = Self::load_partition_family_state_tx(
+    ) -> Result<bool, FdbTransactionAttemptError> {
+        let Some(mut family) = Self::load_partition_family_state_tx_retryable(
             trx,
             prefix,
             PartitionFamilyKind::OrderedLog,
@@ -849,117 +812,6 @@ impl FoundationDbKvStore {
         );
 
         Ok(true)
-    }
-
-    async fn log_conflict_details(
-        &self,
-        trx: &Transaction,
-        operation: &'static str,
-        attempt: u32,
-        retryable: bool,
-        error_code: i32,
-        candidate_keys: &[Vec<u8>],
-    ) {
-        if !retryable {
-            return;
-        }
-
-        if let Err(err) = trx.set_option(options::TransactionOption::ReportConflictingKeys) {
-            tracing::debug!(
-                operation,
-                attempt,
-                error = %err,
-                "failed to enable conflict key reporting for conflict logging"
-            );
-            return;
-        }
-        if let Err(err) = trx.set_option(options::TransactionOption::SpecialKeySpaceRelaxed) {
-            tracing::debug!(
-                operation,
-                attempt,
-                error = %err,
-                "failed to relax special key space for conflict logging"
-            );
-            return;
-        }
-
-        let conflicting = match Self::read_special_key_prefix(
-            trx,
-            CONFLICTING_KEYS_PREFIX,
-            CONFLICT_LOG_MAX_KEYS,
-        )
-        .await
-        {
-            Ok(items) => items,
-            Err(read_err) => {
-                tracing::debug!(
-                    operation,
-                    attempt,
-                    error = %read_err,
-                    "failed to read FoundationDB conflicting keys"
-                );
-                return;
-            }
-        };
-
-        let read_ranges =
-            Self::read_special_key_prefix(trx, READ_CONFLICT_RANGE_PREFIX, CONFLICT_LOG_MAX_RANGES)
-                .await
-                .unwrap_or_default();
-        let write_ranges = Self::read_special_key_prefix(
-            trx,
-            WRITE_CONFLICT_RANGE_PREFIX,
-            CONFLICT_LOG_MAX_RANGES,
-        )
-        .await
-        .unwrap_or_default();
-
-        let conflict_keys: Vec<String> = conflicting
-            .iter()
-            .map(|(key, _)| {
-                let stripped = key.strip_prefix(CONFLICTING_KEYS_PREFIX).unwrap_or(key);
-                self.format_key_with_prefix(stripped)
-            })
-            .collect();
-        let candidate_key_list: Vec<String> = candidate_keys
-            .iter()
-            .take(CONFLICT_LOG_MAX_KEYS)
-            .map(|key| self.format_key_with_prefix(key))
-            .collect();
-        let read_conflict_ranges: Vec<String> = read_ranges
-            .iter()
-            .map(|(key, value)| format!("{} -> {}", Self::hex_encode(key), Self::hex_encode(value)))
-            .collect();
-        let write_conflict_ranges: Vec<String> = write_ranges
-            .iter()
-            .map(|(key, value)| format!("{} -> {}", Self::hex_encode(key), Self::hex_encode(value)))
-            .collect();
-        record_fdb_conflict_artifacts(
-            operation,
-            u64::try_from(conflict_keys.len()).unwrap_or(u64::MAX),
-            u64::try_from(read_conflict_ranges.len()).unwrap_or(u64::MAX),
-            u64::try_from(write_conflict_ranges.len()).unwrap_or(u64::MAX),
-            u64::try_from(candidate_key_list.len()).unwrap_or(u64::MAX),
-        );
-
-        if conflict_keys.is_empty()
-            && read_conflict_ranges.is_empty()
-            && write_conflict_ranges.is_empty()
-            && candidate_key_list.is_empty()
-        {
-            return;
-        }
-
-        tracing::info!(
-            operation,
-            attempt,
-            error_code,
-            conflict_keys = ?conflict_keys,
-            candidate_keys = ?candidate_key_list,
-            read_conflict_ranges = ?read_conflict_ranges,
-            write_conflict_ranges = ?write_conflict_ranges,
-            "FoundationDB transaction conflict detected"
-        );
     }
 
     async fn rewrite_partitioned_pointer_template(
@@ -1210,7 +1062,7 @@ impl FoundationDbKvStore {
         stream_ids: &[Option<StreamItemId>],
         prefix: Option<&Vec<u8>>,
         immediate_gsi_consistency: bool,
-    ) -> StorageResult<FdbTableWriteExecution> {
+    ) -> Result<FdbTableWriteExecution, FdbTableWriteExecutionError> {
         preflight_table_write_operations(operations)?;
         let read_started = Instant::now();
         let current_reads = operations
@@ -1227,7 +1079,7 @@ impl FoundationDbKvStore {
             };
             trx.get(&key, false)
                 .await
-                .map_err(|err| map_fdb_error("read table item", err))
+                .map_err(|err| FdbTableWriteExecutionError::fdb("read table item", err))
                 .map(|value| value.map(|value| value.to_vec()))
         }))
         .await?;
@@ -1320,7 +1172,7 @@ impl FoundationDbKvStore {
         trx: &Transaction,
         operations: &[DirectWriteOperation],
         prefix: Option<&Vec<u8>>,
-    ) -> StorageResult<Vec<PendingOrderedLogWrite>> {
+    ) -> Result<Vec<PendingOrderedLogWrite>, FdbTableWriteExecutionError> {
         let mut ordered_log_writes = Vec::new();
         let mut ordered_log_family_cache = OrderedLogFamilyCache::new();
         for operation in operations {
@@ -1381,10 +1233,14 @@ impl FoundationDbKvStore {
                     let current = trx
                         .get(&prefixed, false)
                         .await
-                        .map_err(|err| map_fdb_error("read key for exact value check", err))?
+                        .map_err(|err| {
+                            FdbTableWriteExecutionError::fdb("read key for exact value check", err)
+                        })?
                         .map(|value| value.to_vec());
                     if current != *expected_value {
-                        return Err(StorageEnum::ConditionalCheckFailed.into());
+                        return Err(FdbTableWriteExecutionError::Storage(
+                            StorageEnum::ConditionalCheckFailed.into(),
+                        ));
                     }
                 }
             }
@@ -1407,123 +1263,6 @@ impl FoundationDbKvStore {
         }
         ids
     }
-
-    async fn read_range(
-        &self,
-        start: &[u8],
-        exclusive_end: &[u8],
-        limit: Option<u32>,
-        page_token: Option<Vec<u8>>,
-        consistent_read: bool,
-    ) -> StorageResult<RangeResult> {
-        let scan = RangeScanSettings::new(start, exclusive_end, limit, page_token)?;
-
-        let (ordered_start, ordered_end) = scan.ordered_bounds();
-
-        let begin_pref = if scan.forward() {
-            match scan.page_token() {
-                Some(token) if token >= ordered_start && token < ordered_end => {
-                    KeySelector::first_greater_than(self.prefix_slice(token))
-                }
-                _ => KeySelector::first_greater_or_equal(self.prefix_slice(ordered_start)),
-            }
-        } else {
-            KeySelector::first_greater_or_equal(self.prefix_slice(ordered_start))
-        };
-
-        let end_pref_ordered = if scan.forward() {
-            KeySelector::first_greater_than(self.prefix_slice(ordered_end))
-        } else {
-            match scan.page_token() {
-                Some(token) if token > ordered_start && token <= ordered_end => {
-                    KeySelector::first_greater_or_equal(self.prefix_slice(token))
-                }
-                _ => KeySelector::first_greater_than(self.prefix_slice(ordered_end)),
-            }
-        };
-
-        let option = dynamodb_range_option(
-            begin_pref.clone(),
-            end_pref_ordered.clone(),
-            scan.fetch_limit(),
-            !scan.forward(),
-        );
-
-        let trx = self.create_transaction()?;
-        self.configure_read_transaction(&trx, None, consistent_read)?;
-        self.prepare_uncached_read_version(&trx, consistent_read)
-            .await?;
-        record_fdb_transaction_start("range");
-        record_fdb_range_read("range", true, 1);
-        record_fdb_operation_bytes(
-            "range",
-            "read_key",
-            begin_pref
-                .key()
-                .len()
-                .saturating_add(end_pref_ordered.key().len()) as u64,
-        );
-
-        let mut stream = trx.get_ranges(option, true);
-        let mut filtered = Vec::new();
-        let mut backend_has_more = false;
-        let fetch_limit = scan.fetch_limit();
-        let mut entries_seen = 0u64;
-        let mut read_bytes = 0u64;
-
-        let range_started = Instant::now();
-        while let Some(values) = stream
-            .try_next()
-            .await
-            .map_err(|err| map_fdb_error("scan range", err))?
-        {
-            for kv in values.as_ref() {
-                entries_seen = entries_seen.saturating_add(1);
-                read_bytes = read_bytes
-                    .saturating_add(kv.key().len().saturating_add(kv.value().len()) as u64);
-                let original_key = self.strip_prefix(kv.key()).to_vec();
-                let value = kv.value().to_vec();
-
-                match scan.evaluate_key(&original_key) {
-                    RangeKeyDecision::Include => {
-                        filtered.push((original_key, value));
-                        if filtered.len() >= fetch_limit {
-                            backend_has_more = true;
-                            break;
-                        }
-                    }
-                    RangeKeyDecision::Skip => {}
-                    RangeKeyDecision::Stop => {
-                        backend_has_more = false;
-                        break;
-                    }
-                }
-            }
-
-            if backend_has_more || filtered.len() >= fetch_limit {
-                break;
-            }
-        }
-
-        record_fdb_operation_latency("range", "range_read", range_started.elapsed());
-        record_fdb_operation("range", "range_entry", entries_seen);
-        record_fdb_operation_bytes("range", "read", read_bytes);
-        Ok(scan.finalize(filtered, backend_has_more))
-    }
-}
-
-pub(super) fn dynamodb_range_option<'a>(
-    begin: KeySelector<'a>,
-    end: KeySelector<'a>,
-    limit: usize,
-    reverse: bool,
-) -> RangeOption<'a> {
-    let mut option = RangeOption::from((begin, end));
-    option.limit = Some(limit);
-    option.target_bytes = DYNAMODB_RANGE_TARGET_BYTES;
-    option.reverse = reverse;
-    option.mode = options::StreamingMode::WantAll;
-    option
 }
 
 #[async_trait::async_trait]
@@ -1713,7 +1452,7 @@ impl QueueKvStore for FoundationDbKvStore {
         let mut attempt = 0u32;
         record_fdb_transaction_start("queue_claim");
 
-        loop {
+        'retry: loop {
             attempt += 1;
             batch = QueueClaimBatch::default();
             Self::configure_transaction(&trx, None, true)?;
@@ -1741,10 +1480,31 @@ impl QueueKvStore for FoundationDbKvStore {
                 let mut option = RangeOption::from((start, end));
                 option.limit = Some(scan_limit);
                 option.mode = options::StreamingMode::WantAll;
-                let ready_entries = trx
-                    .get_range(&option, 1, true)
-                    .await
-                    .map_err(|err| map_fdb_error("read queue claim ready range", err))?;
+                let ready_entries = match trx.get_range(&option, 1, true).await {
+                    Ok(ready_entries) => ready_entries,
+                    Err(err) => {
+                        let candidate_keys = ranges
+                            .iter()
+                            .flat_map(|range| {
+                                [
+                                    Self::prefix_bytes(prefix.as_ref(), &range.ready_start),
+                                    Self::prefix_bytes(prefix.as_ref(), &range.ready_end),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        trx = self
+                            .retry_transaction_after_fdb_error(
+                                trx,
+                                "queue_claim",
+                                "read queue claim ready range",
+                                attempt,
+                                err,
+                                &candidate_keys,
+                            )
+                            .await?;
+                        continue 'retry;
+                    }
+                };
                 record_fdb_range_read("queue_claim", true, 1);
                 record_fdb_operation("queue_claim", "range_entry", ready_entries.len() as u64);
                 let ready_entries_len = ready_entries.len();
@@ -1775,10 +1535,27 @@ impl QueueKvStore for FoundationDbKvStore {
                     }
                     candidates.push(ready_entry);
                 }
+                let candidate_ready_keys = candidates
+                    .iter()
+                    .map(|entry| entry.key().to_vec())
+                    .collect::<Vec<_>>();
                 let ready_reads =
-                    try_join_all(candidates.iter().map(|entry| trx.get(entry.key(), false)))
-                        .await
-                        .map_err(|err| map_fdb_error("read queue claim ready keys", err))?;
+                    match read_fdb_keys_sequential(&trx, &candidate_ready_keys, false).await {
+                        Ok(ready_reads) => ready_reads,
+                        Err(err) => {
+                            trx = self
+                                .retry_transaction_after_fdb_error(
+                                    trx,
+                                    "queue_claim",
+                                    "read queue claim ready keys",
+                                    attempt,
+                                    err,
+                                    &candidate_ready_keys,
+                                )
+                                .await?;
+                            continue 'retry;
+                        }
+                    };
                 ordinary_gets = ordinary_gets
                     .saturating_add(u64::try_from(ready_reads.len()).unwrap_or(u64::MAX));
 
@@ -1832,11 +1609,27 @@ impl QueueKvStore for FoundationDbKvStore {
                     ));
                 }
 
-                let state_reads = try_join_all(claim_candidates.iter().map(
-                    |(_, _, _, _, _, prefixed_state_key, _)| trx.get(prefixed_state_key, true),
-                ))
-                .await
-                .map_err(|err| map_fdb_error("read queue claim states", err))?;
+                let prefixed_state_keys = claim_candidates
+                    .iter()
+                    .map(|(_, _, _, _, _, prefixed_state_key, _)| prefixed_state_key.clone())
+                    .collect::<Vec<_>>();
+                let state_reads =
+                    match read_fdb_keys_sequential(&trx, &prefixed_state_keys, true).await {
+                        Ok(state_reads) => state_reads,
+                        Err(err) => {
+                            trx = self
+                                .retry_transaction_after_fdb_error(
+                                    trx,
+                                    "queue_claim",
+                                    "read queue claim states",
+                                    attempt,
+                                    err,
+                                    &prefixed_state_keys,
+                                )
+                                .await?;
+                            continue 'retry;
+                        }
+                    };
                 snapshot_gets = snapshot_gets
                     .saturating_add(u64::try_from(state_reads.len()).unwrap_or(u64::MAX));
 
@@ -1981,12 +1774,14 @@ impl QueueKvStore for FoundationDbKvStore {
                     self.configure_read_transaction(&payload_trx, None, false)?;
                     let payload_read_count =
                         u64::try_from(pending_claims.len()).unwrap_or(u64::MAX);
+                    let prefixed_payload_keys = pending_claims
+                        .iter()
+                        .map(|(payload_key, _)| Self::prefix_bytes(prefix.as_ref(), payload_key))
+                        .collect::<Vec<_>>();
                     let payload_reads =
-                        try_join_all(pending_claims.iter().map(|(payload_key, _)| {
-                            payload_trx.get(&Self::prefix_bytes(prefix.as_ref(), payload_key), true)
-                        }))
-                        .await
-                        .map_err(|err| map_fdb_error("read queue claim payloads", err))?;
+                        read_fdb_keys_sequential(&payload_trx, &prefixed_payload_keys, true)
+                            .await
+                            .map_err(|err| map_fdb_error("read queue claim payloads", err))?;
                     let mut claimed = Vec::with_capacity(payload_reads.len());
                     let mut payload_read_bytes = 0u64;
                     let mut payload_read_key_bytes = 0u64;
@@ -2062,6 +1857,54 @@ impl PartitionFamilyKvStore for FoundationDbKvStore {
         true
     }
 
+    async fn load_partition_family_state_raw(
+        &self,
+        family_kind: PartitionFamilyKind,
+        family_component: &str,
+    ) -> StorageResult<Option<ResolvedPartitionFamily>> {
+        let prefix = self.config.subspace_prefix.clone();
+        let family_config_key = Self::prefix_bytes(
+            prefix.as_ref(),
+            &crate::partition_family::partition_family_config_key(family_kind, family_component),
+        );
+        let partition_prefix = Self::prefix_bytes(
+            prefix.as_ref(),
+            &crate::partition_family::partition_info_prefix(family_kind, family_component),
+        );
+        let mut trx = self.create_transaction()?;
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            Self::configure_transaction(&trx, None, true)?;
+
+            match Self::load_partition_family_state_tx_retryable(
+                &trx,
+                prefix.as_ref(),
+                family_kind,
+                family_component,
+            )
+            .await
+            {
+                Ok(family) => return Ok(family),
+                Err(FdbTransactionAttemptError::Storage(storage_err)) => return Err(storage_err),
+                Err(FdbTransactionAttemptError::Fdb { scope, error }) => {
+                    let candidate_keys = vec![family_config_key.clone(), partition_prefix.clone()];
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "load_partition_family_state_raw",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+
     async fn append_partitioned_ordered_log_item(
         &self,
         stream_name: &StreamName,
@@ -2087,9 +1930,32 @@ impl PartitionFamilyKvStore for FoundationDbKvStore {
             Self::configure_transaction(&trx, None, true)?;
 
             let mut ordered_log_family_cache = OrderedLogFamilyCache::new();
-            let family =
-                Self::ensure_ordered_log_family_state_tx(&trx, prefix.as_ref(), stream_name)
-                    .await?;
+            let family = match Self::ensure_ordered_log_family_state_tx_retryable(
+                &trx,
+                prefix.as_ref(),
+                stream_name,
+            )
+            .await
+            {
+                Ok(family) => family,
+                Err(FdbTransactionAttemptError::Storage(storage_err)) => {
+                    return Err(storage_err);
+                }
+                Err(FdbTransactionAttemptError::Fdb { scope, error }) => {
+                    let candidate_keys = vec![family_config_key.clone()];
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "append_partitioned_ordered_log_item",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
+                    continue;
+                }
+            };
             ordered_log_family_cache.insert(family_component.clone(), family.clone());
             let partition =
                 find_partition_for_hash(&family.partitions, ordered_log_hash(routing_key))
@@ -2240,7 +2106,7 @@ impl PartitionFamilyKvStore for FoundationDbKvStore {
             attempt += 1;
             Self::configure_transaction(&trx, None, true)?;
 
-            let changed = self
+            let changed = match self
                 .split_partitioned_ordered_log_family_tx(
                     &trx,
                     prefix.as_ref(),
@@ -2248,7 +2114,25 @@ impl PartitionFamilyKvStore for FoundationDbKvStore {
                     partition_id,
                     now_ms,
                 )
-                .await?;
+                .await
+            {
+                Ok(changed) => changed,
+                Err(FdbTransactionAttemptError::Storage(storage_err)) => return Err(storage_err),
+                Err(FdbTransactionAttemptError::Fdb { scope, error }) => {
+                    let candidate_keys = vec![family_config_key.clone()];
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "split_partitioned_ordered_log_family",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
+                    continue;
+                }
+            };
             if !changed {
                 return Ok(false);
             }
@@ -2550,9 +2434,30 @@ impl SortedKvStore for FoundationDbKvStore {
             Self::configure_transaction(&trx, None, true)?;
 
             let execute_started = Instant::now();
-            let ordered_log_writes = self
+            let ordered_log_writes = match self
                 .execute_transact_write_unchecked_tx(&trx, &operations, prefix.as_ref())
-                .await?;
+                .await
+            {
+                Ok(ordered_log_writes) => ordered_log_writes,
+                Err(FdbTableWriteExecutionError::Storage(storage_err)) => {
+                    return Err(storage_err);
+                }
+                Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
+                    let candidate_keys =
+                        Self::collect_unchecked_write_keys(prefix.as_ref(), &operations);
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "transact_write_unchecked",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
+                    continue;
+                }
+            };
             record_fdb_operation_latency(
                 "transact_write_unchecked",
                 "execute",
@@ -2755,8 +2660,22 @@ impl SortedKvStore for FoundationDbKvStore {
                         }
                     }
                 }
-                Err(storage_err) => {
+                Err(FdbTableWriteExecutionError::Storage(storage_err)) => {
                     return Err(storage_err);
+                }
+                Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
+                    let candidate_keys =
+                        Self::collect_transact_write_table_keys(prefix.as_ref(), &operations);
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "transact_write_table",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
                 }
             }
         }
@@ -2819,31 +2738,77 @@ impl SortedKvStore for FoundationDbKvStore {
         }
     }
 
+    async fn begin_read_context(&self) -> StorageResult<Box<dyn SortedKvReadContext>> {
+        let trx = self.create_transaction()?;
+        self.configure_read_transaction(&trx, None, true)?;
+        self.prepare_uncached_read_version_fdb(&trx, true)
+            .await
+            .map_err(|err| map_fdb_error("read context read version", err))?;
+        record_fdb_transaction_start("read_context");
+        Ok(Box::new(FoundationDbReadContext {
+            store: self.clone(),
+            trx,
+        }))
+    }
+
     async fn get(&self, key: &[u8], consistent_read: bool) -> StorageResult<Option<Vec<u8>>> {
         let prefixed_key = self.prefix_slice(key);
-        let trx = self.create_transaction()?;
-        self.configure_read_transaction(&trx, None, consistent_read)?;
-        self.prepare_uncached_read_version(&trx, consistent_read)
-            .await?;
-
-        let get_started = Instant::now();
-        let value = trx
-            .get(&prefixed_key, true)
-            .await
-            .map_err(|err| map_fdb_error("read key", err))?;
-        record_fdb_operation_latency("get", "point_read", get_started.elapsed());
+        let candidate_keys = vec![prefixed_key.to_vec()];
+        let mut trx = self.create_transaction()?;
+        let mut attempt = 0u32;
         record_fdb_transaction_start("get");
-        record_fdb_point_read("get", true, 1);
-        record_fdb_operation_bytes("get", "read_key", prefixed_key.len() as u64);
-        record_fdb_operation_bytes(
-            "get",
-            "read",
-            prefixed_key
-                .len()
-                .saturating_add(value.as_ref().map_or(0, |bytes| bytes.len())) as u64,
-        );
 
-        Ok(value.map(|bytes| bytes.to_vec()))
+        loop {
+            attempt += 1;
+            self.configure_read_transaction(&trx, None, consistent_read)?;
+            if let Err(err) = self
+                .prepare_uncached_read_version_fdb(&trx, consistent_read)
+                .await
+            {
+                trx = self
+                    .retry_transaction_after_fdb_error(
+                        trx,
+                        "get",
+                        "get read version",
+                        attempt,
+                        err,
+                        &candidate_keys,
+                    )
+                    .await?;
+                continue;
+            }
+
+            let get_started = Instant::now();
+            let value = match trx.get(&prefixed_key, true).await {
+                Ok(value) => value,
+                Err(err) => {
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "get",
+                            "read key",
+                            attempt,
+                            err,
+                            &candidate_keys,
+                        )
+                        .await?;
+                    continue;
+                }
+            };
+            record_fdb_operation_latency("get", "point_read", get_started.elapsed());
+            record_fdb_point_read("get", true, 1);
+            record_fdb_operation_bytes("get", "read_key", prefixed_key.len() as u64);
+            record_fdb_operation_bytes(
+                "get",
+                "read",
+                prefixed_key
+                    .len()
+                    .saturating_add(value.as_ref().map_or(0, |bytes| bytes.len()))
+                    as u64,
+            );
+
+            return Ok(value.map(|bytes| bytes.to_vec()));
+        }
     }
 
     async fn multi_get(
@@ -2857,23 +2822,39 @@ impl SortedKvStore for FoundationDbKvStore {
 
         let mut trx = self.create_transaction()?;
         record_fdb_transaction_start("multi_get");
+        let mut attempt = 0u32;
 
         loop {
+            attempt += 1;
             self.configure_read_transaction(&trx, None, consistent_read)?;
-            self.prepare_uncached_read_version(&trx, consistent_read)
-                .await?;
             let prefix = self.config.subspace_prefix.clone();
-
-            let futures = keys
+            let candidate_keys = keys
                 .iter()
-                .map(|key| {
-                    let prefixed = Self::prefix_bytes(prefix.as_ref(), key);
-                    trx.get(&prefixed, false)
-                })
+                .map(|key| Self::prefix_bytes(prefix.as_ref(), key))
                 .collect::<Vec<_>>();
+            if let Err(err) = self
+                .prepare_uncached_read_version_fdb(&trx, consistent_read)
+                .await
+            {
+                trx = self
+                    .retry_transaction_after_fdb_error(
+                        trx,
+                        "multi_get",
+                        "multi_get read version",
+                        attempt,
+                        err,
+                        &candidate_keys,
+                    )
+                    .await?;
+                continue;
+            }
 
+            let prefixed_keys = keys
+                .iter()
+                .map(|key| Self::prefix_bytes(prefix.as_ref(), key))
+                .collect::<Vec<_>>();
             let read_started = Instant::now();
-            match try_join_all(futures).await {
+            match read_fdb_keys_sequential(&trx, &prefixed_keys, false).await {
                 Ok(results) => {
                     record_fdb_operation_latency(
                         "multi_get",
@@ -2884,8 +2865,9 @@ impl SortedKvStore for FoundationDbKvStore {
                     record_fdb_operation_bytes(
                         "multi_get",
                         "read_key",
-                        keys.iter()
-                            .map(|key| Self::prefix_bytes(prefix.as_ref(), key).len() as u64)
+                        prefixed_keys
+                            .iter()
+                            .map(|key| key.len() as u64)
                             .sum::<u64>(),
                     );
                     record_fdb_operation_bytes(
@@ -2909,22 +2891,16 @@ impl SortedKvStore for FoundationDbKvStore {
                         .collect());
                 }
                 Err(err) => {
-                    let on_error_started = Instant::now();
-                    let retry_result = trx.on_error(err).await;
-                    record_fdb_operation_latency(
-                        "multi_get",
-                        "on_error",
-                        on_error_started.elapsed(),
-                    );
-                    match retry_result {
-                        Ok(new_trx) => {
-                            record_fdb_operation("multi_get", "retry", 1);
-                            trx = new_trx;
-                        }
-                        Err(retry_err) => {
-                            return Err(map_fdb_error("multi_get", retry_err));
-                        }
-                    }
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "multi_get",
+                            "multi_get",
+                            0,
+                            err,
+                            &candidate_keys,
+                        )
+                        .await?;
                 }
             }
         }
@@ -2942,6 +2918,7 @@ impl SortedKvStore for FoundationDbKvStore {
         let condition = condition.clone();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
+        let mut maybe_committed = false;
         record_fdb_transaction_start("put");
 
         loop {
@@ -2967,6 +2944,12 @@ impl SortedKvStore for FoundationDbKvStore {
                 );
 
                 if !evaluate_condition_bytes(current.as_deref(), condition) {
+                    if maybe_committed {
+                        return Err(StorageError::internal(
+                            "maybe_committed: conditional put retry observed condition failure \
+                             after a maybe-committed commit",
+                        ));
+                    }
                     return Err(StorageEnum::TransactionCanceled {
                         reasons: vec!["ConditionalCheckFailed".to_string()],
                     }
@@ -2989,6 +2972,7 @@ impl SortedKvStore for FoundationDbKvStore {
                 Ok(_) => return Ok(()),
                 Err(commit_err) => {
                     record_fdb_operation("put", "retry", 1);
+                    maybe_committed |= commit_err.is_maybe_committed();
                     let error_code = commit_err.code();
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {

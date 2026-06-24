@@ -1,12 +1,13 @@
 # DynamoDB API Extensions
 
-Last updated: 2026-06-09
+Last updated: 2026-06-24
 
 Aux-Storage preserves DynamoDB-compatible behavior by default while offering a
 small set of opt-in extensions for teams that need stronger consistency or more
-control over stream retention. These extensions are explicit in the API surface:
-standard DynamoDB clients can keep using standard DynamoDB requests, and software
-that chooses an aux-storage extension can do so deliberately.
+control over stream retention, dependent reads, and audit history. These
+extensions are explicit in the API surface: standard DynamoDB clients can keep
+using standard DynamoDB requests, and software that chooses an aux-storage
+extension can do so deliberately.
 
 ## Immediate Consistency for Global Secondary Indexes
 
@@ -113,6 +114,201 @@ writes. This changes where the cost is paid:
 For user-facing invariants, permissions, routing, and account-state lookups, the latency tradeoff is often worth it. For bulk ingest or write-heavy analytics tables where delayed index visibility is acceptable, eventual GSI maintenance may remain the better fit.
 
 Operators should monitor write p95 and p99 latency, transaction retries, item size limits, and backend write pressure when enabling immediate consistency on tables with several GSIs and large item sizes.
+
+## ReadSequence
+
+`ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded
+N+1 read workflows. It runs an ordered sequence of `Get`, `BatchGet`, and
+`Query` steps, lets later steps bind selected attributes from earlier results,
+and returns a nested response that preserves the parent-child relationships.
+
+Use it when a workflow cannot be expressed as independent point reads and would
+otherwise require a client to issue one read, inspect the result, then issue a
+bounded set of dependent reads. If the reads are independent, prefer standard
+`BatchGetItem`. If the workflow is a small transactional point-read set, prefer
+standard `TransactGetItems`.
+
+`ReadSequence` is not a server-side scripting runtime. It does not run custom
+code, loops, recursion, scans, or unbounded joins. Every request is bounded by
+configured step, fanout, intermediate item, total read, child query, and response
+byte limits.
+
+### How to Call It
+
+`ReadSequence` is exposed as a DynamoDB JSON protocol target:
+
+```http
+POST /storage
+x-amz-target: DynamoDB_20120810.ReadSequence
+content-type: application/x-amz-json-1.0
+```
+
+The request body contains a top-level `ReadConsistency` value and an ordered
+`Sequence` of named read steps. `EVENTUAL` is the default consistency mode.
+
+### Example: Read a User and Its Organization
+
+```json
+{
+  "ReadConsistency": "EVENTUAL",
+  "Sequence": [
+    {
+      "Name": "user",
+      "Get": {
+        "TableName": "Users",
+        "Key": {
+          "pk": { "S": "user#1" }
+        }
+      },
+      "Select": {
+        "org_id": "$.org_id"
+      }
+    },
+    {
+      "Name": "org",
+      "ForEach": {
+        "From": "user.Item.org_id",
+        "As": "org_id",
+        "OnMissing": "ERROR",
+        "Get": {
+          "TableName": "Organizations",
+          "Key": {
+            "pk": { "S": "${org_id}" }
+          }
+        },
+        "Join": {
+          "To": "user",
+          "As": "org",
+          "Type": "REQUIRED_ONE"
+        }
+      }
+    }
+  ]
+}
+```
+
+The first step reads the user and selects `org_id`. The second step binds that
+selected value into an organization key and attaches the organization result to
+the user result as `org`.
+
+### Example: Query Orders and Fetch Dependent Invoices
+
+```json
+{
+  "ReadConsistency": "EVENTUAL",
+  "MaxFanoutPerStep": 25,
+  "MaxTotalReadItems": 100,
+  "Sequence": [
+    {
+      "Name": "orders",
+      "Query": {
+        "TableName": "Orders",
+        "IndexName": "by_customer",
+        "KeyConditionExpression": "customer_id = :customer_id",
+        "ExpressionAttributeValues": {
+          ":customer_id": { "S": "cust#123" }
+        },
+        "ProjectionExpression": "pk, sk, invoice_id, status",
+        "Limit": 25
+      },
+      "Select": {
+        "invoice_id": "$.invoice_id"
+      }
+    },
+    {
+      "Name": "invoice",
+      "ForEach": {
+        "From": "orders.Items",
+        "As": "order",
+        "OnMissing": "NULL",
+        "Get": {
+          "TableName": "Invoices",
+          "Key": {
+            "pk": { "S": "invoice#${order.invoice_id.S}" },
+            "sk": { "S": "meta" }
+          },
+          "ProjectionExpression": "pk, sk, total, status"
+        },
+        "Join": {
+          "To": "orders",
+          "As": "invoice",
+          "Type": "LEFT_ONE"
+        }
+      }
+    }
+  ]
+}
+```
+
+This collapses a common query-plus-child-get workflow into one bounded request.
+aux-storage may return a top-level `Warning` when a query-plus-get sequence is
+better modeled as a GSI. The warning names the suggested key shape but does not
+include raw user data values.
+
+### Consistency Modes
+
+`ReadSequence` supports these consistency modes when the configured backend can
+prove the requested behavior:
+
+- `EVENTUAL`: allows table and GSI reads where the individual operation supports
+  eventual consistency.
+- `STRONG`: allows base-table `Get`, `BatchGet`, and table `Query` reads when
+  the backend supports strong reads. GSI reads are rejected because DynamoDB
+  GSIs do not support strong consistency.
+- `TRANSACTIONAL`: executes the sequence page through one provider-owned
+  backend snapshot, transaction, or read version when the backend supports it.
+  GSI reads are rejected unless the backend is running with immediate GSI
+  consistency.
+
+Unsupported consistency modes fail before partial sequence execution. Remote
+providers can run bounded non-transactional sequences by composing ordinary
+DynamoDB-compatible operations, but reject transactional `ReadSequence` because
+they cannot prove one backend snapshot across multiple remote calls.
+
+### Pagination and Tokens
+
+`ReadSequence` can stop before the logical sequence is exhausted when it reaches
+a root page, child page, fanout boundary, response byte limit, total read limit,
+or backend transaction budget. In those cases the response includes
+`NextSequenceToken`.
+
+Treat `NextSequenceToken` as opaque. Tokens are tied to the request shape and
+service state needed for safe continuation. Stale, mismatched, or tampered
+tokens fail validation instead of producing incomplete or duplicated joins.
+
+Remote `BatchGetItem` partial responses with `UnprocessedKeys` are returned as
+retryable throttling errors rather than incomplete joined data.
+
+### Backend Availability
+
+`ReadSequence` is capability-gated by backend configuration:
+
+| Backend      | Eventual and strong base-table reads | Transactional snapshots | Transactional GSI reads |
+| ------------ | ------------------------------------ | ----------------------- | ----------------------- |
+| SQLite       | Supported.                           | Supported for file-backed SQLite. | Supported only with immediate GSI consistency. |
+| Postgres     | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
+| Turso        | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
+| RocksDB / KV | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
+| FoundationDB | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
+| Remote       | Supported for non-transactional eligible reads. | Rejected.               | Rejected.               |
+
+For production environments, verify the exact backend, service version, and GSI
+consistency setting before accepting `ReadSequence` traffic from application
+clients.
+
+### Performance and Operational Implications
+
+`ReadSequence` reduces application round trips and can reuse one backend read
+context for a transactional sequence page, but it still performs real backend
+reads. Operators should monitor total read items, response bytes, fanout
+rejections, token counts, retryable throttling errors, snapshot expiration, and
+backend read latency.
+
+The extension is usually a good fit for bounded page assembly, authorization
+lookups, account or organization hydration, and support tools that need a small
+dependent graph. It is a poor fit for broad analytics, arbitrary graph traversal,
+unbounded relationship expansion, or access patterns that should be represented
+as a purpose-built GSI.
 
 ## Custom Stream Horizon and Item Duration
 

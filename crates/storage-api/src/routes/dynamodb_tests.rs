@@ -1315,6 +1315,7 @@ async fn request_parameter_validation_takes_priority_before_backend_lookup() {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn execute_dynamodb_json(
     app_state: Arc<AppState>,
     target: &'static str,

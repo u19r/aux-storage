@@ -125,11 +125,7 @@ fn collect_process_cgroup_limits(limits: &mut Vec<u64>) {
                     .join(entry.relative_path)
                     .join("memory.max"),
             );
-        } else if entry
-            .controllers
-            .iter()
-            .any(|controller| *controller == "memory")
-        {
+        } else if entry.controllers.contains(&"memory") {
             collect_cgroup_limit(
                 limits,
                 Path::new("/sys/fs/cgroup/memory")

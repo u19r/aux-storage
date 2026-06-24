@@ -7,8 +7,10 @@ use crate::{
         PARTITION_CONTROLLER_SPLIT_THRESHOLD,
     },
     partition_family::{
-        PartitionFamilyKind, PartitionLoadSample, ResolvedPartitionFamily,
-        default_partition_family_config, initial_partition_infos, routing_key_bucket_bit,
+        PartitionFamilyKind, PartitionInfo, PartitionLoadSample, PartitionState,
+        ResolvedPartitionFamily, default_partition_family_config, initial_partition_infos,
+        next_partition_id, next_placement_slot, open_partition_count, routing_key_bucket_bit,
+        split_partition_children,
     },
     partition_reconcile::{
         QueueReconcileAction, apply_queue_action, controller_pressure,
@@ -16,6 +18,19 @@ use crate::{
         step_pi_controller,
     },
 };
+
+fn writable_owner_count(partitions: &[PartitionInfo], hash: u64) -> usize {
+    partitions
+        .iter()
+        .filter(|partition| partition.is_writable())
+        .filter(|partition| {
+            partition.hash_start_inclusive <= hash
+                && partition
+                    .hash_end_exclusive
+                    .is_none_or(|exclusive_end| hash < exclusive_end)
+        })
+        .count()
+}
 
 #[test]
 fn step_pi_controller_accumulates_high_pressure_streaks_tests() {
@@ -108,6 +123,67 @@ fn ordered_log_split_candidate_requires_routing_key_diversity_tests() {
         ),
         Some(0)
     );
+}
+
+#[test]
+fn ordered_log_sustained_hot_sample_splits_with_total_writable_coverage_tests() {
+    let mut family = ResolvedPartitionFamily {
+        config: default_partition_family_config(PartitionFamilyKind::OrderedLog, 2),
+        partitions: initial_partition_infos(2),
+    };
+    let mut samples = HashMap::new();
+    samples.insert(
+        0,
+        PartitionLoadSample {
+            writes: family.config.target_writes_per_second.saturating_mul(2),
+            routing_key_bucket_bitmap: routing_key_bucket_bit(7) | routing_key_bucket_bit(11),
+            ..Default::default()
+        },
+    );
+
+    for _ in 0..PARTITION_CONTROLLER_HIGH_STREAK_TARGET {
+        assert!(step_pi_controller(
+            &mut family.config,
+            PARTITION_CONTROLLER_SPLIT_THRESHOLD + 0.2,
+        ));
+    }
+
+    let partition_id = ordered_log_autosplit_candidate(
+        &family,
+        &samples,
+        PARTITION_CONTROLLER_SPLIT_THRESHOLD + 0.2,
+        0,
+    )
+    .expect("sustained diverse hot sample should select a partition");
+    let parent_index = family
+        .partitions
+        .iter()
+        .position(|partition| partition.partition_id == partition_id)
+        .expect("candidate partition exists");
+    let parent = family.partitions[parent_index].clone();
+    let (left_child, right_child) = split_partition_children(
+        &parent,
+        next_partition_id(&family.partitions),
+        next_partition_id(&family.partitions).saturating_add(1),
+        next_placement_slot(&family.partitions),
+        next_placement_slot(&family.partitions).saturating_add(1),
+    )
+    .expect("selected partition can split");
+
+    family.partitions[parent_index]
+        .mark_write_closed()
+        .expect("open parent can close writes");
+    family.partitions.push(left_child);
+    family.partitions.push(right_child);
+
+    assert_eq!(
+        family.partitions[parent_index].state,
+        PartitionState::WriteClosed
+    );
+    assert_eq!(open_partition_count(&family.partitions), 3);
+    for hash in [0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+        assert_eq!(writable_owner_count(&family.partitions, hash), 1);
+    }
 }
 
 #[test]

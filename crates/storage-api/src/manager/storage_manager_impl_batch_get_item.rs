@@ -68,7 +68,7 @@ impl StorageApiManagerImpl {
     }
 }
 
-fn batch_get_needs_decoded_response(request: &BatchGetItemRequest) -> bool {
+pub(super) fn batch_get_needs_decoded_response(request: &BatchGetItemRequest) -> bool {
     request.request_items.values().any(|keys| {
         keys.projection_expression.is_some()
             || keys
@@ -105,7 +105,7 @@ fn key_validation_error(error: StorageError) -> HttpApiError {
     HttpApiError::from(StorageError::validation(message.clone()))
 }
 
-fn project_batch_get_response(
+pub(super) fn project_batch_get_response(
     wire_response: BatchGetWireItemResponse,
     request: &BatchGetItemRequest,
 ) -> Result<BatchGetItemResponse, HttpApiError> {
@@ -160,7 +160,7 @@ fn project_batch_get_items(
     }
 }
 
-fn add_empty_batch_get_response_tables(
+pub(super) fn add_empty_batch_get_response_tables(
     mut response: BatchGetWireItemResponse,
     request: &BatchGetItemRequest,
 ) -> BatchGetWireItemResponse {

@@ -25,7 +25,7 @@ use crate::{
     backends::fdb::{
         fdb_support_tests::connect_fdb_store,
         foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot,
-        store::{DYNAMODB_RANGE_TARGET_BYTES, dynamodb_range_option},
+        range_read::{DYNAMODB_RANGE_TARGET_BYTES, dynamodb_range_option},
     },
     sorted_kv_store::{DirectWriteOperation, SortedKvStore},
 };

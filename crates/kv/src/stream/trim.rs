@@ -20,7 +20,8 @@ const PAYLOAD_ATTR: &str = "payload";
 const PK_ATTR: &str = "pk";
 
 struct StreamTrimGroup {
-    stream_item_id: StreamItemId,
+    pointer_stream_item_id: StreamItemId,
+    target_stream_item_id: StreamItemId,
     table_name: TableName,
     item_stream: StreamName,
 }
@@ -111,7 +112,8 @@ async fn collect_stream_trim_groups<
                 continue;
             };
             groups.push(StreamTrimGroup {
-                stream_item_id: item.id,
+                pointer_stream_item_id: item.id,
+                target_stream_item_id: StreamItemId::from(pointer.item_stream_version),
                 table_name: table.identity.table_name.clone(),
                 item_stream: item_stream_name(&table.identity.table_name, &pointer.item_scope),
             });
@@ -133,7 +135,8 @@ async fn collect_stream_trim_groups<
             };
 
         groups.push(StreamTrimGroup {
-            stream_item_id: item.id,
+            pointer_stream_item_id: item.id,
+            target_stream_item_id: StreamItemId::from(stored_pointer.target_item_stream_version()),
             table_name: stored_pointer.table_name().clone(),
             item_stream: stored_pointer.stream_name().clone(),
         });
@@ -316,28 +319,29 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     .await?
                     .map(|metadata| metadata.identity.clone())
                     .ok_or_else(|| StorageError::table_not_found(&group.table_name))?;
-                let sys_key =
-                    crate::keyspace::compact::system_stream_key(group.stream_item_id.as_bytes());
+                let sys_key = crate::keyspace::compact::system_stream_key(
+                    group.pointer_stream_item_id.as_bytes(),
+                );
                 let table_key = crate::keyspace::compact::table_stream_key(
                     table_identity.table_id,
-                    group.stream_item_id.as_bytes(),
+                    group.pointer_stream_item_id.as_bytes(),
                 );
                 let item_key = crate::keyspace::stream_keys::stream_row_key(
                     &group.item_stream,
                     Some(&table_identity),
-                    group.stream_item_id,
+                    group.target_stream_item_id,
                 )?
                 .ok_or_else(|| StorageError::internal("stream trim item stream key is legacy"))?;
                 let pointer_index_key =
                     crate::keyspace::stream_keys::stream_pointer_item_key_for_stream(
                         &table_identity,
                         &group.item_stream,
-                        group.stream_item_id,
+                        group.target_stream_item_id,
                     )?;
                 let table_pointer_index_key =
                     crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
                         &table_identity,
-                        group.stream_item_id,
+                        group.pointer_stream_item_id,
                     );
 
                 batch_items.push(BatchItem {

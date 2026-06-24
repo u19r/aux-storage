@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bg_jobs::BackgroundJobName;
+use rusqlite::OpenFlags;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 use storage_common::{
     GSI_BACKFILL_JOB, GSI_UPDATE_JOB, STREAM_TRIM_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure,
@@ -10,8 +11,8 @@ use storage_common::{
 use storage_condition::parse_condition_expression;
 use storage_provider::{
     CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
-    StorageProvider, StreamTrimDueMarker, StreamTrimState, StreamTrimStateWrite,
-    plan_table_stream_duration, return_values_need_updated_fields,
+    StorageProvider, StorageProviderReadContext, StreamTrimDueMarker, StreamTrimState,
+    StreamTrimStateWrite, plan_table_stream_duration, return_values_need_updated_fields,
 };
 use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
@@ -19,12 +20,14 @@ use storage_types::{
     DeleteGlobalSecondaryIndexAction, DurablePointReadProof, DurablePointReadRequest,
     GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedTransactWriteItemsRequest,
     GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes, PreparedBatchOperation,
-    PutItemResponse, QueryTableRequest, ReplicationMutation, ScanTableRequest, StorageEnum,
-    StorageError, StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
-    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest,
-    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
-    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem, WriteRequest,
+    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    StreamRetentionDuration, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
+    TimestampMillis, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
+    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
+    UpdateTimeToLiveResponse, WireItem, WriteRequest,
 };
+use tokio_rusqlite::Connection;
 use tracing::{Span, field, instrument};
 
 use crate::{
@@ -120,6 +123,89 @@ impl SQLiteStorageProvider {
     }
 }
 
+struct SQLiteReadSequenceReadContext {
+    provider: SQLiteStorageProvider,
+    consistency: ReadSequenceConsistency,
+}
+
+#[async_trait]
+impl StorageProviderReadContext for SQLiteReadSequenceReadContext {
+    async fn get_item(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<WireItem>> {
+        self.ensure_supported()?;
+        <SQLiteStorageProvider as StorageProvider>::get_item(
+            &self.provider,
+            table_name,
+            key,
+            consistent_read,
+        )
+        .await
+    }
+
+    async fn batch_get_item(
+        &self,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        self.ensure_supported()?;
+        <SQLiteStorageProvider as StorageProvider>::batch_get_item(&self.provider, request).await
+    }
+
+    async fn query_table(
+        &self,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        self.ensure_supported()?;
+        <SQLiteStorageProvider as StorageProvider>::query_table(&self.provider, request).await
+    }
+}
+
+impl SQLiteReadSequenceReadContext {
+    fn ensure_supported(&self) -> StorageResult<()> {
+        if self.consistency == ReadSequenceConsistency::Transactional
+            && self.provider.read_sequence_snapshot_path.is_none()
+        {
+            return Err(sqlite_read_sequence_snapshot_unsupported());
+        }
+        Ok(())
+    }
+}
+
+async fn open_read_sequence_snapshot_connection(path: &str) -> StorageResult<Arc<Connection>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .await
+        .map_err(|error| {
+            StorageError::internal(&format!(
+                "open sqlite read-sequence snapshot connection failed: {path}: {error}"
+            ))
+        })?;
+    connection
+        .call(|conn| {
+            let page_cache_size_kb = crate::sqlite_cache_config::sqlite_page_cache_size_kb();
+            conn.pragma_update(None, "busy_timeout", 5_000)?;
+            conn.pragma_update(None, "cache_size", page_cache_size_kb)?;
+            conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            StorageError::internal(&format!(
+                "begin sqlite read-sequence snapshot transaction failed: {path}: {error}"
+            ))
+        })?;
+    Ok(Arc::new(connection))
+}
+
+fn sqlite_read_sequence_snapshot_unsupported() -> StorageError {
+    StorageError::unsupported(
+        "sqlite read-sequence transactional contexts require a file-backed provider snapshot \
+         connection",
+    )
+}
+
 #[async_trait]
 impl StorageProvider for SQLiteStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
@@ -136,6 +222,30 @@ impl StorageProvider for SQLiteStorageProvider {
 
     fn supports_change_index(&self) -> bool {
         true
+    }
+
+    async fn begin_read_sequence_read_context(
+        &self,
+        consistency: ReadSequenceConsistency,
+    ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
+        if consistency != ReadSequenceConsistency::Transactional {
+            return Ok(Box::new(SQLiteReadSequenceReadContext {
+                provider: self.clone(),
+                consistency,
+            }));
+        }
+
+        let Some(snapshot_path) = self.read_sequence_snapshot_path.clone() else {
+            return Err(sqlite_read_sequence_snapshot_unsupported());
+        };
+        let snapshot_connection = open_read_sequence_snapshot_connection(&snapshot_path).await?;
+        let mut provider = self.clone();
+        provider.connection = snapshot_connection;
+
+        Ok(Box::new(SQLiteReadSequenceReadContext {
+            provider,
+            consistency,
+        }))
     }
 
     async fn write_stream_trim_state(&self, state: StreamTrimState) -> StorageResult<()> {

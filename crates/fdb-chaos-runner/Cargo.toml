@@ -1,0 +1,19 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "fdb-chaos-runner"
+version = "0.1.0"
+
+[[bin]]
+name = "fdb-chaos-runner"
+path = "src/main.rs"
+
+[dependencies]
+fdb-chaos-model = { path = "../fdb-chaos-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

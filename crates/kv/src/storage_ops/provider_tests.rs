@@ -15,16 +15,16 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use storage_common::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, TTL_SWEEP_JOB};
 use storage_condition::Condition;
 use storage_provider::{
-    StorageProvider, StreamDurationTrimBackend, StreamTrimDueMarker, StreamTrimScope,
-    StreamTrimState, StreamTrimStateWrite,
+    StorageProvider, StreamDurationTrimBackend, StreamDurationTrimConfig, StreamDurationTrimWorker,
+    StreamTrimDueMarker, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
 };
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateGlobalSecondaryIndex,
     CreateTableRequest, HIDDEN_TTL_INDEX_PREFIX, IndexName, ItemKey, KeyAttributeType,
     KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, QueryTableRequest,
-    ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
-    ReplicationWriteSource, ScanTableRequest, SerializesToKey, StorageEnum, StorageError,
-    StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration,
+    ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
+    ReplicationMutation, ReplicationWriteSource, ScanTableRequest, SerializesToKey, StorageEnum,
+    StorageError, StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration,
     TTL_PARTITION_ATTRIBUTE, TableName, TimeToLiveSpecification, TimeToLiveStatus, TimestampMillis,
     TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
     TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateTableRequest,
@@ -359,7 +359,7 @@ async fn seed_n_items(provider: &TestProvider, table: &TableName, n: usize) {
             Ok::<(), Infallible>(())
         }
     }))
-    .buffer_unordered(96)
+    .buffer_unordered(8)
     .try_collect()
     .await
     .unwrap();
@@ -636,6 +636,184 @@ async fn kv_gsi_updates_add_and_ignore_missing() {
         2,
         "Items A and B should both be indexed after update"
     );
+}
+
+#[tokio::test]
+async fn kv_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_query() {
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    if !foundationdb_live_port_available().await {
+        eprintln!(
+            "Skipping FoundationDB ReadSequence snapshot test: 127.0.0.1:4689 is unavailable"
+        );
+        return;
+    }
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    let _guard = foundationdb_live_test_guard().await;
+
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+
+    let table = TableName::new("ReadSequenceKvSnapshot");
+    create_test_table(&provider, &table, false).await;
+
+    let key = storage_types::KeyAttributes::from([
+        ("pk".to_string(), AttributeValue::S("u".to_string())),
+        ("sk".to_string(), AttributeValue::S("a".to_string())),
+    ]);
+    provider
+        .put_item(
+            table.clone(),
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("u".to_string())),
+                ("sk".to_string(), AttributeValue::S("a".to_string())),
+                ("name".to_string(), AttributeValue::S("before".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    crate::backends::fdb::foundationdb_operation_metrics_reset();
+
+    let read_context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await
+        .expect("begin read sequence context");
+    let initial = read_context
+        .get_item(table.clone(), key.clone(), true)
+        .await
+        .expect("snapshot get")
+        .expect("snapshot item")
+        .to_attribute_map()
+        .expect("decode snapshot item");
+    assert_eq!(
+        initial.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    provider
+        .put_item(
+            table.clone(),
+            HashMap::from([
+                ("pk".to_string(), AttributeValue::S("u".to_string())),
+                ("sk".to_string(), AttributeValue::S("a".to_string())),
+                ("name".to_string(), AttributeValue::S("after".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let ordinary_read = provider
+        .get_item(table.clone(), key.clone(), true)
+        .await
+        .expect("ordinary get")
+        .expect("ordinary item")
+        .to_attribute_map()
+        .expect("decode ordinary item");
+    assert_eq!(
+        ordinary_read.get("name"),
+        Some(&AttributeValue::S("after".to_string()))
+    );
+
+    let snapshot_get = read_context
+        .get_item(table.clone(), key.clone(), true)
+        .await
+        .expect("snapshot get after update")
+        .expect("snapshot item after update")
+        .to_attribute_map()
+        .expect("decode snapshot get item");
+    assert_eq!(
+        snapshot_get.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let snapshot_batch = read_context
+        .batch_get_item(BatchGetItemRequest {
+            request_items: HashMap::from([(
+                table.clone(),
+                KeysAndAttributes {
+                    keys: vec![key.clone()].into(),
+                    attributes_to_get: None,
+                    projection_expression: None,
+                    expression_attribute_names: None,
+                    consistent_read: Some(true),
+                },
+            )]),
+            return_consumed_capacity: None,
+        })
+        .await
+        .expect("snapshot batch get");
+    let snapshot_batch_item = snapshot_batch
+        .responses
+        .as_ref()
+        .and_then(|responses| responses.get(&table))
+        .and_then(|items| items.first())
+        .expect("snapshot batch item")
+        .to_attribute_map()
+        .expect("decode snapshot batch item");
+    assert_eq!(
+        snapshot_batch_item.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let (snapshot_query, _) = read_context
+        .query_table(&QueryTableRequest {
+            table_name: table.clone(),
+            index_name: None,
+            key_condition_expression: "pk = :pk".to_string(),
+            expression_attribute_names: None,
+            expression_attribute_values: Some(HashMap::from([(
+                ":pk".to_string(),
+                AttributeValue::S("u".to_string()),
+            )])),
+            limit: Some(10),
+            exclusive_start_key: None,
+            scan_index_forward: Some(true),
+            consistent_read: true,
+        })
+        .await
+        .expect("snapshot query");
+    let snapshot_query_item = snapshot_query
+        .first()
+        .expect("snapshot query item")
+        .to_attribute_map()
+        .expect("decode snapshot query item");
+    assert_eq!(
+        snapshot_query_item.get("name"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    {
+        let metrics = crate::backends::fdb::foundationdb_operation_metrics_snapshot();
+        assert_eq!(
+            fdb_operation_metric(&metrics, "read_context", "transaction_start"),
+            1,
+            "ReadSequence must reuse one FoundationDB read context transaction\n{metrics}"
+        );
+        assert!(
+            fdb_operation_metric(&metrics, "read_context", "snapshot_point_read") >= 2,
+            "ReadSequence get and batch get must use snapshot point reads\n{metrics}"
+        );
+        assert!(
+            fdb_operation_metric(&metrics, "read_context", "snapshot_range_read") >= 1,
+            "ReadSequence query must use a snapshot range read\n{metrics}"
+        );
+        assert_eq!(
+            fdb_operation_metric(&metrics, "range", "transaction_start"),
+            0,
+            "ReadSequence context query must not report a separate FoundationDB range \
+             transaction\n{metrics}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -7207,6 +7385,7 @@ async fn custom_stream_duration_item_trim_waits_for_retained_table_pointer() {
 
 #[tokio::test]
 async fn custom_table_trim_drives_item_cleanup_from_deleted_pointers() {
+    let _metrics_guard = metrics_assertion_lock().lock().await;
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
     provider.initialize_stream().await.unwrap();
@@ -7281,10 +7460,12 @@ async fn custom_table_trim_drives_item_cleanup_from_deleted_pointers() {
     insert_stream_item(&provider, &item_stream, &latest_item).await;
     write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
 
+    storage_common::provider_perf::reset_provider("kv");
     provider
         .run_job(storage_common::STREAM_TRIM_JOB)
         .await
         .unwrap();
+    let counters = storage_common::provider_perf::snapshot_provider("kv");
 
     let table_page =
         StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
@@ -7310,6 +7491,245 @@ async fn custom_table_trim_drives_item_cleanup_from_deleted_pointers() {
             .collect::<Vec<_>>(),
         vec![retained_pointer_id, latest_id]
     );
+
+    let table_identity = provider
+        .get_table_identity_from_name(&table_name)
+        .await
+        .expect("table identity lookup")
+        .expect("table identity exists")
+        .identity
+        .clone();
+    let deleted_table_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                deleted_id,
+            ),
+            true,
+        )
+        .await
+        .expect("deleted table pointer read");
+    assert!(deleted_table_pointer.is_none());
+    let retained_table_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                retained_pointer_id,
+            ),
+            true,
+        )
+        .await
+        .expect("retained table pointer read");
+    assert!(retained_table_pointer.is_some());
+
+    let deleted_item_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_item_key_for_stream(
+                &table_identity,
+                &item_stream,
+                deleted_id,
+            )
+            .expect("deleted item pointer key"),
+            true,
+        )
+        .await
+        .expect("deleted item pointer read");
+    assert!(deleted_item_pointer.is_none());
+    let retained_item_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_item_key_for_stream(
+                &table_identity,
+                &item_stream,
+                retained_pointer_id,
+            )
+            .expect("retained item pointer key"),
+            true,
+        )
+        .await
+        .expect("retained item pointer read");
+    assert!(retained_item_pointer.is_some());
+
+    assert!(
+        provider_perf_amount(&counters, "custom_stream_duration_rows_deleted") >= 2,
+        "table-driven cleanup should delete both table and item stream rows"
+    );
+    assert!(
+        provider_perf_amount(&counters, "custom_stream_duration_range_deletes") >= 3,
+        "table-driven cleanup should use bounded range deletes for rows and pointer indexes"
+    );
+    assert_eq!(
+        provider_perf_amount(&counters, "custom_stream_duration_point_deletes"),
+        0,
+        "table-driven cleanup should not regress to point deletes"
+    );
+}
+
+#[tokio::test]
+async fn custom_stream_duration_trim_resumes_after_bounded_page_interruption() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    let table_name = TableName::new("CustomDurationTrimResume");
+    create_custom_duration_stream_table(
+        &provider,
+        table_name.clone(),
+        StreamRetentionDuration::FiniteHours(1),
+        StreamRetentionDuration::FiniteHours(1),
+    )
+    .await;
+
+    let item_key = ItemKey::table_key(
+        table_name.clone(),
+        AttributeValue::S("pk1".to_string()),
+        Some(AttributeValue::S("sk1".to_string())),
+    );
+    let item_stream = StreamName::table_item_stream(&table_name, &item_key).expect("item stream");
+    let item = stream_test_item("pk1", "sk1");
+    let now = TimestampMillis::now();
+    let old_created_at = now - (2 * constants::MILLIS_PER_HOUR);
+    let interruption_page_size = 10usize;
+    let expired_total = u32::try_from(interruption_page_size + 2).unwrap();
+
+    for idx in 0..expired_total {
+        let stream_id = stream_id_from_u64(u64::from(idx + 1));
+        let pointer =
+            build_pointer_stream_item(stream_id, old_created_at, &table_name, item_stream.clone());
+        let item_entry =
+            build_item_stream_item(stream_id, old_created_at, item_stream.clone(), &item);
+
+        insert_stream_item(&provider, &StreamName::table_stream(&table_name), &pointer).await;
+        insert_stream_pointer_index(&provider, &table_name, &item_stream, stream_id).await;
+        insert_stream_item(&provider, &item_stream, &item_entry).await;
+    }
+
+    let retained_id = stream_id_from_u64(u64::from(expired_total + 1));
+    let retained_pointer =
+        build_pointer_stream_item(retained_id, now, &table_name, item_stream.clone());
+    let retained_item = build_item_stream_item(retained_id, now, item_stream.clone(), &item);
+    insert_stream_item(
+        &provider,
+        &StreamName::table_stream(&table_name),
+        &retained_pointer,
+    )
+    .await;
+    insert_stream_pointer_index(&provider, &table_name, &item_stream, retained_id).await;
+    insert_stream_item(&provider, &item_stream, &retained_item).await;
+    write_due_table_trim_state(&provider, &table_name, now - constants::MILLIS_PER_HOUR).await;
+
+    let stats = StreamDurationTrimWorker::new(
+        provider.clone(),
+        StreamDurationTrimConfig {
+            marker_page_size: 10,
+            stream_page_size: interruption_page_size,
+        },
+    )
+    .run_due_page(now, now)
+    .await
+    .unwrap();
+    assert_eq!(stats.rows_deleted, interruption_page_size);
+
+    let first_remaining_id = stream_id_from_u64(u64::try_from(interruption_page_size + 1).unwrap());
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        table_page.items.first().map(|item| item.id),
+        Some(first_remaining_id)
+    );
+    assert_eq!(
+        table_page.items.last().map(|item| item.id),
+        Some(retained_id)
+    );
+
+    let item_page = StreamProvider::read_forward(&provider, item_stream.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        item_page.items.first().map(|item| item.id),
+        Some(first_remaining_id)
+    );
+    assert_eq!(
+        item_page.items.last().map(|item| item.id),
+        Some(retained_id)
+    );
+
+    let markers_after_interruption =
+        StorageProvider::list_due_stream_trim_markers(&provider, now, 10)
+            .await
+            .expect("due markers after interrupted pass");
+    assert!(
+        markers_after_interruption
+            .iter()
+            .any(|marker| marker.scope.table_name == table_name)
+    );
+
+    provider
+        .run_job(storage_common::STREAM_TRIM_JOB)
+        .await
+        .unwrap();
+
+    let table_page =
+        StreamProvider::read_forward(&provider, StreamName::table_stream(&table_name), None, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        table_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![retained_id]
+    );
+
+    let item_page = StreamProvider::read_forward(&provider, item_stream.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        item_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![retained_id]
+    );
+
+    let table_identity = provider
+        .get_table_identity_from_name(&table_name)
+        .await
+        .expect("table identity lookup")
+        .expect("table identity exists")
+        .identity
+        .clone();
+    let deleted_table_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                first_remaining_id,
+            ),
+            true,
+        )
+        .await
+        .expect("deleted table pointer read");
+    assert!(deleted_table_pointer.is_none());
+    let retained_table_pointer = provider
+        .kv_store
+        .get(
+            &crate::keyspace::stream_keys::stream_pointer_table_key_for_stream(
+                &table_identity,
+                retained_id,
+            ),
+            true,
+        )
+        .await
+        .expect("retained table pointer read");
+    assert!(retained_table_pointer.is_some());
 }
 
 #[tokio::test]
@@ -7740,6 +8160,17 @@ fn fdb_operation_metric(metrics: &str, path: &str, operation: &str) -> u64 {
         .find(|line| line.contains(&needle))
         .and_then(|line| line.rsplit_once(' '))
         .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn provider_perf_amount(
+    counters: &[storage_common::provider_perf::PerfCounterSnapshot],
+    name: &str,
+) -> u64 {
+    counters
+        .iter()
+        .find(|counter| counter.name == name)
+        .map(|counter| counter.total_amount)
         .unwrap_or(0)
 }
 

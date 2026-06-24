@@ -331,7 +331,7 @@ impl PostgresStorageProvider {
 
     pub(crate) async fn do_delete_table(&self, table_name: &TableName) -> StorageResult<()> {
         let table_name_value = table_name.to_string();
-        let table_name_safe = table_name.sanitized_name();
+        let physical_table_name = physical_names::physical_table_name(table_name);
         let table_info = self.get_table_info(table_name).await.ok();
         if let Some(table_info) = table_info.as_ref()
             && table_info.deletion_protection_enabled
@@ -341,7 +341,7 @@ impl PostgresStorageProvider {
 
         self.retry_postgres_conflicts("delete_table", || {
             let table_name_value = table_name_value.clone();
-            let table_name_safe = table_name_safe.clone();
+            let physical_table_name = physical_table_name.clone();
             let table_info = table_info.clone();
             let table_name = table_name.clone();
             async move {
@@ -366,7 +366,7 @@ impl PostgresStorageProvider {
                 }
 
                 transaction
-                    .batch_execute(&sql_statements::drop_physical_table(&table_name_safe))
+                    .batch_execute(&sql_statements::drop_physical_table(&physical_table_name))
                     .await
                     .map_err(|err| Self::map_postgres_write_error("drop physical table", err))?;
 
@@ -395,7 +395,7 @@ impl PostgresStorageProvider {
 
                 let table_stream = StreamName::table_stream(&table_name);
                 let table_stream_value = Self::encode_stream_name(&table_stream);
-                let item_stream_prefix = format!("{table_name_safe}/stream-item/");
+                let item_stream_prefix = format!("{}/stream-item/", table_name.sanitized_name());
                 let item_stream_prefix_value =
                     Self::encode_stream_name(&StreamName::from(item_stream_prefix.into_bytes()));
                 let item_stream_like = format!("{item_stream_prefix_value}%");

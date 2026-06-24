@@ -134,6 +134,10 @@ foundationdb = { version = "0.10.0", features = [
     "embedded-fdb-include",
     "fdb-7_4",
 ], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
+foundationdb-simulation = { version = "0.2.3", features = [
+    "embedded-fdb-include",
+    "fdb-7_4",
+], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
 hostname = "0.4"
 httpmock = "0.8.3"
 ipnet = "2.12.0"

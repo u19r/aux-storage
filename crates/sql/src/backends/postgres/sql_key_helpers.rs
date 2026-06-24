@@ -829,8 +829,8 @@ impl PostgresStorageProvider {
         )?;
         let mut bind_values = Vec::with_capacity(key_bindings.len());
         let where_sql = Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
-        let table_name_safe = table_name.sanitized_name();
-        let sql = sql_statements::get_item(&table_name_safe, &select_projection, &where_sql);
+        let physical_table_name = physical_names::physical_table_name(table_name);
+        let sql = sql_statements::get_item(&physical_table_name, &select_projection, &where_sql);
         Ok(PreparedGetItemQuery {
             table_info: table_info.clone(),
             sql,

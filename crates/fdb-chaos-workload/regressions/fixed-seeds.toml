@@ -1,0 +1,37 @@
+schema_version = 1
+
+[[fixed_seed]]
+id = "table-atomicity-fdb-read-version-retry"
+workload = "table_atomicity"
+profile = "smoke"
+seed = 1
+buggify = "off"
+status = "fixed"
+area = "fdb_retry_boundary"
+artifact = "run-artifacts/fdb-chaos/smoke/table_atomicity-seed-1-1782227778"
+rerun = "just fdb-chaos-run table_atomicity smoke 1 --buggify off"
+notes = "Manager-backed table writes exposed read-version/read errors that bypassed Transaction::on_error before commit."
+
+[[fixed_seed]]
+id = "queue-visibility-fdb-claim-retry"
+workload = "queue_visibility"
+profile = "smoke"
+seed = 1
+buggify = "on"
+status = "fixed"
+area = "fdb_retry_boundary"
+artifact = "run-artifacts/fdb-chaos/smoke/queue_visibility-seed-1-1782244571"
+rerun = "just fdb-chaos-run queue_visibility smoke 1 --buggify on"
+notes = "Queue claim read-side FDB errors bypassed retry and surfaced during visibility checks."
+
+[[fixed_seed]]
+id = "partition-family-ordered-log-append-retry"
+workload = "partition_family"
+profile = "smoke"
+seed = 1
+buggify = "off"
+status = "fixed"
+area = "fdb_retry_boundary"
+artifact = "run-artifacts/fdb-chaos/smoke/partition_family-seed-1-1782246790"
+rerun = "just fdb-chaos-run partition_family smoke 1 --buggify off"
+notes = "Ordered-log append did not retry partition-family config/range read errors before commit."

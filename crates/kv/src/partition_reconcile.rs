@@ -11,7 +11,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig, errors::JobError};
+use bg_jobs::{BackgroundJob, JobConfig, errors::JobError};
+use storage_common::PARTITION_RECONCILE_JOB;
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 use tracing::{debug, info, instrument};
 
@@ -43,10 +44,6 @@ use crate::{
         routing_key_bucket_count,
     },
     queue::constants::QUEUE_PREWARM_MESSAGE_ID,
-};
-
-const PARTITION_RECONCILE_JOB_ID: BackgroundJobName = BackgroundJobName::Database {
-    kind: bg_jobs::DatabaseJobKind::PartitionFamilyReconcile,
 };
 
 pub struct PartitionReconcileJob<S: PartitionFamilyKvStore + 'static> {
@@ -128,7 +125,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
 
         if self
             .job_manager
-            .is_job_running(PARTITION_RECONCILE_JOB_ID)
+            .is_job_running(PARTITION_RECONCILE_JOB)
             .await
         {
             return Ok(());
@@ -147,7 +144,7 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
 
         match self
             .job_manager
-            .register_job(PARTITION_RECONCILE_JOB_ID, job, config)
+            .register_job(PARTITION_RECONCILE_JOB, job, config)
             .await
         {
             Ok(_) | Err(JobError::JobAlreadyRunning) => Ok(()),
@@ -411,6 +408,38 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
             hot: pressure >= PARTITION_CONTROLLER_SPLIT_THRESHOLD,
             states: family_state_counts(&family.partitions),
         })
+    }
+
+    /// Runs one bounded ordered-log reconcile pass for a single partition
+    /// family.
+    ///
+    /// This is an internal probe/simulation helper. Operator job paths should
+    /// use `PARTITION_RECONCILE_JOB`, which preserves catch-up semantics
+    /// across all families.
+    pub async fn run_ordered_log_partition_reconcile_once(
+        &self,
+        family_component: &str,
+    ) -> StorageResult<bool> {
+        if !self.kv_store.supports_partition_families() {
+            return Ok(false);
+        }
+
+        let now_ms = TimestampMillis::now().timestamp_millis();
+        let window_start_ms =
+            partition_sample_window_start_ms(now_ms, PARTITION_LOAD_SAMPLE_WINDOW_SECONDS);
+        let cutoff_ms = partition_sample_retention_cutoff_ms(
+            now_ms,
+            PARTITION_LOAD_SAMPLE_WINDOW_SECONDS,
+            PARTITION_LOAD_SAMPLE_RETENTION_WINDOWS,
+        );
+
+        let changed = self
+            .flush_runtime_partition_load_samples(window_start_ms)
+            .await?;
+        let outcome = self
+            .reconcile_ordered_log_family(family_component, now_ms, cutoff_ms)
+            .await?;
+        Ok(changed || outcome.changed)
     }
 
     async fn reconcile_queue_family(

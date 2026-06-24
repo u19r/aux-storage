@@ -16,6 +16,7 @@ rocksdb = ["storage/rocksdb", "storage-types/rocksdb"]
 foundationdb = ["storage/foundationdb"]
 queue = ["dep:queue", "dep:queue-provider"]
 pubsub = ["dep:pubsub", "dep:pubsub-provider"]
+remote = ["storage/remote"]
 tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
@@ -57,6 +58,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
+httpmock = { workspace = true }
 quint-connect = { workspace = true }
 storage-cache = { path = "../storage-cache" }
 

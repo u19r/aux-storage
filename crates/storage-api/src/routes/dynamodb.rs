@@ -11,8 +11,8 @@ use storage_provider::ListChangeIndexMarkersRequest;
 use storage_types::{
     BatchGetItemRequest, DeleteItemRequest, DescribeStreamRequest, DescribeTimeToLiveRequest,
     DynamoRequestValidate, GetRecordsRequest, GetShardIteratorRequest, ListStreamsRequest,
-    QueryRequest, TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
-    UpdateTimeToLiveRequest,
+    QueryRequest, ReadSequenceRequest, TransactGetItemsRequest, TransactWriteItemsRequest,
+    UpdateItemRequest, UpdateTimeToLiveRequest,
 };
 
 use crate::{
@@ -174,6 +174,11 @@ async fn execute_dynamodb_operation(
         "DynamoDB_20120810.TransactGetItems" => {
             execute_validated_json_operation!(body, timer, TransactGetItemsRequest, |request| {
                 manager.transact_get_items(request)
+            })
+        }
+        "DynamoDB_20120810.ReadSequence" => {
+            execute_json_operation!(body, timer, ReadSequenceRequest, |request| {
+                manager.read_sequence(request)
             })
         }
         "DynamoDB_20120810.UpdateItem" => {
@@ -391,6 +396,7 @@ pub(super) fn response_to_http(response: ApiResponse) -> AxumResponse {
         ApiResponse::BatchGetWire(resp) => resp.into_http_response(),
         ApiResponse::TransactWriteItems(resp) => json_response(resp),
         ApiResponse::TransactGetItems(resp) => json_response(resp),
+        ApiResponse::ReadSequence(resp) => json_response(resp),
         ApiResponse::UpdateItem(resp) => json_response(resp),
         ApiResponse::UpdateTable(resp) => json_response(resp),
         ApiResponse::UpdateTimeToLive(resp) => json_response(resp),

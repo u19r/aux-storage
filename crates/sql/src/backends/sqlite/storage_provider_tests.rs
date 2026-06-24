@@ -9,17 +9,17 @@ use storage_backfill::{
     LogicalBackfillTombstone, LogicalExportRequest, SyncLearnerCatchupPolicy,
 };
 use storage_common::{GSI_UPDATE_JOB, TTL_SWEEP_JOB};
-use storage_provider::StorageProvider;
+use storage_provider::{SqliteSettings, StorageProvider};
 use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, CreateGlobalSecondaryIndex, CreateTableRequest,
     DurablePointReadGuard, DurablePointReadProof, DurablePointReadRequest,
     GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedUpdateItemRequest, IndexName, ItemKey,
     KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType, Projection, ProjectionType,
-    ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
-    ReplicationWriteSource, ReturnValuesOldNewUpdated, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StreamItemId, StreamName, StreamSpecification, StreamViewType, TableName,
-    TimeToLiveSpecification, TimestampMillis, UpdateItemRequest, UpdateTableRequest,
-    UpdateTimeToLiveRequest, UserStreamName, WireItem, context::WrappedError,
+    ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
+    ReplicationMutation, ReplicationWriteSource, ReturnValuesOldNewUpdated, ScanTableRequest,
+    StorageEnum, StorageError, StorageResult, StreamItemId, StreamName, StreamSpecification,
+    StreamViewType, TableName, TimeToLiveSpecification, TimestampMillis, UpdateItemRequest,
+    UpdateTableRequest, UpdateTimeToLiveRequest, UserStreamName, WireItem, context::WrappedError,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamItem, StreamProvider,
@@ -98,6 +98,158 @@ async fn create_revision_test_table(table_name: &str) -> SQLiteStorageProvider {
         .unwrap();
 
     provider
+}
+
+async fn create_file_backed_revision_test_table(
+    database_path: &str,
+    table_name: &str,
+) -> SQLiteStorageProvider {
+    let provider = SQLiteStorageProvider::new_with_settings(
+        database_path,
+        SqliteSettings {
+            immediate_gsi_consistency: false,
+            force_file_backed_database: true,
+        },
+    )
+    .await
+    .unwrap();
+    provider.initialize_storage().await.unwrap();
+    provider.initialize_stream().await.unwrap();
+
+    provider
+        .create_table(&CreateTableRequest::new(
+            TableName::new(table_name),
+            vec![AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            }],
+            vec![KeySchemaElement {
+                attribute_name: "pk".to_string(),
+                key_type: KeyType::Hash,
+            }],
+            storage_types::BillingMode::PayPerRequest,
+        ))
+        .await
+        .unwrap();
+
+    provider
+}
+
+#[tokio::test]
+async fn sqlite_read_sequence_eventual_context_reads_through_provider_boundary() {
+    let table_name = TableName::new("ReadSequenceContext");
+    let provider = create_revision_test_table(table_name.as_ref()).await;
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("item#1".to_string()));
+    item.insert(
+        "value".to_string(),
+        AttributeValue::S("present".to_string()),
+    );
+    provider
+        .put_item(table_name.clone(), item, None, None, None, None)
+        .await
+        .unwrap();
+
+    let context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Eventual)
+        .await
+        .unwrap();
+    let mut key = KeyAttributes::new();
+    key.insert("pk".to_string(), AttributeValue::S("item#1".to_string()));
+    let read = context
+        .get_item(table_name, key, false)
+        .await
+        .unwrap()
+        .expect("item should be visible through read-sequence context")
+        .into_attribute_map()
+        .unwrap();
+
+    assert_eq!(
+        read.get("value"),
+        Some(&AttributeValue::S("present".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn sqlite_read_sequence_transactional_context_keeps_one_file_backed_snapshot() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("read-sequence-snapshot.db");
+    let table_name = TableName::new("ReadSequenceSnapshot");
+    let provider = create_file_backed_revision_test_table(
+        &database_path.to_string_lossy(),
+        table_name.as_ref(),
+    )
+    .await;
+    let mut item = HashMap::new();
+    item.insert("pk".to_string(), AttributeValue::S("item#1".to_string()));
+    item.insert("value".to_string(), AttributeValue::S("before".to_string()));
+    provider
+        .put_item(table_name.clone(), item, None, None, None, None)
+        .await
+        .unwrap();
+
+    let context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await
+        .unwrap();
+    let mut key = KeyAttributes::new();
+    key.insert("pk".to_string(), AttributeValue::S("item#1".to_string()));
+    let first_read = context
+        .get_item(table_name.clone(), key.clone(), true)
+        .await
+        .unwrap()
+        .expect("first snapshot read")
+        .into_attribute_map()
+        .unwrap();
+    assert_eq!(
+        first_read.get("value"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let mut updated = HashMap::new();
+    updated.insert("pk".to_string(), AttributeValue::S("item#1".to_string()));
+    updated.insert("value".to_string(), AttributeValue::S("after".to_string()));
+    provider
+        .put_item(table_name.clone(), updated, None, None, None, None)
+        .await
+        .unwrap();
+
+    let second_snapshot_read = context
+        .get_item(table_name.clone(), key.clone(), true)
+        .await
+        .unwrap()
+        .expect("second snapshot read")
+        .into_attribute_map()
+        .unwrap();
+    assert_eq!(
+        second_snapshot_read.get("value"),
+        Some(&AttributeValue::S("before".to_string()))
+    );
+
+    let normal_read = provider
+        .get_item(table_name, key, true)
+        .await
+        .unwrap()
+        .expect("normal read should see committed update")
+        .into_attribute_map()
+        .unwrap();
+    assert_eq!(
+        normal_read.get("value"),
+        Some(&AttributeValue::S("after".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn sqlite_read_sequence_transactional_context_fails_closed_without_snapshot_executor() {
+    let provider = create_revision_test_table("ReadSequenceTransactionalUnsupported").await;
+    let result = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await;
+    let Err(error) = result else {
+        panic!("transactional read-sequence context should fail closed");
+    };
+
+    assert!(matches!(error.to_enum(), StorageEnum::Unsupported { .. }));
 }
 
 #[tokio::test]

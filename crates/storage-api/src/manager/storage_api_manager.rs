@@ -16,8 +16,9 @@ use storage_types::{
     DeleteTableRequest, DescribeStreamRequest, DescribeTableRequest, DescribeTimeToLiveRequest,
     GetItemRequest, GetRecordsRequest, GetShardIteratorRequest, GetStreamRecordsRequest,
     ListStreamsRequest, ListTablesRequest, MultiRegionConsistency, PutItemRequest, QueryRequest,
-    ReplicaDescription, ReplicationApplyRequest, ReplicationHeartbeatRequest, ScanRequest,
-    StreamSpecification, TableDescription, TableName, TimestampMillis, TransactGetItemsRequest,
+    ReadSequenceProviderCapabilities, ReadSequenceRequest, ReplicaDescription,
+    ReplicationApplyRequest, ReplicationHeartbeatRequest, ScanRequest, StreamSpecification,
+    TableDescription, TableName, TimestampMillis, TransactGetItemsRequest,
     TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest, UpdateTimeToLiveRequest,
 };
 
@@ -32,12 +33,15 @@ pub struct StorageApiManagerOptions {
     pub sync_proposal_pipeline_limits: storage_sync::SyncProposalPipelineLimits,
     pub sync_read_barrier: Option<Arc<dyn SyncReadBarrier>>,
     pub sync_health_reporter: Option<Arc<dyn SyncHealthReporter>>,
+    pub read_sequence_capabilities: Option<ReadSequenceProviderCapabilities>,
+    #[cfg(test)]
+    pub read_sequence_after_root_step_hook: Option<Arc<dyn ReadSequenceAfterRootStepHook>>,
 }
 
 impl fmt::Debug for StorageApiManagerOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StorageApiManagerOptions")
+        let mut debug_builder = formatter.debug_struct("StorageApiManagerOptions");
+        debug_builder
             .field("self_region", &self.self_region)
             .field(
                 "sync_write_proposer",
@@ -55,7 +59,19 @@ impl fmt::Debug for StorageApiManagerOptions {
                 "sync_health_reporter",
                 &self.sync_health_reporter.as_ref().map(|_| "<configured>"),
             )
-            .finish()
+            .field(
+                "read_sequence_capabilities",
+                &self.read_sequence_capabilities,
+            );
+        #[cfg(test)]
+        debug_builder.field(
+            "read_sequence_after_root_step_hook",
+            &self
+                .read_sequence_after_root_step_hook
+                .as_ref()
+                .map(|_| "<configured>"),
+        );
+        debug_builder.finish()
     }
 }
 
@@ -77,6 +93,12 @@ pub trait SyncHealthReporter: Send + Sync {
     async fn sync_health(&self) -> Result<storage_sync::SyncHealthResponse, HttpApiError>;
 }
 
+#[cfg(test)]
+#[async_trait]
+pub trait ReadSequenceAfterRootStepHook: Send + Sync {
+    async fn after_root_step(&self) -> Result<(), HttpApiError>;
+}
+
 pub struct StorageApiManagerImpl {
     db: Arc<DatabaseManager>,
     self_region: Option<String>,
@@ -84,6 +106,9 @@ pub struct StorageApiManagerImpl {
     pub(super) sync_proposal_pipeline: Arc<SyncProposalPipeline>,
     pub(super) sync_read_barrier: Option<Arc<dyn SyncReadBarrier>>,
     pub(super) sync_health_reporter: Option<Arc<dyn SyncHealthReporter>>,
+    pub(super) read_sequence_capabilities: ReadSequenceProviderCapabilities,
+    #[cfg(test)]
+    pub(super) read_sequence_after_root_step_hook: Option<Arc<dyn ReadSequenceAfterRootStepHook>>,
 }
 
 impl StorageApiManagerImpl {
@@ -93,6 +118,9 @@ impl StorageApiManagerImpl {
             .self_region
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let read_sequence_capabilities = options
+            .read_sequence_capabilities
+            .unwrap_or_else(|| db.read_sequence_capabilities());
         Self {
             db,
             self_region,
@@ -102,6 +130,9 @@ impl StorageApiManagerImpl {
             )),
             sync_read_barrier: options.sync_read_barrier,
             sync_health_reporter: options.sync_health_reporter,
+            read_sequence_capabilities,
+            #[cfg(test)]
+            read_sequence_after_root_step_hook: options.read_sequence_after_root_step_hook,
         }
     }
 
@@ -338,6 +369,7 @@ pub trait StorageApiManager: Send + Sync {
         &self,
         request: TransactGetItemsRequest,
     ) -> Result<Response, HttpApiError>;
+    async fn read_sequence(&self, request: ReadSequenceRequest) -> Result<Response, HttpApiError>;
     async fn update_item(&self, request: UpdateItemRequest) -> Result<Response, HttpApiError>;
     async fn update_table(&self, request: UpdateTableRequest) -> Result<Response, HttpApiError>;
     async fn update_time_to_live(
@@ -459,6 +491,10 @@ impl StorageApiManager for StorageApiManagerImpl {
         request: TransactGetItemsRequest,
     ) -> Result<Response, HttpApiError> {
         self.transact_get_items_internal(request).await
+    }
+
+    async fn read_sequence(&self, request: ReadSequenceRequest) -> Result<Response, HttpApiError> {
+        self.read_sequence_internal(request).await
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> Result<Response, HttpApiError> {

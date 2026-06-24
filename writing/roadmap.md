@@ -1,6 +1,6 @@
 # Aux-Storage Roadmap
 
-Last updated: 2026-06-09
+Last updated: 2026-06-24
 
 Status: developer-preview
 
@@ -13,6 +13,7 @@ Status: developer-preview
 - Backends: SQLite, Postgres, RocksDB, FoundationDB, and remote provider mode.
 - Performance tuning: p50 and p90 latency similar to AWS DynamoDB. Throughput optimisations.
 - Immediate GSI consistency mode.
+- ReadSequence: bounded dependent reads to reduce N+1 request patterns.
 
 ## Experimental
 
@@ -27,7 +28,6 @@ Status: developer-preview
 
 ## Current Development
 
-- ReadSequence: bounded dependent reads to reduce N+1 request patterns.
 - Bounded inverted indexes: opt-in set-membership indexes for DynamoDB set attributes.
 - VersionAt reads: historical reads at a requested timestamp.
 - Tunable limits: knobs to relax selected AWS DynamoDB constraints while preserving bounded work.

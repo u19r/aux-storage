@@ -13,6 +13,7 @@ use crate::sqlite_cache_config::sqlite_page_cache_size_kb;
 #[derive(Clone)]
 pub struct SQLiteStorageProvider {
     pub(crate) connection: Arc<Connection>,
+    pub(crate) read_sequence_snapshot_path: Option<String>,
     pub(crate) job_manager: JobManager,
     pub(crate) table_info_cache: Arc<tokio::sync::RwLock<HashMap<TableName, Arc<StoredTableInfo>>>>,
     pub(crate) immediate_gsi_consistency: bool,
@@ -90,6 +91,7 @@ impl SQLiteStorageProvider {
 
         Ok(Self {
             connection: Arc::new(connection),
+            read_sequence_snapshot_path: (!use_memory_db).then_some(final_path),
             job_manager: JobManager::new_for_test(),
             table_info_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             immediate_gsi_consistency: settings.immediate_gsi_consistency,

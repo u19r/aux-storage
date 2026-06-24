@@ -145,6 +145,65 @@ The workspace is structured around backend features:
 
 Backend support varies by crate. Check each crate's `Cargo.toml` before enabling a feature in a downstream workspace.
 
+## ReadSequence Extension
+
+`ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded N+1 read workflows.
+It runs ordered `Get`, `BatchGet`, and `Query` steps, binds selected parent attributes into child
+steps, and returns a nested response with deterministic joins. It is available through the
+`DynamoDB_20120810.ReadSequence` target.
+
+Supported consistency is capability-gated by backend. Eventual reads are the default. Strong reads
+are allowed for base-table operations and reject GSI reads. Transactional snapshots are currently
+enabled only where the provider can prove one backend snapshot covers the whole sequence page; other
+backends fail closed before partial execution.
+
+Prefer existing DynamoDB-compatible APIs when they already express the workflow: use `BatchGetItem`
+for independent point reads and `TransactGetItems` for small transactional point-read sets. Use
+`ReadSequence` when later reads depend on attributes returned by earlier reads and the whole workflow
+must stay bounded by fanout, total-read, and response-size limits.
+
+Example target and request shape:
+
+```http
+x-amz-target: DynamoDB_20120810.ReadSequence
+```
+
+```json
+{
+  "ReadConsistency": "EVENTUAL",
+  "Sequence": [
+    {
+      "Name": "user",
+      "Get": {
+        "TableName": "Users",
+        "Key": { "pk": { "S": "user#1" } }
+      },
+      "Select": {
+        "org_id": "$.org_id"
+      }
+    },
+    {
+      "Name": "org",
+      "ForEach": {
+        "From": "user.Item.org_id",
+        "As": "org_id",
+        "OnMissing": "ERROR",
+        "Get": {
+          "TableName": "Organizations",
+          "Key": { "pk": { "S": "${org_id}" } }
+        },
+        "Join": { "To": "user", "As": "org", "Type": "REQUIRED_ONE" }
+      }
+    }
+  ]
+}
+```
+
+Operators should treat `NextSequenceToken` as an opaque continuation token. Stale or mismatched
+tokens fail validation. Remote `BatchGetItem` partial responses with `UnprocessedKeys` are surfaced
+as retryable throttling errors instead of incomplete joined data. Transactional requests on backends
+without a provider-owned snapshot context fail before any sequence step executes.
+
 ## Sync Replication
 
 Sync replication is the low-latency quorum-replicated storage mode for `storage-api`. The first

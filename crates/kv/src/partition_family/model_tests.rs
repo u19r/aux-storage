@@ -6,13 +6,14 @@ use crate::{
     keyspace::compact::{ParsedCompactKey, PartitionControlKind, parse_compact_key},
     partition_family::{
         OrderedLogSplitBoundary, PartitionInfo, PartitionState, QueueReceiptHandleData,
-        apply_ordered_log_split_boundaries, ordered_log_bucket, ordered_log_partition_for_key,
-        ordered_log_partition_prefix, ordered_log_split_marker_family_prefix,
-        ordered_log_stream_storage_id, parse_ordered_log_split_boundary_from_key,
-        parse_partitioned_stream_item_id, parse_queue_partition_marker,
-        parse_stream_partition_marker, partition_family_config_key, partition_family_resource_id,
-        partition_info_key, partition_load_sample_key, queue_partition_marker_bytes,
-        queue_partition_marker_key, stream_partition_marker_bytes, stream_partition_marker_key,
+        apply_ordered_log_split_boundaries, find_partition_for_hash, ordered_log_bucket,
+        ordered_log_partition_for_key, ordered_log_partition_prefix,
+        ordered_log_split_marker_family_prefix, ordered_log_stream_storage_id,
+        parse_ordered_log_split_boundary_from_key, parse_partitioned_stream_item_id,
+        parse_queue_partition_marker, parse_stream_partition_marker, partition_family_config_key,
+        partition_family_resource_id, partition_info_key, partition_load_sample_key,
+        queue_partition_marker_bytes, queue_partition_marker_key, readable_partitions,
+        stream_partition_marker_bytes, stream_partition_marker_key,
         supports_pointer_stream_partitioning,
     },
 };
@@ -262,6 +263,67 @@ fn ordered_log_split_boundaries_overlay_parent_and_children_tests() {
     assert_eq!(partitions[0].sealed_after_id, Some(boundary));
     assert_eq!(partitions[1].opened_after_id, Some(boundary));
     assert_eq!(partitions[2].opened_after_id, Some(boundary));
+}
+
+#[test]
+fn partition_routing_ignores_write_closed_parent_and_retired_partitions_tests() {
+    let partitions = vec![
+        PartitionInfo {
+            partition_id: 1,
+            placement_slot: 1,
+            state: PartitionState::WriteClosed,
+            opened_after_id: None,
+            sealed_after_id: None,
+            hash_start_inclusive: 0,
+            hash_end_exclusive: Some(100),
+        },
+        PartitionInfo {
+            partition_id: 2,
+            placement_slot: 2,
+            state: PartitionState::Open,
+            opened_after_id: None,
+            sealed_after_id: None,
+            hash_start_inclusive: 0,
+            hash_end_exclusive: Some(50),
+        },
+        PartitionInfo {
+            partition_id: 3,
+            placement_slot: 3,
+            state: PartitionState::Open,
+            opened_after_id: None,
+            sealed_after_id: None,
+            hash_start_inclusive: 50,
+            hash_end_exclusive: Some(100),
+        },
+        PartitionInfo {
+            partition_id: 4,
+            placement_slot: 4,
+            state: PartitionState::Retired,
+            opened_after_id: None,
+            sealed_after_id: None,
+            hash_start_inclusive: 0,
+            hash_end_exclusive: Some(100),
+        },
+    ];
+
+    assert_eq!(
+        find_partition_for_hash(&partitions, 25)
+            .expect("left child routes")
+            .partition_id,
+        2
+    );
+    assert_eq!(
+        find_partition_for_hash(&partitions, 75)
+            .expect("right child routes")
+            .partition_id,
+        3
+    );
+    assert_eq!(
+        readable_partitions(&partitions)
+            .map(|partition| partition.partition_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]

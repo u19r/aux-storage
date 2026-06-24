@@ -4,12 +4,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use bg_jobs::BackgroundJobName;
 use storage_common::GSI_UPDATE_JOB;
+use storage_provider::StorageProviderReadContext;
 use storage_types::{
     AllOld, AttributeValue, CreateTableRequest, DescribeTimeToLiveResponse, IndexName,
-    KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReturnValuesOldNewUpdated,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, TableName, TableNamespace,
-    TableStatus, TransactEncodeItem, TryIntoWireItem, UpdateTimeToLiveRequest,
-    UpdateTimeToLiveResponse, WireItem, context::WrappedError as _,
+    KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    ReadSequenceProviderCapabilities, ReturnValuesOldNewUpdated, StorageEnum, StorageError,
+    StorageResult, StoredTableInfo, TableName, TableNamespace, TableStatus, TransactEncodeItem,
+    TryIntoWireItem, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
+    context::WrappedError as _,
 };
 use stream::StreamProvider;
 #[cfg(test)]
@@ -410,6 +412,7 @@ pub struct DatabaseManager {
     #[cfg(test)]
     pub(super) pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
     pub(super) supports_multi_region_replication_control_plane: bool,
+    pub(super) read_sequence_capabilities: ReadSequenceProviderCapabilities,
     pub(super) table_info_cache: RwLock<HashMap<TableName, Arc<StoredTableInfo>>>,
 }
 
@@ -525,6 +528,19 @@ impl DatabaseManager {
 
     pub(crate) const fn supports_multi_region_replication_control_plane(&self) -> bool {
         self.supports_multi_region_replication_control_plane
+    }
+
+    pub const fn read_sequence_capabilities(&self) -> ReadSequenceProviderCapabilities {
+        self.read_sequence_capabilities
+    }
+
+    pub async fn begin_read_sequence_read_context(
+        &self,
+        consistency: ReadSequenceConsistency,
+    ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
+        self.storage
+            .begin_read_sequence_read_context(consistency)
+            .await
     }
 
     pub(crate) fn ensure_multi_region_replication_control_plane_supported(

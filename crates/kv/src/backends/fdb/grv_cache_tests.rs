@@ -1,7 +1,10 @@
 #![cfg(feature = "foundationdb-backend")]
 
-use crate::backends::fdb::store::{
-    FoundationDbConfig, FoundationDbNetworkPolicy, validate_network_policy,
+use crate::backends::fdb::{
+    network::{
+        FoundationDbNetworkPolicy, validate_network_policy, validate_simulated_database_config,
+    },
+    store::FoundationDbConfig,
 };
 
 #[test]
@@ -69,6 +72,27 @@ fn foundationdb_network_policy_rejects_mismatched_non_zero_lag_values() {
     .expect_err("mismatched non-zero lags must be rejected");
     assert!(
         error.to_string().contains("cache_read_version_ms mismatch"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn foundationdb_simulated_database_rejects_process_network_options() {
+    validate_simulated_database_config(&FoundationDbConfig {
+        cache_read_version_ms: 0,
+        ..Default::default()
+    })
+    .expect("simulated database should accept config without process network options");
+
+    let error = validate_simulated_database_config(&FoundationDbConfig {
+        cache_read_version_ms: 25,
+        ..Default::default()
+    })
+    .expect_err("simulated database cannot configure process-level GRV cache");
+    assert!(
+        error
+            .to_string()
+            .contains("simulator already owns the FoundationDB network"),
         "unexpected error: {error}"
     );
 }

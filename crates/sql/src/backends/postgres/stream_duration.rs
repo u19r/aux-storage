@@ -131,7 +131,7 @@ impl PostgresStorageProvider {
         system_stream_item_id: StreamItemId,
         created_at: TimestampMillis,
     ) -> StorageResult<()> {
-        let item_stream_name = String::from(item_stream);
+        let item_stream_name = Self::encode_stream_name(item_stream);
         let table_name_value = table_name.to_string();
         let item_stream_version_value = item_stream_version.to_string();
         let table_stream_item_id_value = table_stream_item_id.to_string();

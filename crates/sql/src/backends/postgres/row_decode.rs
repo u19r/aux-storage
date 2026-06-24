@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use deadpool_postgres::GenericClient;
 use queue_provider::{
     MessageAttributeValue, MessageId, QueueError, QueueResult, QueueValidationKind,
 };
@@ -16,6 +17,38 @@ impl PostgresStorageProvider {
     )]
     pub(super) async fn load_paginated_wire_items(
         &self,
+        physical_name: &str,
+        table_info: &StoredTableInfo,
+        primary_key_schema: &[storage_types::KeySchemaElement],
+        secondary_key_schema: Option<&[storage_types::KeySchemaElement]>,
+        where_clauses: &[String],
+        bind_values: &[String],
+        scan_forward: bool,
+        effective_limit: u32,
+    ) -> StorageResult<(Vec<WireItem>, bool)> {
+        let client = self.acquire_client("query_table").await?;
+        let _connection_hold = self.connection_hold_timer("query_table");
+        self.load_paginated_wire_items_with_client(
+            &client,
+            physical_name,
+            table_info,
+            primary_key_schema,
+            secondary_key_schema,
+            where_clauses,
+            bind_values,
+            scan_forward,
+            effective_limit,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Unified paginated read needs schemas, predicates, and pagination inputs"
+    )]
+    pub(super) async fn load_paginated_wire_items_with_client<C: GenericClient + Sync>(
+        &self,
+        client: &C,
         physical_name: &str,
         table_info: &StoredTableInfo,
         primary_key_schema: &[storage_types::KeySchemaElement],
@@ -60,14 +93,10 @@ impl PostgresStorageProvider {
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
             .collect();
-        let rows = {
-            let client = self.acquire_client("query_table").await?;
-            let _connection_hold = self.connection_hold_timer("query_table");
-            client
-                .query(&sql, &params)
-                .await
-                .map_err(|err| Self::map_postgres_error("load ordered rows", err))?
-        };
+        let rows = client
+            .query(&sql, &params)
+            .await
+            .map_err(|err| Self::map_postgres_error("load ordered rows", err))?;
 
         let mut items: Vec<WireItem> = rows
             .into_iter()

@@ -19,6 +19,8 @@ mod storage_manager_impl_list_tables;
 mod storage_manager_impl_put_item;
 mod storage_manager_impl_query;
 mod storage_manager_impl_read_pagination;
+mod storage_manager_impl_read_sequence;
+mod storage_manager_impl_read_sequence_token;
 mod storage_manager_impl_replication;
 mod storage_manager_impl_run_background_job;
 mod storage_manager_impl_scan;
@@ -31,6 +33,8 @@ mod storage_manager_impl_update_time_to_live;
 mod sync_raft_proposal_coalescer;
 mod sync_raft_runtime_adapter;
 
+#[cfg(test)]
+pub use storage_api_manager::ReadSequenceAfterRootStepHook;
 #[allow(unused_imports)]
 pub use storage_api_manager::{
     StorageApiManager, StorageApiManagerImpl, StorageApiManagerOptions, SyncHealthReporter,

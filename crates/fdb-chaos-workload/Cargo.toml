@@ -1,0 +1,28 @@
+[package]
+publish = false
+edition = "2024"
+license.workspace = true
+name = "fdb-chaos-workload"
+version = "0.1.0"
+
+[lib]
+doctest = false
+name = "aux_storage_fdb_chaos"
+crate-type = ["cdylib"]
+
+[dependencies]
+fdb-chaos-model = { path = "../fdb-chaos-model" }
+foundationdb = { workspace = true }
+foundationdb-simulation = { workspace = true }
+kv = { path = "../kv", default-features = false, features = ["foundationdb-backend"] }
+pubsub = { path = "../pubsub", default-features = false, features = ["foundationdb"] }
+queue = { path = "../queue", default-features = false, features = ["foundationdb"] }
+serde_json = { workspace = true }
+storage = { path = "../storage", default-features = false, features = ["foundationdb"] }
+storage-common = { path = "../storage-common" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { path = "../storage-types" }
+stream-provider = { path = "../stream-provider" }
+
+[lints]
+workspace = true

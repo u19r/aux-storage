@@ -1,0 +1,148 @@
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-check:
+    name: repo-gate
+    if: ${{ github.event.repository.private && github.repository_owner == 'u19r' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # Runner class: arm64/large maps to the approved 4xlarge-first Spot pool.
+    # Use x64 only for x86-only toolchains; use xlarge/docker or memory only
+    # for release, image, or integration jobs that cannot pass on large.
+    runs-on:
+      - self-hosted
+      - aux-build
+      - linux
+      - arm64
+      - large
+      - run-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: eu-north-1
+      AWS_ROLE_SESSION_NAME: gha-ci-dependency-read-${{ github.run_id }}-${{ github.run_attempt }}
+      DEPENDENCY_READ_ROLE_ARN: ${{ vars.AUX_BUILD_DEPENDENCY_READ_ROLE_ARN }}
+      DEPENDENCY_TOKEN_BROKER_FUNCTION: ${{ vars.AUX_BUILD_DEPENDENCY_TOKEN_BROKER_FUNCTION || 'aux-build-eu-north-1-dependency-token-broker' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: ${{ github.event.repository.name == 'aux-fe' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Configure private dependency access
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPENDENCY_READ_ROLE_ARN" ]; then
+            echo "AUX_BUILD_DEPENDENCY_READ_ROLE_ARN is required for private dependency access" >&2
+            exit 64
+          fi
+          token_json="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")"
+          web_identity_token="$(printf '%s' "$token_json" | jq -r '.value')"
+          credentials="$(aws sts assume-role-with-web-identity \
+            --role-arn "$DEPENDENCY_READ_ROLE_ARN" \
+            --role-session-name "$AWS_ROLE_SESSION_NAME" \
+            --web-identity-token "$web_identity_token" \
+            --duration-seconds 3600)"
+          aws_access_key_id="$(printf '%s' "$credentials" | jq -r '.Credentials.AccessKeyId')"
+          aws_secret_access_key="$(printf '%s' "$credentials" | jq -r '.Credentials.SecretAccessKey')"
+          aws_session_token="$(printf '%s' "$credentials" | jq -r '.Credentials.SessionToken')"
+          echo "::add-mask::$aws_access_key_id"
+          echo "::add-mask::$aws_secret_access_key"
+          echo "::add-mask::$aws_session_token"
+          export AWS_ACCESS_KEY_ID="$aws_access_key_id"
+          export AWS_SECRET_ACCESS_KEY="$aws_secret_access_key"
+          export AWS_SESSION_TOKEN="$aws_session_token"
+          response_file="$RUNNER_TEMP/dependency-token-response.json"
+          payload="$(jq -nc --arg repository "${{ github.event.repository.name }}" '{repository: $repository}')"
+          aws lambda invoke \
+            --region "$AWS_REGION" \
+            --function-name "$DEPENDENCY_TOKEN_BROKER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$payload" \
+            "$response_file" >/dev/null
+          token="$(jq -r '.body | fromjson | .token' "$response_file")"
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "dependency token broker did not return a token" >&2
+            jq -r '.body // .' "$response_file" >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          {
+            echo "machine github.com"
+            echo "login x-access-token"
+            echo "password ${token}"
+          } > "$HOME/.netrc"
+          chmod 0600 "$HOME/.netrc"
+          git config --global url."https://x-access-token:${token}@github.com/u19r/".insteadOf "https://github.com/u19r/"
+          git config --global url."https://x-access-token:${token}@github.com/u19r/".insteadOf "git@github.com:u19r/"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$cargo_home"
+          {
+            echo "[net]"
+            echo "git-fetch-with-cli = true"
+          } >> "$cargo_home/config.toml"
+
+      - name: Run repository gate
+        run: |
+          set -euo pipefail
+          case "${{ github.event.repository.name }}" in
+            aux-fe)
+              just ci-check
+              ;;
+            aux-fn|aux-analytics-private|aux-storage-private|aux-duckdb-private)
+              just ci-check
+              ;;
+            *)
+              echo "unsupported private Aux repo: ${{ github.event.repository.name }}" >&2
+              exit 64
+              ;;
+          esac
+
+  report:
+    name: report
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: repo-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Comment PR status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.repository.private }}" != "true" ] || [ "${{ github.repository_owner }}" != "u19r" ]; then
+            status="skipped: repository is outside the private u19r scope"
+          elif [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            status="skipped: fork pull requests do not run trusted Aux self-hosted runners"
+          else
+            status="${{ needs.repo-gate.result }}"
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "repo gate: ${status} in run ${{ github.run_id }}" || true

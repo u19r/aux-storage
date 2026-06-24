@@ -4,7 +4,7 @@ use crate::{
     DYNAMODB_STREAM_RECORDS_LIMIT_MIN, DeleteItemRequest, DeleteTableRequest,
     DescribeStreamRequest, DescribeTableRequest, GetItemRequest, GetRecordsRequest,
     GetShardIteratorRequest, GetStreamRecordsRequest, KeyAttributes, KeyType, ListStreamsRequest,
-    ListTablesRequest, PutItemRequest, QueryRequest, ScanRequest, TableName,
+    ListTablesRequest, PutItemRequest, QueryRequest, ReadSequenceRequest, ScanRequest, TableName,
     TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
     dynamodb_limits::{
         MAX_LIST_TABLES_LIMIT, validate_attribute_name, validate_index_name, validate_item,
@@ -466,6 +466,12 @@ impl DynamoRequestValidate for TransactGetItemsRequest {
             )?;
         }
         Ok(())
+    }
+}
+
+impl DynamoRequestValidate for ReadSequenceRequest {
+    fn validate_for_dynamodb(&self) -> Result<(), String> {
+        self.validate().map_err(|error| error.to_string())
     }
 }
 

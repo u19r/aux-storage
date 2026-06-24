@@ -1,20 +1,29 @@
+#[cfg(any(test, feature = "rocksdb-backend"))]
 use queue_provider::MessageId;
 use serde::{Deserialize, Serialize};
-use storage_types::{DurationSeconds, ItemKey, StorageError, StorageResult, TimestampMillis};
+#[cfg(any(test, feature = "rocksdb-backend"))]
+use storage_types::ItemKey;
+use storage_types::{DurationSeconds, StorageError, StorageResult, TimestampMillis};
+#[cfg(any(test, feature = "rocksdb-backend"))]
 use uuid::Uuid;
 
 use crate::{
     helpers::increment_bytes,
     keyspace::compact::QueueStorageId,
-    newtypes::MessageVisibilityKey,
-    partition_family::{
-        PartitionFamilyKvStore, queue_payload_key_with_slot, queue_ready_hint_bytes,
-        queue_ready_key_with_slot, queue_state_key_with_slot,
-    },
+    partition_family::PartitionFamilyKvStore,
     queue::constants::QUEUE_PAYLOAD_CHUNK_BYTES,
     sorted_kv_store::{DirectWriteOperation, SortedKvStore},
 };
+#[cfg(any(test, feature = "rocksdb-backend"))]
+use crate::{
+    newtypes::MessageVisibilityKey,
+    partition_family::{
+        queue_payload_key_with_slot, queue_ready_hint_bytes, queue_ready_key_with_slot,
+        queue_state_key_with_slot,
+    },
+};
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 type QueueReadyEntry = (Box<[u8]>, Box<[u8]>);
 
 #[derive(Clone, Debug)]
@@ -105,6 +114,7 @@ pub trait QueueKvStore: SortedKvStore + PartitionFamilyKvStore {
     ) -> StorageResult<()>;
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 pub(crate) async fn claim_queue_messages_from_ranges_generic<S>(
     store: &S,
     ranges: Vec<QueueClaimRange>,
@@ -138,6 +148,7 @@ where
     Ok(batch)
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 pub(crate) async fn write_partitioned_queue_message_generic<S>(
     store: &S,
     message: PartitionedQueueMessageWrite,
@@ -266,6 +277,7 @@ fn queue_payload_chunk_key(payload_key: &[u8], index: u16) -> Vec<u8> {
 
 const QUEUE_PAYLOAD_CHUNK_KEY_SEGMENT: &[u8] = b"/chunk/";
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 pub(crate) async fn prewarm_partitioned_queue_generic(
     partitions: Vec<QueuePrewarmPartition>,
 ) -> StorageResult<()> {
@@ -280,6 +292,7 @@ pub(crate) async fn prewarm_partitioned_queue_generic(
     Ok(())
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 async fn claim_queue_messages_from_range<S>(
     store: &S,
     range: QueueClaimRange,
@@ -368,6 +381,7 @@ where
     Ok(())
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 async fn claim_queue_candidate<S>(
     store: &S,
     range: &QueueClaimRange,
@@ -465,6 +479,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 fn queue_claim_candidates(
     range: &QueueClaimRange,
     ready_items: Vec<QueueReadyEntry>,
@@ -503,6 +518,7 @@ fn queue_claim_candidates(
     Ok(candidates)
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 struct QueueClaimCandidate {
     ready_key: Vec<u8>,
     state_key: Vec<u8>,
@@ -511,6 +527,7 @@ struct QueueClaimCandidate {
     message_id_hex: String,
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 fn rotate_claim_candidates(items: &mut [QueueReadyEntry], seed: u64) {
     if items.len() <= 1 {
         return;

@@ -16,6 +16,9 @@ pub const TTL_SWEEP_JOB: BackgroundJobName = BackgroundJobName::Database {
 pub const STREAM_TRIM_JOB: BackgroundJobName = BackgroundJobName::Database {
     kind: DatabaseJobKind::StreamTrim,
 };
+pub const PARTITION_RECONCILE_JOB: BackgroundJobName = BackgroundJobName::Database {
+    kind: DatabaseJobKind::PartitionFamilyReconcile,
+};
 
 /// Backfill state machine (can be extended later).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

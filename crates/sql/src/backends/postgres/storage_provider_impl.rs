@@ -15,17 +15,18 @@ use storage_condition::{
 };
 use storage_provider::{
     CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
-    StorageProvider, split_item_into_key_and_attributes_sync,
+    StorageProvider, StorageProviderReadContext, split_item_into_key_and_attributes_sync,
 };
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
     BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof,
     DurableItemRevision, DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
-    KeysAndAttributes, PutItemResponse, QueryTableRequest, ReplicationMutation, ScanTableRequest,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName,
-    TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, UpdateItemRequest,
-    UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
+    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
+    StreamName, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis,
+    UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    WireItem,
 };
 use stream_provider::{CursorName, CursorPosition, StreamDataType, StreamItem, StreamProvider};
 use tokio_postgres::types::ToSql;
@@ -89,6 +90,67 @@ async fn apply_gsi_write_pressure(provider: &PostgresStorageProvider) -> Storage
     .await
 }
 
+struct PostgresReadSequenceReadContext {
+    provider: PostgresStorageProvider,
+    client: tokio::sync::Mutex<Option<deadpool_postgres::Client>>,
+}
+
+#[async_trait]
+impl StorageProviderReadContext for PostgresReadSequenceReadContext {
+    async fn get_item(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<WireItem>> {
+        let _ = consistent_read;
+        let table_info = self.provider.get_table_info_cached_arc(&table_name).await?;
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
+        self.provider
+            .get_item_with_client(client, &table_name, &key, &table_info)
+            .await
+    }
+
+    async fn batch_get_item(
+        &self,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
+        self.provider
+            .batch_get_item_with_client(client, request)
+            .await
+    }
+
+    async fn query_table(
+        &self,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
+        self.provider.query_table_with_client(client, request).await
+    }
+}
+
+impl Drop for PostgresReadSequenceReadContext {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.client.try_lock() else {
+            return;
+        };
+        let Some(client) = guard.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = client.batch_execute("ROLLBACK").await;
+        });
+    }
+}
+
+fn postgres_read_context_closed() -> StorageError {
+    StorageError::internal("postgres read-sequence read context is closed")
+}
+
 impl PostgresStorageProvider {
     pub(crate) async fn trim_change_index_markers_older_than(
         &self,
@@ -109,6 +171,262 @@ impl PostgresStorageProvider {
         usize::try_from(deleted_markers)
             .map_err(|_| StorageError::internal("postgres deleted marker count exceeds usize"))
     }
+
+    async fn query_table_with_client<C: deadpool_postgres::GenericClient + Sync>(
+        &self,
+        client: &C,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        if request.consistent_read && request.index_name.is_some() {
+            return Err(StorageError::validation(
+                "Consistent reads are not supported on global secondary indexes",
+            ));
+        }
+
+        let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
+        let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
+        let scan_forward = request.scan_index_forward.unwrap_or(true);
+        let exclusive_start_key = decode_exclusive_start(
+            &request.exclusive_start_key,
+            &table_info,
+            &request.index_name,
+        )?;
+
+        let (physical_name, primary_key_schema, secondary_key_schema): (
+            String,
+            Vec<storage_types::KeySchemaElement>,
+            Option<Vec<storage_types::KeySchemaElement>>,
+        ) = if let Some(index_name) = &request.index_name {
+            let Some(gsis) = &table_info.global_secondary_indexes else {
+                return Err(missing_index_error(&table_info, index_name));
+            };
+            let Some(gsi) = gsis.iter().find(|gsi| gsi.index_name == *index_name) else {
+                return Err(missing_index_error(&table_info, index_name));
+            };
+            (
+                physical_names::physical_gsi_table_name(&request.table_name, index_name),
+                gsi.key_schema.clone(),
+                Some(table_info.key_schema.clone()),
+            )
+        } else {
+            (
+                physical_names::physical_table_name(&request.table_name),
+                table_info.key_schema.clone(),
+                None,
+            )
+        };
+
+        let parsed_key_condition = parse_condition_expression(
+            &request.key_condition_expression,
+            request.expression_attribute_names.as_ref(),
+            request.expression_attribute_values.as_ref(),
+        )
+        .map_err(|err| {
+            StorageError::validation(format!("Invalid key condition expression: {err}"))
+        })?;
+        let key_attribute_types =
+            Self::key_attribute_types_map_for_schema(&table_info, &primary_key_schema)?;
+        let ordered_columns = Self::ordered_key_columns_for_origin(
+            &table_info,
+            &primary_key_schema,
+            secondary_key_schema.as_deref(),
+        )?;
+        let mut where_clauses = Vec::new();
+        let mut bind_values = Vec::new();
+        where_clauses.push(Self::compile_key_condition_sql(
+            &parsed_key_condition,
+            &key_attribute_types,
+            &mut bind_values,
+        )?);
+        if let Some(start_key) = exclusive_start_key.as_ref()
+            && let Some(predicate) = Self::build_exclusive_start_predicate_after_prefix(
+                &ordered_columns,
+                start_key,
+                scan_forward,
+                1,
+                &mut bind_values,
+            )?
+        {
+            where_clauses.push(format!("({predicate})"));
+        }
+
+        let (items, has_more) = self
+            .load_paginated_wire_items_with_client(
+                client,
+                &physical_name,
+                &table_info,
+                &primary_key_schema,
+                secondary_key_schema.as_deref(),
+                &where_clauses,
+                &bind_values,
+                scan_forward,
+                effective_limit,
+            )
+            .await?;
+
+        let last_evaluated_key = if has_more {
+            items
+                .last()
+                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+
+        Ok((items, last_evaluated_key))
+    }
+
+    async fn batch_get_item_with_client<C: deadpool_postgres::GenericClient + Sync>(
+        &self,
+        client: &C,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        let total_requested_keys: usize = request
+            .request_items
+            .values()
+            .map(|item| item.keys.len())
+            .sum();
+        let mut responses = HashMap::new();
+        let mut unprocessed_keys = HashMap::new();
+        let mut total_items_returned = 0_usize;
+        let mut total_bytes_read = 0_usize;
+
+        for (table_name, keys_and_attributes) in request.request_items {
+            if keys_and_attributes.keys.is_empty() {
+                continue;
+            }
+
+            let prepare_started = Instant::now();
+            let table_info = match self.get_table_info_cached_arc(&table_name).await {
+                Ok(info) => info,
+                Err(err) if matches!(err.as_ref(), StorageEnum::TableNotFound { .. }) => {
+                    return Err(err);
+                }
+                Err(_) => {
+                    unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
+                    continue;
+                }
+            };
+
+            let _consistent_read = keys_and_attributes.consistent_read.unwrap_or(true);
+            let key_columns = table_info
+                .key_schema
+                .iter()
+                .map(|key| {
+                    Ok((
+                        key.attribute_name.clone(),
+                        Self::sanitize_column_name(&key.attribute_name),
+                        Self::key_attribute_type(&table_info, &key.attribute_name)?,
+                    ))
+                })
+                .collect::<StorageResult<Vec<(String, String, storage_types::KeyAttributeType)>>>(
+                )?;
+            if key_columns.is_empty() {
+                unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
+                continue;
+            }
+            let mut select_projection = Vec::with_capacity(key_columns.len() + 1);
+            for (_, column_name, attribute_type) in &key_columns {
+                if matches!(attribute_type, storage_types::KeyAttributeType::N) {
+                    select_projection.push(format!("item.{column_name}::TEXT AS {column_name}"));
+                } else {
+                    select_projection.push(format!("item.{column_name} AS {column_name}"));
+                }
+            }
+            select_projection.push("item.attributes_blob AS attributes_blob".to_string());
+            let select_projection = select_projection.join(", ");
+
+            let mut bind_values =
+                Vec::with_capacity(key_columns.len() * keys_and_attributes.keys.len());
+            let tuple_columns = key_columns
+                .iter()
+                .map(|(_, column_name, _)| column_name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let join_predicates = key_columns
+                .iter()
+                .map(|(_, column_name, _)| format!("item.{column_name} = requested.{column_name}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut values_rows = Vec::with_capacity(keys_and_attributes.keys.len());
+            for key in &keys_and_attributes.keys {
+                let key_attributes = key.clone();
+                let mut row_placeholders = Vec::with_capacity(key_columns.len());
+                for (attribute_name, _, attribute_type) in &key_columns {
+                    let value = key_attributes
+                        .get(attribute_name)
+                        .ok_or_else(StorageError::invalid_or_missing_key)?;
+                    bind_values.push(Self::scalar_key_value(value, attribute_name)?);
+                    row_placeholders.push(Self::postgres_placeholder_for_type(
+                        bind_values.len(),
+                        attribute_type,
+                    ));
+                }
+                values_rows.push(format!("({})", row_placeholders.join(", ")));
+            }
+            let sql = sql_statements::batch_get_composite_key(
+                &select_projection,
+                &physical_names::physical_table_name(&table_name),
+                &tuple_columns,
+                &values_rows.join(", "),
+                &join_predicates,
+            );
+            self.record_transaction_phase("batch_get_item", "prepare", prepare_started.elapsed());
+
+            let params: Vec<&(dyn ToSql + Sync)> = bind_values
+                .iter()
+                .map(|value| value as &(dyn ToSql + Sync))
+                .collect();
+            let query_started = Instant::now();
+            let query_result = client.query(&sql, &params).await;
+            self.record_transaction_phase("batch_get_item", "db_query", query_started.elapsed());
+            match query_result {
+                Ok(rows) => {
+                    let decode_started = Instant::now();
+                    let mut table_items = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        table_items.push(Self::row_to_wire_item(&row, &table_info)?);
+                    }
+                    self.record_transaction_phase(
+                        "batch_get_item",
+                        "row_decode",
+                        decode_started.elapsed(),
+                    );
+                    total_items_returned += table_items.len();
+                    total_bytes_read += wire_items_payload_bytes(&table_items) as usize;
+                    if !table_items.is_empty() {
+                        responses.insert(table_name, table_items);
+                    }
+                }
+                Err(_) => {
+                    unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
+                }
+            }
+        }
+
+        let response = BatchGetWireItemResponse {
+            responses: if responses.is_empty() {
+                None
+            } else {
+                Some(responses)
+            },
+            unprocessed_keys: if unprocessed_keys.is_empty() {
+                None
+            } else {
+                Some(unprocessed_keys)
+            },
+            consumed_capacity: None,
+        };
+        record_read(total_items_returned, total_bytes_read);
+        record_read_cost(
+            "batch_get_item",
+            "get",
+            total_requested_keys,
+            total_bytes_read as u64,
+        );
+        Ok(response)
+    }
 }
 
 #[async_trait]
@@ -123,6 +441,30 @@ impl StorageProvider for PostgresStorageProvider {
 
     fn supports_change_index(&self) -> bool {
         true
+    }
+
+    async fn begin_read_sequence_read_context(
+        &self,
+        consistency: ReadSequenceConsistency,
+    ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
+        if consistency != ReadSequenceConsistency::Transactional {
+            return Err(StorageError::unsupported(
+                "postgres read-sequence provider contexts are only used for transactional reads",
+            ));
+        }
+        let client = self.acquire_client("read_sequence").await?;
+        client
+            .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(|err| {
+                StorageError::internal(&format!(
+                    "begin postgres read-sequence read-only transaction failed: {err}"
+                ))
+            })?;
+        Ok(Box::new(PostgresReadSequenceReadContext {
+            provider: self.clone(),
+            client: tokio::sync::Mutex::new(Some(client)),
+        }))
     }
 
     async fn write_stream_trim_state(
@@ -360,7 +702,7 @@ impl StorageProvider for PostgresStorageProvider {
                             Self::map_postgres_error("serialize non-key attributes", err)
                         })?
                     };
-                    let table_name_safe = table_name.sanitized_name();
+                    let physical_table_name = physical_names::physical_table_name(&table_name);
                     let key_columns = key_bindings
                         .iter()
                         .map(|binding| binding.column.clone())
@@ -390,13 +732,13 @@ impl StorageProvider for PostgresStorageProvider {
                         .join(", ");
                     let sql = if key_absence_condition {
                         sql_statements::insert_main_row_returning(
-                            &table_name_safe,
+                            &physical_table_name,
                             &columns_sql,
                             &values_placeholders,
                         )
                     } else {
                         sql_statements::upsert_main_row_returning(
-                            &table_name_safe,
+                            &physical_table_name,
                             &columns_sql,
                             &values_placeholders,
                             &conflict_target,
@@ -764,8 +1106,8 @@ impl StorageProvider for PostgresStorageProvider {
                     let mut bind_values = Vec::with_capacity(key_bindings.len());
                     let where_sql =
                         Self::where_clause_for_bindings(&key_bindings, &mut bind_values);
-                    let table_name_safe = table_name.sanitized_name();
-                    let sql = sql_statements::delete_main_row(&table_name_safe, &where_sql);
+                    let physical_table_name = physical_names::physical_table_name(&table_name);
+                    let sql = sql_statements::delete_main_row(&physical_table_name, &where_sql);
                     let params: Vec<&(dyn ToSql + Sync)> = bind_values
                         .iter()
                         .map(|value| value as &(dyn ToSql + Sync))
@@ -952,102 +1294,9 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        if request.consistent_read && request.index_name.is_some() {
-            return Err(StorageError::validation(
-                "Consistent reads are not supported on global secondary indexes",
-            ));
-        }
-
-        let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
-        let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
-        let scan_forward = request.scan_index_forward.unwrap_or(true);
-        let exclusive_start_key = decode_exclusive_start(
-            &request.exclusive_start_key,
-            &table_info,
-            &request.index_name,
-        )?;
-
-        let (physical_name, primary_key_schema, secondary_key_schema): (
-            String,
-            Vec<storage_types::KeySchemaElement>,
-            Option<Vec<storage_types::KeySchemaElement>>,
-        ) = if let Some(index_name) = &request.index_name {
-            let Some(gsis) = &table_info.global_secondary_indexes else {
-                return Err(missing_index_error(&table_info, index_name));
-            };
-            let Some(gsi) = gsis.iter().find(|gsi| gsi.index_name == *index_name) else {
-                return Err(missing_index_error(&table_info, index_name));
-            };
-            (
-                physical_names::physical_gsi_table_name(&request.table_name, index_name),
-                gsi.key_schema.clone(),
-                Some(table_info.key_schema.clone()),
-            )
-        } else {
-            (
-                physical_names::physical_table_name(&request.table_name),
-                table_info.key_schema.clone(),
-                None,
-            )
-        };
-
-        let parsed_key_condition = parse_condition_expression(
-            &request.key_condition_expression,
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_ref(),
-        )
-        .map_err(|err| {
-            StorageError::validation(format!("Invalid key condition expression: {err}"))
-        })?;
-        let key_attribute_types =
-            Self::key_attribute_types_map_for_schema(&table_info, &primary_key_schema)?;
-        let ordered_columns = Self::ordered_key_columns_for_origin(
-            &table_info,
-            &primary_key_schema,
-            secondary_key_schema.as_deref(),
-        )?;
-        let mut where_clauses = Vec::new();
-        let mut bind_values = Vec::new();
-        where_clauses.push(Self::compile_key_condition_sql(
-            &parsed_key_condition,
-            &key_attribute_types,
-            &mut bind_values,
-        )?);
-        if let Some(start_key) = exclusive_start_key.as_ref()
-            && let Some(predicate) = Self::build_exclusive_start_predicate_after_prefix(
-                &ordered_columns,
-                start_key,
-                scan_forward,
-                1,
-                &mut bind_values,
-            )?
-        {
-            where_clauses.push(format!("({predicate})"));
-        }
-
-        let (items, has_more) = self
-            .load_paginated_wire_items(
-                &physical_name,
-                &table_info,
-                &primary_key_schema,
-                secondary_key_schema.as_deref(),
-                &where_clauses,
-                &bind_values,
-                scan_forward,
-                effective_limit,
-            )
-            .await?;
-
-        let last_evaluated_key = if has_more {
-            items
-                .last()
-                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-
+        let client = self.acquire_client("query_table").await?;
+        let _connection_hold = self.connection_hold_timer("query_table");
+        let (items, last_evaluated_key) = self.query_table_with_client(&client, request).await?;
         let bytes_read = wire_items_payload_bytes(&items);
         record_read(items.len(), bytes_read as usize);
         record_read_cost("query_table", "query", 1, bytes_read);
@@ -1131,165 +1380,18 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
-        let total_requested_keys: usize = request
-            .request_items
-            .values()
-            .map(|item| item.keys.len())
-            .sum();
-        let mut total_items_returned = 0usize;
-        let mut total_bytes_read = 0usize;
-        let mut responses: HashMap<TableName, Vec<WireItem>> = HashMap::new();
-        let mut unprocessed_keys: HashMap<TableName, KeysAndAttributes> = HashMap::new();
-
-        for (table_name, keys_and_attributes) in request.request_items {
-            if keys_and_attributes.keys.is_empty() {
-                continue;
+        let client = match self.acquire_client("batch_get_item").await {
+            Ok(client) => client,
+            Err(_) => {
+                return Ok(BatchGetWireItemResponse {
+                    responses: None,
+                    unprocessed_keys: Some(request.request_items),
+                    consumed_capacity: None,
+                });
             }
-
-            let prepare_started = Instant::now();
-            let table_info = match self.get_table_info_cached_arc(&table_name).await {
-                Ok(info) => info,
-                Err(err) if matches!(err.as_ref(), StorageEnum::TableNotFound { .. }) => {
-                    return Err(err);
-                }
-                Err(_) => {
-                    unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
-                    continue;
-                }
-            };
-
-            let _consistent_read = keys_and_attributes.consistent_read.unwrap_or(true);
-            let key_columns = table_info
-                .key_schema
-                .iter()
-                .map(|key| {
-                    Ok((
-                        key.attribute_name.clone(),
-                        Self::sanitize_column_name(&key.attribute_name),
-                        Self::key_attribute_type(&table_info, &key.attribute_name)?,
-                    ))
-                })
-                .collect::<StorageResult<Vec<(String, String, storage_types::KeyAttributeType)>>>(
-                )?;
-            if key_columns.is_empty() {
-                unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
-                continue;
-            }
-            let mut select_projection = Vec::with_capacity(key_columns.len() + 1);
-            for (_, column_name, attribute_type) in &key_columns {
-                if matches!(attribute_type, storage_types::KeyAttributeType::N) {
-                    select_projection.push(format!("item.{column_name}::TEXT AS {column_name}"));
-                } else {
-                    select_projection.push(format!("item.{column_name} AS {column_name}"));
-                }
-            }
-            select_projection.push("item.attributes_blob AS attributes_blob".to_string());
-            let select_projection = select_projection.join(", ");
-
-            let mut bind_values =
-                Vec::with_capacity(key_columns.len() * keys_and_attributes.keys.len());
-            let tuple_columns = key_columns
-                .iter()
-                .map(|(_, column_name, _)| column_name.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let join_predicates = key_columns
-                .iter()
-                .map(|(_, column_name, _)| format!("item.{column_name} = requested.{column_name}"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            let mut values_rows = Vec::with_capacity(keys_and_attributes.keys.len());
-            for key in &keys_and_attributes.keys {
-                let key_attributes = key.clone();
-                let mut row_placeholders = Vec::with_capacity(key_columns.len());
-                for (attribute_name, _, attribute_type) in &key_columns {
-                    let value = key_attributes
-                        .get(attribute_name)
-                        .ok_or_else(StorageError::invalid_or_missing_key)?;
-                    bind_values.push(Self::scalar_key_value(value, attribute_name)?);
-                    row_placeholders.push(Self::postgres_placeholder_for_type(
-                        bind_values.len(),
-                        attribute_type,
-                    ));
-                }
-                values_rows.push(format!("({})", row_placeholders.join(", ")));
-            }
-            let sql = sql_statements::batch_get_composite_key(
-                &select_projection,
-                &physical_names::physical_table_name(&table_name),
-                &tuple_columns,
-                &values_rows.join(", "),
-                &join_predicates,
-            );
-            self.record_transaction_phase("batch_get_item", "prepare", prepare_started.elapsed());
-
-            let params: Vec<&(dyn ToSql + Sync)> = bind_values
-                .iter()
-                .map(|value| value as &(dyn ToSql + Sync))
-                .collect();
-            let query_result = {
-                let client = match self.acquire_client("batch_get_item").await {
-                    Ok(client) => client,
-                    Err(_) => {
-                        unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
-                        continue;
-                    }
-                };
-                let _connection_hold = self.connection_hold_timer("batch_get_item");
-                let query_started = Instant::now();
-                let result = client.query(&sql, &params).await;
-                self.record_transaction_phase(
-                    "batch_get_item",
-                    "db_query",
-                    query_started.elapsed(),
-                );
-                result
-            };
-            match query_result {
-                Ok(rows) => {
-                    let decode_started = Instant::now();
-                    let mut table_items = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        table_items.push(Self::row_to_wire_item(&row, &table_info)?);
-                    }
-                    self.record_transaction_phase(
-                        "batch_get_item",
-                        "row_decode",
-                        decode_started.elapsed(),
-                    );
-                    total_items_returned += table_items.len();
-                    total_bytes_read += wire_items_payload_bytes(&table_items) as usize;
-                    if !table_items.is_empty() {
-                        responses.insert(table_name, table_items);
-                    }
-                }
-                Err(_) => {
-                    unprocessed_keys.insert(table_name.clone(), keys_and_attributes);
-                }
-            }
-        }
-
-        let response = BatchGetWireItemResponse {
-            responses: if responses.is_empty() {
-                None
-            } else {
-                Some(responses)
-            },
-            unprocessed_keys: if unprocessed_keys.is_empty() {
-                None
-            } else {
-                Some(unprocessed_keys)
-            },
-            consumed_capacity: None,
         };
-        record_read(total_items_returned, total_bytes_read);
-        record_read_cost(
-            "batch_get_item",
-            "get",
-            total_requested_keys,
-            total_bytes_read as u64,
-        );
-        Ok(response)
+        let _connection_hold = self.connection_hold_timer("batch_get_item");
+        self.batch_get_item_with_client(&client, request).await
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {

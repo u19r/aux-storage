@@ -1297,6 +1297,11 @@ pub fn item_stream_prefix(table_id: TableStorageId, item_scope: &[u8]) -> KeyRan
 }
 
 #[must_use]
+pub fn item_stream_table_prefix(table_id: TableStorageId) -> KeyRange {
+    range_for_prefix(fixed_table_key(KeyFamily::ItemStreamRow, table_id))
+}
+
+#[must_use]
 pub fn stream_pointer_table_prefix(table_id: TableStorageId) -> KeyRange {
     range_for_prefix(fixed_table_key(
         KeyFamily::StreamPointerTableIndex,
@@ -1309,6 +1314,11 @@ pub fn stream_pointer_item_prefix(table_id: TableStorageId, item_scope: &[u8]) -
     let mut prefix = fixed_table_key(KeyFamily::StreamPointerItemIndex, table_id);
     prefix.extend_from_slice(item_scope);
     range_for_prefix(prefix)
+}
+
+#[must_use]
+pub fn stream_pointer_item_table_prefix(table_id: TableStorageId) -> KeyRange {
+    range_for_prefix(fixed_table_key(KeyFamily::StreamPointerItemIndex, table_id))
 }
 
 #[must_use]

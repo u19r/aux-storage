@@ -1055,7 +1055,6 @@ fn measure_put_item_encode_ttl_ops_stage() -> alloc_counter::AllocationReport<'s
     );
     for (item, item_key_token, projected_ttl_value) in &contexts {
         let _ttl_ops = ttl_index_direct_operations_for_wire_items(
-            &table_name,
             &table_identity,
             &table_info,
             ttl_config.as_ref(),
@@ -1121,7 +1120,6 @@ fn measure_put_item_encode_execute_stage() -> alloc_counter::AllocationReport<'s
         }));
 
         let ttl_ops = ttl_index_direct_operations_for_wire_items(
-            &table_name,
             &table_identity,
             &table_info,
             ttl_config.as_ref(),

@@ -107,6 +107,48 @@ fn wire_encoded_stream_entries_use_pointer_envelope_for_insert_tests() {
 }
 
 #[test]
+fn wire_encoded_stream_entries_keep_item_rows_on_target_version_tests() {
+    let table_name = table_name();
+    let item_key = item_key(&table_name);
+    let item_bytes = br#"{"pk":{"S":"ORG#1"},"sk":{"S":"ITEM#1"}}"#;
+    let stream_item_id = StreamItemId::random();
+    let table_identity = table_identity(&table_name);
+
+    let entries = create_item_update_stream_entries_wire_encoded(
+        StreamEntryContext {
+            table_identity: &table_identity,
+            table_name: &table_name,
+            item_key: &item_key,
+        },
+        item_bytes,
+        None,
+        stream_item_id,
+        false,
+        None,
+    )
+    .expect("create stream entries");
+
+    let target_item_stream_id =
+        StreamItemId::from(storage_types::ItemStreamVersion::from(stream_item_id));
+    let versionstamped_entries = entries
+        .iter()
+        .filter(|(template, _)| template.foundationdb_key().is_some())
+        .count();
+    let literal_target_entries = entries
+        .iter()
+        .filter(|(template, _)| {
+            template.foundationdb_key().is_none()
+                && template
+                    .rocks_key()
+                    .ends_with(target_item_stream_id.as_bytes())
+        })
+        .count();
+
+    assert_eq!(versionstamped_entries, 3);
+    assert_eq!(literal_target_entries, 2);
+}
+
+#[test]
 fn wire_encoded_stream_entries_embed_old_and_new_images_for_updates_tests() {
     let table_name = table_name();
     let item_key = item_key(&table_name);

@@ -1,0 +1,14 @@
+[[test]]
+testTitle = "AuxStorageFdbChaosPubsubDelivery"
+
+  [[test.workload]]
+  testName = "External"
+  workloadName = "pubsub_delivery"
+  libraryPath = "target/release"
+  libraryName = "aux_storage_fdb_chaos"
+  useCAPI = true
+  profile = "smoke"
+  operationCount = 1
+  activeClientCount = 1
+  historySampleLimit = 0
+  artifactRoot = "run-artifacts/fdb-chaos"

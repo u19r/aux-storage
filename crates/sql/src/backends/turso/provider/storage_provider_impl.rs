@@ -9,10 +9,10 @@ use storage_common::{
 use storage_condition::{evaluate_condition, parse_condition_expression};
 use storage_provider::{
     CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
-    StorageProvider, StreamDurationTrimBackend, StreamDurationTrimConfig,
-    StreamDurationTrimPageRequest, StreamDurationTrimPageResult, StreamDurationTrimWorker,
-    StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeBoundaries, StreamTrimState,
-    StreamTrimStateWrite, apply_bound_update_operations, before_update_item,
+    StorageProvider, StorageProviderReadContext, StreamDurationTrimBackend,
+    StreamDurationTrimConfig, StreamDurationTrimPageRequest, StreamDurationTrimPageResult,
+    StreamDurationTrimWorker, StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeBoundaries,
+    StreamTrimState, StreamTrimStateWrite, apply_bound_update_operations, before_update_item,
     before_update_item_optional, plan_table_stream_duration, return_values_need_updated_fields,
     split_item_into_key_and_attributes_sync, update_item_response,
 };
@@ -21,20 +21,20 @@ use storage_types::{
     BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof, DurableItemRevision,
     DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
-    PreparedBatchOperation, PutItemResponse, QueryTableRequest, ReplicationMutation,
-    ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName, TableStatus,
-    TimestampMillis, TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
-    UpdateItemRequest, UpdateItemResponse, WireItem,
+    PreparedBatchOperation, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    ReplicationMutation, ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName,
+    TableStatus, TimestampMillis, TransactWriteItem, TransactWriteItemsRequest,
+    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, WireItem,
 };
-use turso::Value as TursoValue;
+use turso::{Connection as TursoConnection, Value as TursoValue};
 
 use crate::{
     backends::{
         prepare_batch_operation,
         turso::{
             provider::{
-                TursoStorageProvider, gsi_table_name, option_string_to_value, row_to_table_info,
-                value_to_i64, value_to_string,
+                TursoSqlConnection, TursoStorageProvider, gsi_table_name, map_turso_error,
+                option_string_to_value, row_to_table_info, value_to_i64, value_to_string,
             },
             sql_statements,
         },
@@ -79,6 +79,72 @@ async fn apply_gsi_write_pressure(provider: &TursoStorageProvider) -> StorageRes
     .await
 }
 
+struct TursoReadSequenceReadContext {
+    provider: TursoStorageProvider,
+    connection: tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<TursoConnection>>>,
+}
+
+#[async_trait]
+impl StorageProviderReadContext for TursoReadSequenceReadContext {
+    async fn get_item(
+        &self,
+        table_name: TableName,
+        key: KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<WireItem>> {
+        let _ = consistent_read;
+        let table_info = self.provider.get_table_info(&table_name).await?;
+        let guard = self.connection.lock().await;
+        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
+        let item = self
+            .provider
+            .get_item_map_by_key(conn, &table_info, &key)
+            .await?;
+        item.map(|map| WireItem::from_attribute_map(&map))
+            .transpose()
+    }
+
+    async fn batch_get_item(
+        &self,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        let guard = self.connection.lock().await;
+        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
+        self.provider
+            .batch_get_item_with_connection(conn, request)
+            .await
+    }
+
+    async fn query_table(
+        &self,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let guard = self.connection.lock().await;
+        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
+        self.provider
+            .query_table_with_connection(conn, request)
+            .await
+    }
+}
+
+impl Drop for TursoReadSequenceReadContext {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.connection.try_lock() else {
+            return;
+        };
+        let Some(connection) = guard.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = connection.execute("ROLLBACK", ()).await;
+        });
+    }
+}
+
+fn turso_read_context_closed() -> StorageError {
+    StorageError::internal("turso read-sequence read context is closed")
+}
+
 async fn run_custom_stream_trim_once(provider: &TursoStorageProvider) -> StorageResult<bool> {
     let stats = StreamDurationTrimWorker::new(
         provider.clone(),
@@ -108,6 +174,128 @@ impl TursoStorageProvider {
         usize::try_from(deleted_markers)
             .map_err(|_| StorageError::internal("turso deleted marker count exceeds usize"))
     }
+
+    async fn query_table_with_connection<C>(
+        &self,
+        conn: &C,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)>
+    where
+        C: TursoSqlConnection + ?Sized,
+    {
+        let table_info = self.get_table_info(&request.table_name).await?;
+        let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
+        let exclusive_start_key = decode_exclusive_start(
+            &request.exclusive_start_key,
+            &table_info,
+            &request.index_name,
+        )?;
+
+        let (table_name_safe, key_schema, table_key_schema_for_index, origin_gsi) =
+            if let Some(index_name) = &request.index_name {
+                let gsi = table_info
+                    .global_secondary_indexes
+                    .as_ref()
+                    .and_then(|indexes| {
+                        indexes.iter().find(|index| &index.index_name == index_name)
+                    })
+                    .ok_or_else(|| missing_index_error(&table_info, index_name))?;
+                (
+                    gsi_table_name(&table_info.table_name, index_name),
+                    gsi.key_schema.clone(),
+                    Some(table_info.key_schema.as_slice()),
+                    true,
+                )
+            } else {
+                (
+                    format!("table_{}", table_info.table_name.sanitized_name()),
+                    table_info.key_schema.clone(),
+                    None,
+                    false,
+                )
+            };
+
+        let conditions = parse_key_condition_expression(
+            &request.key_condition_expression,
+            &key_schema,
+            request.expression_attribute_names.as_ref(),
+            request.expression_attribute_values.as_ref(),
+        )?;
+
+        let (sql, values) = build_sql_query(
+            &table_name_safe,
+            &key_schema,
+            Some(conditions),
+            exclusive_start_key,
+            effective_limit,
+            request.scan_index_forward,
+            table_key_schema_for_index,
+        )?;
+
+        let rows = self
+            .query_row_set(
+                conn,
+                &sql,
+                values.into_iter().map(TursoValue::Text).collect(),
+            )
+            .await?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let wire = if origin_gsi {
+                self.build_wire_item_from_gsi_row_view(row, &table_info, &key_schema)
+                    .await?
+            } else {
+                self.build_wire_item_from_main_row_view(row, &table_info)
+                    .await?
+            };
+            items.push(wire);
+        }
+
+        let has_more = items.len() > effective_limit as usize;
+        if has_more {
+            items.pop();
+        }
+
+        let last_evaluated_key = if has_more {
+            items
+                .last()
+                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+
+        Ok((items, last_evaluated_key))
+    }
+
+    async fn batch_get_item_with_connection<C>(
+        &self,
+        conn: &C,
+        request: BatchGetItemRequest,
+    ) -> StorageResult<BatchGetWireItemResponse>
+    where
+        C: TursoSqlConnection + ?Sized,
+    {
+        let mut responses = HashMap::new();
+        for (table_name, keys_and_attributes) in request.request_items {
+            let table_info = self.get_table_info(&table_name).await?;
+            let mut table_items = Vec::new();
+            for key in keys_and_attributes.keys {
+                if let Some(item) = self.get_item_map_by_key(conn, &table_info, &key).await? {
+                    table_items.push(WireItem::from_attribute_map(&item)?);
+                }
+            }
+            responses.insert(table_name, table_items);
+        }
+
+        Ok(BatchGetWireItemResponse {
+            responses: Some(responses),
+            unprocessed_keys: None,
+            consumed_capacity: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -122,6 +310,23 @@ impl StorageProvider for TursoStorageProvider {
 
     fn supports_change_index(&self) -> bool {
         true
+    }
+
+    async fn begin_read_sequence_read_context(
+        &self,
+        consistency: ReadSequenceConsistency,
+    ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
+        if consistency != ReadSequenceConsistency::Transactional {
+            return Err(StorageError::unsupported(
+                "turso read-sequence provider contexts are only used for transactional reads",
+            ));
+        }
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ()).await.map_err(map_turso_error)?;
+        Ok(Box::new(TursoReadSequenceReadContext {
+            provider: self.clone(),
+            connection: tokio::sync::Mutex::new(Some(conn)),
+        }))
     }
 
     async fn write_stream_trim_state(
@@ -1004,92 +1209,8 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        let table_info = self.get_table_info(&request.table_name).await?;
-        let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
-        let exclusive_start_key = decode_exclusive_start(
-            &request.exclusive_start_key,
-            &table_info,
-            &request.index_name,
-        )?;
-
-        let (table_name_safe, key_schema, table_key_schema_for_index, origin_gsi) =
-            if let Some(index_name) = &request.index_name {
-                let gsi = table_info
-                    .global_secondary_indexes
-                    .as_ref()
-                    .and_then(|indexes| {
-                        indexes.iter().find(|index| &index.index_name == index_name)
-                    })
-                    .ok_or_else(|| missing_index_error(&table_info, index_name))?;
-                (
-                    gsi_table_name(&table_info.table_name, index_name),
-                    gsi.key_schema.clone(),
-                    Some(table_info.key_schema.as_slice()),
-                    true,
-                )
-            } else {
-                (
-                    format!("table_{}", table_info.table_name.sanitized_name()),
-                    table_info.key_schema.clone(),
-                    None,
-                    false,
-                )
-            };
-
-        let conditions = parse_key_condition_expression(
-            &request.key_condition_expression,
-            &key_schema,
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_ref(),
-        )?;
-
-        let (sql, values) = build_sql_query(
-            &table_name_safe,
-            &key_schema,
-            Some(conditions),
-            exclusive_start_key,
-            effective_limit,
-            request.scan_index_forward,
-            table_key_schema_for_index,
-        )?;
-
         let conn = self.connect().await?;
-        let rows = self
-            .query_row_set(
-                &conn,
-                &sql,
-                values.into_iter().map(TursoValue::Text).collect(),
-            )
-            .await?;
-
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let wire = if origin_gsi {
-                self.build_wire_item_from_gsi_row_view(row, &table_info, &key_schema)
-                    .await?
-            } else {
-                self.build_wire_item_from_main_row_view(row, &table_info)
-                    .await?
-            };
-            items.push(wire);
-        }
-
-        let has_more = items.len() > effective_limit as usize;
-        if has_more {
-            items.pop();
-        }
-
-        let last_evaluated_key = if has_more {
-            items
-                .last()
-                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-
-        Ok((items, last_evaluated_key))
+        self.query_table_with_connection(&conn, request).await
     }
 
     async fn batch_write_item(
@@ -1128,22 +1249,8 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
-        let mut responses = HashMap::new();
-        for (table_name, keys_and_attributes) in request.request_items {
-            let mut table_items = Vec::new();
-            for key in keys_and_attributes.keys {
-                if let Some(item) = self.get_item(table_name.clone(), key, false).await? {
-                    table_items.push(item);
-                }
-            }
-            responses.insert(table_name, table_items);
-        }
-
-        Ok(BatchGetWireItemResponse {
-            responses: Some(responses),
-            unprocessed_keys: None,
-            consumed_capacity: None,
-        })
+        let conn = self.connect().await?;
+        self.batch_get_item_with_connection(&conn, request).await
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {

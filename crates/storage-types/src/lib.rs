@@ -84,6 +84,14 @@ mod pagination_limit;
 #[cfg(test)]
 mod pagination_limit_tests;
 pub use pagination_limit::{PaginationLimit, PaginationLimitError};
+mod non_covering_lookup;
+#[cfg(test)]
+mod non_covering_lookup_tests;
+pub use non_covering_lookup::{
+    NonCoveringLookupAttachment, NonCoveringLookupCandidate, NonCoveringLookupError,
+    NonCoveringLookupFetch, NonCoveringLookupJoinMode, NonCoveringLookupPlan,
+    merge_non_covering_lookup_items, plan_non_covering_lookup,
+};
 mod stream_item_id;
 pub use stream_item_id::*;
 mod stream_key;
@@ -104,6 +112,8 @@ mod item_stream_version;
 mod item_stream_version_tests;
 #[cfg(test)]
 mod quint_item_versioned_stream_tests;
+#[cfg(test)]
+mod quint_read_sequence_tests;
 pub use item_stream_version::ItemStreamVersion;
 pub mod storage_serde;
 #[cfg(test)]
@@ -174,6 +184,24 @@ mod request_expression_validation;
 mod request_expression_validation_perf_tests;
 mod request_response;
 pub use request_response::*;
+mod read_sequence;
+mod read_sequence_error;
+mod read_sequence_planner;
+mod read_sequence_response;
+mod read_sequence_selector;
+#[cfg(test)]
+mod read_sequence_tests;
+pub use read_sequence::*;
+pub use read_sequence_error::ReadSequenceValidationError;
+pub use read_sequence_planner::{
+    ReadSequenceChildPlan, ReadSequencePlan, ReadSequencePlannedOperation,
+    ReadSequencePlannerInput, plan_read_sequence, plan_read_sequence_with_capabilities,
+};
+pub use read_sequence_response::*;
+pub use read_sequence_selector::{
+    ParsedReadSequenceSelector, ReadSequenceAttributeValueType, ReadSequenceSelectedContext,
+    ReadSequenceSelectorSegment, bind_read_sequence_attribute_value,
+};
 mod multi_region;
 pub use multi_region::*;
 mod write_wire_request;

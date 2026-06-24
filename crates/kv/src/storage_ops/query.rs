@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::{
     keyspace::table_keys,
-    sorted_kv_store::RawKey,
+    sorted_kv_store::{RawKey, SortedKvReadContext},
     storage_ops::imports::{
         AttributeValue, ItemKey, KeyType, QueryTableRequest, SortedKvDbStorageProvider, Span,
         StorageEnum, StorageError, StorageResult, WireItem, helpers, key_schema_for_gsi,
@@ -13,6 +13,23 @@ use crate::{
 impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
     pub(crate) async fn query_table_impl(
         &self,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        self.query_table_impl_with_context(None, request).await
+    }
+
+    pub(crate) async fn query_table_with_kv_read_context(
+        &self,
+        read_context: &dyn SortedKvReadContext,
+        request: &QueryTableRequest,
+    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        self.query_table_impl_with_context(Some(read_context), request)
+            .await
+    }
+
+    async fn query_table_impl_with_context(
+        &self,
+        read_context: Option<&dyn SortedKvReadContext>,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
         let consistent_read = request.consistent_read;
@@ -101,6 +118,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
 
                     return self
                         .read_query_range(
+                            read_context,
                             encode_key(&key)?,
                             end_key,
                             request,
@@ -123,6 +141,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     if scan_forward {
                         return self
                             .read_query_range(
+                                read_context,
                                 encode_key(&start_key)?,
                                 increment_key(&end_key)?,
                                 request,
@@ -134,6 +153,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
 
                     return self
                         .read_query_range(
+                            read_context,
                             encode_key(&end_key)?,
                             decrement_key(&start_key)?,
                             request,
@@ -199,7 +219,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     };
 
                     return self
-                        .read_query_range(start, end, request, table_info, page_token)
+                        .read_query_range(read_context, start, end, request, table_info, page_token)
                         .await;
                 }
 
@@ -227,7 +247,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             };
 
                             return self
-                                .read_query_range(start, end, request, table_info, page_token)
+                                .read_query_range(
+                                    read_context,
+                                    start,
+                                    end,
+                                    request,
+                                    table_info,
+                                    page_token,
+                                )
                                 .await;
                         }
                         "<=" => {
@@ -243,7 +270,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             };
 
                             return self
-                                .read_query_range(start, end, request, table_info, page_token)
+                                .read_query_range(
+                                    read_context,
+                                    start,
+                                    end,
+                                    request,
+                                    table_info,
+                                    page_token,
+                                )
                                 .await;
                         }
                         ">" => {
@@ -257,7 +291,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             };
 
                             return self
-                                .read_query_range(start, end, request, table_info, page_token)
+                                .read_query_range(
+                                    read_context,
+                                    start,
+                                    end,
+                                    request,
+                                    table_info,
+                                    page_token,
+                                )
                                 .await;
                         }
                         ">=" => {
@@ -271,7 +312,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                             };
 
                             return self
-                                .read_query_range(start, end, request, table_info, page_token)
+                                .read_query_range(
+                                    read_context,
+                                    start,
+                                    end,
+                                    request,
+                                    table_info,
+                                    page_token,
+                                )
                                 .await;
                         }
                         _ => {
@@ -297,7 +345,14 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         };
 
                         return self
-                            .read_query_range(start, end, request, table_info, page_token)
+                            .read_query_range(
+                                read_context,
+                                start,
+                                end,
+                                request,
+                                table_info,
+                                page_token,
+                            )
                             .await;
                     }
                     Err(e) => return Err(e),
@@ -319,7 +374,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     };
 
                     return self
-                        .read_query_range(start, end, request, table_info, page_token)
+                        .read_query_range(read_context, start, end, request, table_info, page_token)
                         .await;
                 }
             }
@@ -341,7 +396,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     };
 
                     return self
-                        .read_query_range(start, end, request, table_info, page_token)
+                        .read_query_range(read_context, start, end, request, table_info, page_token)
                         .await;
                 }
             }
@@ -355,6 +410,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
 
     async fn query_range_values(
         &self,
+        read_context: Option<&dyn SortedKvReadContext>,
         start: &[u8],
         exclusive_end: &[u8],
         limit: Option<u32>,
@@ -362,16 +418,25 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         consistent_read: bool,
     ) -> StorageResult<crate::sorted_kv_store::RangeValuesResult> {
         let started = Instant::now();
-        let result = self
-            .kv_store
-            .get_range_values(start, exclusive_end, limit, page_token, consistent_read)
-            .await;
+        let result = match read_context {
+            Some(read_context) => {
+                read_context
+                    .get_range_values(start, exclusive_end, limit, page_token, consistent_read)
+                    .await
+            }
+            None => {
+                self.kv_store
+                    .get_range_values(start, exclusive_end, limit, page_token, consistent_read)
+                    .await
+            }
+        };
         record_provider_stage("query", "fdb_wait", started.elapsed());
         result
     }
 
     async fn read_query_range(
         &self,
+        read_context: Option<&dyn SortedKvReadContext>,
         start: Vec<u8>,
         exclusive_end: Vec<u8>,
         request: &QueryTableRequest,
@@ -380,6 +445,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
         let range_result = self
             .query_range_values(
+                read_context,
                 &start,
                 &exclusive_end,
                 request.limit,

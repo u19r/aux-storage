@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
+use storage_common::ttl::TtlConfigRecord;
 use storage_provider::StorageProvider;
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateGlobalSecondaryIndex, CreateTableRequest, IndexName,
     ItemKey, KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType,
-    QueryTableRequest, ScanTableRequest, TableName, TableStatus,
+    QueryTableRequest, ScanTableRequest, TableName, TableStatus, TimeToLiveSpecification,
+    TimeToLiveStatus, UpdateTimeToLiveRequest,
 };
 
 use crate::{
@@ -65,6 +67,58 @@ async fn create_table() {
     assert_eq!(table_info.table_status, TableStatus::Active);
     assert_eq!(table_info.attribute_definitions.len(), 2);
     assert_eq!(table_info.key_schema.len(), 1);
+}
+
+#[tokio::test]
+async fn update_time_to_live_is_idempotent_when_already_enabled_for_same_attribute() {
+    let provider = create_test_provider();
+    provider
+        .initialize_storage()
+        .await
+        .expect("Failed to initialize");
+
+    let table_name = unique_table_name("ttl_idempotent");
+    let request = CreateTableRequest::new(
+        table_name.clone(),
+        vec![AttributeDefinition {
+            attribute_name: "id".to_string(),
+            attribute_type: KeyAttributeType::S,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "id".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        storage_types::BillingMode::PayPerRequest,
+    );
+    provider.create_table(&request).await.unwrap();
+
+    let gsi_name = storage_common::ttl::ttl_gsi_name(&table_name);
+    provider
+        .save_ttl_config(
+            &table_name,
+            &TtlConfigRecord::new("ttl".to_string(), &gsi_name, TimeToLiveStatus::Enabled),
+        )
+        .await
+        .expect("save enabled ttl config");
+
+    let response = provider
+        .update_time_to_live(UpdateTimeToLiveRequest {
+            table_name: table_name.clone(),
+            time_to_live_specification: TimeToLiveSpecification {
+                attribute_name: "ttl".to_string(),
+                enabled: true,
+            },
+        })
+        .await
+        .expect("same ttl attribute is idempotent");
+
+    assert!(response.time_to_live_specification.enabled);
+    let config = provider
+        .load_ttl_config(&table_name)
+        .await
+        .expect("load ttl config")
+        .expect("ttl config should remain present");
+    assert_eq!(config.status, TimeToLiveStatus::Enabled);
 }
 
 #[expect(clippy::similar_names)]

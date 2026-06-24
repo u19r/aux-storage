@@ -1,0 +1,119 @@
+name: dependency-update-prs
+
+on:
+  schedule:
+    - cron: "31 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: dependency-update-prs-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rust:
+    name: rust
+    if: ${{ github.event.repository.private && github.repository_owner == 'u19r' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BUILD_ROLE_ARN: ${{ vars.AUX_BUILD_CACHE_MAINTENANCE_ROLE_ARN || 'arn:aws:iam::614073402005:role/aux-build-eu-north-1-github-cache-maintenance' }}
+      BUILD_AWS_REGION: eu-north-1
+      DEPENDENCY_TOKEN_BROKER_FUNCTION: ${{ vars.AUX_BUILD_DEPENDENCY_TOKEN_BROKER_FUNCTION || 'aux-build-eu-north-1-dependency-token-broker' }}
+      AWS_ROLE_SESSION_NAME: gha-dependency-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git author
+        run: |
+          set -euo pipefail
+          git config user.name "aux dependency updater"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Assume build role
+        run: |
+          set -euo pipefail
+          token_json="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")"
+          web_identity_token="$(printf '%s' "$token_json" | jq -r '.value')"
+          credentials="$(aws sts assume-role-with-web-identity \
+            --role-arn "$BUILD_ROLE_ARN" \
+            --role-session-name "$AWS_ROLE_SESSION_NAME" \
+            --web-identity-token "$web_identity_token" \
+            --duration-seconds 3600)"
+          aws_access_key_id="$(printf '%s' "$credentials" | jq -r '.Credentials.AccessKeyId')"
+          aws_secret_access_key="$(printf '%s' "$credentials" | jq -r '.Credentials.SecretAccessKey')"
+          aws_session_token="$(printf '%s' "$credentials" | jq -r '.Credentials.SessionToken')"
+          echo "::add-mask::$aws_access_key_id"
+          echo "::add-mask::$aws_secret_access_key"
+          echo "::add-mask::$aws_session_token"
+          {
+            echo "AWS_ACCESS_KEY_ID=$aws_access_key_id"
+            echo "AWS_SECRET_ACCESS_KEY=$aws_secret_access_key"
+            echo "AWS_SESSION_TOKEN=$aws_session_token"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure private dependency reads
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY#*/}"
+          response_file="$RUNNER_TEMP/dependency-token-response.json"
+          aws lambda invoke \
+            --region "$BUILD_AWS_REGION" \
+            --function-name "$DEPENDENCY_TOKEN_BROKER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "$(jq -nc --arg repository "$repository" '{repository: $repository}')" \
+            "$response_file" >/dev/null
+          token="$(jq -r '.body | fromjson | .token' "$response_file")"
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "dependency token broker did not return a token" >&2
+            jq -r '.body // .' "$response_file" >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          {
+            echo "machine github.com"
+            echo "login x-access-token"
+            echo "password ${token}"
+          } > "$HOME/.netrc"
+          chmod 0600 "$HOME/.netrc"
+          git config --global \
+            url."https://x-access-token:${token}@github.com/u19r/".insteadOf \
+            "https://github.com/u19r/"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$cargo_home"
+          {
+            echo "[net]"
+            echo "git-fetch-with-cli = true"
+          } >> "$cargo_home/config.toml"
+
+      - name: Update Rust lockfile
+        run: cargo update
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No dependency changes."
+            exit 0
+          fi
+          branch="automation/dependency-update-rust-${GITHUB_RUN_ID}"
+          git checkout -b "$branch"
+          git add Cargo.lock
+          git commit -m "Update Rust dependencies"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          gh pr create \
+            --title "Update Rust dependencies" \
+            --body "Scheduled dependency update. Auto-merge is intentionally disabled; review and normal CI are required." \
+            --base main \
+            --head "$branch"

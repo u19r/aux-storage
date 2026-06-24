@@ -896,7 +896,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1843,6 +1843,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "fdb-chaos-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fdb-chaos-runner"
+version = "0.1.0"
+dependencies = [
+ "fdb-chaos-model",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "fdb-chaos-workload"
+version = "0.1.0"
+dependencies = [
+ "fdb-chaos-model",
+ "foundationdb",
+ "foundationdb-simulation",
+ "kv",
+ "pubsub",
+ "queue",
+ "serde_json",
+ "storage",
+ "storage-common",
+ "storage-provider",
+ "storage-types",
+ "stream-provider",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1939,6 +1975,17 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "try_map",
+]
+
+[[package]]
+name = "foundationdb-simulation"
+version = "0.2.3"
+source = "git+https://github.com/foundationdb-rs/foundationdb-rs.git?rev=de6e39558568e6e06090f85283cea2f7eaa9d673#de6e39558568e6e06090f85283cea2f7eaa9d673"
+dependencies = [
+ "bindgen 0.72.1",
+ "cc",
+ "foundationdb",
+ "foundationdb-sys",
 ]
 
 [[package]]
@@ -2874,15 +2921,6 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -5325,6 +5363,7 @@ dependencies = [
  "console-subscriber",
  "http-error",
  "http-request",
+ "httpmock",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-facade",

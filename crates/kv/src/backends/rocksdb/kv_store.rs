@@ -10,8 +10,8 @@ use std::{
 };
 
 use rocksdb::{
-    DEFAULT_COLUMN_FAMILY_NAME, Error, ErrorKind, OptimisticTransactionDB, Options, Transaction,
-    WriteOptions,
+    DB, DEFAULT_COLUMN_FAMILY_NAME, Error, ErrorKind, OptimisticTransactionDB, Options,
+    Transaction, WriteOptions, checkpoint::Checkpoint,
 };
 use storage_condition::{Condition, evaluate_condition};
 use storage_types::{
@@ -43,14 +43,126 @@ use crate::{
         },
     },
     sorted_kv_store::{
-        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, RangeValuesResult,
-        SortedKvStore, TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
+        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, RangeValuesResult, RawKey,
+        SortedKvReadContext, SortedKvStore, TransactWriteOperation, TransactWriteOutput,
+        TransactWriteTableOperation,
     },
 };
 
 #[derive(Clone)]
 pub struct RocksDbKvStore {
     db: Arc<tokio::sync::RwLock<rocksdb::OptimisticTransactionDB>>,
+}
+
+struct RocksDbReadContext {
+    db: Arc<DB>,
+    checkpoint_path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SortedKvReadContext for RocksDbReadContext {
+    async fn get(&self, key: &[u8], _consistent_read: bool) -> StorageResult<Option<Vec<u8>>> {
+        let db = Arc::clone(&self.db);
+        let key = key.to_vec();
+        tokio::task::spawn_blocking(move || {
+            db.get(key)
+                .map_err(|e| StorageError::internal(&format!("rocksdb snapshot get failed: {e}")))
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
+    }
+
+    async fn multi_get(
+        &self,
+        keys: Vec<Vec<u8>>,
+        _consistent_read: bool,
+    ) -> StorageResult<Vec<Option<Vec<u8>>>> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let results = db.multi_get(keys.iter());
+
+            let mut values = Vec::with_capacity(results.len());
+            for result in results {
+                match result {
+                    Ok(data) => values.push(data),
+                    Err(e) => {
+                        return Err(StorageError::internal(&format!(
+                            "rocksdb snapshot multi_get failed: {e}"
+                        )));
+                    }
+                }
+            }
+
+            Ok(values)
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
+    }
+
+    async fn get_range_values(
+        &self,
+        start: &[u8],
+        exclusive_end: &[u8],
+        limit: Option<u32>,
+        page_token: Option<RawKey>,
+        _consistent_read: bool,
+    ) -> StorageResult<RangeValuesResult> {
+        let scan_start = start.to_vec();
+        let mut scan_end = exclusive_end.to_vec();
+        if start == exclusive_end {
+            scan_end = increment_bytes(scan_start.clone());
+        }
+        let forward = scan_start <= scan_end;
+        let (page_bytes, iterator_start) = match page_token {
+            Some(token) => {
+                let serialized = token.serialize_to_bytes()?;
+                let iter_start = if forward {
+                    token.increment_bytes_and_serialize()?
+                } else {
+                    token.decrement_bytes_and_serialize()?
+                };
+                (Some(serialized), iter_start)
+            }
+            None => (None, scan_start.clone()),
+        };
+        let scan = RangeScanSettings::new(&scan_start, &scan_end, limit, page_bytes)?;
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let direction = if scan.forward() {
+                rocksdb::Direction::Forward
+            } else {
+                rocksdb::Direction::Reverse
+            };
+
+            let iter = db.iterator(rocksdb::IteratorMode::From(&iterator_start, direction));
+
+            let mut values = Vec::new();
+
+            for entry in iter.flatten() {
+                let (key, value) = entry;
+                match scan.evaluate_key(&key) {
+                    RangeKeyDecision::Include => {
+                        values.push(value.into_vec());
+                        if values.len() >= scan.fetch_limit() {
+                            break;
+                        }
+                    }
+                    RangeKeyDecision::Skip => {}
+                    RangeKeyDecision::Stop => break,
+                }
+            }
+
+            Ok(scan.finalize_values(values, false))
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
+    }
+}
+
+impl Drop for RocksDbReadContext {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.checkpoint_path);
+    }
 }
 
 static NEXT_ROCKSDB_STREAM_ITEM_VERSION: AtomicU64 = AtomicU64::new(0);
@@ -386,6 +498,32 @@ impl SortedKvStore for RocksDbKvStore {
         }
         unreachable!("rocksdb batch write loop returns on success or final failure")
     }
+
+    async fn begin_read_context(&self) -> StorageResult<Box<dyn SortedKvReadContext>> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let checkpoint_path = std::env::temp_dir().join(format!(
+                "aux-storage-rocksdb-read-context-{}",
+                uuid::Uuid::now_v7()
+            ));
+            let db_guard = db.blocking_read();
+            let checkpoint = Checkpoint::new(&*db_guard).map_err(generic_err)?;
+            checkpoint
+                .create_checkpoint(&checkpoint_path)
+                .map_err(generic_err)?;
+            let opts = rocksdb_options();
+            let cf = vec![DEFAULT_COLUMN_FAMILY_NAME];
+            let read_db = DB::open_cf_for_read_only(&opts, &checkpoint_path, cf, false)
+                .map_err(generic_err)?;
+            Ok(Box::new(RocksDbReadContext {
+                db: Arc::new(read_db),
+                checkpoint_path,
+            }) as Box<dyn SortedKvReadContext>)
+        })
+        .await
+        .map_err(map_rocksdb_blocking_join_error)?
+    }
+
     async fn get(&self, key: &[u8], _consistent_read: bool) -> StorageResult<Option<Vec<u8>>> {
         let db = Arc::clone(&self.db);
         let key = key.to_vec();

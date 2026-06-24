@@ -11,7 +11,7 @@ pub(crate) mod model;
 #[cfg(test)]
 mod model_tests;
 
-pub(crate) use model::*;
+pub use model::*;
 
 use crate::sorted_kv_store::SortedKvStore;
 
@@ -26,6 +26,36 @@ pub trait PartitionFamilyKvStore: SortedKvStore {
         value: &[u8],
         fallback_item_id: StreamItemId,
     ) -> StorageResult<Option<StreamItemId>>;
+
+    async fn load_partition_family_state_raw(
+        &self,
+        family_kind: PartitionFamilyKind,
+        family_component: &str,
+    ) -> StorageResult<Option<ResolvedPartitionFamily>> {
+        if !self.supports_partition_families() {
+            return Ok(None);
+        }
+
+        let config_key = partition_family_config_key(family_kind, family_component);
+        let Some(config_bytes) = self.get(&config_key, true).await? else {
+            return Ok(None);
+        };
+        let config = parse_partition_family_config(&config_bytes)?;
+
+        let partition_prefix = partition_info_prefix(family_kind, family_component);
+        let partition_entries = self.get_prefix(&partition_prefix, true, None, true).await?;
+        let mut partitions = Vec::with_capacity(partition_entries.items.len());
+        for (_key, value) in partition_entries.items {
+            partitions.push(parse_partition_info(&value)?);
+        }
+        partitions.sort_unstable_by(|left, right| {
+            left.hash_start_inclusive
+                .cmp(&right.hash_start_inclusive)
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
+
+        Ok(Some(ResolvedPartitionFamily { config, partitions }))
+    }
 
     async fn drain_runtime_partition_load_samples(
         &self,

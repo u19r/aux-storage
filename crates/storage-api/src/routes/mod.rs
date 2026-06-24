@@ -17,6 +17,9 @@ mod create_table_tests;
 mod batch_get_item_tests;
 
 #[cfg(test)]
+mod read_sequence_tests;
+
+#[cfg(test)]
 mod batch_write_item_tests;
 
 #[cfg(test)]

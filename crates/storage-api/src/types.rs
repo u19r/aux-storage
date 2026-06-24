@@ -235,6 +235,7 @@ pub enum Response {
     BatchGetWire(BatchGetWireResponse),
     TransactWriteItems(storage_types::TransactWriteItemsResponse),
     TransactGetItems(storage_types::TransactGetItemsResponse),
+    ReadSequence(storage_types::ReadSequenceResponse),
     GetStreamRecords(storage_types::GetStreamRecordsResponse),
     ListStreams(storage_types::ListStreamsResponse),
     DescribeStream(storage_types::DescribeStreamResponse),

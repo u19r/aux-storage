@@ -13,11 +13,11 @@ default = ["sqlite"]
 sqlite = ["dep:sql", "sql/sqlite-backend"]
 turso = ["dep:sql", "sql/sqlite-backend", "sql/turso-backend"]
 postgres = ["dep:sql", "sql/postgres-backend"]
-rocksdb = ["dep:kv"]
+rocksdb = ["dep:kv", "kv/rocksdb-backend"]
 foundationdb = ["dep:kv", "kv/foundationdb-backend"]
 
 [dependencies]
-kv = { path = "../kv", optional = true }
+kv = { path = "../kv", optional = true, default-features = false }
 sql = { path = "../sql", optional = true, default-features = false }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }

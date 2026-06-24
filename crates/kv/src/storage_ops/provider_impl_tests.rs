@@ -320,7 +320,6 @@ fn wire_item_key_tokens_round_trip_through_the_item_key_parser() {
 #[test]
 fn ttl_index_direct_operations_are_empty_when_ttl_tracking_is_not_active() {
     let operations = ttl_index_direct_operations_for_wire_items(
-        &TableName::new("jobs"),
         &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Disabled)),
@@ -344,7 +343,6 @@ fn ttl_index_direct_operations_skip_writes_when_the_expiration_bucket_is_unchang
     let token = wire_item_key_token_from_item_key(&new_item_key).expect("key token");
 
     let operations = ttl_index_direct_operations_for_wire_items(
-        &TableName::new("jobs"),
         &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Enabled)),
@@ -368,7 +366,6 @@ fn ttl_index_direct_operations_delete_old_bucket_and_put_new_bucket_when_ttl_cha
     let token = wire_item_key_token_from_item_key(&new_item_key).expect("key token");
 
     let operations = ttl_index_direct_operations_for_wire_items(
-        &TableName::new("jobs"),
         &table_identity(),
         &table_info(),
         Some(&ttl_config(TimeToLiveStatus::Enabled)),

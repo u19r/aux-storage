@@ -1,0 +1,14 @@
+[[test]]
+testTitle = "AuxStorageFdbChaosQueueVisibility"
+
+  [[test.workload]]
+  testName = "External"
+  workloadName = "queue_visibility"
+  libraryPath = "target/release"
+  libraryName = "aux_storage_fdb_chaos"
+  useCAPI = true
+  profile = "smoke"
+  operationCount = 1
+  activeClientCount = 1
+  historySampleLimit = 0
+  artifactRoot = "run-artifacts/fdb-chaos"

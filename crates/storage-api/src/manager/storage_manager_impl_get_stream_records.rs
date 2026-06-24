@@ -33,7 +33,7 @@ impl StorageApiManagerImpl {
         let Some(stream_spec) = &table_info.stream_specification else {
             return Err(HttpApiError::validation_error(format!(
                 "Table '{}' does not have streams enabled",
-                &request.table_name
+                request.table_name
             )));
         };
 

@@ -8,6 +8,7 @@ use crate::{
     TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem, WriteRequest,
 };
 
+#[allow(clippy::extra_unused_lifetimes)]
 #[derive(Debug, Clone, Default, TypedBuilder)]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct BatchWriteItemEncodeRequest {
@@ -96,6 +97,7 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
     }
 }
 
+#[allow(clippy::extra_unused_lifetimes)]
 #[derive(Debug, Clone, Default, TypedBuilder)]
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct TransactWriteItemsEncodeRequest {

@@ -31,7 +31,10 @@ pub mod ttl;
 pub mod validation;
 
 pub use errors::{ensure, err_internal, err_validation};
-pub use gsi::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, GsiBackfillPhase, STREAM_TRIM_JOB, TTL_SWEEP_JOB};
+pub use gsi::{
+    GSI_BACKFILL_JOB, GSI_UPDATE_JOB, GsiBackfillPhase, PARTITION_RECONCILE_JOB, STREAM_TRIM_JOB,
+    TTL_SWEEP_JOB,
+};
 pub use gsi_lag::{
     GSI_LAG_CRITICAL_LIMIT_MS, GSI_LAG_HARD_LIMIT_MS, GSI_LAG_SOFT_LIMIT_MS, GSI_LAG_TARGET_MS,
     GsiLagPolicy, GsiPropagationGovernor, GsiWritePressure, apply_gsi_write_pressure,

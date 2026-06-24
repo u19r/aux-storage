@@ -199,7 +199,7 @@ async fn postgres_logical_metadata_and_ttl_import_create_usable_state() {
         .time_to_live_description
         .expect("ttl description should exist");
     assert_eq!(ttl.attribute_name.as_deref(), Some("ttl"));
-    assert_eq!(ttl.time_to_live_status, TimeToLiveStatus::Enabling);
+    assert_eq!(ttl.time_to_live_status, TimeToLiveStatus::Enabled);
 
     source
         .delete_table(&table_name)
@@ -463,6 +463,7 @@ fn postgres_test_dsn() -> Option<String> {
 
 async fn initialized_provider() -> Option<PostgresStorageProvider> {
     let dsn = postgres_test_dsn()?;
+    let dsn = isolated_schema_dsn(&dsn).await;
     let provider = PostgresStorageProvider::new(&dsn, 8)
         .await
         .expect("create postgres provider");
@@ -471,6 +472,32 @@ async fn initialized_provider() -> Option<PostgresStorageProvider> {
         .await
         .expect("initialize postgres storage");
     Some(provider)
+}
+
+async fn isolated_schema_dsn(base_dsn: &str) -> String {
+    let schema = format!("test_{}", uuid::Uuid::now_v7().simple());
+    let (client, connection) = tokio_postgres::connect(base_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres to create isolated schema");
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres isolated schema connection failed: {err}");
+        }
+    });
+    client
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create isolated postgres schema");
+    dsn_with_search_path(base_dsn, &schema)
+}
+
+fn dsn_with_search_path(base_dsn: &str, schema: &str) -> String {
+    if base_dsn.contains("://") {
+        let separator = if base_dsn.contains('?') { '&' } else { '?' };
+        format!("{base_dsn}{separator}options=-csearch_path%3D{schema}")
+    } else {
+        format!("{base_dsn} options='-csearch_path={schema}'")
+    }
 }
 
 async fn apply_sync_put(
