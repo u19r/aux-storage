@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,6 +27,17 @@ fn queue(queue_name: &str, queue_url: &str) -> Queue {
         queue_url: queue_url.to_string(),
         attributes: Default::default(),
         created_at: TimestampMillis::now(),
+    }
+}
+
+fn queue_with_attributes(
+    queue_name: &str,
+    queue_url: &str,
+    attributes: HashMap<String, String>,
+) -> Queue {
+    Queue {
+        attributes,
+        ..queue(queue_name, queue_url)
     }
 }
 
@@ -85,6 +96,56 @@ async fn legacy_queue_records(
         .into_iter()
         .map(|(key, _)| key.into_vec())
         .collect()
+}
+
+#[tokio::test]
+async fn create_queue_is_idempotent_when_existing_metadata_matches() {
+    let provider = create_test_provider().await;
+    provider.initialize().await.expect("initialize provider");
+    let attributes = HashMap::from([("VisibilityTimeout".to_string(), "30".to_string())]);
+    let queue = queue_with_attributes("idempotent-direct", "idempotent-direct", attributes.clone());
+
+    provider
+        .create_queue(queue.clone())
+        .await
+        .expect("create queue");
+    provider
+        .create_queue(queue.clone())
+        .await
+        .expect("duplicate matching create queue");
+
+    let stored = provider
+        .get_queue("idempotent-direct")
+        .await
+        .expect("get queue")
+        .expect("queue exists");
+    assert_eq!(stored.queue_name, queue.queue_name);
+    assert_eq!(stored.queue_url, queue.queue_url);
+    assert_eq!(stored.attributes, attributes);
+}
+
+#[tokio::test]
+async fn create_queue_rejects_existing_metadata_mismatch() {
+    let provider = create_test_provider().await;
+    provider.initialize().await.expect("initialize provider");
+
+    provider
+        .create_queue(queue_with_attributes(
+            "mismatch-direct",
+            "mismatch-direct",
+            HashMap::from([("VisibilityTimeout".to_string(), "30".to_string())]),
+        ))
+        .await
+        .expect("create queue");
+    let result = provider
+        .create_queue(queue_with_attributes(
+            "mismatch-direct",
+            "mismatch-direct",
+            HashMap::from([("VisibilityTimeout".to_string(), "60".to_string())]),
+        ))
+        .await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]

@@ -1404,6 +1404,30 @@ fn queue_partition_route_for_id(
     }
 }
 
+fn queue_metadata_matches(existing: &Queue, requested: &Queue) -> bool {
+    existing.queue_name == requested.queue_name
+        && existing.queue_url == requested.queue_url
+        && existing.attributes == requested.attributes
+}
+
+impl<S> SortedKvDbStorageProvider<S>
+where S: QueueKvStore + 'static
+{
+    async fn queue_create_already_satisfied(&self, queue: &Queue) -> QueueResult<bool> {
+        if self
+            .get_queue(&queue.queue_url)
+            .await?
+            .is_some_and(|existing| queue_metadata_matches(&existing, queue))
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .find_queue_by_name(&queue.queue_name)
+            .await?
+            .is_some_and(|existing| queue_metadata_matches(&existing, queue)))
+    }
+}
+
 #[async_trait]
 impl<S> QueueProvider for SortedKvDbStorageProvider<S>
 where S: QueueKvStore + 'static
@@ -1427,7 +1451,8 @@ where S: QueueKvStore + 'static
             queue: queue.clone(),
         };
         let queue_id_bytes = encode_queue_storage_id(queue_id);
-        self.kv_store
+        if let Err(error) = self
+            .kv_store
             .transact_write_unchecked(vec![
                 DirectWriteOperation::CheckValue {
                     key: allocator_key.clone(),
@@ -1459,7 +1484,16 @@ where S: QueueKvStore + 'static
                 },
             ])
             .await
-            .map_err(QueueError::TransactWrite)?;
+        {
+            if self
+                .queue_create_already_satisfied(&queue)
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            return Err(QueueError::TransactWrite(error));
+        }
         if self.kv_store.supports_partition_families() {
             let family = self
                 .ensure_queue_family_state(&queue.queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
