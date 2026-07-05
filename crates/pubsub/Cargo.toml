@@ -38,9 +38,9 @@ clap = { workspace = true, optional = true }
 config = { path = "../config" }
 http-error = { path = "../http-error" }
 http-request = { workspace = true }
-kv = { path = "../kv", optional = true }
+kv = { path = "../kv", optional = true, default-features = false }
 pubsub-provider = { path = "../pubsub-provider" }
-queue = { path = "../queue" }
+queue = { path = "../queue", default-features = false }
 queue-provider = { path = "../queue-provider" }
 serde = { workspace = true }
 serde_json = { workspace = true }

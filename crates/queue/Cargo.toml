@@ -37,7 +37,7 @@ bg-jobs = { path = "../bg-jobs" }
 clap = { workspace = true, optional = true }
 config = { path = "../config" }
 http-error = { path = "../http-error" }
-kv = { path = "../kv", optional = true }
+kv = { path = "../kv", optional = true, default-features = false }
 md5 = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-facade = { workspace = true }
