@@ -1,0 +1,142 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target deployment environment
+        required: true
+        default: hetzner
+        type: choice
+        options: [hetzner]
+      force_build:
+        description: Force a new image build even when this commit tag exists
+        required: true
+        default: false
+        type: boolean
+      execute:
+        description: Apply the deployment
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy aux-storage
+    runs-on:
+      - self-hosted
+      - aux-build
+      - linux
+      - x64
+      - standard
+      - run-${{ github.run_id }}-${{ github.run_attempt }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 120
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+      INFRA_CLI_VERSION: latest
+      AUX_DEPLOY_CONTRACT_JSON: ${{ vars.AUX_DEPLOY_CONTRACT_JSON }}
+      AUX_DEPLOY_GITHUB_ENVIRONMENT: ${{ vars.AUX_DEPLOY_GITHUB_ENVIRONMENT }}
+      AUX_DEPLOY_CONTAINER_NAME: ${{ vars.AUX_DEPLOY_CONTAINER_NAME }}
+      AUX_DEPLOY_IMAGE_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_REPOSITORY_URI }}
+      AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI }}
+      AUX_DEPLOY_KUBERNETES_NAMESPACE: ${{ vars.AUX_DEPLOY_KUBERNETES_NAMESPACE }}
+      AUX_DEPLOY_KUBERNETES_DEPLOYMENT: ${{ vars.AUX_DEPLOY_KUBERNETES_DEPLOYMENT }}
+      AUX_DEPLOY_VALIDATION_COMMANDS: ${{ vars.AUX_DEPLOY_VALIDATION_COMMANDS }}
+      AUX_DEPLOY_KUBE_API_SSH_TARGET: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_TARGET }}
+      AUX_DEPLOY_KUBE_API_SSH_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_PORT }}
+      AUX_DEPLOY_KUBE_API_LOCAL_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_LOCAL_PORT }}
+    steps:
+      - name: Print workflow dispatch inputs
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          set -euo pipefail
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
+          echo "repository=${{ github.repository }}"
+          echo "commit=${{ github.sha }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "run_attempt=${{ github.run_attempt }}"
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install infra-cli
+        env:
+          GH_TOKEN: ${{ secrets.AUX_INFRA_RELEASE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::AUX_INFRA_RELEASE_READ_TOKEN is required to download infra-cli releases from u19r/aux-infra"
+            exit 64
+          fi
+          gh release download "$INFRA_CLI_VERSION" --repo u19r/aux-infra --pattern install-infra-cli-release.sh --output install-infra-cli-release.sh
+          bash install-infra-cli-release.sh "$INFRA_CLI_VERSION" "$PWD/infra-cli"
+          printf '%s\n' "$PWD" >> "$GITHUB_PATH"
+
+      - name: Export deployment contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: infra-cli contract export --environment "${{ inputs.environment }}" --component aux-storage --out "$RUNNER_TEMP/contract.json"
+
+      - name: Prepare deploy image
+        id: image
+        env:
+          AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI }}
+          AUX_DEPLOY_REGISTRY_USERNAME: ${{ secrets.AUX_DEPLOY_REGISTRY_USERNAME }}
+          AUX_DEPLOY_REGISTRY_PASSWORD: ${{ secrets.AUX_DEPLOY_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          args=(
+            --contract "$RUNNER_TEMP/contract.json"
+            --tag "$IMAGE_TAG"
+            --artifact-root deploy-artifacts
+            --github-env "$GITHUB_ENV"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [ "${{ inputs.force_build }}" = "true" ]; then
+            args+=(--force-build)
+          fi
+          infra-cli deploy image "${args[@]}"
+
+      - name: Deploy Kubernetes service
+        env:
+          AUX_DEPLOY_KUBECONFIG_B64: ${{ secrets.AUX_DEPLOY_KUBECONFIG_B64 }}
+          AUX_DEPLOY_KUBE_API_SSH_TARGET: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_TARGET }}
+          AUX_DEPLOY_KUBE_API_SSH_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_PORT }}
+          AUX_DEPLOY_KUBE_API_LOCAL_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_LOCAL_PORT }}
+          AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY: ${{ secrets.AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$AUX_DEPLOY_KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 0600 "$HOME/.kube/config"
+          args=()
+          if [ "${{ inputs.execute }}" = "true" ]; then
+            args+=(--execute)
+          fi
+          infra-cli deploy kubernetes --contract "$RUNNER_TEMP/contract.json" --image-uri "$IMAGE_URI" --artifact-root deploy-artifacts "${args[@]}"
+
+      - name: Print deployment evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d deploy-artifacts ]; then
+            find deploy-artifacts -name summary.json -print -exec cat {} \;
+          fi
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: aux-storage-deploy-${{ inputs.environment }}-${{ github.run_id }}
+          path: deploy-artifacts

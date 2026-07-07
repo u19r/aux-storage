@@ -15,17 +15,17 @@ license = "BUSL-1.1"
 [workspace.dependencies]
 ############################################
 # rust-random
-rand = "0.10.1"
+rand = "0.10.2"
 
 ############################################
 # tokio-rs
 axum = "0.8.9"
 deadpool-postgres = "0.14.1"
-rustls = "0.23.40"
-rustls-native-certs = "0.8.2"
+rustls = "0.23.41"
+rustls-native-certs = "0.8.4"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
-tokio-postgres = "0.7.17"
-tokio-postgres-rustls = "0.13.0"
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = "0.14.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
@@ -40,36 +40,36 @@ futures-util = "0.3.31"
 
 ############################################
 # hyperium
-bytes = "1.11.1"
-http = "1.4.0"
+bytes = "1.12.0"
+http = "1.4.2"
 httpdate = "1.0.3"
-tower-http = { version = "0.6.8", features = ["catch-panic", "cors"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "cors"] }
 
 ############################################
 # serde-rs
 md5 = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 url = "2.5.8"
 
 ############################################
 # awslabs
-aws-config = "1.8.16"
+aws-config = "1.8.18"
 aws-credential-types = "1.2.14"
-aws-sdk-dynamodb = "1.111.0"
-aws-sdk-sns = "1.99.0"
-aws-sdk-sqs = "1.98.0"
-aws-sigv4 = "1.4.3"
-aws-smithy-runtime-api = "1.12.0"
-aws-smithy-types = "1.4.7"
+aws-sdk-dynamodb = "1.116.0"
+aws-sdk-sns = "1.104.0"
+aws-sdk-sqs = "1.102.0"
+aws-sigv4 = "1.4.5"
+aws-smithy-runtime-api = "1.12.3"
+aws-smithy-types = "1.5.0"
 
 ############################################
 # dtolnay
-anyhow = "1.0.100"
+anyhow = "1.0.103"
 async-trait = "0.1.89"
 inventory = "0.3.24"
-quote = "1.0.44"
-syn = { version = "2.0.117", features = ["full"] }
+quote = "1.0.46"
+syn = { version = "2.0.118", features = ["full"] }
 thiserror = "2.0.18"
 
 ############################################
@@ -79,7 +79,7 @@ hex = "0.4.3"
 
 ############################################
 # chrono-rs
-chrono = { version = "0.4.43", features = ["clock", "serde"] }
+chrono = { version = "0.4.45", features = ["clock", "serde"] }
 
 ############################################
 # cucumber-rs
@@ -87,7 +87,7 @@ cucumber = "0.23.0"
 
 ############################################
 # seanmonstar
-reqwest = { version = "0.13.3", default-features = false, features = [
+reqwest = { version = "0.13.4", default-features = false, features = [
     "blocking",
     "form",
     "json",
@@ -107,7 +107,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 
 ############################################
 # uuid-rs
-uuid = { version = "1.23.1", features = ["serde", "v4", "v5", "v7"] }
+uuid = { version = "1.23.4", features = ["serde", "v4", "v5", "v7"] }
 
 ############################################
 # idanarye
@@ -141,39 +141,39 @@ foundationdb-simulation = { version = "0.2.3", features = [
 hostname = "0.4"
 httpmock = "0.8.3"
 ipnet = "2.12.0"
-jsonschema = { version = "0.46.4", default-features = false, features = [
+jsonschema = { version = "0.46.10", default-features = false, features = [
     "resolve-file",
 ] }
 lz4_flex = "0.13.1"
-metrics = "0.24.5"
+metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 notify = "8.2.0"
 proptest = "1.11.0"
-quint-connect = "0.1.1"
-rust_decimal = "1.42.0"
+quint-connect = "0.1.2"
+rust_decimal = "1.42.1"
 schemars = "1.2.1"
-smallvec = { version = "1.15.1", features = ["serde"] }
+smallvec = { version = "1.15.2", features = ["serde"] }
 toml = "1.1.2"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
-turso = { version = "0.6.0", default-features = false }
+turso = { version = "0.6.1", default-features = false }
 utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
-xxhash-rust = { version = "0.8.11", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 
 ############################################
 # Public aux-common shared crates.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "2d65d744d937e2f37cf3b4784f9988a49842800a" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "db5471efedc9f8860ccf896b04db28fa57658d09" }
 
 ############################################
 # Local path dependencies
 tokio-rusqlite = { path = "vended/tokio-rusqlite" }
 
-rusqlite = { version = "0.39.0", features = ["bundled", "uuid"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "uuid"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

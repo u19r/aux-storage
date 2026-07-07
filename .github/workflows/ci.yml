@@ -2,10 +2,7 @@ name: ci
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches:
-      - main
+    types: [labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -18,8 +15,8 @@ concurrency:
 
 jobs:
   ci-check:
-    name: repo-gate
-    if: ${{ github.event.repository.private && github.repository_owner == 'u19r' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(github.event.pull_request.labels.*.name, 'no-ci') }}
+    name: ci-check
+    if: ${{ github.event.repository.private && github.repository_owner == 'u19r' && (github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'run-ci'))) }}
     # Runner class: arm64/large maps to the approved 4xlarge-first Spot pool.
     # Use x64 only for x86-only toolchains; use xlarge/docker or memory only
     # for release, image, or integration jobs that cannot pass on large.
@@ -40,6 +37,13 @@ jobs:
       DEPENDENCY_READ_ROLE_ARN: ${{ vars.AUX_BUILD_DEPENDENCY_READ_ROLE_ARN }}
       DEPENDENCY_TOKEN_BROKER_FUNCTION: ${{ vars.AUX_BUILD_DEPENDENCY_TOKEN_BROKER_FUNCTION || 'aux-build-eu-north-1-dependency-token-broker' }}
     steps:
+      - name: Print workflow dispatch inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -106,7 +110,7 @@ jobs:
             echo "git-fetch-with-cli = true"
           } >> "$cargo_home/config.toml"
 
-      - name: Run repository gate
+      - name: Run CI check
         run: |
           set -euo pipefail
           case "${{ github.event.repository.name }}" in
@@ -124,14 +128,21 @@ jobs:
 
   report:
     name: report
-    if: ${{ always() && github.event_name == 'pull_request' }}
-    needs: repo-gate
+    if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
+    needs: ci-check
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
     steps:
+      - name: Print workflow dispatch inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
       - name: Comment PR status
         env:
           GH_TOKEN: ${{ github.token }}
@@ -142,7 +153,7 @@ jobs:
           elif [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
             status="skipped: fork pull requests do not run trusted Aux self-hosted runners"
           else
-            status="${{ needs.repo-gate.result }}"
+            status="${{ needs.ci-check.result }}"
           fi
           gh pr comment "${{ github.event.pull_request.number }}" \
-            --body "repo gate: ${status} in run ${{ github.run_id }}" || true
+            --body "ci-check: ${status} in run ${{ github.run_id }}" || true

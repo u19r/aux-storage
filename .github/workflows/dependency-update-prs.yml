@@ -26,6 +26,13 @@ jobs:
       DEPENDENCY_TOKEN_BROKER_FUNCTION: ${{ vars.AUX_BUILD_DEPENDENCY_TOKEN_BROKER_FUNCTION || 'aux-build-eu-north-1-dependency-token-broker' }}
       AWS_ROLE_SESSION_NAME: gha-dependency-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      - name: Print workflow dispatch inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          WORKFLOW_DISPATCH_INPUTS: ${{ toJson(inputs) }}
+        run: |
+          echo "workflow_dispatch inputs:"
+          printf '%s\n' "$WORKFLOW_DISPATCH_INPUTS"
       - name: Checkout
         uses: actions/checkout@v6
         with:
