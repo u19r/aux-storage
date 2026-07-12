@@ -22,3 +22,4 @@ tmp/
 run-artifacts/
 tmp/opt-loop/
 _apalache-out/
+deploy-artifacts/

@@ -43,17 +43,6 @@ jobs:
     env:
       IMAGE_TAG: ${{ github.sha }}
       INFRA_CLI_VERSION: latest
-      AUX_DEPLOY_CONTRACT_JSON: ${{ vars.AUX_DEPLOY_CONTRACT_JSON }}
-      AUX_DEPLOY_GITHUB_ENVIRONMENT: ${{ vars.AUX_DEPLOY_GITHUB_ENVIRONMENT }}
-      AUX_DEPLOY_CONTAINER_NAME: ${{ vars.AUX_DEPLOY_CONTAINER_NAME }}
-      AUX_DEPLOY_IMAGE_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_REPOSITORY_URI }}
-      AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI }}
-      AUX_DEPLOY_KUBERNETES_NAMESPACE: ${{ vars.AUX_DEPLOY_KUBERNETES_NAMESPACE }}
-      AUX_DEPLOY_KUBERNETES_DEPLOYMENT: ${{ vars.AUX_DEPLOY_KUBERNETES_DEPLOYMENT }}
-      AUX_DEPLOY_VALIDATION_COMMANDS: ${{ vars.AUX_DEPLOY_VALIDATION_COMMANDS }}
-      AUX_DEPLOY_KUBE_API_SSH_TARGET: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_TARGET }}
-      AUX_DEPLOY_KUBE_API_SSH_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_PORT }}
-      AUX_DEPLOY_KUBE_API_LOCAL_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_LOCAL_PORT }}
     steps:
       - name: Print workflow dispatch inputs
         env:
@@ -71,6 +60,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve deploy config
+        id: config
+        run: echo "name=hetzner-single-node" >> "$GITHUB_OUTPUT"
+
       - name: Install infra-cli
         env:
           GH_TOKEN: ${{ secrets.AUX_INFRA_RELEASE_READ_TOKEN }}
@@ -84,21 +77,17 @@ jobs:
           bash install-infra-cli-release.sh "$INFRA_CLI_VERSION" "$PWD/infra-cli"
           printf '%s\n' "$PWD" >> "$GITHUB_PATH"
 
-      - name: Export deployment contract
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: infra-cli contract export --environment "${{ inputs.environment }}" --component aux-storage --out "$RUNNER_TEMP/contract.json"
-
       - name: Prepare deploy image
         id: image
         env:
-          AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI: ${{ vars.AUX_DEPLOY_IMAGE_PUSH_REPOSITORY_URI }}
-          AUX_DEPLOY_REGISTRY_USERNAME: ${{ secrets.AUX_DEPLOY_REGISTRY_USERNAME }}
-          AUX_DEPLOY_REGISTRY_PASSWORD: ${{ secrets.AUX_DEPLOY_REGISTRY_PASSWORD }}
+          AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY: ${{ secrets.AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          mkdir -p deploy-artifacts
           args=(
-            --contract "$RUNNER_TEMP/contract.json"
+            --config "${{ steps.config.outputs.name }}"
+            --environment "${{ inputs.environment }}"
+            --component aux-storage
             --tag "$IMAGE_TAG"
             --artifact-root deploy-artifacts
             --github-env "$GITHUB_ENV"
@@ -112,9 +101,6 @@ jobs:
       - name: Deploy Kubernetes service
         env:
           AUX_DEPLOY_KUBECONFIG_B64: ${{ secrets.AUX_DEPLOY_KUBECONFIG_B64 }}
-          AUX_DEPLOY_KUBE_API_SSH_TARGET: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_TARGET }}
-          AUX_DEPLOY_KUBE_API_SSH_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_SSH_PORT }}
-          AUX_DEPLOY_KUBE_API_LOCAL_PORT: ${{ vars.AUX_DEPLOY_KUBE_API_LOCAL_PORT }}
           AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY: ${{ secrets.AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
@@ -125,7 +111,10 @@ jobs:
           if [ "${{ inputs.execute }}" = "true" ]; then
             args+=(--execute)
           fi
-          infra-cli deploy kubernetes --contract "$RUNNER_TEMP/contract.json" --image-uri "$IMAGE_URI" --artifact-root deploy-artifacts "${args[@]}"
+          if [ -n "${AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY:-}" ]; then
+            args+=(--kube-api-ssh-key-env AUX_DEPLOY_KUBE_API_SSH_PRIVATE_KEY)
+          fi
+          infra-cli deploy kubernetes --config "${{ steps.config.outputs.name }}" --environment "${{ inputs.environment }}" --component aux-storage --image-uri "$IMAGE_URI" --artifact-root deploy-artifacts "${args[@]}"
 
       - name: Print deployment evidence
         if: always()
