@@ -7,8 +7,8 @@ use storage_types::{
 
 use crate::{
     routes::routes_test_support::{
-        create_test_db, default_conformance_backends, handle_create_table, handle_put_item,
-        handle_transact_get_items,
+        create_transactional_test_db, default_conformance_backends, handle_create_table,
+        handle_put_item, handle_transact_get_items,
     },
     types::Response,
 };
@@ -35,7 +35,7 @@ async fn setup_named_table(db: &DatabaseManager, table_name: &str) {
 
 #[tokio::test]
 async fn transact_get_items_returns_ordered_item_responses() {
-    let db = create_test_db().await;
+    let db = create_transactional_test_db().await;
     setup_table(&db).await;
     let put = json!({
         "TableName": "TransactGetTable",
@@ -93,7 +93,7 @@ async fn transact_get_items_returns_ordered_item_responses() {
 #[tokio::test]
 async fn transact_get_items_response_shape_matches_dynamodb() {
     for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
+        let db = backend.create_transactional_db().await;
         setup_table(&db).await;
         handle_put_item(
             db.clone(),
@@ -198,7 +198,7 @@ async fn transact_get_items_response_shape_matches_dynamodb() {
 #[tokio::test]
 async fn transact_get_duplicate_detection_treats_table_name_and_arn_as_same_item() {
     for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
+        let db = backend.create_transactional_db().await;
         setup_table(&db).await;
 
         let err = transact_get_error(
@@ -238,7 +238,7 @@ async fn transact_get_duplicate_detection_treats_table_name_and_arn_as_same_item
 #[tokio::test]
 async fn transact_get_consumed_capacity_groups_and_orders_like_dynamodb() {
     for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
+        let db = backend.create_transactional_db().await;
         setup_named_table(&db, "TransactGetCapacityA").await;
         setup_named_table(&db, "TransactGetCapacityB").await;
         for (table_name, keys) in [
@@ -499,7 +499,7 @@ fn transact_get_alias_validation_takes_priority_over_transaction_preflight() {
 #[tokio::test]
 async fn transact_get_key_validation_takes_priority_over_duplicate_keys() {
     for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
+        let db = backend.create_transactional_db().await;
         create_composite_test_table(db.clone()).await;
 
         let duplicate_err = transact_get_error(
@@ -645,7 +645,7 @@ async fn transact_get_key_validation_takes_priority_over_duplicate_keys() {
 #[tokio::test]
 async fn transact_get_missing_table_takes_priority_over_duplicate_and_key_validation() {
     for backend in default_conformance_backends() {
-        let db = backend.create_db().await;
+        let db = backend.create_transactional_db().await;
         create_composite_test_table(db.clone()).await;
 
         for request in [

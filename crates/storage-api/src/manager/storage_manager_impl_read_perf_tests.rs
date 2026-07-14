@@ -1,11 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use alloc_counter::AllocationGuard;
-use storage::DatabaseManager;
 use storage_types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndex,
     CreateTableRequest, IndexName, KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType,
@@ -143,7 +141,7 @@ async fn measure_transact_get_runtime(
 
 impl ReadPerfFixture {
     async fn new(table_name: &str) -> Self {
-        let db = Arc::new(DatabaseManager::new_for_test().await.expect("db"));
+        let db = crate::routes::routes_test_support::create_transactional_test_db().await;
         let table_name = TableName::new(table_name);
         db.create_table(&create_table_request(&table_name))
             .await

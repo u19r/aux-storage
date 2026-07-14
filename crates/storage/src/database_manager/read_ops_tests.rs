@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 
-use storage_cache::{PhysicalToLogicalReadTableMap, RoutedBatchGetTarget};
 use storage_types::{
     AttributeValue, DurableAbsenceProof, DurableBatchPointReadProof,
-    DurableBatchPointReadProofEntry, DurableItemRevision, DurablePointReadProof, KeyAttributes,
-    KeysAndAttributes, TableName, TableNamespace, WireItem,
+    DurableBatchPointReadProofEntry, DurablePointReadProof, KeyAttributes, KeysAndAttributes,
+    TableName, TableNamespace,
 };
 
 use crate::{
     database_manager::read_ops::{
-        RoutedBatchProofRemap, normalize_unprocessed_keys_for_shared_table,
-        parse_stream_page_token, remap_routed_batch_proof_entry,
-        remap_routed_batch_proof_for_cache_warming,
+        RoutedBatchProofTarget, normalize_unprocessed_keys_for_shared_table,
+        parse_stream_page_token, remap_routed_batch_proof,
     },
     namespace_routing::NamespaceRequestRewriter,
 };
@@ -58,71 +56,10 @@ fn shared_table_unprocessed_keys_are_normalized_back_to_logical_keys() {
 }
 
 #[test]
-fn routed_batch_proof_entries_normalize_present_items_for_shared_table_reads() {
+fn routed_batch_cache_proof_keeps_its_logical_namespace() {
     let rewriter = NamespaceRequestRewriter::new();
     let namespace = TableNamespace::from_seed("tenant-a");
-    let mut key = KeyAttributes::from(HashMap::from([
-        ("pk".to_string(), AttributeValue::S("USER#1".to_string())),
-        ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
-    ]));
-    let mut item = HashMap::from([
-        ("pk".to_string(), AttributeValue::S("USER#1".to_string())),
-        ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
-        (
-            "email".to_string(),
-            AttributeValue::S("a@example.com".to_string()),
-        ),
-    ]);
-    rewriter
-        .rewrite_key_for_shared_table(&namespace, &mut key)
-        .expect("rewrite key");
-    rewriter
-        .rewrite_item_for_shared_table(&namespace, &mut item)
-        .expect("rewrite item");
-
-    let remapped = remap_routed_batch_proof_entry(
-        DurableBatchPointReadProofEntry {
-            key,
-            proof: DurablePointReadProof::Present {
-                item: Box::new(WireItem::from_attribute_map(&item).expect("wire item")),
-                revision: DurableItemRevision::new(vec![1]),
-            },
-        },
-        Some(&namespace),
-        &rewriter,
-    )
-    .expect("remap proof entry");
-
-    assert_eq!(
-        remapped.key.get("pk"),
-        Some(&AttributeValue::S("USER#1".to_string()))
-    );
-    let DurablePointReadProof::Present { item, .. } = remapped.proof else {
-        panic!("expected present proof");
-    };
-    assert_eq!(
-        item.attribute_value("pk").expect("read pk"),
-        Some(AttributeValue::S("USER#1".to_string()))
-    );
-    assert_eq!(
-        item.attribute_value("email").expect("read email"),
-        Some(AttributeValue::S("a@example.com".to_string()))
-    );
-}
-
-#[test]
-fn routed_batch_proofs_are_remapped_from_physical_tables_to_logical_tables_for_cache_warming() {
-    let rewriter = NamespaceRequestRewriter::new();
-    let namespace = TableNamespace::from_seed("tenant-a");
-    let physical = TableName::new("__shared");
-    let logical = TableName::new("users");
-    let mut physical_to_logical = PhysicalToLogicalReadTableMap::default();
-    physical_to_logical.insert(RoutedBatchGetTarget {
-        connection_id: "replica-a".to_string(),
-        physical_table: physical.clone(),
-        logical_table: logical.clone(),
-        shared_metadata: Some(namespace.clone()),
-    });
+    let logical_table = TableName::new("users");
     let mut key = KeyAttributes::from(HashMap::from([
         ("pk".to_string(), AttributeValue::S("USER#1".to_string())),
         ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
@@ -131,10 +68,10 @@ fn routed_batch_proofs_are_remapped_from_physical_tables_to_logical_tables_for_c
         .rewrite_key_for_shared_table(&namespace, &mut key)
         .expect("rewrite key");
 
-    let remapped = remap_routed_batch_proof_for_cache_warming(
+    let remapped = remap_routed_batch_proof(
         DurableBatchPointReadProof {
             responses: HashMap::from([(
-                physical.clone(),
+                TableName::new("__shared"),
                 vec![DurableBatchPointReadProofEntry {
                     key,
                     proof: DurablePointReadProof::Absent {
@@ -144,18 +81,16 @@ fn routed_batch_proofs_are_remapped_from_physical_tables_to_logical_tables_for_c
             )]),
             unprocessed_keys: HashMap::new(),
         },
-        RoutedBatchProofRemap {
-            connection_id: "replica-a",
-            physical_to_logical: &physical_to_logical,
+        RoutedBatchProofTarget {
+            logical_table: &logical_table,
+            shared_namespace: Some(&namespace),
             request_rewriter: &rewriter,
         },
     )
     .expect("remap proof");
 
-    assert!(remapped.responses.contains_key(&logical));
-    assert!(!remapped.responses.contains_key(&physical));
     assert_eq!(
-        remapped.responses[&logical][0].key.get("pk"),
+        remapped.responses[&logical_table][0].key.get("pk"),
         Some(&AttributeValue::S("USER#1".to_string()))
     );
 }

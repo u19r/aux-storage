@@ -817,6 +817,117 @@ async fn kv_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_quer
 }
 
 #[tokio::test]
+async fn transactional_read_context_multi_get_is_one_snapshot() {
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    if !foundationdb_live_port_available().await {
+        eprintln!(
+            "Skipping FoundationDB transactional multi-get test: 127.0.0.1:4689 is unavailable"
+        );
+        return;
+    }
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    let _guard = foundationdb_live_test_guard().await;
+
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("TransactionalMultiGetSnapshot");
+    create_test_table(&provider, &table, false).await;
+    let keys = ["a", "b"].map(|sk| {
+        storage_types::KeyAttributes::from([
+            ("pk".to_string(), AttributeValue::S("u".to_string())),
+            ("sk".to_string(), AttributeValue::S(sk.to_string())),
+        ])
+    });
+    for (sk, key) in ["a", "b"].into_iter().zip(&keys) {
+        provider
+            .put_item(
+                table.clone(),
+                HashMap::from([
+                    ("pk".to_string(), AttributeValue::S("u".to_string())),
+                    ("sk".to_string(), AttributeValue::S(sk.to_string())),
+                    (
+                        "version".to_string(),
+                        AttributeValue::S("before".to_string()),
+                    ),
+                ]),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("seed {key:?}: {error}"));
+    }
+
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    crate::backends::fdb::foundationdb_operation_metrics_reset();
+    let read_context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await
+        .expect("begin transactional read context");
+    provider
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items: ["a", "b"]
+                .into_iter()
+                .map(|sk| TransactWriteItem {
+                    put: Some(TransactPutRequest {
+                        table_name: table.clone(),
+                        item: HashMap::from([
+                            ("pk".to_string(), AttributeValue::S("u".to_string())),
+                            ("sk".to_string(), AttributeValue::S(sk.to_string())),
+                            (
+                                "version".to_string(),
+                                AttributeValue::S("after".to_string()),
+                            ),
+                        ]),
+                        condition_expression: None,
+                        expression_attribute_names: None,
+                        expression_attribute_values: None,
+                        return_values_on_condition_check_failure: None,
+                        aux_item_stream_ttl_hours: None,
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("update both items atomically");
+
+    let snapshot_items = futures::future::try_join_all(
+        keys.into_iter()
+            .map(|key| read_context.get_item(table.clone(), key, true)),
+    )
+    .await
+    .expect("read both snapshot items");
+    for item in snapshot_items {
+        let item = item
+            .expect("snapshot item")
+            .to_attribute_map()
+            .expect("decode snapshot item");
+        assert_eq!(
+            item.get("version"),
+            Some(&AttributeValue::S("before".to_string()))
+        );
+    }
+
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    {
+        let metrics = crate::backends::fdb::foundationdb_operation_metrics_snapshot();
+        assert_eq!(
+            fdb_operation_metric(&metrics, "read_context", "transaction_start"),
+            1,
+            "transactional multi-get must use one FoundationDB transaction\n{metrics}"
+        );
+        assert_eq!(
+            fdb_operation_metric(&metrics, "read_context", "snapshot_point_read"),
+            2,
+            "transactional multi-get must account for both snapshot point reads\n{metrics}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn table_identity_metadata_uses_compact_keys_and_lookup() {
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
@@ -1806,6 +1917,108 @@ async fn kv_gsi_visibility_is_delayed_by_default() {
         .await
         .unwrap();
     assert_eq!(after.len(), 1, "gsi-update should publish the pending row");
+}
+
+#[cfg(feature = "foundationdb-backend")]
+#[tokio::test]
+#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
+async fn foundationdb_transactional_put_gsi_is_visible_after_update_job() {
+    use uuid::Uuid;
+
+    let _guard = foundationdb_live_test_guard().await;
+    if !foundationdb_live_port_available().await {
+        eprintln!("Skipping FoundationDB transactional GSI test: 127.0.0.1:4689 is unavailable");
+        return;
+    }
+    let store = crate::FoundationDbKvStore::connect(crate::backends::fdb::FoundationDbConfig {
+        subspace_prefix: Some(format!("tests/kv/{}/", Uuid::now_v7()).into_bytes()),
+        ..Default::default()
+    })
+    .expect("connect to local FoundationDB");
+    let provider = SortedKvDbStorageProvider::new(store);
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        provider
+            .initialize_storage()
+            .await
+            .expect("initialize storage");
+        let table = TableName::new("FdbTransactionalGsiDelayed");
+        create_test_table(&provider, &table, true).await;
+        let metadata = provider
+            .get_table_identity_from_name(&table)
+            .await
+            .expect("read table metadata")
+            .expect("table metadata exists");
+        let gsi_range = table_keys::gsi_prefix(&metadata.identity, &IndexName::new("TestGSI"))
+            .expect("GSI prefix");
+
+        provider
+            .transact_write_items(TransactWriteItemsRequest {
+                transact_items: vec![TransactWriteItem {
+                    put: Some(TransactPutRequest {
+                        table_name: table.clone(),
+                        item: HashMap::from([
+                            ("pk".to_string(), AttributeValue::S("u".to_string())),
+                            ("sk".to_string(), AttributeValue::S("item#1".to_string())),
+                            ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
+                            ("gsi_sk".to_string(), AttributeValue::N("1".to_string())),
+                        ]),
+                        condition_expression: Some("attribute_not_exists(pk)".to_string()),
+                        expression_attribute_names: None,
+                        expression_attribute_values: None,
+                        return_values_on_condition_check_failure: None,
+                        aux_item_stream_ttl_hours: None,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .expect("transactional put");
+
+        let raw_before = provider
+            .kv_store
+            .get_range(
+                &gsi_range.start,
+                &gsi_range.end,
+                None,
+                None::<ItemKey>,
+                true,
+            )
+            .await
+            .expect("read raw GSI range before maintenance");
+        let (query_before, _) = provider
+            .query_table(&gsi_query_request(&table))
+            .await
+            .expect("query GSI before maintenance");
+        assert!(raw_before.items.is_empty());
+        assert!(query_before.is_empty());
+
+        provider
+            .run_job(GSI_UPDATE_JOB)
+            .await
+            .expect("run GSI update job");
+
+        let raw_after = provider
+            .kv_store
+            .get_range(
+                &gsi_range.start,
+                &gsi_range.end,
+                None,
+                None::<ItemKey>,
+                true,
+            )
+            .await
+            .expect("read raw GSI range after maintenance");
+        let (query_after, _) = provider
+            .query_table(&gsi_query_request(&table))
+            .await
+            .expect("query GSI after maintenance");
+        assert_eq!(raw_after.items.len(), 1);
+        assert_eq!(query_after.len(), 1);
+    })
+    .await
+    .expect("FoundationDB transactional GSI test timed out");
 }
 
 #[tokio::test]

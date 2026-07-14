@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use storage_types::{
     AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, KeyAttributes,
@@ -6,9 +6,8 @@ use storage_types::{
 };
 
 use crate::batch_get::{
-    BatchGetCachePlanOptions, PhysicalToLogicalReadTableMap, RoutedBatchGetTarget,
-    RuntimeBatchGetCacheOutcome, batch_get_keys_and_attributes_count_map, batch_request_has_items,
-    finish_batch_get_request, insert_routed_batch_get_request, merge_cached_batch_get_response,
+    BatchGetCachePlanOptions, RuntimeBatchGetCacheOutcome, batch_get_keys_and_attributes_count_map,
+    batch_request_has_items, finish_batch_get_request, merge_cached_batch_get_response,
     plan_batch_get_request, plan_batch_get_request_with_options,
 };
 
@@ -195,41 +194,4 @@ fn finish_batch_get_request_returns_partial_hit_and_db_suffix() {
             .len(),
         1
     );
-}
-
-#[test]
-fn routed_batch_get_request_builder_tracks_physical_to_logical_tables() {
-    let mut per_connection = BTreeMap::new();
-    let mut physical_to_logical = PhysicalToLogicalReadTableMap::default();
-    let target = RoutedBatchGetTarget {
-        connection_id: "conn-a".into(),
-        physical_table: TableName::new("shared-users"),
-        logical_table: TableName::new("users"),
-        shared_metadata: Some("tenant-1".to_string()),
-    };
-    let keys_and_attributes = KeysAndAttributes {
-        keys: vec![key("1")].into(),
-        attributes_to_get: None,
-        consistent_read: Some(false),
-        projection_expression: None,
-        expression_attribute_names: None,
-    };
-
-    insert_routed_batch_get_request(
-        &mut per_connection,
-        &mut physical_to_logical,
-        &Some("TOTAL".into()),
-        target,
-        keys_and_attributes,
-    );
-
-    assert!(
-        per_connection["conn-a"]
-            .request_items
-            .contains_key(&TableName::new("shared-users"))
-    );
-    let resolved =
-        physical_to_logical.resolve_or_physical("conn-a", TableName::new("shared-users"));
-    assert_eq!(resolved.logical_table, TableName::new("users"));
-    assert_eq!(resolved.shared_metadata, Some("tenant-1".to_string()));
 }

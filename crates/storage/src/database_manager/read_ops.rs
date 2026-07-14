@@ -1,19 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use storage_cache::{
-    PhysicalToLogicalReadTableMap, RoutedBatchGetTarget, batch_request_has_items,
-    insert_routed_batch_get_request,
-};
+use storage_cache::batch_request_has_items;
 use storage_provider::StorageProvider;
 use storage_types::{
-    AttributeMap, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
-    DurableBatchPointReadProof, DurableBatchPointReadProofEntry, DurablePointReadProof,
-    DurablePointReadRequest, GetStreamRecordsResponse, ItemResponse, KeyAttributes,
-    KeySchemaElement, KeysAndAttributes, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StoredTableInfo, StreamItemId, StreamName, StreamSpecification, StreamViewType,
-    TableName, TableNamespace, TransactGetItemsRequest, TransactGetItemsResponse, TryFromWireItem,
-    WireItem, context::WrappedError, preflight_transact_get_item_key_with_table_info,
-    transaction_canceled_for_preflights, validate_no_duplicate_transact_item_keys,
+    AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, DurableBatchPointReadProof,
+    DurableBatchPointReadProofEntry, DurablePointReadProof, DurablePointReadRequest,
+    GetStreamRecordsResponse, KeyAttributes, KeySchemaElement, KeysAndAttributes, ScanTableRequest,
+    StorageEnum, StorageError, StorageResult, StreamItemId, StreamName, StreamSpecification,
+    StreamViewType, TableName, TableNamespace, TryFromWireItem, WireItem, context::WrappedError,
 };
 use stream::StreamError;
 
@@ -354,62 +348,52 @@ impl DatabaseManager {
         } = db_request.clone();
 
         let default_connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
-        let mut per_connection: BTreeMap<String, BatchGetItemRequest> = BTreeMap::new();
-        let mut physical_to_logical = PhysicalToLogicalReadTableMap::default();
+        let mut routed_requests = Vec::with_capacity(request_items.len());
 
         for (logical_table, mut keys_and_attributes) in request_items {
             let route = self
                 .resolve_namespace_route_for_table(&logical_table)
                 .await?;
-            if let Some(route) = route {
+            let (connection_id, physical_table, shared_namespace) = if let Some(route) = route {
                 if route.storage_mode == NamespaceStorageMode::SharedTable {
                     for key in &mut keys_and_attributes.keys {
                         self.request_rewriter
                             .rewrite_key_for_shared_table(&route.namespace, key)?;
                     }
                 }
-                insert_routed_batch_get_request(
-                    &mut per_connection,
-                    &mut physical_to_logical,
-                    &return_consumed_capacity,
-                    RoutedBatchGetTarget {
-                        connection_id: route.read_target.connection_id.clone(),
-                        physical_table: route.read_target.table_name.clone(),
-                        logical_table,
-                        shared_metadata: (route.storage_mode == NamespaceStorageMode::SharedTable)
-                            .then_some(route.namespace.clone()),
-                    },
-                    keys_and_attributes,
-                );
+                (
+                    route.read_target.connection_id.clone(),
+                    route.read_target.table_name.clone(),
+                    (route.storage_mode == NamespaceStorageMode::SharedTable)
+                        .then_some(route.namespace.clone()),
+                )
             } else {
-                insert_routed_batch_get_request(
-                    &mut per_connection,
-                    &mut physical_to_logical,
-                    &return_consumed_capacity,
-                    RoutedBatchGetTarget {
-                        connection_id: default_connection_id.clone(),
-                        physical_table: logical_table.clone(),
-                        logical_table,
-                        shared_metadata: None,
-                    },
-                    keys_and_attributes,
-                );
-            }
+                (default_connection_id.clone(), logical_table.clone(), None)
+            };
+            routed_requests.push((
+                connection_id,
+                logical_table,
+                shared_namespace,
+                BatchGetItemRequest {
+                    request_items: HashMap::from([(physical_table, keys_and_attributes)]),
+                    return_consumed_capacity: return_consumed_capacity.clone(),
+                },
+            ));
         }
 
         let mut merged_responses: HashMap<TableName, Vec<WireItem>> =
-            HashMap::with_capacity(per_connection.len());
+            HashMap::with_capacity(routed_requests.len());
         let mut merged_unprocessed = HashMap::new();
-        for (connection_id, request) in per_connection {
+        for (connection_id, logical_table, shared_namespace, request) in routed_requests {
             let provider = self.provider_for_request_connection(&connection_id)?;
             if connection_id == default_connection_id {
                 warm_strong_batch_read_through(
                     &batch_get_cache,
                     provider.as_ref(),
                     &request,
-                    Some(RoutedBatchProofRemap {
-                        connection_id: &connection_id,
-                        physical_to_logical: &physical_to_logical,
+                    Some(RoutedBatchProofTarget {
+                        logical_table: &logical_table,
+                        shared_namespace: shared_namespace.as_ref(),
                         request_rewriter: &self.request_rewriter,
                     }),
                 )
@@ -419,11 +403,9 @@ impl DatabaseManager {
                 record_storage_operation("batch_get_item", provider.batch_get_item(request))
                     .await?;
             if let Some(responses) = response.responses {
-                for (physical_table, items) in responses {
-                    let target_info =
-                        physical_to_logical.resolve_or_physical(&connection_id, physical_table);
+                for (_, items) in responses {
                     let mut items = items;
-                    if let Some(namespace) = target_info.shared_metadata.as_ref() {
+                    if let Some(namespace) = shared_namespace.as_ref() {
                         normalize_wire_items_for_shared_table(
                             &self.request_rewriter,
                             namespace,
@@ -431,24 +413,22 @@ impl DatabaseManager {
                         )?;
                     }
                     merged_responses
-                        .entry(target_info.logical_table)
+                        .entry(logical_table.clone())
                         .or_default()
                         .extend(items);
                 }
             }
             if let Some(unprocessed_keys) = response.unprocessed_keys {
-                for (physical_table, keys) in unprocessed_keys {
-                    let target_info =
-                        physical_to_logical.resolve_or_physical(&connection_id, physical_table);
+                for (_, keys) in unprocessed_keys {
                     let mut keys = keys;
-                    if let Some(namespace) = target_info.shared_metadata.as_ref() {
+                    if let Some(namespace) = shared_namespace.as_ref() {
                         normalize_unprocessed_keys_for_shared_table(
                             &self.request_rewriter,
                             namespace,
                             &mut keys,
                         )?;
                     }
-                    merged_unprocessed.insert(target_info.logical_table, keys);
+                    merged_unprocessed.insert(logical_table.clone(), keys);
                 }
             }
         }
@@ -462,80 +442,6 @@ impl DatabaseManager {
         batch_get_cache.merge_cached_responses(&mut response, prepared_cache_read.cached_responses);
         batch_get_cache.record_outcome(cache_outcome);
         Ok(response)
-    }
-
-    pub async fn transact_get_items(
-        &self,
-        request: TransactGetItemsRequest,
-    ) -> StorageResult<TransactGetItemsResponse> {
-        let return_consumed_capacity = request.return_consumed_capacity;
-        let mut transact_items = request.transact_items;
-        let mut preflights = Vec::with_capacity(transact_items.len());
-        let mut table_infos = Vec::<(TableName, StoredTableInfo)>::new();
-        let mut consumed_capacity_counts =
-            should_track_transact_get_consumed_capacity(return_consumed_capacity.as_deref())
-                .then(Vec::new);
-        for item in &mut transact_items {
-            let requested_table_name = item.get.table_name.clone();
-            item.get.table_name = TableName::new(item.get.table_name.dynamodb_resource_name());
-            let table_info_index = if let Some(index) = table_infos
-                .iter()
-                .position(|(table_name, _)| table_name == &item.get.table_name)
-            {
-                index
-            } else {
-                let table_info = self
-                    .get_table_info(&item.get.table_name)
-                    .await
-                    .map_err(transact_get_table_not_found_as_resource_not_found)?;
-                table_infos.push((item.get.table_name.clone(), table_info));
-                table_infos.len() - 1
-            };
-            let table_info = &table_infos[table_info_index].1;
-            preflights.push(preflight_transact_get_item_key_with_table_info(
-                item, table_info,
-            )?);
-            if let Some(counts) = consumed_capacity_counts.as_mut() {
-                increment_transact_get_consumed_capacity_count(
-                    counts,
-                    &table_info.table_name,
-                    &requested_table_name,
-                );
-            }
-        }
-        if let Some(error) = transaction_canceled_for_preflights(&preflights) {
-            return Err(error);
-        }
-        validate_no_duplicate_transact_item_keys(&preflights)?;
-
-        let mut responses = Vec::with_capacity(transact_items.len());
-        for item in transact_items {
-            let get = item.get;
-            let table_name = get.table_name;
-            let key = get.key;
-            let item = self
-                .get_item_map_with_consistent_read(table_name, key, true)
-                .await?;
-            let item = match (item, get.projection_expression.as_deref()) {
-                (Some(item), Some(projection_expression)) => {
-                    let projected = storage_api_project_item(
-                        &item,
-                        projection_expression,
-                        get.expression_attribute_names.as_ref(),
-                    );
-                    (!projected.is_empty()).then_some(AttributeMap::from(projected))
-                }
-                (Some(item), None) => Some(AttributeMap::from(item)),
-                (None, _) => None,
-            };
-            responses.push(ItemResponse { item });
-        }
-        Ok(TransactGetItemsResponse {
-            responses,
-            consumed_capacity: consumed_capacity_counts.as_deref().and_then(|counts| {
-                transact_get_consumed_capacity(return_consumed_capacity.as_deref(), counts)
-            }),
-        })
     }
 
     pub async fn get_stream_records_for_table_name(
@@ -555,93 +461,6 @@ impl DatabaseManager {
         self.get_stream_records(table_name, &key_schema, &stream_spec, page_token, limit)
             .await
     }
-}
-
-struct TransactGetConsumedCapacityCount {
-    canonical_table_name: TableName,
-    response_table_name: TableName,
-    count: usize,
-}
-
-fn should_track_transact_get_consumed_capacity(return_consumed_capacity: Option<&str>) -> bool {
-    matches!(return_consumed_capacity, Some("TOTAL" | "INDEXES"))
-}
-
-fn increment_transact_get_consumed_capacity_count(
-    counts: &mut Vec<TransactGetConsumedCapacityCount>,
-    canonical_table_name: &TableName,
-    response_table_name: &TableName,
-) {
-    if let Some(entry) = counts
-        .iter_mut()
-        .find(|entry| &entry.canonical_table_name == canonical_table_name)
-    {
-        entry.count += 1;
-        return;
-    }
-    counts.push(TransactGetConsumedCapacityCount {
-        canonical_table_name: canonical_table_name.clone(),
-        response_table_name: response_table_name.clone(),
-        count: 1,
-    });
-}
-
-fn transact_get_consumed_capacity(
-    return_consumed_capacity: Option<&str>,
-    counts: &[TransactGetConsumedCapacityCount],
-) -> Option<serde_json::Value> {
-    let return_consumed_capacity = return_consumed_capacity?;
-    let mut counts = counts.iter().collect::<Vec<_>>();
-    counts.sort_by(|left, right| {
-        right
-            .canonical_table_name
-            .as_ref()
-            .cmp(left.canonical_table_name.as_ref())
-    });
-    match return_consumed_capacity {
-        "TOTAL" => Some(serde_json::Value::Array(
-            counts
-                .iter()
-                .map(|entry| {
-                    let capacity_units = (entry.count as f64) * 2.0;
-                    serde_json::json!({
-                        "TableName": entry.response_table_name,
-                        "CapacityUnits": capacity_units,
-                        "ReadCapacityUnits": capacity_units
-                    })
-                })
-                .collect(),
-        )),
-        "INDEXES" => Some(serde_json::Value::Array(
-            counts
-                .iter()
-                .map(|entry| {
-                    let capacity_units = (entry.count as f64) * 2.0;
-                    serde_json::json!({
-                        "TableName": entry.response_table_name,
-                        "CapacityUnits": capacity_units,
-                        "ReadCapacityUnits": capacity_units,
-                        "Table": {
-                            "ReadCapacityUnits": capacity_units,
-                            "CapacityUnits": capacity_units
-                        }
-                    })
-                })
-                .collect(),
-        )),
-        "NONE" => None,
-        _ => None,
-    }
-}
-
-fn transact_get_table_not_found_as_resource_not_found(error: StorageError) -> StorageError {
-    if let StorageEnum::TableNotFound { name, .. } = error.to_enum() {
-        return StorageError::Base(StorageEnum::ResourceNotFound {
-            resource_type: "table",
-            resource_id: name.clone(),
-        });
-    }
-    error
 }
 
 fn should_try_strong_read_through_warming(
@@ -675,7 +494,7 @@ async fn warm_strong_batch_read_through(
     batch_get_cache: &crate::cache_batch_get_runtime::StorageBatchGetCacheRuntime<'_>,
     provider: &dyn StorageProvider,
     db_request: &BatchGetItemRequest,
-    remap: Option<RoutedBatchProofRemap<'_>>,
+    target: Option<RoutedBatchProofTarget<'_>>,
 ) -> StorageResult<()> {
     if !batch_get_cache.strong_read_through_warming_enabled()
         || !request_contains_consistent_reads(db_request)
@@ -696,85 +515,72 @@ async fn warm_strong_batch_read_through(
         Err(error) if matches!(error.to_enum(), StorageEnum::Unsupported { .. }) => return Ok(()),
         Err(error) => return Err(error),
     };
-    if let Some(remap) = remap {
-        proof = remap_routed_batch_proof_for_cache_warming(proof, remap)?;
+    if let Some(target) = target {
+        proof = remap_routed_batch_proof(proof, target)?;
     }
-
     batch_get_cache.warm_authoritative_batch(proof).await
 }
 
-pub(crate) struct RoutedBatchProofRemap<'a> {
-    pub(crate) connection_id: &'a str,
-    pub(crate) physical_to_logical: &'a PhysicalToLogicalReadTableMap<TableNamespace>,
+pub(crate) struct RoutedBatchProofTarget<'a> {
+    pub(crate) logical_table: &'a TableName,
+    pub(crate) shared_namespace: Option<&'a TableNamespace>,
     pub(crate) request_rewriter: &'a NamespaceRequestRewriter,
 }
 
-pub(crate) fn remap_routed_batch_proof_for_cache_warming(
+pub(crate) fn remap_routed_batch_proof(
     proof: DurableBatchPointReadProof,
-    remap: RoutedBatchProofRemap<'_>,
+    target: RoutedBatchProofTarget<'_>,
 ) -> StorageResult<DurableBatchPointReadProof> {
-    let mut logical_responses = HashMap::new();
-    for (physical_table, entries) in proof.responses {
-        let target_info = remap
-            .physical_to_logical
-            .resolve_or_physical(remap.connection_id, physical_table);
-        let mut logical_entries = Vec::with_capacity(entries.len());
-        for entry in entries {
-            logical_entries.push(remap_routed_batch_proof_entry(
-                entry,
-                target_info.shared_metadata.as_ref(),
-                remap.request_rewriter,
-            )?);
-        }
-        logical_responses
-            .entry(target_info.logical_table)
-            .or_insert_with(Vec::new)
-            .extend(logical_entries);
+    let DurableBatchPointReadProof {
+        responses,
+        unprocessed_keys,
+    } = proof;
+    let mut entries = responses.into_values().flatten().collect::<Vec<_>>();
+    for entry in &mut entries {
+        normalize_durable_proof_entry(entry, &target)?;
     }
-
-    let mut logical_unprocessed_keys = HashMap::new();
-    for (physical_table, mut keys) in proof.unprocessed_keys {
-        let target_info = remap
-            .physical_to_logical
-            .resolve_or_physical(remap.connection_id, physical_table);
-        if let Some(namespace) = target_info.shared_metadata.as_ref() {
-            normalize_unprocessed_keys_for_shared_table(
-                remap.request_rewriter,
-                namespace,
-                &mut keys,
-            )?;
-        }
-        logical_unprocessed_keys.insert(target_info.logical_table, keys);
+    let mut unprocessed_values = unprocessed_keys.into_values();
+    let mut unprocessed = unprocessed_values.next();
+    if unprocessed_values.next().is_some() {
+        return Err(StorageError::internal(
+            "single-table routed batch proof returned multiple unprocessed tables",
+        ));
     }
-
+    if let (Some(namespace), Some(keys)) = (target.shared_namespace, unprocessed.as_mut()) {
+        for key in &mut keys.keys {
+            target
+                .request_rewriter
+                .normalize_key_from_shared_table(namespace, key)?;
+        }
+    }
     Ok(DurableBatchPointReadProof {
-        responses: logical_responses,
-        unprocessed_keys: logical_unprocessed_keys,
+        responses: if !entries.is_empty() {
+            HashMap::from([(target.logical_table.clone(), entries)])
+        } else {
+            Default::default()
+        },
+        unprocessed_keys: unprocessed
+            .map(|keys| HashMap::from([(target.logical_table.clone(), keys)]))
+            .unwrap_or_default(),
     })
 }
 
-pub(crate) fn remap_routed_batch_proof_entry(
-    entry: DurableBatchPointReadProofEntry,
-    namespace: Option<&TableNamespace>,
-    request_rewriter: &NamespaceRequestRewriter,
-) -> StorageResult<DurableBatchPointReadProofEntry> {
-    let DurableBatchPointReadProofEntry { mut key, proof } = entry;
-    let proof = match proof {
-        DurablePointReadProof::Present { mut item, revision } => {
-            if let Some(namespace) = namespace {
-                request_rewriter.normalize_key_from_shared_table(namespace, &mut key)?;
-                request_rewriter.normalize_wire_item_from_shared_table(namespace, &mut item)?;
-            }
-            DurablePointReadProof::Present { item, revision }
-        }
-        DurablePointReadProof::Absent { proof } => {
-            if let Some(namespace) = namespace {
-                request_rewriter.normalize_key_from_shared_table(namespace, &mut key)?;
-            }
-            DurablePointReadProof::Absent { proof }
-        }
+fn normalize_durable_proof_entry(
+    entry: &mut DurableBatchPointReadProofEntry,
+    target: &RoutedBatchProofTarget<'_>,
+) -> StorageResult<()> {
+    let Some(namespace) = target.shared_namespace else {
+        return Ok(());
     };
-    Ok(DurableBatchPointReadProofEntry { key, proof })
+    target
+        .request_rewriter
+        .normalize_key_from_shared_table(namespace, &mut entry.key)?;
+    if let DurablePointReadProof::Present { item, .. } = &mut entry.proof {
+        target
+            .request_rewriter
+            .normalize_wire_item_from_shared_table(namespace, item)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_stream_page_token(

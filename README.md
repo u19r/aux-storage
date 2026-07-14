@@ -162,6 +162,13 @@ for independent point reads and `TransactGetItems` for small transactional point
 `ReadSequence` when later reads depend on attributes returned by earlier reads and the whole workflow
 must stay bounded by fanout, total-read, and response-size limits.
 
+Embedded Rust consumers can use `DatabaseManager::read_sequence_executor` for the same dependent
+read boundary without an HTTP hop or JSON request/response conversion. Its wire-native `get_item`
+and `query_table` methods require mutable access to the executor, reuse one provider context, reject
+cross-connection sequences, and enforce hard operation, item, and response-byte caps. The executor's
+stats distinguish started operations from completed operations so cancellation and provider failures
+remain observable.
+
 Example target and request shape:
 
 ```http

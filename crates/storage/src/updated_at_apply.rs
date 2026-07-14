@@ -404,6 +404,16 @@ fn reserve_placeholder<T>(existing: Option<&HashMap<String, T>>, base: &str) -> 
 }
 
 fn stamp_item_map(item: &mut HashMap<String, AttributeValue>, updated_at_ms: i64) {
+    let updated_at_ms = item
+        .get(storage_types::single_table_entity::CREATED_AT_ALIAS_ATTR)
+        .or_else(|| item.get(storage_types::single_table_entity::CREATED_AT_ATTR))
+        .and_then(|value| match value {
+            AttributeValue::N(value) => value.parse::<i64>().ok(),
+            _ => None,
+        })
+        .map_or(updated_at_ms, |created_at_ms| {
+            updated_at_ms.max(created_at_ms)
+        });
     item.remove(storage_types::single_table_entity::UPDATED_AT_ATTR);
     item.insert(
         storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR.to_string(),

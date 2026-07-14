@@ -23,11 +23,10 @@ pub mod raft_network;
 pub mod raft_types;
 
 pub use batch_get::{
-    BatchGetCachePlan, BatchGetCachePlanOptions, PhysicalToLogicalReadTableMap,
-    PreparedBatchGetExecution, ResolvedBatchGetTarget, RoutedBatchGetTarget,
+    BatchGetCachePlan, BatchGetCachePlanOptions, PreparedBatchGetExecution,
     RuntimeBatchGetCacheOutcome, batch_get_keys_and_attributes_count_map, batch_request_has_items,
-    finish_batch_get_request, insert_routed_batch_get_request, merge_cached_batch_get_response,
-    plan_batch_get_request, plan_batch_get_request_with_options,
+    finish_batch_get_request, merge_cached_batch_get_response, plan_batch_get_request,
+    plan_batch_get_request_with_options,
 };
 pub use batch_write::{
     PhysicalToLogicalWriteTableMap, RoutedBatchWriteTarget,

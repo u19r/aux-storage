@@ -429,6 +429,86 @@ async fn shared_table_routing_rewrites_keys_and_blocks_unsafe_forms() {
 }
 
 #[tokio::test]
+async fn batch_get_keeps_logical_namespaces_that_share_one_physical_table_separate() {
+    let db = new_routed_db().await;
+    Tables::create_sys_namespaces_table(&db)
+        .await
+        .expect("create namespace routing table");
+    create_simple_shared_table(&db, 1).await;
+    put_location_dictionary(&db, &[(1, "default")]).await;
+
+    let first_namespace = TableNamespace::from_seed("first");
+    let second_namespace = TableNamespace::from_seed("second");
+    put_shared_namespace_route_metadata(&db, &first_namespace, 1).await;
+    put_shared_namespace_route_metadata(&db, &second_namespace, 1).await;
+    let first_table = Tables::namespace(&first_namespace);
+    let second_table = Tables::namespace(&second_namespace);
+
+    for (table, value) in [(&first_table, "first"), (&second_table, "second")] {
+        db.put_item(
+            PutItemInput::builder()
+                .table_name(table.clone())
+                .item(HashMap::from([
+                    ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+                    ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+                    ("value".to_string(), AttributeValue::S(value.to_string())),
+                ]))
+                .build(),
+        )
+        .await
+        .expect("put routed item");
+    }
+
+    let key = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+        ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+    ]);
+    let response = db
+        .batch_get_item(BatchGetItemRequest {
+            request_items: HashMap::from([
+                (
+                    first_table.clone(),
+                    KeysAndAttributes {
+                        keys: vec![key.clone().into()].into(),
+                        attributes_to_get: None,
+                        consistent_read: None,
+                        projection_expression: None,
+                        expression_attribute_names: None,
+                    },
+                ),
+                (
+                    second_table.clone(),
+                    KeysAndAttributes {
+                        keys: vec![key.into()].into(),
+                        attributes_to_get: None,
+                        consistent_read: None,
+                        projection_expression: None,
+                        expression_attribute_names: None,
+                    },
+                ),
+            ]),
+            return_consumed_capacity: None,
+        })
+        .await
+        .expect("batch get routed items")
+        .responses
+        .expect("batch get responses");
+
+    assert_eq!(
+        response[&first_table][0]
+            .attribute_value("value")
+            .expect("first value"),
+        Some(AttributeValue::S("first".to_string()))
+    );
+    assert_eq!(
+        response[&second_table][0]
+            .attribute_value("value")
+            .expect("second value"),
+        Some(AttributeValue::S("second".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn shared_table_query_pagination_round_trips_logical_start_keys() {
     let db = new_routed_db().await;
     Tables::create_sys_namespaces_table(&db)

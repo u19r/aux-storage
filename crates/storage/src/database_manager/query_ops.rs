@@ -166,7 +166,7 @@ impl DatabaseManager {
         Ok((items, lek))
     }
 
-    async fn rewrite_query_start_key_for_shared_table(
+    pub(super) async fn rewrite_query_start_key_for_shared_table(
         &self,
         namespace: &TableNamespace,
         request: &mut QueryTableRequest,
@@ -209,7 +209,7 @@ impl DatabaseManager {
         Ok(())
     }
 
-    async fn normalize_query_start_key_from_shared_table(
+    pub(super) async fn normalize_query_start_key_from_shared_table(
         &self,
         namespace: &TableNamespace,
         request: &QueryTableRequest,

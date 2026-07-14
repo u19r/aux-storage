@@ -427,10 +427,9 @@ fn find_env_end(raw: &str, mut index: usize) -> Option<usize> {
             }
             nested -= 1;
             index += 1;
-        } else if let Some(ch) = rest.chars().next() {
-            index += ch.len_utf8();
         } else {
-            return None;
+            let ch = rest.chars().next()?;
+            index += ch.len_utf8();
         }
     }
     None
@@ -448,10 +447,9 @@ fn find_file_end(raw: &str, mut index: usize) -> Option<usize> {
             index += 1;
         } else if rest.starts_with("::") && env_depth == 0 {
             return Some(index);
-        } else if let Some(ch) = rest.chars().next() {
-            index += ch.len_utf8();
         } else {
-            return None;
+            let ch = rest.chars().next()?;
+            index += ch.len_utf8();
         }
     }
     None

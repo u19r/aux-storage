@@ -46,6 +46,27 @@ impl ConformanceTestBackend {
         )
     }
 
+    pub async fn create_transactional_db(&self) -> Arc<DatabaseManager> {
+        let mut config = self.isolated_config();
+        if matches!(config.backend_type, StorageBackend::SQLite) {
+            config.connection_string = Some(unique_test_path("sqlite-transactional"));
+            config
+                .sqlite
+                .get_or_insert_with(storage_provider::SqliteSettings::default)
+                .force_file_backed_database = true;
+        }
+        Arc::new(
+            DatabaseManager::new_for_test_with_config(config)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "create transactional {} conformance database: {err}",
+                        self.name
+                    )
+                }),
+        )
+    }
+
     fn isolated_config(&self) -> StorageConfig {
         match self.config.backend_type {
             #[cfg(feature = "postgres")]
@@ -62,6 +83,28 @@ impl ConformanceTestBackend {
             _ => self.config.clone(),
         }
     }
+}
+
+pub async fn create_transactional_test_db() -> Arc<DatabaseManager> {
+    let config = StorageConfig {
+        backend_type: StorageBackend::SQLite,
+        connection_string: Some(unique_test_path("sqlite-transactional")),
+        file_path: None,
+        sqlite: Some(storage_provider::SqliteSettings {
+            force_file_backed_database: true,
+            ..storage_provider::SqliteSettings::default()
+        }),
+        postgres: None,
+        turso: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    Arc::new(
+        DatabaseManager::new_for_test_with_config(config)
+            .await
+            .expect("create transactional test database manager"),
+    )
 }
 
 pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {

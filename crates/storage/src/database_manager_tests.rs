@@ -8,10 +8,10 @@ use storage_types::{
     AttributeDefinition, AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
     CreateGlobalSecondaryIndex, CreateTableRequest, EncodePutRequest, EncodeWriteRequest,
     IndexName, KeyAttributeType, KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest,
-    StreamSpecification, StreamViewType, TableName, TableNamespace, TransactEncodeItem,
-    TransactEncodePutRequest, TransactPutRequest, TransactUpdateRequest, TransactWriteItem,
-    TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, TryIntoWireItem, WireItem,
-    WriteRequest, single_table_entity::SingleTableEntity,
+    StreamSpecification, StreamViewType, TableName, TableNamespace, TimestampMillis,
+    TransactEncodeItem, TransactEncodePutRequest, TransactPutRequest, TransactUpdateRequest,
+    TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, TryIntoWireItem,
+    WireItem, WriteRequest, single_table_entity::SingleTableEntity,
 };
 
 use crate::{
@@ -1062,6 +1062,39 @@ async fn put_item_stamps_updated_at_millis() {
         read_updated_at_ms(&stored) > 0,
         "updated_at should be stamped by DatabaseManager"
     );
+}
+
+#[tokio::test]
+async fn put_item_never_stamps_updated_at_before_created_at() {
+    let db = create_single_table_mode_db().await;
+    let table_name = TableName::new("put_item_created_at_floor");
+    create_hash_table(&db, &table_name).await;
+    let created_at_ms = TimestampMillis::now().timestamp_millis() + 60_000;
+
+    db.put_item(
+        crate::PutItemInput::builder()
+            .table_name(table_name.clone())
+            .item(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("item#1".to_string())),
+                (
+                    "c_at".to_string(),
+                    AttributeValue::N(created_at_ms.to_string()),
+                ),
+            ]))
+            .build(),
+    )
+    .await
+    .expect("put item");
+
+    let stored = db
+        .get_item_map(
+            table_name,
+            HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
+        )
+        .await
+        .expect("get item")
+        .expect("item should exist");
+    assert_eq!(read_updated_at_ms(&stored), created_at_ms);
 }
 
 #[tokio::test]

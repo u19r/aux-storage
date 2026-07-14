@@ -63,6 +63,7 @@ pub(crate) use database_manager::DatabaseManagerTestPauseHandle;
 pub use database_manager::{
     CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,
     DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput, DeleteItemInput,
+    InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
     PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
     ReplicationMutationApplyOutcome, ScanTableInput, UpdateItemInput,
 };

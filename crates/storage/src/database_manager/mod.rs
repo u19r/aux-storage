@@ -9,6 +9,9 @@ mod logical_backfill_ops;
 mod operation_metrics;
 mod query_ops;
 mod read_ops;
+mod read_sequence_executor;
+#[cfg(test)]
+mod read_sequence_executor_tests;
 mod replication_ops;
 mod routed_write_ops;
 mod runtime_options;
@@ -19,6 +22,7 @@ mod sync_replay_ops;
 mod sync_resolver_ops;
 mod sync_serialization;
 mod sync_transaction_resolver_ops;
+mod transact_get_ops;
 mod transact_item_ops;
 mod transaction_write_coordinator;
 mod wire_item_ops;
@@ -67,6 +71,9 @@ pub use crate::database_manager::{
         DeleteItemInput, PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
         ScanTableInput, UpdateItemInput,
     },
+    read_sequence_executor::{
+        InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
+    },
     replication_ops::ReplicationMutationApplyOutcome,
     wire_item_ops::PutItemPayload,
 };
@@ -95,6 +102,8 @@ mod sync_single_node_public_tests;
 mod sync_single_node_side_effect_tests;
 #[cfg(test)]
 mod sync_single_node_tests;
+#[cfg(test)]
+mod transact_get_ops_tests;
 #[cfg(test)]
 mod transact_item_ops_tests;
 #[cfg(test)]

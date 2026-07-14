@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use storage_types::{
     BatchGetItemRequest, BatchGetWireItemResponse, KeysAndAttributes, TableName, WireItem,
@@ -23,75 +23,6 @@ pub struct PreparedBatchGetExecution {
     pub db_request: BatchGetItemRequest,
     pub cached_responses: HashMap<TableName, Vec<WireItem>>,
     pub cache_outcome: Option<RuntimeBatchGetCacheOutcome>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RoutedBatchGetTarget<T> {
-    pub connection_id: String,
-    pub physical_table: TableName,
-    pub logical_table: TableName,
-    pub shared_metadata: Option<T>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResolvedBatchGetTarget<T> {
-    pub logical_table: TableName,
-    pub shared_metadata: Option<T>,
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct PhysicalToLogicalReadTableMap<T> {
-    by_connection: HashMap<String, HashMap<TableName, ResolvedBatchGetTarget<T>>>,
-}
-
-impl<T: Clone> PhysicalToLogicalReadTableMap<T> {
-    pub fn insert(&mut self, target: RoutedBatchGetTarget<T>) {
-        self.by_connection
-            .entry(target.connection_id)
-            .or_default()
-            .insert(
-                target.physical_table,
-                ResolvedBatchGetTarget {
-                    logical_table: target.logical_table,
-                    shared_metadata: target.shared_metadata,
-                },
-            );
-    }
-
-    pub fn resolve_or_physical(
-        &self,
-        connection_id: &str,
-        physical_table: TableName,
-    ) -> ResolvedBatchGetTarget<T> {
-        self.by_connection
-            .get(connection_id)
-            .and_then(|tables| tables.get(&physical_table))
-            .cloned()
-            .unwrap_or(ResolvedBatchGetTarget {
-                logical_table: physical_table,
-                shared_metadata: None,
-            })
-    }
-}
-
-pub fn insert_routed_batch_get_request<T: Clone>(
-    per_connection: &mut BTreeMap<String, BatchGetItemRequest>,
-    physical_to_logical: &mut PhysicalToLogicalReadTableMap<T>,
-    return_consumed_capacity: &Option<String>,
-    target: RoutedBatchGetTarget<T>,
-    keys_and_attributes: KeysAndAttributes,
-) {
-    let connection_id = target.connection_id.clone();
-    let physical_table = target.physical_table.clone();
-    per_connection
-        .entry(connection_id)
-        .or_insert_with(|| BatchGetItemRequest {
-            request_items: HashMap::new(),
-            return_consumed_capacity: return_consumed_capacity.clone(),
-        })
-        .request_items
-        .insert(physical_table, keys_and_attributes);
-    physical_to_logical.insert(target);
 }
 
 pub fn plan_batch_get_request(request: &BatchGetItemRequest) -> BatchGetCachePlan {
