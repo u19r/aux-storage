@@ -212,6 +212,28 @@ fn read_count_value(item: &HashMap<String, AttributeValue>) -> u64 {
     }
 }
 
+#[test]
+fn query_index_input_conversion_preserves_projection_expression() {
+    let request = storage_types::QueryTableRequest::from(
+        QueryIndexInput::builder()
+            .table_name(TableName::new("tenant_data"))
+            .index_name(IndexName::new("gsi1"))
+            .key_condition_expression("#pk = :pk".to_string())
+            .expression_attribute_names(HashMap::from([("#pk".to_string(), "gsi1pk".to_string())]))
+            .expression_attribute_values(HashMap::from([(
+                ":pk".to_string(),
+                AttributeValue::S("tenant#1".to_string()),
+            )]))
+            .projection_expression("pk, sk, emails".to_string())
+            .build(),
+    );
+
+    assert_eq!(
+        request.projection_expression.as_deref(),
+        Some("pk, sk, emails")
+    );
+}
+
 fn assert_no_single_table_metadata(item: &HashMap<String, AttributeValue>) {
     for attr in [
         "created_at",
@@ -807,7 +829,7 @@ async fn default_update_item_refreshes_existing_updated_at_metadata() {
 }
 
 #[tokio::test]
-async fn default_mode_allows_custom_gsi_name_and_numeric_sort_key() {
+async fn custom_gsi_query_projection_returns_only_selected_attributes() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
@@ -885,6 +907,10 @@ async fn default_mode_allows_custom_gsi_name_and_numeric_sort_key() {
                 .table_name(table_name)
                 .index_name(index_name)
                 .key_condition_expression("category = :category AND score = :score".to_string())
+                .expression_attribute_names(HashMap::from([(
+                    "#selected".to_string(),
+                    "score".to_string(),
+                )]))
                 .expression_attribute_values(HashMap::from([
                     (
                         ":category".to_string(),
@@ -892,12 +918,14 @@ async fn default_mode_allows_custom_gsi_name_and_numeric_sort_key() {
                     ),
                     (":score".to_string(), AttributeValue::N("42".to_string())),
                 ]))
+                .projection_expression("#selected".to_string())
                 .build(),
         )
         .await
         .expect("query custom index");
 
     assert_eq!(items.len(), 1);
+    assert_eq!(items[0].len(), 1);
     assert_no_single_table_metadata(&items[0]);
     assert_eq!(
         items[0].get("score"),

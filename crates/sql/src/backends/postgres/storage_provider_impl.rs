@@ -177,6 +177,7 @@ impl PostgresStorageProvider {
         client: &C,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        request.validate_for_dynamodb()?;
         if request.consistent_read && request.index_name.is_some() {
             return Err(StorageError::validation(
                 "Consistent reads are not supported on global secondary indexes",
@@ -274,7 +275,7 @@ impl PostgresStorageProvider {
             None
         };
 
-        Ok((items, last_evaluated_key))
+        Ok((request.project_wire_items(items)?, last_evaluated_key))
     }
 
     async fn batch_get_item_with_client<C: deadpool_postgres::GenericClient + Sync>(

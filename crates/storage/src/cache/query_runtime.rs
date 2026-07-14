@@ -112,6 +112,9 @@ where L: StorageCacheQueryRuntimeLoad
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<PreparedQueryCacheExecution> {
+        if request.projection_expression.is_some() {
+            return Ok(RuntimePreparedQueryExecution::None);
+        }
         let table_info = self
             .loader
             .get_table_info_for_cache_query(&request.table_name)
@@ -169,6 +172,9 @@ where L: StorageCacheQueryRuntimeLoad
         items: &[WireItem],
         has_more: bool,
     ) -> StorageResult<()> {
+        if request.projection_expression.is_some() {
+            return Ok(());
+        }
         let should_record_query_page = self.services.query_proof_enabled();
         let should_record_query_items =
             self.services.point_read_enabled() && request.index_name.is_none() && !items.is_empty();

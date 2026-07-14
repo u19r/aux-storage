@@ -150,6 +150,7 @@ impl SQLiteStorageProvider {
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        request.validate_for_dynamodb()?;
         if request.consistent_read && request.index_name.is_some() {
             return Err(StorageError::validation(
                 "Consistent reads are not supported on global secondary indexes",
@@ -210,6 +211,7 @@ impl SQLiteStorageProvider {
             Ok::<_, StorageError>((res.items, res.last_evaluated_key))
         })
         .await?;
+        let items = request.project_wire_items(items)?;
         let elapsed_ms_u128 = start.elapsed().as_millis();
         let elapsed_ms = u64::try_from(elapsed_ms_u128).unwrap_or(u64::MAX);
         debug!(

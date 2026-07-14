@@ -487,14 +487,16 @@ async fn query_between() {
     expression_values.insert(":start".to_string(), AttributeValue::N("100".to_string()));
     expression_values.insert(":end".to_string(), AttributeValue::N("3500".to_string()));
 
-    // Note: The actual query uses ExpressionAttributeNames, but for the unit test
-    // we'll use the simplified form without attribute name substitution
     let query_request = QueryTableRequest {
         table_name: table_name.clone(),
         index_name: None,
-        key_condition_expression: "pk = :pk_val AND timestamp BETWEEN :start AND :end".to_string(),
-        expression_attribute_names: None,
+        key_condition_expression: "pk = :pk_val AND #timestamp BETWEEN :start AND :end".to_string(),
+        expression_attribute_names: Some(HashMap::from([(
+            "#timestamp".to_string(),
+            "timestamp".to_string(),
+        )])),
         expression_attribute_values: Some(expression_values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: None,
@@ -597,14 +599,16 @@ async fn query_less_than() {
     expression_values.insert(":pk_val".to_string(), AttributeValue::S("U#1".to_string()));
     expression_values.insert(":max_ts".to_string(), AttributeValue::N("2500".to_string()));
 
-    // Note: The actual query uses ExpressionAttributeNames, but for the unit test
-    // we'll use the simplified form without attribute name substitution
     let query_request = QueryTableRequest {
         table_name: table_name.clone(),
         index_name: None,
-        key_condition_expression: "pk = :pk_val AND timestamp < :max_ts".to_string(),
-        expression_attribute_names: None,
+        key_condition_expression: "pk = :pk_val AND #timestamp < :max_ts".to_string(),
+        expression_attribute_names: Some(HashMap::from([(
+            "#timestamp".to_string(),
+            "timestamp".to_string(),
+        )])),
         expression_attribute_values: Some(expression_values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: None,
@@ -684,6 +688,7 @@ async fn query_pagination() {
         key_condition_expression: "pk = :pk_val".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(expression_values),
+        projection_expression: None,
         limit: Some(2), // Limit to 2 items
         exclusive_start_key: None,
         scan_index_forward: None,
@@ -764,6 +769,7 @@ async fn query_scan_index_forward_false() {
         key_condition_expression: "pk = :pk_val".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(expression_values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(false), // ScanIndexForward = false

@@ -507,6 +507,7 @@ fn gsi_query(table_name: TableName) -> QueryTableRequest {
             ":status".to_string(),
             AttributeValue::S("open".to_string()),
         )])),
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: None,
         scan_index_forward: Some(true),

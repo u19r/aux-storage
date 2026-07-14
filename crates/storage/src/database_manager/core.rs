@@ -283,6 +283,8 @@ pub struct QueryIndexInput {
     #[builder(setter(strip_option))]
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     #[builder(setter(strip_option))]
+    pub projection_expression: Option<String>,
+    #[builder(setter(strip_option))]
     pub limit: Option<u32>,
     #[builder(setter(strip_option))]
     pub exclusive_start_key: Option<String>,
@@ -298,6 +300,7 @@ impl From<QueryTableInput> for QueryTableRequest {
             key_condition_expression: input.key_condition_expression,
             expression_attribute_names: input.expression_attribute_names,
             expression_attribute_values: input.expression_attribute_values,
+            projection_expression: None,
             limit: input.limit,
             exclusive_start_key: input.exclusive_start_key,
             scan_index_forward: input.scan_index_forward,
@@ -314,6 +317,7 @@ impl From<QueryIndexInput> for QueryTableRequest {
             key_condition_expression: input.key_condition_expression,
             expression_attribute_names: input.expression_attribute_names,
             expression_attribute_values: input.expression_attribute_values,
+            projection_expression: input.projection_expression,
             limit: input.limit,
             exclusive_start_key: input.exclusive_start_key,
             scan_index_forward: input.scan_index_forward,

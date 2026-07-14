@@ -89,6 +89,7 @@ async fn scan_vs_query_parity_same_key_condition() {
             m
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -247,6 +248,7 @@ async fn pagination_boundary_limit_exact() {
             m
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(3),
         exclusive_start_key: None,
         scan_index_forward: Some(true),

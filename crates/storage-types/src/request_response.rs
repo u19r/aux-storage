@@ -6,11 +6,11 @@ use typed_builder::TypedBuilder;
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeDefinition, AttributeMap, AttributeValue, GlobalSecondaryIndex, IndexName, ItemKey,
-    ItemStreamVersion, KeyAttributes, KeySchemaElement, MultiRegionConsistency, Projection,
-    ReplicaDescription, ReplicaUpdate, StorageError, StoredTableInfo, StreamRecord,
-    StreamRetentionDuration, StreamSpecification, StreamViewType, TableName, TableStatus,
-    TimestampSecondsFractional, WireItem,
+    AttributeDefinition, AttributeMap, AttributeValue, DynamoRequestValidate, GlobalSecondaryIndex,
+    IndexName, ItemKey, ItemStreamVersion, KeyAttributes, KeySchemaElement, MultiRegionConsistency,
+    Projection, ReplicaDescription, ReplicaUpdate, StorageError, StorageResult, StoredTableInfo,
+    StreamRecord, StreamRetentionDuration, StreamSpecification, StreamViewType, TableName,
+    TableStatus, TimestampSecondsFractional, WireItem, project_wire_items,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1758,10 +1758,38 @@ pub struct QueryTableRequest {
     pub key_condition_expression: String,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub projection_expression: Option<String>,
     pub limit: Option<u32>,
     pub exclusive_start_key: Option<String>,
     pub scan_index_forward: Option<bool>,
     pub consistent_read: bool,
+}
+
+impl QueryTableRequest {
+    pub fn validate_for_dynamodb(&self) -> StorageResult<()> {
+        let mut request = QueryRequest::new(
+            self.table_name.clone(),
+            self.key_condition_expression.clone(),
+        )
+        .with_index_name(self.index_name.clone())
+        .with_expression_attribute_names(self.expression_attribute_names.clone())
+        .with_expression_attribute_values(self.expression_attribute_values.clone())
+        .with_limit(self.limit)
+        .with_scan_index_forward(self.scan_index_forward);
+        request.projection_expression = self.projection_expression.clone();
+        request.consistent_read = Some(self.consistent_read);
+        request
+            .validate_for_dynamodb()
+            .map_err(StorageError::validation)
+    }
+
+    pub fn project_wire_items(&self, items: Vec<WireItem>) -> StorageResult<Vec<WireItem>> {
+        project_wire_items(
+            items,
+            self.projection_expression.as_deref(),
+            self.expression_attribute_names.as_ref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

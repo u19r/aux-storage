@@ -112,6 +112,7 @@ fn gsi_query_request_for_partition(table_name: &TableName, partition: &str) -> Q
             ":p".to_string(),
             AttributeValue::S(partition.to_string()),
         )])),
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -609,6 +610,7 @@ async fn kv_gsi_updates_add_and_ignore_missing() {
             m.insert(":p".to_string(), AttributeValue::S("grp".to_string()));
             m
         }),
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -774,6 +776,7 @@ async fn kv_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_quer
                 ":pk".to_string(),
                 AttributeValue::S("u".to_string()),
             )])),
+            projection_expression: None,
             limit: Some(10),
             exclusive_start_key: None,
             scan_index_forward: Some(true),
@@ -1195,6 +1198,7 @@ async fn kv_gsi_updates_remove_field() {
             m.insert(":p".to_string(), AttributeValue::S("grp2".to_string()));
             m
         }),
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -1753,6 +1757,7 @@ async fn update_table_creates_gsi_and_backfills_kv() {
             m.insert(":p".to_string(), AttributeValue::S("grp".to_string()));
             m
         }),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -1867,6 +1872,7 @@ async fn kv_backfill_crash_resume() {
             m.insert(":p".to_string(), AttributeValue::S("grp".to_string()));
             m
         }),
+        projection_expression: None,
         limit: Some(2000),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2284,6 +2290,7 @@ async fn kv_backfill_concurrent_writes() {
             m.insert(":p".to_string(), AttributeValue::S("grp".to_string()));
             m
         }),
+        projection_expression: None,
         limit: Some(2000),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -3295,6 +3302,7 @@ fn create_query_request(
         key_condition_expression: key_condition.to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(expression_values),
+        projection_expression: None,
         limit,
         exclusive_start_key,
         scan_index_forward: scan_forward,
@@ -3398,6 +3406,7 @@ async fn query_gsi_consistent_read_rejected() {
         key_condition_expression: "gsi_pk = :gsi_pk".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -3451,6 +3460,7 @@ async fn query_base_table_allows_consistent_read() {
         key_condition_expression: "pk = :pk".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5040,6 +5050,7 @@ async fn scan_forward_default_behavior() {
         key_condition_expression: "pk = :pk".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(values),
+        projection_expression: None,
         limit: Some(3),
         exclusive_start_key: None,
         scan_index_forward: None, // Should default to true
@@ -5396,10 +5407,10 @@ async fn begins_with_numeric_validation_error() {
         "Expected validation error for begins_with with numeric value"
     );
     let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("begins_with is only valid for string types"),
-        "Unexpected error: {err}"
+    assert_eq!(
+        err.to_string(),
+        "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
+         operator or function: begins_with, operand type: N"
     );
 }
 
@@ -6089,17 +6100,17 @@ async fn query_with_attribute_name_substitution() {
     create_test_table(&provider, &TableName::new("test_table"), false).await;
     populate_test_data(&provider, &TableName::new("test_table"), false).await;
 
-    // Test with expression attribute names (though our implementation may not fully
-    // support this)
+    // Test with expression attribute names.
     let mut values = HashMap::new();
     values.insert(":pk".to_string(), AttributeValue::S("user1".to_string()));
 
     let request = QueryTableRequest {
         table_name: TableName::new("test_table"),
         index_name: None,
-        key_condition_expression: "pk = :pk".to_string(),
+        key_condition_expression: "#pk = :pk".to_string(),
         expression_attribute_names: Some(HashMap::from([("#pk".to_string(), "pk".to_string())])),
         expression_attribute_values: Some(values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -6158,6 +6169,7 @@ async fn error_handling_malformed_expressions() {
         key_condition_expression: "invalid expression".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(HashMap::new()),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),

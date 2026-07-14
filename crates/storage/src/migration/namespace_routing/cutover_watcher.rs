@@ -159,6 +159,7 @@ async fn query_cutover_events(
                 (":from".to_string(), AttributeValue::S(from_value.clone())),
                 (":to".to_string(), AttributeValue::S(to_value.clone())),
             ])),
+            projection_expression: None,
             limit: Some(1_000),
             exclusive_start_key: next.clone(),
             scan_index_forward: Some(true),

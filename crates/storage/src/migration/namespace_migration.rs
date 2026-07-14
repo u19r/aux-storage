@@ -154,6 +154,7 @@ impl DualWriteCoordinator {
                             index_key_codec.partition_key(&input.namespace, entity_type.as_str()),
                         ),
                     )])),
+                    projection_expression: None,
                     limit: Some(input.page_size),
                     exclusive_start_key: next.clone(),
                     scan_index_forward: Some(true),

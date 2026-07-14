@@ -179,9 +179,13 @@ pub use errors::{
 mod expression_usage;
 pub use expression_usage::*;
 pub mod context;
+mod projection_expression;
+#[cfg(test)]
+mod projection_expression_tests;
 mod request_expression_validation;
 #[cfg(test)]
 mod request_expression_validation_perf_tests;
+pub use projection_expression::project_wire_items;
 mod request_response;
 pub use request_response::*;
 mod read_sequence;

@@ -191,6 +191,7 @@ fn query_request() -> QueryTableRequest {
             ":pk".to_string(),
             AttributeValue::S(PK_VALUE.to_string()),
         )])),
+        projection_expression: None,
         limit: Some(PAGE_LIMIT),
         exclusive_start_key: None,
         scan_index_forward: Some(true),

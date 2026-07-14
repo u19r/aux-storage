@@ -117,6 +117,7 @@ pub(super) fn build_query_request(request: &QueryTableRequest) -> QueryRequest {
     .with_limit(request.limit)
     .with_exclusive_start_key(None)
     .with_scan_index_forward(request.scan_index_forward);
+    remote_request.projection_expression = request.projection_expression.clone();
     remote_request.exclusive_start_key = request
         .exclusive_start_key
         .as_deref()

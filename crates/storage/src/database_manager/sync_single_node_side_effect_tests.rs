@@ -181,6 +181,7 @@ async fn single_node_sync_put_updates_immediate_gsi_side_effect() {
                 ":gsi_pk".to_string(),
                 AttributeValue::S("grp".to_string()),
             )])),
+            projection_expression: None,
             limit: Some(10),
             exclusive_start_key: None,
             scan_index_forward: Some(true),

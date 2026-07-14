@@ -102,6 +102,7 @@ impl NamespaceRouteResolver {
                     ":pk".to_string(),
                     AttributeValue::S(SHARED_TABLE_LOOKUP_MARKER.to_string()),
                 )])),
+                projection_expression: None,
                 limit: Some(1_000),
                 exclusive_start_key: next.clone(),
                 scan_index_forward: Some(true),

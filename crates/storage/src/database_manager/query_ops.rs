@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use storage_cache::RuntimePreparedQueryExecution;
 use storage_types::{
     AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, QueryTableRequest, StorageError,
-    StorageResult, TableNamespace, TryFromWireItem, WireItem, validate_expression_attribute_usage,
+    StorageResult, TableNamespace, TryFromWireItem, WireItem,
+    subset_expression_attribute_names_for_expression,
 };
 
 use crate::{
@@ -110,14 +111,11 @@ impl DatabaseManager {
         &self,
         mut request: QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        validate_expression_attribute_usage(
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_ref(),
-            std::iter::once(request.key_condition_expression.as_str()),
-        )?;
+        request.validate_for_dynamodb()?;
         let logical_request = request.clone();
         let mut provider: std::sync::Arc<dyn DatabaseTrait> = std::sync::Arc::clone(&self.storage);
         let mut normalize_namespace: Option<TableNamespace> = None;
+        let mut project_after_namespace_normalization = false;
 
         if let Some(route) = self
             .resolve_namespace_route_for_table(&request.table_name)
@@ -129,6 +127,15 @@ impl DatabaseManager {
                 self.rewrite_query_start_key_for_shared_table(&route.namespace, &mut request)
                     .await?;
                 normalize_namespace = Some(route.namespace.clone());
+                if request.projection_expression.is_some() {
+                    project_after_namespace_normalization = true;
+                    request.projection_expression = None;
+                    request.expression_attribute_names =
+                        subset_expression_attribute_names_for_expression(
+                            &request.key_condition_expression,
+                            request.expression_attribute_names.as_ref(),
+                        );
+                }
             }
             request.table_name = route.read_target.table_name.clone();
             provider = self.provider_for_connection(&route.read_target.connection_id)?;
@@ -159,6 +166,9 @@ impl DatabaseManager {
             lek = self
                 .normalize_query_start_key_from_shared_table(namespace, &logical_request, lek)
                 .await?;
+        }
+        if project_after_namespace_normalization {
+            items = logical_request.project_wire_items(items)?;
         }
         self.cache_query_runtime()
             .observe_db_query_result(&logical_request, &items, lek.is_some())

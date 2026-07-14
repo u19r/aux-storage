@@ -2048,6 +2048,7 @@ fn gsi_query_request(table_name: &str, gsi_pk: &str) -> storage_types::QueryTabl
             AttributeValue::S(gsi_pk.to_string()),
         )])),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2126,6 +2127,7 @@ async fn sqlite_gsi_visibility_is_delayed_by_default() {
             AttributeValue::S("grp".to_string()),
         )])),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2181,6 +2183,7 @@ async fn sqlite_immediate_gsi_consistency_updates_indexes_inline() {
             AttributeValue::S("grp".to_string()),
         )])),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2258,6 +2261,7 @@ async fn sqlite_immediate_gsi_consistency_moves_index_entries_inline() {
             AttributeValue::S("grp".to_string()),
         )])),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2278,6 +2282,7 @@ async fn sqlite_immediate_gsi_consistency_moves_index_entries_inline() {
             AttributeValue::S("grp-2".to_string()),
         )])),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -2415,6 +2420,7 @@ async fn gsi_updates_add_and_ignore_missing_sqlite() {
             m
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -3051,6 +3057,7 @@ async fn gsi_updates_remove_field_sqlite() {
             m
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(100),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -3103,6 +3110,7 @@ async fn query_gsi_consistent_read_rejected_sqlite() {
         key_condition_expression: "gsi_pk = :gsi_pk".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(values),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -3252,6 +3260,7 @@ async fn sqlite_query_and_scan_only_return_last_evaluated_key_when_more_items_re
         key_condition_expression: "pk = :pk".to_string(),
         expression_attribute_names: None,
         expression_attribute_values: Some(query_values.clone()),
+        projection_expression: None,
         limit: None,
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5668,6 +5677,7 @@ async fn query_table_with_gsi_hash_key_only() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5720,6 +5730,7 @@ async fn query_table_with_gsi_hash_and_range_key() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5766,6 +5777,7 @@ async fn query_table_gsi_with_range_key_condition() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5808,6 +5820,7 @@ async fn query_table_gsi_pagination() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(2),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5830,6 +5843,7 @@ async fn query_table_gsi_pagination() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(2),
         exclusive_start_key: last_key,
         scan_index_forward: Some(true),
@@ -5889,6 +5903,7 @@ async fn query_table_gsi_pagination_includes_items_added_after_first_page() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(2),
         exclusive_start_key: None,
         scan_index_forward: Some(true),
@@ -5934,6 +5949,7 @@ async fn query_table_gsi_pagination_includes_items_added_after_first_page() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: last_key,
         scan_index_forward: Some(true),
@@ -5970,6 +5986,7 @@ async fn query_table_gsi_reverse_order() {
             values
         }),
         expression_attribute_names: None,
+        projection_expression: None,
         limit: Some(10),
         exclusive_start_key: None,
         scan_index_forward: Some(false), // Reverse order

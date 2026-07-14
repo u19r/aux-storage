@@ -26,6 +26,7 @@ fn build_scan_and_query_request_when_consistent_read_is_set_then_preserve_it() {
             ":pk".to_string(),
             AttributeValue::S("tenant#1".to_string()),
         )])),
+        projection_expression: Some("#pk, payload".to_string()),
         limit: Some(10),
         exclusive_start_key: Some("cursor-2".to_string()),
         scan_index_forward: Some(false),
@@ -46,6 +47,10 @@ fn build_scan_and_query_request_when_consistent_read_is_set_then_preserve_it() {
     assert_eq!(remote_query.index_name, Some(IndexName::new("by_status")));
     assert_eq!(remote_query.limit, Some(10));
     assert_eq!(remote_query.scan_index_forward, Some(false));
+    assert_eq!(
+        remote_query.projection_expression.as_deref(),
+        Some("#pk, payload")
+    );
     assert!(matches!(
         remote_query.exclusive_start_key,
         Some(ExclusiveStartKey::Token(ref token)) if token == "cursor-2"

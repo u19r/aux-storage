@@ -32,6 +32,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         read_context: Option<&dyn SortedKvReadContext>,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        request.validate_for_dynamodb()?;
         let consistent_read = request.consistent_read;
         if consistent_read && request.index_name.is_some() {
             return Err(StorageError::validation(
@@ -455,7 +456,8 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
             .await?;
         let query_result =
             Self::materialize_query_result(range_result, table_info, &request.index_name)?;
-        Ok(record_query_result(query_result))
+        let (items, last_evaluated_key) = record_query_result(query_result);
+        Ok((request.project_wire_items(items)?, last_evaluated_key))
     }
 
     fn materialize_query_result(

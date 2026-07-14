@@ -183,6 +183,7 @@ impl TursoStorageProvider {
     where
         C: TursoSqlConnection + ?Sized,
     {
+        request.validate_for_dynamodb()?;
         let table_info = self.get_table_info(&request.table_name).await?;
         let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
         let exclusive_start_key = decode_exclusive_start(
@@ -267,7 +268,7 @@ impl TursoStorageProvider {
             None
         };
 
-        Ok((items, last_evaluated_key))
+        Ok((request.project_wire_items(items)?, last_evaluated_key))
     }
 
     async fn batch_get_item_with_connection<C>(

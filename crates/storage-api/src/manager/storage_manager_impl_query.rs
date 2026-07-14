@@ -617,6 +617,7 @@ impl<'a> PreparedQuery<'a> {
             key_condition_expression: self.key_condition_expression.to_string(),
             expression_attribute_names: self.expression_attribute_names.cloned(),
             expression_attribute_values: self.expression_attribute_values.cloned(),
+            projection_expression: None,
             limit: self.limit,
             exclusive_start_key: self.exclusive_start_key.map(str::to_string),
             scan_index_forward: self.scan_index_forward,

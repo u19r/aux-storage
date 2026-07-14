@@ -484,6 +484,7 @@ async fn api_query(provider: Arc<FdbProvider>, table: TableName, id: usize) -> S
                 ":pk".to_string(),
                 AttributeValue::S("read".to_string()),
             )])),
+            projection_expression: None,
             limit: Some(8 + u32::try_from(id % 8).unwrap_or(0)),
             exclusive_start_key: None,
             scan_index_forward: Some(true),
