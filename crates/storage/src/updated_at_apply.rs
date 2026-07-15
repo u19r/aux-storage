@@ -369,11 +369,11 @@ fn is_updated_at_attribute_name(name: &str) -> bool {
         || name == storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR
 }
 
-fn resolve_update_attribute_name(
+pub(crate) fn resolve_update_attribute_name(
     token: &str,
     expression_attribute_names: Option<&HashMap<String, String>>,
 ) -> StorageResult<String> {
-    if !token.starts_with('#') {
+    if !token.contains('#') {
         return Ok(token.to_string());
     }
     let names = expression_attribute_names.ok_or_else(|| {
@@ -382,11 +382,35 @@ fn resolve_update_attribute_name(
              was missing",
         )
     })?;
-    names.get(token).cloned().ok_or_else(|| {
-        StorageError::validation(format!(
-            "update expression placeholder '{token}' was not found in expression_attribute_names"
-        ))
-    })
+
+    let mut resolved = String::with_capacity(token.len());
+    let mut chars = token.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '#' {
+            resolved.push(ch);
+            continue;
+        }
+
+        let mut end = token.len();
+        while let Some((index, next)) = chars.peek().copied() {
+            if matches!(next, '.' | '[') {
+                end = index;
+                break;
+            }
+            chars.next();
+        }
+        let Some(placeholder) = token.get(start..end) else {
+            return Err(StorageError::validation("Invalid update document path"));
+        };
+        let attribute_name = names.get(placeholder).ok_or_else(|| {
+            StorageError::validation(format!(
+                "update expression placeholder '{placeholder}' was not found in \
+                 expression_attribute_names"
+            ))
+        })?;
+        resolved.push_str(attribute_name);
+    }
+    Ok(resolved)
 }
 
 fn reserve_placeholder<T>(existing: Option<&HashMap<String, T>>, base: &str) -> String {

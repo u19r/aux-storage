@@ -8,7 +8,7 @@ use storage_types::{
     StorageError, StoredTableInfo, TableName, WireItem, context::WrappedError,
     subset_expression_attribute_names_for_expression,
     subset_expression_attribute_values_for_expression, validate_expression_attribute_usage,
-    validate_key_attribute_value_for_schema,
+    validate_gsi_projection_expression, validate_key_attribute_value_for_schema,
 };
 
 use crate::{
@@ -81,6 +81,12 @@ impl StorageApiManagerImpl {
         );
 
         let table_info = self.db().get_table_info(&request.table_name).await?;
+        validate_gsi_projection_expression(
+            &table_info,
+            request.index_name.as_ref(),
+            request.projection_expression.as_deref(),
+            request.expression_attribute_names.as_ref(),
+        )?;
         validate_query_key_condition_values(&request, &table_info)?;
         let exclusive_start_key = resolve_exclusive_start_key(
             request.exclusive_start_key.as_ref(),

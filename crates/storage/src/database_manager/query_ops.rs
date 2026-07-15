@@ -5,6 +5,7 @@ use storage_types::{
     AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, QueryTableRequest, StorageError,
     StorageResult, TableNamespace, TryFromWireItem, WireItem,
     subset_expression_attribute_names_for_expression,
+    validate_gsi_projection_expression,
 };
 
 use crate::{
@@ -157,6 +158,12 @@ impl DatabaseManager {
                      specified index: {index_name}"
                 )));
             }
+            validate_gsi_projection_expression(
+                &table_info,
+                Some(index_name),
+                request.projection_expression.as_deref(),
+                request.expression_attribute_names.as_ref(),
+            )?;
         }
 
         let (mut items, mut lek) =

@@ -1,6 +1,72 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::{AttributeValue, StorageResult, WireItem};
+use crate::{
+    AttributeValue, IndexName, ProjectionType, StorageError, StorageResult, StoredTableInfo,
+    WireItem,
+};
+
+pub fn validate_gsi_projection_expression(
+    table_info: &StoredTableInfo,
+    index_name: Option<&IndexName>,
+    projection_expression: Option<&str>,
+    expression_attribute_names: Option<&HashMap<String, String>>,
+) -> StorageResult<()> {
+    let (Some(index_name), Some(projection_expression)) =
+        (index_name, projection_expression)
+    else {
+        return Ok(());
+    };
+    let Some(index) = table_info
+        .global_secondary_indexes
+        .as_ref()
+        .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+    else {
+        return Ok(());
+    };
+    if index
+        .projection
+        .projection_type
+        .as_ref()
+        .is_none_or(|projection_type| *projection_type == ProjectionType::All)
+    {
+        return Ok(());
+    }
+
+    let mut unprojected = Vec::new();
+    for path in projection_expression
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| parse_projection_path(path, expression_attribute_names))
+    {
+        let Some(ProjectionSegment::Key(attribute_name)) = path.first() else {
+            continue;
+        };
+        let is_key = table_info
+            .key_schema
+            .iter()
+            .chain(index.key_schema.iter())
+            .any(|key| key.attribute_name == *attribute_name);
+        let is_included = index.projection.projection_type == Some(ProjectionType::Include)
+            && index
+                .projection
+                .non_key_attributes
+                .as_ref()
+                .is_some_and(|attributes| attributes.contains(attribute_name));
+        if !is_key && !is_included && !unprojected.contains(attribute_name) {
+            unprojected.push(attribute_name.clone());
+        }
+    }
+
+    if unprojected.is_empty() {
+        return Ok(());
+    }
+    Err(StorageError::validation(format!(
+        "One or more parameter values were invalid: Global secondary index {index_name} does not \
+         project [{}]",
+        unprojected.join(", ")
+    )))
+}
 
 pub fn project_wire_items(
     items: Vec<WireItem>,

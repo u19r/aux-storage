@@ -829,7 +829,7 @@ async fn default_update_item_refreshes_existing_updated_at_metadata() {
 }
 
 #[tokio::test]
-async fn custom_gsi_query_projection_returns_only_selected_attributes() {
+async fn custom_gsi_query_projection_returns_only_projected_selected_attributes() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
@@ -870,7 +870,7 @@ async fn custom_gsi_query_projection_returns_only_selected_attributes() {
             },
         ],
         projection: Projection {
-            projection_type: Some(ProjectionType::All),
+            projection_type: Some(ProjectionType::KeysOnly),
             non_key_attributes: None,
         },
         provisioned_throughput: None,
@@ -904,8 +904,8 @@ async fn custom_gsi_query_projection_returns_only_selected_attributes() {
     let (items, _) = db
         .query_index_map(
             QueryIndexInput::builder()
-                .table_name(table_name)
-                .index_name(index_name)
+                .table_name(table_name.clone())
+                .index_name(index_name.clone())
                 .key_condition_expression("category = :category AND score = :score".to_string())
                 .expression_attribute_names(HashMap::from([(
                     "#selected".to_string(),
@@ -930,6 +930,29 @@ async fn custom_gsi_query_projection_returns_only_selected_attributes() {
     assert_eq!(
         items[0].get("score"),
         Some(&AttributeValue::N("42".to_string()))
+    );
+
+    let error = db
+        .query_index_map(
+            QueryIndexInput::builder()
+                .table_name(table_name)
+                .index_name(index_name.clone())
+                .key_condition_expression("category = :category".to_string())
+                .expression_attribute_values(HashMap::from([(
+                    ":category".to_string(),
+                    AttributeValue::S("games".to_string()),
+                )]))
+                .projection_expression("private_note".to_string())
+                .build(),
+        )
+        .await
+        .expect_err("KEYS_ONLY index must reject non-projected attributes");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "One or more parameter values were invalid: Global secondary index {index_name} does \
+             not project [private_note]"
+        )
     );
 }
 

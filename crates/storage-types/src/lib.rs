@@ -185,7 +185,7 @@ mod projection_expression_tests;
 mod request_expression_validation;
 #[cfg(test)]
 mod request_expression_validation_perf_tests;
-pub use projection_expression::project_wire_items;
+pub use projection_expression::{project_wire_items, validate_gsi_projection_expression};
 mod request_response;
 pub use request_response::*;
 mod read_sequence;

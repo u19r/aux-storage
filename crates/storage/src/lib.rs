@@ -59,6 +59,8 @@ pub(crate) use multi_region::{metrics as multi_region_metrics, model as multi_re
 pub mod startup;
 mod updated_at_apply;
 #[cfg(test)]
+mod updated_at_apply_tests;
+#[cfg(test)]
 pub(crate) use database_manager::DatabaseManagerTestPauseHandle;
 pub use database_manager::{
     CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,

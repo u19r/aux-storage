@@ -185,6 +185,41 @@ async fn create_test_table_hash_range_with_gsi(db: &DatabaseManager, table_name:
     db.create_table(&request).await.unwrap();
 }
 
+async fn create_test_table_with_keys_only_gsi(db: &DatabaseManager, table_name: &str) {
+    let request = CreateTableRequest::new(
+        TableName::new(table_name),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gpk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+        index_name: IndexName::new("ByGsi"),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "gpk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        projection: Projection {
+            projection_type: Some(ProjectionType::KeysOnly),
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+    }]));
+
+    db.create_table(&request).await.unwrap();
+}
+
 async fn put_test_item(db: &DatabaseManager, table_name: &str, pk: &str, name: &str, age: u32) {
     let mut item = HashMap::new();
     item.insert("pk".to_string(), AttributeValue::S(pk.to_string()));
@@ -633,6 +668,7 @@ async fn query_gsi_with_limit_returns_full_dynamodb_last_evaluated_key() {
             "IndexName": "ByGsi",
             "KeyConditionExpression": "gpk = :gpk",
             "ExpressionAttributeValues": {":gpk": {"S": "G#1"}},
+            "ProjectionExpression": "gsk",
             "Limit": 2
         });
 
@@ -640,6 +676,12 @@ async fn query_gsi_with_limit_returns_full_dynamodb_last_evaluated_key() {
         assert!(result.is_ok(), "{}: {result:?}", backend.name);
         let response = expect_query_response(result.unwrap());
         assert_eq!(response.count, 2, "{}", backend.name);
+        let items = response.items.as_ref().expect("projected GSI items");
+        assert!(
+            items.iter().all(|item| item.len() == 1 && item.contains_key("gsk")),
+            "{}",
+            backend.name
+        );
         let last_evaluated_key = response
             .last_evaluated_key
             .expect("limited GSI query should return a DynamoDB key map");
@@ -660,6 +702,7 @@ async fn query_gsi_with_limit_returns_full_dynamodb_last_evaluated_key() {
             "IndexName": "ByGsi",
             "KeyConditionExpression": "gpk = :gpk",
             "ExpressionAttributeValues": {":gpk": {"S": "G#1"}},
+            "ProjectionExpression": "gsk",
             "ExclusiveStartKey": last_evaluated_key
         });
 
@@ -969,6 +1012,34 @@ async fn query_with_projection_expression() {
     assert!(item.contains_key("pk"));
     assert!(item.contains_key("name"));
     assert!(!item.contains_key("age")); // Should be excluded by projection
+}
+
+#[tokio::test]
+async fn query_gsi_rejects_unprojected_projection_expression_attribute() {
+    let db = setup_test_db().await;
+    create_test_table_with_keys_only_gsi(db.as_ref(), "ProjectionGsiTable").await;
+
+    let payload = json!({
+        "TableName": "ProjectionGsiTable",
+        "IndexName": "ByGsi",
+        "KeyConditionExpression": "#gpk = :gpk",
+        "ProjectionExpression": "#private",
+        "ExpressionAttributeNames": {
+            "#gpk": "gpk",
+            "#private": "private_note"
+        },
+        "ExpressionAttributeValues": {":gpk": {"S": "tenant#1"}}
+    });
+
+    let error = handle_query(db, payload.try_into().unwrap())
+        .await
+        .expect_err("GSI query must reject a non-projected attribute");
+    assert_eq!(error.status_code, 400);
+    assert_eq!(
+        error.message,
+        "One or more parameter values were invalid: Global secondary index ByGsi does not project \
+         [private_note]"
+    );
 }
 
 #[tokio::test]
