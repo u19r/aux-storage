@@ -5,8 +5,28 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         request: TransactWriteItemsEncodeRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
-        apply_gsi_write_pressure(self).await?;
+        self.transact_write_items_encode_with_retry_impl(request, WriteRetryPolicy::no_retry())
+            .await
+    }
+
+    pub(super) async fn transact_write_items_encode_with_retry_impl(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<TransactWriteItemsResponse> {
         validate_encode_transaction_request(&request)?;
+
+        for attempt in 0..policy.max_attempts() {
+            match apply_gsi_write_pressure(self).await {
+                Ok(()) => break,
+                Err(error)
+                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
+                {
+                    tokio::time::sleep(policy.delay()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
         if request.client_request_token.is_none()
             && let Some(response) = self.try_apply_fast_encode_transaction(&request).await?
@@ -15,7 +35,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         let mapped = TransactWriteItemsRequest::try_from(request)?;
-        self.transact_write_items(mapped).await
+        self.transact_write_items_after_pressure(mapped).await
     }
 
     async fn try_apply_fast_encode_transaction(

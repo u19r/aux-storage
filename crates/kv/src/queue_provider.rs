@@ -2,9 +2,11 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig};
+use futures::future::try_join_all;
 use queue_provider::{
     MessageAttributeValue, MessageId, MessageResponse, Queue, QueueError, QueueInternalKind,
-    QueueMessage, QueueProvider, QueueResult, QueueValidationKind, ReceiptHandle,
+    QueueMessage, QueueMessageCounts, QueueProvider, QueueResult, QueueValidationKind,
+    ReceiptHandle,
 };
 use serde::{Deserialize, Serialize};
 use storage_types::{DurationSeconds, StorageEnum, StorageError, StorageResult, TimestampMillis};
@@ -13,12 +15,15 @@ use uuid::Uuid;
 use crate::{
     SortedKvDbStorageProvider,
     constants::PARTITION_ROUTING_RETRIES_TOTAL_METRIC,
+    helpers::increment_bytes,
     keyspace::compact::{self, QueueStorageId, U48},
     newtypes::MessageVisibilityKey,
     partition_family::{
         DEFAULT_STANDARD_QUEUE_PARTITION_COUNT, PartitionFamilyKind, QueueReceiptHandleData,
         ResolvedPartitionFamily, default_partition_family_config, find_partition_by_id,
-        initial_partition_infos, ordered_log_hash, queue_body_prefix_with_slot,
+        initial_partition_infos, ordered_log_hash, parse_partition_family_config,
+        parse_partition_info, partition_family_config_key, partition_info_prefix,
+        queue_body_prefix_with_slot,
         queue_checkpoint_key_with_slot, queue_family_component, queue_partition_marker_bytes,
         queue_partition_marker_key, queue_payload_key_with_slot, queue_ready_hint_bytes,
         queue_ready_hint_key, queue_ready_key_with_slot, queue_ready_prefix_with_slot,
@@ -166,6 +171,50 @@ fn queue_storage_id(value: u64) -> StorageResult<QueueStorageId> {
         .map_err(|err| StorageError::internal(&format!("invalid queue storage id: {err}")))
 }
 
+fn queue_url_with_storage_id(queue_url: &str, queue_id: QueueStorageId) -> String {
+    let encoded_id = format!("{:012x}", queue_id.get());
+    queue_url.rsplit_once('/').map_or_else(
+        || format!("{encoded_id}/{queue_url}"),
+        |(prefix, queue_name)| format!("{prefix}/{encoded_id}/{queue_name}"),
+    )
+}
+
+pub(crate) fn queue_storage_id_from_url(queue_url: &str) -> QueueResult<QueueStorageId> {
+    let mut segments = queue_url.rsplit('/');
+    let _queue_name = segments.next();
+    let encoded_id = segments.next().ok_or_else(|| {
+        QueueError::validation(
+            QueueValidationKind::InvalidQueueUrlFormat,
+        )
+    })?;
+    if encoded_id.len() != 12 {
+        return Err(QueueError::validation(
+            QueueValidationKind::InvalidQueueUrlFormat,
+        ));
+    }
+    let value = u64::from_str_radix(encoded_id, 16).map_err(|_| {
+        QueueError::validation(
+            QueueValidationKind::InvalidQueueUrlFormat,
+        )
+    })?;
+    queue_storage_id(value).map_err(QueueError::from)
+}
+
+fn queue_url_without_storage_id(queue_url: &str) -> Option<String> {
+    let (prefix_with_id, queue_name) = queue_url.rsplit_once('/')?;
+    let (prefix, encoded_id) = prefix_with_id
+        .rsplit_once('/')
+        .map_or(("", prefix_with_id), |parts| parts);
+    if encoded_id.len() != 12 || !encoded_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(if prefix.is_empty() {
+        queue_name.to_string()
+    } else {
+        format!("{prefix}/{queue_name}")
+    })
+}
+
 fn encode_queue_identity(identity: &StoredQueueIdentity) -> StorageResult<Vec<u8>> {
     storage_types::storage_serde::to_bytes(identity)
 }
@@ -223,6 +272,11 @@ enum QueueRoutingState {
     Control(ResolvedPartitionFamily),
 }
 
+struct QueueExecutionContext {
+    queue_id: QueueStorageId,
+    routing_state: QueueRoutingState,
+}
+
 #[derive(Clone, Copy)]
 struct QueuePartitionRoute {
     partition_id: u16,
@@ -234,13 +288,57 @@ struct PreparedPartitionedQueueMessage {
     message_id_hex: String,
     queue_url: String,
     visibility_timestamp: TimestampMillis,
-    state_bytes: Vec<u8>,
-    payload_bytes: Vec<u8>,
+    state_bytes: Arc<[u8]>,
+    payload_bytes: Arc<[u8]>,
+    payload_record_bytes: Option<Arc<[u8]>>,
 }
 
 impl<S> SortedKvDbStorageProvider<S>
 where S: QueueKvStore + 'static
 {
+    async fn ensure_queue_execution_context(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<QueueExecutionContext> {
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
+        let routing_state = QueueRoutingState::Control(
+            self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
+                .await?,
+        );
+        Ok(QueueExecutionContext {
+            queue_id,
+            routing_state,
+        })
+    }
+
+    async fn queue_execution_context(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<QueueExecutionContext>> {
+        let Some(routing_state) = self.queue_routing_state(queue_url).await? else {
+            return Ok(None);
+        };
+        let queue_id = self
+            .queue_identity_by_url(queue_url)
+            .await?
+            .ok_or_else(|| QueueError::ResourceNotFound {
+                resource_type: "queue",
+                resource_id: queue_url.to_string(),
+            })?
+            .queue_id;
+        Ok(Some(QueueExecutionContext {
+            queue_id,
+            routing_state,
+        }))
+    }
+
     fn record_queue_partition_load(
         &self,
         queue_url: &str,
@@ -616,12 +714,14 @@ where S: QueueKvStore + 'static
     async fn receive_partitioned_messages_once_coalesced(
         &self,
         queue_url: &str,
+        queue_id: QueueStorageId,
         max_messages: u32,
         visibility_timeout: DurationSeconds,
         routing_state: &QueueRoutingState,
     ) -> QueueResult<Vec<MessageResponse>> {
         self.receive_partitioned_messages_with_claim_rounds(
             queue_url,
+            queue_id,
             max_messages,
             visibility_timeout,
             routing_state,
@@ -632,6 +732,7 @@ where S: QueueKvStore + 'static
     async fn receive_partitioned_messages_with_claim_rounds(
         &self,
         queue_url: &str,
+        queue_id: QueueStorageId,
         max_messages: u32,
         visibility_timeout: DurationSeconds,
         routing_state: &QueueRoutingState,
@@ -646,6 +747,7 @@ where S: QueueKvStore + 'static
             match self
                 .receive_partitioned_messages_once(
                     queue_url,
+                    queue_id,
                     remaining,
                     visibility_timeout,
                     routing_state,
@@ -748,13 +850,18 @@ where S: QueueKvStore + 'static
         let state_bytes = storage_types::storage_serde::to_bytes(&state)?;
         let payload_bytes =
             partitioned_body_bytes(message.body, message.message_attributes, message.created_at)?;
+        let payload_record_bytes = crate::queue::storage::queue_payload_record_bytes(
+            payload_bytes.len(),
+        )?
+        .map(Arc::from);
         Ok(PreparedPartitionedQueueMessage {
             message_id: message.message_id,
             message_id_hex: message.message_id.to_string(),
             queue_url: message.queue_url,
             visibility_timestamp,
-            state_bytes,
-            payload_bytes,
+            state_bytes: state_bytes.into(),
+            payload_bytes: payload_bytes.into(),
+            payload_record_bytes,
         })
     }
 
@@ -784,6 +891,7 @@ where S: QueueKvStore + 'static
                 &prepared.message_id_hex,
             ),
             payload_bytes: prepared.payload_bytes.clone(),
+            payload_record_bytes: prepared.payload_record_bytes.clone(),
             ready_key: queue_ready_key_with_slot(
                 queue_id,
                 route.placement_slot,
@@ -830,16 +938,9 @@ where S: QueueKvStore + 'static
                 "send_messages requires all messages to target the same queue_url",
             ));
         }
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
-        self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
-            .await?;
+        let context = self.ensure_queue_execution_context(queue_url).await?;
+        let queue_id = context.queue_id;
+        let mut initial_routing_state = Some(context.routing_state);
         let cache_key = crate::sorted_kv::PartitionFamilyCacheKey::new(
             PartitionFamilyKind::StandardQueue,
             &queue_family_component(queue_url),
@@ -847,15 +948,18 @@ where S: QueueKvStore + 'static
         let wake_key = queue_wake_key(queue_id);
         let wake_bytes = wake_value_bytes()?;
         for attempt in 0..PARTITIONED_QUEUE_SEND_MAX_ATTEMPTS {
-            let routing_state = match self.queue_routing_state(queue_url).await? {
+            let routing_state = match initial_routing_state.take() {
                 Some(routing_state) => routing_state,
-                None => QueueRoutingState::Control(
-                    self.ensure_queue_family_state(
-                        queue_url,
-                        DEFAULT_STANDARD_QUEUE_PARTITION_COUNT,
-                    )
-                    .await?,
-                ),
+                None => match self.queue_routing_state(queue_url).await? {
+                    Some(routing_state) => routing_state,
+                    None => QueueRoutingState::Control(
+                        self.ensure_queue_family_state(
+                            queue_url,
+                            DEFAULT_STANDARD_QUEUE_PARTITION_COUNT,
+                        )
+                        .await?,
+                    ),
+                },
             };
             let mut send_messages = Vec::with_capacity(prepared_messages.len());
             let mut partition_load = HashMap::<u16, (u64, u64)>::new();
@@ -947,6 +1051,7 @@ where S: QueueKvStore + 'static
     async fn receive_partitioned_messages_once(
         &self,
         queue_url: &str,
+        queue_id: QueueStorageId,
         max_messages: u32,
         visibility_timeout: DurationSeconds,
         routing_state: &QueueRoutingState,
@@ -960,15 +1065,6 @@ where S: QueueKvStore + 'static
         let now = TimestampMillis::now();
         let mut scanned_partitions = 0usize;
         let mut claim_ranges = Vec::new();
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
-
         let routes = queue_partition_routes(routing_state);
         let receive_scan_shards = max_messages.max(1);
         let scan_shards = usize::try_from(receive_scan_shards)
@@ -1094,19 +1190,12 @@ where S: QueueKvStore + 'static
     async fn receive_partitioned_messages(
         &self,
         queue_url: &str,
+        queue_id: QueueStorageId,
         max_messages: u32,
         visibility_timeout: DurationSeconds,
         wait_time_seconds: DurationSeconds,
         routing_state: QueueRoutingState,
     ) -> QueueResult<Vec<MessageResponse>> {
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(u64::from(*wait_time_seconds));
         let mut messages = Vec::new();
@@ -1120,6 +1209,7 @@ where S: QueueKvStore + 'static
             let mut received = self
                 .receive_partitioned_messages_once_coalesced(
                     queue_url,
+                    queue_id,
                     remaining_max_messages,
                     visibility_timeout,
                     &routing_state,
@@ -1157,8 +1247,8 @@ where S: QueueKvStore + 'static
 
     async fn load_partitioned_state(
         &self,
-        queue_url: &str,
         handle: &QueueReceiptHandleData,
+        context: &QueueExecutionContext,
     ) -> QueueResult<(
         PartitionedQueueState,
         MessageId,
@@ -1174,20 +1264,9 @@ where S: QueueKvStore + 'static
                     error,
                 )
             })?;
-        let routing_state = self
-            .queue_routing_state(queue_url)
-            .await?
+        let route = queue_partition_route_for_id(&context.routing_state, handle.partition_id)
             .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
-        let route = queue_partition_route_for_id(&routing_state, handle.partition_id)
-            .ok_or_else(|| QueueError::internal(QueueInternalKind::MissingQueuePartitionState))?;
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
+        let queue_id = context.queue_id;
         let state_key = queue_state_key_with_slot(
             queue_id,
             route.placement_slot,
@@ -1228,13 +1307,13 @@ where S: QueueKvStore + 'static
 
     async fn delete_partitioned_message_with_state(
         &self,
-        queue_url: &str,
         handle: &QueueReceiptHandleData,
+        context: &QueueExecutionContext,
         started_at: Instant,
     ) -> QueueResult<()> {
         let now = TimestampMillis::now();
         let (state, message_id, route, queue_id) =
-            self.load_partitioned_state(queue_url, handle).await?;
+            self.load_partitioned_state(handle, context).await?;
         if state.visibility_timestamp < now {
             return Err(QueueError::validation(
                 QueueValidationKind::CannotOperateVisibleMessage,
@@ -1273,7 +1352,7 @@ where S: QueueKvStore + 'static
             .map_err(QueueError::TransactWrite)?;
         record_deferred_payload_cleanup(1);
         tracing::debug!(
-            queue_url,
+            queue_id = queue_id.get(),
             partition_id = handle.partition_id,
             elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
             "deleted partitioned queue message through state fallback"
@@ -1296,15 +1375,96 @@ where S: QueueKvStore + 'static
         &self,
         queue_url: &str,
     ) -> QueueResult<Option<StoredQueueIdentity>> {
-        let Some(queue_id_bytes) = self
-            .kv_store
-            .get(&compact::queue_url_lookup_key(queue_url), true)
+        let queue_id = queue_storage_id_from_url(queue_url)?;
+        Ok(self
+            .queue_identity_by_id(queue_id)
             .await?
-        else {
+            .filter(|identity| identity.queue.queue_url == queue_url))
+    }
+
+    async fn queue_with_message_counts(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<(Queue, QueueMessageCounts)>> {
+        let queue_id = queue_storage_id_from_url(queue_url)?;
+        let family_component = queue_family_component(queue_url);
+        let metadata_key = compact::queue_metadata_key(queue_id);
+        let config_key = partition_family_config_key(
+            PartitionFamilyKind::StandardQueue,
+            &family_component,
+        );
+        let partition_prefix = partition_info_prefix(
+            PartitionFamilyKind::StandardQueue,
+            &family_component,
+        );
+        let partition_end = increment_bytes(partition_prefix.clone());
+        let read_context = self.kv_store.begin_read_context().await?;
+        let (metadata, config, partition_values) = tokio::try_join!(
+            read_context.get(&metadata_key, true),
+            read_context.get(&config_key, true),
+            read_context.get_range_values(
+                &partition_prefix,
+                &partition_end,
+                None,
+                None,
+                true,
+            ),
+        )?;
+        let Some(metadata) = metadata else {
             return Ok(None);
         };
-        let queue_id = decode_queue_storage_id(&queue_id_bytes)?;
-        self.queue_identity_by_id(queue_id).await
+        let identity = decode_queue_identity(&metadata)?;
+        if identity.queue.queue_url != queue_url {
+            return Ok(None);
+        }
+        let Some(config) = config else {
+            return Ok(Some((identity.queue, QueueMessageCounts::default())));
+        };
+        let mut partitions = partition_values
+            .values
+            .into_iter()
+            .map(|value| parse_partition_info(&value))
+            .collect::<StorageResult<Vec<_>>>()?;
+        partitions.sort_unstable_by(|left, right| {
+            left.hash_start_inclusive
+                .cmp(&right.hash_start_inclusive)
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
+        let routing_state = QueueRoutingState::Control(ResolvedPartitionFamily {
+            config: parse_partition_family_config(&config)?,
+            partitions,
+        });
+        let now = TimestampMillis::now();
+        let state_ranges = try_join_all(queue_partition_routes(&routing_state).into_iter().map(
+            |route| {
+                let prefix = queue_state_key_with_slot(
+                    queue_id,
+                    route.placement_slot,
+                    route.partition_id,
+                    "",
+                );
+                let end = increment_bytes(prefix.clone());
+                let read_context = &read_context;
+                async move {
+                    read_context
+                        .get_range_values(&prefix, &end, None, None, true)
+                        .await
+                }
+            },
+        ))
+        .await?;
+        let mut counts = QueueMessageCounts::default();
+        for state in state_ranges.into_iter().flat_map(|range| range.values) {
+            let state = storage_types::storage_serde::from_bytes::<PartitionedQueueState>(&state)?;
+            if state.visibility_timestamp <= now {
+                counts.visible = counts.visible.saturating_add(1);
+            } else if state.claim_nonce.is_some() {
+                counts.not_visible = counts.not_visible.saturating_add(1);
+            } else {
+                counts.delayed = counts.delayed.saturating_add(1);
+            }
+        }
+        Ok(Some((identity.queue, counts)))
     }
 
     async fn find_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
@@ -1406,25 +1566,20 @@ fn queue_partition_route_for_id(
 
 fn queue_metadata_matches(existing: &Queue, requested: &Queue) -> bool {
     existing.queue_name == requested.queue_name
-        && existing.queue_url == requested.queue_url
+        && (existing.queue_url == requested.queue_url
+            || queue_url_without_storage_id(&existing.queue_url)
+                .is_some_and(|queue_url| queue_url == requested.queue_url))
         && existing.attributes == requested.attributes
 }
 
 impl<S> SortedKvDbStorageProvider<S>
 where S: QueueKvStore + 'static
 {
-    async fn queue_create_already_satisfied(&self, queue: &Queue) -> QueueResult<bool> {
-        if self
-            .get_queue(&queue.queue_url)
-            .await?
-            .is_some_and(|existing| queue_metadata_matches(&existing, queue))
-        {
-            return Ok(true);
-        }
+    async fn existing_queue_for_create(&self, queue: &Queue) -> QueueResult<Option<Queue>> {
         Ok(self
             .find_queue_by_name(&queue.queue_name)
             .await?
-            .is_some_and(|existing| queue_metadata_matches(&existing, queue)))
+            .filter(|existing| queue_metadata_matches(existing, queue)))
     }
 }
 
@@ -1438,7 +1593,11 @@ where S: QueueKvStore + 'static
         Ok(())
     }
 
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+    async fn create_queue(&self, mut queue: Queue) -> QueueResult<Queue> {
+        if let Some(existing) = self.existing_queue_for_create(&queue).await? {
+            return Ok(existing);
+        }
+        let requested_queue = queue.clone();
         let allocator_key = compact::queue_id_allocator_key();
         let allocator_value = self.kv_store.get(&allocator_key, true).await?;
         let queue_id = match allocator_value.as_deref() {
@@ -1446,6 +1605,7 @@ where S: QueueKvStore + 'static
             None => queue_storage_id(1)?,
         };
         let next_queue_id = queue_storage_id(queue_id.get().saturating_add(1))?;
+        queue.queue_url = queue_url_with_storage_id(&queue.queue_url, queue_id);
         let identity = StoredQueueIdentity {
             queue_id,
             queue: queue.clone(),
@@ -1459,20 +1619,12 @@ where S: QueueKvStore + 'static
                     expected_value: allocator_value,
                 },
                 DirectWriteOperation::CheckValue {
-                    key: compact::queue_url_lookup_key(&queue.queue_url),
-                    expected_value: None,
-                },
-                DirectWriteOperation::CheckValue {
                     key: compact::queue_name_lookup_key(&queue.queue_name),
                     expected_value: None,
                 },
                 DirectWriteOperation::Put {
                     key: allocator_key,
                     value: encode_queue_storage_id(next_queue_id),
-                },
-                DirectWriteOperation::Put {
-                    key: compact::queue_url_lookup_key(&queue.queue_url),
-                    value: queue_id_bytes.clone(),
                 },
                 DirectWriteOperation::Put {
                     key: compact::queue_name_lookup_key(&queue.queue_name),
@@ -1485,12 +1637,12 @@ where S: QueueKvStore + 'static
             ])
             .await
         {
-            if self
-                .queue_create_already_satisfied(&queue)
+            if let Some(existing) = self
+                .existing_queue_for_create(&requested_queue)
                 .await
-                .unwrap_or(false)
+                .unwrap_or(None)
             {
-                return Ok(());
+                return Ok(existing);
             }
             return Err(QueueError::TransactWrite(error));
         }
@@ -1526,7 +1678,7 @@ where S: QueueKvStore + 'static
                 .put(&queue_wake_key(queue_id), &wake_value_bytes()?, None)
                 .await?;
         }
-        Ok(())
+        Ok(queue)
     }
 
     async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {
@@ -1534,6 +1686,13 @@ where S: QueueKvStore + 'static
             .queue_identity_by_url(queue_url)
             .await?
             .map(|identity| identity.queue))
+    }
+
+    async fn get_queue_with_message_counts(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<(Queue, QueueMessageCounts)>> {
+        self.queue_with_message_counts(queue_url).await
     }
 
     async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
@@ -1612,9 +1771,6 @@ where S: QueueKvStore + 'static
                         key: compact::queue_metadata_key(identity.queue_id),
                     },
                     DirectWriteOperation::Delete {
-                        key: compact::queue_url_lookup_key(&identity.queue.queue_url),
-                    },
-                    DirectWriteOperation::Delete {
                         key: compact::queue_name_lookup_key(&identity.queue.queue_name),
                     },
                 ])
@@ -1676,28 +1832,18 @@ where S: QueueKvStore + 'static
         queue_url: &str,
         attributes: HashMap<String, String>,
     ) -> QueueResult<()> {
-        let Some(mut queue) = self.get_queue(queue_url).await? else {
-            return Err(QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            });
-        };
-        queue.attributes = attributes;
-        let identity = self
+        let mut identity = self
             .queue_identity_by_url(queue_url)
             .await?
             .ok_or_else(|| QueueError::ResourceNotFound {
                 resource_type: "queue",
                 resource_id: queue_url.to_string(),
             })?;
-        let updated_identity = StoredQueueIdentity {
-            queue_id: identity.queue_id,
-            queue,
-        };
+        identity.queue.attributes = attributes;
         self.kv_store
             .put(
-                &compact::queue_metadata_key(updated_identity.queue_id),
-                &encode_queue_identity(&updated_identity)?,
+                &compact::queue_metadata_key(identity.queue_id),
+                &encode_queue_identity(&identity)?,
                 None,
             )
             .await?;
@@ -1723,16 +1869,14 @@ where S: QueueKvStore + 'static
         visibility_timeout: DurationSeconds,
         wait_time_seconds: DurationSeconds,
     ) -> QueueResult<Vec<MessageResponse>> {
-        let routing_state = QueueRoutingState::Control(
-            self.ensure_queue_family_state(queue_url, DEFAULT_STANDARD_QUEUE_PARTITION_COUNT)
-                .await?,
-        );
+        let context = self.ensure_queue_execution_context(queue_url).await?;
         self.receive_partitioned_messages(
             queue_url,
+            context.queue_id,
             max_messages,
             visibility_timeout,
             wait_time_seconds,
-            routing_state,
+            context.routing_state,
         )
         .await
     }
@@ -1744,7 +1888,7 @@ where S: QueueKvStore + 'static
     ) -> QueueResult<()> {
         let started_at = Instant::now();
         let handle = Self::decode_receipt_handle(&receipt_handle)?;
-        if let Some(routing_state) = self.queue_routing_state(queue_url).await? {
+        if let Some(context) = self.queue_execution_context(queue_url).await? {
             let now = TimestampMillis::now();
             let message_id = handle
                 .message_id_hex
@@ -1761,18 +1905,11 @@ where S: QueueKvStore + 'static
                     QueueValidationKind::CannotOperateVisibleMessage,
                 ));
             }
-            let route = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            let route = queue_partition_route_for_id(&context.routing_state, handle.partition_id)
                 .ok_or_else(|| {
                     QueueError::internal(QueueInternalKind::MissingQueuePartitionState)
                 })?;
-            let queue_id = self
-                .queue_identity_by_url(queue_url)
-                .await?
-                .ok_or_else(|| QueueError::ResourceNotFound {
-                    resource_type: "queue",
-                    resource_id: queue_url.to_string(),
-                })?
-                .queue_id;
+            let queue_id = context.queue_id;
             let visibility_key =
                 MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));
             let ready_key = queue_ready_key_with_slot(
@@ -1808,7 +1945,7 @@ where S: QueueKvStore + 'static
                 return match error.as_ref() {
                     StorageEnum::ConditionalCheckFailed
                     | StorageEnum::TransactionCanceled { .. } => {
-                        self.delete_partitioned_message_with_state(queue_url, &handle, started_at)
+                        self.delete_partitioned_message_with_state(&handle, &context, started_at)
                             .await
                     }
                     _ => Err(QueueError::TransactWrite(error)),
@@ -1834,7 +1971,7 @@ where S: QueueKvStore + 'static
         let mut results = std::iter::repeat_with(|| None)
             .take(receipt_handles.len())
             .collect::<Vec<Option<QueueResult<()>>>>();
-        let routing_state = self.queue_routing_state(queue_url).await?;
+        let context = self.queue_execution_context(queue_url).await?;
         let mut decoded_handles = Vec::with_capacity(receipt_handles.len());
         for (index, receipt_handle) in receipt_handles.iter().enumerate() {
             match Self::decode_receipt_handle(receipt_handle) {
@@ -1845,7 +1982,7 @@ where S: QueueKvStore + 'static
                 }
             }
         }
-        let Some(routing_state) = routing_state else {
+        let Some(context) = context else {
             return Ok(results
                 .into_iter()
                 .enumerate()
@@ -1859,14 +1996,7 @@ where S: QueueKvStore + 'static
 
         let mut operations = Vec::with_capacity(decoded_handles.len().saturating_mul(2));
         let mut deferred_payload_cleanup = 0u64;
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
+        let queue_id = context.queue_id;
 
         for (index, handle) in decoded_handles.iter().enumerate() {
             let Some(handle) = handle else {
@@ -1882,7 +2012,8 @@ where S: QueueKvStore + 'static
                     continue;
                 }
             };
-            let Some(route) = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            let Some(route) =
+                queue_partition_route_for_id(&context.routing_state, handle.partition_id)
             else {
                 results[index] = Some(Err(QueueError::internal(
                     QueueInternalKind::MissingQueuePartitionState,
@@ -1941,8 +2072,8 @@ where S: QueueKvStore + 'static
                     fallback_results.push(match handle {
                         Some(handle) => {
                             self.delete_partitioned_message_with_state(
-                                queue_url,
                                 &handle,
+                                &context,
                                 Instant::now(),
                             )
                             .await
@@ -1969,10 +2100,10 @@ where S: QueueKvStore + 'static
         visibility_timeout: DurationSeconds,
     ) -> QueueResult<()> {
         let handle = Self::decode_receipt_handle(&receipt_handle)?;
-        if self.queue_routing_state(queue_url).await?.is_some() {
+        if let Some(context) = self.queue_execution_context(queue_url).await? {
             let now = TimestampMillis::now();
             let (mut state, message_id, route, queue_id) =
-                self.load_partitioned_state(queue_url, &handle).await?;
+                self.load_partitioned_state(&handle, &context).await?;
             if state.visibility_timestamp < now {
                 return Err(QueueError::validation(
                     QueueValidationKind::CannotOperateVisibleMessage,
@@ -2048,7 +2179,7 @@ where S: QueueKvStore + 'static
         let mut results = std::iter::repeat_with(|| None)
             .take(entries.len())
             .collect::<Vec<Option<QueueResult<()>>>>();
-        let routing_state = self.queue_routing_state(queue_url).await?;
+        let context = self.queue_execution_context(queue_url).await?;
         let mut decoded_entries = Vec::with_capacity(entries.len());
         for (index, (receipt_handle, visibility_timeout)) in entries.iter().enumerate() {
             match Self::decode_receipt_handle(receipt_handle) {
@@ -2059,7 +2190,7 @@ where S: QueueKvStore + 'static
                 }
             }
         }
-        let Some(routing_state) = routing_state else {
+        let Some(context) = context else {
             return Ok(results
                 .into_iter()
                 .enumerate()
@@ -2071,14 +2202,7 @@ where S: QueueKvStore + 'static
 
         let mut operations = Vec::with_capacity(decoded_entries.len().saturating_mul(3) + 1);
         let mut changed_any = false;
-        let queue_id = self
-            .queue_identity_by_url(queue_url)
-            .await?
-            .ok_or_else(|| QueueError::ResourceNotFound {
-                resource_type: "queue",
-                resource_id: queue_url.to_string(),
-            })?
-            .queue_id;
+        let queue_id = context.queue_id;
 
         for (index, (handle, visibility_timeout)) in decoded_entries.into_iter().enumerate() {
             let Some(handle) = handle else {
@@ -2094,7 +2218,8 @@ where S: QueueKvStore + 'static
                     continue;
                 }
             };
-            let Some(route) = queue_partition_route_for_id(&routing_state, handle.partition_id)
+            let Some(route) =
+                queue_partition_route_for_id(&context.routing_state, handle.partition_id)
             else {
                 results[index] = Some(Err(QueueError::internal(
                     QueueInternalKind::MissingQueuePartitionState,
@@ -2220,9 +2345,9 @@ where S: QueueKvStore + 'static
         checkpoint_data: String,
     ) -> QueueResult<()> {
         let handle = Self::decode_receipt_handle(&receipt_handle)?;
-        if self.queue_routing_state(queue_url).await?.is_some() {
+        if let Some(context) = self.queue_execution_context(queue_url).await? {
             let (mut state, _, route, queue_id) =
-                self.load_partitioned_state(queue_url, &handle).await?;
+                self.load_partitioned_state(&handle, &context).await?;
             state.checkpoint_data = Some(checkpoint_data);
             let value = storage_types::storage_serde::to_bytes(&state)?;
             self.kv_store

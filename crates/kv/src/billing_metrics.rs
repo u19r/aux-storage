@@ -70,6 +70,16 @@ pub(crate) fn record_billed_item_ops(
     direction: &'static str,
     count: u64,
 ) {
+    #[cfg(test)]
+    metrics_facade::active_metrics_facade().increment_counter(
+        STORAGE_BILLED_ITEM_OPS_TOTAL_METRIC,
+        &[
+            metrics_facade::MetricLabel::new("ddb_op", ddb_op),
+            metrics_facade::MetricLabel::new("item_kind", item_kind),
+            metrics_facade::MetricLabel::new("direction", direction),
+        ],
+        count,
+    );
     if let Some(handles) = billing_metric_handles(ddb_op, item_kind, direction) {
         handles.billed_item_ops_total.increment(count);
         return;
@@ -89,6 +99,16 @@ pub(crate) fn record_logical_item_bytes(
     direction: &'static str,
     bytes: u64,
 ) {
+    #[cfg(test)]
+    metrics_facade::active_metrics_facade().increment_counter(
+        STORAGE_LOGICAL_ITEM_BYTES_TOTAL_METRIC,
+        &[
+            metrics_facade::MetricLabel::new("ddb_op", ddb_op),
+            metrics_facade::MetricLabel::new("item_kind", item_kind),
+            metrics_facade::MetricLabel::new("direction", direction),
+        ],
+        bytes,
+    );
     if let Some(handles) = billing_metric_handles(ddb_op, item_kind, direction) {
         handles.logical_item_bytes_total.increment(bytes);
         return;

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use storage_types::{
     AttributeDefinition, AttributeValue, AttributeValueRef, CreateTableRequest, ExprNameRef,
     ExprValueRef, KeyAttributeType, KeyRef, KeySchemaElement, KeyType, ReturnValuesOldNewUpdated,
-    ScalarValueRef, TableName,
+    ScalarValueRef, StorageEnum, TableName, context::WrappedError as _,
 };
 
 use crate::{DatabaseManager, PutItemInput};
@@ -100,4 +100,37 @@ async fn update_item_ref_rejects_unused_expression_values_before_writing() {
         .expect_err("unused expression value fails");
 
     assert!(format!("{error}").contains(":unused"));
+}
+
+#[tokio::test]
+async fn resolved_operation_rejects_a_write_for_another_table() {
+    let db = DatabaseManager::new_for_test()
+        .await
+        .expect("create test database manager");
+    let resolved_table = TableName::new("resolved_operation_table");
+    create_hash_table(&db, &resolved_table).await;
+    let operation = db
+        .resolve_storage_operation(resolved_table)
+        .await
+        .expect("resolve table");
+
+    let error = db
+        .put_item_with_resolved_operation(
+            operation,
+            PutItemInput::builder()
+                .table_name(TableName::new("different_table"))
+                .item(HashMap::from([(
+                    "pk".to_string(),
+                    AttributeValue::S("item#1".to_string()),
+                )]))
+                .build(),
+        )
+        .await
+        .expect_err("resolved context must not bind to another table");
+
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::InternalServerError { message }
+            if message == "resolved storage operation does not match PutItem table"
+    ));
 }

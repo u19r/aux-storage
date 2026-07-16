@@ -43,6 +43,8 @@ pub use storage_api_manager::{
 pub use sync_raft_runtime_adapter::SyncRaftRuntimeAdapter;
 
 #[cfg(test)]
+mod storage_manager_impl_batch_get_item_perf_tests;
+#[cfg(test)]
 mod storage_manager_impl_consumed_capacity_alloc_tests;
 #[cfg(test)]
 mod storage_manager_impl_delete_table_tests;

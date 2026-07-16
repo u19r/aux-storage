@@ -15,7 +15,9 @@ impl StorageApiManagerImpl {
         request: UpdateTimeToLiveRequest,
     ) -> Result<Response, HttpApiError> {
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::UpdateTimeToLive(request.clone()))
+            .propose_sync_write_if_configured(|| {
+                SyncWriteRequest::UpdateTimeToLive(request.clone())
+            })
             .await?
         {
             return Ok(Response::UpdateTimeToLive(required_sync_response_at::<

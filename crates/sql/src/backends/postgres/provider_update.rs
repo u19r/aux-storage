@@ -26,6 +26,7 @@ impl PostgresStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_values_on_condition_check_failure,
             aux_item_stream_ttl_hours,
             ..
         } = request;
@@ -37,6 +38,10 @@ impl PostgresStorageProvider {
             expression_attribute_values.as_ref(),
         )?;
         let table_info = self.get_table_info_cached_arc(&table_name).await?;
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                return_values_on_condition_check_failure.as_ref(),
+            );
         let key_attributes = key.clone();
         let response = self
             .retry_postgres_conflicts("update_item", || {
@@ -80,7 +85,10 @@ impl PostgresStorageProvider {
                         let empty_item = std::collections::HashMap::new();
                         let condition_item = existing_item.as_ref().unwrap_or(&empty_item);
                         if !evaluate_condition(condition_item, condition) {
-                            return Err(storage_types::StorageEnum::ConditionalCheckFailed.into());
+                            return Err(crate::provider_core::write::conditional_failure(
+                                existing_item.as_ref(),
+                                return_old_on_condition_failure,
+                            ));
                         }
                     }
                     let old_item_for_write = existing_item.clone();

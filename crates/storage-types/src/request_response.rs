@@ -83,7 +83,7 @@ pub struct CreateTableRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_specification: Option<StreamSpecification>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Return the item preimage when the condition fails if set to `ALL_OLD`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_secondary_indexes: Option<Vec<LocalSecondaryIndex>>,
 
@@ -92,19 +92,19 @@ pub struct CreateTableRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_mode: Option<BillingMode>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Return the item preimage when the condition fails if set to `ALL_OLD`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Return the item preimage when the condition fails if set to `ALL_OLD`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_demand_throughput: Option<OnDemandThroughput>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Return the item preimage when the condition fails if set to `ALL_OLD`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_policy: Option<serde_json::Value>,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
+    /// Return the item preimage when the condition fails if set to `ALL_OLD`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sse_specification: Option<SseSpecification>,
 
@@ -520,7 +520,7 @@ pub struct DescribeTableResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PutItemRequest {
     pub table_name: TableName,
 
@@ -630,7 +630,7 @@ pub struct PutItemResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct GetItemRequest {
     pub table_name: TableName,
 

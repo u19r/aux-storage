@@ -5,7 +5,8 @@ use crate::{
     ConfirmSubscriptionResponse, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
     GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse, GetTopicAttributesRequest,
     GetTopicAttributesResponse, ListSubscriptionsRequest, ListSubscriptionsResponse,
-    ListTopicsRequest, ListTopicsResponse, PubsubResult, SetSubscriptionAttributesRequest,
+    ListTopicsRequest, ListTopicsResponse, PublishRequest, PubsubError, PubsubMessageId,
+    PubsubResult, SetSubscriptionAttributesRequest,
     SetTopicAttributesRequest, SubscribeRequest, Subscription, SubscriptionArn, Topic, TopicArn,
 };
 
@@ -57,6 +58,40 @@ pub trait PubsubProvider: Send + Sync {
         &self,
         request: ListSubscriptionsRequest,
     ) -> PubsubResult<ListSubscriptionsResponse>;
+
+    async fn accept_publish(
+        &self,
+        request: PublishRequest,
+        message_id: PubsubMessageId,
+        custom_sender_enabled: bool,
+    ) -> PubsubResult<()> {
+        if self.get_topic(&request.topic_arn).await?.is_none() {
+            return Err(PubsubError::topic_not_found(request.topic_arn.to_string()));
+        }
+        let records = self
+            .list_subscriptions(ListSubscriptionsRequest {
+                topic_arn: Some(request.topic_arn.clone()),
+                next_token: None,
+            })
+            .await?
+            .subscriptions
+            .into_iter()
+            .filter(|subscription| !subscription.confirmation.pending_confirmation())
+            .map(|subscription| {
+                DeliveryRecord::pending_notification(
+                    &request,
+                    &message_id,
+                    &subscription,
+                    custom_sender_enabled,
+                )
+            })
+            .collect();
+        self.put_delivery_records(records).await
+    }
+
+    async fn materialize_publish_intents(&self, _limit: usize) -> PubsubResult<usize> {
+        Ok(0)
+    }
 
     async fn put_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()>;
 

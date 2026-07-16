@@ -5,12 +5,16 @@ use aws_sigv4_signing::{AwsRequestSigner, AwsStaticCredentials, CredentialSource
 use http::{HeaderMap, HeaderValue, Uri};
 use http_request::reqwest::Client;
 use queue_provider::{
-    ChangeMessageVisibilityRequest, CreateQueueRequest, CreateQueueResponse, DeleteMessageRequest,
-    DeleteQueueRequest, GetQueueAttributesRequest, GetQueueAttributesResponse, GetQueueUrlRequest,
-    GetQueueUrlResponse, ListQueuesRequest, ListQueuesResponse, MessageId, PurgeQueueRequest,
-    Queue, QueueError, QueueInternalKind, QueueMessage, QueueProvider, QueueResult,
+    BatchResultErrorEntry, ChangeMessageVisibilityBatchRequest,
+    ChangeMessageVisibilityBatchRequestEntry, ChangeMessageVisibilityBatchResponse,
+    ChangeMessageVisibilityRequest, CreateQueueRequest, CreateQueueResponse,
+    DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry, DeleteMessageBatchResponse,
+    DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest, GetQueueAttributesResponse,
+    GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest, ListQueuesResponse, MessageId,
+    PurgeQueueRequest, Queue, QueueError, QueueInternalKind, QueueMessage, QueueProvider, QueueResult,
     QueueValidationKind, ReceiptHandle, ReceiveMessageRequest, ReceiveMessageResponse,
-    RemoteCredentialStrategy, RemoteQueueSettings, SendMessageRequest, SendMessageResponse,
+    RemoteCredentialStrategy, RemoteQueueSettings, SendMessageBatchRequest,
+    SendMessageBatchRequestEntry, SendMessageBatchResponse, SendMessageRequest, SendMessageResponse,
     SetQueueAttributesRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -155,8 +159,8 @@ impl RemoteQueueProvider {
             })
     }
 
-    async fn ensure_queue_matches(&self, queue: Queue) -> QueueResult<()> {
-        let Some(existing_queue) = self.get_queue_by_name(&queue.queue_name).await? else {
+    async fn ensure_queue_matches(&self, queue: Queue) -> QueueResult<Queue> {
+        let Some(mut existing_queue) = self.get_queue_by_name(&queue.queue_name).await? else {
             return Err(QueueError::internal_with_detail(
                 QueueInternalKind::RemoteBackendNotImplemented,
                 format!(
@@ -168,12 +172,12 @@ impl RemoteQueueProvider {
 
         let attribute_updates =
             queue_attribute_updates(&existing_queue.attributes, &queue.attributes);
-        if attribute_updates.is_empty() {
-            return Ok(());
+        if !attribute_updates.is_empty() {
+            self.set_queue_attributes(&existing_queue.queue_url, attribute_updates)
+                .await?;
+            existing_queue.attributes = queue.attributes;
         }
-
-        self.set_queue_attributes(&existing_queue.queue_url, attribute_updates)
-            .await
+        Ok(existing_queue)
     }
 }
 
@@ -183,7 +187,7 @@ impl QueueProvider for RemoteQueueProvider {
         Ok(())
     }
 
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue> {
         match self
             .invoke::<_, CreateQueueResponse>(
                 "AmazonSQS.CreateQueue",
@@ -194,7 +198,12 @@ impl QueueProvider for RemoteQueueProvider {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(response) => Ok(Queue {
+                queue_name: queue.queue_name,
+                queue_url: response.queue_url,
+                attributes: queue.attributes,
+                created_at: queue.created_at,
+            }),
             Err(QueueError::ResourceExists { .. }) => self.ensure_queue_matches(queue).await,
             Err(err) => Err(err),
         }
@@ -315,6 +324,44 @@ impl QueueProvider for RemoteQueueProvider {
         Ok(response.message_id)
     }
 
+    async fn send_messages(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> QueueResult<Vec<QueueResult<MessageId>>> {
+        let Some(first) = messages.first() else {
+            return Ok(Vec::new());
+        };
+        let queue_url = first.queue_url.clone();
+        if messages.iter().any(|message| message.queue_url != queue_url) {
+            return Err(QueueError::validation_with_detail(
+                QueueValidationKind::InvalidParameterValue,
+                "send_messages requires one queue URL",
+            ));
+        }
+        let entry_count = messages.len();
+        let entries = messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| SendMessageBatchRequestEntry {
+                id: index.to_string(),
+                message_body: message.body,
+                delay_seconds: message.visibility_timestamp.map(delay_seconds_from_timestamp),
+                message_attributes: message.message_attributes,
+            })
+            .collect();
+        let response: SendMessageBatchResponse = self
+            .invoke(
+                "AmazonSQS.SendMessageBatch",
+                &SendMessageBatchRequest { queue_url, entries },
+            )
+            .await?;
+        ordered_batch_results(
+            entry_count,
+            response.successful.into_iter().map(|entry| (entry.id, entry.message_id)),
+            response.failed,
+        )
+    }
+
     async fn receive_messages(
         &self,
         queue_url: &str,
@@ -354,6 +401,39 @@ impl QueueProvider for RemoteQueueProvider {
         Ok(())
     }
 
+    async fn delete_messages(
+        &self,
+        queue_url: &str,
+        receipt_handles: Vec<ReceiptHandle>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        if receipt_handles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entry_count = receipt_handles.len();
+        let entries = receipt_handles
+            .into_iter()
+            .enumerate()
+            .map(|(index, receipt_handle)| DeleteMessageBatchRequestEntry {
+                id: index.to_string(),
+                receipt_handle,
+            })
+            .collect();
+        let response: DeleteMessageBatchResponse = self
+            .invoke(
+                "AmazonSQS.DeleteMessageBatch",
+                &DeleteMessageBatchRequest {
+                    queue_url: queue_url.to_string(),
+                    entries,
+                },
+            )
+            .await?;
+        ordered_batch_results(
+            entry_count,
+            response.successful.into_iter().map(|entry| (entry.id, ())),
+            response.failed,
+        )
+    }
+
     async fn change_message_visibility(
         &self,
         queue_url: &str,
@@ -372,6 +452,42 @@ impl QueueProvider for RemoteQueueProvider {
         Ok(())
     }
 
+    async fn change_message_visibilities(
+        &self,
+        queue_url: &str,
+        entries: Vec<(ReceiptHandle, storage_types::DurationSeconds)>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entry_count = entries.len();
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (receipt_handle, visibility_timeout))| {
+                ChangeMessageVisibilityBatchRequestEntry {
+                    id: index.to_string(),
+                    receipt_handle,
+                    visibility_timeout: *visibility_timeout,
+                }
+            })
+            .collect();
+        let response: ChangeMessageVisibilityBatchResponse = self
+            .invoke(
+                "AmazonSQS.ChangeMessageVisibilityBatch",
+                &ChangeMessageVisibilityBatchRequest {
+                    queue_url: queue_url.to_string(),
+                    entries,
+                },
+            )
+            .await?;
+        ordered_batch_results(
+            entry_count,
+            response.successful.into_iter().map(|entry| (entry.id, ())),
+            response.failed,
+        )
+    }
+
     async fn update_message_snapshot_checkpoint(
         &self,
         _queue_url: &str,
@@ -380,6 +496,70 @@ impl QueueProvider for RemoteQueueProvider {
     ) -> QueueResult<()> {
         Ok(())
     }
+}
+
+fn delay_seconds_from_timestamp(visibility: storage_types::TimestampMillis) -> u32 {
+    let now = storage_types::TimestampMillis::now().timestamp_millis();
+    let delay_ms = visibility.timestamp_millis().saturating_sub(now);
+    u32::try_from(delay_ms / 1_000).unwrap_or(u32::MAX)
+}
+
+fn ordered_batch_results<T>(
+    entry_count: usize,
+    successful: impl IntoIterator<Item = (String, T)>,
+    failed: Vec<BatchResultErrorEntry>,
+) -> QueueResult<Vec<QueueResult<T>>> {
+    let mut results = std::iter::repeat_with(|| None)
+        .take(entry_count)
+        .collect::<Vec<Option<QueueResult<T>>>>();
+    for (id, value) in successful {
+        insert_batch_result(&mut results, id, Ok(value))?;
+    }
+    for failure in failed {
+        let BatchResultErrorEntry {
+            id,
+            sender_fault,
+            code,
+            message,
+        } = failure;
+        insert_batch_result(
+            &mut results,
+            id,
+            Err(QueueError::batch_entry(sender_fault, code, message)),
+        )?;
+    }
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.ok_or_else(|| malformed_batch_response(format!("missing entry {index}")))
+        })
+        .collect()
+}
+
+fn insert_batch_result<T>(
+    results: &mut [Option<QueueResult<T>>],
+    id: String,
+    result: QueueResult<T>,
+) -> QueueResult<()> {
+    let index = id
+        .parse::<usize>()
+        .map_err(|_| malformed_batch_response(format!("invalid entry id {id}")))?;
+    let slot = results
+        .get_mut(index)
+        .ok_or_else(|| malformed_batch_response(format!("unknown entry id {id}")))?;
+    if slot.is_some() {
+        return Err(malformed_batch_response(format!("duplicate entry id {id}")));
+    }
+    *slot = Some(result);
+    Ok(())
+}
+
+fn malformed_batch_response(detail: impl std::fmt::Display) -> QueueError {
+    QueueError::internal_with_detail(
+        QueueInternalKind::RemoteBackendNotImplemented,
+        format!("malformed remote batch response: {detail}"),
+    )
 }
 
 fn signer_credentials(strategy: &RemoteCredentialStrategy) -> CredentialSource {

@@ -6,7 +6,7 @@ use http_error::HttpApiError;
 use serde_json::json;
 
 use crate::protocol::{
-    QueueAction, QueueProtocol, add_common_headers, api_error_response, decode_request,
+    QueueAction, QueueProtocol, QueueRequest, add_common_headers, api_error_response, decode_request,
     error_response, ok_response,
 };
 
@@ -35,8 +35,10 @@ fn json_request_decodes_action_and_payload() {
         .expect("json request decodes");
 
     assert_eq!(request.protocol, QueueProtocol::Json);
-    assert_eq!(request.action, QueueAction::CreateQueue);
-    assert_eq!(request.payload["QueueName"], "jobs");
+    let QueueRequest::CreateQueue(request) = request.request else {
+        panic!("expected create queue request");
+    };
+    assert_eq!(request.queue_name, "jobs");
 }
 
 #[test]
@@ -50,8 +52,10 @@ fn query_request_decodes_action_and_flat_payload() {
     .expect("query request decodes");
 
     assert_eq!(request.protocol, QueueProtocol::Query);
-    assert_eq!(request.action, QueueAction::GetQueueUrl);
-    assert_eq!(request.payload["QueueName"], "jobs");
+    let QueueRequest::GetQueueUrl(request) = request.request else {
+        panic!("expected get queue URL request");
+    };
+    assert_eq!(request.queue_name, "jobs");
 }
 
 #[test]
@@ -66,8 +70,11 @@ fn query_request_decodes_numeric_payload_fields() {
     )
     .expect("query request decodes");
 
-    assert_eq!(request.payload["MaxNumberOfMessages"], 2);
-    assert_eq!(request.payload["VisibilityTimeout"], 30);
+    let QueueRequest::ReceiveMessage(request) = request.request else {
+        panic!("expected receive request");
+    };
+    assert_eq!(request.max_number_of_messages, Some(2));
+    assert_eq!(request.visibility_timeout, Some(30));
 }
 
 #[test]
@@ -188,14 +195,16 @@ fn given_query_protocol_queue_attributes_when_decoding_then_numbered_name_value_
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=SetQueueAttributes&Attribute.2.Value=20&Attribute.1.Name=VisibilityTimeout&Attribute.2.Name=DelaySeconds&Attribute.1.Value=30",
+            b"Action=SetQueueAttributes&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&Attribute.2.Value=20&Attribute.1.Name=VisibilityTimeout&Attribute.2.Name=DelaySeconds&Attribute.1.Value=30",
         ),
     )
     .expect("attributes decode");
 
-    assert_eq!(request.action, QueueAction::SetQueueAttributes);
-    assert_eq!(request.payload["Attributes"]["VisibilityTimeout"], "30");
-    assert_eq!(request.payload["Attributes"]["DelaySeconds"], "20");
+    let QueueRequest::SetQueueAttributes(request) = request.request else {
+        panic!("expected set attributes request");
+    };
+    assert_eq!(request.attributes["VisibilityTimeout"], "30");
+    assert_eq!(request.attributes["DelaySeconds"], "20");
 }
 
 #[test]
@@ -206,13 +215,19 @@ fn given_query_protocol_attribute_name_lists_when_decoding_then_numbered_members
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=ReceiveMessage&AttributeName.1=All&MessageAttributeName.1=TraceId",
+            b"Action=ReceiveMessage&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&AttributeName.1=All&MessageAttributeName.1=TraceId",
         ),
     )
     .expect("attribute names decode");
 
-    assert_eq!(request.payload["AttributeNames"], json!(["All"]));
-    assert_eq!(request.payload["MessageAttributeNames"], json!(["TraceId"]));
+    let QueueRequest::ReceiveMessage(request) = request.request else {
+        panic!("expected receive request");
+    };
+    assert_eq!(request.attribute_names, Some(vec!["All".to_string()]));
+    assert_eq!(
+        request.message_attribute_names,
+        Some(vec!["TraceId".to_string()])
+    );
 }
 
 #[test]
@@ -223,15 +238,21 @@ fn given_query_protocol_message_attributes_when_decoding_then_nested_value_field
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=SendMessage&MessageAttribute.1.Name=Trace&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=abc",
+            b"Action=SendMessage&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&MessageBody=body&MessageAttribute.1.Name=Trace&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=abc",
         ),
     )
     .expect("message attributes decode");
 
-    assert_eq!(
-        request.payload["MessageAttributes"]["Trace"],
-        json!({"DataType": "String", "StringValue": "abc"})
-    );
+    let QueueRequest::SendMessage(request) = request.request else {
+        panic!("expected send request");
+    };
+    let attributes = request
+        .message_attributes
+        .as_ref()
+        .expect("message attributes");
+    let trace = attributes.get("Trace").expect("trace attribute");
+    assert_eq!(trace.data_type, "String");
+    assert_eq!(trace.string_value.as_deref(), Some("abc"));
 }
 
 #[test]
@@ -241,15 +262,18 @@ fn given_query_protocol_batch_entries_when_decoding_then_numbered_entries_preser
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=SendMessageBatch&SendMessageBatchRequestEntry.2.Id=second&SendMessageBatchRequestEntry.2.MessageBody=two&SendMessageBatchRequestEntry.1.Id=first&SendMessageBatchRequestEntry.1.DelaySeconds=5",
+            b"Action=SendMessageBatch&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&SendMessageBatchRequestEntry.2.Id=second&SendMessageBatchRequestEntry.2.MessageBody=two&SendMessageBatchRequestEntry.1.Id=first&SendMessageBatchRequestEntry.1.MessageBody=one&SendMessageBatchRequestEntry.1.DelaySeconds=5",
         ),
     )
     .expect("send batch entries decode");
 
-    assert_eq!(request.payload["Entries"][0]["Id"], "first");
-    assert_eq!(request.payload["Entries"][0]["DelaySeconds"], 5);
-    assert_eq!(request.payload["Entries"][1]["Id"], "second");
-    assert_eq!(request.payload["Entries"][1]["MessageBody"], "two");
+    let QueueRequest::SendMessageBatch(request) = request.request else {
+        panic!("expected send batch request");
+    };
+    assert_eq!(request.entries[0].id, "first");
+    assert_eq!(request.entries[0].delay_seconds, Some(5));
+    assert_eq!(request.entries[1].id, "second");
+    assert_eq!(request.entries[1].message_body, "two");
 }
 
 #[test]
@@ -260,13 +284,16 @@ fn given_query_protocol_delete_batch_entries_when_decoding_then_entries_use_the_
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=DeleteMessageBatch&DeleteMessageBatchRequestEntry.1.Id=one&DeleteMessageBatchRequestEntry.1.ReceiptHandle=abc",
+            b"Action=DeleteMessageBatch&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&DeleteMessageBatchRequestEntry.1.Id=one&DeleteMessageBatchRequestEntry.1.ReceiptHandle=abc",
         ),
     )
     .expect("delete batch entries decode");
 
-    assert_eq!(request.payload["Entries"][0]["Id"], "one");
-    assert_eq!(request.payload["Entries"][0]["ReceiptHandle"], "abc");
+    let QueueRequest::DeleteMessageBatch(request) = request.request else {
+        panic!("expected delete batch request");
+    };
+    assert_eq!(request.entries[0].id, "one");
+    assert_eq!(request.entries[0].receipt_handle.to_string(), "abc");
 }
 
 #[test]
@@ -277,13 +304,16 @@ fn given_query_protocol_visibility_batch_entries_when_decoding_then_visibility_t
     let request = decode_request(
         &headers,
         Bytes::from_static(
-            b"Action=ChangeMessageVisibilityBatch&ChangeMessageVisibilityBatchRequestEntry.1.Id=one&ChangeMessageVisibilityBatchRequestEntry.1.VisibilityTimeout=45",
+            b"Action=ChangeMessageVisibilityBatch&QueueUrl=http%3A%2F%2Flocalhost%2Fqueue&ChangeMessageVisibilityBatchRequestEntry.1.Id=one&ChangeMessageVisibilityBatchRequestEntry.1.ReceiptHandle=abc&ChangeMessageVisibilityBatchRequestEntry.1.VisibilityTimeout=45",
         ),
     )
     .expect("visibility batch entries decode");
 
-    assert_eq!(request.payload["Entries"][0]["Id"], "one");
-    assert_eq!(request.payload["Entries"][0]["VisibilityTimeout"], 45);
+    let QueueRequest::ChangeMessageVisibilityBatch(request) = request.request else {
+        panic!("expected visibility batch request");
+    };
+    assert_eq!(request.entries[0].id, "one");
+    assert_eq!(request.entries[0].visibility_timeout, 45);
 }
 
 #[tokio::test]

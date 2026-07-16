@@ -67,7 +67,7 @@ impl QueueProvider for SQLiteStorageProvider {
         .map_err(Into::into)
     }
 
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue> {
         let attributes_json = serde_json::to_string(&queue.attributes)?;
 
         call_sqlite_queue(&self.connection, move |conn| {
@@ -83,7 +83,7 @@ impl QueueProvider for SQLiteStorageProvider {
                 let existing_attributes: HashMap<String, String> =
                     serde_json::from_str(&existing_attributes_json)?;
                 if existing_url == queue.queue_url && existing_attributes == queue.attributes {
-                    return Ok(());
+                    return Ok(queue);
                 }
                 return Err(QueueError::queue_already_exists(queue.queue_name.clone()));
             }
@@ -97,7 +97,7 @@ impl QueueProvider for SQLiteStorageProvider {
 
             conn.execute(sql, params).map_err(map_sqlite_error)?;
 
-            Ok(())
+            Ok(queue)
         })
         .await
     }

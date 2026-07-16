@@ -53,6 +53,7 @@ impl TableAtomicityWorkload {
                             expression_attribute_names: None,
                             expression_attribute_values: None,
                             return_values: None,
+                            return_old_on_condition_failure: false,
                             aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
                         })
                         .await;
@@ -86,6 +87,7 @@ impl TableAtomicityWorkload {
                             expression_attribute_names: None,
                             expression_attribute_values: None,
                             return_values: None,
+                            return_old_on_condition_failure: false,
                             aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
                         })
                         .await;
@@ -145,6 +147,7 @@ impl TableAtomicityWorkload {
                             expression_attribute_names: None,
                             expression_attribute_values: Some(expression_attribute_values),
                             return_values: None,
+                            return_old_on_condition_failure: false,
                             aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
                         })
                         .await;

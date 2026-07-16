@@ -7,11 +7,13 @@ pub(super) struct PutItemStreamTtlRequest<T> {
     pub(super) expression_attribute_names: Option<HashMap<String, String>>,
     pub(super) expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub(super) return_values: Option<AllOld>,
+    pub(super) return_old_on_condition_failure: bool,
     pub(super) aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
-    pub(super) async fn put_item_impl(
+    #[allow(clippy::too_many_arguments)]
+    async fn put_item_after_pressure(
         &self,
         table_name: TableName,
         mut item: HashMap<String, AttributeValue>,
@@ -19,13 +21,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        return_old_on_condition_failure: bool,
     ) -> StorageResult<PutItemResponse> {
         if item.is_empty() {
             return Err(StorageError::validation(
                 "Item must have at least one attribute",
             ));
         }
-        apply_gsi_write_pressure(self).await?;
         normalize_attribute_map_numbers_for_write(&mut item);
         let billed_bytes = attr_map_payload_bytes(&item);
         let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
@@ -36,6 +38,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 condition_expression,
                 expression_attribute_names,
                 expression_attribute_values,
+                return_old_on_condition_failure,
                 None,
             )
             .await?;
@@ -49,25 +52,35 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         request: PutItemStreamTtlRequest<HashMap<String, AttributeValue>>,
     ) -> StorageResult<PutItemResponse> {
+        apply_gsi_write_pressure(self).await?;
+        self.put_item_with_stream_ttl_after_pressure(request).await
+    }
+
+    async fn put_item_with_stream_ttl_after_pressure(
+        &self,
+        request: PutItemStreamTtlRequest<HashMap<String, AttributeValue>>,
+    ) -> StorageResult<PutItemResponse> {
         let PutItemStreamTtlRequest {
             table_name,
             mut item,
             condition_expression,
             expression_attribute_names,
-            expression_attribute_values,
+                expression_attribute_values,
             return_values,
-            aux_item_stream_ttl_hours,
+            return_old_on_condition_failure,
+                aux_item_stream_ttl_hours,
         } = request;
 
         if aux_item_stream_ttl_hours.is_none() {
             return self
-                .put_item_impl(
+                .put_item_after_pressure(
                     table_name,
                     item,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
                     return_values,
+                    return_old_on_condition_failure,
                 )
                 .await;
         }
@@ -76,7 +89,6 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 "Item must have at least one attribute",
             ));
         }
-        apply_gsi_write_pressure(self).await?;
         normalize_attribute_map_numbers_for_write(&mut item);
         let billed_bytes = attr_map_payload_bytes(&item);
         let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
@@ -86,8 +98,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 item,
                 condition_expression,
                 expression_attribute_names,
-                expression_attribute_values,
-                aux_item_stream_ttl_hours,
+            expression_attribute_values,
+            return_old_on_condition_failure,
+            aux_item_stream_ttl_hours,
             )
             .await?;
 
@@ -104,8 +117,32 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        return_old_on_condition_failure: bool,
     ) -> StorageResult<PutItemResponse> {
         apply_gsi_write_pressure(self).await?;
+        self.put_item_encode_after_pressure(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            return_old_on_condition_failure,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_item_encode_after_pressure(
+        &self,
+        table_name: TableName,
+        item: WireItem,
+        condition_expression: Option<String>,
+        expression_attribute_names: Option<HashMap<String, String>>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_values: Option<AllOld>,
+        return_old_on_condition_failure: bool,
+    ) -> StorageResult<PutItemResponse> {
         let table_metadata = self
             .get_table_identity_from_name(&table_name)
             .await?
@@ -122,17 +159,19 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             && expression_attribute_names.is_none()
             && expression_attribute_values.is_none()
             && !matches!(return_values, Some(AllOld::AllOld))
+            && !return_old_on_condition_failure
             && !should_write_gsi_immediately;
 
         if !can_wire_native_path {
             return self
-                .put_item_impl(
+                .put_item_after_pressure(
                     table_name,
                     item.into_attribute_map()?,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
                     return_values,
+                    return_old_on_condition_failure,
                 )
                 .await;
         }
@@ -157,6 +196,15 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         request: PutItemStreamTtlRequest<WireItem>,
     ) -> StorageResult<PutItemResponse> {
+        apply_gsi_write_pressure(self).await?;
+        self.put_item_encode_with_stream_ttl_after_pressure(request)
+            .await
+    }
+
+    async fn put_item_encode_with_stream_ttl_after_pressure(
+        &self,
+        request: PutItemStreamTtlRequest<WireItem>,
+    ) -> StorageResult<PutItemResponse> {
         let PutItemStreamTtlRequest {
             table_name,
             item,
@@ -164,31 +212,90 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_old_on_condition_failure,
             aux_item_stream_ttl_hours,
         } = request;
 
         if aux_item_stream_ttl_hours.is_none() {
             return self
-                .put_item_encode_impl(
+                .put_item_encode_after_pressure(
                     table_name,
                     item,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
                     return_values,
+                    return_old_on_condition_failure,
                 )
                 .await;
         }
-        self.put_item_with_stream_ttl_impl(PutItemStreamTtlRequest {
+        self.put_item_with_stream_ttl_after_pressure(PutItemStreamTtlRequest {
             table_name,
             item: item.into_attribute_map()?,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_old_on_condition_failure,
             aux_item_stream_ttl_hours,
         })
         .await
+    }
+
+    pub(super) async fn put_item_request_with_retry_impl(
+        &self,
+        request: PutItemRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<PutItemResponse> {
+        self.retry_put_pressure(policy).await?;
+        self.put_item_with_stream_ttl_after_pressure(PutItemStreamTtlRequest {
+            table_name: request.table_name,
+            item: request.item,
+            condition_expression: request.condition_expression,
+            expression_attribute_names: request.expression_attribute_names,
+            expression_attribute_values: request.expression_attribute_values,
+            return_values: request.return_values,
+            return_old_on_condition_failure:
+                return_values_on_condition_check_failure_all_old(
+                    request.return_values_on_condition_check_failure.as_ref(),
+                ),
+            aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+        })
+        .await
+    }
+
+    pub(super) async fn put_item_encode_with_retry_impl(
+        &self,
+        request: PutItemEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<PutItemResponse> {
+        self.retry_put_pressure(policy).await?;
+        self.put_item_encode_with_stream_ttl_after_pressure(PutItemStreamTtlRequest {
+            table_name: request.table_name,
+            item: request.item,
+            condition_expression: request.condition_expression,
+            expression_attribute_names: request.expression_attribute_names,
+            expression_attribute_values: request.expression_attribute_values,
+            return_values: request.return_values,
+            return_old_on_condition_failure: request.return_old_on_condition_failure,
+            aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+        })
+        .await
+    }
+
+    async fn retry_put_pressure(&self, policy: WriteRetryPolicy) -> StorageResult<()> {
+        for attempt in 0..policy.max_attempts() {
+            match apply_gsi_write_pressure(self).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
+                {
+                    tokio::time::sleep(policy.delay()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("write retry policy always has an attempt")
     }
 
     async fn execute_put_item(
@@ -198,6 +305,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         condition_expression: Option<String>,
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let table_metadata = self
@@ -221,7 +329,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     item,
                     item_stream_ttl_hours: aux_item_stream_ttl_hours,
                     condition,
-                    return_values_on_condition_check_failure: None,
+                    return_values_on_condition_check_failure: return_old_on_condition_failure
+                        .then(|| "ALL_OLD".to_string()),
                     replication: None,
                     ttl_config,
                 }],

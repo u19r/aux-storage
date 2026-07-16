@@ -18,6 +18,7 @@ impl SQLiteStorageProvider {
         key: &KeyAttributes,
         sqlite: &SqliteConn<'_>,
         immediate_gsi_consistency: bool,
+        return_old_on_condition_failure: bool,
         item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<(
         HashMap<String, AttributeValue>,
@@ -26,7 +27,13 @@ impl SQLiteStorageProvider {
         // First, get the item to return it if it exists
         let existing_item = Self::do_get_item(table_name, key, sqlite)?;
         let (item_to_update, updated_item) =
-            plan_update_from_existing_item(existing_item, key, operations, condition.as_ref())?;
+            plan_update_from_existing_item(
+                existing_item,
+                key,
+                operations,
+                condition.as_ref(),
+                return_old_on_condition_failure,
+            )?;
 
         // Try to put the updated item
         let _ = Self::do_put_item(
@@ -35,6 +42,7 @@ impl SQLiteStorageProvider {
             &None,
             sqlite,
             immediate_gsi_consistency,
+            false,
             None,
             item_stream_ttl_hours,
         )?;

@@ -7,10 +7,12 @@ mod constants;
 mod errors;
 mod newtypes;
 mod provider;
+mod query_protocol;
 mod request_fields;
 mod request_validation;
 mod serde_types;
 mod types;
+mod wire_request;
 
 pub use config::*;
 pub use constants::{
@@ -22,7 +24,13 @@ pub use constants::{
 pub use errors::{QueueError, QueueInternalKind, QueueResult, QueueValidationKind};
 pub use newtypes::*;
 pub use provider::QueueProvider;
+pub use query_protocol::query_fields_to_json;
+pub use request_validation::QueueRequestValidation;
 pub use types::*;
+pub use wire_request::{
+    IntoValidatedQueueRequest, QueueAction, QueueRequest, ValidatedQueueRequest,
+    decode_json_request, decode_value_request,
+};
 
 #[cfg(test)]
 mod errors_tests;
@@ -32,3 +40,5 @@ mod newtypes_perf_tests;
 mod newtypes_tests;
 #[cfg(test)]
 mod types_tests;
+#[cfg(test)]
+mod wire_request_tests;

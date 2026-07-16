@@ -161,13 +161,13 @@ xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 
 ############################################
 # Public aux-common shared crates.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "ae3f4b27a8c0c1baa3eaa785b36d0ca12b842cf2" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "0c25157e510be4ef38c4e48eeeb9975882546510" }
 
 ############################################
 # Local path dependencies

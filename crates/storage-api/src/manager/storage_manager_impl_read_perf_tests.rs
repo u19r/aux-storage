@@ -154,6 +154,7 @@ impl ReadPerfFixture {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values: None,
+                return_old_on_condition_failure: false,
                 aux_item_stream_ttl_hours: None,
             })
             .await

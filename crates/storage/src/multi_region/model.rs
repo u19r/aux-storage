@@ -776,6 +776,7 @@ fn put_item_input_from_request(request: PutItemRequest) -> PutItemInput {
         expression_attribute_names: request.expression_attribute_names,
         expression_attribute_values: request.expression_attribute_values,
         return_values: request.return_values,
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
     }
 }

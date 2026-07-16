@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::OnceLock;
 
 // SQLite and Turso both use SQLite's `PRAGMA cache_size` semantics here. A
 // positive value means "pages"; a negative value means "KiB". The production
@@ -40,10 +41,14 @@ const PAGE_CACHE_MEMORY_FRACTION: u64 = 10;
 const BYTES_PER_SQLITE_CACHE_KB: u64 = 1024;
 
 pub(crate) fn sqlite_page_cache_size_kb() -> i32 {
-    let cache_kb = effective_memory_limit_bytes().map_or(DEFAULT_SQLITE_PAGE_CACHE_KB, |limit| {
-        sqlite_page_cache_size_kb_for_memory_limit(limit)
-    });
-    -(cache_kb as i32)
+    static PAGE_CACHE_SIZE_KB: OnceLock<i32> = OnceLock::new();
+    *PAGE_CACHE_SIZE_KB.get_or_init(|| {
+        let cache_kb = effective_memory_limit_bytes()
+            .map_or(DEFAULT_SQLITE_PAGE_CACHE_KB, |limit| {
+                sqlite_page_cache_size_kb_for_memory_limit(limit)
+            });
+        -(cache_kb as i32)
+    })
 }
 
 pub(crate) fn sqlite_page_cache_size_kb_for_memory_limit(memory_limit_bytes: u64) -> u64 {

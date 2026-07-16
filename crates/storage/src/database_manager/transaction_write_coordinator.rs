@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use storage_sync::SyncWriteRequest;
 use storage_types::{
-    DurableTransactWriteGuard, GuardedTransactWriteItemsRequest, StorageError, StorageResult,
-    TableNamespace, TransactWriteItem, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    AttributeValue, DurableTransactWriteGuard, GuardedTransactWriteItemsRequest, StorageEnum,
+    StorageError, StorageResult, TableNamespace, TransactWriteItem, TransactWriteItemsRequest,
+    TransactWriteItemsResponse, context::WrappedError as _,
 };
 
 use crate::{
@@ -27,6 +28,12 @@ struct PreparedTransactWriteItems {
     return_item_collection_metrics: Option<String>,
     pending_routes: HashMap<TableNamespace, NamespaceRouteRecord>,
     cache_effects: storage_cache::RuntimeWriteEffects,
+}
+
+#[derive(Default)]
+struct RoutedTransactWriteItems {
+    request: TransactWriteItemsRequest,
+    shared_table_namespaces: Vec<Option<TableNamespace>>,
 }
 
 impl DatabaseManager {
@@ -205,9 +212,9 @@ impl DatabaseManager {
         &self,
         transact_items: Vec<TransactWriteItem>,
         pending_routes: &HashMap<TableNamespace, NamespaceRouteRecord>,
-    ) -> StorageResult<BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest>> {
+    ) -> StorageResult<BTreeMap<RoutedWriteDispatchKey, RoutedTransactWriteItems>> {
         let default_connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
-        let mut per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest> =
+        let mut per_connection: BTreeMap<RoutedWriteDispatchKey, RoutedTransactWriteItems> =
             BTreeMap::new();
         for item in transact_items {
             let logical_table = transact_item_table_name(&item)?;
@@ -217,6 +224,9 @@ impl DatabaseManager {
             if let Some(route) = route {
                 ensure_route_writes_not_paused(&route)?;
                 let mut routed_item = item;
+                let shared_table_namespace =
+                    (route.storage_mode == NamespaceStorageMode::SharedTable)
+                        .then(|| route.namespace.clone());
                 if route.storage_mode == NamespaceStorageMode::SharedTable {
                     self.request_rewriter
                         .rewrite_transact_item_for_shared_table(
@@ -234,26 +244,31 @@ impl DatabaseManager {
                             &mut routed_item_for_target,
                             target.table_name.clone(),
                         );
-                        per_connection
+                        let batch = per_connection
                             .entry(RoutedWriteDispatchKey {
                                 connection_id: target.connection_id.clone(),
                                 target_role,
                             })
-                            .or_default()
+                            .or_default();
+                        batch
+                            .request
                             .transact_items
                             .push(routed_item_for_target);
+                        batch
+                            .shared_table_namespaces
+                            .push(shared_table_namespace.clone());
                         Ok(())
                     },
                 )?;
             } else {
-                per_connection
+                let batch = per_connection
                     .entry(RoutedWriteDispatchKey {
                         connection_id: default_connection_id.clone(),
                         target_role: RoutedWriteTargetRole::Primary,
                     })
-                    .or_default()
-                    .transact_items
-                    .push(item);
+                    .or_default();
+                batch.request.transact_items.push(item);
+                batch.shared_table_namespaces.push(None);
             }
         }
         Ok(per_connection)
@@ -261,13 +276,14 @@ impl DatabaseManager {
 
     async fn execute_routed_transact_write_items(
         &self,
-        per_connection: BTreeMap<RoutedWriteDispatchKey, TransactWriteItemsRequest>,
+        per_connection: BTreeMap<RoutedWriteDispatchKey, RoutedTransactWriteItems>,
         client_request_token: Option<String>,
         return_consumed_capacity: Option<String>,
         return_item_collection_metrics: Option<String>,
     ) -> StorageResult<TransactWriteItemsResponse> {
         let mut primary_response: Option<TransactWriteItemsResponse> = None;
-        for (dispatch_key, mut request_for_connection) in per_connection {
+        for (dispatch_key, mut batch) in per_connection {
+            let request_for_connection = &mut batch.request;
             request_for_connection.client_request_token = client_request_token.clone();
             request_for_connection.return_consumed_capacity = return_consumed_capacity.clone();
             request_for_connection.return_item_collection_metrics =
@@ -277,9 +293,15 @@ impl DatabaseManager {
             let response = record_storage_operation_for_target(
                 "transact_write_items",
                 dispatch_key.target_role,
-                provider.transact_write_items(request_for_connection),
+                provider.transact_write_items(batch.request),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                self.normalize_routed_transaction_error(
+                    error,
+                    &batch.shared_table_namespaces,
+                )
+            })?;
             if primary_response.is_none() {
                 primary_response = Some(response);
             }
@@ -290,6 +312,45 @@ impl DatabaseManager {
         primary_response.ok_or_else(|| {
             StorageError::internal("transact_write_items routing produced no write targets")
         })
+    }
+
+    fn normalize_routed_transaction_error(
+        &self,
+        error: StorageError,
+        shared_table_namespaces: &[Option<TableNamespace>],
+    ) -> StorageError {
+        let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+            return error;
+        };
+        let mut reasons = reasons.clone();
+        for (reason, namespace) in reasons.iter_mut().zip(shared_table_namespaces) {
+            let Some(namespace) = namespace else {
+                continue;
+            };
+            let mut parts = reason.splitn(3, '\t');
+            if parts.next() != Some("ConditionalCheckFailed") {
+                continue;
+            }
+            let (Some(message), Some(item)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let mut item: HashMap<String, AttributeValue> = match serde_json::from_str(item) {
+                Ok(item) => item,
+                Err(error) => return error.into(),
+            };
+            if let Err(error) = self
+                .request_rewriter
+                .normalize_item_from_shared_table(namespace, &mut item)
+            {
+                return error;
+            }
+            let item = match serde_json::to_string(&item) {
+                Ok(item) => item,
+                Err(error) => return error.into(),
+            };
+            *reason = format!("ConditionalCheckFailed\t{message}\t{item}");
+        }
+        StorageEnum::TransactionCanceled { reasons }.into()
     }
 
     async fn try_cached_guarded_transact_write_items(

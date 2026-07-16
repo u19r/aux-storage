@@ -11,24 +11,26 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, stream};
-use metrics_exporter_prometheus::PrometheusHandle;
 use storage_common::{GSI_BACKFILL_JOB, GSI_UPDATE_JOB, TTL_SWEEP_JOB};
 use storage_condition::Condition;
 use storage_provider::{
-    StorageProvider, StreamDurationTrimBackend, StreamDurationTrimConfig, StreamDurationTrimWorker,
+    AtomicItemReadModifyWriteRequest, AtomicItemWriteDecision, StorageProvider,
+    StreamDurationTrimBackend, StreamDurationTrimConfig, StreamDurationTrimWorker,
     StreamTrimDueMarker, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
 };
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateGlobalSecondaryIndex,
     CreateTableRequest, HIDDEN_TTL_INDEX_PREFIX, IndexName, ItemKey, KeyAttributeType,
-    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, QueryTableRequest,
+    KeyAttributes,
+    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
+    PutItemEncodeRequest, QueryTableRequest,
     ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
     ReplicationMutation, ReplicationWriteSource, ScanTableRequest, SerializesToKey, StorageEnum,
     StorageError, StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration,
     TTL_PARTITION_ATTRIBUTE, TableName, TimeToLiveSpecification, TimeToLiveStatus, TimestampMillis,
     TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
     TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateTableRequest,
-    UpdateTimeToLiveRequest, WireItem,
+    UpdateTimeToLiveRequest, WireItem, WriteRetryPolicy,
 };
 use stream_provider::{StoredStreamPointer, StreamDataType, StreamItem, StreamProvider};
 use tracing_test::traced_test;
@@ -59,6 +61,90 @@ use crate::{
 
 fn create_test_provider() -> TestProvider {
     make_test_provider()
+}
+
+#[tokio::test]
+async fn atomic_item_read_modify_write_preserves_concurrent_updates() {
+    let provider = Arc::new(create_test_provider());
+    provider.initialize_storage().await.unwrap();
+    let table = TableName::new("AtomicItemRmwTable");
+    create_test_table(provider.as_ref(), &table, false).await;
+    let key = KeyAttributes::from(HashMap::from([
+        ("pk".to_string(), AttributeValue::S("counter".to_string())),
+        ("sk".to_string(), AttributeValue::S("state".to_string())),
+    ]));
+
+    let writes = (0..32).map(|_| {
+        let provider = Arc::clone(&provider);
+        let table = table.clone();
+        let key = key.clone();
+        async move {
+            provider
+                .atomic_item_read_modify_write(AtomicItemReadModifyWriteRequest {
+                    table_name: table,
+                    key,
+                    transform: Arc::new(|current| {
+                        let count = current
+                            .and_then(|item| item.get("count"))
+                            .and_then(|value| match value {
+                                AttributeValue::N(value) => value.parse::<u64>().ok(),
+                                _ => None,
+                            })
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        Ok(AtomicItemWriteDecision::Write {
+                            item: HashMap::from([
+                                (
+                                    "pk".to_string(),
+                                    AttributeValue::S("counter".to_string()),
+                                ),
+                                (
+                                    "sk".to_string(),
+                                    AttributeValue::S("state".to_string()),
+                                ),
+                                (
+                                    "count".to_string(),
+                                    AttributeValue::N(count.to_string()),
+                                ),
+                            ]),
+                            additional_items: Vec::new(),
+                            output: count.to_be_bytes().to_vec(),
+                        })
+                    }),
+                })
+                .await
+                .expect("atomic increment")
+        }
+    });
+    let outputs = futures::future::join_all(writes).await;
+    assert_eq!(outputs.len(), 32);
+    let item = provider
+        .get_item_map(table, key, true)
+        .await
+        .unwrap()
+        .expect("counter item");
+    assert_eq!(item.get("count"), Some(&AttributeValue::N("32".to_string())));
+
+    let denied = provider
+        .atomic_item_read_modify_write(AtomicItemReadModifyWriteRequest {
+            table_name: TableName::new("AtomicItemRmwTable"),
+            key: KeyAttributes::from(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("counter".to_string())),
+                ("sk".to_string(), AttributeValue::S("state".to_string())),
+            ])),
+            transform: Arc::new(|current| {
+                assert_eq!(
+                    current.and_then(|item| item.get("count")),
+                    Some(&AttributeValue::N("32".to_string()))
+                );
+                Ok(AtomicItemWriteDecision::NoWrite {
+                    output: b"denied".to_vec(),
+                })
+            }),
+        })
+        .await
+        .expect("atomic no-write decision");
+    assert_eq!(denied, b"denied");
 }
 
 async fn compact_ttl_key_for_item(
@@ -149,15 +235,6 @@ async fn foundationdb_live_port_available() -> bool {
     )
     .await
     .is_ok_and(|result| result.is_ok())
-}
-
-fn metrics_handle() -> &'static PrometheusHandle {
-    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-    HANDLE.get_or_init(|| {
-        metrics_exporter_prometheus::PrometheusBuilder::new()
-            .install_recorder()
-            .expect("install metrics recorder")
-    })
 }
 
 fn metrics_assertion_lock() -> &'static tokio::sync::Mutex<()> {
@@ -308,24 +385,6 @@ fn metric_key(name: &'static str, labels: &[metrics_facade::MetricLabel]) -> Str
         key.push('"');
     }
     key
-}
-
-fn parse_counter(handle: &PrometheusHandle, metric: &str, label_fragments: &[&str]) -> f64 {
-    let body = handle.render();
-    for line in body.lines() {
-        if !line.starts_with(metric) {
-            continue;
-        }
-        if !label_fragments.iter().all(|frag| line.contains(frag)) {
-            continue;
-        }
-        if let Some(value) = line.split_whitespace().last()
-            && let Ok(num) = value.parse::<f64>()
-        {
-            return num;
-        }
-    }
-    0.0
 }
 
 fn global_log_lines() -> Vec<String> {
@@ -6583,7 +6642,19 @@ async fn put_item_encode_updates_stream_and_ttl_side_effects() {
     let wire_item = WireItem::from_attribute_map(&item).expect("wire item");
 
     provider
-        .put_item_encode(table.clone(), wire_item, None, None, None, None)
+        .put_item_encode_with_retry(
+            PutItemEncodeRequest {
+                table_name: table.clone(),
+                item: wire_item,
+                condition_expression: None,
+                expression_attribute_names: None,
+                expression_attribute_values: None,
+                return_values: None,
+                return_old_on_condition_failure: false,
+                aux_item_stream_ttl_hours: None,
+            },
+            WriteRetryPolicy::new(3, Duration::ZERO),
+        )
         .await
         .unwrap();
 
@@ -8952,7 +9023,7 @@ async fn stream_trim_skips_invalid_pointer() {
 #[tokio::test]
 async fn batch_get_item_emits_billed_metrics_for_requested_keys() {
     let _metrics_guard = metrics_assertion_lock().lock().await;
-    let handle = metrics_handle();
+    let (metrics, _facade_guard) = CapturingMetricsFacade::install();
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
 
@@ -8973,9 +9044,6 @@ async fn batch_get_item_emits_billed_metrics_for_requested_keys() {
         "item_kind=\"get\"",
         "direction=\"read\"",
     ];
-    let base_ops = parse_counter(handle, "storage_billed_item_ops_total", &op_fragments);
-    let base_bytes = parse_counter(handle, "storage_logical_item_bytes_total", &op_fragments);
-
     let present_key = HashMap::from([
         ("pk".to_string(), AttributeValue::S("tenant".to_string())),
         ("sk".to_string(), AttributeValue::S("item#1".to_string())),
@@ -9017,17 +9085,26 @@ async fn batch_get_item_emits_billed_metrics_for_requested_keys() {
     ]))
     .unwrap()
     .payload_len() as f64;
-    let after_ops = parse_counter(handle, "storage_billed_item_ops_total", &op_fragments);
-    let after_bytes = parse_counter(handle, "storage_logical_item_bytes_total", &op_fragments);
-
-    assert_eq!(after_ops - base_ops, 2.0);
-    assert_eq!(after_bytes - base_bytes, expected_bytes);
+    assert_eq!(
+        metrics.counter_value(
+            metrics_facade::CounterMetric::StorageBilledItemOpsTotalMetric,
+            &op_fragments,
+        ),
+        2
+    );
+    assert_eq!(
+        metrics.counter_value(
+            metrics_facade::CounterMetric::StorageLogicalItemBytesTotalMetric,
+            &op_fragments,
+        ),
+        expected_bytes as u64
+    );
 }
 
 #[tokio::test]
 async fn transact_write_items_emits_billed_item_breakdown_metrics() {
     let _metrics_guard = metrics_assertion_lock().lock().await;
-    let handle = metrics_handle();
+    let (metrics, _facade_guard) = CapturingMetricsFacade::install();
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
 
@@ -9051,39 +9128,6 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
     }
 
     let write_fragments = ["ddb_op=\"transact_write_items\"", "direction=\"write\""];
-    let base_put_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[write_fragments[0], "item_kind=\"put\"", write_fragments[1]],
-    );
-    let base_update_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"update\"",
-            write_fragments[1],
-        ],
-    );
-    let base_delete_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"delete\"",
-            write_fragments[1],
-        ],
-    );
-    let base_check_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"condition_check\"",
-            write_fragments[1],
-        ],
-    );
-
     provider
         .transact_write_items(TransactWriteItemsRequest {
             transact_items: vec![
@@ -9178,41 +9222,17 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
         .await
         .unwrap();
 
-    let after_put_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[write_fragments[0], "item_kind=\"put\"", write_fragments[1]],
-    );
-    let after_update_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"update\"",
-            write_fragments[1],
-        ],
-    );
-    let after_delete_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"delete\"",
-            write_fragments[1],
-        ],
-    );
-    let after_check_ops = parse_counter(
-        handle,
-        "storage_billed_item_ops_total",
-        &[
-            write_fragments[0],
-            "item_kind=\"condition_check\"",
-            write_fragments[1],
-        ],
-    );
-
-    assert_eq!(after_put_ops - base_put_ops, 1.0);
-    assert_eq!(after_update_ops - base_update_ops, 1.0);
-    assert_eq!(after_delete_ops - base_delete_ops, 1.0);
-    assert_eq!(after_check_ops - base_check_ops, 1.0);
+    for item_kind in ["put", "update", "delete", "condition_check"] {
+        assert_eq!(
+            metrics.counter_value(
+                metrics_facade::CounterMetric::StorageBilledItemOpsTotalMetric,
+                &[
+                    write_fragments[0],
+                    &format!("item_kind=\"{item_kind}\""),
+                    write_fragments[1],
+                ],
+            ),
+            1
+        );
+    }
 }

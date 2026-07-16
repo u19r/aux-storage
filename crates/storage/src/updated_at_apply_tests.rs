@@ -59,11 +59,9 @@ fn document_path_preserves_adjacent_list_indices_and_raw_segments() {
         ("#value".to_string(), "value".to_string()),
     ]);
 
-    let resolved = resolve_update_attribute_name(
-        "payload.#matrix[2][1].items[0].#value",
-        Some(&names),
-    )
-    .expect("all document path segments should remain intact");
+    let resolved =
+        resolve_update_attribute_name("payload.#matrix[2][1].items[0].#value", Some(&names))
+            .expect("all document path segments should remain intact");
 
     assert_eq!(resolved, "payload.matrix[2][1].items[0].value");
 }
@@ -113,9 +111,7 @@ fn top_level_updated_at_placeholder_is_still_recognized() {
         Some("u_at")
     );
     assert_ne!(
-        values
-            .as_ref()
-            .and_then(|values| values.get(":existing")),
+        values.as_ref().and_then(|values| values.get(":existing")),
         Some(&AttributeValue::N("1".to_string()))
     );
 }

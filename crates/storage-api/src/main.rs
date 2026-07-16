@@ -24,6 +24,12 @@ use tracing_subscriber::{
 };
 
 const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "pubsub")]
+const PUBSUB_DELIVERY_IDLE_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "pubsub")]
+const PUBSUB_DELIVERY_ERROR_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "pubsub")]
+const PUBSUB_DELIVERY_BATCH_LIMIT: usize = 100;
 const PROMETHEUS_LATENCY_MS_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
     1000.0, 2500.0, 5000.0, 10000.0,
@@ -273,7 +279,7 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     }
     #[cfg(feature = "pubsub")]
     {
-        app_state.pubsub_manager = pubsub_manager;
+        app_state.pubsub_manager = pubsub_manager.clone();
     }
     let app_state = Arc::new(app_state);
 
@@ -315,6 +321,9 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     let bind_addr = effective.bind_addr;
     let router = router.layer(cors_layer);
 
+    #[cfg(feature = "pubsub")]
+    let pubsub_delivery_worker = pubsub_manager.map(spawn_pubsub_delivery_worker);
+
     if launch.inputs.config_path.is_some() {
         println!("Using runtime config bindings.");
     }
@@ -327,12 +336,40 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
         .map_err(|err| StorageError::internal(&err.to_string()))?;
     println!("Listening on {bind_addr}");
     let shutdown_grace = shutdown_grace_period();
-    axum::serve(listener, router)
+    let server_result = axum::serve(listener, router)
         .with_graceful_shutdown(await_shutdown_signal(shutdown_grace))
-        .await
-        .map_err(|err| StorageError::internal(&err.to_string()))?;
+        .await;
+
+    #[cfg(feature = "pubsub")]
+    if let Some(worker) = pubsub_delivery_worker {
+        worker.abort();
+    }
+
+    server_result.map_err(|err| StorageError::internal(&err.to_string()))?;
 
     Ok(())
+}
+
+#[cfg(feature = "pubsub")]
+fn spawn_pubsub_delivery_worker(manager: Arc<pubsub::PubsubManager>) -> JoinHandle<()> {
+    spawn_named("storage-api-pubsub-delivery", async move {
+        loop {
+            match manager
+                .process_due_deliveries(PUBSUB_DELIVERY_BATCH_LIMIT)
+                .await
+            {
+                Ok(0) => tokio::time::sleep(PUBSUB_DELIVERY_IDLE_INTERVAL).await,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "pubsub delivery worker failed; retrying"
+                    );
+                    tokio::time::sleep(PUBSUB_DELIVERY_ERROR_INTERVAL).await;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(feature = "queue")]

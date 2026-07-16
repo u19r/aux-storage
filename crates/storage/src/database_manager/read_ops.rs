@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use futures::future::join_all;
 use storage_cache::batch_request_has_items;
 use storage_provider::StorageProvider;
 use storage_types::{
@@ -14,12 +15,32 @@ use stream::StreamError;
 use crate::{
     ScanTableInput,
     cache_batch_get_runtime::{request_contains_consistent_reads, strong_only_batch_get_request},
+    cache_point_read_runtime::{PreparedPointReadCacheRead, StoragePointReadCacheRuntime},
     database_manager::{
-        DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, decode_wire_items_to_decoded,
-        decode_wire_items_to_maps, normalize_wire_items_for_shared_table, record_storage_operation,
+        DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, ResolvedBatchGetPlan, ResolvedGetItem,
+        decode_wire_items_to_decoded, decode_wire_items_to_maps,
+        normalize_wire_items_for_shared_table, record_storage_operation,
     },
     namespace_routing::{NamespaceRequestRewriter, NamespaceStorageMode},
 };
+
+pub(super) struct RoutedBatchGetTarget {
+    pub(super) logical_table: TableName,
+    pub(super) shared_namespace: Option<TableNamespace>,
+}
+
+pub(super) struct RoutedBatchGetRequest {
+    pub(super) connection_id: String,
+    pub(super) request: BatchGetItemRequest,
+    pub(super) targets: HashMap<TableName, RoutedBatchGetTarget>,
+}
+
+pub(super) struct RoutedBatchGetTable {
+    pub(super) connection_id: String,
+    pub(super) physical_table: TableName,
+    pub(super) target: RoutedBatchGetTarget,
+    pub(super) keys_and_attributes: KeysAndAttributes,
+}
 
 impl DatabaseManager {
     pub async fn get_item_map<K>(
@@ -55,7 +76,7 @@ impl DatabaseManager {
     where
         K: Into<KeyAttributes>,
     {
-        let mut key = key.into();
+        let key = key.into();
         let point_read_runtime = self.cache_point_read_runtime();
         let prepared_cache_read = point_read_runtime
             .prepare_get(&table_name, &key, consistent_read)
@@ -63,19 +84,65 @@ impl DatabaseManager {
         if let Some(item) = prepared_cache_read.cache_hit() {
             return Ok(item);
         }
+        let resolved = self
+            .resolve_storage_operation(table_name)
+            .await?
+            .validate_key(key)?;
+        self.get_item_from_resolved_operation(
+            resolved,
+            consistent_read,
+            &point_read_runtime,
+            &prepared_cache_read,
+        )
+        .await
+    }
 
-        let table_info = self.get_table_info_arc(&table_name).await?;
-        storage_types::validate_key_attributes_for_schema(&table_info.key_schema, &key)?;
+    pub async fn get_item_with_resolved_operation(
+        &self,
+        resolved: ResolvedGetItem,
+        consistent_read: bool,
+    ) -> StorageResult<Option<WireItem>> {
+        let point_read_runtime = self.cache_point_read_runtime();
+        let prepared_cache_read = point_read_runtime
+            .prepare_get(
+                &resolved.operation.logical_table_name,
+                &resolved.key,
+                consistent_read,
+            )
+            .await?;
+        if let Some(item) = prepared_cache_read.cache_hit() {
+            return Ok(item);
+        }
+        self.get_item_from_resolved_operation(
+            resolved,
+            consistent_read,
+            &point_read_runtime,
+            &prepared_cache_read,
+        )
+        .await
+    }
 
-        if let Some(route) = self.resolve_namespace_route_for_table(&table_name).await? {
+    async fn get_item_from_resolved_operation(
+        &self,
+        resolved: ResolvedGetItem,
+        consistent_read: bool,
+        point_read_runtime: &StoragePointReadCacheRuntime<'_>,
+        prepared_cache_read: &PreparedPointReadCacheRead,
+    ) -> StorageResult<Option<WireItem>> {
+        let ResolvedGetItem {
+            operation,
+            mut key,
+        } = resolved;
+        let table_name = operation.logical_table_name;
+        if let Some(route) = operation.route {
             if route.storage_mode == NamespaceStorageMode::SharedTable {
                 self.request_rewriter
                     .rewrite_key_for_shared_table(&route.namespace, &mut key)?;
             }
             let provider = self.provider_for_connection(&route.read_target.connection_id)?;
             let mut item = if should_try_strong_read_through_warming(
-                &point_read_runtime,
-                &prepared_cache_read,
+                point_read_runtime,
+                prepared_cache_read,
                 consistent_read,
             ) && route.storage_mode != NamespaceStorageMode::SharedTable
             {
@@ -91,8 +158,8 @@ impl DatabaseManager {
                 {
                     Ok(proof) => {
                         item_from_durable_proof_for_cache_warming(
-                            &point_read_runtime,
-                            &prepared_cache_read,
+                            point_read_runtime,
+                            prepared_cache_read,
                             proof,
                         )
                         .await?
@@ -128,8 +195,8 @@ impl DatabaseManager {
         }
 
         let result = if should_try_strong_read_through_warming(
-            &point_read_runtime,
-            &prepared_cache_read,
+            point_read_runtime,
+            prepared_cache_read,
             consistent_read,
         ) {
             match record_storage_operation(
@@ -145,8 +212,8 @@ impl DatabaseManager {
             {
                 Ok(proof) => {
                     item_from_durable_proof_for_cache_warming(
-                        &point_read_runtime,
-                        &prepared_cache_read,
+                        point_read_runtime,
+                        prepared_cache_read,
                         proof,
                     )
                     .await?
@@ -314,6 +381,22 @@ impl DatabaseManager {
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
+        self.batch_get_item_with_plan(request, None).await
+    }
+
+    pub async fn batch_get_item_resolved(
+        &self,
+        request: BatchGetItemRequest,
+        plan: ResolvedBatchGetPlan,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        self.batch_get_item_with_plan(request, Some(plan)).await
+    }
+
+    async fn batch_get_item_with_plan(
+        &self,
+        request: BatchGetItemRequest,
+        mut plan: Option<ResolvedBatchGetPlan>,
+    ) -> StorageResult<BatchGetWireItemResponse> {
         let batch_get_cache = self.cache_batch_get_runtime();
         let prepared_cache_read = batch_get_cache.prepare(request).await?;
         let db_request = prepared_cache_read.db_request;
@@ -349,11 +432,17 @@ impl DatabaseManager {
 
         let default_connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
         let mut routed_requests = Vec::with_capacity(request_items.len());
+        let mut grouped_requests = HashMap::<String, RoutedBatchGetRequest>::new();
 
         for (logical_table, mut keys_and_attributes) in request_items {
-            let route = self
-                .resolve_namespace_route_for_table(&logical_table)
-                .await?;
+            let route = match plan.as_mut() {
+                Some(plan) => plan
+                    .operations
+                    .remove(&logical_table)
+                    .ok_or_else(|| StorageError::internal("resolved BatchGet plan is incomplete"))?
+                    .route,
+                None => self.resolve_namespace_route_for_table(&logical_table).await?,
+            };
             let (connection_id, physical_table, shared_namespace) = if let Some(route) = route {
                 if route.storage_mode == NamespaceStorageMode::SharedTable {
                     for key in &mut keys_and_attributes.keys {
@@ -370,42 +459,95 @@ impl DatabaseManager {
             } else {
                 (default_connection_id.clone(), logical_table.clone(), None)
             };
-            routed_requests.push((
-                connection_id,
-                logical_table,
-                shared_namespace,
-                BatchGetItemRequest {
-                    request_items: HashMap::from([(physical_table, keys_and_attributes)]),
-                    return_consumed_capacity: return_consumed_capacity.clone(),
+            insert_routed_batch_get_table(
+                &mut routed_requests,
+                &mut grouped_requests,
+                &return_consumed_capacity,
+                RoutedBatchGetTable {
+                    connection_id,
+                    physical_table,
+                    target: RoutedBatchGetTarget {
+                        logical_table,
+                        shared_namespace,
+                    },
+                    keys_and_attributes,
                 },
-            ));
+            );
         }
+        routed_requests.extend(grouped_requests.into_values());
+        routed_requests.sort_by(|left, right| {
+            left.connection_id
+                .cmp(&right.connection_id)
+                .then_with(|| {
+                    left.request
+                        .request_items
+                        .keys()
+                        .map(TableName::as_ref)
+                        .min()
+                        .cmp(
+                            &right
+                                .request
+                                .request_items
+                                .keys()
+                                .map(TableName::as_ref)
+                                .min(),
+                        )
+                })
+        });
 
         let mut merged_responses: HashMap<TableName, Vec<WireItem>> =
             HashMap::with_capacity(routed_requests.len());
         let mut merged_unprocessed = HashMap::new();
-        for (connection_id, logical_table, shared_namespace, request) in routed_requests {
-            let provider = self.provider_for_request_connection(&connection_id)?;
-            if connection_id == default_connection_id {
-                warm_strong_batch_read_through(
-                    &batch_get_cache,
-                    provider.as_ref(),
-                    &request,
-                    Some(RoutedBatchProofTarget {
-                        logical_table: &logical_table,
-                        shared_namespace: shared_namespace.as_ref(),
-                        request_rewriter: &self.request_rewriter,
-                    }),
+        let routed_responses = join_all(routed_requests.into_iter().map(|routed| {
+            let batch_get_cache = &batch_get_cache;
+            async move {
+                let provider = self.provider_for_request_connection(&routed.connection_id)?;
+                if routed.connection_id == ROUTED_DEFAULT_CONNECTION_ID {
+                    let (physical_table, target) = routed.targets.iter().next().ok_or_else(|| {
+                        StorageError::internal("routed BatchGet request has no response target")
+                    })?;
+                    if routed.targets.len() != 1 {
+                        return Err(StorageError::internal(
+                            "default BatchGet cache warming requires one response target",
+                        ));
+                    }
+                    warm_strong_batch_read_through(
+                        batch_get_cache,
+                        provider.as_ref(),
+                        &routed.request,
+                        Some(RoutedBatchProofTarget {
+                            logical_table: &target.logical_table,
+                            shared_namespace: target.shared_namespace.as_ref(),
+                            request_rewriter: &self.request_rewriter,
+                        }),
+                    )
+                    .await?;
+                    if !routed.request.request_items.contains_key(physical_table) {
+                        return Err(StorageError::internal(
+                            "routed BatchGet response target has no request table",
+                        ));
+                    }
+                }
+                let response = record_storage_operation(
+                    "batch_get_item",
+                    provider.batch_get_item(routed.request),
                 )
                 .await?;
+                Ok::<_, StorageError>((routed.targets, response))
             }
-            let response =
-                record_storage_operation("batch_get_item", provider.batch_get_item(request))
-                    .await?;
+        }))
+        .await
+        .into_iter()
+        .collect::<StorageResult<Vec<_>>>()?;
+        for (targets, response) in routed_responses {
             if let Some(responses) = response.responses {
-                for (_, items) in responses {
-                    let mut items = items;
-                    if let Some(namespace) = shared_namespace.as_ref() {
+                for (physical_table, mut items) in responses {
+                    let target = targets.get(&physical_table).ok_or_else(|| {
+                        StorageError::internal(
+                            "BatchGet provider returned an unexpected response table",
+                        )
+                    })?;
+                    if let Some(namespace) = target.shared_namespace.as_ref() {
                         normalize_wire_items_for_shared_table(
                             &self.request_rewriter,
                             namespace,
@@ -413,22 +555,26 @@ impl DatabaseManager {
                         )?;
                     }
                     merged_responses
-                        .entry(logical_table.clone())
+                        .entry(target.logical_table.clone())
                         .or_default()
                         .extend(items);
                 }
             }
             if let Some(unprocessed_keys) = response.unprocessed_keys {
-                for (_, keys) in unprocessed_keys {
-                    let mut keys = keys;
-                    if let Some(namespace) = shared_namespace.as_ref() {
+                for (physical_table, mut keys) in unprocessed_keys {
+                    let target = targets.get(&physical_table).ok_or_else(|| {
+                        StorageError::internal(
+                            "BatchGet provider returned an unexpected unprocessed table",
+                        )
+                    })?;
+                    if let Some(namespace) = target.shared_namespace.as_ref() {
                         normalize_unprocessed_keys_for_shared_table(
                             &self.request_rewriter,
                             namespace,
                             &mut keys,
                         )?;
                     }
-                    merged_unprocessed.insert(logical_table.clone(), keys);
+                    merged_unprocessed.insert(target.logical_table.clone(), keys);
                 }
             }
         }
@@ -461,6 +607,50 @@ impl DatabaseManager {
         self.get_stream_records(table_name, &key_schema, &stream_spec, page_token, limit)
             .await
     }
+}
+
+pub(super) fn insert_routed_batch_get_table(
+    isolated: &mut Vec<RoutedBatchGetRequest>,
+    grouped: &mut HashMap<String, RoutedBatchGetRequest>,
+    return_consumed_capacity: &Option<String>,
+    table: RoutedBatchGetTable,
+) {
+    let RoutedBatchGetTable {
+        connection_id,
+        physical_table,
+        target,
+        keys_and_attributes,
+    } = table;
+    let can_group = connection_id != ROUTED_DEFAULT_CONNECTION_ID
+        && target.shared_namespace.is_none();
+    if can_group {
+        let request = grouped
+            .entry(connection_id.clone())
+            .or_insert_with(|| RoutedBatchGetRequest {
+                connection_id: connection_id.clone(),
+                request: BatchGetItemRequest {
+                    request_items: HashMap::new(),
+                    return_consumed_capacity: return_consumed_capacity.clone(),
+                },
+                targets: HashMap::new(),
+            });
+        if !request.request.request_items.contains_key(&physical_table) {
+            request
+                .request
+                .request_items
+                .insert(physical_table.clone(), keys_and_attributes);
+            request.targets.insert(physical_table, target);
+            return;
+        }
+    }
+    isolated.push(RoutedBatchGetRequest {
+        connection_id,
+        request: BatchGetItemRequest {
+            request_items: HashMap::from([(physical_table.clone(), keys_and_attributes)]),
+            return_consumed_capacity: return_consumed_capacity.clone(),
+        },
+        targets: HashMap::from([(physical_table, target)]),
+    });
 }
 
 fn should_try_strong_read_through_warming(

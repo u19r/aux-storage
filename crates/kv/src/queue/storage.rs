@@ -43,9 +43,10 @@ pub struct QueueClaimRange {
 #[derive(Clone, Debug)]
 pub struct PartitionedQueueMessageWrite {
     pub(crate) state_key: Vec<u8>,
-    pub(crate) state_bytes: Vec<u8>,
+    pub(crate) state_bytes: Arc<[u8]>,
     pub(crate) payload_key: Vec<u8>,
-    pub(crate) payload_bytes: Vec<u8>,
+    pub(crate) payload_bytes: Arc<[u8]>,
+    pub(crate) payload_record_bytes: Option<Arc<[u8]>>,
     pub(crate) ready_key: Vec<u8>,
     pub(crate) ready_hint_key: Vec<u8>,
     pub(crate) ready_hint_bytes: Vec<u8>,
@@ -159,7 +160,7 @@ where
     let mut operations = vec![
         DirectWriteOperation::Put {
             key: message.state_key,
-            value: message.state_bytes,
+            value: message.state_bytes.as_ref().to_vec(),
         },
         DirectWriteOperation::Put {
             key: message.ready_key,
@@ -176,7 +177,10 @@ where
     ];
     operations.extend(queue_payload_write_operations(
         message.payload_key,
-        message.payload_bytes,
+        message.payload_bytes.as_ref().to_vec(),
+        message
+            .payload_record_bytes
+            .map(|bytes| bytes.as_ref().to_vec()),
     )?);
     store.transact_write_unchecked(operations).await
 }
@@ -184,6 +188,7 @@ where
 pub(crate) fn queue_payload_write_operations(
     payload_key: Vec<u8>,
     payload_bytes: Vec<u8>,
+    payload_record_bytes: Option<Vec<u8>>,
 ) -> StorageResult<Vec<DirectWriteOperation>> {
     if payload_bytes.len() <= QUEUE_PAYLOAD_CHUNK_BYTES {
         return Ok(vec![DirectWriteOperation::Put {
@@ -195,15 +200,13 @@ pub(crate) fn queue_payload_write_operations(
     let chunks = payload_bytes
         .chunks(QUEUE_PAYLOAD_CHUNK_BYTES)
         .collect::<Vec<_>>();
-    let chunk_count = u16::try_from(chunks.len())
-        .map_err(|_| StorageError::internal("queue payload chunk count exceeds u16"))?;
     let mut operations = Vec::with_capacity(chunks.len().saturating_add(1));
+    let record_bytes = payload_record_bytes.ok_or_else(|| {
+        StorageError::internal("chunked queue payload is missing its prepared record")
+    })?;
     operations.push(DirectWriteOperation::Put {
         key: payload_key.clone(),
-        value: storage_types::storage_serde::to_bytes(&QueuePayloadRecord::Chunked {
-            chunks: chunk_count,
-            total_len: payload_bytes.len(),
-        })?,
+        value: record_bytes,
     });
     for (index, chunk) in chunks.into_iter().enumerate() {
         operations.push(DirectWriteOperation::Put {
@@ -262,7 +265,7 @@ pub(crate) fn queue_payload_is_chunk_key(payload_key: &[u8]) -> bool {
         .any(|window| window == QUEUE_PAYLOAD_CHUNK_KEY_SEGMENT)
 }
 
-fn queue_payload_chunk_key(payload_key: &[u8], index: u16) -> Vec<u8> {
+pub(crate) fn queue_payload_chunk_key(payload_key: &[u8], index: u16) -> Vec<u8> {
     let mut key = Vec::with_capacity(
         payload_key
             .len()
@@ -273,6 +276,22 @@ fn queue_payload_chunk_key(payload_key: &[u8], index: u16) -> Vec<u8> {
     key.extend_from_slice(QUEUE_PAYLOAD_CHUNK_KEY_SEGMENT);
     key.extend_from_slice(format!("{index:04x}").as_bytes());
     key
+}
+
+pub(crate) fn queue_payload_record_bytes(
+    payload_len: usize,
+) -> StorageResult<Option<Vec<u8>>> {
+    if payload_len <= QUEUE_PAYLOAD_CHUNK_BYTES {
+        return Ok(None);
+    }
+    let chunks = payload_len.div_ceil(QUEUE_PAYLOAD_CHUNK_BYTES);
+    let chunks = u16::try_from(chunks)
+        .map_err(|_| StorageError::internal("queue payload chunk count exceeds u16"))?;
+    storage_types::storage_serde::to_bytes(&QueuePayloadRecord::Chunked {
+        chunks,
+        total_len: payload_len,
+    })
+    .map(Some)
 }
 
 const QUEUE_PAYLOAD_CHUNK_KEY_SEGMENT: &[u8] = b"/chunk/";
@@ -535,3 +554,4 @@ fn rotate_claim_candidates(items: &mut [QueueReadyEntry], seed: u64) {
     let offset = usize::try_from(seed % u64::try_from(items.len()).unwrap_or(1)).unwrap_or(0);
     items.rotate_left(offset);
 }
+use std::sync::Arc;

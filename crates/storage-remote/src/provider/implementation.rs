@@ -14,7 +14,7 @@ use serde_json::Value;
 use storage_provider::{RemoteCredentialStrategy, RemoteStorageSettings, StorageProvider};
 use storage_sync::{SYNC_LEADER_HINT_HEADER, SYNC_NOT_LEADER_ERROR_TYPE};
 use storage_types::{
-    AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
+    AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
     BatchWriteItemResponse, CreateTableRequest, CreateTableResponse, DeleteItemRequest,
     DeleteItemResponse, DeleteTableRequest, DeleteTableResponse, DescribeTableRequest,
     DescribeTableResponse, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, DurationSeconds,
@@ -445,25 +445,12 @@ impl StorageProvider for RemoteStorageProvider {
         skip_all,
         fields(feature = "storage",
             ddb_op = "put_item",
-            table_name = %table_name,
+            table_name = %request.table_name,
             ddb_write = true,
             items_updated = tracing::field::Empty,
         )
     )]
-    async fn put_item(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse> {
-        let request = PutItemRequest::new(table_name, item)
-            .with_condition_expression(condition_expression)
-            .with_expression_attribute_names(expression_attribute_names)
-            .with_expression_attribute_values(expression_attribute_values)
-            .with_return_values(return_values);
+    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
         let response = self.invoke("DynamoDB_20120810.PutItem", &request).await?;
         record_items_updated(1);
         record_write_cost("put_item", "put", 1, attr_map_payload_bytes(&request.item));
@@ -504,23 +491,15 @@ impl StorageProvider for RemoteStorageProvider {
         skip_all,
         fields(feature = "storage",
             ddb_op = "delete_item",
-            table_name = %table_name,
+            table_name = %request.table_name,
             ddb_write = true,
             items_updated = tracing::field::Empty,
         )
     )]
-    async fn delete_item(
+    async fn delete_item_request(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        let request = DeleteItemRequest::new(table_name, key)
-            .with_condition_expression(condition_expression)
-            .with_expression_attribute_names(expression_attribute_names)
-            .with_expression_attribute_values(expression_attribute_values);
         let response: DeleteItemResponse = self
             .invoke("DynamoDB_20120810.DeleteItem", &request)
             .await?;

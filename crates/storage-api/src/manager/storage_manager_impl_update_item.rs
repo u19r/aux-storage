@@ -10,7 +10,7 @@ use crate::{
     manager::{
         StorageApiManagerImpl,
         storage_manager_impl_condition_failure::{
-            conditional_failure_with_old_item, should_return_old_item_on_condition_failure,
+            should_return_old_item_on_condition_failure,
         },
         storage_manager_impl_sync_write_proposer::sync_response_at,
     },
@@ -22,26 +22,18 @@ impl StorageApiManagerImpl {
         &self,
         request: UpdateItemRequest,
     ) -> Result<Response, HttpApiError> {
-        let table_info = self.db().get_table_info(&request.table_name).await?;
-        validate_transact_key(&table_info, &request.key).map_err(key_validation_error)?;
-        let old_item_on_condition_failure = if should_return_old_item_on_condition_failure(
+        let operation = self
+            .db()
+            .resolve_storage_operation(request.table_name.clone())
+            .await?;
+        validate_transact_key(operation.table_info(), &request.key).map_err(key_validation_error)?;
+        let return_old_on_condition_failure = should_return_old_item_on_condition_failure(
             request.condition_expression.as_deref(),
             request.return_values_on_condition_check_failure.as_ref(),
-        ) {
-            self.db()
-                .get_item_map_with_consistent_read(
-                    request.table_name.clone(),
-                    request.key.clone(),
-                    true,
-                )
-                .await?
-                .map(Into::into)
-        } else {
-            None
-        };
+        );
 
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::UpdateItem(request.clone()))
+            .propose_sync_write_if_configured(|| SyncWriteRequest::UpdateItem(request.clone()))
             .await?
         {
             return Ok(Response::UpdateItem(sync_response_at(
@@ -51,9 +43,7 @@ impl StorageApiManagerImpl {
             )?));
         }
 
-        let result = self
-            .db()
-            .update_item(UpdateItemInput {
+        let input = UpdateItemInput {
                 table_name: request.table_name,
                 key: request.key,
                 update_expression: request.update_expression.unwrap_or_default(),
@@ -61,12 +51,13 @@ impl StorageApiManagerImpl {
                 expression_attribute_names: request.expression_attribute_names,
                 expression_attribute_values: request.expression_attribute_values,
                 return_values: request.return_values,
+                return_old_on_condition_failure,
                 aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
-            })
-            .await
-            .map_err(|error| {
-                conditional_failure_with_old_item(error, old_item_on_condition_failure)
-            })?;
+            };
+        let result = self
+            .db()
+            .update_item_with_resolved_operation(operation, input)
+            .await?;
 
         Ok(Response::UpdateItem(result))
     }

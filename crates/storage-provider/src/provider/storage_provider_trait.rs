@@ -6,17 +6,20 @@ use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
     BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableBatchPointReadProof,
     DurableBatchPointReadProofEntry, DurableBatchPointReadRequest, DurablePointReadProof,
-    DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
+    DeleteItemRequest, DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
     GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, ItemVersionedWireItem,
-    KeyAttributes, KeySchemaElement, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    KeyAttributes, KeySchemaElement, PutItemEncodeRequest, PutItemRequest, PutItemResponse,
+    QueryTableRequest,
+    ReadSequenceConsistency,
     ReplicationMutation, ScanTableRequest, SplitDynamoItem, StorageError, StorageResult,
     StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
     TransactWriteItemsEncodeRequest, UpdateItemRequest, UpdateItemResponse, WireItem,
+    WriteRetryPolicy,
 };
 
 use crate::{
-    AttributeValue, ChangeIndexMarker, ListChangeIndexMarkersRequest, StreamTrimDueMarker,
-    StreamTrimState,
+    AtomicItemReadModifyWriteRequest, AttributeValue, ChangeIndexMarker,
+    ListChangeIndexMarkersRequest, StreamTrimDueMarker, StreamTrimState,
 };
 
 /// Provider-owned read context for operations that must share one backend
@@ -129,7 +132,16 @@ pub trait StorageProvider: Send + Sync {
         request: &CreateTableRequest,
     ) -> StorageResult<()>;
 
-    /// Store an item in a table
+    async fn atomic_item_read_modify_write(
+        &self,
+        _request: AtomicItemReadModifyWriteRequest,
+    ) -> StorageResult<Vec<u8>> {
+        Err(StorageError::unsupported(
+            "atomic item read-modify-write is not supported by this provider",
+        ))
+    }
+
+    /// Store an item in a table.
     async fn put_item(
         &self,
         table_name: TableName,
@@ -138,7 +150,16 @@ pub trait StorageProvider: Send + Sync {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse>;
+    ) -> StorageResult<PutItemResponse> {
+        self.put_item_request(
+            PutItemRequest::new(table_name, item)
+                .with_condition_expression(condition_expression)
+                .with_expression_attribute_names(expression_attribute_names)
+                .with_expression_attribute_values(expression_attribute_values)
+                .with_return_values(return_values),
+        )
+        .await
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn put_item_with_stream_ttl(
@@ -151,18 +172,43 @@ pub trait StorageProvider: Send + Sync {
         return_values: Option<AllOld>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<PutItemResponse> {
-        if aux_item_stream_ttl_hours.is_some() {
-            return Err(StorageError::unsupported_custom_stream_duration());
+        let mut request = PutItemRequest::new(table_name, item)
+            .with_condition_expression(condition_expression)
+            .with_expression_attribute_names(expression_attribute_names)
+            .with_expression_attribute_values(expression_attribute_values)
+            .with_return_values(return_values);
+        request.aux_item_stream_ttl_hours = aux_item_stream_ttl_hours;
+        self.put_item_request(request).await
+    }
+
+    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse>;
+
+    async fn put_item_request_with_retry(
+        &self,
+        request: PutItemRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<PutItemResponse> {
+        if policy.max_attempts() <= 1 {
+            return self.put_item_request(request).await;
         }
-        self.put_item(
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-        )
-        .await
+        let mut request = Some(request);
+        for attempt in 0..policy.max_attempts() {
+            let attempt_request = if attempt + 1 == policy.max_attempts() {
+                request.take().expect("put request is available")
+            } else {
+                request.as_ref().expect("put request is available").clone()
+            };
+            match self.put_item_request(attempt_request).await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
+                {
+                    tokio::time::sleep(policy.delay()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("write retry policy always has an attempt")
     }
 
     /// Store a wire-encoded item in a table.
@@ -216,6 +262,65 @@ pub trait StorageProvider: Send + Sync {
         .await
     }
 
+    async fn put_item_encode_with_retry(
+        &self,
+        request: PutItemEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<PutItemResponse> {
+        if policy.max_attempts() <= 1 {
+            if request.return_old_on_condition_failure {
+                return self
+                    .put_item_request(PutItemRequest {
+                        table_name: request.table_name,
+                        item: request.item.into_attribute_map()?,
+                        condition_expression: request.condition_expression,
+                        expression_attribute_names: request.expression_attribute_names,
+                        expression_attribute_values: request.expression_attribute_values,
+                        expected: None,
+                        conditional_operator: None,
+                        return_values: request.return_values,
+                        return_consumed_capacity: None,
+                        return_item_collection_metrics: None,
+                        return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
+                        aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+                    })
+                    .await;
+            }
+            return self
+                .put_item_encode_with_stream_ttl(
+                    request.table_name,
+                    request.item,
+                    request.condition_expression,
+                    request.expression_attribute_names,
+                    request.expression_attribute_values,
+                    request.return_values,
+                    request.aux_item_stream_ttl_hours,
+                )
+                .await;
+        }
+        let mut request = Some(request);
+        for attempt in 0..policy.max_attempts() {
+            let attempt_request = if attempt + 1 == policy.max_attempts() {
+                request.take().expect("put request is available")
+            } else {
+                request.as_ref().expect("put request is available").clone()
+            };
+            match self
+                .put_item_encode_with_retry(attempt_request, WriteRetryPolicy::no_retry())
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
+                {
+                    tokio::time::sleep(policy.delay()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("write retry policy always has an attempt")
+    }
+
     /// Retrieve an item from a table
     async fn get_item(
         &self,
@@ -260,7 +365,7 @@ pub trait StorageProvider: Send + Sync {
         })
     }
 
-    /// Delete an item from a table and optionally return the deleted item
+    /// Delete an item from a table and optionally return the deleted item.
     async fn delete_item(
         &self,
         table_name: TableName,
@@ -268,7 +373,15 @@ pub trait StorageProvider: Send + Sync {
         condition_expression: Option<String>,
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>>;
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        self.delete_item_request(
+            DeleteItemRequest::new(table_name, key)
+                .with_condition_expression(condition_expression)
+                .with_expression_attribute_names(expression_attribute_names)
+                .with_expression_attribute_values(expression_attribute_values),
+        )
+        .await
+    }
 
     async fn delete_item_with_stream_ttl(
         &self,
@@ -279,18 +392,18 @@ pub trait StorageProvider: Send + Sync {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        if aux_item_stream_ttl_hours.is_some() {
-            return Err(StorageError::unsupported_custom_stream_duration());
-        }
-        self.delete_item(
-            table_name,
-            key,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-        )
-        .await
+        let mut request = DeleteItemRequest::new(table_name, key)
+            .with_condition_expression(condition_expression)
+            .with_expression_attribute_names(expression_attribute_names)
+            .with_expression_attribute_values(expression_attribute_values);
+        request.aux_item_stream_ttl_hours = aux_item_stream_ttl_hours;
+        self.delete_item_request(request).await
     }
+
+    async fn delete_item_request(
+        &self,
+        request: DeleteItemRequest,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>>;
 
     async fn guarded_put_item(
         &self,
@@ -470,6 +583,34 @@ pub trait StorageProvider: Send + Sync {
     ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
         let mapped = storage_types::TransactWriteItemsRequest::try_from(request)?;
         self.transact_write_items(mapped).await
+    }
+
+    async fn transact_write_items_encode_with_retry(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
+        if policy.max_attempts() <= 1 {
+            return self.transact_write_items_encode(request).await;
+        }
+        let mut request = Some(request);
+        for attempt in 0..policy.max_attempts() {
+            let attempt_request = if attempt + 1 == policy.max_attempts() {
+                request.take().expect("retry request")
+            } else {
+                request.as_ref().expect("retry request").clone()
+            };
+            match self.transact_write_items_encode(attempt_request).await {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
+                {
+                    tokio::time::sleep(policy.delay()).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("write retry loop has at least one attempt")
     }
 
     async fn update_table(

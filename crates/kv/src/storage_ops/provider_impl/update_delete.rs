@@ -70,6 +70,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         condition_expression: Option<String>,
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         if key.is_empty() {
@@ -100,7 +101,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     item_stream_ttl_hours: aux_item_stream_ttl_hours,
                     use_key_attributes_for_missing_item_condition: true,
                     condition,
-                    return_values_on_condition_check_failure: None,
+                    return_values_on_condition_check_failure: return_old_on_condition_failure
+                        .then(|| "ALL_OLD".to_string()),
                     replication: None,
                     ttl_config,
                 }],
@@ -266,6 +268,7 @@ fn is_terminal_update_error(error: &StorageEnum) -> bool {
     matches!(
         error,
         StorageEnum::ConditionalCheckFailed
+            | StorageEnum::ConditionalCheckFailedWithItem { .. }
             | StorageEnum::TransactionCanceled { .. }
             | StorageEnum::InternalServerError { .. }
     )

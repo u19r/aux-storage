@@ -65,6 +65,63 @@ pub(crate) struct DatabaseManagerTestPauseHandle {
     state: Arc<DatabaseManagerTestPauseState>,
 }
 
+#[derive(Clone)]
+pub struct ResolvedStorageOperation {
+    pub(super) logical_table_name: TableName,
+    pub(super) table_info: Arc<StoredTableInfo>,
+    pub(super) route: Option<NamespaceRoute>,
+}
+
+pub struct ResolvedBatchGetPlan {
+    pub(super) operations: HashMap<TableName, ResolvedStorageOperation>,
+}
+
+impl ResolvedBatchGetPlan {
+    #[must_use]
+    pub fn new(operations: Vec<ResolvedStorageOperation>) -> Self {
+        Self {
+            operations: operations
+                .into_iter()
+                .map(|operation| (operation.logical_table_name.clone(), operation))
+                .collect(),
+        }
+    }
+}
+
+impl ResolvedStorageOperation {
+    #[must_use]
+    pub fn table_info(&self) -> &StoredTableInfo {
+        &self.table_info
+    }
+
+    pub fn validate_key(self, key: KeyAttributes) -> StorageResult<ResolvedGetItem> {
+        storage_types::validate_key_attributes_for_schema(&self.table_info.key_schema, &key)?;
+        Ok(ResolvedGetItem {
+            operation: self,
+            key,
+        })
+    }
+
+    pub(super) fn ensure_table(
+        &self,
+        table_name: &TableName,
+        operation: &'static str,
+    ) -> StorageResult<()> {
+        if &self.logical_table_name != table_name {
+            return Err(StorageError::internal(
+                &format!("resolved storage operation does not match {operation} table"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct ResolvedGetItem {
+    pub(super) operation: ResolvedStorageOperation,
+    pub(super) key: KeyAttributes,
+}
+
+
 #[cfg(test)]
 impl DatabaseManagerTestPauseHandle {
     #[must_use]
@@ -206,6 +263,8 @@ pub struct PutItemInput {
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub return_values: Option<AllOld>,
+    #[builder(setter(!strip_option))]
+    pub return_old_on_condition_failure: bool,
     pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
@@ -232,6 +291,8 @@ pub struct DeleteItemInput {
     pub condition_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[builder(setter(!strip_option))]
+    pub return_old_on_condition_failure: bool,
     pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
@@ -339,6 +400,8 @@ pub struct UpdateItemInput {
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
     pub return_values: Option<ReturnValuesOldNewUpdated>,
+    #[builder(setter(!strip_option))]
+    pub return_old_on_condition_failure: bool,
     pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
@@ -436,6 +499,18 @@ impl StorageCachePlannerLoad for DatabaseManager {
     ) -> StorageResult<StoredTableInfo> {
         self.get_table_info_with_pending(table_name, pending_routes)
             .await
+    }
+
+    async fn get_item_map_with_resolved_operation_for_cache(
+        &self,
+        operation: &ResolvedStorageOperation,
+        key: KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let item = self
+            .get_item_with_resolved_operation(operation.clone().validate_key(key)?, consistent_read)
+            .await?;
+        item.map(WireItem::into_attribute_map).transpose()
     }
 
     async fn get_item_map_with_consistent_read_for_cache(
@@ -896,20 +971,44 @@ impl DatabaseManager {
         Ok(self.get_table_info_arc(table_name).await?.as_ref().clone())
     }
 
+    pub async fn resolve_storage_operation(
+        &self,
+        table_name: TableName,
+    ) -> StorageResult<ResolvedStorageOperation> {
+        let route = self.resolve_namespace_route_for_table(&table_name).await?;
+        let table_info = if let Some(route) = route.as_ref() {
+            let provider = self.provider_for_connection(&route.read_target.connection_id)?;
+            Arc::new(
+                record_storage_operation(
+                    "get_table_info",
+                    provider.get_table_info(&route.read_target.table_name),
+                )
+                .await?,
+            )
+        } else {
+            self.get_unrouted_table_info_arc(&table_name).await?
+        };
+        Ok(ResolvedStorageOperation {
+            logical_table_name: table_name,
+            table_info,
+            route,
+        })
+    }
+
     pub(crate) async fn get_table_info_arc(
         &self,
         table_name: &TableName,
     ) -> StorageResult<Arc<StoredTableInfo>> {
-        if let Some(route) = self.resolve_namespace_route_for_table(table_name).await? {
-            let provider = self.provider_for_connection(&route.read_target.connection_id)?;
-            let table_info = record_storage_operation(
-                "get_table_info",
-                provider.get_table_info(&route.read_target.table_name),
-            )
-            .await;
-            return Ok(Arc::new(table_info?));
-        }
+        Ok(self
+            .resolve_storage_operation(table_name.clone())
+            .await?
+            .table_info)
+    }
 
+    async fn get_unrouted_table_info_arc(
+        &self,
+        table_name: &TableName,
+    ) -> StorageResult<Arc<StoredTableInfo>> {
         if let Some(cached) = self.table_info_cache.read().await.get(table_name).cloned()
             && cached.as_ref().table_status == TableStatus::Active
         {
@@ -1130,6 +1229,7 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_old_on_condition_failure: false,
             aux_item_stream_ttl_hours: None,
         })
         .await
@@ -1152,6 +1252,7 @@ impl DatabaseManager {
             expression_attribute_names: input.expression_attribute_names,
             expression_attribute_values: input.expression_attribute_values,
             return_values: input.return_values,
+            return_old_on_condition_failure: false,
             aux_item_stream_ttl_hours: None,
         })
         .await

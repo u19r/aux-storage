@@ -13,6 +13,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
         apply_gsi_write_pressure(self).await?;
+        self.transact_write_items_after_pressure(request).await
+    }
+
+    pub(super) async fn transact_write_items_after_pressure(
+        &self,
+        request: TransactWriteItemsRequest,
+    ) -> StorageResult<TransactWriteItemsResponse> {
         if let Some(response) = self
             .load_cached_transact_write_response(request.client_request_token.as_deref())
             .await?

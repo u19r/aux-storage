@@ -24,11 +24,12 @@ use crate::{
 impl StorageApiManagerImpl {
     pub(super) async fn propose_sync_write_if_configured(
         &self,
-        request: SyncWriteRequest,
+        build_request: impl FnOnce() -> SyncWriteRequest,
     ) -> Result<Option<SyncProposalResponse>, HttpApiError> {
         let Some(proposer) = self.sync_write_proposer.as_ref() else {
             return Ok(None);
         };
+        let request = build_request();
         let _admission = self.sync_proposal_pipeline.admit(&request)?;
         let proposal_id = sync_proposal_id_for_request(&request)?;
         let started = std::time::Instant::now();

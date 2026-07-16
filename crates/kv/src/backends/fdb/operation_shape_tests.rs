@@ -95,7 +95,7 @@ async fn foundationdb_queue_and_pubsub_operation_shape_tests() {
         "https://queue.example.test/000000000000/fdb-shape-{}",
         Uuid::now_v7()
     );
-    provider
+    let queue_url = provider
         .create_queue(Queue {
             queue_name: "fdb-shape".to_string(),
             queue_url: queue_url.clone(),
@@ -103,7 +103,8 @@ async fn foundationdb_queue_and_pubsub_operation_shape_tests() {
             created_at: TimestampMillis::from(1_000),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .queue_url;
 
     let topic = provider
         .create_topic(CreateTopicRequest {
@@ -352,6 +353,7 @@ fn delivery_record(
         kind: DeliveryRecordKind::Notification,
         message_id: PubsubMessageId::new_from_string(format!("fdb-shape-message-{index}")).unwrap(),
         subscription_arn,
+        subscription: None,
         message_body: Some("body".to_string()),
         subject: None,
         message_attributes: HashMap::new(),

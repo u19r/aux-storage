@@ -1,10 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+};
 
+use futures::future::join_all;
 use http_error::HttpApiError;
 use storage_types::{
     AttributeMap, BatchGetItemRequest, BatchGetItemResponse, BatchGetWireItemResponse,
-    KeyAttributes, KeysAndAttributes, StorageEnum, StorageError, StoredTableInfo,
-    context::WrappedError as _, validate_key_attributes_for_schema, validate_transact_key,
+    AttributeValue, KeyAttributes, KeySchemaElement, KeysAndAttributes, StorageEnum, StorageError,
+    StoredTableInfo, context::WrappedError as _, normalize_dynamodb_number_for_write,
+    validate_key_attributes_for_schema, validate_transact_key,
 };
 
 use crate::{
@@ -24,14 +29,31 @@ impl StorageApiManagerImpl {
         request: BatchGetItemRequest,
     ) -> Result<Response, HttpApiError> {
         let request_shape = request.clone();
-        self.validate_batch_get_keys(&request_shape).await?;
+        let resolutions = join_all(request_shape.request_items.keys().cloned().map(|table_name| {
+            async move {
+                let operation = self.db().resolve_storage_operation(table_name.clone()).await;
+                (table_name, operation)
+            }
+        }))
+        .await;
+        let mut operations = Vec::with_capacity(resolutions.len());
+        for (table_name, operation) in resolutions {
+            let operation = operation?;
+            let keys_and_attributes = request_shape
+                .request_items
+                .get(&table_name)
+                .ok_or_else(|| StorageError::internal("resolved BatchGet table is missing"))?;
+            self.validate_batch_get_keys(keys_and_attributes, operation.table_info())?;
+            operations.push(operation);
+        }
+        let plan = storage::ResolvedBatchGetPlan::new(operations);
 
         let needs_barrier = request
             .request_items
             .values()
             .any(|keys| keys.consistent_read.unwrap_or(false));
         self.ensure_sync_read_barrier(needs_barrier).await?;
-        let wire_response = self.db().batch_get_item(request).await?;
+        let wire_response = self.db().batch_get_item_resolved(request, plan).await?;
 
         if batch_get_needs_decoded_response(&request_shape) {
             let response = project_batch_get_response(wire_response, &request_shape)?;
@@ -44,27 +66,99 @@ impl StorageApiManagerImpl {
         )))
     }
 
-    async fn validate_batch_get_keys(
+    fn validate_batch_get_keys(
         &self,
-        request: &BatchGetItemRequest,
+        keys_and_attributes: &KeysAndAttributes,
+        table_info: &StoredTableInfo,
     ) -> Result<(), HttpApiError> {
-        for (table_name, keys_and_attributes) in &request.request_items {
-            let table_info = self.db().get_table_info(table_name).await?;
-            let mut seen = HashSet::with_capacity(keys_and_attributes.keys.len());
-            for key in &keys_and_attributes.keys {
-                validate_batch_get_key(&table_info, key)?;
-                let fingerprint = key
-                    .canonical_dynamo_json()
-                    .map_err(|err| StorageError::internal(&err.to_string()))?;
-                if !seen.insert(fingerprint) {
-                    return Err(StorageError::validation(
-                        "Provided list of item keys contains duplicates",
-                    )
-                    .into());
-                }
+        let mut seen = HashSet::with_capacity(keys_and_attributes.keys.len());
+        for key in &keys_and_attributes.keys {
+            validate_batch_get_key(table_info, key)?;
+            if !seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, key)) {
+                return Err(StorageError::validation(
+                    "Provided list of item keys contains duplicates",
+                )
+                .into());
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BatchGetKeyIdentity<'a> {
+    key_schema: &'a [KeySchemaElement],
+    key: &'a KeyAttributes,
+}
+
+impl<'a> BatchGetKeyIdentity<'a> {
+    pub(super) fn new(key_schema: &'a [KeySchemaElement], key: &'a KeyAttributes) -> Self {
+        Self { key_schema, key }
+    }
+}
+
+impl PartialEq for BatchGetKeyIdentity<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_schema.len() == other.key_schema.len()
+            && self
+                .key_schema
+                .iter()
+                .zip(other.key_schema)
+                .all(|(left_schema, right_schema)| {
+                    left_schema.attribute_name == right_schema.attribute_name
+                        && match (
+                            self.key.get(&left_schema.attribute_name),
+                            other.key.get(&right_schema.attribute_name),
+                        ) {
+                            (Some(left), Some(right)) => canonical_key_value_eq(left, right),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+    }
+}
+
+impl Eq for BatchGetKeyIdentity<'_> {}
+
+impl Hash for BatchGetKeyIdentity<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_schema.len().hash(state);
+        for schema in self.key_schema {
+            schema.attribute_name.hash(state);
+            if let Some(value) = self.key.get(&schema.attribute_name) {
+                hash_canonical_key_value(value, state);
+            }
+        }
+    }
+}
+
+fn canonical_key_value_eq(left: &AttributeValue, right: &AttributeValue) -> bool {
+    match (left, right) {
+        (AttributeValue::N(left), AttributeValue::N(right)) => {
+            normalize_dynamodb_number_for_write(left) == normalize_dynamodb_number_for_write(right)
+        }
+        _ => left == right,
+    }
+}
+
+fn hash_canonical_key_value<H: Hasher>(value: &AttributeValue, state: &mut H) {
+    match value {
+        AttributeValue::S(value) => {
+            0_u8.hash(state);
+            value.hash(state);
+        }
+        AttributeValue::N(value) => {
+            1_u8.hash(state);
+            normalize_dynamodb_number_for_write(value).hash(state);
+        }
+        AttributeValue::B(value) => {
+            2_u8.hash(state);
+            value.hash(state);
+        }
+        value => {
+            3_u8.hash(state);
+            std::mem::discriminant(value).hash(state);
+        }
     }
 }
 

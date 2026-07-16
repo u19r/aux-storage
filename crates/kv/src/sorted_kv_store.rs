@@ -16,6 +16,18 @@ use crate::{
 
 type KeyValuePair = (Box<[u8]>, Box<[u8]>);
 
+pub enum AtomicTableWriteDecision {
+    NoWrite { output: Vec<u8> },
+    Write {
+        operations: Vec<TransactWriteTableOperation>,
+        output: Vec<u8>,
+    },
+}
+
+pub type AtomicTableWriteTransform = Arc<
+    dyn Fn(Option<&[u8]>) -> StorageResult<AtomicTableWriteDecision> + Send + Sync,
+>;
+
 #[derive(Debug, Clone)]
 pub struct RangeResult {
     pub items: Vec<KeyValuePair>,
@@ -318,6 +330,17 @@ pub trait SortedKvReadContext: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait SortedKvStore: Send + Sync + Clone {
+    async fn atomic_read_modify_write_table(
+        &self,
+        _read_key: Vec<u8>,
+        _transform: AtomicTableWriteTransform,
+        _immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<u8>> {
+        Err(StorageError::unsupported(
+            "atomic table read-modify-write is not supported by this backend",
+        ))
+    }
+
     async fn transact_write(
         &self,
         operations: Vec<TransactWriteOperation>,

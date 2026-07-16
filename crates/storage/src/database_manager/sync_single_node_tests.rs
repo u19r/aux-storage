@@ -174,6 +174,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
                 (":old".to_string(), AttributeValue::S("open".to_string())),
             ])),
             return_values: None,
+            return_old_on_condition_failure: false,
             aux_item_stream_ttl_hours: None,
         })
         .await

@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use crate::{ReceiptHandle, newtypes::MessageId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateQueueRequest {
     #[serde(rename = "QueueName")]
     #[schema(
@@ -30,6 +31,7 @@ pub struct CreateQueueResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteQueueRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -39,6 +41,7 @@ pub struct DeleteQueueRequest {
 pub struct DeleteQueueResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ListQueuesRequest {
     #[serde(rename = "QueueNamePrefix", skip_serializing_if = "Option::is_none")]
     pub queue_name_prefix: Option<String>,
@@ -51,6 +54,7 @@ pub struct ListQueuesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetQueueUrlRequest {
     #[serde(rename = "QueueName")]
     pub queue_name: String,
@@ -63,6 +67,7 @@ pub struct GetQueueUrlResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetQueueAttributesRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -78,6 +83,7 @@ pub struct GetQueueAttributesResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SetQueueAttributesRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -90,6 +96,7 @@ pub struct SetQueueAttributesRequest {
 pub struct SetQueueAttributesResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PurgeQueueRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -99,6 +106,7 @@ pub struct PurgeQueueRequest {
 pub struct PurgeQueueResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
     #[serde(rename = "QueueUrl")]
     #[schema(
@@ -137,6 +145,7 @@ pub struct SendMessageResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageBatchRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -146,6 +155,7 @@ pub struct SendMessageBatchRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendMessageBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -189,6 +199,7 @@ pub struct SendMessageBatchResultEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiveMessageRequest {
     #[serde(rename = "QueueUrl")]
     #[schema(
@@ -233,6 +244,7 @@ pub struct ReceiveMessageResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteMessageRequest {
     #[serde(rename = "QueueUrl")]
     #[schema(
@@ -247,6 +259,7 @@ pub struct DeleteMessageRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteMessageBatchRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -256,6 +269,7 @@ pub struct DeleteMessageBatchRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteMessageBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -281,6 +295,7 @@ pub struct DeleteMessageBatchResultEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeMessageVisibilityRequest {
     #[serde(rename = "QueueUrl")]
     #[schema(
@@ -304,6 +319,7 @@ pub struct ChangeMessageVisibilityRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeMessageVisibilityBatchRequest {
     #[serde(rename = "QueueUrl")]
     pub queue_url: String,
@@ -313,6 +329,7 @@ pub struct ChangeMessageVisibilityBatchRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeMessageVisibilityBatchRequestEntry {
     #[serde(rename = "Id")]
     pub id: String,
@@ -390,6 +407,7 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MessageAttributeValue {
     #[serde(rename = "StringValue", skip_serializing_if = "Option::is_none")]
     #[schema(example = "John Doe")]

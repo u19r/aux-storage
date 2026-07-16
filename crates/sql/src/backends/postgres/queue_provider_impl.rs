@@ -25,7 +25,7 @@ impl QueueProvider for PostgresStorageProvider {
         Ok(())
     }
 
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue> {
         self.retry_postgres_queue_conflicts("create_queue", || {
             let queue = queue.clone();
             async move {
@@ -51,7 +51,8 @@ impl QueueProvider for PostgresStorageProvider {
                 Ok(())
             }
         })
-        .await
+        .await?;
+        Ok(queue)
     }
 
     async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {

@@ -204,6 +204,8 @@ pub struct DeliveryRecord {
     pub message_id: PubsubMessageId,
     pub subscription_arn: SubscriptionArn,
     #[serde(default)]
+    pub subscription: Option<Subscription>,
+    #[serde(default)]
     pub message_body: Option<String>,
     #[serde(default)]
     pub subject: Option<String>,
@@ -223,6 +225,45 @@ pub struct DeliveryRecord {
 }
 
 impl DeliveryRecord {
+    #[must_use]
+    pub fn pending_notification(
+        request: &PublishRequest,
+        message_id: &PubsubMessageId,
+        subscription: &Subscription,
+        custom_sender_enabled: bool,
+    ) -> Self {
+        let now = TimestampMillis::now();
+        let target = if custom_sender_enabled
+            && matches!(
+                subscription.protocol,
+                SubscriptionProtocol::Http | SubscriptionProtocol::Https
+            )
+        {
+            DeliveryTarget::CustomSender
+        } else {
+            DeliveryTarget::BuiltIn
+        };
+        Self {
+            id: DeliveryRecordId(format!("{}:{}", subscription.subscription_arn, message_id)),
+            kind: DeliveryRecordKind::Notification,
+            message_id: message_id.clone(),
+            subscription_arn: subscription.subscription_arn.clone(),
+            subscription: Some(subscription.clone()),
+            message_body: Some(request.message.clone()),
+            subject: request.subject.clone(),
+            message_attributes: request.message_attributes.clone(),
+            target,
+            status: DeliveryStatus::Pending,
+            attempts: 0,
+            next_attempt_at: None,
+            lease_owner: None,
+            lease_expires_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     pub fn is_claimable(&self, now: TimestampMillis) -> bool {
         matches!(
             self.status,

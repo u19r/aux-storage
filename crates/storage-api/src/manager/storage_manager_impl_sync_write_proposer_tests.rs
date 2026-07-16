@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
+    hint::black_box,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use alloc_counter::AllocationGuard;
 use async_trait::async_trait;
 use http_error::HttpApiError;
 use serde_json::json;
@@ -165,6 +167,103 @@ async fn create_db_with_table() -> Arc<DatabaseManager> {
         .await
         .expect("create table");
     db
+}
+
+fn realistic_put_request() -> storage_types::PutItemRequest {
+    json!({
+        "TableName": "SyncWrites",
+        "Item": {
+            "id": {"S": "allocation-put"},
+            "payload": {"S": "x".repeat(64 * 1024)}
+        }
+    })
+    .try_into()
+    .expect("put request")
+}
+
+fn realistic_update_request() -> storage_types::UpdateItemRequest {
+    json!({
+        "TableName": "SyncWrites",
+        "Key": {"id": {"S": "allocation-update"}},
+        "UpdateExpression": "SET #payload = :payload",
+        "ExpressionAttributeNames": {"#payload": "payload"},
+        "ExpressionAttributeValues": {":payload": {"S": "x".repeat(64 * 1024)}}
+    })
+    .try_into()
+    .expect("update request")
+}
+
+fn measure_eager_clone<T: Clone>(
+    label: &'static str,
+    request: &T,
+    wrap: fn(T) -> SyncWriteRequest,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "disabled_sync_write_allocation_profile_tests",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..100 {
+        black_box(wrap(request.clone()));
+    }
+    guard.finish()
+}
+
+async fn measure_lazy_disabled<T: Clone>(
+    manager: &StorageApiManagerImpl,
+    label: &'static str,
+    request: &T,
+    wrap: fn(T) -> SyncWriteRequest,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "disabled_sync_write_allocation_profile_tests",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..100 {
+        let response = manager
+            .propose_sync_write_if_configured(|| wrap(request.clone()))
+            .await
+            .expect("disabled proposer");
+        black_box(response);
+    }
+    guard.finish()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_sync_proposer_does_not_construct_put_or_update_payloads() {
+    let manager = StorageApiManagerImpl::new_with_options(
+        create_db_with_table().await,
+        StorageApiManagerOptions::default(),
+    );
+    let put = realistic_put_request();
+    let update = realistic_update_request();
+
+    let eager_put = measure_eager_clone("put_eager_clone", &put, SyncWriteRequest::PutItem);
+    let lazy_put =
+        measure_lazy_disabled(&manager, "put_lazy_disabled", &put, SyncWriteRequest::PutItem)
+            .await;
+    let eager_update =
+        measure_eager_clone("update_eager_clone", &update, SyncWriteRequest::UpdateItem);
+    let lazy_update = measure_lazy_disabled(
+        &manager,
+        "update_lazy_disabled",
+        &update,
+        SyncWriteRequest::UpdateItem,
+    )
+    .await;
+
+    for report in [&eager_put, &lazy_put, &eager_update, &lazy_update] {
+        alloc_counter::emit_report(report);
+    }
+    assert!(lazy_put.allocation_count < eager_put.allocation_count);
+    assert!(lazy_put.allocated_bytes < eager_put.allocated_bytes);
+    assert!(lazy_update.allocation_count < eager_update.allocation_count);
+    assert!(lazy_update.allocated_bytes < eager_update.allocated_bytes);
 }
 
 #[tokio::test]

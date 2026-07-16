@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
     DeliveryRecordKind, DeliveryStatus, DeliveryTarget, PubsubMessageId, PubsubProvider,
-    SubscribeRequest, SubscriptionProtocol, TopicName,
+    PublishRequest, SubscribeRequest, SubscriptionProtocol, TopicName,
 };
 use storage_condition::Condition;
 use storage_types::{SerializesToKey, StorageResult, TimestampMillis};
@@ -25,6 +28,7 @@ use crate::{
 struct ObservingPubsubKvStore {
     inner: RocksDbKvStore,
     stats: Arc<Mutex<PubsubShapeStats>>,
+    omit_first_multi_get_value: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +49,8 @@ struct PubsubShapeStats {
     read_key_bytes: u64,
     write_key_bytes: u64,
     serial_awaits: u64,
+    unchecked_writes_in_flight: u64,
+    max_concurrent_unchecked_writes: u64,
 }
 
 impl ObservingPubsubKvStore {
@@ -52,6 +58,7 @@ impl ObservingPubsubKvStore {
         Self {
             inner,
             stats: Arc::new(Mutex::new(PubsubShapeStats::default())),
+            omit_first_multi_get_value: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -61,6 +68,10 @@ impl ObservingPubsubKvStore {
 
     fn snapshot(&self) -> PubsubShapeStats {
         self.lock_stats().clone()
+    }
+
+    fn omit_first_multi_get_value_once(&self) {
+        self.omit_first_multi_get_value.store(true, Ordering::Release);
     }
 
     fn lock_stats(&self) -> MutexGuard<'_, PubsubShapeStats> {
@@ -73,6 +84,20 @@ impl ObservingPubsubKvStore {
     fn record_serial_await(&self) {
         let mut stats = self.lock_stats();
         stats.serial_awaits = stats.serial_awaits.saturating_add(1);
+    }
+
+    fn start_unchecked_write(&self) {
+        let mut stats = self.lock_stats();
+        stats.serial_awaits = stats.serial_awaits.saturating_add(1);
+        stats.unchecked_writes_in_flight = stats.unchecked_writes_in_flight.saturating_add(1);
+        stats.max_concurrent_unchecked_writes = stats
+            .max_concurrent_unchecked_writes
+            .max(stats.unchecked_writes_in_flight);
+    }
+
+    fn finish_unchecked_write(&self) {
+        let mut stats = self.lock_stats();
+        stats.unchecked_writes_in_flight = stats.unchecked_writes_in_flight.saturating_sub(1);
     }
 }
 
@@ -90,9 +115,12 @@ impl SortedKvStore for ObservingPubsubKvStore {
         &self,
         operations: Vec<DirectWriteOperation>,
     ) -> StorageResult<()> {
-        self.record_serial_await();
+        self.start_unchecked_write();
+        tokio::task::yield_now().await;
         record_direct_ops(&mut self.lock_stats(), &operations);
-        self.inner.transact_write_unchecked(operations).await
+        let result = self.inner.transact_write_unchecked(operations).await;
+        self.finish_unchecked_write();
+        result
     }
 
     async fn transact_write_table(
@@ -131,7 +159,15 @@ impl SortedKvStore for ObservingPubsubKvStore {
     ) -> StorageResult<Vec<Option<Vec<u8>>>> {
         let key_count = keys.len();
         let key_bytes = keys.iter().map(Vec::len).sum::<usize>();
-        let values = self.inner.multi_get(keys, consistent_read).await?;
+        let mut values = self.inner.multi_get(keys, consistent_read).await?;
+        if self
+            .omit_first_multi_get_value
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Some(value) = values.first_mut() {
+                *value = None;
+            }
+        }
         let mut stats = self.lock_stats();
         stats.multi_get_calls = stats.multi_get_calls.saturating_add(1);
         stats.multi_get_keys = stats
@@ -301,6 +337,7 @@ fn delivery_record(subscription_arn: pubsub_provider::SubscriptionArn, id: &str)
         kind: DeliveryRecordKind::Notification,
         message_id: PubsubMessageId::new_from_string(format!("message-{id}")).unwrap(),
         subscription_arn,
+        subscription: None,
         message_body: Some("body".to_string()),
         subject: None,
         message_attributes: HashMap::new(),
@@ -314,6 +351,54 @@ fn delivery_record(subscription_arn: pubsub_provider::SubscriptionArn, id: &str)
         created_at: TimestampMillis::from(1_000),
         updated_at: TimestampMillis::from(1_000),
     }
+}
+
+#[tokio::test]
+async fn pubsub_publish_acceptance_is_constant_shape() {
+    let (provider, store) = observed_provider().await;
+    let topic = provider
+        .create_topic(CreateTopicRequest {
+            name: TopicName::new(format!("pubsub-accept-shape-{}", Uuid::now_v7())).unwrap(),
+            attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    for index in 0..20 {
+        provider
+            .create_subscription(SubscribeRequest {
+                topic_arn: topic.topic_arn.clone(),
+                protocol: SubscriptionProtocol::Queue,
+                endpoint: format!("queue-{index}"),
+                attributes: HashMap::new(),
+                extra_json: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+    }
+
+    store.reset();
+    provider
+        .accept_publish(
+            PublishRequest {
+                topic_arn: topic.topic_arn,
+                message: "body".to_string(),
+                subject: None,
+                message_attributes: HashMap::new(),
+            },
+            PubsubMessageId::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let stats = store.snapshot();
+    assert_eq!(stats.point_gets, 2);
+    assert_eq!(stats.range_reads, 0);
+    assert_eq!(stats.unchecked_transact_writes, 1);
+    assert_eq!(stats.check_values, 2);
+    assert_eq!(stats.puts, 1);
+    assert_eq!(stats.deletes, 0);
+    assert_eq!(stats.serial_awaits, 1);
 }
 
 #[tokio::test]
@@ -359,25 +444,61 @@ async fn pubsub_delivery_record_shape_tests() {
             owner: "shape-worker".to_string(),
             now: TimestampMillis::from(2_000),
             lease_expires_at: TimestampMillis::from(3_000),
-            limit: 1,
+            limit: 2,
         })
         .await
         .unwrap();
-    assert_eq!(claim.records.len(), 1);
+    assert_eq!(claim.records.len(), 2);
     let stats = store.snapshot();
     assert_eq!(stats.range_reads, 1);
-    assert!((2..=4).contains(&stats.point_gets));
-    assert_eq!(stats.unchecked_transact_writes, 1);
-    assert_eq!(stats.check_values, 1);
-    assert_eq!(stats.puts, 1);
-    assert_eq!(stats.read_modify_writes, 1);
+    assert_eq!(stats.point_gets, 0);
+    assert_eq!(stats.multi_get_calls, 1);
+    assert_eq!(stats.multi_get_keys, 2);
+    assert_eq!(stats.unchecked_transact_writes, 2);
+    assert_eq!(stats.check_values, 2);
+    assert_eq!(stats.puts, 2);
+    assert_eq!(stats.read_modify_writes, 2);
+    assert_eq!(stats.serial_awaits, 2);
+    assert_eq!(stats.max_concurrent_unchecked_writes, 2);
 
     store.reset();
     provider.delete_topic(&topic.topic_arn).await.unwrap();
     let stats = store.snapshot();
-    assert!(stats.range_reads >= 2);
+    assert_eq!(stats.range_reads, 2);
     assert!(stats.point_gets >= 1);
     assert_eq!(stats.unchecked_transact_writes, 1);
     assert!(stats.deletes >= 6);
     assert!(stats.write_key_bytes > 0);
+}
+
+#[tokio::test]
+async fn pubsub_claim_rejects_stale_index_records_without_shifting_associations() {
+    let (provider, store) = observed_provider().await;
+    let subscription_arn = pubsub_provider::SubscriptionArn::new(
+        "arn:aws:sns:us-east-1:000000000000:shape:subscription",
+    )
+    .unwrap();
+    provider
+        .put_delivery_records(vec![
+            delivery_record(subscription_arn.clone(), "stale-record"),
+            delivery_record(subscription_arn, "live-record"),
+        ])
+        .await
+        .unwrap();
+
+    store.reset();
+    store.omit_first_multi_get_value_once();
+    let claim = provider
+        .claim_delivery_records(ClaimDeliveryRecordsRequest {
+            owner: "shape-worker".to_string(),
+            now: TimestampMillis::from(2_000),
+            lease_expires_at: TimestampMillis::from(3_000),
+            limit: 2,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(claim.records.len(), 1);
+    assert_eq!(claim.records[0].id.0, "live-record");
+    assert_eq!(store.snapshot().unchecked_transact_writes, 1);
 }

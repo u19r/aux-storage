@@ -7,7 +7,7 @@ use storage_condition::{
 use storage_provider::split_item_into_key_and_attributes_sync;
 use storage_types::{
     AttributeValue, KeyAttributes, KeySchemaElement, ReplicationEventMetadata, SplitDynamoItem,
-    StorageEnum, StorageError, StorageResult, StreamRetentionDuration, TableName, WireItem,
+    StorageError, StorageResult, StreamRetentionDuration, TableName, WireItem,
     context::ErrorContext as _,
 };
 
@@ -64,6 +64,7 @@ impl SQLiteStorageProvider {
         sqlite: &SqliteConn<'_>,
         immediate_gsi_consistency: bool,
         should_return_old: bool,
+        return_old_on_condition_failure: bool,
         replication: Option<&ReplicationEventMetadata>,
         item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
@@ -87,7 +88,14 @@ impl SQLiteStorageProvider {
         if let Some(condition) = condition
             && !evaluate_wire_condition(old_item.as_ref(), condition)?
         {
-            return Err(StorageEnum::ConditionalCheckFailed.into());
+            return Err(crate::provider_core::write::conditional_failure(
+                old_item
+                    .as_ref()
+                    .map(WireItem::to_attribute_map)
+                    .transpose()?
+                    .as_ref(),
+                return_old_on_condition_failure,
+            ));
         }
 
         let attributes_blob = wire_item_attributes_blob(item)?;
@@ -153,6 +161,7 @@ impl SQLiteStorageProvider {
         condition: &Option<Condition>,
         sqlite: &SqliteConn<'_>,
         immediate_gsi_consistency: bool,
+        return_old_on_condition_failure: bool,
         replication: Option<&ReplicationEventMetadata>,
         item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
@@ -174,7 +183,10 @@ impl SQLiteStorageProvider {
         if let Some(condition) = condition
             && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
         {
-            return Err(StorageEnum::ConditionalCheckFailed.into());
+            return Err(crate::provider_core::write::conditional_failure(
+                old_item.as_ref(),
+                return_old_on_condition_failure,
+            ));
         }
 
         // Build the SQL statement for main table

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
     DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PubsubMessageId,
-    PubsubProvider, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
+    PubsubProvider, PublishRequest, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
     SubscriptionProtocol, TopicName,
 };
 use storage_types::TimestampMillis;
@@ -68,6 +68,57 @@ async fn sqlite_pubsub_provider_persists_topic_subscription_and_attributes() {
     );
     assert!(subscriptions[0].raw_message_delivery);
     assert_eq!(subscriptions[0].extra_json["token_ref"], "secret");
+}
+
+#[tokio::test]
+async fn sqlite_publish_acceptance_persists_subscription_snapshot() {
+    let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
+    PubsubProvider::initialize(&provider).await.unwrap();
+    let topic = provider
+        .create_topic(CreateTopicRequest {
+            name: TopicName::new("snapshot-orders").unwrap(),
+            attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    let subscription = provider
+        .create_subscription(SubscribeRequest {
+            topic_arn: topic.topic_arn.clone(),
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: "snapshot-queue".to_string(),
+            attributes: HashMap::new(),
+            extra_json: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+    let message_id = PubsubMessageId::new();
+    provider
+        .accept_publish(
+            PublishRequest {
+                topic_arn: topic.topic_arn,
+                message: "body".to_string(),
+                subject: None,
+                message_attributes: HashMap::new(),
+            },
+            message_id.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+    provider
+        .delete_subscription(&subscription.subscription_arn)
+        .await
+        .unwrap();
+
+    let record = provider
+        .get_delivery_record(&DeliveryRecordId(format!(
+            "{}:{}",
+            subscription.subscription_arn, message_id
+        )))
+        .await
+        .unwrap()
+        .expect("accepted delivery");
+    assert_eq!(record.subscription, Some(subscription));
 }
 
 #[tokio::test]
@@ -163,6 +214,7 @@ fn delivery_record(
         message_id: PubsubMessageId::new(),
         subscription_arn: SubscriptionArn::new("arn:aws:sns:us-east-1:000000000000:orders:sub")
             .unwrap(),
+        subscription: None,
         message_body: None,
         subject: None,
         message_attributes: Default::default(),

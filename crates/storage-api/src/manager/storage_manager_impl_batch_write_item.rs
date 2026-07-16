@@ -13,7 +13,7 @@ impl StorageApiManagerImpl {
         request: BatchWriteItemRequest,
     ) -> Result<Response, HttpApiError> {
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::BatchWriteItem(request.clone()))
+            .propose_sync_write_if_configured(|| SyncWriteRequest::BatchWriteItem(request.clone()))
             .await?
         {
             let response = sync_response_at(

@@ -686,6 +686,7 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         item: &HashMap<String, AttributeValue>,
         condition: Option<&Condition>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
     where
@@ -699,7 +700,7 @@ impl TursoStorageProvider {
             ..
         } = split_item_into_key_and_attributes_sync(item, table_info)?;
 
-        if is_key_absence_condition(condition, table_info) {
+        if is_key_absence_condition(condition, table_info) && !return_old_on_condition_failure {
             self.insert_main_row(conn, table_info, &key_attributes, &all_attributes)
                 .await?;
             let item_stream_version = storage_types::ItemStreamVersion::try_from(
@@ -739,7 +740,10 @@ impl TursoStorageProvider {
         if let Some(condition) = condition
             && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
         {
-            return Err(StorageEnum::ConditionalCheckFailed.into());
+            return Err(crate::provider_core::write::conditional_failure(
+                old_item.as_ref(),
+                return_old_on_condition_failure,
+            ));
         }
 
         self.upsert_main_row(conn, table_info, &key_attributes, &all_attributes)
@@ -861,6 +865,7 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         key: &KeyAttributes,
         condition: Option<&Condition>,
+        return_old_on_condition_failure: bool,
         replication: Option<&ReplicationEventMetadata>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
@@ -875,7 +880,10 @@ impl TursoStorageProvider {
         if let Some(condition) = condition
             && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
         {
-            return Err(StorageEnum::ConditionalCheckFailed.into());
+            return Err(crate::provider_core::write::conditional_failure(
+                old_item.as_ref(),
+                return_old_on_condition_failure,
+            ));
         }
 
         let table_name_safe = table_info.table_name.sanitized_name();

@@ -11,8 +11,7 @@ pub fn validate_gsi_projection_expression(
     projection_expression: Option<&str>,
     expression_attribute_names: Option<&HashMap<String, String>>,
 ) -> StorageResult<()> {
-    let (Some(index_name), Some(projection_expression)) =
-        (index_name, projection_expression)
+    let (Some(index_name), Some(projection_expression)) = (index_name, projection_expression)
     else {
         return Ok(());
     };

@@ -67,6 +67,7 @@ pub use database_manager::{
     DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput, DeleteItemInput,
     InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
     PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
+    ResolvedBatchGetPlan, ResolvedGetItem, ResolvedStorageOperation,
     ReplicationMutationApplyOutcome, ScanTableInput, UpdateItemInput,
 };
 pub use multi_region_metrics::{

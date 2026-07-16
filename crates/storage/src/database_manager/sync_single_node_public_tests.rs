@@ -94,6 +94,7 @@ async fn public_delete_item_routes_through_single_node_sync_log() {
         condition_expression: None,
         expression_attribute_names: None,
         expression_attribute_values: None,
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: None,
     })
     .await
@@ -147,6 +148,7 @@ async fn public_update_item_routes_through_single_node_sync_log() {
             (":old".to_string(), AttributeValue::S("open".to_string())),
         ])),
         return_values: None,
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: None,
     })
     .await
@@ -202,6 +204,7 @@ async fn public_update_item_return_values_are_resolved_in_single_node_sync_mode(
                 AttributeValue::S("closed".to_string()),
             )])),
             return_values: Some(storage_types::ReturnValuesOldNewUpdated::AllNew),
+            return_old_on_condition_failure: false,
             aux_item_stream_ttl_hours: None,
         })
         .await

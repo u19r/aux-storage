@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use storage_condition::{Condition, evaluate_condition};
 use storage_types::{
-    AttributeValue, KeyAttributes, ReplicationEventMetadata, StorageEnum, StorageError,
+    AttributeValue, KeyAttributes, ReplicationEventMetadata, StorageError,
     StorageResult, StreamRetentionDuration, TableName,
 };
 
@@ -19,6 +19,7 @@ impl SQLiteStorageProvider {
         condition: &Option<Condition>,
         sqlite: &crate::utils::SqliteConn<'_>,
         immediate_gsi_consistency: bool,
+        return_old_on_condition_failure: bool,
         replication: Option<&ReplicationEventMetadata>,
         item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
@@ -66,7 +67,10 @@ impl SQLiteStorageProvider {
         if let Some(condition) = condition
             && !evaluate_condition(&item, condition)
         {
-            return Err(StorageEnum::ConditionalCheckFailed.into());
+            return Err(crate::provider_core::write::conditional_failure(
+                existing_item.as_ref(),
+                return_old_on_condition_failure,
+            ));
         }
 
         // Delete from main table

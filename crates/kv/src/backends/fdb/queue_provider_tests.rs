@@ -201,10 +201,11 @@ async fn foundationdb_queue_send_receive_extend_delete() {
             .expect("initialize queue provider");
 
         let queue_url = format!("fdb-queue-{}", Uuid::now_v7());
-        provider
+        let queue_url = provider
             .create_queue(queue_definition(&queue_url))
             .await
-            .expect("create queue");
+            .expect("create queue")
+            .queue_url;
 
         let message_body = "hello-foundationdb";
         let sent_message_id = provider
@@ -304,10 +305,11 @@ async fn foundationdb_shared_backend_concurrent_receives_do_not_duplicate_claims
             .expect("initialize queue receiver b");
 
         let queue_url = format!("fdb-queue-concurrent-{}", Uuid::now_v7());
-        writer
+        let queue_url = writer
             .create_queue(queue_definition(&queue_url))
             .await
-            .expect("create queue");
+            .expect("create queue")
+            .queue_url;
 
         let mut expected_ids = HashSet::new();
         for index in 0..40usize {
@@ -472,10 +474,11 @@ async fn foundationdb_queue_reconcile_scales_out_hot_family_tests() {
             .expect("initialize queue provider");
 
         let queue_url = format!("fdb-queue-reconcile-{}", Uuid::now_v7());
-        provider
+        let queue_url = provider
             .create_queue(queue_definition(&queue_url))
             .await
-            .expect("create queue");
+            .expect("create queue")
+            .queue_url;
 
         let family_component = queue_family_component(&queue_url);
         let family_before = provider
@@ -627,10 +630,11 @@ async fn foundationdb_partitioned_queue_send_retries_after_topology_change_tests
             .expect("initialize updater queue provider");
 
         let queue_url = format!("fdb-queue-routing-fence-{}", Uuid::now_v7());
-        writer
+        let queue_url = writer
             .create_queue(queue_definition(&queue_url))
             .await
-            .expect("create queue");
+            .expect("create queue")
+            .queue_url;
 
         let family_component = queue_family_component(&queue_url);
         let cached_family = writer
@@ -765,10 +769,11 @@ async fn foundationdb_queue_scale_churn_stress_preserves_messages_tests() {
             .expect("initialize queue scaler provider");
 
         let queue_url = format!("fdb-queue-scale-churn-{}", Uuid::now_v7());
-        provider
+        let queue_url = provider
             .create_queue(queue_definition(&queue_url))
             .await
-            .expect("create queue");
+            .expect("create queue")
+            .queue_url;
 
         let family_component = queue_family_component(&queue_url);
         for _ in 0..2 {

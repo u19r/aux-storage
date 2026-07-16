@@ -85,6 +85,7 @@ async fn single_node_sync_update_preserves_old_and_new_stream_images() {
             (":old".to_string(), AttributeValue::S("open".to_string())),
         ])),
         return_values: Some(storage_types::ReturnValuesOldNewUpdated::AllNew),
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: None,
     })
     .await

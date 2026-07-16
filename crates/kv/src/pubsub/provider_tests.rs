@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
     DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PubsubMessageId,
-    PubsubProvider, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
+    PubsubProvider, PublishRequest, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
     SubscriptionProtocol, TopicName,
 };
 use storage_types::TimestampMillis;
@@ -14,6 +14,89 @@ use crate::{RocksDbKvStore, SortedKvDbStorageProvider, kv_support_tests::rocksdb
 async fn create_test_provider() -> SortedKvDbStorageProvider<RocksDbKvStore> {
     let store = RocksDbKvStore::new(rocksdb_test_path("pubsub-kv")).expect("open rocksdb");
     SortedKvDbStorageProvider::new(store)
+}
+
+#[tokio::test]
+async fn sorted_kv_publish_intent_uses_immutable_chunked_subscription_snapshot() {
+    let provider = create_test_provider().await;
+    PubsubProvider::initialize(&provider).await.unwrap();
+    let topic = provider
+        .create_topic(CreateTopicRequest {
+            name: TopicName::new(format!("snapshot-{}", Uuid::now_v7())).unwrap(),
+            attributes: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    let mut subscriptions = Vec::new();
+    for index in 0..12 {
+        subscriptions.push(
+            provider
+                .create_subscription(SubscribeRequest {
+                    topic_arn: topic.topic_arn.clone(),
+                    protocol: SubscriptionProtocol::Queue,
+                    endpoint: format!("queue-{index}"),
+                    attributes: HashMap::new(),
+                    extra_json: serde_json::Value::Null,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let message_id = PubsubMessageId::new_from_string(format!("message-{}", Uuid::now_v7()))
+        .unwrap();
+    provider
+        .accept_publish(
+            PublishRequest {
+                topic_arn: topic.topic_arn.clone(),
+                message: "snapshot-body".to_string(),
+                subject: None,
+                message_attributes: HashMap::new(),
+            },
+            message_id.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    provider
+        .set_subscription_attributes(SetSubscriptionAttributesRequest {
+            subscription_arn: subscriptions[0].subscription_arn.clone(),
+            attributes: HashMap::from([("RawMessageDelivery".to_string(), "true".to_string())]),
+        })
+        .await
+        .unwrap();
+    provider.delete_topic(&topic.topic_arn).await.unwrap();
+
+    let (first, competing) = tokio::join!(
+        provider.materialize_publish_intents(10),
+        provider.materialize_publish_intents(10),
+    );
+    assert_eq!(first.unwrap() + competing.unwrap(), 10);
+    assert_eq!(provider.materialize_publish_intents(10).await.unwrap(), 2);
+    assert_eq!(provider.materialize_publish_intents(10).await.unwrap(), 0);
+
+    for (index, subscription) in subscriptions.iter().enumerate() {
+        let record = provider
+            .get_delivery_record(&DeliveryRecordId(format!(
+                "{}:{}",
+                subscription.subscription_arn, message_id
+            )))
+            .await
+            .unwrap()
+            .expect("accepted subscription delivery must be materialized");
+        let snapshot = record
+            .subscription
+            .clone()
+            .expect("delivery owns subscription snapshot");
+        assert_eq!(snapshot.subscription_arn, subscription.subscription_arn);
+        assert_eq!(snapshot.endpoint, format!("queue-{index}"));
+        assert!(!snapshot.raw_message_delivery);
+        if index == 1 {
+            let mut delivered = record;
+            delivered.status = DeliveryStatus::Delivered;
+            provider.update_delivery_record(delivered).await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -121,6 +204,49 @@ async fn sorted_kv_pubsub_provider_claims_due_delivery_records_once() {
 }
 
 #[tokio::test]
+async fn sorted_kv_pubsub_provider_competing_workers_never_double_claim() {
+    let provider = create_test_provider().await;
+    PubsubProvider::initialize(&provider).await.unwrap();
+    let now = TimestampMillis::from(1_000);
+    provider
+        .put_delivery_records(
+            (0..10)
+                .map(|index| delivery_record(&format!("competing-{index}"), now, Some(now)))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let (first, second) = tokio::join!(
+        provider.claim_delivery_records(ClaimDeliveryRecordsRequest {
+            owner: "worker-a".to_string(),
+            now,
+            lease_expires_at: TimestampMillis::from(2_000),
+            limit: 10,
+        }),
+        provider.claim_delivery_records(ClaimDeliveryRecordsRequest {
+            owner: "worker-b".to_string(),
+            now,
+            lease_expires_at: TimestampMillis::from(2_000),
+            limit: 10,
+        }),
+    );
+    let claimed = first
+        .unwrap()
+        .records
+        .into_iter()
+        .chain(second.unwrap().records)
+        .collect::<Vec<_>>();
+    let unique_ids = claimed
+        .iter()
+        .map(|record| record.id.0.clone())
+        .collect::<HashSet<_>>();
+
+    assert_eq!(claimed.len(), 10);
+    assert_eq!(unique_ids.len(), claimed.len());
+}
+
+#[tokio::test]
 async fn sorted_kv_pubsub_provider_recovers_expired_delivery_leases() {
     let provider = create_test_provider().await;
     PubsubProvider::initialize(&provider).await.unwrap();
@@ -143,7 +269,7 @@ async fn sorted_kv_pubsub_provider_recovers_expired_delivery_leases() {
 }
 
 #[tokio::test]
-async fn sorted_kv_pubsub_provider_deletes_subscription_delivery_records_with_topic() {
+async fn sorted_kv_pubsub_provider_retains_accepted_deliveries_after_topic_delete() {
     let provider = create_test_provider().await;
     PubsubProvider::initialize(&provider).await.unwrap();
 
@@ -177,12 +303,12 @@ async fn sorted_kv_pubsub_provider_deletes_subscription_delivery_records_with_to
             .unwrap()
             .is_none()
     );
-    assert!(
+    assert_eq!(
         provider
             .get_delivery_record(&record.id)
             .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        Some(record)
     );
 }
 
@@ -253,6 +379,7 @@ fn delivery_record(
         message_id: PubsubMessageId::new(),
         subscription_arn: SubscriptionArn::new("arn:aws:sns:us-east-1:000000000000:orders:sub")
             .unwrap(),
+        subscription: None,
         message_body: None,
         subject: None,
         message_attributes: Default::default(),

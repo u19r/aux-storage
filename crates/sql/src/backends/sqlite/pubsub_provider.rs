@@ -56,7 +56,8 @@ impl PubsubProvider for SQLiteStorageProvider {
                     lease_expires_at INTEGER,
                     last_error TEXT,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    subscription_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_pubsub_deliveries_claimable
                     ON sys_pubsub_deliveries(status, next_attempt_at, lease_expires_at);
@@ -76,6 +77,7 @@ impl PubsubProvider for SQLiteStorageProvider {
                 "TEXT NOT NULL DEFAULT 'notification'",
             )?;
             add_column_if_missing(conn, "sys_pubsub_deliveries", "confirmation_token", "TEXT")?;
+            add_column_if_missing(conn, "sys_pubsub_deliveries", "subscription_json", "TEXT")?;
             Ok(())
         })
         .await
@@ -384,7 +386,7 @@ impl PubsubProvider for SQLiteStorageProvider {
                     "SELECT id, message_id, delivery_kind, confirmation_token, subscription_arn, \
                      message_body, subject, message_attributes_json, target, status, attempts, \
                      next_attempt_at, lease_owner, lease_expires_at, last_error, created_at, \
-                     updated_at
+                     updated_at, subscription_json
                      FROM sys_pubsub_deliveries
                      WHERE status IN ('pending', 'retry_scheduled')
                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
@@ -442,7 +444,7 @@ impl PubsubProvider for SQLiteStorageProvider {
                 "SELECT id, message_id, delivery_kind, confirmation_token, subscription_arn, \
                  message_body, subject, message_attributes_json, target, status, attempts, \
                  next_attempt_at, lease_owner, lease_expires_at, last_error, created_at, \
-                 updated_at FROM sys_pubsub_deliveries WHERE id = ?1",
+                 updated_at, subscription_json FROM sys_pubsub_deliveries WHERE id = ?1",
                 [id.as_str()],
                 row_to_delivery_record,
             )
@@ -661,8 +663,8 @@ fn upsert_delivery_record(
         "INSERT INTO sys_pubsub_deliveries (id, message_id, delivery_kind, confirmation_token, \
          subscription_arn, message_body, subject, message_attributes_json, target, status, \
          attempts, next_attempt_at, lease_owner, lease_expires_at, last_error, created_at, \
-         updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         updated_at, subscription_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(id) DO UPDATE SET
             message_id = excluded.message_id,
             delivery_kind = excluded.delivery_kind,
@@ -678,6 +680,7 @@ fn upsert_delivery_record(
             lease_owner = excluded.lease_owner,
             lease_expires_at = excluded.lease_expires_at,
             last_error = excluded.last_error,
+            subscription_json = excluded.subscription_json,
             updated_at = excluded.updated_at",
         params![
             record.id.0.as_str(),
@@ -701,6 +704,11 @@ fn upsert_delivery_record(
             record.last_error.as_deref(),
             record.created_at.timestamp_millis(),
             record.updated_at.timestamp_millis(),
+            record
+                .subscription
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )
     .map_err(map_pubsub_sqlite_error)?;
@@ -725,12 +733,17 @@ fn row_to_delivery_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryR
     let last_error: Option<String> = row.get(14)?;
     let created_at: i64 = row.get(15)?;
     let updated_at: i64 = row.get(16)?;
+    let subscription_json: Option<String> = row.get(17)?;
     Ok(DeliveryRecord {
         id: DeliveryRecordId(id),
         kind: parse_delivery_kind(&delivery_kind, confirmation_token)?,
         message_id: pubsub_provider::PubsubMessageId::new_from_string(message_id)
             .map_err(to_sql_conversion_error)?,
         subscription_arn: SubscriptionArn::new(subscription_arn)
+            .map_err(to_sql_conversion_error)?,
+        subscription: subscription_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
             .map_err(to_sql_conversion_error)?,
         message_body,
         subject,

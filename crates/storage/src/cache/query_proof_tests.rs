@@ -1864,6 +1864,7 @@ async fn database_manager_update_rewrites_gsi_sort_order_after_refresh() {
             AttributeValue::S("001".to_string()),
         )])),
         return_values: None,
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: None,
     })
     .await

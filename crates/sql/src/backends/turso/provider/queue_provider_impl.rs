@@ -43,7 +43,8 @@ impl QueueProvider for TursoStorageProvider {
         .map_err(QueueError::from)
     }
 
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()> {
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue> {
+        let created_queue = queue.clone();
         let conn = self.connect().await.map_err(QueueError::from)?;
         let attributes_json = serde_json::to_string(&queue.attributes)?;
         let created_at = *queue.created_at;
@@ -58,7 +59,7 @@ impl QueueProvider for TursoStorageProvider {
             .execute(&conn, sql, params)
             .await
             .map_err(QueueError::from)?;
-        Ok(())
+        Ok(created_queue)
     }
 
     async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {

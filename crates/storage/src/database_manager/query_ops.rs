@@ -4,8 +4,7 @@ use storage_cache::RuntimePreparedQueryExecution;
 use storage_types::{
     AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, QueryTableRequest, StorageError,
     StorageResult, TableNamespace, TryFromWireItem, WireItem,
-    subset_expression_attribute_names_for_expression,
-    validate_gsi_projection_expression,
+    subset_expression_attribute_names_for_expression, validate_gsi_projection_expression,
 };
 
 use crate::{

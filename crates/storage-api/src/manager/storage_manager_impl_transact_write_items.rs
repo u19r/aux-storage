@@ -20,7 +20,9 @@ impl StorageApiManagerImpl {
         request: TransactWriteItemsRequest,
     ) -> Result<Response, HttpApiError> {
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::TransactWriteItems(request.clone()))
+            .propose_sync_write_if_configured(|| {
+                SyncWriteRequest::TransactWriteItems(request.clone())
+            })
             .await?
         {
             return Ok(Response::TransactWriteItems(sync_response_at(

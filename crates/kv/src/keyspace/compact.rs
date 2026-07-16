@@ -464,6 +464,9 @@ pub enum PubsubRecordKind {
     Delivery,
     DeliverySubscription,
     DeliveryClaim,
+    SubscriptionSnapshotRoot,
+    SubscriptionSnapshotChunk,
+    PublishIntent,
 }
 
 impl PubsubRecordKind {
@@ -477,6 +480,9 @@ impl PubsubRecordKind {
             Self::Delivery => b'v',
             Self::DeliverySubscription => b'u',
             Self::DeliveryClaim => b'c',
+            Self::SubscriptionSnapshotRoot => b'r',
+            Self::SubscriptionSnapshotChunk => b'h',
+            Self::PublishIntent => b'p',
         }
     }
 
@@ -490,6 +496,9 @@ impl PubsubRecordKind {
             b'v' => Ok(Self::Delivery),
             b'u' => Ok(Self::DeliverySubscription),
             b'c' => Ok(Self::DeliveryClaim),
+            b'r' => Ok(Self::SubscriptionSnapshotRoot),
+            b'h' => Ok(Self::SubscriptionSnapshotChunk),
+            b'p' => Ok(Self::PublishIntent),
             other => Err(CompactKeyError::InvalidKind {
                 family: KeyFamily::PubsubRecord,
                 kind: other,
@@ -507,6 +516,9 @@ impl PubsubRecordKind {
             Self::Delivery => "delivery",
             Self::DeliverySubscription => "delivery_subscription",
             Self::DeliveryClaim => "delivery_claim",
+            Self::SubscriptionSnapshotRoot => "subscription_snapshot_root",
+            Self::SubscriptionSnapshotChunk => "subscription_snapshot_chunk",
+            Self::PublishIntent => "publish_intent",
         }
     }
 }

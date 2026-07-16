@@ -43,9 +43,9 @@ use crate::{
         },
     },
     sorted_kv_store::{
-        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, RangeValuesResult, RawKey,
-        SortedKvReadContext, SortedKvStore, TransactWriteOperation, TransactWriteOutput,
-        TransactWriteTableOperation,
+        AtomicTableWriteDecision, AtomicTableWriteTransform, BatchItem, DirectWriteOperation,
+        OldNewItems, RangeResult, RangeValuesResult, RawKey, SortedKvReadContext, SortedKvStore,
+        TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
     },
 };
 
@@ -404,6 +404,63 @@ impl PartitionFamilyKvStore for RocksDbKvStore {
 
 #[async_trait::async_trait]
 impl SortedKvStore for RocksDbKvStore {
+    async fn atomic_read_modify_write_table(
+        &self,
+        read_key: Vec<u8>,
+        transform: AtomicTableWriteTransform,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<u8>> {
+        for attempt in 0..ROCKSDB_BATCH_WRITE_RETRIES {
+            let db_guard = self.db.read().await;
+            let opts = write_options_sync();
+            let otxn_opts = transaction_options_with_snapshot();
+            let txn = db_guard.transaction_opt(&opts, &otxn_opts);
+            let current = txn.get_for_update(&read_key, true).map_err(generic_err)?;
+            let (operations, output) = match transform(current.as_deref())? {
+                AtomicTableWriteDecision::NoWrite { output } => return Ok(output),
+                AtomicTableWriteDecision::Write { operations, output } => (operations, output),
+            };
+            preflight_table_write_operations(&operations)?;
+            let mut current_values = Vec::with_capacity(operations.len());
+            let mut stream_ids = Vec::with_capacity(operations.len());
+            for operation in &operations {
+                let key = table_operation_primary_key(operation)?;
+                current_values.push(txn.get_for_update(&key, true).map_err(generic_err)?);
+                stream_ids.push(
+                    operation_requires_stream_entries(operation, immediate_gsi_consistency)
+                        .then(|| {
+                            allocate_rocksdb_stream_item_id(
+                                &txn,
+                                next_rocksdb_stream_item_id(),
+                            )
+                        })
+                        .transpose()?,
+                );
+            }
+            let plan = plan_table_write_preflighted(
+                &operations,
+                current_values,
+                &stream_ids,
+                immediate_gsi_consistency,
+            )?;
+            apply_mutations(&txn, plan.mutations)?;
+            match txn
+                .commit()
+                .map_err(|error| StorageError::from(map_rocksdb_transaction_commit(error)))
+            {
+                Ok(()) => return Ok(output),
+                Err(error)
+                    if is_rocksdb_transaction_retryable(&error)
+                        && attempt + 1 < ROCKSDB_BATCH_WRITE_RETRIES =>
+                {
+                    warn!(attempt, error = %error, "rocksdb atomic item RMW retry");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("rocksdb atomic item RMW retry loop returns on success or final failure")
+    }
+
     async fn transact_write_table(
         &self,
         operations: Vec<TransactWriteTableOperation>,

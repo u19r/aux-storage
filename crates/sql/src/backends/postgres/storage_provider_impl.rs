@@ -20,9 +20,11 @@ use storage_provider::{
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
     BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof,
-    DurableItemRevision, DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
+    DeleteItemRequest, DurableItemRevision, DurablePointReadProof, DurablePointReadRequest,
+    GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
-    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    PutItemRequest, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    ReplicationMutation,
     ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
     StreamName, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis,
     UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
@@ -633,37 +635,21 @@ impl StorageProvider for PostgresStorageProvider {
         self.do_create_table_storage(table_name, request).await
     }
 
-    async fn put_item(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, storage_provider::AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
-        return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse> {
-        self.put_item_with_stream_ttl(
+    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let PutItemRequest {
             table_name,
             item,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
             return_values,
-            None,
-        )
-        .await
-    }
-
-    async fn put_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, storage_provider::AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
-    ) -> StorageResult<PutItemResponse> {
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         let _write_permit = self.acquire_foreground_write_permit("put_item").await?;
         apply_gsi_write_pressure(self).await?;
         let bytes_written = attr_map_payload_bytes(&item);
@@ -694,8 +680,10 @@ impl StorageProvider for PostgresStorageProvider {
                         &split_item.key_attributes,
                         None,
                     )?;
-                    let key_absence_condition =
-                        is_key_absence_condition(condition.as_ref(), &table_info);
+                    let key_absence_condition = is_key_absence_condition(
+                        condition.as_ref(),
+                        &table_info,
+                    ) && !return_old_on_condition_failure;
                     let attributes_blob = if split_item.non_key_attributes.is_empty() {
                         "{}".to_string()
                     } else {
@@ -821,7 +809,14 @@ impl StorageProvider for PostgresStorageProvider {
                             condition_started.elapsed(),
                         );
                         if !condition_matches {
-                            return Err(StorageEnum::ConditionalCheckFailed.into());
+                            let old_item = old_item
+                                .as_ref()
+                                .map(WireItem::to_attribute_map)
+                                .transpose()?;
+                            return Err(crate::provider_core::write::conditional_failure(
+                                old_item.as_ref(),
+                                return_old_on_condition_failure,
+                            ));
                         }
                     }
 
@@ -1022,34 +1017,23 @@ impl StorageProvider for PostgresStorageProvider {
         })
     }
 
-    async fn delete_item(
+    async fn delete_item_request(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
-        self.delete_item_with_stream_ttl(
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let DeleteItemRequest {
             table_name,
             key,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
-            None,
-        )
-        .await
-    }
-
-    async fn delete_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, storage_provider::AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
-    ) -> StorageResult<Option<HashMap<String, storage_provider::AttributeValue>>> {
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         let _write_permit = self.acquire_foreground_write_permit("delete_item").await?;
         apply_gsi_write_pressure(self).await?;
         let key_bytes = attr_map_payload_bytes(&key);
@@ -1091,7 +1075,14 @@ impl StorageProvider for PostgresStorageProvider {
                     if let Some(condition) = &condition
                         && !evaluate_wire_condition(old_item.as_ref(), condition)?
                     {
-                        return Err(StorageEnum::ConditionalCheckFailed.into());
+                        let old_item = old_item
+                            .as_ref()
+                            .map(WireItem::to_attribute_map)
+                            .transpose()?;
+                        return Err(crate::provider_core::write::conditional_failure(
+                            old_item.as_ref(),
+                            return_old_on_condition_failure,
+                        ));
                     }
 
                     let Some(old_item) = old_item else {

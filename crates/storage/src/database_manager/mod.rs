@@ -1,4 +1,5 @@
 mod cache_write_execution;
+mod atomic_item_ops;
 mod capped_entity_ops;
 mod constants;
 mod construction;
@@ -69,7 +70,8 @@ pub use crate::database_manager::{
     core::{
         CappedStorageError, CreateCappedEntityInput, DatabaseManager, DeleteCappedEntityInput,
         DeleteItemInput, PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
-        ScanTableInput, UpdateItemInput,
+        ResolvedBatchGetPlan, ResolvedGetItem, ResolvedStorageOperation, ScanTableInput,
+        UpdateItemInput,
     },
     read_sequence_executor::{
         InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,

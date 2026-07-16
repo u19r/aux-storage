@@ -240,6 +240,90 @@ async fn sqlite_read_sequence_transactional_context_keeps_one_file_backed_snapsh
 }
 
 #[tokio::test]
+async fn sqlite_read_sequence_transactional_context_reuses_snapshot_connection() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("read-sequence-reuse.db");
+    let provider = create_file_backed_revision_test_table(
+        &database_path.to_string_lossy(),
+        "ReadSequenceReuse",
+    )
+    .await;
+    let pool = provider
+        .snapshot_connection_pool
+        .as_ref()
+        .expect("file-backed snapshot pool");
+
+    let context = provider
+        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+        .await
+        .expect("first context");
+    assert_eq!(pool.counts(), (1, 1));
+    drop(context);
+    for _ in 0..100 {
+        if pool.counts().0 == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(pool.counts(), (0, 1));
+
+    for _ in 0..64 {
+        let context = provider
+            .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+            .await
+            .expect("reused context");
+        assert_eq!(pool.counts(), (1, 1));
+        drop(context);
+        for _ in 0..100 {
+            if pool.counts().0 == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pool.counts(), (0, 1));
+    }
+}
+
+#[tokio::test]
+async fn sqlite_read_sequence_transactional_context_obeys_snapshot_connection_cap() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let database_path = temp_dir.path().join("read-sequence-cap.db");
+    let provider =
+        create_file_backed_revision_test_table(&database_path.to_string_lossy(), "ReadSequenceCap")
+            .await;
+    let mut contexts = Vec::new();
+    for _ in 0..crate::backends::sqlite::provider::SQLITE_SNAPSHOT_POOL_SIZE {
+        contexts.push(
+            provider
+                .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+                .await
+                .expect("context within cap"),
+        );
+    }
+    let blocked_provider = provider.clone();
+    let mut blocked = tokio::spawn(async move {
+        blocked_provider
+            .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut blocked)
+            .await
+            .is_err(),
+        "connection beyond cap must wait for a lease"
+    );
+
+    drop(contexts.pop());
+    let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+        .await
+        .expect("released lease should unblock waiter")
+        .expect("waiter task should complete")
+        .expect("waiter should acquire snapshot connection");
+    drop(acquired);
+    drop(contexts);
+}
+
+#[tokio::test]
 async fn sqlite_read_sequence_transactional_context_fails_closed_without_snapshot_executor() {
     let provider = create_revision_test_table("ReadSequenceTransactionalUnsupported").await;
     let result = provider

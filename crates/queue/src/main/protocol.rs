@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::{
     Json,
     body::Bytes,
@@ -8,8 +6,12 @@ use axum::{
 };
 use http_error::HttpApiError;
 use queue_provider::{
-    SQS_INVALID_ACTION_ERROR_TYPE, SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE, sqs_json_error_type,
+    SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE, SQS_INVALID_ACTION_ERROR_TYPE,
+    SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE, SQS_MISSING_PARAMETER_ERROR_TYPE,
+    decode_json_request as decode_json_body, decode_value_request, query_fields_to_json,
+    sqs_json_error_type,
 };
+pub(crate) use queue_provider::{QueueAction, QueueRequest};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -21,70 +23,10 @@ pub(crate) enum QueueProtocol {
     Query,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueueAction {
-    CreateQueue,
-    DeleteQueue,
-    ListQueues,
-    GetQueueUrl,
-    GetQueueAttributes,
-    SetQueueAttributes,
-    PurgeQueue,
-    SendMessage,
-    SendMessageBatch,
-    ReceiveMessage,
-    DeleteMessage,
-    DeleteMessageBatch,
-    ChangeMessageVisibility,
-    ChangeMessageVisibilityBatch,
-}
-
-impl QueueAction {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "CreateQueue" => Some(Self::CreateQueue),
-            "DeleteQueue" => Some(Self::DeleteQueue),
-            "ListQueues" => Some(Self::ListQueues),
-            "GetQueueUrl" => Some(Self::GetQueueUrl),
-            "GetQueueAttributes" => Some(Self::GetQueueAttributes),
-            "SetQueueAttributes" => Some(Self::SetQueueAttributes),
-            "PurgeQueue" => Some(Self::PurgeQueue),
-            "SendMessage" => Some(Self::SendMessage),
-            "SendMessageBatch" => Some(Self::SendMessageBatch),
-            "ReceiveMessage" => Some(Self::ReceiveMessage),
-            "DeleteMessage" => Some(Self::DeleteMessage),
-            "DeleteMessageBatch" => Some(Self::DeleteMessageBatch),
-            "ChangeMessageVisibility" => Some(Self::ChangeMessageVisibility),
-            "ChangeMessageVisibilityBatch" => Some(Self::ChangeMessageVisibilityBatch),
-            _ => None,
-        }
-    }
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::CreateQueue => "CreateQueue",
-            Self::DeleteQueue => "DeleteQueue",
-            Self::ListQueues => "ListQueues",
-            Self::GetQueueUrl => "GetQueueUrl",
-            Self::GetQueueAttributes => "GetQueueAttributes",
-            Self::SetQueueAttributes => "SetQueueAttributes",
-            Self::PurgeQueue => "PurgeQueue",
-            Self::SendMessage => "SendMessage",
-            Self::SendMessageBatch => "SendMessageBatch",
-            Self::ReceiveMessage => "ReceiveMessage",
-            Self::DeleteMessage => "DeleteMessage",
-            Self::DeleteMessageBatch => "DeleteMessageBatch",
-            Self::ChangeMessageVisibility => "ChangeMessageVisibility",
-            Self::ChangeMessageVisibilityBatch => "ChangeMessageVisibilityBatch",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct QueueWireRequest {
     pub(crate) protocol: QueueProtocol,
-    pub(crate) action: QueueAction,
-    pub(crate) payload: Value,
+    pub(crate) request: QueueRequest,
 }
 
 #[derive(Debug)]
@@ -108,6 +50,21 @@ impl QueueWireError {
             status: StatusCode::BAD_REQUEST,
             code: SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE,
             message: message.into(),
+        }
+    }
+
+    fn validation(message: String) -> Self {
+        let code = if message.starts_with("Id ") && message.ends_with(" repeated.") {
+            SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE
+        } else if message == "The request must contain the parameter MessageBody." {
+            SQS_MISSING_PARAMETER_ERROR_TYPE
+        } else {
+            SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE
+        };
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message,
         }
     }
 }
@@ -147,261 +104,33 @@ fn decode_json_request(
         .ok_or_else(|| QueueWireError::invalid_action("invalid_x_amz_target"))?;
     let action = QueueAction::from_name(action_name)
         .ok_or_else(|| QueueWireError::invalid_action("unsupported_action"))?;
-    let payload = serde_json::from_slice::<Value>(&body)
-        .map_err(|err| QueueWireError::invalid_parameter(format!("invalid_json:{err}")))?;
+    let request = decode_json_body(action, &body)
+        .map_err(|error| QueueWireError::validation(error.message))?;
 
     Ok(QueueWireRequest {
         protocol: QueueProtocol::Json,
-        action,
-        payload,
+        request,
     })
 }
 
 fn decode_query_request(body: Bytes) -> Result<QueueWireRequest, QueueWireError> {
-    let fields: HashMap<String, String> = url::form_urlencoded::parse(&body)
+    let fields = url::form_urlencoded::parse(&body)
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
+        .collect::<Vec<_>>();
     let action_name = fields
-        .get("Action")
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == "Action").then_some(value))
         .ok_or_else(|| QueueWireError::invalid_action("missing_action"))?;
     let action = QueueAction::from_name(action_name)
         .ok_or_else(|| QueueWireError::invalid_action("unsupported_action"))?;
 
+    let request = decode_value_request(action, query_fields_to_json(fields))
+        .map_err(|error| QueueWireError::validation(error.message))?;
     Ok(QueueWireRequest {
         protocol: QueueProtocol::Query,
-        action,
-        payload: query_fields_to_json(fields),
+        request,
     })
-}
-
-fn query_fields_to_json(fields: HashMap<String, String>) -> Value {
-    let mut payload = serde_json::Map::new();
-    let mut attributes = serde_json::Map::new();
-    let mut attribute_names = Vec::new();
-    let mut message_attribute_names = Vec::new();
-    let mut send_entries = Vec::new();
-    let mut delete_entries = Vec::new();
-    let mut visibility_entries = Vec::new();
-    let mut message_attributes = serde_json::Map::new();
-
-    for (key, value) in &fields {
-        if key == "Action" || key == "Version" {
-            continue;
-        }
-        if collect_map_entry(&mut attributes, key, value, "Attribute") {
-            continue;
-        }
-        if collect_list_member(&mut attribute_names, key, value, "AttributeName") {
-            continue;
-        }
-        if collect_list_member(
-            &mut message_attribute_names,
-            key,
-            value,
-            "MessageAttributeName",
-        ) {
-            continue;
-        }
-        if collect_batch_entry(
-            &mut send_entries,
-            key,
-            value,
-            "SendMessageBatchRequestEntry",
-        ) {
-            continue;
-        }
-        if collect_batch_entry(
-            &mut delete_entries,
-            key,
-            value,
-            "DeleteMessageBatchRequestEntry",
-        ) {
-            continue;
-        }
-        if collect_batch_entry(
-            &mut visibility_entries,
-            key,
-            value,
-            "ChangeMessageVisibilityBatchRequestEntry",
-        ) {
-            continue;
-        }
-        if collect_message_attribute(&mut message_attributes, key, value, "MessageAttribute") {
-            continue;
-        }
-        let json_value = query_value_to_json(key, value.clone());
-        payload.insert(key.clone(), json_value);
-    }
-
-    if !attributes.is_empty() {
-        payload.insert("Attributes".to_string(), Value::Object(attributes));
-    }
-    if !attribute_names.is_empty() {
-        payload.insert("AttributeNames".to_string(), Value::Array(attribute_names));
-    }
-    if !message_attribute_names.is_empty() {
-        payload.insert(
-            "MessageAttributeNames".to_string(),
-            Value::Array(message_attribute_names),
-        );
-    }
-    message_attributes.retain(|key, _| !key.starts_with("__message_attribute_"));
-    if !message_attributes.is_empty() {
-        payload.insert(
-            "MessageAttributes".to_string(),
-            Value::Object(message_attributes),
-        );
-    }
-    if !send_entries.is_empty() {
-        payload.insert("Entries".to_string(), Value::Array(send_entries));
-    } else if !delete_entries.is_empty() {
-        payload.insert("Entries".to_string(), Value::Array(delete_entries));
-    } else if !visibility_entries.is_empty() {
-        payload.insert("Entries".to_string(), Value::Array(visibility_entries));
-    }
-    Value::Object(payload)
-}
-
-fn collect_map_entry(
-    output: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: &str,
-    prefix: &str,
-) -> bool {
-    let Some(rest) = key
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return false;
-    };
-    let parts: Vec<_> = rest.split('.').collect();
-    if parts.len() != 2 {
-        return false;
-    }
-    let Some(field) = map_entry_field(parts[1]) else {
-        return false;
-    };
-    let entry_key = format!("__entry_{}_{}", prefix, parts[0]);
-    let entry = output
-        .entry(entry_key)
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Some(entry) = entry.as_object_mut() else {
-        return false;
-    };
-    entry.insert(field.to_string(), Value::String(value.to_string()));
-
-    let completed = entry
-        .get("Name")
-        .and_then(Value::as_str)
-        .zip(entry.get("Value").and_then(Value::as_str))
-        .map(|(name, value)| (name.to_string(), value.to_string()));
-    if let Some((name, value)) = completed {
-        output.remove(&format!("__entry_{}_{}", prefix, parts[0]));
-        output.insert(name, Value::String(value));
-    }
-    true
-}
-
-fn map_entry_field(field: &str) -> Option<&'static str> {
-    match field {
-        "Name" | "key" => Some("Name"),
-        "Value" | "value" => Some("Value"),
-        _ => None,
-    }
-}
-
-fn collect_list_member(output: &mut Vec<Value>, key: &str, value: &str, prefix: &str) -> bool {
-    let Some(index) = key
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return false;
-    };
-    if index.parse::<usize>().is_err() {
-        return false;
-    }
-    output.push(Value::String(value.to_string()));
-    true
-}
-
-fn collect_batch_entry(output: &mut Vec<Value>, key: &str, value: &str, prefix: &str) -> bool {
-    let Some(rest) = key
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return false;
-    };
-    let parts: Vec<_> = rest.split('.').collect();
-    if parts.len() != 2 {
-        return false;
-    }
-    let Ok(index) = parts[0].parse::<usize>() else {
-        return false;
-    };
-    ensure_array_len(output, index);
-    if let Some(entry) = output.get_mut(index - 1).and_then(Value::as_object_mut) {
-        entry.insert(
-            parts[1].to_string(),
-            query_value_to_json(parts[1], value.to_string()),
-        );
-    }
-    true
-}
-
-fn collect_message_attribute(
-    output: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: &str,
-    prefix: &str,
-) -> bool {
-    let Some(rest) = key
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('.'))
-    else {
-        return false;
-    };
-    let parts: Vec<_> = rest.split('.').collect();
-    if parts.len() != 2 && parts.len() != 3 {
-        return false;
-    }
-    let entry_key = format!("__message_attribute_{}", parts[0]);
-    let entry = output
-        .entry(entry_key.clone())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Some(entry) = entry.as_object_mut() else {
-        return false;
-    };
-    let field = if parts.len() == 3 && parts[1] == "Value" {
-        parts[2]
-    } else {
-        parts[1]
-    };
-    entry.insert(field.to_string(), Value::String(value.to_string()));
-    let completed = entry
-        .get("Name")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if let Some(name) = completed {
-        let mut attr = entry.clone();
-        attr.remove("Name");
-        output.insert(name, Value::Object(attr));
-    }
-    true
-}
-
-fn ensure_array_len(output: &mut Vec<Value>, index: usize) {
-    while output.len() < index {
-        output.push(Value::Object(serde_json::Map::new()));
-    }
-}
-
-fn query_value_to_json(key: &str, value: String) -> Value {
-    match key {
-        "DelaySeconds" | "MaxNumberOfMessages" | "VisibilityTimeout" | "WaitTimeSeconds" => value
-            .parse::<u32>()
-            .map_or_else(|_| Value::String(value), |number| json!(number)),
-        _ => Value::String(value),
-    }
 }
 
 pub(crate) fn ok_response<T: Serialize>(

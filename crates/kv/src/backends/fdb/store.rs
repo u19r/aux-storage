@@ -56,11 +56,13 @@ use crate::{
     queue::{
         PartitionedQueueMessageWrite, QueueClaimBatch, QueueClaimRange, QueueClaimedMessage,
         QueueKvStore, QueuePrewarmPartition,
-        storage::{queue_payload_write_operations, read_partitioned_queue_payload},
+        constants::QUEUE_PAYLOAD_CHUNK_BYTES,
+        storage::{queue_payload_chunk_key, read_partitioned_queue_payload},
     },
     sorted_kv_store::{
-        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, SortedKvReadContext,
-        SortedKvStore, TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
+        AtomicTableWriteDecision, AtomicTableWriteTransform, BatchItem, DirectWriteOperation,
+        OldNewItems, RangeResult, SortedKvReadContext, SortedKvStore, TransactWriteOperation,
+        TransactWriteOutput, TransactWriteTableOperation,
     },
     stream::item_codec::decode_stream_item,
 };
@@ -1291,38 +1293,39 @@ impl QueueKvStore for FoundationDbKvStore {
             attempt += 1;
             Self::configure_transaction(&trx, None, true)?;
 
-            let empty_ready_value = Vec::new();
             let mut write_bytes = 0u64;
             let mut write_key_bytes = 0u64;
             let mut set_count = 0u64;
             let mut ready_hints = HashMap::<&[u8], &[u8]>::new();
             let mut wake_writes = HashMap::<&[u8], &[u8]>::new();
             for message in &messages {
-                let mut writes = vec![
-                    DirectWriteOperation::Put {
-                        key: message.state_key.clone(),
-                        value: message.state_bytes.clone(),
-                    },
-                    DirectWriteOperation::Put {
-                        key: message.ready_key.clone(),
-                        value: empty_ready_value.clone(),
-                    },
-                ];
-                writes.extend(queue_payload_write_operations(
-                    message.payload_key.clone(),
-                    message.payload_bytes.clone(),
-                )?);
-                for write in writes {
-                    let DirectWriteOperation::Put { key, value } = write else {
-                        continue;
-                    };
+                let mut set_value = |key: &[u8], value: &[u8]| -> StorageResult<()> {
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
-                    let prefixed_key = Self::prefix_bytes(prefix.as_ref(), &key);
+                    let prefixed_key = Self::prefix_bytes(prefix.as_ref(), key);
                     write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);
                     trx.set_option(options::TransactionOption::NextWriteNoWriteConflictRange)
                         .map_err(|err| map_fdb_error("disable queue send write conflict", err))?;
-                    trx.set(&prefixed_key, &value);
+                    trx.set(&prefixed_key, value);
                     set_count = set_count.saturating_add(1);
+                    Ok(())
+                };
+                set_value(&message.state_key, &message.state_bytes)?;
+                set_value(&message.ready_key, &[])?;
+                if let Some(record_bytes) = &message.payload_record_bytes {
+                    set_value(&message.payload_key, record_bytes)?;
+                    for (index, chunk) in message
+                        .payload_bytes
+                        .chunks(QUEUE_PAYLOAD_CHUNK_BYTES)
+                        .enumerate()
+                    {
+                        let chunk_key = queue_payload_chunk_key(
+                            &message.payload_key,
+                            u16::try_from(index).unwrap_or(u16::MAX),
+                        );
+                        set_value(&chunk_key, chunk)?;
+                    }
+                } else {
+                    set_value(&message.payload_key, &message.payload_bytes)?;
                 }
                 ready_hints
                     .entry(&message.ready_hint_key)
@@ -2172,6 +2175,78 @@ impl PartitionFamilyKvStore for FoundationDbKvStore {
 
 #[async_trait::async_trait]
 impl SortedKvStore for FoundationDbKvStore {
+    async fn atomic_read_modify_write_table(
+        &self,
+        read_key: Vec<u8>,
+        transform: AtomicTableWriteTransform,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<u8>> {
+        let prefix = self.config.subspace_prefix.clone();
+        let prefixed_read_key = Self::prefix_bytes(prefix.as_ref(), &read_key);
+        let mut trx = self.create_transaction()?;
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            Self::configure_transaction(&trx, None, true)?;
+            trx.set_option(options::TransactionOption::ReadYourWritesDisable)
+                .map_err(|error| map_fdb_error("disable atomic RMW read-your-writes", error))?;
+            let current = trx
+                .get(&prefixed_read_key, false)
+                .await
+                .map_err(|error| map_fdb_error("atomic RMW read item", error))?
+                .map(|value| value.to_vec());
+            let (operations, output) = match transform(current.as_deref())? {
+                AtomicTableWriteDecision::NoWrite { output } => return Ok(output),
+                AtomicTableWriteDecision::Write { operations, output } => (operations, output),
+            };
+            let stream_ids = self.build_stream_ids(&operations).await;
+            match self
+                .execute_transact_write_table_tx(
+                    &trx,
+                    &operations,
+                    &stream_ids,
+                    prefix.as_ref(),
+                    immediate_gsi_consistency,
+                )
+                .await
+            {
+                Ok(execution) => match Self::commit_transaction("atomic_item_rmw", trx).await {
+                    Ok(_) => {
+                        self.record_ordered_log_writes(
+                            &execution.ordered_log_writes,
+                            u64::from(attempt.saturating_sub(1)),
+                        );
+                        return Ok(output);
+                    }
+                    Err(error) => match error.on_error().await {
+                        Ok(mut new_trx) => {
+                            new_trx.reset();
+                            trx = new_trx;
+                        }
+                        Err(error) => {
+                            return Err(map_fdb_error("atomic item RMW commit", error));
+                        }
+                    },
+                },
+                Err(FdbTableWriteExecutionError::Storage(error)) => return Err(error),
+                Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
+                    let candidate_keys =
+                        Self::collect_transact_write_table_keys(prefix.as_ref(), &operations);
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "atomic_item_rmw",
+                            scope,
+                            attempt,
+                            error,
+                            &candidate_keys,
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+
     async fn transact_write(
         &self,
         operations: Vec<TransactWriteOperation>,

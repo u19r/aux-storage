@@ -46,6 +46,7 @@ async fn foundationdb_pubsub_provider_persists_and_claims_delivery_records() {
         kind: DeliveryRecordKind::Notification,
         message_id: PubsubMessageId::new(),
         subscription_arn: subscription.subscription_arn,
+        subscription: None,
         message_body: None,
         subject: None,
         message_attributes: Default::default(),

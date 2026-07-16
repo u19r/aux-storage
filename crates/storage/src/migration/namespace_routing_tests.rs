@@ -8,7 +8,8 @@ use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateTableRequest, KeyAttributeType,
     KeySchemaElement, KeyType, KeysAndAttributes, StorageEnum, StorageError, TableName,
     TableNamespace, TransactConditionCheckRequest, TransactEncodeItem, TransactUpdateRequest,
-    TransactWriteItem, UpdateItemRequest,
+    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
+    context::WrappedError as _,
 };
 
 use crate::{
@@ -40,8 +41,28 @@ async fn new_routed_db() -> DatabaseManager {
     .expect("database manager")
 }
 
+async fn new_multi_connection_routed_db() -> DatabaseManager {
+    DatabaseManager::new_with_connection_registry(StorageConnectionRegistry {
+        default_connection_id: "default".to_string(),
+        connections: HashMap::from([
+            ("default".to_string(), sqlite_connection(":memory:")),
+            ("tenant-store".to_string(), sqlite_connection(":memory:")),
+        ]),
+    })
+    .await
+    .expect("multi-connection database manager")
+}
+
 async fn create_simple_shared_table(db: &DatabaseManager, loc: u16) {
     let table_name = Tables::shared_namespace(loc);
+    create_simple_table_on_connection(db, "default", table_name).await;
+}
+
+async fn create_simple_table_on_connection(
+    db: &DatabaseManager,
+    connection_id: &str,
+    table_name: TableName,
+) {
     let request = CreateTableRequest::new(
         table_name,
         vec![
@@ -66,9 +87,9 @@ async fn create_simple_shared_table(db: &DatabaseManager, loc: u16) {
         ],
         storage_types::BillingMode::PayPerRequest,
     );
-    db.create_table(&request)
+    db.create_table_on_connection(connection_id, &request)
         .await
-        .expect("create shared table");
+        .expect("create routed table");
 }
 
 async fn put_location_dictionary(db: &DatabaseManager, mappings: &[(u16, &str)]) {
@@ -429,6 +450,180 @@ async fn shared_table_routing_rewrites_keys_and_blocks_unsafe_forms() {
 }
 
 #[tokio::test]
+async fn routed_transaction_failure_returns_logical_all_old_item() {
+    let db = new_routed_db().await;
+    Tables::create_sys_namespaces_table(&db)
+        .await
+        .expect("create sys tenants");
+    create_simple_shared_table(&db, 1).await;
+    put_location_dictionary(&db, &[(1, "default")]).await;
+
+    let namespace = TableNamespace::new();
+    put_shared_namespace_route_metadata(&db, &namespace, 1).await;
+    let logical_table = Tables::namespace(&namespace);
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(logical_table.clone())
+            .item(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("USER#TXN".to_string())),
+                ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
+                ("state".to_string(), AttributeValue::S("winner".to_string())),
+            ]))
+            .build(),
+    )
+    .await
+    .expect("seed routed item");
+
+    let error = db
+        .transact_write_items(TransactWriteItemsRequest {
+            transact_items: vec![TransactWriteItem {
+                update: Some(TransactUpdateRequest {
+                    table_name: logical_table,
+                    key: HashMap::from([
+                        ("pk".to_string(), AttributeValue::S("USER#TXN".to_string())),
+                        ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
+                    ])
+                    .into(),
+                    update_expression: "SET #state = :next".to_string(),
+                    condition_expression: Some("#state = :expected".to_string()),
+                    expression_attribute_names: Some(HashMap::from([(
+                        "#state".to_string(),
+                        "state".to_string(),
+                    )])),
+                    expression_attribute_values: Some(HashMap::from([
+                        (":next".to_string(), AttributeValue::S("next".to_string())),
+                        (
+                            ":expected".to_string(),
+                            AttributeValue::S("loser".to_string()),
+                        ),
+                    ])),
+                    return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
+                    aux_item_stream_ttl_hours: None,
+                }),
+                ..TransactWriteItem::default()
+            }],
+            ..TransactWriteItemsRequest::default()
+        })
+        .await
+        .expect_err("condition must fail");
+
+    let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        panic!("expected transaction cancellation, got {error}");
+    };
+    let item: HashMap<String, AttributeValue> = serde_json::from_str(
+        reasons[0]
+            .splitn(3, '\t')
+            .nth(2)
+            .expect("conditional failure item"),
+    )
+    .expect("decode conditional failure item");
+    assert_eq!(
+        item.get("pk"),
+        Some(&AttributeValue::S("USER#TXN".to_string()))
+    );
+    assert_eq!(
+        item.get("state"),
+        Some(&AttributeValue::S("winner".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn resolved_get_uses_one_route_snapshot_across_cutover() {
+    let db = new_routed_db().await;
+    Tables::create_sys_namespaces_table(&db)
+        .await
+        .expect("create sys tenants");
+    create_simple_shared_table(&db, 1).await;
+    create_simple_shared_table(&db, 2).await;
+    put_location_dictionary(&db, &[(1, "default"), (2, "default")]).await;
+
+    let namespace = TableNamespace::new();
+    put_shared_namespace_route_metadata(&db, &namespace, 1).await;
+    let logical_table = Tables::namespace(&namespace);
+    let logical_key = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("USER#SNAPSHOT".to_string())),
+        ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
+    ]);
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(logical_table.clone())
+            .item(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("USER#SNAPSHOT".to_string())),
+                ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
+                ("location".to_string(), AttributeValue::N("1".to_string())),
+            ]))
+            .build(),
+    )
+    .await
+    .expect("seed old route");
+
+    db.storage_provider()
+        .put_item(
+            Tables::shared_namespace(2),
+            HashMap::from([
+                (
+                    "pk".to_string(),
+                    AttributeValue::S(format!("{}#USER#SNAPSHOT", namespace.as_str())),
+                ),
+                ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
+                ("location".to_string(), AttributeValue::N("2".to_string())),
+            ]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed new route");
+
+    let resolved = db
+        .resolve_storage_operation(logical_table.clone())
+        .await
+        .expect("resolve before cutover")
+        .validate_key(logical_key.clone().into())
+        .expect("validate logical key");
+
+    let now_ms = storage_types::TimestampMillis::now().timestamp_millis();
+    put_cutover_event(
+        &db,
+        &namespace,
+        "resolved-operation-cutover",
+        1,
+        2,
+        now_ms - 1,
+    )
+    .await;
+    db.run_job(GSI_UPDATE_JOB).await;
+    let resolver = db.route_resolver_for_tests().expect("route resolver");
+    CutoverWatcher::new(resolver, db.default_storage_for_tests())
+        .poll_once()
+        .await
+        .expect("apply cutover");
+
+    let snapshot_item = db
+        .get_item_with_resolved_operation(resolved, true)
+        .await
+        .expect("read from resolved route")
+        .expect("snapshot item")
+        .into_attribute_map()
+        .expect("decode snapshot item");
+    assert_eq!(
+        snapshot_item.get("location"),
+        Some(&AttributeValue::N("1".to_string()))
+    );
+
+    let fresh_item = db
+        .get_item_map(logical_table, logical_key)
+        .await
+        .expect("read fresh route")
+        .expect("fresh item");
+    assert_eq!(
+        fresh_item.get("location"),
+        Some(&AttributeValue::N("2".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn batch_get_keeps_logical_namespaces_that_share_one_physical_table_separate() {
     let db = new_routed_db().await;
     Tables::create_sys_namespaces_table(&db)
@@ -506,6 +701,88 @@ async fn batch_get_keeps_logical_namespaces_that_share_one_physical_table_separa
             .expect("second value"),
         Some(AttributeValue::S("second".to_string()))
     );
+}
+
+#[tokio::test]
+async fn batch_get_groups_dedicated_tables_on_one_routed_connection() {
+    let db = new_multi_connection_routed_db().await;
+    put_location_dictionary(&db, &[(2, "tenant-store")]).await;
+    let first_namespace = TableNamespace::from_seed("dedicated-first");
+    let second_namespace = TableNamespace::from_seed("dedicated-second");
+
+    for namespace in [&first_namespace, &second_namespace] {
+        put_dedicated_namespace_route_metadata(&db, namespace, 2).await;
+        create_simple_table_on_connection(
+            &db,
+            "tenant-store",
+            Tables::namespace(namespace),
+        )
+        .await;
+        db.put_item(
+            PutItemInput::builder()
+                .table_name(Tables::namespace(namespace))
+                .item(HashMap::from([
+                    ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+                    ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+                    (
+                        "namespace".to_string(),
+                        AttributeValue::S(namespace.as_str().to_string()),
+                    ),
+                ]))
+                .build(),
+        )
+        .await
+        .expect("put routed dedicated item");
+    }
+
+    let key = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+        ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+    ]);
+    let first_table = Tables::namespace(&first_namespace);
+    let second_table = Tables::namespace(&second_namespace);
+    let response = db
+        .batch_get_item(BatchGetItemRequest {
+            request_items: HashMap::from([
+                (
+                    first_table.clone(),
+                    KeysAndAttributes {
+                        keys: vec![key.clone().into()].into(),
+                        attributes_to_get: None,
+                        consistent_read: Some(true),
+                        projection_expression: None,
+                        expression_attribute_names: None,
+                    },
+                ),
+                (
+                    second_table.clone(),
+                    KeysAndAttributes {
+                        keys: vec![key.into()].into(),
+                        attributes_to_get: None,
+                        consistent_read: Some(false),
+                        projection_expression: None,
+                        expression_attribute_names: None,
+                    },
+                ),
+            ]),
+            return_consumed_capacity: None,
+        })
+        .await
+        .expect("batch get grouped routed items")
+        .responses
+        .expect("grouped responses");
+
+    for (table, namespace) in [
+        (first_table, first_namespace),
+        (second_table, second_namespace),
+    ] {
+        assert_eq!(
+            response[&table][0]
+                .attribute_value("namespace")
+                .expect("namespace value"),
+            Some(AttributeValue::S(namespace.as_str().to_string()))
+        );
+    }
 }
 
 #[tokio::test]
@@ -1240,6 +1517,59 @@ async fn shared_table_routing_rewrites_partition_assignments_inside_if_not_exist
             "{}#USER_LOOKUP#bob@example.test",
             namespace.as_str()
         )))
+    );
+}
+
+#[test]
+fn shared_table_routing_allows_nested_document_update_paths() {
+    let namespace = TableNamespace::new();
+    let rewriter = NamespaceRequestRewriter::new();
+    let mut request = UpdateItemRequest::builder()
+        .table_name(Tables::namespace(&namespace))
+        .key(HashMap::from([
+            ("pk".to_string(), AttributeValue::S("ROLE#1".to_string())),
+            ("sk".to_string(), AttributeValue::S("LOOKUP".to_string())),
+        ]))
+        .update_expression(
+            "SET #entries.#entry = :entry_payload, #updated_at = :updated_at".to_string(),
+        )
+        .expression_attribute_names(Some(HashMap::from([
+            ("#entries".to_string(), "assignment_entries".to_string()),
+            ("#entry".to_string(), "role-1".to_string()),
+            ("#updated_at".to_string(), "updated_at".to_string()),
+        ])))
+        .expression_attribute_values(Some(HashMap::from([
+            (
+                ":entry_payload".to_string(),
+                AttributeValue::M(HashMap::from([(
+                    "role_id".to_string(),
+                    AttributeValue::S("role-1".to_string()),
+                )])),
+            ),
+            (
+                ":updated_at".to_string(),
+                AttributeValue::N("1".to_string()),
+            ),
+        ])))
+        .build();
+
+    rewriter
+        .rewrite_update_for_shared_table(&namespace, &mut request)
+        .expect("nested document paths must not be parsed as one expression-name alias");
+
+    assert_eq!(
+        request.key.get("pk"),
+        Some(&AttributeValue::S(format!("{}#ROLE#1", namespace.as_str())))
+    );
+    assert_eq!(
+        request
+            .expression_attribute_values
+            .as_ref()
+            .and_then(|values| values.get(":entry_payload")),
+        Some(&AttributeValue::M(HashMap::from([(
+            "role_id".to_string(),
+            AttributeValue::S("role-1".to_string()),
+        )])))
     );
 }
 

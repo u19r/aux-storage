@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest, EncodePutRequest,
     EncodeWriteRequest, PutRequest, TableName, TransactEncodeItem, TransactEncodePutRequest,
-    TransactWriteItemsEncodeRequest, WireItem, WriteRequest,
+    TransactWriteItemsEncodeRequest, WireItem, WriteRequest, WriteRetryPolicy,
 };
 
 fn sample_wire_item() -> WireItem {
@@ -16,6 +16,69 @@ fn sample_wire_item() -> WireItem {
         ),
     ]);
     WireItem::from_attribute_map(&item).expect("wire item")
+}
+
+fn transaction_with_25_four_kib_items() -> TransactWriteItemsEncodeRequest {
+    let table_name = TableName::new("retry_alloc_table");
+    let payload = vec![b'x'; 4 * 1024];
+    TransactWriteItemsEncodeRequest::builder()
+        .transact_items(
+            (0..25)
+                .map(|_| {
+                    TransactEncodeItem::builder()
+                        .put(
+                            TransactEncodePutRequest::builder()
+                                .table_name(table_name.clone())
+                                .item(WireItem::dynamo_json(payload.clone()))
+                                .build(),
+                        )
+                        .build()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .build()
+}
+
+#[test]
+fn owned_transaction_retry_handoff_avoids_payload_clones_tests() {
+    let request = transaction_with_25_four_kib_items();
+    let legacy_guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "owned_transaction_retry_handoff_avoids_payload_clones_tests",
+        file!(),
+        line!(),
+        Some("legacy_clone"),
+    );
+    for _ in 0..3 {
+        std::hint::black_box(request.clone());
+    }
+    let legacy = legacy_guard.finish();
+
+    let owned_guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "owned_transaction_retry_handoff_avoids_payload_clones_tests",
+        file!(),
+        line!(),
+        Some("owned_borrowed_attempts"),
+    );
+    let owned_request = request;
+    for _ in 0..3 {
+        std::hint::black_box(&owned_request);
+    }
+    let owned = owned_guard.finish();
+
+    alloc_counter::emit_report(&legacy);
+    alloc_counter::emit_report(&owned);
+    assert!(legacy.allocated_bytes >= 3 * 25 * 4 * 1024);
+    assert_eq!(owned.allocation_count, 0);
+    assert_eq!(owned.allocated_bytes, 0);
+}
+
+#[test]
+fn write_retry_policy_always_has_an_attempt_tests() {
+    let policy = WriteRetryPolicy::new(0, std::time::Duration::from_millis(1));
+    assert_eq!(policy.max_attempts(), 1);
+    assert_eq!(policy.delay(), std::time::Duration::from_millis(1));
 }
 
 #[test]

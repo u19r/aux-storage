@@ -3,10 +3,57 @@ use std::collections::HashMap;
 use typed_builder::TypedBuilder;
 
 use crate::{
-    AttributeValue, BatchWriteItemRequest, DeleteRequest, PutRequest, TableName,
+    AllOld, AttributeValue, BatchWriteItemRequest, DeleteRequest, PutRequest,
+    StreamRetentionDuration, TableName,
     TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
     TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem, WriteRequest,
 };
+
+#[derive(Debug, Clone)]
+pub struct PutItemEncodeRequest {
+    pub table_name: TableName,
+    pub item: WireItem,
+    pub condition_expression: Option<String>,
+    pub expression_attribute_names: Option<HashMap<String, String>>,
+    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub return_values: Option<AllOld>,
+    pub return_old_on_condition_failure: bool,
+    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRetryPolicy {
+    max_attempts: u32,
+    delay: std::time::Duration,
+}
+
+impl WriteRetryPolicy {
+    #[must_use]
+    pub const fn no_retry() -> Self {
+        Self {
+            max_attempts: 1,
+            delay: std::time::Duration::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub const fn new(max_attempts: u32, delay: std::time::Duration) -> Self {
+        Self {
+            max_attempts: if max_attempts == 0 { 1 } else { max_attempts },
+            delay,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    #[must_use]
+    pub const fn delay(self) -> std::time::Duration {
+        self.delay
+    }
+}
 
 #[allow(clippy::extra_unused_lifetimes)]
 #[derive(Debug, Clone, Default, TypedBuilder)]

@@ -284,6 +284,7 @@ fn delivery_record(
         message_id: PubsubMessageId::new(),
         subscription_arn: SubscriptionArn::new("arn:aws:sns:us-east-1:000000000000:orders:sub")
             .unwrap(),
+        subscription: None,
         message_body: None,
         subject: None,
         message_attributes: Default::default(),

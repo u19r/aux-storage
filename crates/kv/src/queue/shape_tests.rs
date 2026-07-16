@@ -12,6 +12,7 @@ use storage_types::{
 
 use crate::{
     RocksDbKvStore, SortedKvDbStorageProvider,
+    keyspace::compact,
     kv_support_tests::rocksdb_test_path,
     partition_family::{PartitionFamilyKind, PartitionFamilyKvStore, RuntimePartitionLoadSample},
     queue::{
@@ -23,12 +24,15 @@ use crate::{
         },
     },
     sorted_kv_store::{
-        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, RangeValuesResult,
-        SortedKvStore, TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
+        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, RangeValuesResult, RawKey,
+        SortedKvReadContext, SortedKvStore, TransactWriteOperation, TransactWriteOutput,
+        TransactWriteTableOperation,
     },
 };
 
-const QUEUE_URL: &str = "https://queue.example.test/000000000000/shape-profile";
+const QUEUE_CREATE_URL: &str = "https://queue.example.test/000000000000/shape-profile";
+const QUEUE_URL: &str =
+    "https://queue.example.test/000000000000/000000000001/shape-profile";
 const QUEUE_NAME: &str = "shape-profile";
 
 #[derive(Clone)]
@@ -40,6 +44,7 @@ struct ObservingQueueKvStore {
 #[derive(Clone, Debug, Default)]
 struct QueueShapeStats {
     point_gets: u64,
+    queue_metadata_reads: u64,
     ordinary_point_reads: u64,
     snapshot_point_reads: u64,
     multi_get_calls: u64,
@@ -69,6 +74,61 @@ struct QueueShapeStats {
     queue_message_writes: u64,
     await_total: u64,
     await_serial_total: u64,
+    read_contexts: u64,
+}
+
+struct ObservingQueueReadContext {
+    inner: Box<dyn SortedKvReadContext>,
+    stats: Arc<Mutex<QueueShapeStats>>,
+}
+
+#[async_trait::async_trait]
+impl SortedKvReadContext for ObservingQueueReadContext {
+    async fn get(&self, key: &[u8], consistent_read: bool) -> StorageResult<Option<Vec<u8>>> {
+        let value = self.inner.get(key, consistent_read).await?;
+        let mut stats = self.stats.lock().unwrap_or_else(|error| error.into_inner());
+        stats.point_gets = stats.point_gets.saturating_add(1);
+        if key.starts_with(&compact::queue_metadata_prefix().start) {
+            stats.queue_metadata_reads = stats.queue_metadata_reads.saturating_add(1);
+        }
+        record_read_shape(&mut stats, consistent_read, 1, 0);
+        Ok(value)
+    }
+
+    async fn multi_get(
+        &self,
+        keys: Vec<Vec<u8>>,
+        consistent_read: bool,
+    ) -> StorageResult<Vec<Option<Vec<u8>>>> {
+        let key_count = u64::try_from(keys.len()).unwrap_or(u64::MAX);
+        let values = self.inner.multi_get(keys, consistent_read).await?;
+        let mut stats = self.stats.lock().unwrap_or_else(|error| error.into_inner());
+        stats.multi_get_calls = stats.multi_get_calls.saturating_add(1);
+        stats.multi_get_keys = stats.multi_get_keys.saturating_add(key_count);
+        record_read_shape(&mut stats, consistent_read, key_count, 0);
+        Ok(values)
+    }
+
+    async fn get_range_values(
+        &self,
+        start: &[u8],
+        exclusive_end: &[u8],
+        limit: Option<u32>,
+        page_token: Option<RawKey>,
+        consistent_read: bool,
+    ) -> StorageResult<RangeValuesResult> {
+        let result = self
+            .inner
+            .get_range_values(start, exclusive_end, limit, page_token, consistent_read)
+            .await?;
+        let mut stats = self.stats.lock().unwrap_or_else(|error| error.into_inner());
+        stats.range_reads = stats.range_reads.saturating_add(1);
+        stats.range_entries = stats
+            .range_entries
+            .saturating_add(u64::try_from(result.values.len()).unwrap_or(u64::MAX));
+        record_read_shape(&mut stats, consistent_read, 0, 1);
+        Ok(result)
+    }
 }
 
 impl ObservingQueueKvStore {
@@ -162,6 +222,17 @@ impl PartitionFamilyKvStore for ObservingQueueKvStore {
 
 #[async_trait::async_trait]
 impl SortedKvStore for ObservingQueueKvStore {
+    async fn begin_read_context(&self) -> StorageResult<Box<dyn SortedKvReadContext>> {
+        {
+            let mut stats = self.lock_stats();
+            stats.read_contexts = stats.read_contexts.saturating_add(1);
+        }
+        Ok(Box::new(ObservingQueueReadContext {
+            inner: self.inner.begin_read_context().await?,
+            stats: Arc::clone(&self.stats),
+        }))
+    }
+
     async fn transact_write(
         &self,
         operations: Vec<TransactWriteOperation>,
@@ -220,6 +291,9 @@ impl SortedKvStore for ObservingQueueKvStore {
         let value = self.inner.get(key, consistent_read).await?;
         let mut stats = self.lock_stats();
         stats.point_gets = stats.point_gets.saturating_add(1);
+        if key.starts_with(&compact::queue_metadata_prefix().start) {
+            stats.queue_metadata_reads = stats.queue_metadata_reads.saturating_add(1);
+        }
         record_read_shape(&mut stats, consistent_read, 1, 0);
         stats.bytes_read = stats
             .bytes_read
@@ -629,7 +703,7 @@ fn record_read_shape(
 fn queue() -> Queue {
     Queue {
         queue_name: QUEUE_NAME.to_string(),
-        queue_url: QUEUE_URL.to_string(),
+        queue_url: QUEUE_CREATE_URL.to_string(),
         attributes: HashMap::new(),
         created_at: TimestampMillis::from(1_700_000_000_000),
     }
@@ -677,12 +751,34 @@ async fn send_1_small_message_shape_tests() {
     assert_eq!(stats.check_values, 0);
     assert_eq!(stats.puts, 5);
     assert_eq!(stats.deletes, 0);
-    assert_eq!(stats.ordinary_point_reads, 2);
+    assert_eq!(stats.ordinary_point_reads, 1);
+    assert_eq!(stats.queue_metadata_reads, 1);
     assert_eq!(stats.snapshot_point_reads, 0);
     assert_eq!(stats.blind_writes, 5);
     assert_eq!(stats.read_modify_writes, 0);
     assert!(stats.write_key_bytes > 0);
     assert_eq!(stats.await_serial_total, 1);
+}
+
+#[tokio::test]
+async fn queue_attributes_use_one_read_context_shape_tests() {
+    let (provider, store) = create_observed_provider().await;
+    store.reset();
+
+    let (_, counts) = provider
+        .get_queue_with_message_counts(QUEUE_URL)
+        .await
+        .expect("read queue attributes")
+        .expect("queue exists");
+
+    assert_eq!(counts.visible, 0);
+    assert_eq!(counts.not_visible, 0);
+    assert_eq!(counts.delayed, 0);
+    let stats = store.snapshot();
+    assert_eq!(stats.read_contexts, 1);
+    assert_eq!(stats.queue_metadata_reads, 1);
+    assert_eq!(stats.ordinary_point_reads, 2);
+    assert_eq!(stats.snapshot_point_reads, 0);
 }
 
 #[tokio::test]
@@ -724,6 +820,7 @@ async fn queue_receive_delete_and_drain_shape_tests() {
     assert_eq!(stats.snapshot_range_reads, 0);
     assert!(stats.ordinary_point_reads >= 10);
     assert!(stats.ordinary_range_reads >= 1);
+    assert_eq!(stats.queue_metadata_reads, 1);
     assert_eq!(stats.queue_claim_messages, 10);
     assert!(stats.queue_claim_ready_entries_seen >= 10);
     assert_eq!(stats.unchecked_transact_writes, 10);
@@ -758,6 +855,7 @@ async fn queue_receive_delete_and_drain_shape_tests() {
     assert_eq!(stats.puts, 21);
     assert!((20..=256).contains(&stats.ordinary_point_reads));
     assert_eq!(stats.snapshot_point_reads, 0);
+    assert_eq!(stats.queue_metadata_reads, 1);
     assert_eq!(stats.blind_writes, 0);
     assert_eq!(stats.read_modify_writes, 31);
 
@@ -804,8 +902,9 @@ async fn queue_receive_delete_and_drain_shape_tests() {
     assert_eq!(stats.check_values, 10);
     assert_eq!(stats.puts, 10);
     assert_eq!(stats.deletes, 10);
-    assert!((12..=18).contains(&stats.ordinary_point_reads));
+    assert!((11..=17).contains(&stats.ordinary_point_reads));
     assert_eq!(stats.snapshot_point_reads, 0);
+    assert_eq!(stats.queue_metadata_reads, 1);
     assert_eq!(stats.blind_writes, 0);
     assert_eq!(stats.read_modify_writes, 20);
     assert!(stats.read_key_bytes > 0);

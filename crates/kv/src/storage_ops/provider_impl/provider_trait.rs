@@ -4,6 +4,13 @@ use crate::storage_ops::provider_impl::*;
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvider
     for SortedKvDbStorageProvider<S>
 {
+    async fn atomic_item_read_modify_write(
+        &self,
+        request: AtomicItemReadModifyWriteRequest,
+    ) -> StorageResult<Vec<u8>> {
+        self.atomic_item_read_modify_write_impl(request).await
+    }
+
     fn supports_custom_stream_duration(&self) -> bool {
         true
     }
@@ -178,47 +185,33 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         self.get_item_impl(table_name, key, consistent_read).await
     }
 
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "put_item", table_name = %table_name, ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
-    async fn put_item(
+    #[instrument(skip_all, fields(feature = "storage", ddb_op = "put_item", table_name = %request.table_name, ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
+    async fn put_item_request(
         &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
+        request: storage_types::PutItemRequest,
     ) -> StorageResult<PutItemResponse> {
-        self.put_item_impl(
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-        )
+        self.put_item_with_stream_ttl_impl(put_item::PutItemStreamTtlRequest {
+            table_name: request.table_name,
+            item: request.item,
+            condition_expression: request.condition_expression,
+            expression_attribute_names: request.expression_attribute_names,
+            expression_attribute_values: request.expression_attribute_values,
+            return_values: request.return_values,
+            return_old_on_condition_failure:
+                storage_types::return_values_on_condition_check_failure_all_old(
+                    request.return_values_on_condition_check_failure.as_ref(),
+                ),
+            aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+        })
         .await
     }
 
-    async fn put_item_with_stream_ttl(
+    async fn put_item_request_with_retry(
         &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: storage_types::PutItemRequest,
+        policy: WriteRetryPolicy,
     ) -> StorageResult<PutItemResponse> {
-        self.put_item_with_stream_ttl_impl(put_item::PutItemStreamTtlRequest {
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-            aux_item_stream_ttl_hours,
-        })
-        .await
+        self.put_item_request_with_retry_impl(request, policy).await
     }
 
     #[instrument(skip_all, fields(feature = "storage", ddb_op = "put_item", table_name = %table_name, ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
@@ -238,6 +231,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            false,
         )
         .await
     }
@@ -259,47 +253,35 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_old_on_condition_failure: false,
             aux_item_stream_ttl_hours,
         })
         .await
     }
 
-    #[instrument(skip_all, fields(feature = "storage", ddb_op = "delete_item", table_name = %table_name, ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
-    async fn delete_item(
+    async fn put_item_encode_with_retry(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        self.execute_delete_item(
-            table_name,
-            key,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            None,
-        )
-        .await
+        request: PutItemEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<PutItemResponse> {
+        self.put_item_encode_with_retry_impl(request, policy).await
     }
 
-    async fn delete_item_with_stream_ttl(
+    #[instrument(skip_all, fields(feature = "storage", ddb_op = "delete_item", table_name = %request.table_name, ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
+    async fn delete_item_request(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: storage_types::DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         self.execute_delete_item(
-            table_name,
-            key,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            aux_item_stream_ttl_hours,
+            request.table_name,
+            request.key,
+            request.condition_expression,
+            request.expression_attribute_names,
+            request.expression_attribute_values,
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            ),
+            request.aux_item_stream_ttl_hours,
         )
         .await
     }
@@ -367,6 +349,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         request: TransactWriteItemsEncodeRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
         self.transact_write_items_encode_impl(request).await
+    }
+
+    #[instrument(skip_all, fields(feature = "storage", ddb_op = "transact_write_items", ddb_write = true, items_updated = tracing::field::Empty, bytes_written = tracing::field::Empty))]
+    async fn transact_write_items_encode_with_retry(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+        policy: WriteRetryPolicy,
+    ) -> StorageResult<TransactWriteItemsResponse> {
+        self.transact_write_items_encode_with_retry_impl(request, policy)
+            .await
     }
 
     async fn update_table(

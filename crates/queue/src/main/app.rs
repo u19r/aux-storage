@@ -16,25 +16,17 @@ use config::{
 use http_error::HttpApiError;
 use metrics_exporter_prometheus::PrometheusHandle;
 use queue::{
-    ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
-    DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest, FoundationDbSettings,
-    GetQueueAttributesRequest, GetQueueUrlRequest, ListQueuesRequest, PostgresSettings,
-    PurgeQueueRequest, QueueBackend, QueueConfig as ProviderQueueConfig, QueueManager,
-    QueueProvider, ReceiveMessageRequest, RemoteCredentialStrategy, RemoteQueueSettings,
-    RemoteSigv4Settings, RemoteStaticCredentials, SendMessageBatchRequest, SendMessageRequest,
-    SetQueueAttributesRequest, create_queue_provider,
-};
-use queue_provider::{
-    SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE, SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE,
-    SQS_MISSING_PARAMETER_ERROR_TYPE,
+    FoundationDbSettings, PostgresSettings, QueueBackend, QueueConfig as ProviderQueueConfig,
+    QueueManager, QueueProvider, RemoteCredentialStrategy, RemoteQueueSettings,
+    RemoteSigv4Settings, RemoteStaticCredentials, create_queue_provider,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::protocol::{
-    QueueAction, QueueProtocol, api_error_response, decode_request, error_response, ok_response,
+    QueueAction, QueueProtocol, QueueRequest, api_error_response, decode_request, ok_response,
     wire_error_response,
 };
 
@@ -487,159 +479,102 @@ async fn queue_endpoint(
         }
     };
     let protocol = wire_request.protocol;
-    let payload = wire_request.payload;
+    let action = wire_request.request.action();
 
-    match wire_request.action {
-        QueueAction::CreateQueue => {
-            handle_create_queue(&request_id, protocol, app_state.as_ref(), payload).await
+    match wire_request.request {
+        QueueRequest::CreateQueue(request) => {
+            let queue_url = queue_url(
+                &app_state.public_base_url,
+                &app_state.account_id,
+                &request.queue_name,
+            );
+            match app_state
+                .manager
+                .create_queue_with_url(request, queue_url)
+                .await
+            {
+                Ok(response) => ok_response(&request_id, protocol, action, &response),
+                Err(err) => queue_error_response(&request_id, protocol, err),
+            }
         }
-        QueueAction::DeleteQueue => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                DeleteQueueRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.delete_queue(req).await },
-            )
+        QueueRequest::DeleteQueue(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.delete_queue(req).await
+            })
             .await
         }
-        QueueAction::ListQueues => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                ListQueuesRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.list_queues(req).await },
-            )
+        QueueRequest::ListQueues(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.list_queues(req).await
+            })
             .await
         }
-        QueueAction::GetQueueUrl => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                GetQueueUrlRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.get_queue_url(req).await },
-            )
+        QueueRequest::GetQueueUrl(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.get_queue_url(req).await
+            })
             .await
         }
-        QueueAction::GetQueueAttributes => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                GetQueueAttributesRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.get_queue_attributes(req).await },
-            )
+        QueueRequest::GetQueueAttributes(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.get_queue_attributes(req).await
+            })
             .await
         }
-        QueueAction::SetQueueAttributes => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                SetQueueAttributesRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.set_queue_attributes(req).await },
-            )
+        QueueRequest::SetQueueAttributes(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.set_queue_attributes(req).await
+            })
             .await
         }
-        QueueAction::PurgeQueue => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                PurgeQueueRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.purge_queue(req).await },
-            )
+        QueueRequest::PurgeQueue(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.purge_queue(req).await
+            })
             .await
         }
-        QueueAction::SendMessage => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                SendMessageRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.send_message(req).await },
-            )
+        QueueRequest::SendMessage(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.send_message(req).await
+            })
             .await
         }
-        QueueAction::SendMessageBatch => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                SendMessageBatchRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.send_message_batch(req).await },
-            )
+        QueueRequest::SendMessageBatch(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.send_message_batch(req).await
+            })
             .await
         }
-        QueueAction::ReceiveMessage => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                ReceiveMessageRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.receive_message(req).await },
-            )
+        QueueRequest::ReceiveMessage(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.receive_message(req).await
+            })
             .await
         }
-        QueueAction::DeleteMessage => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                DeleteMessageRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move {
-                    app_state.manager.delete_message(req).await?;
-                    Ok(json!({}))
-                },
-            )
+        QueueRequest::DeleteMessage(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.delete_message(req).await?;
+                Ok(json!({}))
+            })
             .await
         }
-        QueueAction::DeleteMessageBatch => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                DeleteMessageBatchRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.delete_message_batch(req).await },
-            )
+        QueueRequest::DeleteMessageBatch(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.delete_message_batch(req).await
+            })
             .await
         }
-        QueueAction::ChangeMessageVisibility => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                ChangeMessageVisibilityRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move {
-                    app_state.manager.change_message_visibility(req).await?;
-                    Ok(json!({}))
-                },
-            )
+        QueueRequest::ChangeMessageVisibility(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.change_message_visibility(req).await?;
+                Ok(json!({}))
+            })
             .await
         }
-        QueueAction::ChangeMessageVisibilityBatch => {
-            handle_manager(
-                &request_id,
-                protocol,
-                wire_request.action,
-                ChangeMessageVisibilityBatchRequest::from_json(payload)
-                    .map_err(|err| std::io::Error::other(err.message)),
-                |req| async move { app_state.manager.change_message_visibility_batch(req).await },
-            )
+        QueueRequest::ChangeMessageVisibilityBatch(request) => {
+            handle_manager(&request_id, protocol, action, request, |req| async move {
+                app_state.manager.change_message_visibility_batch(req).await
+            })
             .await
         }
     }
@@ -658,45 +593,12 @@ fn protocol_from_headers(headers: &HeaderMap) -> QueueProtocol {
     }
 }
 
-async fn handle_create_queue(
-    request_id: &str,
-    protocol: QueueProtocol,
-    app_state: &AppState,
-    payload: Value,
-) -> Response {
-    let request = match CreateQueueRequest::from_json(payload) {
-        Ok(request) => request,
-        Err(err) => {
-            let wire_error = validation_wire_error(&err.message);
-            return error_response(
-                request_id,
-                protocol,
-                StatusCode::BAD_REQUEST,
-                wire_error.code,
-                wire_error.message.as_str(),
-            );
-        }
-    };
-    let queue_url = queue_url(
-        &app_state.public_base_url,
-        &app_state.account_id,
-        &request.queue_name,
-    );
-    match app_state
-        .manager
-        .create_queue_with_url(request, queue_url)
-        .await
-    {
-        Ok(response) => ok_response(request_id, protocol, QueueAction::CreateQueue, &response),
-        Err(err) => queue_error_response(request_id, protocol, err),
-    }
-}
 
 async fn handle_manager<Request, Handler, Fut, T>(
     request_id: &str,
     protocol: QueueProtocol,
     action: QueueAction,
-    request: Result<Request, std::io::Error>,
+    request: Request,
     handler: Handler,
 ) -> Response
 where
@@ -704,47 +606,9 @@ where
     Fut: std::future::Future<Output = queue::QueueResult<T>>,
     T: Serialize,
 {
-    let request = match request {
-        Ok(request) => request,
-        Err(err) => {
-            let wire_error = validation_wire_error(&err.to_string());
-            return error_response(
-                request_id,
-                protocol,
-                StatusCode::BAD_REQUEST,
-                wire_error.code,
-                wire_error.message.as_str(),
-            );
-        }
-    };
     match handler(request).await {
         Ok(value) => ok_response(request_id, protocol, action, &value),
         Err(err) => queue_error_response(request_id, protocol, err),
-    }
-}
-
-struct ValidationWireError {
-    code: &'static str,
-    message: String,
-}
-
-fn validation_wire_error(message: &str) -> ValidationWireError {
-    if message.starts_with("Id ") && message.ends_with(" repeated.") {
-        return ValidationWireError {
-            code: SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE,
-            message: message.to_string(),
-        };
-    }
-    if message == "The request must contain the parameter MessageBody." {
-        return ValidationWireError {
-            code: SQS_MISSING_PARAMETER_ERROR_TYPE,
-            message: message.to_string(),
-        };
-    }
-
-    ValidationWireError {
-        code: SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE,
-        message: message.to_string(),
     }
 }
 

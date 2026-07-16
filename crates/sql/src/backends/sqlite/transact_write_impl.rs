@@ -88,6 +88,9 @@ impl SQLiteStorageProvider {
             sqlite,
             immediate_gsi_consistency,
             false,
+            storage_types::return_values_on_condition_check_failure_all_old(
+                put_request.return_values_on_condition_check_failure.as_ref(),
+            ),
             None,
             put_request.aux_item_stream_ttl_hours,
         )
@@ -150,6 +153,9 @@ impl SQLiteStorageProvider {
             &None,
             sqlite,
             immediate_gsi_consistency,
+            storage_types::return_values_on_condition_check_failure_all_old(
+                put_request.return_values_on_condition_check_failure.as_ref(),
+            ),
             None,
             put_request.aux_item_stream_ttl_hours,
         )
@@ -182,10 +188,17 @@ impl SQLiteStorageProvider {
             &update_request.key,
             sqlite,
             immediate_gsi_consistency,
+            storage_types::return_values_on_condition_check_failure_all_old(
+                update_request.return_values_on_condition_check_failure.as_ref(),
+            ),
             update_request.aux_item_stream_ttl_hours,
         );
         if let Err(error) = result {
-            if matches!(error.to_enum(), StorageEnum::ConditionalCheckFailed) {
+            if matches!(
+                error.to_enum(),
+                StorageEnum::ConditionalCheckFailed
+                    | StorageEnum::ConditionalCheckFailedWithItem { .. }
+            ) {
                 return Err(transaction_canceled_for_reason(
                     item_index,
                     conditional_check_failed_reason(
@@ -261,6 +274,9 @@ impl SQLiteStorageProvider {
             &None,
             sqlite,
             immediate_gsi_consistency,
+            storage_types::return_values_on_condition_check_failure_all_old(
+                delete_request.return_values_on_condition_check_failure.as_ref(),
+            ),
             None,
             delete_request.aux_item_stream_ttl_hours,
         )

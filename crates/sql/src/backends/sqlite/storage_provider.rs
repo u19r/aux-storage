@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use bg_jobs::BackgroundJobName;
-use rusqlite::OpenFlags;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 use storage_common::{
     GSI_BACKFILL_JOB, GSI_UPDATE_JOB, STREAM_TRIM_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure,
@@ -17,17 +16,18 @@ use storage_provider::{
 use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
-    DeleteGlobalSecondaryIndexAction, DurablePointReadProof, DurablePointReadRequest,
+    DeleteGlobalSecondaryIndexAction, DeleteItemRequest, DurablePointReadProof,
+    DurablePointReadRequest,
     GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedTransactWriteItemsRequest,
     GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes, PreparedBatchOperation,
-    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    PutItemRequest, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    ReplicationMutation,
     ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo,
     StreamRetentionDuration, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
     TimestampMillis, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
     TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
     UpdateTimeToLiveResponse, WireItem, WriteRequest,
 };
-use tokio_rusqlite::Connection;
 use tracing::{Span, field, instrument};
 
 use crate::{
@@ -98,6 +98,7 @@ use crate::{
         prepare_batch_operation,
         sqlite::{
             SQLiteStorageProvider,
+            provider::SQLiteSnapshotConnectionLease,
             provider_table_lifecycle::{load_sqlite_table_scope_id, next_table_policy_version},
             stream_duration::write_stream_trim_state_tx,
         },
@@ -126,6 +127,7 @@ impl SQLiteStorageProvider {
 struct SQLiteReadSequenceReadContext {
     provider: SQLiteStorageProvider,
     consistency: ReadSequenceConsistency,
+    snapshot_lease: Option<SQLiteSnapshotConnectionLease>,
 }
 
 #[async_trait]
@@ -166,37 +168,12 @@ impl StorageProviderReadContext for SQLiteReadSequenceReadContext {
 impl SQLiteReadSequenceReadContext {
     fn ensure_supported(&self) -> StorageResult<()> {
         if self.consistency == ReadSequenceConsistency::Transactional
-            && self.provider.read_sequence_snapshot_path.is_none()
+            && self.snapshot_lease.is_none()
         {
             return Err(sqlite_read_sequence_snapshot_unsupported());
         }
         Ok(())
     }
-}
-
-async fn open_read_sequence_snapshot_connection(path: &str) -> StorageResult<Arc<Connection>> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .await
-        .map_err(|error| {
-            StorageError::internal(&format!(
-                "open sqlite read-sequence snapshot connection failed: {path}: {error}"
-            ))
-        })?;
-    connection
-        .call(|conn| {
-            let page_cache_size_kb = crate::sqlite_cache_config::sqlite_page_cache_size_kb();
-            conn.pragma_update(None, "busy_timeout", 5_000)?;
-            conn.pragma_update(None, "cache_size", page_cache_size_kb)?;
-            conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| {
-            StorageError::internal(&format!(
-                "begin sqlite read-sequence snapshot transaction failed: {path}: {error}"
-            ))
-        })?;
-    Ok(Arc::new(connection))
 }
 
 fn sqlite_read_sequence_snapshot_unsupported() -> StorageError {
@@ -232,19 +209,21 @@ impl StorageProvider for SQLiteStorageProvider {
             return Ok(Box::new(SQLiteReadSequenceReadContext {
                 provider: self.clone(),
                 consistency,
+                snapshot_lease: None,
             }));
         }
 
-        let Some(snapshot_path) = self.read_sequence_snapshot_path.clone() else {
+        let Some(pool) = self.snapshot_connection_pool.as_ref() else {
             return Err(sqlite_read_sequence_snapshot_unsupported());
         };
-        let snapshot_connection = open_read_sequence_snapshot_connection(&snapshot_path).await?;
+        let snapshot_lease = pool.acquire().await?;
         let mut provider = self.clone();
-        provider.connection = snapshot_connection;
+        provider.connection = Arc::new(snapshot_lease.connection().clone());
 
         Ok(Box::new(SQLiteReadSequenceReadContext {
             provider,
             consistency,
+            snapshot_lease: Some(snapshot_lease),
         }))
     }
 
@@ -430,44 +409,6 @@ impl StorageProvider for SQLiteStorageProvider {
             bytes_written = tracing::field::Empty,
         )
     )]
-    async fn put_item(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse> {
-        self.apply_gsi_write_pressure().await?;
-        let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
-        let response = self
-            .put_item_internal(
-                table_name,
-                item,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                return_values,
-                None,
-            )
-            .await?;
-        self.maybe_apply_immediate_gsi_updates().await?;
-        record_write(1, bytes_written);
-        record_write_cost("put_item", "put", 1, bytes_written as u64);
-        Ok(response)
-    }
-
-    #[instrument(
-        skip_all,
-        fields(feature = "storage",
-            ddb_op = "put_item",
-            table_name = %table_name,
-            ddb_write = true,
-            items_updated = tracing::field::Empty,
-            bytes_written = tracing::field::Empty,
-        )
-    )]
     async fn put_item_encode(
         &self,
         table_name: TableName,
@@ -477,46 +418,45 @@ impl StorageProvider for SQLiteStorageProvider {
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
-        self.apply_gsi_write_pressure().await?;
-        let bytes_written = item.payload_len();
-        let response = self
-            .put_item_wire_internal(
-                table_name,
-                item,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                return_values,
-                None,
-            )
-            .await?;
-        self.maybe_apply_immediate_gsi_updates().await?;
-        record_write(1, bytes_written);
-        record_write_cost("put_item", "put", 1, bytes_written as u64);
-        Ok(response)
+        self.put_item_encode_with_stream_ttl(
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            None,
+        )
+        .await
     }
 
-    async fn put_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<PutItemResponse> {
+    #[instrument(
+        skip_all,
+        fields(feature = "storage",
+            ddb_op = "put_item",
+            table_name = %request.table_name,
+            ddb_write = true,
+            items_updated = tracing::field::Empty,
+            bytes_written = tracing::field::Empty,
+        )
+    )]
+    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
         self.apply_gsi_write_pressure().await?;
-        let bytes_written = compute_items_bytes(std::slice::from_ref(&item))?;
+        let bytes_written = compute_items_bytes(std::slice::from_ref(&request.item))?;
         let response = self
             .put_item_internal(
-                table_name,
-                item,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                return_values,
-                aux_item_stream_ttl_hours,
+                request.table_name,
+                request.item,
+                request.condition_expression,
+                request.expression_attribute_names,
+                request.expression_attribute_values,
+                request.return_values,
+                return_old_on_condition_failure,
+                request.aux_item_stream_ttl_hours,
             )
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -545,6 +485,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 expression_attribute_names,
                 expression_attribute_values,
                 return_values,
+                false,
                 aux_item_stream_ttl_hours,
             )
             .await?;
@@ -606,66 +547,35 @@ impl StorageProvider for SQLiteStorageProvider {
         skip_all,
         fields(feature = "storage",
             ddb_op = "delete_item",
-            table_name = %table_name,
+            table_name = %request.table_name,
             ddb_write = true,
             items_updated = tracing::field::Empty,
             bytes_written = tracing::field::Empty,
         )
     )]
-    async fn delete_item(
+    async fn delete_item_request(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        if key.is_empty() {
+        if request.key.is_empty() {
             record_write(0, 0);
             return Ok(None);
         }
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
         self.apply_gsi_write_pressure().await?;
-        let key_bytes = attr_map_payload_bytes(&key);
-
+        let key_bytes = attr_map_payload_bytes(&request.key);
         let result = self
             .delete_item_internal(
-                table_name,
-                key,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                None,
-            )
-            .await?;
-        self.maybe_apply_immediate_gsi_updates().await?;
-        record_write(usize::from(result.is_some()), 0);
-        record_write_cost("delete_item", "delete", 1, key_bytes);
-        Ok(result)
-    }
-
-    async fn delete_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        if key.is_empty() {
-            record_write(0, 0);
-            return Ok(None);
-        }
-        self.apply_gsi_write_pressure().await?;
-        let key_bytes = attr_map_payload_bytes(&key);
-        let result = self
-            .delete_item_internal(
-                table_name,
-                key,
-                condition_expression,
-                expression_attribute_names,
-                expression_attribute_values,
-                aux_item_stream_ttl_hours,
+                request.table_name,
+                request.key,
+                request.condition_expression,
+                request.expression_attribute_names,
+                request.expression_attribute_values,
+                return_old_on_condition_failure,
+                request.aux_item_stream_ttl_hours,
             )
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
@@ -707,6 +617,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 &condition,
                 sqlite,
                 immediate_gsi_consistency,
+                false,
                 None,
                 None,
             )
@@ -745,6 +656,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 &condition,
                 sqlite,
                 immediate_gsi_consistency,
+                false,
                 None,
                 None,
             )
@@ -797,6 +709,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     &key,
                     sqlite,
                     immediate_gsi_consistency,
+                    false,
                     aux_item_stream_ttl_hours,
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))
@@ -1316,6 +1229,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     &None,
                     sqlite,
                     immediate_gsi_consistency,
+                    false,
                     Some(&metadata),
                     None,
                 )
@@ -1335,6 +1249,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 &None,
                 sqlite,
                 immediate_gsi_consistency,
+                false,
                 Some(&metadata),
                 None,
             )

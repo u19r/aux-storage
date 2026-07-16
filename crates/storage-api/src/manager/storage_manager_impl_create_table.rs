@@ -18,7 +18,7 @@ impl StorageApiManagerImpl {
         request: CreateTableRequest,
     ) -> Result<Response, HttpApiError> {
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::CreateTable(request.clone()))
+            .propose_sync_write_if_configured(|| SyncWriteRequest::CreateTable(request.clone()))
             .await?
         {
             return Ok(Response::CreateTable(required_sync_response_at(

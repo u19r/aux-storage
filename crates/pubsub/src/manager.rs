@@ -254,44 +254,20 @@ impl PubsubManager {
         if request.message.is_empty() {
             return Err(PubsubError::validation(PubsubValidationKind::EmptyMessage));
         }
-        let Some(_topic) = self.provider.get_topic(&request.topic_arn).await? else {
-            return Err(PubsubError::topic_not_found(request.topic_arn.to_string()));
-        };
         let message_id = PubsubMessageId::new();
-        let subscriptions = self
+        self
             .provider
-            .list_subscriptions(ListSubscriptionsRequest {
-                topic_arn: Some(request.topic_arn.clone()),
-                next_token: None,
-            })
-            .await?
-            .subscriptions;
-        if self.can_batch_pending_delivery_records() {
-            let records = subscriptions
-                .into_iter()
-                .filter(|subscription| !subscription.confirmation.pending_confirmation())
-                .map(|subscription| {
-                    self.pending_delivery_record(&request, &message_id, &subscription)
-                })
-                .collect::<Vec<_>>();
-            self.provider.put_delivery_records(records).await?;
-            return Ok(PublishResponse { message_id });
-        }
-        for subscription in subscriptions {
-            if subscription.confirmation.pending_confirmation() {
-                continue;
-            }
-            self.deliver_to_subscription(&request, &message_id, subscription)
-                .await?;
-        }
+            .accept_publish(
+                request,
+                message_id.clone(),
+                self.subscription_message_sender.is_some(),
+            )
+            .await?;
         Ok(PublishResponse { message_id })
     }
 
-    fn can_batch_pending_delivery_records(&self) -> bool {
-        self.queue_manager.is_none() && self.subscription_message_sender.is_none()
-    }
-
     pub async fn process_due_deliveries(&self, limit: usize) -> PubsubResult<usize> {
+        self.provider.materialize_publish_intents(limit).await?;
         let now = TimestampMillis::now();
         let lease_expires_at = TimestampMillis::from_timestamp(
             now.timestamp_millis()
@@ -395,219 +371,6 @@ impl PubsubManager {
         }
     }
 
-    async fn deliver_to_subscription(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: Subscription,
-    ) -> PubsubResult<()> {
-        match subscription.protocol {
-            SubscriptionProtocol::Queue => {
-                self.deliver_to_queue(request, message_id, &subscription)
-                    .await
-            }
-            SubscriptionProtocol::Http | SubscriptionProtocol::Https => {
-                self.deliver_to_custom_or_record(request, message_id, subscription)
-                    .await
-            }
-        }
-    }
-
-    async fn deliver_to_queue(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-    ) -> PubsubResult<()> {
-        let Some(queue_manager) = self.queue_manager.as_ref() else {
-            self.record_delivery(
-                request,
-                message_id,
-                subscription,
-                DeliveryTarget::BuiltIn,
-                DeliveryStatus::Pending,
-                None,
-            )
-            .await?;
-            return Ok(());
-        };
-        let message_body = if subscription.raw_message_delivery {
-            request.message.clone()
-        } else {
-            self.pubsub_notification_body(request, message_id, subscription)?
-        };
-        let message_attributes = if subscription.raw_message_delivery {
-            queue_message_attributes(&request.message_attributes)
-        } else {
-            None
-        };
-        queue_manager
-            .send_message(SendMessageRequest {
-                queue_url: subscription.endpoint.clone(),
-                message_body,
-                delay_seconds: None,
-                message_attributes,
-            })
-            .await
-            .map_err(|err| err.to_string())
-            .map_or_else(
-                |err| {
-                    self.record_delivery(
-                        request,
-                        message_id,
-                        subscription,
-                        DeliveryTarget::BuiltIn,
-                        DeliveryStatus::Failed,
-                        Some(err),
-                    )
-                },
-                |_| {
-                    self.record_delivery(
-                        request,
-                        message_id,
-                        subscription,
-                        DeliveryTarget::BuiltIn,
-                        DeliveryStatus::Delivered,
-                        None,
-                    )
-                },
-            )
-            .await
-    }
-
-    async fn deliver_to_custom_or_record(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: Subscription,
-    ) -> PubsubResult<()> {
-        let Some(sender) = self.subscription_message_sender.as_ref() else {
-            self.record_delivery(
-                request,
-                message_id,
-                &subscription,
-                DeliveryTarget::BuiltIn,
-                DeliveryStatus::Pending,
-                None,
-            )
-            .await?;
-            return Ok(());
-        };
-        let destination = SubscriptionDestination::new(
-            subscription.protocol.as_str(),
-            subscription.endpoint.clone(),
-        )
-        .with_extra_json(subscription.extra_json.clone());
-        let message = SubscriptionMessage::new(
-            subscription.subscription_arn.to_string(),
-            message_id.to_string(),
-            destination,
-            request.message.as_bytes().to_vec(),
-        )
-        .with_attributes(request.message_attributes.clone());
-        match sender.send_subscription_message(message).await {
-            Ok(outcome) => {
-                let status = match outcome {
-                    SubscriptionSendOutcome::Delivered => DeliveryStatus::Delivered,
-                    SubscriptionSendOutcome::AcceptedForDelivery => {
-                        DeliveryStatus::AcceptedByCustomSender
-                    }
-                };
-                self.record_delivery(
-                    request,
-                    message_id,
-                    &subscription,
-                    DeliveryTarget::CustomSender,
-                    status,
-                    None,
-                )
-                .await
-            }
-            Err(err) => {
-                self.record_delivery(
-                    request,
-                    message_id,
-                    &subscription,
-                    DeliveryTarget::CustomSender,
-                    DeliveryStatus::Failed,
-                    Some(err.to_string()),
-                )
-                .await
-            }
-        }
-    }
-
-    async fn record_delivery(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-        target: DeliveryTarget,
-        status: DeliveryStatus,
-        last_error: Option<String>,
-    ) -> PubsubResult<()> {
-        self.provider
-            .put_delivery_record(self.delivery_record(
-                request,
-                message_id,
-                subscription,
-                target,
-                status,
-                last_error,
-            ))
-            .await
-    }
-
-    fn pending_delivery_record(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-    ) -> DeliveryRecord {
-        self.delivery_record(
-            request,
-            message_id,
-            subscription,
-            DeliveryTarget::BuiltIn,
-            DeliveryStatus::Pending,
-            None,
-        )
-    }
-
-    fn delivery_record(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-        target: DeliveryTarget,
-        status: DeliveryStatus,
-        last_error: Option<String>,
-    ) -> DeliveryRecord {
-        let now = TimestampMillis::now();
-        DeliveryRecord {
-            id: DeliveryRecordId(format!("{}:{}", subscription.subscription_arn, message_id)),
-            kind: DeliveryRecordKind::Notification,
-            message_id: message_id.clone(),
-            subscription_arn: subscription.subscription_arn.clone(),
-            message_body: Some(request.message.clone()),
-            subject: request.subject.clone(),
-            message_attributes: request.message_attributes.clone(),
-            target,
-            status,
-            attempts: if matches!(status, DeliveryStatus::Pending) {
-                0
-            } else {
-                1
-            },
-            next_attempt_at: None,
-            lease_owner: None,
-            lease_expires_at: None,
-            last_error,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
     async fn record_confirmation_delivery(
         &self,
         subscription: &Subscription,
@@ -626,6 +389,7 @@ impl PubsubManager {
                 },
                 message_id,
                 subscription_arn: subscription.subscription_arn.clone(),
+                subscription: None,
                 message_body: None,
                 subject: None,
                 message_attributes: HashMap::new(),
@@ -643,18 +407,24 @@ impl PubsubManager {
     }
 
     async fn process_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()> {
-        let Some(subscription) = self
-            .provider
-            .get_subscription(&record.subscription_arn)
-            .await?
-        else {
-            self.update_delivery(
-                record,
-                DeliveryStatus::Failed,
-                Some("subscription not found".to_string()),
-            )
-            .await?;
-            return Ok(());
+        let subscription = match record.subscription.clone() {
+            Some(subscription) => subscription,
+            None => {
+                let Some(subscription) = self
+                    .provider
+                    .get_subscription(&record.subscription_arn)
+                    .await?
+                else {
+                    self.update_delivery(
+                        record,
+                        DeliveryStatus::Failed,
+                        Some("subscription not found".to_string()),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                subscription
+            }
         };
         if let DeliveryRecordKind::SubscriptionConfirmation { token } = record.kind.clone() {
             self.process_confirmation_delivery(record, subscription, token)

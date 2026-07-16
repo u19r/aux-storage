@@ -435,6 +435,64 @@ async fn update_item_condition_failure_returns_all_old_item_when_requested() {
 }
 
 #[tokio::test]
+async fn competing_conditional_updates_return_the_atomic_winner_as_all_old() {
+    let db = create_test_db().await;
+    create_hash_table(db.clone(), "UpdateConditionalAtomicPreimage").await;
+    handle_put_item(
+        db.clone(),
+        json!({
+            "TableName": "UpdateConditionalAtomicPreimage",
+            "Item": {"pk": {"S": "p"}, "status": {"S": "open"}}
+        })
+        .try_into()
+        .expect("put item request"),
+    )
+    .await
+    .expect("seed item");
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = tokio::task::JoinSet::new();
+    for next in ["closed-a", "closed-b"] {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            let request = json!({
+                "TableName": "UpdateConditionalAtomicPreimage",
+                "Key": {"pk": {"S": "p"}},
+                "UpdateExpression": "SET #status = :next",
+                "ConditionExpression": "#status = :expected",
+                "ExpressionAttributeNames": {"#status": "status"},
+                "ExpressionAttributeValues": {
+                    ":next": {"S": next},
+                    ":expected": {"S": "open"}
+                },
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+            })
+            .try_into()
+            .expect("update request");
+            barrier.wait().await;
+            (next, handle_update_item(db, request).await)
+        });
+    }
+
+    let mut winner = None;
+    let mut loser_item = None;
+    while let Some(result) = tasks.join_next().await {
+        let (next, result) = result.expect("update task");
+        match result {
+            Ok(_) => winner = Some(next),
+            Err(error) => loser_item = error.item,
+        }
+    }
+    let winner = winner.expect("one update wins");
+    let loser_item = loser_item.expect("one update loses with an atomic preimage");
+    assert_eq!(
+        loser_item.get("status"),
+        Some(&AttributeValue::S(winner.to_string()))
+    );
+}
+
+#[tokio::test]
 async fn update_item_return_values_for_deep_paths_match_dynamodb_across_conformance_backends() {
     for backend in default_conformance_backends() {
         let db = backend.create_db().await;

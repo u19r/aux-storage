@@ -286,6 +286,7 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values: None,
+        return_old_on_condition_failure: false,
         aux_item_stream_ttl_hours: None,
     })
     .await
@@ -320,6 +321,90 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
     assert_eq!(
         item.get("status"),
         Some(&AttributeValue::S("open".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn competing_transaction_writes_return_the_atomic_winner_as_all_old() {
+    let db = create_test_db_manager().await;
+    handle_create_table(
+        db.clone(),
+        json!({
+            "TableName": "TxnConditionalAtomicPreimage",
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        })
+        .try_into()
+        .expect("create table request"),
+    )
+    .await
+    .expect("create table");
+    db.put_item(storage::PutItemInput {
+        table_name: TableName::new("TxnConditionalAtomicPreimage"),
+        item: std::collections::HashMap::from([
+            ("pk".to_string(), AttributeValue::S("p".to_string())),
+            ("status".to_string(), AttributeValue::S("open".to_string())),
+        ])
+        .into(),
+        condition_expression: None,
+        expression_attribute_names: None,
+        expression_attribute_values: None,
+        return_values: None,
+        return_old_on_condition_failure: false,
+        aux_item_stream_ttl_hours: None,
+    })
+    .await
+    .expect("seed item");
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = tokio::task::JoinSet::new();
+    for next in ["closed-a", "closed-b"] {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            let request = json!({
+                "TransactItems": [{
+                    "Update": {
+                        "TableName": "TxnConditionalAtomicPreimage",
+                        "Key": {"pk": {"S": "p"}},
+                        "UpdateExpression": "SET #status = :next",
+                        "ConditionExpression": "#status = :expected",
+                        "ExpressionAttributeNames": {"#status": "status"},
+                        "ExpressionAttributeValues": {
+                            ":next": {"S": next},
+                            ":expected": {"S": "open"}
+                        },
+                        "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                    }
+                }]
+            })
+            .try_into()
+            .expect("transaction request");
+            barrier.wait().await;
+            (next, handle_transact_write_items(db, request).await)
+        });
+    }
+
+    let mut winner = None;
+    let mut loser_item = None;
+    while let Some(result) = tasks.join_next().await {
+        let (next, result) = result.expect("transaction task");
+        match result {
+            Ok(_) => winner = Some(next),
+            Err(error) => {
+                loser_item = error
+                    .cancellation_reasons
+                    .and_then(|mut reasons| reasons.pop())
+                    .and_then(|reason| reason.item)
+            }
+        }
+    }
+    let winner = winner.expect("one transaction wins");
+    let loser_item = loser_item.expect("one transaction loses with an atomic preimage");
+    assert_eq!(
+        loser_item.get("status"),
+        Some(&AttributeValue::S(winner.to_string()))
     );
 }
 

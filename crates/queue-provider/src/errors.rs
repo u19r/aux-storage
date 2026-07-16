@@ -128,6 +128,13 @@ pub enum QueueError {
 
     #[error("Transact Write failed")]
     TransactWrite(StorageError),
+
+    #[error("Batch entry failed: {code}: {message}")]
+    BatchEntry {
+        sender_fault: bool,
+        code: String,
+        message: String,
+    },
 }
 
 impl QueueError {
@@ -179,8 +186,16 @@ impl QueueError {
         }
     }
 
+    pub fn batch_entry(sender_fault: bool, code: String, message: String) -> Self {
+        Self::BatchEntry {
+            sender_fault,
+            code,
+            message,
+        }
+    }
+
     #[must_use]
-    pub fn aws_query_error_type(&self) -> &'static str {
+    pub fn aws_query_error_type(&self) -> &str {
         match self {
             Self::ResourceExists { .. } => SQS_QUEUE_NAME_EXISTS_ERROR_TYPE,
             Self::ResourceNotFound {
@@ -189,6 +204,7 @@ impl QueueError {
             } => SQS_RECEIPT_HANDLE_INVALID_ERROR_TYPE,
             Self::ResourceNotFound { .. } => SQS_NON_EXISTENT_QUEUE_ERROR_TYPE,
             Self::Validation { kind, .. } => kind.aws_query_error_type(),
+            Self::BatchEntry { code, .. } => code,
             Self::Serialization(_)
             | Self::Internal { .. }
             | Self::StorageError(_)
@@ -207,6 +223,7 @@ impl QueueError {
             }
             Self::ResourceNotFound { .. } => "The specified queue does not exist.".to_string(),
             Self::Validation { kind, detail } => kind.aws_query_message(detail.clone()),
+            Self::BatchEntry { message, .. } => message.clone(),
             other => other.to_string(),
         }
     }
@@ -218,6 +235,9 @@ impl QueueError {
             | Self::Internal { .. }
             | Self::StorageError(_)
             | Self::TransactWrite(_) => 500,
+            Self::BatchEntry { sender_fault, .. } => {
+                if *sender_fault { 400 } else { 500 }
+            }
             Self::ResourceNotFound {
                 resource_type: "receipt_handle",
                 ..
@@ -232,6 +252,16 @@ impl QueueError {
             | Self::ResourceNotFound { .. }
             | Self::Validation { .. } => 400,
         }
+    }
+
+    #[must_use]
+    pub fn is_sender_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceExists { .. }
+                | Self::ResourceNotFound { .. }
+                | Self::Validation { .. }
+        ) || matches!(self, Self::BatchEntry { sender_fault: true, .. })
     }
 }
 

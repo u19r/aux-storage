@@ -18,7 +18,7 @@ pub trait QueueProvider: Send + Sync {
     async fn initialize(&self) -> QueueResult<()>;
 
     /// Create a new queue.
-    async fn create_queue(&self, queue: Queue) -> QueueResult<()>;
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue>;
 
     /// Get a queue by URL.
     async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>>;
@@ -45,6 +45,18 @@ pub trait QueueProvider: Send + Sync {
     /// Return approximate queue message counts.
     async fn get_queue_message_counts(&self, _queue_url: &str) -> QueueResult<QueueMessageCounts> {
         Ok(QueueMessageCounts::default())
+    }
+
+    /// Return queue metadata and approximate counts from one provider-owned snapshot.
+    async fn get_queue_with_message_counts(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<(Queue, QueueMessageCounts)>> {
+        let Some(queue) = self.get_queue(queue_url).await? else {
+            return Ok(None);
+        };
+        let counts = self.get_queue_message_counts(queue_url).await?;
+        Ok(Some((queue, counts)))
     }
 
     /// Send a message to a queue.

@@ -8,11 +8,88 @@ use storage_types::{
 
 use crate::{
     database_manager::read_ops::{
-        RoutedBatchProofTarget, normalize_unprocessed_keys_for_shared_table,
+        RoutedBatchGetTable, RoutedBatchGetTarget, RoutedBatchProofTarget,
+        insert_routed_batch_get_table, normalize_unprocessed_keys_for_shared_table,
         parse_stream_page_token, remap_routed_batch_proof,
     },
     namespace_routing::NamespaceRequestRewriter,
 };
+
+fn empty_keys_and_attributes() -> KeysAndAttributes {
+    KeysAndAttributes {
+        keys: Vec::new().into(),
+        attributes_to_get: None,
+        consistent_read: None,
+        projection_expression: None,
+        expression_attribute_names: None,
+    }
+}
+
+#[test]
+fn routed_batch_get_groups_distinct_dedicated_tables_by_connection() {
+    let mut isolated = Vec::new();
+    let mut grouped = HashMap::new();
+
+    for suffix in ["a", "b"] {
+        insert_routed_batch_get_table(
+            &mut isolated,
+            &mut grouped,
+            &Some("TOTAL".to_string()),
+            RoutedBatchGetTable {
+                connection_id: "tenant-store".to_string(),
+                physical_table: TableName::new(&format!("physical-{suffix}")),
+                target: RoutedBatchGetTarget {
+                    logical_table: TableName::new(&format!("logical-{suffix}")),
+                    shared_namespace: None,
+                },
+                keys_and_attributes: empty_keys_and_attributes(),
+            },
+        );
+    }
+
+    assert!(isolated.is_empty());
+    let request = grouped.get("tenant-store").expect("provider group");
+    assert_eq!(request.request.request_items.len(), 2);
+    assert_eq!(request.targets.len(), 2);
+    assert_eq!(
+        request.request.return_consumed_capacity.as_deref(),
+        Some("TOTAL")
+    );
+    assert_eq!(
+        request.targets[&TableName::new("physical-a")].logical_table,
+        TableName::new("logical-a")
+    );
+}
+
+#[test]
+fn routed_batch_get_keeps_shared_and_default_tables_isolated() {
+    let mut isolated = Vec::new();
+    let mut grouped = HashMap::new();
+    let namespace = TableNamespace::from_seed("shared");
+
+    for (connection_id, namespace) in [
+        ("tenant-store", Some(namespace)),
+        ("default", None),
+    ] {
+        insert_routed_batch_get_table(
+            &mut isolated,
+            &mut grouped,
+            &None,
+            RoutedBatchGetTable {
+                connection_id: connection_id.to_string(),
+                physical_table: TableName::new(&format!("physical-{connection_id}")),
+                target: RoutedBatchGetTarget {
+                    logical_table: TableName::new(&format!("logical-{connection_id}")),
+                    shared_namespace: namespace,
+                },
+                keys_and_attributes: empty_keys_and_attributes(),
+            },
+        );
+    }
+
+    assert_eq!(isolated.len(), 2);
+    assert!(grouped.is_empty());
+}
 
 #[test]
 fn stream_page_tokens_must_be_valid_stream_item_hex_ids() {

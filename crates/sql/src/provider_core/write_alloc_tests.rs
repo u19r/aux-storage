@@ -76,7 +76,13 @@ fn measure_plan_update_condition_borrowed() -> alloc_counter::AllocationReport<'
     for _ in 0..PLAN_UPDATE_ITERATIONS {
         let existing_item = Some(existing_item.clone());
         let (_, updated_item) =
-            plan_update_from_existing_item(existing_item, &key, &operations, condition.as_ref())
+            plan_update_from_existing_item(
+                existing_item,
+                &key,
+                &operations,
+                condition.as_ref(),
+                false,
+            )
                 .expect("plan update");
         std::hint::black_box(updated_item.len());
     }

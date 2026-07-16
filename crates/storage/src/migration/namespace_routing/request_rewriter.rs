@@ -464,7 +464,11 @@ fn rewrite_update_partition_assignments(
         let Some((lhs, rhs)) = assignment.split_once('=') else {
             continue;
         };
-        let attr_name = resolve_attribute_name(lhs.trim(), expression_attribute_names)?;
+        let lhs = lhs.trim();
+        if lhs.contains(['.', '[']) {
+            continue;
+        }
+        let attr_name = resolve_attribute_name(lhs, expression_attribute_names)?;
         if !PARTITION_KEY_NAMES.contains(&attr_name.as_str()) {
             continue;
         }

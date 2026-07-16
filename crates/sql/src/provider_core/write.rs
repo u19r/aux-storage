@@ -36,14 +36,33 @@ pub(crate) fn plan_update_from_existing_item(
     key: &KeyAttributes,
     operations: &[BoundUpdateOperation<'_>],
     condition: Option<&Condition>,
+    return_old_on_condition_failure: bool,
 ) -> StorageResult<UpdatePlan> {
     if let Some(condition) = condition
         && !evaluate_condition(condition_item_ref(existing_item.as_ref()), condition)
     {
-        return Err(StorageEnum::ConditionalCheckFailed.into());
+        return Err(conditional_failure(
+            existing_item.as_ref(),
+            return_old_on_condition_failure,
+        ));
     }
 
     apply_update_to_existing_or_key(existing_item, key, operations)
+}
+
+pub(crate) fn conditional_failure(
+    old_item: Option<&AttributeMap>,
+    return_old: bool,
+) -> StorageError {
+    if return_old
+        && let Some(item) = old_item
+    {
+        return StorageEnum::ConditionalCheckFailedWithItem {
+            item: item.clone().into(),
+        }
+        .into();
+    }
+    StorageEnum::ConditionalCheckFailed.into()
 }
 
 fn condition_item_ref(

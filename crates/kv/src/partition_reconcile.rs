@@ -30,7 +30,7 @@ use crate::{
         PARTITION_RECONCILE_ACTIONS_TOTAL_METRIC, PARTITION_RECONCILE_RUNS_TOTAL_METRIC,
         PARTITION_RECONCILE_RUNTIME_MS_METRIC,
     },
-    keyspace::compact::{self, QueueStorageId, U48},
+    keyspace::compact::QueueStorageId,
     newtypes::MessageVisibilityKey,
     partition_family::{
         PartitionFamilyConfig, PartitionFamilyKind, PartitionFamilyKvStore, PartitionInfo,
@@ -97,25 +97,9 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         &self,
         queue_url: &str,
     ) -> StorageResult<Option<QueueStorageId>> {
-        let Some(bytes) = self
-            .kv_store
-            .get(&compact::queue_url_lookup_key(queue_url), true)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if bytes.len() != 6 {
-            return Err(StorageError::internal(&format!(
-                "invalid queue storage id width: expected 6 bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let mut padded = [0u8; 8];
-        padded[2..].copy_from_slice(&bytes);
-        U48::new(u64::from_be_bytes(padded))
-            .map(QueueStorageId::from)
+        crate::queue_provider::queue_storage_id_from_url(queue_url)
             .map(Some)
-            .map_err(|error| StorageError::internal(&format!("invalid queue storage id: {error}")))
+            .map_err(|error| StorageError::internal(&error.to_string()))
     }
 
     pub(crate) async fn start_partition_reconcile_task(&self) -> StorageResult<()> {

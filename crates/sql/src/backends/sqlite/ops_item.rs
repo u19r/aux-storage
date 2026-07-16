@@ -23,6 +23,7 @@ impl SQLiteStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<storage_types::PutItemResponse> {
         let condition = parse_optional_condition(
@@ -38,6 +39,7 @@ impl SQLiteStorageProvider {
                 &condition,
                 sqlite,
                 immediate_gsi_consistency,
+                return_old_on_condition_failure,
                 None,
                 aux_item_stream_ttl_hours,
             )
@@ -62,6 +64,7 @@ impl SQLiteStorageProvider {
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<storage_types::PutItemResponse> {
         let condition = parse_optional_condition(
@@ -79,6 +82,7 @@ impl SQLiteStorageProvider {
                 sqlite,
                 immediate_gsi_consistency,
                 should_return_old,
+                return_old_on_condition_failure,
                 None,
                 aux_item_stream_ttl_hours,
             )
@@ -109,6 +113,7 @@ impl SQLiteStorageProvider {
         condition_expression: Option<String>,
         expression_attribute_names: Option<HashMap<String, String>>,
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        return_old_on_condition_failure: bool,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let condition = parse_optional_condition(
@@ -124,6 +129,7 @@ impl SQLiteStorageProvider {
                 &condition,
                 sqlite,
                 immediate_gsi_consistency,
+                return_old_on_condition_failure,
                 None,
                 aux_item_stream_ttl_hours,
             )
@@ -143,11 +149,16 @@ impl SQLiteStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_values_on_condition_check_failure,
             aux_item_stream_ttl_hours,
             ..
         } = request;
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                return_values_on_condition_check_failure.as_ref(),
+            );
         let (old_item, new_item, response_fields) =
             with_transaction(&self.connection, move |sqlite| {
                 let (operations, condition) = before_update_item_optional(
@@ -173,6 +184,7 @@ impl SQLiteStorageProvider {
                     &key,
                     sqlite,
                     immediate_gsi_consistency,
+                    return_old_on_condition_failure,
                     aux_item_stream_ttl_hours,
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))

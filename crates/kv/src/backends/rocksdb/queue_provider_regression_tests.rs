@@ -30,6 +30,18 @@ fn queue(queue_name: &str, queue_url: &str) -> Queue {
     }
 }
 
+async fn create_queue(
+    provider: &SortedKvDbStorageProvider<RocksDbKvStore>,
+    queue_name: &str,
+    queue_url: &str,
+) -> String {
+    provider
+        .create_queue(queue(queue_name, queue_url))
+        .await
+        .expect("create queue")
+        .queue_url
+}
+
 fn queue_with_attributes(
     queue_name: &str,
     queue_url: &str,
@@ -105,22 +117,23 @@ async fn create_queue_is_idempotent_when_existing_metadata_matches() {
     let attributes = HashMap::from([("VisibilityTimeout".to_string(), "30".to_string())]);
     let queue = queue_with_attributes("idempotent-direct", "idempotent-direct", attributes.clone());
 
-    provider
+    let created = provider
         .create_queue(queue.clone())
         .await
         .expect("create queue");
-    provider
+    let duplicate = provider
         .create_queue(queue.clone())
         .await
         .expect("duplicate matching create queue");
 
     let stored = provider
-        .get_queue("idempotent-direct")
+        .get_queue(&created.queue_url)
         .await
         .expect("get queue")
         .expect("queue exists");
     assert_eq!(stored.queue_name, queue.queue_name);
-    assert_eq!(stored.queue_url, queue.queue_url);
+    assert_eq!(stored.queue_url, created.queue_url);
+    assert_eq!(duplicate.queue_url, created.queue_url);
     assert_eq!(stored.attributes, attributes);
 }
 
@@ -154,10 +167,8 @@ async fn large_message_payload_is_split_and_reassembled() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/large-message";
-    provider
-        .create_queue(queue("large-message", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "large-message", queue_url).await;
+    let queue_url = queue_url.as_str();
     let large_body = large_text_body(900 * 1024);
 
     let sent_id = provider
@@ -187,15 +198,65 @@ async fn large_message_payload_is_split_and_reassembled() {
 }
 
 #[tokio::test]
+async fn queue_metadata_and_counts_share_one_snapshot() {
+    let provider = create_test_provider().await;
+    let queue_url = create_queue(
+        &provider,
+        "attribute-counts",
+        "https://queue.test/attribute-counts",
+    )
+    .await;
+    let now = TimestampMillis::now();
+    provider
+        .send_message(QueueMessage {
+            queue_url: queue_url.clone(),
+            body: "visible".to_string(),
+            created_at: now,
+            visibility_timestamp: Some(now),
+            ..Default::default()
+        })
+        .await
+        .expect("send visible message");
+    provider
+        .send_message(QueueMessage {
+            queue_url: queue_url.clone(),
+            body: "delayed".to_string(),
+            created_at: now,
+            visibility_timestamp: Some(now + DurationSeconds::from(60)),
+            ..Default::default()
+        })
+        .await
+        .expect("send delayed message");
+    let received = provider
+        .receive_messages(
+            &queue_url,
+            1,
+            DurationSeconds::from(60),
+            DurationSeconds::from(0),
+        )
+        .await
+        .expect("claim visible message");
+    assert_eq!(received.len(), 1);
+
+    let (queue, counts) = provider
+        .get_queue_with_message_counts(&queue_url)
+        .await
+        .expect("read queue attributes snapshot")
+        .expect("queue exists");
+    assert_eq!(queue.queue_url, queue_url);
+    assert_eq!(counts.visible, 0);
+    assert_eq!(counts.not_visible, 1);
+    assert_eq!(counts.delayed, 1);
+}
+
+#[tokio::test]
 async fn large_message_payload_chunks_are_removed_by_cleanup() {
     let provider = create_test_provider().await;
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/large-message-cleanup";
-    provider
-        .create_queue(queue("large-message-cleanup", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "large-message-cleanup", queue_url).await;
+    let queue_url = queue_url.as_str();
 
     provider
         .send_message(message(queue_url, large_text_body(300 * 1024)))
@@ -235,10 +296,8 @@ async fn concurrent_receives_claim_each_message_once() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/concurrency";
-    provider
-        .create_queue(queue("concurrency", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "concurrency", queue_url).await;
+    let queue_url = queue_url.as_str();
 
     for index in 0..24 {
         provider
@@ -289,10 +348,8 @@ async fn twelve_workers_receive_known_messages_without_duplicates_or_drops() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/twelve-workers";
-    provider
-        .create_queue(queue("twelve-workers", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "twelve-workers", queue_url).await;
+    let queue_url = queue_url.as_str();
 
     for index in 0..120 {
         provider
@@ -333,6 +390,29 @@ async fn twelve_workers_receive_known_messages_without_duplicates_or_drops() {
         }
     }
 
+    for _ in 0..16 {
+        if total_received == 120 {
+            break;
+        }
+        let messages = provider
+            .receive_messages(
+                queue_url,
+                u32::try_from(120 - total_received).unwrap_or(10).min(10),
+                DurationSeconds::from(30),
+                DurationSeconds::from(0),
+            )
+            .await
+            .expect("drain messages after concurrent claim conflicts");
+        total_received += messages.len();
+        for message in messages {
+            assert!(
+                unique_ids.insert(message.message_id.clone()),
+                "duplicate message claimed while draining after concurrent wave: {}",
+                message.message_id
+            );
+        }
+    }
+
     assert_eq!(unique_ids.len(), 120);
     assert_eq!(total_received, 120);
 }
@@ -343,10 +423,8 @@ async fn known_visible_message_is_found_within_four_receive_attempts() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/bounded-discovery";
-    provider
-        .create_queue(queue("bounded-discovery", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "bounded-discovery", queue_url).await;
+    let queue_url = queue_url.as_str();
     let sent_id = provider
         .send_message(message(queue_url, "known-visible".to_string()))
         .await
@@ -378,10 +456,8 @@ async fn sent_message_can_be_received_within_500ms_after_send_response() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/send-to-receive-latency";
-    provider
-        .create_queue(queue("send-to-receive-latency", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "send-to-receive-latency", queue_url).await;
+    let queue_url = queue_url.as_str();
     provider
         .send_message(message(queue_url, "latency".to_string()))
         .await
@@ -418,10 +494,8 @@ async fn delete_and_visibility_changes_work_across_provider_clones() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/cross-node";
-    provider
-        .create_queue(queue("cross-node", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "cross-node", queue_url).await;
+    let queue_url = queue_url.as_str();
     provider
         .send_message(message(queue_url, "first".to_string()))
         .await
@@ -495,10 +569,8 @@ async fn malformed_receipt_handles_do_not_use_legacy_queue_fallbacks() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/malformed-handle";
-    provider
-        .create_queue(queue("malformed-handle", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "malformed-handle", queue_url).await;
+    let queue_url = queue_url.as_str();
     let receipt_handle = ReceiptHandle::from("not-a-compact-receipt-handle");
 
     let delete_error = provider
@@ -537,10 +609,8 @@ async fn visibility_timeout_zero_makes_claimed_message_receivable_again() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/visibility-zero";
-    provider
-        .create_queue(queue("visibility-zero", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "visibility-zero", queue_url).await;
+    let queue_url = queue_url.as_str();
     let sent_id = provider
         .send_message(message(queue_url, "visible-again".to_string()))
         .await
@@ -586,10 +656,8 @@ async fn payload_cleanup_removes_deleted_messages_without_dropping_live_messages
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/payload-cleanup";
-    provider
-        .create_queue(queue("payload-cleanup", queue_url))
-        .await
-        .expect("create queue");
+    let queue_url = create_queue(&provider, "payload-cleanup", queue_url).await;
+    let queue_url = queue_url.as_str();
 
     for index in 0..6 {
         provider
@@ -662,10 +730,7 @@ async fn payload_cleanup_discards_malformed_delete_ledger_entries() {
     provider.initialize().await.expect("initialize provider");
 
     let queue_url = "https://queue.example.test/000000000000/malformed-ledger";
-    provider
-        .create_queue(queue("malformed-ledger", queue_url))
-        .await
-        .expect("create queue");
+    let _created_queue_url = create_queue(&provider, "malformed-ledger", queue_url).await;
     let ledger_key = crate::queue_provider::queue_delete_ledger_key(
         QueueStorageId::new(1).expect("first queue id"),
         0,
@@ -694,24 +759,30 @@ async fn payload_cleanup_discards_malformed_delete_ledger_entries() {
 }
 
 #[tokio::test]
-async fn queue_lookup_by_name_supports_canonical_queue_urls() {
+async fn queue_url_embeds_incarnation_without_a_lookup_record() {
     let provider = create_test_provider().await;
     provider.initialize().await.expect("initialize provider");
 
-    let queue_url = "https://queue.example.test/000000000000/name-lookup";
-    provider
-        .create_queue(queue("name-lookup", queue_url))
+    let queue_create_url = "https://queue.example.test/000000000000/name-lookup";
+    let created = provider
+        .create_queue(queue("name-lookup", queue_create_url))
         .await
         .expect("create queue");
+    let queue_url = created.queue_url.as_str();
 
     let queue_id = QueueStorageId::new(1).expect("first queue id");
-    let queue_id_bytes = provider
-        .kv_store
-        .get(&compact::queue_url_lookup_key(queue_url), true)
-        .await
-        .expect("read queue url lookup")
-        .expect("queue url lookup should exist");
-    assert_eq!(queue_id_bytes.len(), 6);
+    assert_eq!(
+        queue_url,
+        "https://queue.example.test/000000000000/000000000001/name-lookup"
+    );
+    assert!(
+        provider
+            .kv_store
+            .get(&compact::queue_url_lookup_key(queue_url), true)
+            .await
+            .expect("read obsolete queue url lookup")
+            .is_none()
+    );
     assert!(
         provider
             .kv_store
@@ -729,7 +800,7 @@ async fn queue_lookup_by_name_supports_canonical_queue_urls() {
             .is_some()
     );
 
-    let queue = provider
+    let stored_queue = provider
         .get_queue_by_name("name-lookup")
         .await
         .expect("get queue by name")
@@ -739,7 +810,7 @@ async fn queue_lookup_by_name_supports_canonical_queue_urls() {
         .await
         .expect("list queues");
 
-    assert_eq!(queue.queue_url, queue_url);
+    assert_eq!(stored_queue.queue_url, queue_url);
     assert_eq!(queues.len(), 1);
     assert_eq!(queues[0].queue_url, queue_url);
 
@@ -770,5 +841,22 @@ async fn queue_lookup_by_name_supports_canonical_queue_urls() {
             .await
             .expect("read deleted queue metadata")
             .is_none()
+    );
+
+    let recreated = provider
+        .create_queue(queue("name-lookup", queue_create_url))
+        .await
+        .expect("recreate queue");
+    assert_eq!(
+        recreated.queue_url,
+        "https://queue.example.test/000000000000/000000000002/name-lookup"
+    );
+    assert!(
+        provider
+            .get_queue(queue_url)
+            .await
+            .expect("look up deleted incarnation")
+            .is_none(),
+        "a deleted queue URL must not address its replacement"
     );
 }

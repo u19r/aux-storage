@@ -237,6 +237,8 @@ async fn publish_routes_http_subscription_to_custom_sender_with_extra_json() {
         .await
         .unwrap();
 
+    assert!(sender.messages().is_empty());
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 2);
     let messages = sender.messages();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].payload, b"created");
@@ -466,6 +468,7 @@ async fn publish_sends_queue_notification_body_matching_aws_fixture() {
         .await
         .unwrap();
 
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
     let messages = queue_manager
         .receive_message(ReceiveMessageRequest {
             queue_url: "orders-queue".to_string(),
@@ -528,6 +531,7 @@ async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
         .await
         .unwrap();
 
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 1);
     let messages = queue_manager
         .receive_message(ReceiveMessageRequest {
             queue_url: "orders-raw-queue".to_string(),

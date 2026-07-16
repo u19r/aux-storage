@@ -3,7 +3,7 @@
 #[cfg(not(feature = "queue"))]
 use std::sync::Arc;
 #[cfg(feature = "queue")]
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[cfg(feature = "queue")]
 use axum::{
@@ -18,16 +18,13 @@ use axum::{body::Bytes, extract::State, http::HeaderMap, response::Response};
 #[cfg(feature = "queue")]
 use http_error::HttpApiError;
 #[cfg(feature = "queue")]
-use queue::{
-    ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
-    DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
-    GetQueueUrlRequest, ListQueuesRequest, PurgeQueueRequest, QueueManager, ReceiveMessageRequest,
-    SendMessageBatchRequest, SendMessageRequest, SetQueueAttributesRequest,
-};
+use queue::QueueManager;
 #[cfg(feature = "queue")]
 use queue_provider::{
-    SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE, SQS_INVALID_ACTION_ERROR_TYPE,
-    SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE, SQS_MISSING_PARAMETER_ERROR_TYPE, sqs_json_error_type,
+    QueueAction, QueueRequest, SQS_BATCH_ENTRY_IDS_NOT_DISTINCT_ERROR_TYPE,
+    SQS_INVALID_ACTION_ERROR_TYPE, SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE,
+    SQS_MISSING_PARAMETER_ERROR_TYPE, decode_json_request, decode_value_request,
+    query_fields_to_json, sqs_json_error_type,
 };
 #[cfg(feature = "queue")]
 use serde::Serialize;
@@ -49,71 +46,9 @@ enum QueueProtocol {
 }
 
 #[cfg(feature = "queue")]
-#[derive(Debug, Clone, Copy)]
-enum QueueAction {
-    CreateQueue,
-    DeleteQueue,
-    ListQueues,
-    GetQueueUrl,
-    GetQueueAttributes,
-    SetQueueAttributes,
-    PurgeQueue,
-    SendMessage,
-    SendMessageBatch,
-    ReceiveMessage,
-    DeleteMessage,
-    DeleteMessageBatch,
-    ChangeMessageVisibility,
-    ChangeMessageVisibilityBatch,
-}
-
-#[cfg(feature = "queue")]
-impl QueueAction {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "CreateQueue" => Some(Self::CreateQueue),
-            "DeleteQueue" => Some(Self::DeleteQueue),
-            "ListQueues" => Some(Self::ListQueues),
-            "GetQueueUrl" => Some(Self::GetQueueUrl),
-            "GetQueueAttributes" => Some(Self::GetQueueAttributes),
-            "SetQueueAttributes" => Some(Self::SetQueueAttributes),
-            "PurgeQueue" => Some(Self::PurgeQueue),
-            "SendMessage" => Some(Self::SendMessage),
-            "SendMessageBatch" => Some(Self::SendMessageBatch),
-            "ReceiveMessage" => Some(Self::ReceiveMessage),
-            "DeleteMessage" => Some(Self::DeleteMessage),
-            "DeleteMessageBatch" => Some(Self::DeleteMessageBatch),
-            "ChangeMessageVisibility" => Some(Self::ChangeMessageVisibility),
-            "ChangeMessageVisibilityBatch" => Some(Self::ChangeMessageVisibilityBatch),
-            _ => None,
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::CreateQueue => "CreateQueue",
-            Self::DeleteQueue => "DeleteQueue",
-            Self::ListQueues => "ListQueues",
-            Self::GetQueueUrl => "GetQueueUrl",
-            Self::GetQueueAttributes => "GetQueueAttributes",
-            Self::SetQueueAttributes => "SetQueueAttributes",
-            Self::PurgeQueue => "PurgeQueue",
-            Self::SendMessage => "SendMessage",
-            Self::SendMessageBatch => "SendMessageBatch",
-            Self::ReceiveMessage => "ReceiveMessage",
-            Self::DeleteMessage => "DeleteMessage",
-            Self::DeleteMessageBatch => "DeleteMessageBatch",
-            Self::ChangeMessageVisibility => "ChangeMessageVisibility",
-            Self::ChangeMessageVisibilityBatch => "ChangeMessageVisibilityBatch",
-        }
-    }
-}
-
-#[cfg(feature = "queue")]
 struct QueueWireRequest {
     protocol: QueueProtocol,
-    action: QueueAction,
-    payload: Value,
+    request: QueueRequest,
 }
 
 #[utoipa::path(
@@ -141,11 +76,9 @@ pub async fn queue_endpoint(
     let wire_request = match decode_request(&headers, body) {
         Ok(request) => request,
         Err(message) => {
-            return error_response(
+            return validation_response(
                 &request_id,
                 protocol_from_headers(&headers),
-                StatusCode::BAD_REQUEST,
-                SQS_INVALID_PARAMETER_VALUE_ERROR_TYPE,
                 &message,
             );
         }
@@ -155,8 +88,7 @@ pub async fn queue_endpoint(
         app_state.as_ref(),
         &request_id,
         wire_request.protocol,
-        wire_request.action,
-        wire_request.payload,
+        wire_request.request,
     )
     .await
 }
@@ -185,15 +117,11 @@ async fn dispatch_queue_request(
     app_state: &AppState,
     request_id: &str,
     protocol: QueueProtocol,
-    action: QueueAction,
-    payload: Value,
+    request: QueueRequest,
 ) -> Response {
-    match action {
-        QueueAction::CreateQueue => {
-            let request = match CreateQueueRequest::from_json(payload) {
-                Ok(request) => request,
-                Err(err) => return validation_response(request_id, protocol, &err.message),
-            };
+    let action = request.action();
+    match request {
+        QueueRequest::CreateQueue(request) => {
             let queue_url = format!(
                 "{}/{}/{}",
                 app_state.queue_public_base_url.trim_end_matches('/'),
@@ -205,151 +133,94 @@ async fn dispatch_queue_request(
                 Err(err) => api_error_response(request_id, protocol, HttpApiError::from(err)),
             }
         }
-        QueueAction::DeleteQueue => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                DeleteQueueRequest::from_json(payload),
-                |req| async move { manager.delete_queue(req).await },
-            )
+        QueueRequest::DeleteQueue(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.delete_queue(req).await
+            })
             .await
         }
-        QueueAction::ListQueues => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                ListQueuesRequest::from_json(payload),
-                |req| async move { manager.list_queues(req).await },
-            )
+        QueueRequest::ListQueues(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.list_queues(req).await
+            })
             .await
         }
-        QueueAction::GetQueueUrl => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                GetQueueUrlRequest::from_json(payload),
-                |req| async move { manager.get_queue_url(req).await },
-            )
+        QueueRequest::GetQueueUrl(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.get_queue_url(req).await
+            })
             .await
         }
-        QueueAction::GetQueueAttributes => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                GetQueueAttributesRequest::from_json(payload),
-                |req| async move { manager.get_queue_attributes(req).await },
-            )
+        QueueRequest::GetQueueAttributes(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.get_queue_attributes(req).await
+            })
             .await
         }
-        QueueAction::SetQueueAttributes => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                SetQueueAttributesRequest::from_json(payload),
-                |req| async move { manager.set_queue_attributes(req).await },
-            )
+        QueueRequest::SetQueueAttributes(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.set_queue_attributes(req).await
+            })
             .await
         }
-        QueueAction::PurgeQueue => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                PurgeQueueRequest::from_json(payload),
-                |req| async move { manager.purge_queue(req).await },
-            )
+        QueueRequest::PurgeQueue(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.purge_queue(req).await
+            })
             .await
         }
-        QueueAction::SendMessage => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                SendMessageRequest::from_json(payload),
-                |req| async move { manager.send_message(req).await },
-            )
+        QueueRequest::SendMessage(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.send_message(req).await
+            })
             .await
         }
-        QueueAction::SendMessageBatch => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                SendMessageBatchRequest::from_json(payload),
-                |req| async move { manager.send_message_batch(req).await },
-            )
+        QueueRequest::SendMessageBatch(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.send_message_batch(req).await
+            })
             .await
         }
-        QueueAction::ReceiveMessage => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                ReceiveMessageRequest::from_json(payload),
-                |req| async move { manager.receive_message(req).await },
-            )
+        QueueRequest::ReceiveMessage(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.receive_message(req).await
+            })
             .await
         }
-        QueueAction::DeleteMessage => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                DeleteMessageRequest::from_json(payload),
-                |req| async move {
-                    manager.delete_message(req).await?;
-                    Ok(json!({}))
-                },
-            )
+        QueueRequest::DeleteMessage(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.delete_message(req).await?;
+                Ok(json!({}))
+            })
             .await
         }
-        QueueAction::DeleteMessageBatch => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                DeleteMessageBatchRequest::from_json(payload),
-                |req| async move { manager.delete_message_batch(req).await },
-            )
+        QueueRequest::DeleteMessageBatch(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.delete_message_batch(req).await
+            })
             .await
         }
-        QueueAction::ChangeMessageVisibility => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                ChangeMessageVisibilityRequest::from_json(payload),
-                |req| async move {
-                    manager.change_message_visibility(req).await?;
-                    Ok(json!({}))
-                },
-            )
+        QueueRequest::ChangeMessageVisibility(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.change_message_visibility(req).await?;
+                Ok(json!({}))
+            })
             .await
         }
-        QueueAction::ChangeMessageVisibilityBatch => {
-            handle_manager(
-                request_id,
-                protocol,
-                action,
-                ChangeMessageVisibilityBatchRequest::from_json(payload),
-                |req| async move { manager.change_message_visibility_batch(req).await },
-            )
+        QueueRequest::ChangeMessageVisibilityBatch(request) => {
+            handle_manager(request_id, protocol, action, request, |req| async move {
+                manager.change_message_visibility_batch(req).await
+            })
             .await
         }
     }
 }
-
 #[cfg(feature = "queue")]
 async fn handle_manager<Request, Handler, Fut, T>(
     request_id: &str,
     protocol: QueueProtocol,
     action: QueueAction,
-    request: Result<Request, HttpApiError>,
+    request: Request,
     handler: Handler,
 ) -> Response
 where
@@ -357,10 +228,6 @@ where
     Fut: std::future::Future<Output = queue::QueueResult<T>>,
     T: Serialize,
 {
-    let request = match request {
-        Ok(request) => request,
-        Err(err) => return validation_response(request_id, protocol, &err.message),
-    };
     match handler(request).await {
         Ok(value) => ok_response(request_id, protocol, action, &value),
         Err(err) => api_error_response(request_id, protocol, HttpApiError::from(err)),
@@ -383,41 +250,31 @@ fn decode_request(headers: &HeaderMap, body: Bytes) -> Result<QueueWireRequest, 
             .ok_or_else(|| "invalid_x_amz_target".to_string())?;
         let action =
             QueueAction::from_name(action_name).ok_or_else(|| "unsupported_action".to_string())?;
-        let payload =
-            serde_json::from_slice::<Value>(&body).map_err(|err| format!("invalid_json:{err}"))?;
+        let request = decode_json_request(action, &body).map_err(|error| error.message)?;
         return Ok(QueueWireRequest {
             protocol: QueueProtocol::Json,
-            action,
-            payload,
+            request,
         });
     }
     if content_type.starts_with("application/x-www-form-urlencoded") {
-        let fields: HashMap<String, String> = url::form_urlencoded::parse(&body)
+        let fields = url::form_urlencoded::parse(&body)
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
+            .collect::<Vec<_>>();
         let action_name = fields
-            .get("Action")
+            .iter()
+            .rev()
+            .find_map(|(key, value)| (key == "Action").then_some(value))
             .ok_or_else(|| "missing_action".to_string())?;
         let action =
             QueueAction::from_name(action_name).ok_or_else(|| "unsupported_action".to_string())?;
+        let request = decode_value_request(action, query_fields_to_json(fields))
+            .map_err(|error| error.message)?;
         return Ok(QueueWireRequest {
             protocol: QueueProtocol::Query,
-            action,
-            payload: query_fields_to_json(fields),
+            request,
         });
     }
     Err("unsupported_content_type".to_string())
-}
-
-#[cfg(feature = "queue")]
-fn query_fields_to_json(fields: HashMap<String, String>) -> Value {
-    let mut payload = serde_json::Map::new();
-    for (key, value) in fields {
-        if key != "Action" && key != "Version" {
-            payload.insert(key, Value::String(value));
-        }
-    }
-    Value::Object(payload)
 }
 
 #[cfg(feature = "queue")]
@@ -566,4 +423,69 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(all(test, feature = "queue"))]
+mod tests {
+    use super::*;
+
+    fn decode_query(body: &'static [u8]) -> QueueWireRequest {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        decode_request(&headers, Bytes::from_static(body)).expect("query request decodes")
+    }
+
+    #[test]
+    fn query_protocol_decodes_numbered_attribute_maps_and_lists() {
+        let request = decode_query(
+            b"Action=ReceiveMessage&QueueUrl=https%3A%2F%2Fqueue.example%2Fjobs&AttributeName.2=SentTimestamp&AttributeName.1=All&MessageAttributeName.1=TraceId",
+        );
+
+        let QueueRequest::ReceiveMessage(request) = request.request else {
+            panic!("expected receive request");
+        };
+        assert_eq!(
+            request.attribute_names,
+            Some(vec!["All".to_string(), "SentTimestamp".to_string()])
+        );
+        assert_eq!(
+            request.message_attribute_names,
+            Some(vec!["TraceId".to_string()])
+        );
+    }
+
+    #[test]
+    fn query_protocol_decodes_message_attributes() {
+        let request = decode_query(
+            b"Action=SendMessage&QueueUrl=https%3A%2F%2Fqueue.example%2Fjobs&MessageBody=body&MessageAttribute.1.Name=Trace&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=abc",
+        );
+
+        let QueueRequest::SendMessage(request) = request.request else {
+            panic!("expected send request");
+        };
+        let attributes = request
+            .message_attributes
+            .as_ref()
+            .expect("message attributes");
+        let trace = attributes.get("Trace").expect("trace attribute");
+        assert_eq!(trace.data_type, "String");
+        assert_eq!(trace.string_value.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn query_protocol_decodes_batch_entries_in_index_order() {
+        let request = decode_query(
+            b"Action=SendMessageBatch&QueueUrl=https%3A%2F%2Fqueue.example%2Fjobs&SendMessageBatchRequestEntry.2.Id=second&SendMessageBatchRequestEntry.2.MessageBody=two&SendMessageBatchRequestEntry.1.Id=first&SendMessageBatchRequestEntry.1.MessageBody=one&SendMessageBatchRequestEntry.1.DelaySeconds=5",
+        );
+
+        let QueueRequest::SendMessageBatch(request) = request.request else {
+            panic!("expected send batch request");
+        };
+        assert_eq!(request.entries[0].id, "first");
+        assert_eq!(request.entries[0].delay_seconds, Some(5));
+        assert_eq!(request.entries[1].id, "second");
+    }
 }

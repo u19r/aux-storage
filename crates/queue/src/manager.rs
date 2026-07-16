@@ -7,8 +7,9 @@ use queue_provider::{
     DeleteMessageBatchRequest, DeleteMessageBatchResponse, DeleteMessageBatchResultEntry,
     DeleteMessageRequest, DeleteQueueRequest, DeleteQueueResponse, GetQueueAttributesRequest,
     GetQueueAttributesResponse, GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest,
-    ListQueuesResponse, MessageId, MessageResponse, PurgeQueueRequest, PurgeQueueResponse, Queue,
-    QueueError, QueueMessage, QueueMessageCounts, QueueResult, ReceiptHandle,
+    IntoValidatedQueueRequest, ListQueuesResponse, MessageId, MessageResponse, PurgeQueueRequest,
+    PurgeQueueResponse, Queue, QueueError, QueueMessage, QueueMessageCounts, QueueResult,
+    ReceiptHandle,
     ReceiveMessageRequest, ReceiveMessageResponse, SendMessageBatchRequest,
     SendMessageBatchResponse, SendMessageBatchResultEntry, SendMessageRequest, SendMessageResponse,
     SetQueueAttributesRequest, SetQueueAttributesResponse, UpdateMessageSnapshotRequest,
@@ -45,24 +46,24 @@ impl QueueManager {
         Self { storage }
     }
 
-    #[instrument(skip(self), fields(feature = "queue", queue_name = tracing::field::Empty))]
+    #[instrument(skip(self, request), fields(feature = "queue", queue_name = tracing::field::Empty))]
     pub async fn create_queue(
         &self,
-        request: CreateQueueRequest,
+        request: impl IntoValidatedQueueRequest<CreateQueueRequest>,
     ) -> QueueResult<CreateQueueResponse> {
-        request.validate()?;
+        let request = request.into_validated()?;
         let queue_url = request.queue_name.clone();
 
         self.create_queue_with_url(request, queue_url).await
     }
 
-    #[instrument(skip(self), fields(feature = "queue", queue_name = tracing::field::Empty))]
+    #[instrument(skip(self, request), fields(feature = "queue", queue_name = tracing::field::Empty))]
     pub async fn create_queue_with_url(
         &self,
-        request: CreateQueueRequest,
+        request: impl IntoValidatedQueueRequest<CreateQueueRequest>,
         queue_url: String,
     ) -> QueueResult<CreateQueueResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         Queue::validate_url(&queue_url)?;
         let queue_name = request.queue_name;
 
@@ -75,25 +76,30 @@ impl QueueManager {
             created_at: TimestampMillis::now(),
         };
 
-        self.storage.create_queue(queue).await.map_err(|e| {
+        let queue = self.storage.create_queue(queue).await.map_err(|e| {
             tracing::error!(error = %e, "queue.create.failed");
             e
         })?;
 
-        Ok(CreateQueueResponse { queue_url })
+        Ok(CreateQueueResponse {
+            queue_url: queue.queue_url,
+        })
     }
 
     pub async fn delete_queue(
         &self,
-        request: DeleteQueueRequest,
+        request: impl IntoValidatedQueueRequest<DeleteQueueRequest>,
     ) -> QueueResult<DeleteQueueResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         self.storage.delete_queue(&request.queue_url).await?;
         Ok(DeleteQueueResponse::default())
     }
 
-    pub async fn list_queues(&self, request: ListQueuesRequest) -> QueueResult<ListQueuesResponse> {
-        request.validate()?;
+    pub async fn list_queues(
+        &self,
+        request: impl IntoValidatedQueueRequest<ListQueuesRequest>,
+    ) -> QueueResult<ListQueuesResponse> {
+        let request = request.into_validated()?.into_inner();
         let queues = self
             .storage
             .list_queues(request.queue_name_prefix.as_deref())
@@ -105,9 +111,9 @@ impl QueueManager {
 
     pub async fn get_queue_url(
         &self,
-        request: GetQueueUrlRequest,
+        request: impl IntoValidatedQueueRequest<GetQueueUrlRequest>,
     ) -> QueueResult<GetQueueUrlResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let queue = self.storage.get_queue_by_name(&request.queue_name).await?;
         let queue = queue.ok_or_else(|| queue_provider::QueueError::ResourceNotFound {
             resource_type: "queue",
@@ -120,18 +126,17 @@ impl QueueManager {
 
     pub async fn get_queue_attributes(
         &self,
-        request: GetQueueAttributesRequest,
+        request: impl IntoValidatedQueueRequest<GetQueueAttributesRequest>,
     ) -> QueueResult<GetQueueAttributesResponse> {
-        request.validate()?;
-        let queue = self.storage.get_queue(&request.queue_url).await?;
-        let queue = queue.ok_or_else(|| queue_provider::QueueError::ResourceNotFound {
+        let request = request.into_validated()?.into_inner();
+        let (queue, counts) = self
+            .storage
+            .get_queue_with_message_counts(&request.queue_url)
+            .await?
+            .ok_or_else(|| queue_provider::QueueError::ResourceNotFound {
             resource_type: "queue",
             resource_id: request.queue_url.clone(),
         })?;
-        let counts = self
-            .storage
-            .get_queue_message_counts(&request.queue_url)
-            .await?;
         Ok(GetQueueAttributesResponse {
             attributes: selected_queue_attributes(
                 queue.attributes,
@@ -143,17 +148,20 @@ impl QueueManager {
 
     pub async fn set_queue_attributes(
         &self,
-        request: SetQueueAttributesRequest,
+        request: impl IntoValidatedQueueRequest<SetQueueAttributesRequest>,
     ) -> QueueResult<SetQueueAttributesResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         self.storage
             .set_queue_attributes(&request.queue_url, request.attributes)
             .await?;
         Ok(SetQueueAttributesResponse::default())
     }
 
-    pub async fn purge_queue(&self, request: PurgeQueueRequest) -> QueueResult<PurgeQueueResponse> {
-        request.validate()?;
+    pub async fn purge_queue(
+        &self,
+        request: impl IntoValidatedQueueRequest<PurgeQueueRequest>,
+    ) -> QueueResult<PurgeQueueResponse> {
+        let request = request.into_validated()?.into_inner();
         self.storage.purge_queue(&request.queue_url).await?;
         Ok(PurgeQueueResponse::default())
     }
@@ -161,9 +169,9 @@ impl QueueManager {
     #[instrument(skip(self, request), fields(feature = "queue", queue_url = tracing::field::Empty, delay_seconds = tracing::field::Empty, message_body_size = tracing::field::Empty, message_id = tracing::field::Empty))]
     pub async fn send_message(
         &self,
-        request: SendMessageRequest,
+        request: impl IntoValidatedQueueRequest<SendMessageRequest>,
     ) -> QueueResult<SendMessageResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let now = TimestampMillis::now();
 
         tracing::Span::current().record("queue_url", &request.queue_url);
@@ -181,11 +189,12 @@ impl QueueManager {
             .message_attributes
             .as_ref()
             .and_then(queue_provider::md5_of_message_attributes);
+        let md5_hash = format!("{:x}", md5::compute(request.message_body.as_bytes()));
 
         let message = QueueMessage {
             message_id: MessageId::default(),
             queue_url: request.queue_url,
-            body: request.message_body.clone(),
+            body: request.message_body,
             message_attributes: request.message_attributes,
             receipt_handle: None,
             created_at: now,
@@ -202,8 +211,6 @@ impl QueueManager {
 
         tracing::Span::current().record("message_id", assigned_id.to_string());
 
-        let md5_hash = format!("{:x}", md5::compute(request.message_body.as_bytes()));
-
         Ok(SendMessageResponse {
             message_id: assigned_id,
             md5_of_body: md5_hash,
@@ -213,9 +220,9 @@ impl QueueManager {
 
     pub async fn send_message_batch(
         &self,
-        request: SendMessageBatchRequest,
+        request: impl IntoValidatedQueueRequest<SendMessageBatchRequest>,
     ) -> QueueResult<SendMessageBatchResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let now = TimestampMillis::now();
         let mut entry_ids = Vec::with_capacity(request.entries.len());
         let mut response_metadata = Vec::with_capacity(request.entries.len());
@@ -266,12 +273,12 @@ impl QueueManager {
         Ok(SendMessageBatchResponse { successful, failed })
     }
 
-    #[instrument(skip(self), fields(feature = "queue", queue_url = tracing::field::Empty, max_messages = tracing::field::Empty, visibility_timeout = tracing::field::Empty, messages_received = tracing::field::Empty))]
+    #[instrument(skip(self, request), fields(feature = "queue", queue_url = tracing::field::Empty, max_messages = tracing::field::Empty, visibility_timeout = tracing::field::Empty, messages_received = tracing::field::Empty))]
     pub async fn receive_message(
         &self,
-        request: ReceiveMessageRequest,
+        request: impl IntoValidatedQueueRequest<ReceiveMessageRequest>,
     ) -> QueueResult<ReceiveMessageResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let max_messages = request.max_number_of_messages.unwrap_or(1);
         let visibility_timeout = request
             .visibility_timeout
@@ -298,8 +305,11 @@ impl QueueManager {
         Ok(ReceiveMessageResponse { messages })
     }
 
-    pub async fn delete_message(&self, request: DeleteMessageRequest) -> QueueResult<()> {
-        request.validate()?;
+    pub async fn delete_message(
+        &self,
+        request: impl IntoValidatedQueueRequest<DeleteMessageRequest>,
+    ) -> QueueResult<()> {
+        let request = request.into_validated()?.into_inner();
         let receipt_handle = request.receipt_handle;
         record_queue_operation(
             "delete_message",
@@ -312,9 +322,9 @@ impl QueueManager {
 
     pub async fn delete_message_batch(
         &self,
-        request: DeleteMessageBatchRequest,
+        request: impl IntoValidatedQueueRequest<DeleteMessageBatchRequest>,
     ) -> QueueResult<DeleteMessageBatchResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let mut successful = Vec::with_capacity(request.entries.len());
         let mut failed = Vec::new();
 
@@ -353,9 +363,9 @@ impl QueueManager {
 
     pub async fn change_message_visibility(
         &self,
-        request: ChangeMessageVisibilityRequest,
+        request: impl IntoValidatedQueueRequest<ChangeMessageVisibilityRequest>,
     ) -> QueueResult<()> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         record_queue_operation(
             "change_message_visibility",
             self.storage.change_message_visibility(
@@ -370,9 +380,9 @@ impl QueueManager {
 
     pub async fn change_message_visibility_batch(
         &self,
-        request: ChangeMessageVisibilityBatchRequest,
+        request: impl IntoValidatedQueueRequest<ChangeMessageVisibilityBatchRequest>,
     ) -> QueueResult<ChangeMessageVisibilityBatchResponse> {
-        request.validate()?;
+        let request = request.into_validated()?.into_inner();
         let mut successful = Vec::with_capacity(request.entries.len());
         let mut failed = Vec::new();
 
@@ -502,9 +512,36 @@ impl QueueManager {
 fn batch_error_entry(id: String, error: &QueueError) -> BatchResultErrorEntry {
     BatchResultErrorEntry {
         id,
-        sender_fault: true,
+        sender_fault: error.is_sender_fault(),
         code: error.aws_query_error_type().to_string(),
         message: error.aws_query_message(),
+    }
+}
+
+#[cfg(test)]
+mod batch_error_tests {
+    use queue_provider::{QueueError, QueueInternalKind, QueueValidationKind};
+
+    use super::batch_error_entry;
+
+    #[test]
+    fn batch_error_classifies_request_failures_as_sender_faults() {
+        let entry = batch_error_entry(
+            "request".to_string(),
+            &QueueError::validation(QueueValidationKind::InvalidParameterValue),
+        );
+
+        assert!(entry.sender_fault);
+    }
+
+    #[test]
+    fn batch_error_classifies_internal_failures_as_receiver_faults() {
+        let entry = batch_error_entry(
+            "storage".to_string(),
+            &QueueError::internal(QueueInternalKind::MissingQueuePartitionState),
+        );
+
+        assert!(!entry.sender_fault);
     }
 }
 

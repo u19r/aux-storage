@@ -678,7 +678,9 @@ async fn query_gsi_with_limit_returns_full_dynamodb_last_evaluated_key() {
         assert_eq!(response.count, 2, "{}", backend.name);
         let items = response.items.as_ref().expect("projected GSI items");
         assert!(
-            items.iter().all(|item| item.len() == 1 && item.contains_key("gsk")),
+            items
+                .iter()
+                .all(|item| item.len() == 1 && item.contains_key("gsk")),
             "{}",
             backend.name
         );

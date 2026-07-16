@@ -1,7 +1,7 @@
 use http_error::HttpApiError;
 use storage_types::{
     GetItemRequest, StorageEnum, StorageError, context::WrappedError,
-    validate_key_attributes_for_schema, validate_transact_key,
+    validate_transact_key,
 };
 
 use crate::{
@@ -15,16 +15,21 @@ impl StorageApiManagerImpl {
         &self,
         request: GetItemRequest,
     ) -> Result<Response, HttpApiError> {
-        let table_info = self.db().get_table_info(&request.table_name).await?;
-        validate_transact_key(&table_info, &request.key).map_err(key_validation_error)?;
-        validate_key_attributes_for_schema(&table_info.key_schema, &request.key)
+        let operation = self
+            .db()
+            .resolve_storage_operation(request.table_name)
+            .await?;
+        validate_transact_key(operation.table_info(), &request.key)
+            .map_err(key_validation_error)?;
+        let operation = operation
+            .validate_key(request.key)
             .map_err(get_item_key_validation_error)?;
 
         let consistent_read = request.consistent_read.unwrap_or(false);
         self.ensure_sync_read_barrier(consistent_read).await?;
         let item = self
             .db()
-            .get_item_with_consistent_read(request.table_name, request.key, consistent_read)
+            .get_item_with_resolved_operation(operation, consistent_read)
             .await?;
 
         if request.projection_expression.is_some() || request.attributes_to_get.is_some() {

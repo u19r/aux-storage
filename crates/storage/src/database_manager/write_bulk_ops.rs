@@ -10,7 +10,7 @@ use storage_types::{
     AttributeValue, AttributeValueLookup, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
     BatchWriteItemResponse, EncodeWriteRequest, KeySchemaElement, StorageEnum, StorageError,
     StorageResult, TableName, TableNamespace, TransactEncodeItem, TransactWriteItemsEncodeRequest,
-    TransactWriteItemsResponse, WriteRequest, context::WrappedError,
+    TransactWriteItemsResponse, WriteRequest, WriteRetryPolicy, context::WrappedError,
     validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
 };
 
@@ -454,6 +454,15 @@ impl DatabaseManager {
         &self,
         request: TransactWriteItemsEncodeRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
+        self.transact_write_items_encode_with_retry(request, WriteRetryPolicy::no_retry())
+            .await
+    }
+
+    pub async fn transact_write_items_encode_with_retry(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+        retry_policy: WriteRetryPolicy,
+    ) -> StorageResult<TransactWriteItemsResponse> {
         let prepared = self.prepare_transact_write_items_encode(request).await?;
         if self.single_node_sync_mode_enabled() {
             return Err(StorageError::unsupported(
@@ -461,9 +470,12 @@ impl DatabaseManager {
             ));
         }
         if self.route_resolver.is_none() {
-            return self.transact_write_items_encode_unrouted(prepared).await;
+            return self
+                .transact_write_items_encode_unrouted(prepared, retry_policy)
+                .await;
         }
-        self.transact_write_items_encode_routed(prepared).await
+        self.transact_write_items_encode_routed(prepared, retry_policy)
+            .await
     }
 
     async fn prepare_transact_write_items_encode(
@@ -524,6 +536,7 @@ impl DatabaseManager {
     async fn transact_write_items_encode_unrouted(
         &self,
         prepared: PreparedTransactWriteItemsEncode,
+        retry_policy: WriteRetryPolicy,
     ) -> StorageResult<TransactWriteItemsResponse> {
         let PreparedTransactWriteItemsEncode {
             request,
@@ -535,7 +548,8 @@ impl DatabaseManager {
             || async {
                 let response = record_storage_operation(
                     "transact_write_items",
-                    self.storage.transact_write_items_encode(request),
+                    self.storage
+                        .transact_write_items_encode_with_retry(request, retry_policy),
                 )
                 .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
@@ -550,6 +564,7 @@ impl DatabaseManager {
     async fn transact_write_items_encode_routed(
         &self,
         prepared: PreparedTransactWriteItemsEncode,
+        retry_policy: WriteRetryPolicy,
     ) -> StorageResult<TransactWriteItemsResponse> {
         let PreparedTransactWriteItemsEncode {
             request,
@@ -570,6 +585,7 @@ impl DatabaseManager {
                     client_request_token,
                     return_consumed_capacity,
                     return_item_collection_metrics,
+                    retry_policy,
                 )
                 .await
             },
@@ -642,6 +658,7 @@ impl DatabaseManager {
         client_request_token: Option<String>,
         return_consumed_capacity: Option<String>,
         return_item_collection_metrics: Option<String>,
+        retry_policy: WriteRetryPolicy,
     ) -> StorageResult<TransactWriteItemsResponse> {
         let mut primary_response: Option<TransactWriteItemsResponse> = None;
         for (dispatch_key, mut request_for_connection) in per_connection {
@@ -654,7 +671,10 @@ impl DatabaseManager {
             let response = record_storage_operation_for_target(
                 "transact_write_items",
                 dispatch_key.target_role,
-                provider.transact_write_items_encode(request_for_connection),
+                provider.transact_write_items_encode_with_retry(
+                    request_for_connection,
+                    retry_policy,
+                ),
             )
             .await?;
             if primary_response.is_none() {

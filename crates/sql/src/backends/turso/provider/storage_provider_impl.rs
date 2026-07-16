@@ -19,9 +19,10 @@ use storage_provider::{
 use storage_types::{
     AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
     BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof, DurableItemRevision,
-    DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
+    DeleteItemRequest, DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
-    PreparedBatchOperation, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
+    PreparedBatchOperation, PutItemRequest, PutItemResponse, QueryTableRequest,
+    ReadSequenceConsistency,
     ReplicationMutation, ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName,
     TableStatus, TimestampMillis, TransactWriteItem, TransactWriteItemsRequest,
     TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, WireItem,
@@ -774,37 +775,21 @@ impl StorageProvider for TursoStorageProvider {
         Ok(())
     }
 
-    async fn put_item(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse> {
-        self.put_item_with_stream_ttl(
+    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let PutItemRequest {
             table_name,
             item,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
             return_values,
-            None,
-        )
-        .await
-    }
-
-    async fn put_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
-    ) -> StorageResult<PutItemResponse> {
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
@@ -828,6 +813,7 @@ impl StorageProvider for TursoStorageProvider {
                         &table_info,
                         &item,
                         condition.as_ref(),
+                        return_old_on_condition_failure,
                         aux_item_stream_ttl_hours,
                     )
                     .await
@@ -905,34 +891,23 @@ impl StorageProvider for TursoStorageProvider {
         })
     }
 
-    async fn delete_item(
+    async fn delete_item_request(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        self.delete_item_with_stream_ttl(
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let DeleteItemRequest {
             table_name,
             key,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
-            None,
-        )
-        .await
-    }
-
-    async fn delete_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         apply_gsi_write_pressure(self).await?;
         let table_info = self.get_table_info(&table_name).await?;
         let condition = self
@@ -955,6 +930,7 @@ impl StorageProvider for TursoStorageProvider {
                     &table_info,
                     &key,
                     condition.as_ref(),
+                    return_old_on_condition_failure,
                     None,
                     aux_item_stream_ttl_hours,
                 )
@@ -1006,7 +982,7 @@ impl StorageProvider for TursoStorageProvider {
                         &guard,
                     )
                     .await?;
-                    this.put_item_txn(conn, &table_info, &item, condition.as_ref(), None)
+                    this.put_item_txn(conn, &table_info, &item, condition.as_ref(), false, None)
                         .await
                 })
             })
@@ -1060,6 +1036,7 @@ impl StorageProvider for TursoStorageProvider {
                     &table_info,
                     &key,
                     condition.as_ref(),
+                    false,
                     None,
                     None,
                 )
@@ -1111,6 +1088,7 @@ impl StorageProvider for TursoStorageProvider {
                     &table_info,
                     &key,
                     None,
+                    false,
                     Some(&metadata),
                     None,
                 )
@@ -1265,11 +1243,16 @@ impl StorageProvider for TursoStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            return_values_on_condition_check_failure,
             aux_item_stream_ttl_hours,
             ..
         } = request;
         let this = self.clone();
         let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                return_values_on_condition_check_failure.as_ref(),
+            );
 
         let (old_item, new_item, response_fields) = self
             .with_transaction(true, |conn| {
@@ -1301,6 +1284,7 @@ impl StorageProvider for TursoStorageProvider {
                         &key,
                         &operations,
                         condition.as_ref(),
+                        return_old_on_condition_failure,
                     )?;
 
                     this.overwrite_item_txn(
@@ -1382,6 +1366,7 @@ impl StorageProvider for TursoStorageProvider {
                         &key,
                         &operations,
                         condition.as_ref(),
+                        false,
                     )?;
 
                     this.overwrite_item_txn(
@@ -1479,6 +1464,7 @@ impl StorageProvider for TursoStorageProvider {
                                     &table_info,
                                     &put.item,
                                     None,
+                                    false,
                                     put.aux_item_stream_ttl_hours,
                                 )
                                 .await?;
@@ -1525,6 +1511,7 @@ impl StorageProvider for TursoStorageProvider {
                                     &table_info,
                                     &delete.key,
                                     None,
+                                    false,
                                     None,
                                     delete.aux_item_stream_ttl_hours,
                                 )
@@ -1573,6 +1560,7 @@ impl StorageProvider for TursoStorageProvider {
                                     &table_info,
                                     &updated_item,
                                     None,
+                                    false,
                                     update.aux_item_stream_ttl_hours,
                                 )
                                 .await?;
@@ -1883,6 +1871,7 @@ impl TursoStorageProvider {
                             table_info,
                             full_item,
                             None,
+                            false,
                             *aux_item_stream_ttl_hours,
                         )
                         .await?;
@@ -1899,6 +1888,7 @@ impl TursoStorageProvider {
                             table_info,
                             key,
                             None,
+                            false,
                             None,
                             *aux_item_stream_ttl_hours,
                         )

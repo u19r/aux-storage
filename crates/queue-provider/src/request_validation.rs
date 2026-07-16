@@ -20,8 +20,12 @@ use crate::{
     },
 };
 
-impl CreateQueueRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+pub trait QueueRequestValidation {
+    fn validate_request(&self) -> QueueResult<()>;
+}
+
+impl QueueRequestValidation for CreateQueueRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_name(&self.queue_name))?;
         if let Some(attributes) = self.attributes.as_ref() {
             queue_validation(validate_queue_attributes(attributes))?;
@@ -30,8 +34,8 @@ impl CreateQueueRequest {
     }
 }
 
-impl DeleteQueueRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for DeleteQueueRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))
     }
 }
@@ -42,8 +46,8 @@ impl Queue {
     }
 }
 
-impl ListQueuesRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for ListQueuesRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         if let Some(prefix) = self.queue_name_prefix.as_deref() {
             queue_validation(validate_queue_name_prefix(prefix))?;
         }
@@ -51,14 +55,14 @@ impl ListQueuesRequest {
     }
 }
 
-impl GetQueueUrlRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for GetQueueUrlRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_name(&self.queue_name))
     }
 }
 
-impl GetQueueAttributesRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for GetQueueAttributesRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         if let Some(attribute_names) = self.attribute_names.as_ref() {
             queue_validation(validate_attribute_names(attribute_names))?;
@@ -67,21 +71,21 @@ impl GetQueueAttributesRequest {
     }
 }
 
-impl SetQueueAttributesRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for SetQueueAttributesRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_queue_attributes(&self.attributes))
     }
 }
 
-impl PurgeQueueRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for PurgeQueueRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))
     }
 }
 
-impl SendMessageRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for SendMessageRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_message_body(&self.message_body))?;
         if let Some(delay_seconds) = self.delay_seconds {
@@ -94,8 +98,8 @@ impl SendMessageRequest {
     }
 }
 
-impl SendMessageBatchRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for SendMessageBatchRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_batch_entries(
             self.entries.iter().map(|entry| entry.id.as_str()),
@@ -120,8 +124,8 @@ impl SendMessageBatchRequestEntry {
     }
 }
 
-impl ReceiveMessageRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for ReceiveMessageRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         if let Some(max_messages) = self.max_number_of_messages {
             queue_validation(validate_max_number_of_messages(max_messages))?;
@@ -142,15 +146,15 @@ impl ReceiveMessageRequest {
     }
 }
 
-impl DeleteMessageRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for DeleteMessageRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_receipt_handle(&self.receipt_handle))
     }
 }
 
-impl DeleteMessageBatchRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for DeleteMessageBatchRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_batch_entries(
             self.entries.iter().map(|entry| entry.id.as_str()),
@@ -168,16 +172,16 @@ impl DeleteMessageBatchRequestEntry {
     }
 }
 
-impl ChangeMessageVisibilityRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for ChangeMessageVisibilityRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_receipt_handle(&self.receipt_handle))?;
         queue_validation(validate_visibility_timeout(self.visibility_timeout))
     }
 }
 
-impl ChangeMessageVisibilityBatchRequest {
-    pub fn validate(&self) -> QueueResult<()> {
+impl QueueRequestValidation for ChangeMessageVisibilityBatchRequest {
+    fn validate_request(&self) -> QueueResult<()> {
         queue_validation(validate_queue_url(&self.queue_url))?;
         queue_validation(validate_batch_entries(
             self.entries.iter().map(|entry| entry.id.as_str()),

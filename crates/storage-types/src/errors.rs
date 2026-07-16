@@ -2,7 +2,10 @@ use std::fmt::Error;
 
 use thiserror::Error;
 
-use crate::{AttributeMap, ItemKeyError, dynamodb_table_not_found_message, err_context};
+use crate::{
+    AttributeMap, ItemKeyError, context::WrappedError as _, dynamodb_table_not_found_message,
+    err_context,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageValidationKind {
@@ -185,6 +188,20 @@ pub enum StorageEnum {
 err_context!(StorageError, StorageEnum);
 
 impl StorageError {
+    #[must_use]
+    pub fn is_retryable_write(&self) -> bool {
+        matches!(
+            self.to_enum(),
+            StorageEnum::TransactionConflict { .. }
+                | StorageEnum::TransactionInProgress { .. }
+                | StorageEnum::TransactionCanceled { .. }
+                | StorageEnum::ProvisionedThroughputExceeded { .. }
+                | StorageEnum::Throttled { .. }
+                | StorageEnum::RequestLimitExceeded
+                | StorageEnum::LimitExceeded { .. }
+        )
+    }
+
     pub fn validation(input: impl Into<StorageValidationInput>) -> Self {
         let message = match input.into() {
             StorageValidationInput::Kind(kind) => kind.message().to_string(),

@@ -18,7 +18,7 @@ impl StorageApiManagerImpl {
         request: DeleteTableRequest,
     ) -> Result<Response, HttpApiError> {
         if let Some(response) = self
-            .propose_sync_write_if_configured(SyncWriteRequest::DeleteTable(request.clone()))
+            .propose_sync_write_if_configured(|| SyncWriteRequest::DeleteTable(request.clone()))
             .await?
         {
             return Ok(Response::DeleteTable(required_sync_response_at(
