@@ -5,7 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use storage_types::{AttributeValue, KeyAttributes, StorageResult, TableName};
 
 pub enum AtomicItemWriteDecision {
-    NoWrite { output: Vec<u8> },
+    NoWrite {
+        output: Vec<u8>,
+    },
     Write {
         item: HashMap<String, AttributeValue>,
         additional_items: Vec<HashMap<String, AttributeValue>>,

@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::{collections::HashMap, sync::Arc};
 
@@ -14,7 +14,7 @@ use storage_types::{
     context::WrappedError as _,
 };
 use stream::StreamProvider;
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 use tokio::sync::Notify;
 use tokio::{sync::RwLock, task::JoinHandle};
 use typed_builder::TypedBuilder;
@@ -50,7 +50,7 @@ use crate::{
     tables::Tables,
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 #[derive(Debug, Default)]
 struct DatabaseManagerTestPauseState {
     armed: AtomicBool,
@@ -59,7 +59,7 @@ struct DatabaseManagerTestPauseState {
     resume_notify: Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DatabaseManagerTestPauseHandle {
     state: Arc<DatabaseManagerTestPauseState>,
@@ -108,9 +108,9 @@ impl ResolvedStorageOperation {
         operation: &'static str,
     ) -> StorageResult<()> {
         if &self.logical_table_name != table_name {
-            return Err(StorageError::internal(
-                &format!("resolved storage operation does not match {operation} table"),
-            ));
+            return Err(StorageError::internal(&format!(
+                "resolved storage operation does not match {operation} table"
+            )));
         }
         Ok(())
     }
@@ -121,8 +121,7 @@ pub struct ResolvedGetItem {
     pub(super) key: KeyAttributes,
 }
 
-
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 impl DatabaseManagerTestPauseHandle {
     #[must_use]
     pub(crate) fn armed() -> Self {
@@ -476,7 +475,7 @@ pub struct DatabaseManager {
     pub(super) cache_services: StorageCacheServices,
     pub(super) cutover_watcher_task: Option<JoinHandle<()>>,
     pub(super) run_gsi_maintenance: bool,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-write-planner"))]
     pub(super) pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
     pub(super) supports_multi_region_replication_control_plane: bool,
     pub(super) read_sequence_capabilities: ReadSequenceProviderCapabilities,
@@ -634,14 +633,14 @@ impl DatabaseManager {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-write-planner"))]
     pub(super) async fn maybe_pause_after_storage_write_for_test(&self) {
         if let Some(handle) = self.pause_after_storage_write.as_ref() {
             handle.maybe_pause().await;
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(all(test, feature = "cache-write-planner")))]
     pub(super) async fn maybe_pause_after_storage_write_for_test(&self) {}
 
     pub(super) async fn maybe_create_sys_storage_replication_table(&self) -> StorageResult<()> {

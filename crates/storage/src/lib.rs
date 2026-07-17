@@ -60,15 +60,15 @@ pub mod startup;
 mod updated_at_apply;
 #[cfg(test)]
 mod updated_at_apply_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 pub(crate) use database_manager::DatabaseManagerTestPauseHandle;
 pub use database_manager::{
     CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,
     DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput, DeleteItemInput,
     InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
     PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
-    ResolvedBatchGetPlan, ResolvedGetItem, ResolvedStorageOperation,
-    ReplicationMutationApplyOutcome, ScanTableInput, UpdateItemInput,
+    ReplicationMutationApplyOutcome, ResolvedBatchGetPlan, ResolvedGetItem,
+    ResolvedStorageOperation, ScanTableInput, UpdateItemInput,
 };
 pub use multi_region_metrics::{
     increment_multi_region_apply_total, increment_multi_region_auth_failure_total,

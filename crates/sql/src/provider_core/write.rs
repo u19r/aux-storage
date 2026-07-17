@@ -54,9 +54,7 @@ pub(crate) fn conditional_failure(
     old_item: Option<&AttributeMap>,
     return_old: bool,
 ) -> StorageError {
-    if return_old
-        && let Some(item) = old_item
-    {
+    if return_old && let Some(item) = old_item {
         return StorageEnum::ConditionalCheckFailedWithItem {
             item: item.clone().into(),
         }

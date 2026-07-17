@@ -354,7 +354,7 @@ impl DatabaseManager {
             ),
             cutover_watcher_task,
             run_gsi_maintenance,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: runtime_options.pause_after_storage_write.clone(),
             supports_multi_region_replication_control_plane,
             read_sequence_capabilities,
@@ -400,7 +400,7 @@ impl DatabaseManager {
             ),
             cutover_watcher_task: None,
             run_gsi_maintenance: true,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: None,
             supports_multi_region_replication_control_plane: true,
             read_sequence_capabilities: ReadSequenceProviderCapabilities::default(),

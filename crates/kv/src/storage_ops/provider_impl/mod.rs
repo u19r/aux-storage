@@ -13,40 +13,36 @@ use storage_condition::parse_condition_expression;
 use storage_provider::{
     AtomicItemReadModifyWriteRequest, AtomicItemWriteDecision, CHANGE_INDEX_MARKER_RETENTION_MS,
     ChangeIndexMarker, ListChangeIndexMarkersRequest, StorageProvider, StorageProviderReadContext,
-    StreamTrimDueMarker, StreamTrimState,
-    plan_table_stream_duration, return_values_need_old_item, update_item_response,
+    StreamTrimDueMarker, StreamTrimState, plan_table_stream_duration, return_values_need_old_item,
+    update_item_response,
 };
 use storage_types::{
     AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
-    DeleteRequest, DescribeTimeToLiveResponse, DurablePointReadProof, DurablePointReadRequest,
-    EncodeWriteRequest, IndexName, ItemKey, ItemVersionedWireItem, KeyAttributes, KeySchemaElement,
-    KeyType, KeysAndAttributes, Projection, ProjectionType, PutItemEncodeRequest, PutItemRequest,
-    PutItemResponse, PutRequest,
-    QueryTableRequest, ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum,
-    StorageError, StorageResult, StorageValidationKind, StoredTableInfo, StreamName,
-    StreamRetentionDuration, TTL_PARTITION_ATTRIBUTE, TableName, TableStatus,
-    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItem,
-    TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, TransactWriteItemsResponse,
-    UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
-    WireItem, WriteRequest, WriteRetryPolicy, context::WrappedError as _,
-    normalize_attribute_map_numbers_for_write,
-    return_values_on_condition_check_failure_all_old,
+    DeleteItemRequest, DeleteRequest, DescribeTimeToLiveResponse, DurablePointReadProof,
+    DurablePointReadRequest, EncodeWriteRequest, IndexName, ItemKey, ItemVersionedWireItem,
+    KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
+    PutItemEncodeRequest, PutItemRequest, PutItemResponse, PutRequest, QueryTableRequest,
+    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
+    StorageResult, StorageValidationKind, StoredTableInfo, StreamName, StreamRetentionDuration,
+    TTL_PARTITION_ATTRIBUTE, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
+    TimestampMillis, TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
+    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
+    UpdateTimeToLiveResponse, WireItem, WriteRequest, WriteRetryPolicy, context::WrappedError as _,
+    normalize_attribute_map_numbers_for_write, return_values_on_condition_check_failure_all_old,
     validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
 };
 use tracing::{Span, instrument, warn};
 
 use crate::{
     helpers::deserialize_item_from_bytes,
-    sorted_kv_store::{
-        AtomicTableWriteDecision, AtomicTableWriteTransform, SortedKvReadContext,
-    },
+    sorted_kv_store::{AtomicTableWriteDecision, AtomicTableWriteTransform, SortedKvReadContext},
     storage_ops::constants::{IDEMPOTENCY_TOKEN_TTL_MS, REPLICATION_APPLY_PARALLELISM_HINT},
     storage_provider::{GsiBackfillJob, GsiUpdateJob},
 };
 
-mod batch_write;
 mod atomic_item;
+mod batch_write;
 mod batch_write_encode;
 mod batch_write_support;
 mod conditional_errors;

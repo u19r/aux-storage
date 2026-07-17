@@ -6,15 +6,16 @@ use storage_common::GSI_UPDATE_JOB;
 use storage_provider::{StorageBackend, StorageConnectionConfig, StorageConnectionRegistry};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateTableRequest, KeyAttributeType,
-    KeySchemaElement, KeyType, KeysAndAttributes, StorageEnum, StorageError, TableName,
-    TableNamespace, TransactConditionCheckRequest, TransactEncodeItem, TransactUpdateRequest,
-    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
+    KeySchemaElement, KeyType, KeysAndAttributes, ReadSequenceConsistency, StorageEnum,
+    StorageError, TableName, TableNamespace, TransactConditionCheckRequest, TransactEncodeItem,
+    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
     context::WrappedError as _,
 };
 
 use crate::{
-    CutoverWatcher, DatabaseManager, DeleteItemInput, NamespaceRequestRewriter, PutItemInput,
-    QueryTableInput, ScanTableInput, Tables, UpdateItemInput, is_retryable_pause_error,
+    CutoverWatcher, DatabaseManager, DeleteItemInput, InProcessReadSequenceLimits,
+    NamespaceRequestRewriter, PutItemInput, QueryTableInput, ScanTableInput, Tables,
+    UpdateItemInput, is_retryable_pause_error,
     namespace_routing::reject_direct_shared_table_access, namespace_source_table,
 };
 
@@ -51,6 +52,57 @@ async fn new_multi_connection_routed_db() -> DatabaseManager {
     })
     .await
     .expect("multi-connection database manager")
+}
+
+#[tokio::test]
+async fn given_routed_transactional_provider_when_sequence_begins_then_default_capabilities_do_not_apply()
+ {
+    let path = std::env::temp_dir().join(format!(
+        "aux-storage-routed-read-sequence-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let db = DatabaseManager::new_with_connection_registry(StorageConnectionRegistry {
+        default_connection_id: "default".to_string(),
+        connections: HashMap::from([
+            ("default".to_string(), sqlite_connection(":memory:")),
+            (
+                "tenant-store".to_string(),
+                sqlite_connection(path.to_string_lossy().as_ref()),
+            ),
+        ]),
+    })
+    .await
+    .expect("multi-connection database manager");
+    put_location_dictionary(&db, &[(2, "tenant-store")]).await;
+    let namespace = TableNamespace::from_seed("routed-read-sequence");
+    put_dedicated_namespace_route_metadata(&db, &namespace, 2).await;
+    let table = Tables::namespace(&namespace);
+    create_simple_table_on_connection(&db, "tenant-store", table.clone()).await;
+    let limits = InProcessReadSequenceLimits::try_new(3, 4, 2, 64 * 1024).expect("limits");
+
+    let default_error =
+        match db.read_sequence_executor(ReadSequenceConsistency::Transactional, limits) {
+            Ok(_) => panic!("in-memory default connection lacks transactional snapshots"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        default_error.to_enum(),
+        StorageEnum::Unsupported { .. }
+    ));
+    let sequence = db
+        .read_sequence_executor_for_table(&table, ReadSequenceConsistency::Transactional, limits)
+        .await
+        .expect("routed file-backed connection supports a transactional snapshot");
+
+    drop(sequence);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
 }
 
 async fn create_simple_shared_table(db: &DatabaseManager, loc: u16) {
@@ -541,14 +593,20 @@ async fn resolved_get_uses_one_route_snapshot_across_cutover() {
     put_shared_namespace_route_metadata(&db, &namespace, 1).await;
     let logical_table = Tables::namespace(&namespace);
     let logical_key = HashMap::from([
-        ("pk".to_string(), AttributeValue::S("USER#SNAPSHOT".to_string())),
+        (
+            "pk".to_string(),
+            AttributeValue::S("USER#SNAPSHOT".to_string()),
+        ),
         ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
     ]);
     db.put_item(
         PutItemInput::builder()
             .table_name(logical_table.clone())
             .item(HashMap::from([
-                ("pk".to_string(), AttributeValue::S("USER#SNAPSHOT".to_string())),
+                (
+                    "pk".to_string(),
+                    AttributeValue::S("USER#SNAPSHOT".to_string()),
+                ),
                 ("sk".to_string(), AttributeValue::S("PROFILE".to_string())),
                 ("location".to_string(), AttributeValue::N("1".to_string())),
             ]))
@@ -704,6 +762,77 @@ async fn batch_get_keeps_logical_namespaces_that_share_one_physical_table_separa
 }
 
 #[tokio::test]
+async fn in_process_batch_get_round_trips_one_shared_namespace() {
+    let db = new_routed_db().await;
+    Tables::create_sys_namespaces_table(&db)
+        .await
+        .expect("create namespace routing table");
+    create_simple_shared_table(&db, 1).await;
+    put_location_dictionary(&db, &[(1, "default")]).await;
+    let namespace = TableNamespace::from_seed("sequence-batch");
+    put_shared_namespace_route_metadata(&db, &namespace, 1).await;
+    let table = Tables::namespace(&namespace);
+    let logical_key = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+        ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+    ]);
+    db.put_item(
+        PutItemInput::builder()
+            .table_name(table.clone())
+            .item(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
+                ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
+                (
+                    "value".to_string(),
+                    AttributeValue::S("logical".to_string()),
+                ),
+            ]))
+            .build(),
+    )
+    .await
+    .expect("put routed item");
+    let mut sequence = db
+        .read_sequence_executor_for_table(
+            &table,
+            ReadSequenceConsistency::Eventual,
+            InProcessReadSequenceLimits::try_new(1, 1, 1, 64 * 1024).expect("limits"),
+        )
+        .await
+        .expect("route-bound sequence");
+
+    let response = sequence
+        .batch_get_item(
+            table.clone(),
+            KeysAndAttributes {
+                keys: vec![logical_key.clone().into()].into(),
+                attributes_to_get: None,
+                consistent_read: None,
+                projection_expression: None,
+                expression_attribute_names: None,
+            },
+        )
+        .await
+        .expect("sequence batch get")
+        .responses
+        .expect("responses");
+    let item = &response[&table][0];
+
+    assert_eq!(
+        item.attribute_value("value").expect("value"),
+        Some(AttributeValue::S("logical".to_string()))
+    );
+    assert_eq!(
+        item.clone()
+            .into_attribute_map()
+            .expect("item map")
+            .get("pk"),
+        logical_key.get("pk")
+    );
+    assert_eq!(sequence.stats().operations_completed(), 1);
+    assert_eq!(sequence.stats().requested_items(), 1);
+}
+
+#[tokio::test]
 async fn batch_get_groups_dedicated_tables_on_one_routed_connection() {
     let db = new_multi_connection_routed_db().await;
     put_location_dictionary(&db, &[(2, "tenant-store")]).await;
@@ -712,12 +841,7 @@ async fn batch_get_groups_dedicated_tables_on_one_routed_connection() {
 
     for namespace in [&first_namespace, &second_namespace] {
         put_dedicated_namespace_route_metadata(&db, namespace, 2).await;
-        create_simple_table_on_connection(
-            &db,
-            "tenant-store",
-            Tables::namespace(namespace),
-        )
-        .await;
+        create_simple_table_on_connection(&db, "tenant-store", Tables::namespace(namespace)).await;
         db.put_item(
             PutItemInput::builder()
                 .table_name(Tables::namespace(namespace))

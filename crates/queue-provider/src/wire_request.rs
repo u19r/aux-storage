@@ -4,9 +4,8 @@ use serde::de::DeserializeOwned;
 use crate::{
     ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
     DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
-    GetQueueUrlRequest, ListQueuesRequest, PurgeQueueRequest, ReceiveMessageRequest,
-    QueueRequestValidation, QueueResult, SendMessageBatchRequest, SendMessageRequest,
-    SetQueueAttributesRequest,
+    GetQueueUrlRequest, ListQueuesRequest, PurgeQueueRequest, QueueRequestValidation, QueueResult,
+    ReceiveMessageRequest, SendMessageBatchRequest, SendMessageRequest, SetQueueAttributesRequest,
 };
 
 #[derive(Debug)]
@@ -225,7 +224,6 @@ pub fn decode_value_request(
     }
 }
 
-
 fn decode_json<T>(
     body: &[u8],
     legacy_decode: fn(serde_json::Value) -> Result<T, HttpApiError>,
@@ -239,9 +237,8 @@ where
             HttpApiError::validation_error(format!("Invalid request format: {error}")),
         ),
         Err(_) => {
-            let value = serde_json::from_slice(body).map_err(|error| {
-                HttpApiError::validation_error(format!("invalid_json:{error}"))
-            })?;
+            let value = serde_json::from_slice(body)
+                .map_err(|error| HttpApiError::validation_error(format!("invalid_json:{error}")))?;
             legacy_decode(value).map(ValidatedQueueRequest::from_validated)
         }
     }

@@ -1,13 +1,63 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hint::black_box, time::Instant};
 
 use alloc_counter::AllocationGuard;
 
 use crate::{
     AttributeValue, extract_expression_attribute_placeholders,
-    request_expression_validation::validate_expression_set,
+    request_expression_validation::{
+        is_dynamodb_reserved_word, is_dynamodb_reserved_word_linear, validate_expression_set,
+    },
 };
 
 const EXPRESSION_VALIDATION_ITERATIONS: usize = 1024;
+const RESERVED_LOOKUP_ITERATIONS: usize = 100_000;
+
+#[test]
+fn given_reserved_words_when_looked_up_then_case_and_boundaries_are_preserved() {
+    for word in ["ABORT", "comment", "uPdAtE", "ZONE"] {
+        assert!(is_dynamodb_reserved_word(word), "missing {word}");
+    }
+    for word in ["", "comments", "tenant_comment", "zone2", "not_reserved"] {
+        assert!(!is_dynamodb_reserved_word(word), "unexpected {word}");
+    }
+}
+
+#[test]
+#[ignore = "manual debug comparison of the former full scan and current static set"]
+fn given_repeated_tokens_when_looked_up_then_static_set_replaces_full_word_scan() {
+    let tokens = ["tenant_id", "payload", "comment", "sort_key", "updated_at"];
+    is_dynamodb_reserved_word("warmup");
+
+    let baseline_started = Instant::now();
+    let mut baseline_matches = 0usize;
+    for _ in 0..RESERVED_LOOKUP_ITERATIONS {
+        for token in tokens {
+            baseline_matches += is_dynamodb_reserved_word_linear(black_box(token)) as usize;
+        }
+    }
+    let baseline = baseline_started.elapsed();
+
+    let candidate_started = Instant::now();
+    let mut candidate_matches = 0usize;
+    for _ in 0..RESERVED_LOOKUP_ITERATIONS {
+        for token in tokens {
+            candidate_matches += is_dynamodb_reserved_word(black_box(token)) as usize;
+        }
+    }
+    let candidate = candidate_started.elapsed();
+
+    assert_eq!(candidate_matches, baseline_matches);
+    assert!(
+        candidate < baseline,
+        "baseline={baseline:?} candidate={candidate:?}"
+    );
+    eprintln!(
+        "p2-057a lookups={} baseline_ns={} candidate_ns={}",
+        RESERVED_LOOKUP_ITERATIONS * tokens.len(),
+        baseline.as_nanos(),
+        candidate.as_nanos()
+    );
+}
 
 #[test]
 fn expression_heavy_update_validation_reuses_placeholder_scans_tests() {

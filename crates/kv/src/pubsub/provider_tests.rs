@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
-    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PubsubMessageId,
-    PubsubProvider, PublishRequest, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
-    SubscriptionProtocol, TopicName,
+    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PublishRequest,
+    PubsubMessageId, PubsubProvider, SetSubscriptionAttributesRequest, SubscribeRequest,
+    SubscriptionArn, SubscriptionProtocol, TopicName,
 };
 use storage_types::TimestampMillis;
 use uuid::Uuid;
@@ -42,8 +42,8 @@ async fn sorted_kv_publish_intent_uses_immutable_chunked_subscription_snapshot()
                 .unwrap(),
         );
     }
-    let message_id = PubsubMessageId::new_from_string(format!("message-{}", Uuid::now_v7()))
-        .unwrap();
+    let message_id =
+        PubsubMessageId::new_from_string(format!("message-{}", Uuid::now_v7())).unwrap();
     provider
         .accept_publish(
             PublishRequest {
@@ -304,10 +304,7 @@ async fn sorted_kv_pubsub_provider_retains_accepted_deliveries_after_topic_delet
             .is_none()
     );
     assert_eq!(
-        provider
-            .get_delivery_record(&record.id)
-            .await
-            .unwrap(),
+        provider.get_delivery_record(&record.id).await.unwrap(),
         Some(record)
     );
 }

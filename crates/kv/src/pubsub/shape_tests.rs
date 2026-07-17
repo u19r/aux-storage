@@ -8,8 +8,8 @@ use std::{
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
-    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, PubsubMessageId, PubsubProvider,
-    PublishRequest, SubscribeRequest, SubscriptionProtocol, TopicName,
+    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, PublishRequest, PubsubMessageId,
+    PubsubProvider, SubscribeRequest, SubscriptionProtocol, TopicName,
 };
 use storage_condition::Condition;
 use storage_types::{SerializesToKey, StorageResult, TimestampMillis};
@@ -71,7 +71,8 @@ impl ObservingPubsubKvStore {
     }
 
     fn omit_first_multi_get_value_once(&self) {
-        self.omit_first_multi_get_value.store(true, Ordering::Release);
+        self.omit_first_multi_get_value
+            .store(true, Ordering::Release);
     }
 
     fn lock_stats(&self) -> MutexGuard<'_, PubsubShapeStats> {
@@ -163,10 +164,9 @@ impl SortedKvStore for ObservingPubsubKvStore {
         if self
             .omit_first_multi_get_value
             .swap(false, Ordering::AcqRel)
+            && let Some(value) = values.first_mut()
         {
-            if let Some(value) = values.first_mut() {
-                *value = None;
-            }
+            *value = None;
         }
         let mut stats = self.lock_stats();
         stats.multi_get_calls = stats.multi_get_calls.saturating_add(1);

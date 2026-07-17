@@ -237,8 +237,7 @@ impl DeliveryRecord {
             && matches!(
                 subscription.protocol,
                 SubscriptionProtocol::Http | SubscriptionProtocol::Https
-            )
-        {
+            ) {
             DeliveryTarget::CustomSender
         } else {
             DeliveryTarget::BuiltIn

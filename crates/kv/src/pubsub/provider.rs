@@ -5,11 +5,10 @@ use pubsub_provider::{
     ConfirmSubscriptionResponse, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
     DeliveryStatus, GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse,
     GetTopicAttributesRequest, GetTopicAttributesResponse, ListSubscriptionsRequest,
-    ListSubscriptionsResponse, ListTopicsRequest, ListTopicsResponse, PubsubError, PubsubProvider,
-    PubsubMessageId, PubsubResult, PubsubValidationKind, PublishRequest,
-    SetSubscriptionAttributesRequest,
-    SetTopicAttributesRequest, SubscribeRequest, Subscription, SubscriptionArn,
-    SubscriptionConfirmation, SubscriptionProtocol, Topic, TopicArn, TopicName,
+    ListSubscriptionsResponse, ListTopicsRequest, ListTopicsResponse, PublishRequest, PubsubError,
+    PubsubMessageId, PubsubProvider, PubsubResult, PubsubValidationKind,
+    SetSubscriptionAttributesRequest, SetTopicAttributesRequest, SubscribeRequest, Subscription,
+    SubscriptionArn, SubscriptionConfirmation, SubscriptionProtocol, Topic, TopicArn, TopicName,
 };
 use serde::{Deserialize, Serialize};
 use storage_types::{StorageEnum, StorageError, TimestampMillis};
@@ -314,7 +313,8 @@ where S: SortedKvStore + 'static
                 .await?
                 .ok_or_else(|| PubsubError::storage("subscription creation conflicted"))?,
         };
-        self.publish_subscription_snapshot(&stored.topic_arn).await?;
+        self.publish_subscription_snapshot(&stored.topic_arn)
+            .await?;
         Ok(stored)
     }
 
@@ -333,7 +333,8 @@ where S: SortedKvStore + 'static
         };
         subscription.confirmation = SubscriptionConfirmation::Confirmed;
         self.write_subscription_record(&subscription).await?;
-        self.publish_subscription_snapshot(&subscription.topic_arn).await?;
+        self.publish_subscription_snapshot(&subscription.topic_arn)
+            .await?;
         Ok(ConfirmSubscriptionResponse {
             subscription_arn: subscription.subscription_arn,
         })
@@ -350,7 +351,8 @@ where S: SortedKvStore + 'static
             .transact_write_unchecked(operations)
             .await
             .map_err(map_storage_error)?;
-        self.publish_subscription_snapshot(&subscription.topic_arn).await?;
+        self.publish_subscription_snapshot(&subscription.topic_arn)
+            .await?;
         Ok(())
     }
 
@@ -381,7 +383,8 @@ where S: SortedKvStore + 'static
             subscription.raw_message_delivery = value.eq_ignore_ascii_case("true");
         }
         self.write_subscription_record(&subscription).await?;
-        self.publish_subscription_snapshot(&subscription.topic_arn).await?;
+        self.publish_subscription_snapshot(&subscription.topic_arn)
+            .await?;
         Ok(subscription)
     }
 
@@ -518,7 +521,8 @@ where S: SortedKvStore + 'static
                 continue;
             }
             intent.lease_expires_at = Some(TimestampMillis::from_timestamp(
-                now.timestamp_millis().saturating_add(PUBLISH_INTENT_LEASE_MILLIS),
+                now.timestamp_millis()
+                    .saturating_add(PUBLISH_INTENT_LEASE_MILLIS),
             ));
             let claimed_bytes = encode_pubsub(&intent)?;
             if self
@@ -907,13 +911,13 @@ where S: SortedKvStore + 'static
                 .get(&root_key, true)
                 .await
                 .map_err(map_storage_error)?;
-            let snapshots = self
-                .list_subscription_snapshots_for_topic(topic_id)
-                .await?;
+            let snapshots = self.list_subscription_snapshots_for_topic(topic_id).await?;
             let root = SubscriptionSnapshotRoot {
                 generation: Uuid::now_v7().simple().to_string(),
-                chunk_count: u32::try_from(snapshots.len().div_ceil(SUBSCRIPTION_SNAPSHOT_CHUNK_SIZE))
-                    .map_err(|error| PubsubError::storage(error.to_string()))?,
+                chunk_count: u32::try_from(
+                    snapshots.len().div_ceil(SUBSCRIPTION_SNAPSHOT_CHUNK_SIZE),
+                )
+                .map_err(|error| PubsubError::storage(error.to_string()))?,
             };
             for (chunk_index, chunk) in snapshots
                 .chunks(SUBSCRIPTION_SNAPSHOT_CHUNK_SIZE)
@@ -953,8 +957,11 @@ where S: SortedKvStore + 'static
                         .map(|bytes| decode_pubsub::<SubscriptionSnapshotRoot>(&bytes))
                         .transpose()?
                     {
-                        self.cleanup_subscription_snapshot_if_unreferenced(topic_id, &previous_root)
-                            .await?;
+                        self.cleanup_subscription_snapshot_if_unreferenced(
+                            topic_id,
+                            &previous_root,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
@@ -963,18 +970,19 @@ where S: SortedKvStore + 'static
                         error.as_ref(),
                         StorageEnum::ConditionalCheckFailed
                             | StorageEnum::TransactionCanceled { .. }
-                    ) => {
-                        for chunk_index in 0..root.chunk_count {
-                            self.kv_store
-                                .delete(&subscription_snapshot_chunk_key(
-                                    topic_id,
-                                    &root.generation,
-                                    chunk_index,
-                                ))
-                                .await
-                                .map_err(map_storage_error)?;
-                        }
+                    ) =>
+                {
+                    for chunk_index in 0..root.chunk_count {
+                        self.kv_store
+                            .delete(&subscription_snapshot_chunk_key(
+                                topic_id,
+                                &root.generation,
+                                chunk_index,
+                            ))
+                            .await
+                            .map_err(map_storage_error)?;
                     }
+                }
                 Err(error) => return Err(map_storage_error(error)),
             }
         }
@@ -1013,9 +1021,7 @@ where S: SortedKvStore + 'static
             .map_err(map_storage_error)?;
         for (_key, bytes) in intents.items {
             let intent = decode_pubsub::<PublishIntent>(&bytes)?;
-            if intent.topic_id == topic_id
-                && intent.snapshot.generation == snapshot.generation
-            {
+            if intent.topic_id == topic_id && intent.snapshot.generation == snapshot.generation {
                 return Ok(());
             }
         }
@@ -1373,7 +1379,10 @@ fn subscription_snapshot_chunk_key(
 }
 
 fn publish_intent_key(message_id: &PubsubMessageId) -> Vec<u8> {
-    compact::pubsub_global_record_key(PubsubRecordKind::PublishIntent, message_id.as_str().as_bytes())
+    compact::pubsub_global_record_key(
+        PubsubRecordKind::PublishIntent,
+        message_id.as_str().as_bytes(),
+    )
 }
 
 fn delivery_record_lookup_key(record_id: &DeliveryRecordId) -> Vec<u8> {

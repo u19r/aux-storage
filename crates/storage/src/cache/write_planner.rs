@@ -106,10 +106,9 @@ where L: StorageCachePlannerLoad
         operation: &ResolvedStorageOperation,
     ) -> StorageResult<Option<PreparedQueryProofPrewriteImage>> {
         let table_info = operation.table_info();
-        let Some(table_info) = maybe_indexed_table_info(
-            self.query_proof_enabled,
-            table_info.clone(),
-        ) else {
+        let Some(table_info) =
+            maybe_indexed_table_info(self.query_proof_enabled, table_info.clone())
+        else {
             return Ok(None);
         };
         let current_item = self
@@ -137,10 +136,7 @@ where L: StorageCachePlannerLoad
         }
         let table_info = operation.table_info();
         let query_proof_prewrite = self
-            .query_proof_cache_maybe_load_gsi_prewrite_image_with_table_info(
-                logical_key,
-                operation,
-            )
+            .query_proof_cache_maybe_load_gsi_prewrite_image_with_table_info(logical_key, operation)
             .await?;
         Ok(build_delete_item_cache_effects(
             table_name,
@@ -162,11 +158,8 @@ where L: StorageCachePlannerLoad
             table_name,
             table_info.clone(),
             key,
-            self.query_proof_cache_maybe_load_gsi_prewrite_image_with_table_info(
-                key,
-                operation,
-            )
-            .await?,
+            self.query_proof_cache_maybe_load_gsi_prewrite_image_with_table_info(key, operation)
+                .await?,
         ))
     }
 

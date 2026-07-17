@@ -6,8 +6,8 @@ use crate::{
     GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse, GetTopicAttributesRequest,
     GetTopicAttributesResponse, ListSubscriptionsRequest, ListSubscriptionsResponse,
     ListTopicsRequest, ListTopicsResponse, PublishRequest, PubsubError, PubsubMessageId,
-    PubsubResult, SetSubscriptionAttributesRequest,
-    SetTopicAttributesRequest, SubscribeRequest, Subscription, SubscriptionArn, Topic, TopicArn,
+    PubsubResult, SetSubscriptionAttributesRequest, SetTopicAttributesRequest, SubscribeRequest,
+    Subscription, SubscriptionArn, Topic, TopicArn,
 };
 
 #[async_trait]

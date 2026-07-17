@@ -2,12 +2,13 @@ use config::{
     Backends, FoundationdbBackendConfig, PostgresBackendConfig, RemoteBackendConfig,
     RemoteDefaultStorageMode, RocksdbBackendConfig, SqliteBackendConfig, TursoBackendConfig,
 };
+use pubsub_provider::{SubscribeRequest, SubscriptionProtocol};
 
 use super::app::{
-    Args, PubsubStorageArg, ensure_no_remote_pubsub_backend, parse_override_args,
-    pubsub_backend_override_path, pubsub_bind_addr, pubsub_config_overrides,
-    pubsub_db_path_override_path, rocksdb_pubsub_db_path, selected_pubsub_backend,
-    sqlite_pubsub_db_path, turso_pubsub_db_path,
+    Args, PubsubStorageArg, create_pubsub_runtime_providers, ensure_no_remote_pubsub_backend,
+    initialize_pubsub_runtime, parse_override_args, pubsub_backend_override_path, pubsub_bind_addr,
+    pubsub_config_overrides, pubsub_db_path_override_path, rocksdb_pubsub_db_path,
+    selected_pubsub_backend, sqlite_pubsub_db_path, turso_pubsub_db_path,
 };
 
 fn base_args(storage: Option<PubsubStorageArg>) -> Args {
@@ -24,6 +25,44 @@ fn base_args(storage: Option<PubsubStorageArg>) -> Args {
         config: None,
         overrides: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn given_standalone_runtime_when_subscribing_queue_then_protocol_is_available() {
+    let backends = Backends {
+        sqlite: Some(SqliteBackendConfig {
+            db_path: ":memory:".to_string(),
+            immediate_gsi_consistency: false,
+        }),
+        turso: None,
+        postgres: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    let providers = create_pubsub_runtime_providers(&backends)
+        .await
+        .expect("standalone providers should initialize");
+    let manager = initialize_pubsub_runtime(providers)
+        .await
+        .expect("standalone manager should initialize");
+    let topic = manager
+        .create_topic("standalone-queue-subscription")
+        .await
+        .expect("topic should be created");
+
+    let subscription = manager
+        .subscribe(SubscribeRequest {
+            topic_arn: topic.topic_arn,
+            protocol: SubscriptionProtocol::Queue,
+            endpoint: "queue://standalone-subscriber".to_string(),
+            attributes: Default::default(),
+            extra_json: serde_json::Value::Null,
+        })
+        .await
+        .expect("queue protocol should be available");
+
+    assert!(!subscription.subscription_arn.is_empty());
 }
 
 #[test]

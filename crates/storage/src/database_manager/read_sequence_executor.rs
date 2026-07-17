@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use storage_provider::StorageProviderReadContext;
 use storage_types::{
-    KeyAttributes, QueryTableRequest, READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES,
+    BatchGetItemRequest, BatchGetWireItemResponse, KeyAttributes, KeysAndAttributes,
+    QueryTableRequest, READ_SEQUENCE_DEFAULT_MAX_RESPONSE_BYTES,
     READ_SEQUENCE_DEFAULT_MAX_ROOT_ITEMS, READ_SEQUENCE_DEFAULT_MAX_SEQUENCE_STEPS,
     READ_SEQUENCE_DEFAULT_MAX_TOTAL_READ_ITEMS, READ_SEQUENCE_HARD_MAX_RESPONSE_BYTES,
     READ_SEQUENCE_HARD_MAX_ROOT_ITEMS, READ_SEQUENCE_HARD_MAX_SEQUENCE_STEPS,
@@ -11,7 +14,10 @@ use storage_types::{
 
 use crate::{
     QueryTableInput,
-    database_manager::{DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, record_storage_operation},
+    database_manager::{
+        DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID,
+        read_ops::normalize_unprocessed_keys_for_shared_table, record_storage_operation,
+    },
     namespace_routing::NamespaceStorageMode,
 };
 
@@ -159,6 +165,27 @@ impl DatabaseManager {
             read_context: None,
         })
     }
+
+    /// Resolve `table_name` and bind the sequence to that connection's read
+    /// context.
+    pub async fn read_sequence_executor_for_table(
+        &self,
+        table_name: &TableName,
+        consistency: ReadSequenceConsistency,
+        limits: InProcessReadSequenceLimits,
+    ) -> StorageResult<InProcessReadSequence<'_>> {
+        let mut sequence = InProcessReadSequence {
+            manager: self,
+            consistency,
+            limits,
+            stats: InProcessReadSequenceStats::default(),
+            connection_id: None,
+            read_context: None,
+        };
+        let target = sequence.prepare_target(table_name).await?;
+        sequence.ensure_context(&target.connection_id).await?;
+        Ok(sequence)
+    }
 }
 
 impl InProcessReadSequence<'_> {
@@ -230,6 +257,111 @@ impl InProcessReadSequence<'_> {
             .as_ref()
             .map(T::try_from_wire_item)
             .transpose()
+    }
+
+    pub async fn batch_get_item(
+        &mut self,
+        table_name: TableName,
+        mut keys_and_attributes: KeysAndAttributes,
+    ) -> StorageResult<BatchGetWireItemResponse> {
+        let requested_items = u32::try_from(keys_and_attributes.keys.len()).map_err(|_| {
+            StorageError::validation("in-process read sequence BatchGet has too many keys")
+        })?;
+        self.ensure_operation_budget(requested_items)?;
+        let table_info = self.manager.get_table_info_arc(&table_name).await?;
+        for key in &keys_and_attributes.keys {
+            validate_key_attributes_for_schema(&table_info.key_schema, key)?;
+        }
+        validate_expression_attribute_usage(
+            keys_and_attributes.expression_attribute_names.as_ref(),
+            None,
+            keys_and_attributes
+                .projection_expression
+                .iter()
+                .map(String::as_str),
+        )?;
+        let target = self.prepare_target(&table_name).await?;
+        if let Some(namespace) = target.shared_namespace.as_ref() {
+            for key in &mut keys_and_attributes.keys {
+                self.manager
+                    .request_rewriter
+                    .rewrite_key_for_shared_table(namespace, key)?;
+            }
+        }
+        keys_and_attributes.consistent_read =
+            Some(self.consistency != ReadSequenceConsistency::Eventual);
+        self.start_operation(requested_items)?;
+        self.ensure_context(&target.connection_id).await?;
+        let physical_table = target.physical_table;
+        let mut response = record_storage_operation(
+            "in_process_read_sequence_batch_get_item",
+            self.context()?.batch_get_item(BatchGetItemRequest {
+                request_items: HashMap::from([(physical_table.clone(), keys_and_attributes)]),
+                return_consumed_capacity: None,
+            }),
+        )
+        .await?;
+        if response
+            .responses
+            .as_ref()
+            .is_some_and(|responses| responses.keys().any(|name| name != &physical_table))
+            || response
+                .unprocessed_keys
+                .as_ref()
+                .is_some_and(|keys| keys.keys().any(|name| name != &physical_table))
+        {
+            return Err(StorageError::internal(
+                "read-sequence provider returned an unexpected BatchGet table",
+            ));
+        }
+        if let Some(namespace) = target.shared_namespace.as_ref() {
+            if let Some(items) = response
+                .responses
+                .as_mut()
+                .and_then(|responses| responses.get_mut(&physical_table))
+            {
+                crate::database_manager::normalize_wire_items_for_shared_table(
+                    &self.manager.request_rewriter,
+                    namespace,
+                    items,
+                )?;
+            }
+            if let Some(keys) = response
+                .unprocessed_keys
+                .as_mut()
+                .and_then(|keys| keys.get_mut(&physical_table))
+            {
+                normalize_unprocessed_keys_for_shared_table(
+                    &self.manager.request_rewriter,
+                    namespace,
+                    keys,
+                )?;
+            }
+        }
+        if let Some(responses) = response.responses.as_mut()
+            && let Some(items) = responses.remove(&physical_table)
+        {
+            responses.insert(table_name.clone(), items);
+        }
+        if let Some(keys) = response.unprocessed_keys.as_mut()
+            && let Some(keys_and_attributes) = keys.remove(&physical_table)
+        {
+            keys.insert(table_name, keys_and_attributes);
+        }
+        let returned_items = response
+            .responses
+            .as_ref()
+            .and_then(|responses| responses.values().next())
+            .map_or(0, Vec::len);
+        let returned_bytes = response
+            .responses
+            .as_ref()
+            .and_then(|responses| responses.values().next())
+            .map_or(0, |items| {
+                items.iter().map(WireItem::payload_len).sum::<usize>()
+            });
+        self.complete_operation(returned_items as u32, returned_bytes as u64)?;
+        Ok(response)
     }
 
     pub async fn query_table(

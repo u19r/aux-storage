@@ -593,7 +593,6 @@ fn protocol_from_headers(headers: &HeaderMap) -> QueueProtocol {
     }
 }
 
-
 async fn handle_manager<Request, Handler, Fut, T>(
     request_id: &str,
     protocol: QueueProtocol,

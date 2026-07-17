@@ -1,5 +1,5 @@
-mod cache_write_execution;
 mod atomic_item_ops;
+mod cache_write_execution;
 mod capped_entity_ops;
 mod constants;
 mod construction;
@@ -32,7 +32,7 @@ mod write_ops;
 
 pub use runtime_options::{DatabaseManagerRuntimeOptions, DatabaseManagerRuntimeOptionsBuilder};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 pub(crate) use crate::database_manager::core::DatabaseManagerTestPauseHandle;
 pub(crate) use crate::database_manager::{
     cache_write_execution::PreparedCacheWrite,

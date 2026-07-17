@@ -9,9 +9,7 @@ use storage_types::{
 use crate::{
     manager::{
         StorageApiManagerImpl,
-        storage_manager_impl_condition_failure::{
-            should_return_old_item_on_condition_failure,
-        },
+        storage_manager_impl_condition_failure::should_return_old_item_on_condition_failure,
         storage_manager_impl_sync_write_proposer::sync_response_at,
     },
     types::Response,
@@ -26,7 +24,8 @@ impl StorageApiManagerImpl {
             .db()
             .resolve_storage_operation(request.table_name.clone())
             .await?;
-        validate_transact_key(operation.table_info(), &request.key).map_err(key_validation_error)?;
+        validate_transact_key(operation.table_info(), &request.key)
+            .map_err(key_validation_error)?;
         let return_old_on_condition_failure = should_return_old_item_on_condition_failure(
             request.condition_expression.as_deref(),
             request.return_values_on_condition_check_failure.as_ref(),
@@ -44,16 +43,16 @@ impl StorageApiManagerImpl {
         }
 
         let input = UpdateItemInput {
-                table_name: request.table_name,
-                key: request.key,
-                update_expression: request.update_expression.unwrap_or_default(),
-                condition_expression: request.condition_expression,
-                expression_attribute_names: request.expression_attribute_names,
-                expression_attribute_values: request.expression_attribute_values,
-                return_values: request.return_values,
-                return_old_on_condition_failure,
-                aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
-            };
+            table_name: request.table_name,
+            key: request.key,
+            update_expression: request.update_expression.unwrap_or_default(),
+            condition_expression: request.condition_expression,
+            expression_attribute_names: request.expression_attribute_names,
+            expression_attribute_values: request.expression_attribute_values,
+            return_values: request.return_values,
+            return_old_on_condition_failure,
+            aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+        };
         let result = self
             .db()
             .update_item_with_resolved_operation(operation, input)

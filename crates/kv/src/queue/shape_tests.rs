@@ -19,7 +19,8 @@ use crate::{
         PartitionedQueueMessageWrite, QueueClaimBatch, QueueClaimRange, QueueKvStore,
         QueuePrewarmPartition,
         storage::{
-            claim_queue_messages_from_ranges_generic, prewarm_partitioned_queue_generic,
+            claim_queue_messages_from_ranges_generic, is_queue_prewarm_marker_bytes,
+            prewarm_partitioned_queue_generic, queue_prewarm_marker_bytes,
             write_partitioned_queue_message_generic,
         },
     },
@@ -31,9 +32,22 @@ use crate::{
 };
 
 const QUEUE_CREATE_URL: &str = "https://queue.example.test/000000000000/shape-profile";
-const QUEUE_URL: &str =
-    "https://queue.example.test/000000000000/000000000001/shape-profile";
+const QUEUE_URL: &str = "https://queue.example.test/000000000000/000000000001/shape-profile";
 const QUEUE_NAME: &str = "shape-profile";
+
+#[test]
+fn given_queue_prewarm_marker_when_classifying_state_then_only_exact_marker_is_skipped() {
+    let marker = queue_prewarm_marker_bytes(QUEUE_URL, 7, 11);
+    assert!(is_queue_prewarm_marker_bytes(QUEUE_URL, &marker));
+    assert!(!is_queue_prewarm_marker_bytes(
+        QUEUE_URL,
+        b"invalid persisted queue state",
+    ));
+    assert!(!is_queue_prewarm_marker_bytes(
+        "https://queue.example.test/another-queue",
+        &marker,
+    ));
+}
 
 #[derive(Clone)]
 struct ObservingQueueKvStore {

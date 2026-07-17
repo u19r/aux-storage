@@ -19,9 +19,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         for attempt in 0..policy.max_attempts() {
             match apply_gsi_write_pressure(self).await {
                 Ok(()) => break,
-                Err(error)
-                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
-                {
+                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),

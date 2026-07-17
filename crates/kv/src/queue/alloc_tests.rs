@@ -7,8 +7,7 @@ use storage_types::{DurationSeconds, TimestampMillis};
 use crate::{RocksDbKvStore, SortedKvDbStorageProvider, kv_support_tests::rocksdb_test_path};
 
 const QUEUE_CREATE_URL: &str = "https://queue.example.test/000000000000/alloc-profile";
-const QUEUE_URL: &str =
-    "https://queue.example.test/000000000000/000000000001/alloc-profile";
+const QUEUE_URL: &str = "https://queue.example.test/000000000000/000000000001/alloc-profile";
 const MESSAGE_COUNT: usize = 32;
 const RECEIVE_LIMIT: u32 = 8;
 const ITERATIONS: usize = 4;

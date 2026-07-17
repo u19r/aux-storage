@@ -224,9 +224,9 @@ impl DatabaseManager {
             if let Some(route) = route {
                 ensure_route_writes_not_paused(&route)?;
                 let mut routed_item = item;
-                let shared_table_namespace =
-                    (route.storage_mode == NamespaceStorageMode::SharedTable)
-                        .then(|| route.namespace.clone());
+                let shared_table_namespace = (route.storage_mode
+                    == NamespaceStorageMode::SharedTable)
+                    .then(|| route.namespace.clone());
                 if route.storage_mode == NamespaceStorageMode::SharedTable {
                     self.request_rewriter
                         .rewrite_transact_item_for_shared_table(
@@ -250,10 +250,7 @@ impl DatabaseManager {
                                 target_role,
                             })
                             .or_default();
-                        batch
-                            .request
-                            .transact_items
-                            .push(routed_item_for_target);
+                        batch.request.transact_items.push(routed_item_for_target);
                         batch
                             .shared_table_namespaces
                             .push(shared_table_namespace.clone());
@@ -297,10 +294,7 @@ impl DatabaseManager {
             )
             .await
             .map_err(|error| {
-                self.normalize_routed_transaction_error(
-                    error,
-                    &batch.shared_table_namespaces,
-                )
+                self.normalize_routed_transaction_error(error, &batch.shared_table_namespaces)
             })?;
             if primary_response.is_none() {
                 primary_response = Some(response);

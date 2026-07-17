@@ -18,14 +18,14 @@ use storage_provider::{
 };
 use storage_types::{
     AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemRequest,
-    BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof, DurableItemRevision,
-    DeleteItemRequest, DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
+    BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest, DurableAbsenceProof,
+    DurableItemRevision, DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
     GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
     PreparedBatchOperation, PutItemRequest, PutItemResponse, QueryTableRequest,
-    ReadSequenceConsistency,
-    ReplicationMutation, ScanTableRequest, StorageError, StorageResult, StoredTableInfo, TableName,
-    TableStatus, TimestampMillis, TransactWriteItem, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, WireItem,
+    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageError, StorageResult,
+    StoredTableInfo, TableName, TableStatus, TimestampMillis, TransactWriteItem,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    WireItem,
 };
 use turso::{Connection as TursoConnection, Value as TursoValue};
 
@@ -34,8 +34,9 @@ use crate::{
         prepare_batch_operation,
         turso::{
             provider::{
-                TursoSqlConnection, TursoStorageProvider, gsi_table_name, map_turso_error,
-                option_string_to_value, row_to_table_info, value_to_i64, value_to_string,
+                TursoDeleteItemInput, TursoSqlConnection, TursoStorageProvider, gsi_table_name,
+                map_turso_error, option_string_to_value, row_to_table_info, value_to_i64,
+                value_to_string,
             },
             sql_statements,
         },
@@ -927,12 +928,14 @@ impl StorageProvider for TursoStorageProvider {
             Box::pin(async move {
                 this.delete_item_txn_with_replication(
                     conn,
-                    &table_info,
-                    &key,
-                    condition.as_ref(),
-                    return_old_on_condition_failure,
-                    None,
-                    aux_item_stream_ttl_hours,
+                    TursoDeleteItemInput {
+                        table_info: &table_info,
+                        key: &key,
+                        condition: condition.as_ref(),
+                        return_old_on_condition_failure,
+                        replication: None,
+                        item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    },
                 )
                 .await
             })
@@ -1033,12 +1036,14 @@ impl StorageProvider for TursoStorageProvider {
                     .await?;
                 this.delete_item_txn_with_replication(
                     conn,
-                    &table_info,
-                    &key,
-                    condition.as_ref(),
-                    false,
-                    None,
-                    None,
+                    TursoDeleteItemInput {
+                        table_info: &table_info,
+                        key: &key,
+                        condition: condition.as_ref(),
+                        return_old_on_condition_failure: false,
+                        replication: None,
+                        item_stream_ttl_hours: None,
+                    },
                 )
                 .await
             })
@@ -1085,12 +1090,14 @@ impl StorageProvider for TursoStorageProvider {
             Box::pin(async move {
                 this.delete_item_txn_with_replication(
                     conn,
-                    &table_info,
-                    &key,
-                    None,
-                    false,
-                    Some(&metadata),
-                    None,
+                    TursoDeleteItemInput {
+                        table_info: &table_info,
+                        key: &key,
+                        condition: None,
+                        return_old_on_condition_failure: false,
+                        replication: Some(&metadata),
+                        item_stream_ttl_hours: None,
+                    },
                 )
                 .await
                 .map(|_| ())
@@ -1508,12 +1515,14 @@ impl StorageProvider for TursoStorageProvider {
                             let _ = this
                                 .delete_item_txn_with_replication(
                                     conn,
-                                    &table_info,
-                                    &delete.key,
-                                    None,
-                                    false,
-                                    None,
-                                    delete.aux_item_stream_ttl_hours,
+                                    TursoDeleteItemInput {
+                                        table_info: &table_info,
+                                        key: &delete.key,
+                                        condition: None,
+                                        return_old_on_condition_failure: false,
+                                        replication: None,
+                                        item_stream_ttl_hours: delete.aux_item_stream_ttl_hours,
+                                    },
                                 )
                                 .await?;
                         }
@@ -1885,12 +1894,14 @@ impl TursoStorageProvider {
                     let _ = self
                         .delete_item_txn_with_replication(
                             conn,
-                            table_info,
-                            key,
-                            None,
-                            false,
-                            None,
-                            *aux_item_stream_ttl_hours,
+                            TursoDeleteItemInput {
+                                table_info,
+                                key,
+                                condition: None,
+                                return_old_on_condition_failure: false,
+                                replication: None,
+                                item_stream_ttl_hours: *aux_item_stream_ttl_hours,
+                            },
                         )
                         .await?;
                 }

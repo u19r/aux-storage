@@ -1,3 +1,9 @@
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    sync::LazyLock,
+};
+
 use smallvec::SmallVec;
 
 use crate::collect_expression_attribute_placeholder_refs;
@@ -53,6 +59,31 @@ ABORT ABSOLUTE ACTION ADD AFTER AGENT AGGREGATE ALL ALLOCATE ALTER ANALYZE AND A
      USE USER USERS USING UUID VACUUM VALUE VALUED VALUES VARCHAR VARIABLE VARIANCE VARINT \
      VARYING VIEW VIEWS VIRTUAL VOID WAIT WHEN WHENEVER WHERE WHILE WINDOW WITH WITHIN WITHOUT \
      WORK WRAPPED WRITE YEAR ZONE ";
+
+#[derive(Clone, Copy, Eq)]
+struct AsciiCaseInsensitive<'a>(&'a str);
+
+impl PartialEq for AsciiCaseInsensitive<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Hash for AsciiCaseInsensitive<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for byte in self.0.bytes() {
+            state.write_u8(byte.to_ascii_uppercase());
+        }
+    }
+}
+
+static DYNAMODB_RESERVED_WORD_SET: LazyLock<HashSet<AsciiCaseInsensitive<'static>>> =
+    LazyLock::new(|| {
+        DYNAMODB_RESERVED_WORDS
+            .split_ascii_whitespace()
+            .map(AsciiCaseInsensitive)
+            .collect()
+    });
 
 pub(crate) fn validate_expression_attribute_value_keys(
     values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
@@ -1741,21 +1772,28 @@ fn reserved_expression_token<'a>(
         return None;
     }
 
+    is_dynamodb_reserved_word(token).then_some(token)
+}
+
+pub(crate) fn is_dynamodb_reserved_word(token: &str) -> bool {
+    DYNAMODB_RESERVED_WORD_SET.contains(&AsciiCaseInsensitive(token))
+}
+
+#[cfg(test)]
+pub(crate) fn is_dynamodb_reserved_word_linear(token: &str) -> bool {
     DYNAMODB_RESERVED_WORDS
         .split_ascii_whitespace()
         .any(|word| word.eq_ignore_ascii_case(token))
-        .then_some(token)
 }
 
 fn is_expression_grammar_keyword(token: &str, label: &str) -> bool {
-    let token = token.to_ascii_uppercase();
+    let is_one_of = |words: &[&str]| words.iter().any(|word| word.eq_ignore_ascii_case(token));
     match label {
         "ProjectionExpression" => false,
-        "UpdateExpression" => matches!(
-            token.as_str(),
-            "AND" | "OR" | "NOT" | "BETWEEN" | "IN" | "SET" | "ADD" | "REMOVE" | "DELETE"
-        ),
-        _ => matches!(token.as_str(), "AND" | "OR" | "NOT" | "BETWEEN" | "IN"),
+        "UpdateExpression" => is_one_of(&[
+            "AND", "OR", "NOT", "BETWEEN", "IN", "SET", "ADD", "REMOVE", "DELETE",
+        ]),
+        _ => is_one_of(&["AND", "OR", "NOT", "BETWEEN", "IN"]),
     }
 }
 

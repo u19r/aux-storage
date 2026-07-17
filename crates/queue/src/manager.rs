@@ -6,11 +6,10 @@ use queue_provider::{
     ChangeMessageVisibilityRequest, CreateQueueRequest, CreateQueueResponse,
     DeleteMessageBatchRequest, DeleteMessageBatchResponse, DeleteMessageBatchResultEntry,
     DeleteMessageRequest, DeleteQueueRequest, DeleteQueueResponse, GetQueueAttributesRequest,
-    GetQueueAttributesResponse, GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest,
-    IntoValidatedQueueRequest, ListQueuesResponse, MessageId, MessageResponse, PurgeQueueRequest,
+    GetQueueAttributesResponse, GetQueueUrlRequest, GetQueueUrlResponse, IntoValidatedQueueRequest,
+    ListQueuesRequest, ListQueuesResponse, MessageId, MessageResponse, PurgeQueueRequest,
     PurgeQueueResponse, Queue, QueueError, QueueMessage, QueueMessageCounts, QueueResult,
-    ReceiptHandle,
-    ReceiveMessageRequest, ReceiveMessageResponse, SendMessageBatchRequest,
+    ReceiptHandle, ReceiveMessageRequest, ReceiveMessageResponse, SendMessageBatchRequest,
     SendMessageBatchResponse, SendMessageBatchResultEntry, SendMessageRequest, SendMessageResponse,
     SetQueueAttributesRequest, SetQueueAttributesResponse, UpdateMessageSnapshotRequest,
 };
@@ -134,9 +133,9 @@ impl QueueManager {
             .get_queue_with_message_counts(&request.queue_url)
             .await?
             .ok_or_else(|| queue_provider::QueueError::ResourceNotFound {
-            resource_type: "queue",
-            resource_id: request.queue_url.clone(),
-        })?;
+                resource_type: "queue",
+                resource_id: request.queue_url.clone(),
+            })?;
         Ok(GetQueueAttributesResponse {
             attributes: selected_queue_attributes(
                 queue.attributes,
@@ -518,33 +517,6 @@ fn batch_error_entry(id: String, error: &QueueError) -> BatchResultErrorEntry {
     }
 }
 
-#[cfg(test)]
-mod batch_error_tests {
-    use queue_provider::{QueueError, QueueInternalKind, QueueValidationKind};
-
-    use super::batch_error_entry;
-
-    #[test]
-    fn batch_error_classifies_request_failures_as_sender_faults() {
-        let entry = batch_error_entry(
-            "request".to_string(),
-            &QueueError::validation(QueueValidationKind::InvalidParameterValue),
-        );
-
-        assert!(entry.sender_fault);
-    }
-
-    #[test]
-    fn batch_error_classifies_internal_failures_as_receiver_faults() {
-        let entry = batch_error_entry(
-            "storage".to_string(),
-            &QueueError::internal(QueueInternalKind::MissingQueuePartitionState),
-        );
-
-        assert!(!entry.sender_fault);
-    }
-}
-
 fn receipt_handle_error_with_value(
     error: QueueError,
     receipt_handle: &ReceiptHandle,
@@ -639,4 +611,31 @@ fn remaining_wait_time(deadline: Option<Instant>) -> Duration {
     deadline
         .map(|deadline| deadline.saturating_duration_since(Instant::now()))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod batch_error_tests {
+    use queue_provider::{QueueError, QueueInternalKind, QueueValidationKind};
+
+    use super::batch_error_entry;
+
+    #[test]
+    fn batch_error_classifies_request_failures_as_sender_faults() {
+        let entry = batch_error_entry(
+            "request".to_string(),
+            &QueueError::validation(QueueValidationKind::InvalidParameterValue),
+        );
+
+        assert!(entry.sender_fault);
+    }
+
+    #[test]
+    fn batch_error_classifies_internal_failures_as_receiver_faults() {
+        let entry = batch_error_entry(
+            "storage".to_string(),
+            &QueueError::internal(QueueInternalKind::MissingQueuePartitionState),
+        );
+
+        assert!(!entry.sender_fault);
+    }
 }

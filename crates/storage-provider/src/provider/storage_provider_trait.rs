@@ -4,17 +4,15 @@ use async_trait::async_trait;
 use bg_jobs::BackgroundJobName;
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
-    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableBatchPointReadProof,
-    DurableBatchPointReadProofEntry, DurableBatchPointReadRequest, DurablePointReadProof,
-    DeleteItemRequest, DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
-    GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, ItemVersionedWireItem,
-    KeyAttributes, KeySchemaElement, PutItemEncodeRequest, PutItemRequest, PutItemResponse,
-    QueryTableRequest,
-    ReadSequenceConsistency,
-    ReplicationMutation, ScanTableRequest, SplitDynamoItem, StorageError, StorageResult,
-    StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
-    TransactWriteItemsEncodeRequest, UpdateItemRequest, UpdateItemResponse, WireItem,
-    WriteRetryPolicy,
+    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest,
+    DurableBatchPointReadProof, DurableBatchPointReadProofEntry, DurableBatchPointReadRequest,
+    DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
+    GuardedPutItemRequest, GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest,
+    ItemVersionedWireItem, KeyAttributes, KeySchemaElement, PutItemEncodeRequest, PutItemRequest,
+    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    ScanTableRequest, SplitDynamoItem, StorageError, StorageResult, StoredTableInfo,
+    StreamRetentionDuration, TableName, TableStatus, TransactWriteItemsEncodeRequest,
+    UpdateItemRequest, UpdateItemResponse, WireItem, WriteRetryPolicy,
 };
 
 use crate::{
@@ -200,9 +198,7 @@ pub trait StorageProvider: Send + Sync {
             };
             match self.put_item_request(attempt_request).await {
                 Ok(response) => return Ok(response),
-                Err(error)
-                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
-                {
+                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),
@@ -310,9 +306,7 @@ pub trait StorageProvider: Send + Sync {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(error)
-                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
-                {
+                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),
@@ -602,9 +596,7 @@ pub trait StorageProvider: Send + Sync {
             };
             match self.transact_write_items_encode(attempt_request).await {
                 Ok(response) => return Ok(response),
-                Err(error)
-                    if error.is_retryable_write() && attempt + 1 < policy.max_attempts() =>
-                {
+                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),

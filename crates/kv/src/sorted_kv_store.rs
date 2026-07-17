@@ -17,16 +17,17 @@ use crate::{
 type KeyValuePair = (Box<[u8]>, Box<[u8]>);
 
 pub enum AtomicTableWriteDecision {
-    NoWrite { output: Vec<u8> },
+    NoWrite {
+        output: Vec<u8>,
+    },
     Write {
         operations: Vec<TransactWriteTableOperation>,
         output: Vec<u8>,
     },
 }
 
-pub type AtomicTableWriteTransform = Arc<
-    dyn Fn(Option<&[u8]>) -> StorageResult<AtomicTableWriteDecision> + Send + Sync,
->;
+pub type AtomicTableWriteTransform =
+    Arc<dyn Fn(Option<&[u8]>) -> StorageResult<AtomicTableWriteDecision> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct RangeResult {

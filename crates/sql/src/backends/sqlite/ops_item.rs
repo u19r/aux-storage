@@ -4,28 +4,41 @@ use storage_provider::{
     before_update_item_optional, return_values_need_updated_fields, update_item_response,
 };
 use storage_types::{
-    AllOld, AttributeValue, KeyAttributes, StorageResult, StreamRetentionDuration, TableName,
-    UpdateItemRequest, WireItem,
+    AllOld, AttributeValue, DeleteItemRequest, KeyAttributes, PutItemEncodeRequest, PutItemRequest,
+    StorageResult, TableName, UpdateItemRequest, WireItem,
 };
 
 use crate::{
-    SQLiteStorageProvider, storage_provider::parse_optional_condition,
-    transaction_manager::with_transaction, utils::call_sqlite,
+    SQLiteStorageProvider,
+    backends::sqlite::{
+        delete_item_impl::DeleteItemInput,
+        put_item_impl::{PutItemInput, PutWireItemInput},
+        update_item_impl::UpdateItemInput,
+    },
+    storage_provider::parse_optional_condition,
+    transaction_manager::with_transaction,
+    utils::call_sqlite,
 }; // now pub(crate)
 
 impl SQLiteStorageProvider {
-    #[allow(clippy::too_many_arguments)]
     pub async fn put_item_internal(
         &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: PutItemRequest,
     ) -> StorageResult<storage_types::PutItemResponse> {
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let PutItemRequest {
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         let condition = parse_optional_condition(
             condition_expression,
             &expression_attribute_names,
@@ -34,14 +47,16 @@ impl SQLiteStorageProvider {
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         let old_value = with_transaction(&self.connection, move |sqlite| {
             crate::SQLiteStorageProvider::do_put_item(
-                &table_name,
-                &item,
-                &condition,
                 sqlite,
-                immediate_gsi_consistency,
-                return_old_on_condition_failure,
-                None,
-                aux_item_stream_ttl_hours,
+                PutItemInput {
+                    table_name: &table_name,
+                    item: &item,
+                    condition: &condition,
+                    immediate_gsi_consistency,
+                    return_old_on_condition_failure,
+                    replication: None,
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                },
             )
         })
         .await?;
@@ -55,18 +70,20 @@ impl SQLiteStorageProvider {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn put_item_wire_internal(
         &self,
-        table_name: TableName,
-        item: WireItem,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: PutItemEncodeRequest,
     ) -> StorageResult<storage_types::PutItemResponse> {
+        let PutItemEncodeRequest {
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            return_old_on_condition_failure,
+            aux_item_stream_ttl_hours,
+        } = request;
         let condition = parse_optional_condition(
             condition_expression,
             &expression_attribute_names,
@@ -76,15 +93,17 @@ impl SQLiteStorageProvider {
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         let old_value = with_transaction(&self.connection, move |sqlite| {
             crate::SQLiteStorageProvider::do_put_wire_item(
-                &table_name,
-                &item,
-                &condition,
                 sqlite,
-                immediate_gsi_consistency,
-                should_return_old,
-                return_old_on_condition_failure,
-                None,
-                aux_item_stream_ttl_hours,
+                PutWireItemInput {
+                    table_name: &table_name,
+                    item: &item,
+                    condition: &condition,
+                    immediate_gsi_consistency,
+                    should_return_old,
+                    return_old_on_condition_failure,
+                    replication: None,
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                },
             )
         })
         .await?;
@@ -108,14 +127,21 @@ impl SQLiteStorageProvider {
 
     pub async fn delete_item_internal(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let return_old_on_condition_failure =
+            storage_types::return_values_on_condition_check_failure_all_old(
+                request.return_values_on_condition_check_failure.as_ref(),
+            );
+        let DeleteItemRequest {
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         let condition = parse_optional_condition(
             condition_expression,
             &expression_attribute_names,
@@ -124,14 +150,16 @@ impl SQLiteStorageProvider {
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         with_transaction(&self.connection, move |sqlite| {
             crate::SQLiteStorageProvider::do_delete_item(
-                &table_name,
-                &key,
-                &condition,
                 sqlite,
-                immediate_gsi_consistency,
-                return_old_on_condition_failure,
-                None,
-                aux_item_stream_ttl_hours,
+                DeleteItemInput {
+                    table_name: &table_name,
+                    key: &key,
+                    condition: &condition,
+                    immediate_gsi_consistency,
+                    return_old_on_condition_failure,
+                    replication: None,
+                    item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                },
             )
         })
         .await
@@ -178,14 +206,16 @@ impl SQLiteStorageProvider {
                     Default::default()
                 };
                 crate::SQLiteStorageProvider::do_update_item(
-                    &operations,
-                    &condition,
-                    &table_name,
-                    &key,
                     sqlite,
-                    immediate_gsi_consistency,
-                    return_old_on_condition_failure,
-                    aux_item_stream_ttl_hours,
+                    UpdateItemInput {
+                        operations: &operations,
+                        condition: &condition,
+                        table_name: &table_name,
+                        key: &key,
+                        immediate_gsi_consistency,
+                        return_old_on_condition_failure,
+                        item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    },
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))
             })

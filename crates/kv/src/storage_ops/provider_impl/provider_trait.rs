@@ -190,7 +190,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         &self,
         request: storage_types::PutItemRequest,
     ) -> StorageResult<PutItemResponse> {
-        self.put_item_with_stream_ttl_impl(put_item::PutItemStreamTtlRequest {
+        self.put_item_with_stream_ttl_impl(put_item::PutItemInput {
             table_name: request.table_name,
             item: request.item,
             condition_expression: request.condition_expression,
@@ -224,15 +224,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         expression_attribute_values: Option<HashMap<String, AttributeValue>>,
         return_values: Option<AllOld>,
     ) -> StorageResult<PutItemResponse> {
-        self.put_item_encode_impl(
+        self.put_item_encode_impl(put_item::PutItemInput {
             table_name,
             item,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
             return_values,
-            false,
-        )
+            return_old_on_condition_failure: false,
+            aux_item_stream_ttl_hours: None,
+        })
         .await
     }
 
@@ -246,7 +247,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         return_values: Option<AllOld>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<PutItemResponse> {
-        self.put_item_encode_with_stream_ttl_impl(put_item::PutItemStreamTtlRequest {
+        self.put_item_encode_with_stream_ttl_impl(put_item::PutItemInput {
             table_name,
             item,
             condition_expression,
@@ -272,18 +273,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         &self,
         request: storage_types::DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        self.execute_delete_item(
-            request.table_name,
-            request.key,
-            request.condition_expression,
-            request.expression_attribute_names,
-            request.expression_attribute_values,
-            storage_types::return_values_on_condition_check_failure_all_old(
-                request.return_values_on_condition_check_failure.as_ref(),
-            ),
-            request.aux_item_stream_ttl_hours,
-        )
-        .await
+        self.execute_delete_item(request).await
     }
 
     #[instrument(skip_all, fields(feature = "storage", ddb_op = "scan_table", table_name = %request.table_name, index_name = tracing::field::Empty, ddb_read = true, items_returned = tracing::field::Empty, bytes_read = tracing::field::Empty))]

@@ -57,7 +57,9 @@ use crate::{
         PartitionedQueueMessageWrite, QueueClaimBatch, QueueClaimRange, QueueClaimedMessage,
         QueueKvStore, QueuePrewarmPartition,
         constants::QUEUE_PAYLOAD_CHUNK_BYTES,
-        storage::{queue_payload_chunk_key, read_partitioned_queue_payload},
+        storage::{
+            queue_payload_chunk_key, queue_prewarm_marker_bytes, read_partitioned_queue_payload,
+        },
     },
     sorted_kv_store::{
         AtomicTableWriteDecision, AtomicTableWriteTransform, BatchItem, DirectWriteOperation,
@@ -1413,11 +1415,11 @@ impl QueueKvStore for FoundationDbKvStore {
             let mut write_bytes = 0u64;
             let mut write_key_bytes = 0u64;
             for partition in chunk {
-                let marker_value = format!(
-                    "{}:{}:{}",
-                    queue_url, partition.placement_slot, partition.partition_id
-                )
-                .into_bytes();
+                let marker_value = queue_prewarm_marker_bytes(
+                    queue_url,
+                    partition.placement_slot,
+                    partition.partition_id,
+                );
                 write_bytes = write_bytes.saturating_add(marker_value.len() as u64);
                 let prefixed_key = Self::prefix_bytes(prefix.as_ref(), &partition.marker_key);
                 write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);

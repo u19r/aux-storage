@@ -21,16 +21,14 @@ use storage_provider::{
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateGlobalSecondaryIndex,
     CreateTableRequest, HIDDEN_TTL_INDEX_PREFIX, IndexName, ItemKey, KeyAttributeType,
-    KeyAttributes,
-    KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
-    PutItemEncodeRequest, QueryTableRequest,
-    ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
-    ReplicationMutation, ReplicationWriteSource, ScanTableRequest, SerializesToKey, StorageEnum,
-    StorageError, StorageResult, StreamItemId, StreamKey, StreamName, StreamRetentionDuration,
-    TTL_PARTITION_ATTRIBUTE, TableName, TimeToLiveSpecification, TimeToLiveStatus, TimestampMillis,
-    TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
-    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateTableRequest,
-    UpdateTimeToLiveRequest, WireItem, WriteRetryPolicy,
+    KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
+    PutItemEncodeRequest, QueryTableRequest, ReadSequenceConsistency, ReplicationEventMetadata,
+    ReplicationHybridLogicalClock, ReplicationMutation, ReplicationWriteSource, ScanTableRequest,
+    SerializesToKey, StorageEnum, StorageError, StorageResult, StreamItemId, StreamKey, StreamName,
+    StreamRetentionDuration, TTL_PARTITION_ATTRIBUTE, TableName, TimeToLiveSpecification,
+    TimeToLiveStatus, TimestampMillis, TransactConditionCheckRequest, TransactDeleteRequest,
+    TransactPutRequest, TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest,
+    UpdateTableRequest, UpdateTimeToLiveRequest, WireItem, WriteRetryPolicy,
 };
 use stream_provider::{StoredStreamPointer, StreamDataType, StreamItem, StreamProvider};
 use tracing_test::traced_test;
@@ -94,18 +92,9 @@ async fn atomic_item_read_modify_write_preserves_concurrent_updates() {
                             .saturating_add(1);
                         Ok(AtomicItemWriteDecision::Write {
                             item: HashMap::from([
-                                (
-                                    "pk".to_string(),
-                                    AttributeValue::S("counter".to_string()),
-                                ),
-                                (
-                                    "sk".to_string(),
-                                    AttributeValue::S("state".to_string()),
-                                ),
-                                (
-                                    "count".to_string(),
-                                    AttributeValue::N(count.to_string()),
-                                ),
+                                ("pk".to_string(), AttributeValue::S("counter".to_string())),
+                                ("sk".to_string(), AttributeValue::S("state".to_string())),
+                                ("count".to_string(), AttributeValue::N(count.to_string())),
                             ]),
                             additional_items: Vec::new(),
                             output: count.to_be_bytes().to_vec(),
@@ -123,7 +112,10 @@ async fn atomic_item_read_modify_write_preserves_concurrent_updates() {
         .await
         .unwrap()
         .expect("counter item");
-    assert_eq!(item.get("count"), Some(&AttributeValue::N("32".to_string())));
+    assert_eq!(
+        item.get("count"),
+        Some(&AttributeValue::N("32".to_string()))
+    );
 
     let denied = provider
         .atomic_item_read_modify_write(AtomicItemReadModifyWriteRequest {

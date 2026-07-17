@@ -67,10 +67,7 @@ fn routed_batch_get_keeps_shared_and_default_tables_isolated() {
     let mut grouped = HashMap::new();
     let namespace = TableNamespace::from_seed("shared");
 
-    for (connection_id, namespace) in [
-        ("tenant-store", Some(namespace)),
-        ("default", None),
-    ] {
+    for (connection_id, namespace) in [("tenant-store", Some(namespace)), ("default", None)] {
         insert_routed_batch_get_table(
             &mut isolated,
             &mut grouped,

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
-    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PubsubMessageId,
-    PubsubProvider, PublishRequest, SetSubscriptionAttributesRequest, SubscribeRequest, SubscriptionArn,
-    SubscriptionProtocol, TopicName,
+    DeliveryRecordKind, DeliveryStatus, DeliveryTarget, GetTopicAttributesRequest, PublishRequest,
+    PubsubMessageId, PubsubProvider, SetSubscriptionAttributesRequest, SubscribeRequest,
+    SubscriptionArn, SubscriptionProtocol, TopicName,
 };
 use storage_types::TimestampMillis;
 

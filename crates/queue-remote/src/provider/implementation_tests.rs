@@ -65,7 +65,10 @@ async fn remote_send_batch_maps_ten_results_in_request_order_with_one_call() {
         })
         .collect();
 
-    let results = provider.send_messages(messages).await.expect("batch response");
+    let results = provider
+        .send_messages(messages)
+        .await
+        .expect("batch response");
 
     assert_eq!(send.calls(), 1);
     assert_eq!(results.len(), 10);
@@ -156,7 +159,13 @@ async fn empty_remote_batches_do_not_issue_requests() {
         .await
         .expect("provider");
 
-    assert!(provider.send_messages(Vec::new()).await.expect("send").is_empty());
+    assert!(
+        provider
+            .send_messages(Vec::new())
+            .await
+            .expect("send")
+            .is_empty()
+    );
     assert!(
         provider
             .delete_messages("unused", Vec::new())

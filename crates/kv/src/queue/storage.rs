@@ -61,6 +61,31 @@ pub struct QueuePrewarmPartition {
     pub(crate) marker_key: Vec<u8>,
 }
 
+#[cfg(any(test, feature = "foundationdb-backend"))]
+pub(crate) fn queue_prewarm_marker_bytes(
+    queue_url: &str,
+    placement_slot: u16,
+    partition_id: u16,
+) -> Vec<u8> {
+    format!("{queue_url}:{placement_slot}:{partition_id}").into_bytes()
+}
+
+pub(crate) fn is_queue_prewarm_marker_bytes(queue_url: &str, bytes: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(suffix) = value
+        .strip_prefix(queue_url)
+        .and_then(|value| value.strip_prefix(':'))
+    else {
+        return false;
+    };
+    let Some((placement_slot, partition_id)) = suffix.split_once(':') else {
+        return false;
+    };
+    placement_slot.parse::<u16>().is_ok() && partition_id.parse::<u16>().is_ok()
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueClaimedMessage {
     pub(crate) partition_id: u16,
@@ -185,6 +210,7 @@ where
     store.transact_write_unchecked(operations).await
 }
 
+#[cfg(any(test, feature = "rocksdb-backend"))]
 pub(crate) fn queue_payload_write_operations(
     payload_key: Vec<u8>,
     payload_bytes: Vec<u8>,
@@ -278,9 +304,7 @@ pub(crate) fn queue_payload_chunk_key(payload_key: &[u8], index: u16) -> Vec<u8>
     key
 }
 
-pub(crate) fn queue_payload_record_bytes(
-    payload_len: usize,
-) -> StorageResult<Option<Vec<u8>>> {
+pub(crate) fn queue_payload_record_bytes(payload_len: usize) -> StorageResult<Option<Vec<u8>>> {
     if payload_len <= QUEUE_PAYLOAD_CHUNK_BYTES {
         return Ok(None);
     }

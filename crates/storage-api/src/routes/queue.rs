@@ -76,11 +76,7 @@ pub async fn queue_endpoint(
     let wire_request = match decode_request(&headers, body) {
         Ok(request) => request,
         Err(message) => {
-            return validation_response(
-                &request_id,
-                protocol_from_headers(&headers),
-                &message,
-            );
+            return validation_response(&request_id, protocol_from_headers(&headers), &message);
         }
     };
     dispatch_queue_request(

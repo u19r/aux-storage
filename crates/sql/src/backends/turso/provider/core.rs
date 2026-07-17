@@ -59,6 +59,15 @@ pub(crate) struct TursoWriteStreamEntriesInput<'a> {
     pub replication: Option<&'a ReplicationEventMetadata>,
 }
 
+pub(crate) struct TursoDeleteItemInput<'a> {
+    pub(crate) table_info: &'a StoredTableInfo,
+    pub(crate) key: &'a KeyAttributes,
+    pub(crate) condition: Option<&'a Condition>,
+    pub(crate) return_old_on_condition_failure: bool,
+    pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
 pub(super) fn condition_item_ref(
     old_item: Option<&HashMap<String, AttributeValue>>,
 ) -> &HashMap<String, AttributeValue> {
@@ -862,16 +871,19 @@ impl TursoStorageProvider {
     pub(crate) async fn delete_item_txn_with_replication<C>(
         &self,
         conn: &C,
-        table_info: &StoredTableInfo,
-        key: &KeyAttributes,
-        condition: Option<&Condition>,
-        return_old_on_condition_failure: bool,
-        replication: Option<&ReplicationEventMetadata>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: TursoDeleteItemInput<'_>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
     where
         C: TursoSqlConnection + ?Sized,
     {
+        let TursoDeleteItemInput {
+            table_info,
+            key,
+            condition,
+            return_old_on_condition_failure,
+            replication,
+            item_stream_ttl_hours,
+        } = input;
         let old_item = self.get_item_map_by_key(conn, table_info, key).await?;
         if old_item.is_none() {
             return Ok(None);
@@ -906,7 +918,7 @@ impl TursoStorageProvider {
             },
         )
         .await?;
-        self.apply_item_stream_duration(conn, table_info, key, aux_item_stream_ttl_hours)
+        self.apply_item_stream_duration(conn, table_info, key, item_stream_ttl_hours)
             .await?;
 
         if self.immediate_gsi_consistency {

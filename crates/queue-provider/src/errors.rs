@@ -236,7 +236,11 @@ impl QueueError {
             | Self::StorageError(_)
             | Self::TransactWrite(_) => 500,
             Self::BatchEntry { sender_fault, .. } => {
-                if *sender_fault { 400 } else { 500 }
+                if *sender_fault {
+                    400
+                } else {
+                    500
+                }
             }
             Self::ResourceNotFound {
                 resource_type: "receipt_handle",
@@ -258,10 +262,14 @@ impl QueueError {
     pub fn is_sender_fault(&self) -> bool {
         matches!(
             self,
-            Self::ResourceExists { .. }
-                | Self::ResourceNotFound { .. }
-                | Self::Validation { .. }
-        ) || matches!(self, Self::BatchEntry { sender_fault: true, .. })
+            Self::ResourceExists { .. } | Self::ResourceNotFound { .. } | Self::Validation { .. }
+        ) || matches!(
+            self,
+            Self::BatchEntry {
+                sender_fault: true,
+                ..
+            }
+        )
     }
 }
 

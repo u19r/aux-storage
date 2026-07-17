@@ -5,8 +5,8 @@ use std::{
 
 use alloc_counter::AllocationGuard;
 use storage_types::{
-    AttributeDefinition, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType,
-    StoredTableInfo, TableName, TableStatus, TimestampMillis,
+    AttributeDefinition, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement,
+    KeyType, StoredTableInfo, TableName, TableStatus, TimestampMillis,
 };
 
 use super::storage_manager_impl_batch_get_item::BatchGetKeyIdentity;
@@ -17,7 +17,10 @@ const ITERATIONS: usize = 10_000;
 fn batch_get_typed_key_fingerprint_avoids_canonical_json_allocations() {
     let table_info = table_info();
     let key = KeyAttributes::from(HashMap::from([
-        ("pk".to_string(), AttributeValue::S("tenant-123".to_string())),
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
         ("sk".to_string(), AttributeValue::N("12300".to_string())),
     ]));
 
@@ -67,20 +70,23 @@ fn batch_get_typed_key_fingerprint_avoids_canonical_json_allocations() {
 fn batch_get_key_identity_normalizes_equivalent_numbers() {
     let table_info = table_info();
     let first = KeyAttributes::from(HashMap::from([
-        ("pk".to_string(), AttributeValue::S("tenant-123".to_string())),
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
         ("sk".to_string(), AttributeValue::N("1.23E4".to_string())),
     ]));
     let second = KeyAttributes::from(HashMap::from([
-        ("pk".to_string(), AttributeValue::S("tenant-123".to_string())),
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
         ("sk".to_string(), AttributeValue::N("12300".to_string())),
     ]));
     let mut seen = HashSet::new();
 
     assert!(seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &first)));
-    assert!(!seen.insert(BatchGetKeyIdentity::new(
-        &table_info.key_schema,
-        &second
-    )));
+    assert!(!seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &second)));
 }
 
 fn table_info() -> StoredTableInfo {

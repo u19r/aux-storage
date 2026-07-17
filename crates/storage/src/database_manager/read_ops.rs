@@ -129,10 +129,7 @@ impl DatabaseManager {
         point_read_runtime: &StoragePointReadCacheRuntime<'_>,
         prepared_cache_read: &PreparedPointReadCacheRead,
     ) -> StorageResult<Option<WireItem>> {
-        let ResolvedGetItem {
-            operation,
-            mut key,
-        } = resolved;
+        let ResolvedGetItem { operation, mut key } = resolved;
         let table_name = operation.logical_table_name;
         if let Some(route) = operation.route {
             if route.storage_mode == NamespaceStorageMode::SharedTable {
@@ -436,12 +433,18 @@ impl DatabaseManager {
 
         for (logical_table, mut keys_and_attributes) in request_items {
             let route = match plan.as_mut() {
-                Some(plan) => plan
-                    .operations
-                    .remove(&logical_table)
-                    .ok_or_else(|| StorageError::internal("resolved BatchGet plan is incomplete"))?
-                    .route,
-                None => self.resolve_namespace_route_for_table(&logical_table).await?,
+                Some(plan) => {
+                    plan.operations
+                        .remove(&logical_table)
+                        .ok_or_else(|| {
+                            StorageError::internal("resolved BatchGet plan is incomplete")
+                        })?
+                        .route
+                }
+                None => {
+                    self.resolve_namespace_route_for_table(&logical_table)
+                        .await?
+                }
             };
             let (connection_id, physical_table, shared_namespace) = if let Some(route) = route {
                 if route.storage_mode == NamespaceStorageMode::SharedTable {
@@ -476,23 +479,21 @@ impl DatabaseManager {
         }
         routed_requests.extend(grouped_requests.into_values());
         routed_requests.sort_by(|left, right| {
-            left.connection_id
-                .cmp(&right.connection_id)
-                .then_with(|| {
-                    left.request
-                        .request_items
-                        .keys()
-                        .map(TableName::as_ref)
-                        .min()
-                        .cmp(
-                            &right
-                                .request
-                                .request_items
-                                .keys()
-                                .map(TableName::as_ref)
-                                .min(),
-                        )
-                })
+            left.connection_id.cmp(&right.connection_id).then_with(|| {
+                left.request
+                    .request_items
+                    .keys()
+                    .map(TableName::as_ref)
+                    .min()
+                    .cmp(
+                        &right
+                            .request
+                            .request_items
+                            .keys()
+                            .map(TableName::as_ref)
+                            .min(),
+                    )
+            })
         });
 
         let mut merged_responses: HashMap<TableName, Vec<WireItem>> =
@@ -503,9 +504,10 @@ impl DatabaseManager {
             async move {
                 let provider = self.provider_for_request_connection(&routed.connection_id)?;
                 if routed.connection_id == ROUTED_DEFAULT_CONNECTION_ID {
-                    let (physical_table, target) = routed.targets.iter().next().ok_or_else(|| {
-                        StorageError::internal("routed BatchGet request has no response target")
-                    })?;
+                    let (physical_table, target) =
+                        routed.targets.iter().next().ok_or_else(|| {
+                            StorageError::internal("routed BatchGet request has no response target")
+                        })?;
                     if routed.targets.len() != 1 {
                         return Err(StorageError::internal(
                             "default BatchGet cache warming requires one response target",
@@ -621,19 +623,20 @@ pub(super) fn insert_routed_batch_get_table(
         target,
         keys_and_attributes,
     } = table;
-    let can_group = connection_id != ROUTED_DEFAULT_CONNECTION_ID
-        && target.shared_namespace.is_none();
+    let can_group =
+        connection_id != ROUTED_DEFAULT_CONNECTION_ID && target.shared_namespace.is_none();
     if can_group {
-        let request = grouped
-            .entry(connection_id.clone())
-            .or_insert_with(|| RoutedBatchGetRequest {
-                connection_id: connection_id.clone(),
-                request: BatchGetItemRequest {
-                    request_items: HashMap::new(),
-                    return_consumed_capacity: return_consumed_capacity.clone(),
-                },
-                targets: HashMap::new(),
-            });
+        let request =
+            grouped
+                .entry(connection_id.clone())
+                .or_insert_with(|| RoutedBatchGetRequest {
+                    connection_id: connection_id.clone(),
+                    request: BatchGetItemRequest {
+                        request_items: HashMap::new(),
+                        return_consumed_capacity: return_consumed_capacity.clone(),
+                    },
+                    targets: HashMap::new(),
+                });
         if !request.request.request_items.contains_key(&physical_table) {
             request
                 .request

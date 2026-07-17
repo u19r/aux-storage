@@ -47,7 +47,8 @@ pub trait QueueProvider: Send + Sync {
         Ok(QueueMessageCounts::default())
     }
 
-    /// Return queue metadata and approximate counts from one provider-owned snapshot.
+    /// Return queue metadata and approximate counts from one provider-owned
+    /// snapshot.
     async fn get_queue_with_message_counts(
         &self,
         queue_url: &str,

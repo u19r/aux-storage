@@ -21,6 +21,27 @@ use crate::{
     utils::{SqliteConn, main_table_attributes_blob},
 };
 
+pub(crate) struct PutItemInput<'a> {
+    pub(crate) table_name: &'a TableName,
+    pub(crate) item: &'a HashMap<String, AttributeValue>,
+    pub(crate) condition: &'a Option<Condition>,
+    pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) return_old_on_condition_failure: bool,
+    pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
+pub(crate) struct PutWireItemInput<'a> {
+    pub(crate) table_name: &'a TableName,
+    pub(crate) item: &'a WireItem,
+    pub(crate) condition: &'a Option<Condition>,
+    pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) should_return_old: bool,
+    pub(crate) return_old_on_condition_failure: bool,
+    pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
 pub(crate) fn condition_item_ref(
     old_item: Option<&HashMap<String, AttributeValue>>,
 ) -> &HashMap<String, AttributeValue> {
@@ -56,18 +77,20 @@ fn evaluate_wire_condition_cached(
 }
 
 impl SQLiteStorageProvider {
-    #[allow(clippy::too_many_arguments)]
-    pub fn do_put_wire_item(
-        table_name: &TableName,
-        item: &WireItem,
-        condition: &Option<Condition>,
+    pub(crate) fn do_put_wire_item(
         sqlite: &SqliteConn<'_>,
-        immediate_gsi_consistency: bool,
-        should_return_old: bool,
-        return_old_on_condition_failure: bool,
-        replication: Option<&ReplicationEventMetadata>,
-        item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: PutWireItemInput<'_>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let PutWireItemInput {
+            table_name,
+            item,
+            condition,
+            immediate_gsi_consistency,
+            should_return_old,
+            return_old_on_condition_failure,
+            replication,
+            item_stream_ttl_hours,
+        } = input;
         let table_name_safe = table_name.sanitized_name();
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
         let key_attributes = extract_wire_item_key_attributes(item, &table_info.key_schema)?;
@@ -155,16 +178,19 @@ impl SQLiteStorageProvider {
         }
     }
 
-    pub fn do_put_item(
-        table_name: &TableName,
-        item: &HashMap<String, AttributeValue>,
-        condition: &Option<Condition>,
+    pub(crate) fn do_put_item(
         sqlite: &SqliteConn<'_>,
-        immediate_gsi_consistency: bool,
-        return_old_on_condition_failure: bool,
-        replication: Option<&ReplicationEventMetadata>,
-        item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: PutItemInput<'_>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let PutItemInput {
+            table_name,
+            item,
+            condition,
+            immediate_gsi_consistency,
+            return_old_on_condition_failure,
+            replication,
+            item_stream_ttl_hours,
+        } = input;
         let table_name_safe = table_name.sanitized_name();
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
 

@@ -11,8 +11,9 @@ use storage_provider::{SqliteSettings, StorageBackend, StorageConfig, StoragePro
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BillingMode, CreateTableRequest, KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType,
-    QueryTableRequest, ReadSequenceConsistency, ReadSequenceConsistency::Eventual, StorageError,
-    StorageResult, TableName, WireItem,
+    KeysAndAttributes, QueryTableRequest, ReadSequenceConsistency,
+    ReadSequenceConsistency::Eventual, StorageEnum, StorageError, StorageResult, TableName,
+    WireItem, context::WrappedError as _,
 };
 
 use super::{InProcessReadSequenceLimits, ROUTED_DEFAULT_CONNECTION_ID};
@@ -166,6 +167,77 @@ async fn given_query_above_remaining_budget_when_executed_then_provider_limit_is
 }
 
 #[tokio::test]
+async fn given_batch_keys_when_executed_then_items_and_accounting_use_one_operation() {
+    let db = DatabaseManager::new_for_test().await.expect("test db");
+    let table = TableName::new("in_process_sequence_batch_get");
+    create_hash_table(&db, &table).await;
+    put_version(&db, &table, "item#1", "one").await;
+    put_version(&db, &table, "item#2", "two").await;
+    let limits = InProcessReadSequenceLimits::try_new(1, 3, 3, 64 * 1024).expect("limits");
+    let mut executor = db
+        .read_sequence_executor(Eventual, limits)
+        .expect("executor");
+
+    let response = executor
+        .batch_get_item(
+            table.clone(),
+            KeysAndAttributes {
+                keys: vec![key("item#1"), key("missing"), key("item#2")].into(),
+                attributes_to_get: None,
+                projection_expression: None,
+                expression_attribute_names: None,
+                consistent_read: Some(true),
+            },
+        )
+        .await
+        .expect("batch read");
+    let items = response
+        .responses
+        .expect("responses")
+        .remove(&table)
+        .expect("logical table response");
+
+    assert_eq!(items.len(), 2);
+    assert!(response.unprocessed_keys.is_none());
+    assert_eq!(executor.stats().operations_started(), 1);
+    assert_eq!(executor.stats().operations_completed(), 1);
+    assert_eq!(executor.stats().requested_items(), 3);
+    assert_eq!(executor.stats().returned_items(), 2);
+    assert!(executor.stats().returned_bytes() > 0);
+}
+
+#[tokio::test]
+async fn given_invalid_batch_key_when_executed_then_it_fails_before_provider_work() {
+    let db = DatabaseManager::new_for_test().await.expect("test db");
+    let table = TableName::new("in_process_sequence_invalid_batch_get");
+    create_hash_table(&db, &table).await;
+    let mut executor = db
+        .read_sequence_executor(Eventual, InProcessReadSequenceLimits::default())
+        .expect("executor");
+
+    let error = executor
+        .batch_get_item(
+            table,
+            KeysAndAttributes {
+                keys: vec![KeyAttributes::from([(
+                    "wrong".to_string(),
+                    AttributeValue::S("item#1".to_string()),
+                )])]
+                .into(),
+                attributes_to_get: None,
+                projection_expression: None,
+                expression_attribute_names: None,
+                consistent_read: None,
+            },
+        )
+        .await
+        .expect_err("invalid key");
+
+    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
+    assert_eq!(executor.stats(), Default::default());
+}
+
+#[tokio::test]
 async fn given_transactional_sequence_when_writer_commits_then_dependent_read_keeps_root_snapshot()
 {
     let path = std::env::temp_dir().join(format!(
@@ -202,9 +274,23 @@ async fn given_transactional_sequence_when_writer_commits_then_dependent_read_ke
     put_version(&writer, &table, "root", "after").await;
     put_version(&writer, &table, "child", "after").await;
     let child = executor
-        .get_item(table, key("child"))
+        .batch_get_item(
+            table.clone(),
+            KeysAndAttributes {
+                keys: vec![key("child")].into(),
+                attributes_to_get: None,
+                projection_expression: None,
+                expression_attribute_names: None,
+                consistent_read: None,
+            },
+        )
         .await
-        .expect("dependent read")
+        .expect("dependent batch read")
+        .responses
+        .expect("responses")
+        .remove(&table)
+        .expect("logical table response")
+        .pop()
         .expect("child item");
 
     assert_eq!(version(&root), "before");
@@ -213,6 +299,30 @@ async fn given_transactional_sequence_when_writer_commits_then_dependent_read_ke
     assert_eq!(executor.stats().operations_completed(), 2);
     assert_eq!(executor.stats().requested_items(), 2);
     assert_eq!(executor.stats().returned_items(), 2);
+}
+
+#[tokio::test]
+async fn given_unsupported_resolved_provider_when_sequence_begins_then_it_fails_before_reads() {
+    let db = DatabaseManager::new_for_test().await.expect("test db");
+    let table = TableName::new("unsupported_route_bound_sequence");
+    create_hash_table(&db, &table).await;
+
+    let error = match db
+        .read_sequence_executor_for_table(
+            &table,
+            ReadSequenceConsistency::Transactional,
+            InProcessReadSequenceLimits::default(),
+        )
+        .await
+    {
+        Ok(_) => panic!("in-memory SQLite must not advertise transactional snapshots"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error.to_enum(),
+        storage_types::StorageEnum::Unsupported { .. }
+    ));
 }
 
 #[cfg(feature = "foundationdb")]

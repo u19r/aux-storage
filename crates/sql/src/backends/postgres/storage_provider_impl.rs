@@ -19,16 +19,14 @@ use storage_provider::{
 };
 use storage_types::{
     AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
-    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DurableAbsenceProof,
-    DeleteItemRequest, DurableItemRevision, DurablePointReadProof, DurablePointReadRequest,
-    GuardedDeleteItemRequest,
-    GuardedPutItemRequest, GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes,
-    PutItemRequest, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
-    ReplicationMutation,
-    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
-    StreamName, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis,
-    UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
-    WireItem,
+    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest,
+    DurableAbsenceProof, DurableItemRevision, DurablePointReadProof, DurablePointReadRequest,
+    GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedUpdateItemRequest,
+    ItemVersionedWireItem, KeyAttributes, PutItemRequest, PutItemResponse, QueryTableRequest,
+    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
+    StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName, TableStatus,
+    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, UpdateItemRequest,
+    UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
 };
 use stream_provider::{CursorName, CursorPosition, StreamDataType, StreamItem, StreamProvider};
 use tokio_postgres::types::ToSql;
@@ -680,10 +678,9 @@ impl StorageProvider for PostgresStorageProvider {
                         &split_item.key_attributes,
                         None,
                     )?;
-                    let key_absence_condition = is_key_absence_condition(
-                        condition.as_ref(),
-                        &table_info,
-                    ) && !return_old_on_condition_failure;
+                    let key_absence_condition =
+                        is_key_absence_condition(condition.as_ref(), &table_info)
+                            && !return_old_on_condition_failure;
                     let attributes_blob = if split_item.non_key_attributes.is_empty() {
                         "{}".to_string()
                     } else {

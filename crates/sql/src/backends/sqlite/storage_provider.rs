@@ -17,20 +17,22 @@ use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
     DeleteGlobalSecondaryIndexAction, DeleteItemRequest, DurablePointReadProof,
-    DurablePointReadRequest,
-    GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedTransactWriteItemsRequest,
-    GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes, PreparedBatchOperation,
-    PutItemRequest, PutItemResponse, QueryTableRequest, ReadSequenceConsistency,
-    ReplicationMutation,
-    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
-    TimestampMillis, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
-    UpdateTimeToLiveResponse, WireItem, WriteRequest,
+    DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
+    GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes,
+    PreparedBatchOperation, PutItemRequest, PutItemResponse, QueryTableRequest,
+    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
+    StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
+    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem, WriteRequest,
 };
 use tracing::{Span, field, instrument};
 
 use crate::{
+    backends::sqlite::{
+        delete_item_impl::DeleteItemInput, put_item_impl::PutItemInput,
+        update_item_impl::UpdateItemInput,
+    },
     billing_metrics::{
         WriteCostTally, attr_map_payload_bytes, record_read_cost, record_write_cost,
         serializable_payload_bytes,
@@ -441,24 +443,9 @@ impl StorageProvider for SQLiteStorageProvider {
         )
     )]
     async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
-        let return_old_on_condition_failure =
-            storage_types::return_values_on_condition_check_failure_all_old(
-                request.return_values_on_condition_check_failure.as_ref(),
-            );
         self.apply_gsi_write_pressure().await?;
         let bytes_written = compute_items_bytes(std::slice::from_ref(&request.item))?;
-        let response = self
-            .put_item_internal(
-                request.table_name,
-                request.item,
-                request.condition_expression,
-                request.expression_attribute_names,
-                request.expression_attribute_values,
-                request.return_values,
-                return_old_on_condition_failure,
-                request.aux_item_stream_ttl_hours,
-            )
-            .await?;
+        let response = self.put_item_internal(request).await?;
         self.maybe_apply_immediate_gsi_updates().await?;
         record_write(1, bytes_written);
         record_write_cost("put_item", "put", 1, bytes_written as u64);
@@ -478,16 +465,16 @@ impl StorageProvider for SQLiteStorageProvider {
         self.apply_gsi_write_pressure().await?;
         let bytes_written = item.payload_len();
         let response = self
-            .put_item_wire_internal(
+            .put_item_wire_internal(storage_types::PutItemEncodeRequest {
                 table_name,
                 item,
                 condition_expression,
                 expression_attribute_names,
                 expression_attribute_values,
                 return_values,
-                false,
+                return_old_on_condition_failure: false,
                 aux_item_stream_ttl_hours,
-            )
+            })
             .await?;
         self.maybe_apply_immediate_gsi_updates().await?;
         record_write(1, bytes_written);
@@ -561,23 +548,9 @@ impl StorageProvider for SQLiteStorageProvider {
             record_write(0, 0);
             return Ok(None);
         }
-        let return_old_on_condition_failure =
-            storage_types::return_values_on_condition_check_failure_all_old(
-                request.return_values_on_condition_check_failure.as_ref(),
-            );
         self.apply_gsi_write_pressure().await?;
         let key_bytes = attr_map_payload_bytes(&request.key);
-        let result = self
-            .delete_item_internal(
-                request.table_name,
-                request.key,
-                request.condition_expression,
-                request.expression_attribute_names,
-                request.expression_attribute_values,
-                return_old_on_condition_failure,
-                request.aux_item_stream_ttl_hours,
-            )
-            .await?;
+        let result = self.delete_item_internal(request).await?;
         self.maybe_apply_immediate_gsi_updates().await?;
         record_write(usize::from(result.is_some()), 0);
         record_write_cost("delete_item", "delete", 1, key_bytes);
@@ -612,14 +585,16 @@ impl StorageProvider for SQLiteStorageProvider {
         let old_value = with_transaction(&self.connection, move |sqlite| {
             Self::validate_durable_guard(&table_name, &key_attributes, &guard, sqlite)?;
             Self::do_put_item(
-                &table_name,
-                &item_for_write,
-                &condition,
                 sqlite,
-                immediate_gsi_consistency,
-                false,
-                None,
-                None,
+                PutItemInput {
+                    table_name: &table_name,
+                    item: &item_for_write,
+                    condition: &condition,
+                    immediate_gsi_consistency,
+                    return_old_on_condition_failure: false,
+                    replication: None,
+                    item_stream_ttl_hours: None,
+                },
             )
         })
         .await?;
@@ -651,14 +626,16 @@ impl StorageProvider for SQLiteStorageProvider {
         with_transaction(&self.connection, move |sqlite| {
             Self::validate_durable_guard(&table_name, &key, &guard, sqlite)?;
             Self::do_delete_item(
-                &table_name,
-                &key,
-                &condition,
                 sqlite,
-                immediate_gsi_consistency,
-                false,
-                None,
-                None,
+                DeleteItemInput {
+                    table_name: &table_name,
+                    key: &key,
+                    condition: &condition,
+                    immediate_gsi_consistency,
+                    return_old_on_condition_failure: false,
+                    replication: None,
+                    item_stream_ttl_hours: None,
+                },
             )
         })
         .await
@@ -703,14 +680,16 @@ impl StorageProvider for SQLiteStorageProvider {
                 };
                 Self::validate_durable_guard(&table_name, &key, &guard, sqlite)?;
                 Self::do_update_item(
-                    &operations,
-                    &condition,
-                    &table_name,
-                    &key,
                     sqlite,
-                    immediate_gsi_consistency,
-                    false,
-                    aux_item_stream_ttl_hours,
+                    UpdateItemInput {
+                        operations: &operations,
+                        condition: &condition,
+                        table_name: &table_name,
+                        key: &key,
+                        immediate_gsi_consistency,
+                        return_old_on_condition_failure: false,
+                        item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                    },
                 )
                 .map(|(old_item, new_item)| (old_item, new_item, response_fields))
             })
@@ -1224,14 +1203,16 @@ impl StorageProvider for SQLiteStorageProvider {
             let immediate_gsi_consistency = self.immediate_gsi_consistency;
             with_transaction(&self.connection, move |sqlite| {
                 crate::SQLiteStorageProvider::do_put_item(
-                    &table_name,
-                    &new_image,
-                    &None,
                     sqlite,
-                    immediate_gsi_consistency,
-                    false,
-                    Some(&metadata),
-                    None,
+                    PutItemInput {
+                        table_name: &table_name,
+                        item: &new_image,
+                        condition: &None,
+                        immediate_gsi_consistency,
+                        return_old_on_condition_failure: false,
+                        replication: Some(&metadata),
+                        item_stream_ttl_hours: None,
+                    },
                 )
                 .map(|_| ())
             })
@@ -1244,14 +1225,16 @@ impl StorageProvider for SQLiteStorageProvider {
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         with_transaction(&self.connection, move |sqlite| {
             crate::SQLiteStorageProvider::do_delete_item(
-                &table_name,
-                &mutation.key,
-                &None,
                 sqlite,
-                immediate_gsi_consistency,
-                false,
-                Some(&metadata),
-                None,
+                DeleteItemInput {
+                    table_name: &table_name,
+                    key: &mutation.key,
+                    condition: &None,
+                    immediate_gsi_consistency,
+                    return_old_on_condition_failure: false,
+                    replication: Some(&metadata),
+                    item_stream_ttl_hours: None,
+                },
             )
             .map(|_| ())
         })

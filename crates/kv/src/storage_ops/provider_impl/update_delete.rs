@@ -65,14 +65,20 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
     pub(super) async fn execute_delete_item(
         &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let return_old_on_condition_failure = return_values_on_condition_check_failure_all_old(
+            request.return_values_on_condition_check_failure.as_ref(),
+        );
+        let DeleteItemRequest {
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            aux_item_stream_ttl_hours,
+            ..
+        } = request;
         if key.is_empty() {
             record_write(0, 0);
             return Ok(None);

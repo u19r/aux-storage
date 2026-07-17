@@ -185,6 +185,60 @@ async fn prepare_queue_scale_in(
 }
 
 #[tokio::test]
+#[ignore = "requires a local FoundationDB cluster"]
+async fn given_prewarmed_queue_when_reading_attributes_then_marker_is_not_counted() {
+    let Some(store) = connect_fdb_store("fdb-queue-attributes").await else {
+        eprintln!("Skipping FoundationDB queue test: unable to connect to local cluster");
+        return;
+    };
+    let provider = SortedKvDbStorageProvider::new(store);
+    provider
+        .initialize()
+        .await
+        .expect("initialize queue provider");
+    let queue_url = format!("fdb-queue-attributes-{}", Uuid::now_v7());
+    let queue = provider
+        .create_queue(queue_definition(&queue_url))
+        .await
+        .expect("create queue");
+
+    let (stored, counts) = provider
+        .get_queue_with_message_counts(&queue.queue_url)
+        .await
+        .expect("read queue attributes")
+        .expect("queue exists");
+
+    assert_eq!(stored.queue_url, queue.queue_url);
+    assert_eq!(counts.visible, 0);
+    assert_eq!(counts.not_visible, 0);
+    assert_eq!(counts.delayed, 0);
+
+    provider
+        .send_message(new_message(&queue.queue_url, "visible"))
+        .await
+        .expect("send visible message");
+    let mut delayed = new_message(&queue.queue_url, "delayed");
+    delayed.visibility_timestamp = Some(TimestampMillis::from(
+        TimestampMillis::now().timestamp_millis() + 120_000,
+    ));
+    provider
+        .send_message(delayed)
+        .await
+        .expect("send delayed message");
+    let received = receive_until_message(&provider, &queue.queue_url).await;
+    assert_eq!(received.len(), 1);
+
+    let (_, counts) = provider
+        .get_queue_with_message_counts(&queue.queue_url)
+        .await
+        .expect("read populated queue attributes")
+        .expect("queue exists");
+    assert_eq!(counts.visible, 0);
+    assert_eq!(counts.not_visible, 1);
+    assert_eq!(counts.delayed, 1);
+}
+
+#[tokio::test]
 #[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
 async fn foundationdb_queue_send_receive_extend_delete() {
     let Some(store) = connect_fdb_store("fdb-queues").await else {

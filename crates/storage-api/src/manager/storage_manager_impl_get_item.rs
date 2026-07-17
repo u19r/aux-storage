@@ -1,7 +1,6 @@
 use http_error::HttpApiError;
 use storage_types::{
-    GetItemRequest, StorageEnum, StorageError, context::WrappedError,
-    validate_transact_key,
+    GetItemRequest, StorageEnum, StorageError, context::WrappedError, validate_transact_key,
 };
 
 use crate::{

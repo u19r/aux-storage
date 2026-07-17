@@ -10,41 +10,55 @@ use crate::{
     SQLiteStorageProvider, provider_core::write::plan_update_from_existing_item, utils::SqliteConn,
 };
 
+pub(crate) struct UpdateItemInput<'a> {
+    pub(crate) operations: &'a [BoundUpdateOperation<'a>],
+    pub(crate) condition: &'a Option<Condition>,
+    pub(crate) table_name: &'a TableName,
+    pub(crate) key: &'a KeyAttributes,
+    pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) return_old_on_condition_failure: bool,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
 impl SQLiteStorageProvider {
-    pub fn do_update_item(
-        operations: &[BoundUpdateOperation<'_>],
-        condition: &Option<Condition>,
-        table_name: &TableName,
-        key: &KeyAttributes,
+    pub(crate) fn do_update_item(
         sqlite: &SqliteConn<'_>,
-        immediate_gsi_consistency: bool,
-        return_old_on_condition_failure: bool,
-        item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: UpdateItemInput<'_>,
     ) -> StorageResult<(
         HashMap<String, AttributeValue>,
         HashMap<String, AttributeValue>,
     )> {
+        let UpdateItemInput {
+            operations,
+            condition,
+            table_name,
+            key,
+            immediate_gsi_consistency,
+            return_old_on_condition_failure,
+            item_stream_ttl_hours,
+        } = input;
         // First, get the item to return it if it exists
         let existing_item = Self::do_get_item(table_name, key, sqlite)?;
-        let (item_to_update, updated_item) =
-            plan_update_from_existing_item(
-                existing_item,
-                key,
-                operations,
-                condition.as_ref(),
-                return_old_on_condition_failure,
-            )?;
+        let (item_to_update, updated_item) = plan_update_from_existing_item(
+            existing_item,
+            key,
+            operations,
+            condition.as_ref(),
+            return_old_on_condition_failure,
+        )?;
 
         // Try to put the updated item
         let _ = Self::do_put_item(
-            table_name,
-            &updated_item,
-            &None,
             sqlite,
-            immediate_gsi_consistency,
-            false,
-            None,
-            item_stream_ttl_hours,
+            crate::backends::sqlite::put_item_impl::PutItemInput {
+                table_name,
+                item: &updated_item,
+                condition: &None,
+                immediate_gsi_consistency,
+                return_old_on_condition_failure: false,
+                replication: None,
+                item_stream_ttl_hours,
+            },
         )?;
 
         Ok((item_to_update, updated_item))

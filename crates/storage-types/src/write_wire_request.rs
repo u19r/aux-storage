@@ -4,9 +4,9 @@ use typed_builder::TypedBuilder;
 
 use crate::{
     AllOld, AttributeValue, BatchWriteItemRequest, DeleteRequest, PutRequest,
-    StreamRetentionDuration, TableName,
-    TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
-    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem, WriteRequest,
+    StreamRetentionDuration, TableName, TransactConditionCheckRequest, TransactDeleteRequest,
+    TransactPutRequest, TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest,
+    WireItem, WriteRequest,
 };
 
 #[derive(Debug, Clone)]

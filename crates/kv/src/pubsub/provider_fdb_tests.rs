@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
@@ -37,42 +37,69 @@ async fn foundationdb_pubsub_provider_persists_and_claims_delivery_records() {
         })
         .await
         .unwrap();
-    let record = DeliveryRecord {
-        id: DeliveryRecordId(format!(
-            "{}:{}",
-            subscription.subscription_arn,
-            Uuid::now_v7()
-        )),
-        kind: DeliveryRecordKind::Notification,
-        message_id: PubsubMessageId::new(),
-        subscription_arn: subscription.subscription_arn,
-        subscription: None,
-        message_body: None,
-        subject: None,
-        message_attributes: Default::default(),
-        target: DeliveryTarget::BuiltIn,
-        status: DeliveryStatus::Pending,
-        attempts: 0,
-        next_attempt_at: None,
-        lease_owner: None,
-        lease_expires_at: None,
-        last_error: None,
-        created_at: TimestampMillis::from(1_000),
-        updated_at: TimestampMillis::from(1_000),
-    };
-    provider.put_delivery_record(record.clone()).await.unwrap();
+    let records = (0..32)
+        .map(|_| DeliveryRecord {
+            id: DeliveryRecordId(format!(
+                "{}:{}",
+                subscription.subscription_arn,
+                Uuid::now_v7()
+            )),
+            kind: DeliveryRecordKind::Notification,
+            message_id: PubsubMessageId::new(),
+            subscription_arn: subscription.subscription_arn.clone(),
+            subscription: None,
+            message_body: None,
+            subject: None,
+            message_attributes: Default::default(),
+            target: DeliveryTarget::BuiltIn,
+            status: DeliveryStatus::Pending,
+            attempts: 0,
+            next_attempt_at: None,
+            lease_owner: None,
+            lease_expires_at: None,
+            last_error: None,
+            created_at: TimestampMillis::from(1_000),
+            updated_at: TimestampMillis::from(1_000),
+        })
+        .collect::<Vec<_>>();
+    for record in &records {
+        provider.put_delivery_record(record.clone()).await.unwrap();
+    }
 
+    let started = Instant::now();
     let claim = provider
         .claim_delivery_records(ClaimDeliveryRecordsRequest {
             owner: "fdb-worker".to_string(),
             now: TimestampMillis::from(2_000),
             lease_expires_at: TimestampMillis::from(3_000),
-            limit: 10,
+            limit: records.len(),
         })
         .await
         .unwrap();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "claimed {} FoundationDB records in {elapsed:?}",
+        claim.records.len()
+    );
 
-    assert_eq!(claim.records.len(), 1);
-    assert_eq!(claim.records[0].id, record.id);
-    assert_eq!(claim.records[0].lease_owner.as_deref(), Some("fdb-worker"));
+    let mut expected_ids = records
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    expected_ids.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(claim.records.len(), expected_ids.len());
+    assert_eq!(
+        claim
+            .records
+            .iter()
+            .map(|record| &record.id)
+            .collect::<Vec<_>>(),
+        expected_ids.iter().collect::<Vec<_>>()
+    );
+    assert!(
+        claim
+            .records
+            .iter()
+            .all(|record| record.lease_owner.as_deref() == Some("fdb-worker"))
+    );
 }

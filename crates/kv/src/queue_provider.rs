@@ -23,11 +23,10 @@ use crate::{
         ResolvedPartitionFamily, default_partition_family_config, find_partition_by_id,
         initial_partition_infos, ordered_log_hash, parse_partition_family_config,
         parse_partition_info, partition_family_config_key, partition_info_prefix,
-        queue_body_prefix_with_slot,
-        queue_checkpoint_key_with_slot, queue_family_component, queue_partition_marker_bytes,
-        queue_partition_marker_key, queue_payload_key_with_slot, queue_ready_hint_bytes,
-        queue_ready_hint_key, queue_ready_key_with_slot, queue_ready_prefix_with_slot,
-        queue_state_key_with_slot, queue_wake_key, wake_value_bytes,
+        queue_body_prefix_with_slot, queue_checkpoint_key_with_slot, queue_family_component,
+        queue_partition_marker_bytes, queue_partition_marker_key, queue_payload_key_with_slot,
+        queue_ready_hint_bytes, queue_ready_hint_key, queue_ready_key_with_slot,
+        queue_ready_prefix_with_slot, queue_state_key_with_slot, queue_wake_key, wake_value_bytes,
     },
     queue::{
         PartitionedQueueMessageWrite, QueueClaimRange, QueueKvStore, QueuePrewarmPartition,
@@ -39,7 +38,9 @@ use crate::{
             QUEUE_PREWARM_MESSAGE_ID, RECEIVE_SCAN_MAX_LIMIT, RECEIVE_SCAN_MIN_LIMIT,
         },
         record_queue_storage_operation, set_queue_storage_gauge,
-        storage::{queue_payload_delete_range, queue_payload_is_chunk_key},
+        storage::{
+            is_queue_prewarm_marker_bytes, queue_payload_delete_range, queue_payload_is_chunk_key,
+        },
     },
     sorted_kv_store::{DirectWriteOperation, RawKey},
 };
@@ -182,21 +183,16 @@ fn queue_url_with_storage_id(queue_url: &str, queue_id: QueueStorageId) -> Strin
 pub(crate) fn queue_storage_id_from_url(queue_url: &str) -> QueueResult<QueueStorageId> {
     let mut segments = queue_url.rsplit('/');
     let _queue_name = segments.next();
-    let encoded_id = segments.next().ok_or_else(|| {
-        QueueError::validation(
-            QueueValidationKind::InvalidQueueUrlFormat,
-        )
-    })?;
+    let encoded_id = segments
+        .next()
+        .ok_or_else(|| QueueError::validation(QueueValidationKind::InvalidQueueUrlFormat))?;
     if encoded_id.len() != 12 {
         return Err(QueueError::validation(
             QueueValidationKind::InvalidQueueUrlFormat,
         ));
     }
-    let value = u64::from_str_radix(encoded_id, 16).map_err(|_| {
-        QueueError::validation(
-            QueueValidationKind::InvalidQueueUrlFormat,
-        )
-    })?;
+    let value = u64::from_str_radix(encoded_id, 16)
+        .map_err(|_| QueueError::validation(QueueValidationKind::InvalidQueueUrlFormat))?;
     queue_storage_id(value).map_err(QueueError::from)
 }
 
@@ -850,10 +846,8 @@ where S: QueueKvStore + 'static
         let state_bytes = storage_types::storage_serde::to_bytes(&state)?;
         let payload_bytes =
             partitioned_body_bytes(message.body, message.message_attributes, message.created_at)?;
-        let payload_record_bytes = crate::queue::storage::queue_payload_record_bytes(
-            payload_bytes.len(),
-        )?
-        .map(Arc::from);
+        let payload_record_bytes =
+            crate::queue::storage::queue_payload_record_bytes(payload_bytes.len())?.map(Arc::from);
         Ok(PreparedPartitionedQueueMessage {
             message_id: message.message_id,
             message_id_hex: message.message_id.to_string(),
@@ -1389,26 +1383,16 @@ where S: QueueKvStore + 'static
         let queue_id = queue_storage_id_from_url(queue_url)?;
         let family_component = queue_family_component(queue_url);
         let metadata_key = compact::queue_metadata_key(queue_id);
-        let config_key = partition_family_config_key(
-            PartitionFamilyKind::StandardQueue,
-            &family_component,
-        );
-        let partition_prefix = partition_info_prefix(
-            PartitionFamilyKind::StandardQueue,
-            &family_component,
-        );
+        let config_key =
+            partition_family_config_key(PartitionFamilyKind::StandardQueue, &family_component);
+        let partition_prefix =
+            partition_info_prefix(PartitionFamilyKind::StandardQueue, &family_component);
         let partition_end = increment_bytes(partition_prefix.clone());
         let read_context = self.kv_store.begin_read_context().await?;
         let (metadata, config, partition_values) = tokio::try_join!(
             read_context.get(&metadata_key, true),
             read_context.get(&config_key, true),
-            read_context.get_range_values(
-                &partition_prefix,
-                &partition_end,
-                None,
-                None,
-                true,
-            ),
+            read_context.get_range_values(&partition_prefix, &partition_end, None, None, true,),
         )?;
         let Some(metadata) = metadata else {
             return Ok(None);
@@ -1455,6 +1439,9 @@ where S: QueueKvStore + 'static
         .await?;
         let mut counts = QueueMessageCounts::default();
         for state in state_ranges.into_iter().flat_map(|range| range.values) {
+            if is_queue_prewarm_marker_bytes(queue_url, &state) {
+                continue;
+            }
             let state = storage_types::storage_serde::from_bytes::<PartitionedQueueState>(&state)?;
             if state.visibility_timestamp <= now {
                 counts.visible = counts.visible.saturating_add(1);
@@ -1907,8 +1894,8 @@ where S: QueueKvStore + 'static
             }
             let route = queue_partition_route_for_id(&context.routing_state, handle.partition_id)
                 .ok_or_else(|| {
-                    QueueError::internal(QueueInternalKind::MissingQueuePartitionState)
-                })?;
+                QueueError::internal(QueueInternalKind::MissingQueuePartitionState)
+            })?;
             let queue_id = context.queue_id;
             let visibility_key =
                 MessageVisibilityKey(visibility_key(visibility_timestamp, &message_id));

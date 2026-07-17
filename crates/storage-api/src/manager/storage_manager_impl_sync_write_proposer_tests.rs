@@ -244,9 +244,13 @@ async fn disabled_sync_proposer_does_not_construct_put_or_update_payloads() {
     let update = realistic_update_request();
 
     let eager_put = measure_eager_clone("put_eager_clone", &put, SyncWriteRequest::PutItem);
-    let lazy_put =
-        measure_lazy_disabled(&manager, "put_lazy_disabled", &put, SyncWriteRequest::PutItem)
-            .await;
+    let lazy_put = measure_lazy_disabled(
+        &manager,
+        "put_lazy_disabled",
+        &put,
+        SyncWriteRequest::PutItem,
+    )
+    .await;
     let eager_update =
         measure_eager_clone("update_eager_clone", &update, SyncWriteRequest::UpdateItem);
     let lazy_update = measure_lazy_disabled(

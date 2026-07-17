@@ -11,9 +11,8 @@ use storage_provider::ListChangeIndexMarkersRequest;
 use storage_types::{
     BatchGetItemRequest, DeleteItemRequest, DescribeStreamRequest, DescribeTimeToLiveRequest,
     DynamoRequestValidate, GetItemRequest, GetRecordsRequest, GetShardIteratorRequest,
-    ListStreamsRequest, PutItemRequest, QueryRequest, ReadSequenceRequest,
-    TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
-    UpdateTimeToLiveRequest,
+    ListStreamsRequest, PutItemRequest, QueryRequest, ReadSequenceRequest, TransactGetItemsRequest,
+    TransactWriteItemsRequest, UpdateItemRequest, UpdateTimeToLiveRequest,
 };
 
 use crate::{
@@ -472,9 +471,7 @@ mod decode_perf_tests {
         br#"{"TableName":"table","Item":{"pk":{"S":"value"},"data":{"S":"payload"}}}"#;
 
     fn direct<T>(body: &[u8]) -> T
-    where
-        T: serde::de::DeserializeOwned + DynamoRequestValidate,
-    {
+    where T: serde::de::DeserializeOwned + DynamoRequestValidate {
         let request: T = serde_json::from_slice(body).expect("direct request decode");
         request
             .validate_for_dynamodb()

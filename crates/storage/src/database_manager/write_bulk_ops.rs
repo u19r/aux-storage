@@ -671,10 +671,8 @@ impl DatabaseManager {
             let response = record_storage_operation_for_target(
                 "transact_write_items",
                 dispatch_key.target_role,
-                provider.transact_write_items_encode_with_retry(
-                    request_for_connection,
-                    retry_policy,
-                ),
+                provider
+                    .transact_write_items_encode_with_retry(request_for_connection, retry_policy),
             )
             .await?;
             if primary_response.is_none() {

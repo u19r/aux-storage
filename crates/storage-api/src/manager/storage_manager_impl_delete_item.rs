@@ -6,9 +6,7 @@ use storage_types::{AllOld, DeleteItemRequest, DeleteItemResponse};
 use crate::{
     manager::{
         StorageApiManagerImpl,
-        storage_manager_impl_condition_failure::{
-            should_return_old_item_on_condition_failure,
-        },
+        storage_manager_impl_condition_failure::should_return_old_item_on_condition_failure,
         storage_manager_impl_sync_write_proposer::sync_response_at,
     },
     types::Response,
@@ -50,14 +48,14 @@ impl StorageApiManagerImpl {
 
         let return_deleted_item = matches!(request.return_values, Some(AllOld::AllOld));
         let input = DeleteItemInput {
-                table_name: request.table_name,
-                key: request.key,
-                condition_expression: request.condition_expression,
-                expression_attribute_names: request.expression_attribute_names,
-                expression_attribute_values: request.expression_attribute_values,
-                return_old_on_condition_failure,
-                aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
-            };
+            table_name: request.table_name,
+            key: request.key,
+            condition_expression: request.condition_expression,
+            expression_attribute_names: request.expression_attribute_names,
+            expression_attribute_values: request.expression_attribute_values,
+            return_old_on_condition_failure,
+            aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+        };
         let deleted_item = self
             .db()
             .delete_item_with_resolved_operation(operation, input)

@@ -10,8 +10,8 @@ use storage_types::{
     GuardedPutItemRequest, GuardedUpdateItemRequest, KeyAttributes, KeyRef, PutItemEncodeRequest,
     PutItemRequest, PutItemResponse, ReturnValuesOldNewUpdated, StorageEnum, StorageError,
     StorageResult, TableName, TableNamespace, UpdateItemRequest, UpdateItemResponse, WireItem,
-    WriteRetryPolicy, expr_names_to_map,
-    context::WrappedError as _, expr_values_to_map, validate_expression_attribute_usage,
+    WriteRetryPolicy, context::WrappedError as _, expr_names_to_map, expr_values_to_map,
+    validate_expression_attribute_usage,
 };
 
 use crate::{
@@ -19,10 +19,10 @@ use crate::{
     database_manager::{
         DatabaseManager, DeleteItemInput, PreparedCacheWrite, PutItemInput, PutItemPayload,
         ResolvedStorageOperation, UpdateItemInput, WriteTargetSet,
-        guarded_write_coordinator as guarded_write,
-        record_storage_operation, record_storage_operation_for_target,
-        refresh_existing_updated_at_on_put_payload, stamp_updated_at_on_put_payload,
-        update_item_return_values_rewritable_from_post_image, validate_update_expression_usage,
+        guarded_write_coordinator as guarded_write, record_storage_operation,
+        record_storage_operation_for_target, refresh_existing_updated_at_on_put_payload,
+        stamp_updated_at_on_put_payload, update_item_return_values_rewritable_from_post_image,
+        validate_update_expression_usage,
     },
     namespace_routing::{NamespaceRequestRewriter, NamespaceRoute, NamespaceStorageMode},
     updated_at_apply::inject_updated_at_into_update_expression,
@@ -66,9 +66,7 @@ fn condition_failure_from_preimage(
     item: Option<HashMap<String, AttributeValue>>,
     return_old: bool,
 ) -> StorageError {
-    if return_old
-        && let Some(item) = item
-    {
+    if return_old && let Some(item) = item {
         return StorageEnum::ConditionalCheckFailedWithItem { item: item.into() }.into();
     }
     StorageEnum::ConditionalCheckFailed.into()
@@ -171,11 +169,7 @@ impl DatabaseManager {
             &logical_item,
         )?;
         let cache_effects = self
-            .plan_put_item_cache_effects(
-                &table_name,
-                &operation,
-                &logical_item,
-            )
+            .plan_put_item_cache_effects(&table_name, &operation, &logical_item)
             .await?;
         Ok(PreparedPutItem {
             operation,
@@ -268,10 +262,16 @@ impl DatabaseManager {
         prepared: PreparedPutItem,
         retry_policy: WriteRetryPolicy,
     ) -> StorageResult<PutItemResponse> {
+        if retry_policy.max_attempts() == 1
+            && prepared.aux_item_stream_ttl_hours.is_none()
+            && let Some(response) = self.try_cached_guarded_put_item(&prepared).await?
+        {
+            return Ok(response);
+        }
         let PreparedPutItem {
             operation,
             item,
-            logical_item,
+            logical_item: _,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -281,36 +281,21 @@ impl DatabaseManager {
             cache_effects,
         } = prepared;
         let table_name = operation.logical_table_name;
-        if retry_policy.max_attempts() == 1
-            && aux_item_stream_ttl_hours.is_none()
-            && let Some(response) = self
-                .try_cached_guarded_put_item(
-                    &table_name,
-                    &logical_item,
-                    cache_effects.clone(),
-                    condition_expression.clone(),
-                    expression_attribute_names.clone(),
-                    expression_attribute_values.clone(),
-                    return_values.clone(),
-                    return_old_on_condition_failure,
-                )
-                .await?
-        {
-            return Ok(response);
-        }
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
                 let response = self
                     .execute_put_item_payload(
-                        table_name,
-                        item,
-                        condition_expression,
-                        expression_attribute_names,
-                        expression_attribute_values,
-                        return_values,
-                        return_old_on_condition_failure,
-                        aux_item_stream_ttl_hours,
+                        PutItemInput {
+                            table_name,
+                            item,
+                            condition_expression,
+                            expression_attribute_names,
+                            expression_attribute_values,
+                            return_values,
+                            return_old_on_condition_failure,
+                            aux_item_stream_ttl_hours,
+                        },
                         retry_policy,
                     )
                     .await?;
@@ -323,19 +308,21 @@ impl DatabaseManager {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_put_item_payload(
         &self,
-        table_name: TableName,
-        item: PutItemPayload,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+        input: PutItemInput,
         retry_policy: WriteRetryPolicy,
     ) -> StorageResult<PutItemResponse> {
+        let PutItemInput {
+            table_name,
+            item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            return_old_on_condition_failure,
+            aux_item_stream_ttl_hours,
+        } = input;
         match item {
             PutItemPayload::AttributeMap(item) => {
                 record_storage_operation(
@@ -353,8 +340,7 @@ impl DatabaseManager {
                             return_consumed_capacity: None,
                             return_item_collection_metrics: None,
                             return_values_on_condition_check_failure:
-                                return_old_on_condition_failure
-                                    .then(|| "ALL_OLD".to_string()),
+                                return_old_on_condition_failure.then(|| "ALL_OLD".to_string()),
                             aux_item_stream_ttl_hours,
                         },
                         retry_policy,
@@ -460,8 +446,7 @@ impl DatabaseManager {
                                             table_name,
                                             item: item?,
                                             condition_expression: condition_expression?,
-                                            expression_attribute_names:
-                                                expression_attribute_names?,
+                                            expression_attribute_names: expression_attribute_names?,
                                             expression_attribute_values:
                                                 expression_attribute_values?,
                                             expected: None,
@@ -472,8 +457,7 @@ impl DatabaseManager {
                                             return_values_on_condition_check_failure:
                                                 return_old_on_condition_failure
                                                     .then(|| "ALL_OLD".to_string()),
-                                            aux_item_stream_ttl_hours:
-                                                aux_item_stream_ttl_hours?,
+                                            aux_item_stream_ttl_hours: aux_item_stream_ttl_hours?,
                                         },
                                         retry_policy,
                                     ),
@@ -552,11 +536,7 @@ impl DatabaseManager {
         storage_types::validate_key_attributes_for_schema(&operation.table_info.key_schema, &key)?;
         let logical_key = key.clone();
         let cache_effects = self
-            .plan_delete_item_cache_effects(
-                &table_name,
-                &operation,
-                &logical_key,
-            )
+            .plan_delete_item_cache_effects(&table_name, &operation, &logical_key)
             .await?;
         Ok(PreparedDeleteItem {
             operation,
@@ -660,13 +640,16 @@ impl DatabaseManager {
         if aux_item_stream_ttl_hours.is_none()
             && let Some(response) = self
                 .try_cached_guarded_delete_item(
-                    &table_name,
-                    &logical_key,
+                    DeleteItemInput {
+                        table_name: table_name.clone(),
+                        key: logical_key.clone(),
+                        condition_expression: condition_expression.clone(),
+                        expression_attribute_names: expression_attribute_names.clone(),
+                        expression_attribute_values: expression_attribute_values.clone(),
+                        return_old_on_condition_failure,
+                        aux_item_stream_ttl_hours: None,
+                    },
                     cache_effects.clone(),
-                    condition_expression.clone(),
-                    expression_attribute_names.clone(),
-                    expression_attribute_values.clone(),
-                    return_old_on_condition_failure,
                 )
                 .await?
         {
@@ -677,21 +660,22 @@ impl DatabaseManager {
             || async {
                 let response = record_storage_operation(
                     "delete_item",
-                    self.storage.delete_item_request(storage_types::DeleteItemRequest {
-                        table_name,
-                        key,
-                        condition_expression,
-                        expression_attribute_names,
-                        expression_attribute_values,
-                        expected: None,
-                        conditional_operator: None,
-                        return_values: None,
-                        return_consumed_capacity: None,
-                        return_item_collection_metrics: None,
-                        return_values_on_condition_check_failure: return_old_on_condition_failure
-                            .then(|| "ALL_OLD".to_string()),
-                        aux_item_stream_ttl_hours,
-                    }),
+                    self.storage
+                        .delete_item_request(storage_types::DeleteItemRequest {
+                            table_name,
+                            key,
+                            condition_expression,
+                            expression_attribute_names,
+                            expression_attribute_values,
+                            expected: None,
+                            conditional_operator: None,
+                            return_values: None,
+                            return_consumed_capacity: None,
+                            return_item_collection_metrics: None,
+                            return_values_on_condition_check_failure:
+                                return_old_on_condition_failure.then(|| "ALL_OLD".to_string()),
+                            aux_item_stream_ttl_hours,
+                        }),
                 )
                 .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
@@ -772,8 +756,7 @@ impl DatabaseManager {
                                             table_name,
                                             key: key?,
                                             condition_expression: condition_expression?,
-                                            expression_attribute_names:
-                                                expression_attribute_names?,
+                                            expression_attribute_names: expression_attribute_names?,
                                             expression_attribute_values:
                                                 expression_attribute_values?,
                                             expected: None,
@@ -938,11 +921,7 @@ impl DatabaseManager {
                 .build()
         };
         let prepared_cache_write = self
-            .prepare_update_item_cache_write(
-                &request.table_name,
-                &operation,
-                &request.key,
-            )
+            .prepare_update_item_cache_write(&request.table_name, &operation, &request.key)
             .await?;
         Ok(PreparedUpdateItem {
             operation,
@@ -1220,21 +1199,22 @@ impl DatabaseManager {
         Ok(self.empty_cache_write_effects())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "helper mirrors guarded put request and cache effect inputs"
-    )]
     async fn try_cached_guarded_put_item(
         &self,
-        table_name: &TableName,
-        logical_item: &HashMap<String, AttributeValue>,
-        cache_effects: storage_cache::RuntimeWriteEffects,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        return_old_on_condition_failure: bool,
+        prepared: &PreparedPutItem,
     ) -> StorageResult<Option<PutItemResponse>> {
+        let PreparedPutItem {
+            operation,
+            logical_item,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+            return_old_on_condition_failure,
+            cache_effects,
+            ..
+        } = prepared;
+        let table_name = &operation.logical_table_name;
         if !self.storage.supports_guarded_writes() {
             guarded_write::record_unsupported_fallback("put_item");
             return Ok(None);
@@ -1265,28 +1245,28 @@ impl DatabaseManager {
             &preimage.item,
         )? {
             self.cache_services
-                .prepare_write_intents(&cache_effects)
+                .prepare_write_intents(cache_effects)
                 .await?;
             self.cache_services
-                .release_write_intents(&cache_effects)
+                .release_write_intents(cache_effects)
                 .await?;
             return Err(condition_failure_from_preimage(
                 preimage.item,
-                return_old_on_condition_failure,
+                *return_old_on_condition_failure,
             ));
         }
 
         self.cache_services
-            .prepare_write_intents(&cache_effects)
+            .prepare_write_intents(cache_effects)
             .await?;
         let guarded = GuardedPutItemRequest {
             table_name: table_name.clone(),
             item: logical_item.clone(),
             guard: preimage.guard,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
+            condition_expression: condition_expression.clone(),
+            expression_attribute_names: expression_attribute_names.clone(),
+            expression_attribute_values: expression_attribute_values.clone(),
+            return_values: return_values.clone(),
         };
         let response = match record_storage_operation(
             "guarded_put_item",
@@ -1298,13 +1278,13 @@ impl DatabaseManager {
             Err(error) if guarded_write::should_fallback(&error) => {
                 guarded_write::record_fallback("put_item", &error);
                 self.cache_services
-                    .release_write_intents(&cache_effects)
+                    .release_write_intents(cache_effects)
                     .await?;
                 return Ok(None);
             }
             Err(error) => {
                 self.cache_services
-                    .release_write_intents(&cache_effects)
+                    .release_write_intents(cache_effects)
                     .await?;
                 return Err(error);
             }
@@ -1312,21 +1292,25 @@ impl DatabaseManager {
         self.maybe_pause_after_storage_write_for_test().await;
         self.maybe_run_gsi_maintenance().await;
         self.cache_services
-            .apply_write_effects(&cache_effects)
+            .apply_write_effects(cache_effects)
             .await?;
         Ok(Some(response))
     }
 
     async fn try_cached_guarded_delete_item(
         &self,
-        table_name: &TableName,
-        logical_key: &KeyAttributes,
+        input: DeleteItemInput,
         cache_effects: storage_cache::RuntimeWriteEffects,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_old_on_condition_failure: bool,
     ) -> StorageResult<Option<Option<HashMap<String, AttributeValue>>>> {
+        let DeleteItemInput {
+            table_name,
+            key: logical_key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_old_on_condition_failure,
+            ..
+        } = input;
         if !self.storage.supports_guarded_writes() {
             guarded_write::record_unsupported_fallback("delete_item");
             return Ok(None);
@@ -1366,8 +1350,8 @@ impl DatabaseManager {
             .prepare_write_intents(&cache_effects)
             .await?;
         let guarded = GuardedDeleteItemRequest {
-            table_name: table_name.clone(),
-            key: logical_key.clone(),
+            table_name,
+            key: logical_key,
             guard: preimage.guard,
             condition_expression,
             expression_attribute_names,

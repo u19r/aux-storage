@@ -22,9 +22,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let metadata_for_transform = Arc::clone(&metadata);
         let read_key_for_transform = read_key.clone();
         let adapter: AtomicTableWriteTransform = Arc::new(move |current_bytes| {
-            let current = current_bytes
-                .map(deserialize_item_from_bytes)
-                .transpose()?;
+            let current = current_bytes.map(deserialize_item_from_bytes).transpose()?;
             match transform(current.as_ref())? {
                 AtomicItemWriteDecision::NoWrite { output } => {
                     Ok(AtomicTableWriteDecision::NoWrite { output })
@@ -50,10 +48,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                                 &metadata_for_transform.table_info.key_schema,
                                 &item,
                             )?;
-                            let transformed_key = table_keys::item_key(
-                                &metadata_for_transform.identity,
-                                &item_key,
-                            )?;
+                            let transformed_key =
+                                table_keys::item_key(&metadata_for_transform.identity, &item_key)?;
                             if transformed_key != read_key_for_transform {
                                 return Err(StorageError::validation(
                                     "atomic item transform changed the primary item key",

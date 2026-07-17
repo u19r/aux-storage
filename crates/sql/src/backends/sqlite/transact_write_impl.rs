@@ -10,6 +10,11 @@ use tracing::warn;
 
 use crate::{
     SQLiteStorageProvider,
+    backends::sqlite::{
+        delete_item_impl::DeleteItemInput,
+        put_item_impl::{PutItemInput, PutWireItemInput},
+        update_item_impl::UpdateItemInput,
+    },
     provider_core::transaction::{
         TransactionKeyPreflight, all_old, conditional_check_failed_reason,
         preflight_transact_item_key_with_table_info, transact_item_table_name,
@@ -82,17 +87,22 @@ impl SQLiteStorageProvider {
         }
 
         Self::do_put_wire_item(
-            &put_request.table_name,
-            &put_request.item,
-            &None,
             sqlite,
-            immediate_gsi_consistency,
-            false,
-            storage_types::return_values_on_condition_check_failure_all_old(
-                put_request.return_values_on_condition_check_failure.as_ref(),
-            ),
-            None,
-            put_request.aux_item_stream_ttl_hours,
+            PutWireItemInput {
+                table_name: &put_request.table_name,
+                item: &put_request.item,
+                condition: &None,
+                immediate_gsi_consistency,
+                should_return_old: false,
+                return_old_on_condition_failure:
+                    storage_types::return_values_on_condition_check_failure_all_old(
+                        put_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    ),
+                replication: None,
+                item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+            },
         )
         .map(|_| ())
     }
@@ -148,16 +158,21 @@ impl SQLiteStorageProvider {
         }
 
         Self::do_put_item(
-            &put_request.table_name,
-            &put_request.item,
-            &None,
             sqlite,
-            immediate_gsi_consistency,
-            storage_types::return_values_on_condition_check_failure_all_old(
-                put_request.return_values_on_condition_check_failure.as_ref(),
-            ),
-            None,
-            put_request.aux_item_stream_ttl_hours,
+            PutItemInput {
+                table_name: &put_request.table_name,
+                item: &put_request.item,
+                condition: &None,
+                immediate_gsi_consistency,
+                return_old_on_condition_failure:
+                    storage_types::return_values_on_condition_check_failure_all_old(
+                        put_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    ),
+                replication: None,
+                item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+            },
         )
         .map(|_| ())
     }
@@ -182,16 +197,21 @@ impl SQLiteStorageProvider {
             .flatten();
 
         let result = Self::do_update_item(
-            &operations,
-            &condition,
-            &update_request.table_name,
-            &update_request.key,
             sqlite,
-            immediate_gsi_consistency,
-            storage_types::return_values_on_condition_check_failure_all_old(
-                update_request.return_values_on_condition_check_failure.as_ref(),
-            ),
-            update_request.aux_item_stream_ttl_hours,
+            UpdateItemInput {
+                operations: &operations,
+                condition: &condition,
+                table_name: &update_request.table_name,
+                key: &update_request.key,
+                immediate_gsi_consistency,
+                return_old_on_condition_failure:
+                    storage_types::return_values_on_condition_check_failure_all_old(
+                        update_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    ),
+                item_stream_ttl_hours: update_request.aux_item_stream_ttl_hours,
+            },
         );
         if let Err(error) = result {
             if matches!(
@@ -269,16 +289,21 @@ impl SQLiteStorageProvider {
         }
 
         Self::do_delete_item(
-            &delete_request.table_name,
-            &delete_request.key,
-            &None,
             sqlite,
-            immediate_gsi_consistency,
-            storage_types::return_values_on_condition_check_failure_all_old(
-                delete_request.return_values_on_condition_check_failure.as_ref(),
-            ),
-            None,
-            delete_request.aux_item_stream_ttl_hours,
+            DeleteItemInput {
+                table_name: &delete_request.table_name,
+                key: &delete_request.key,
+                condition: &None,
+                immediate_gsi_consistency,
+                return_old_on_condition_failure:
+                    storage_types::return_values_on_condition_check_failure_all_old(
+                        delete_request
+                            .return_values_on_condition_check_failure
+                            .as_ref(),
+                    ),
+                replication: None,
+                item_stream_ttl_hours: delete_request.aux_item_stream_ttl_hours,
+            },
         )
         .map(|_| ())
     }

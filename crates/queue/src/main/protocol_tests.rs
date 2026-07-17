@@ -6,8 +6,8 @@ use http_error::HttpApiError;
 use serde_json::json;
 
 use crate::protocol::{
-    QueueAction, QueueProtocol, QueueRequest, add_common_headers, api_error_response, decode_request,
-    error_response, ok_response,
+    QueueAction, QueueProtocol, QueueRequest, add_common_headers, api_error_response,
+    decode_request, error_response, ok_response,
 };
 
 fn query_headers() -> HeaderMap {

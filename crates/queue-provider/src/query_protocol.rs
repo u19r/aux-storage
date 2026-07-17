@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-pub fn query_fields_to_json(
-    fields: impl IntoIterator<Item = (String, String)>,
-) -> Value {
+pub fn query_fields_to_json(fields: impl IntoIterator<Item = (String, String)>) -> Value {
     let mut payload = serde_json::Map::new();
     let mut attributes = BTreeMap::<usize, (Option<String>, Option<String>)>::new();
     let mut attribute_names = BTreeMap::new();

@@ -6,9 +6,9 @@ use std::{
 use futures::future::join_all;
 use http_error::HttpApiError;
 use storage_types::{
-    AttributeMap, BatchGetItemRequest, BatchGetItemResponse, BatchGetWireItemResponse,
-    AttributeValue, KeyAttributes, KeySchemaElement, KeysAndAttributes, StorageEnum, StorageError,
-    StoredTableInfo, context::WrappedError as _, normalize_dynamodb_number_for_write,
+    AttributeMap, AttributeValue, BatchGetItemRequest, BatchGetItemResponse,
+    BatchGetWireItemResponse, KeyAttributes, KeySchemaElement, KeysAndAttributes, StorageEnum,
+    StorageError, StoredTableInfo, context::WrappedError as _, normalize_dynamodb_number_for_write,
     validate_key_attributes_for_schema, validate_transact_key,
 };
 
@@ -29,12 +29,15 @@ impl StorageApiManagerImpl {
         request: BatchGetItemRequest,
     ) -> Result<Response, HttpApiError> {
         let request_shape = request.clone();
-        let resolutions = join_all(request_shape.request_items.keys().cloned().map(|table_name| {
-            async move {
-                let operation = self.db().resolve_storage_operation(table_name.clone()).await;
+        let resolutions = join_all(request_shape.request_items.keys().cloned().map(
+            |table_name| async move {
+                let operation = self
+                    .db()
+                    .resolve_storage_operation(table_name.clone())
+                    .await;
                 (table_name, operation)
-            }
-        }))
+            },
+        ))
         .await;
         let mut operations = Vec::with_capacity(resolutions.len());
         for (table_name, operation) in resolutions {

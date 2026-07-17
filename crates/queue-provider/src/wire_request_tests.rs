@@ -7,13 +7,14 @@ use std::{
 use alloc_counter::AllocationGuard;
 
 use crate::{
-    DeleteMessageRequest, IntoValidatedQueueRequest, QueueAction, QueueRequest, QueueRequestValidation,
-    QueueResult, ReceiveMessageRequest, SendMessageRequest, ValidatedQueueRequest,
-    decode_json_request,
+    DeleteMessageRequest, IntoValidatedQueueRequest, QueueAction, QueueRequest,
+    QueueRequestValidation, QueueResult, ReceiveMessageRequest, SendMessageRequest,
+    ValidatedQueueRequest, decode_json_request,
 };
 
 const ITERATIONS: usize = 1_000;
-const SEND_JSON: &[u8] = br#"{"QueueUrl":"https://queue.example/jobs","MessageBody":"hello","DelaySeconds":1}"#;
+const SEND_JSON: &[u8] =
+    br#"{"QueueUrl":"https://queue.example/jobs","MessageBody":"hello","DelaySeconds":1}"#;
 
 fn legacy_json_send() -> SendMessageRequest {
     let value = serde_json::from_slice(SEND_JSON).expect("JSON value");
@@ -111,8 +112,8 @@ impl QueueRequestValidation for CountingRequest<'_> {
 #[test]
 fn validated_request_conversion_skips_revalidation_but_raw_conversion_validates() {
     let validation_count = AtomicUsize::new(0);
-    let validated = ValidatedQueueRequest::new(CountingRequest(&validation_count))
-        .expect("initial validation");
+    let validated =
+        ValidatedQueueRequest::new(CountingRequest(&validation_count)).expect("initial validation");
     let _ = validated.into_validated().expect("validated conversion");
     assert_eq!(validation_count.load(Ordering::Relaxed), 1);
 
@@ -144,9 +145,12 @@ fn common_request_validation_cpu(passes: usize) -> Duration {
     let started = Instant::now();
     for _ in 0..100_000 {
         for _ in 0..passes {
-            black_box(send.validate_request().expect("send"));
-            black_box(receive.validate_request().expect("receive"));
-            black_box(delete.validate_request().expect("delete"));
+            send.validate_request().expect("send");
+            black_box(());
+            receive.validate_request().expect("receive");
+            black_box(());
+            delete.validate_request().expect("delete");
+            black_box(());
         }
     }
     started.elapsed()
@@ -157,8 +161,6 @@ fn single_owner_validation_halves_common_request_validation_work() {
     let single_owner = common_request_validation_cpu(1);
     let duplicate = common_request_validation_cpu(2);
 
-    eprintln!(
-        "common SQS validation: single_owner={single_owner:?} duplicate={duplicate:?}"
-    );
+    eprintln!("common SQS validation: single_owner={single_owner:?} duplicate={duplicate:?}");
     assert!(duplicate > single_owner);
 }

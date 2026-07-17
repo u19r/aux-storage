@@ -255,8 +255,7 @@ impl PubsubManager {
             return Err(PubsubError::validation(PubsubValidationKind::EmptyMessage));
         }
         let message_id = PubsubMessageId::new();
-        self
-            .provider
+        self.provider
             .accept_publish(
                 request,
                 message_id.clone(),

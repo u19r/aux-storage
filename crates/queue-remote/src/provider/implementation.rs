@@ -9,13 +9,13 @@ use queue_provider::{
     ChangeMessageVisibilityBatchRequestEntry, ChangeMessageVisibilityBatchResponse,
     ChangeMessageVisibilityRequest, CreateQueueRequest, CreateQueueResponse,
     DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry, DeleteMessageBatchResponse,
-    DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest, GetQueueAttributesResponse,
-    GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest, ListQueuesResponse, MessageId,
-    PurgeQueueRequest, Queue, QueueError, QueueInternalKind, QueueMessage, QueueProvider, QueueResult,
-    QueueValidationKind, ReceiptHandle, ReceiveMessageRequest, ReceiveMessageResponse,
-    RemoteCredentialStrategy, RemoteQueueSettings, SendMessageBatchRequest,
-    SendMessageBatchRequestEntry, SendMessageBatchResponse, SendMessageRequest, SendMessageResponse,
-    SetQueueAttributesRequest,
+    DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
+    GetQueueAttributesResponse, GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest,
+    ListQueuesResponse, MessageId, PurgeQueueRequest, Queue, QueueError, QueueInternalKind,
+    QueueMessage, QueueProvider, QueueResult, QueueValidationKind, ReceiptHandle,
+    ReceiveMessageRequest, ReceiveMessageResponse, RemoteCredentialStrategy, RemoteQueueSettings,
+    SendMessageBatchRequest, SendMessageBatchRequestEntry, SendMessageBatchResponse,
+    SendMessageRequest, SendMessageResponse, SetQueueAttributesRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::instrument;
@@ -332,7 +332,10 @@ impl QueueProvider for RemoteQueueProvider {
             return Ok(Vec::new());
         };
         let queue_url = first.queue_url.clone();
-        if messages.iter().any(|message| message.queue_url != queue_url) {
+        if messages
+            .iter()
+            .any(|message| message.queue_url != queue_url)
+        {
             return Err(QueueError::validation_with_detail(
                 QueueValidationKind::InvalidParameterValue,
                 "send_messages requires one queue URL",
@@ -345,7 +348,9 @@ impl QueueProvider for RemoteQueueProvider {
             .map(|(index, message)| SendMessageBatchRequestEntry {
                 id: index.to_string(),
                 message_body: message.body,
-                delay_seconds: message.visibility_timestamp.map(delay_seconds_from_timestamp),
+                delay_seconds: message
+                    .visibility_timestamp
+                    .map(delay_seconds_from_timestamp),
                 message_attributes: message.message_attributes,
             })
             .collect();
@@ -357,7 +362,10 @@ impl QueueProvider for RemoteQueueProvider {
             .await?;
         ordered_batch_results(
             entry_count,
-            response.successful.into_iter().map(|entry| (entry.id, entry.message_id)),
+            response
+                .successful
+                .into_iter()
+                .map(|entry| (entry.id, entry.message_id)),
             response.failed,
         )
     }

@@ -429,10 +429,7 @@ impl SortedKvStore for RocksDbKvStore {
                 stream_ids.push(
                     operation_requires_stream_entries(operation, immediate_gsi_consistency)
                         .then(|| {
-                            allocate_rocksdb_stream_item_id(
-                                &txn,
-                                next_rocksdb_stream_item_id(),
-                            )
+                            allocate_rocksdb_stream_item_id(&txn, next_rocksdb_stream_item_id())
                         })
                         .transpose()?,
                 );

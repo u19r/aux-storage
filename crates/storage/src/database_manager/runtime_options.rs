@@ -3,7 +3,7 @@ use std::sync::Arc;
 use metrics_facade::MetricsFacade;
 use storage_common::DatabaseJobIntervals;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-write-planner"))]
 use super::DatabaseManagerTestPauseHandle;
 use crate::cache_coordinator::StorageAuthoritativeCacheOptions;
 
@@ -24,7 +24,7 @@ pub struct DatabaseManagerRuntimeOptions {
     pub database_job_intervals: DatabaseJobIntervals,
     pub authoritative_cache_options: StorageAuthoritativeCacheOptions,
     pub metrics_facade: Option<Arc<dyn MetricsFacade>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-write-planner"))]
     pub(crate) pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
 }
 
@@ -40,7 +40,7 @@ impl Default for DatabaseManagerRuntimeOptions {
             database_job_intervals: DatabaseJobIntervals::default(),
             authoritative_cache_options: StorageAuthoritativeCacheOptions::default(),
             metrics_facade: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: None,
         }
     }
@@ -125,7 +125,7 @@ impl DatabaseManagerRuntimeOptionsBuilder {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-write-planner"))]
     #[must_use]
     pub(crate) fn pause_after_storage_write(
         mut self,

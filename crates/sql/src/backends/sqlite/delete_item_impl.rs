@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use storage_condition::{Condition, evaluate_condition};
 use storage_types::{
-    AttributeValue, KeyAttributes, ReplicationEventMetadata, StorageError,
-    StorageResult, StreamRetentionDuration, TableName,
+    AttributeValue, KeyAttributes, ReplicationEventMetadata, StorageError, StorageResult,
+    StreamRetentionDuration, TableName,
 };
 
 use crate::{
@@ -12,17 +12,30 @@ use crate::{
     stream_writer::{should_write_stream_entries_for_gsi_mode, write_stream_entries},
 };
 
+pub(crate) struct DeleteItemInput<'a> {
+    pub(crate) table_name: &'a TableName,
+    pub(crate) key: &'a KeyAttributes,
+    pub(crate) condition: &'a Option<Condition>,
+    pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) return_old_on_condition_failure: bool,
+    pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
 impl SQLiteStorageProvider {
-    pub fn do_delete_item(
-        table_name: &TableName,
-        key: &KeyAttributes,
-        condition: &Option<Condition>,
+    pub(crate) fn do_delete_item(
         sqlite: &crate::utils::SqliteConn<'_>,
-        immediate_gsi_consistency: bool,
-        return_old_on_condition_failure: bool,
-        replication: Option<&ReplicationEventMetadata>,
-        item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: DeleteItemInput<'_>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+        let DeleteItemInput {
+            table_name,
+            key,
+            condition,
+            immediate_gsi_consistency,
+            return_old_on_condition_failure,
+            replication,
+            item_stream_ttl_hours,
+        } = input;
         let table_name_safe = table_name.sanitized_name();
         let key_item = key_item_map(key);
 
