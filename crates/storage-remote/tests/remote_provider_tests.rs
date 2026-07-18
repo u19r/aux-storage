@@ -6,8 +6,9 @@ use storage_remote::{MAX_ENDPOINT_RETRIES, RemoteStorageProvider};
 use storage_sync::{SYNC_LEADER_HINT_HEADER, SYNC_NOT_LEADER_ERROR_TYPE};
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateTableRequest, KeyAttributeType, KeySchemaElement,
-    KeyType, StorageError, TableName,
+    KeyType, StorageError, StreamItemId, StreamName, TableName,
 };
+use stream::StreamProvider;
 
 fn table_def() -> (TableName, Vec<AttributeDefinition>, Vec<KeySchemaElement>) {
     table_def_with_name("remote-test-table")
@@ -52,6 +53,52 @@ async fn provider_with_endpoints(endpoints: Vec<String>) -> RemoteStorageProvide
     })
     .await
     .expect("remote provider")
+}
+
+#[tokio::test]
+async fn table_stream_records_are_forwarded_to_the_remote_storage_api() {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let table_name = TableName::new("tenant_a");
+    let starting_cursor = "000000000000000000000001"
+        .parse::<StreamItemId>()
+        .expect("starting cursor");
+    let next_cursor = "000000000000000000000002";
+
+    let stream_mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.GetStreamRecords")
+                .path("/")
+                .body_includes("\"TableName\":\"tenant_a\"")
+                .body_includes("\"LastEvaluatedKey\":\"000000000000000000000001\"")
+                .body_includes("\"Limit\":25");
+            then.status(200).json_body(serde_json::json!({
+                "TableName": "tenant_a",
+                "Records": [{
+                    "Keys": {"pk": {"S": "metric_batch_1"}},
+                    "SequenceNumber": "sequence_1",
+                    "NewImage": {"value": {"N": "7"}}
+                }],
+                "LastEvaluatedKey": next_cursor
+            }));
+        })
+        .await;
+
+    let (records, cursor) = provider
+        .get_stream_records_from_pointer_stream(
+            StreamName::table_stream(&table_name),
+            &[],
+            Some(starting_cursor),
+            Some(25),
+        )
+        .await
+        .expect("remote table stream records");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].sequence_number, "sequence_1");
+    assert_eq!(cursor.expect("next cursor").to_string(), next_cursor);
+    stream_mock.assert_calls_async(1).await;
 }
 
 #[tokio::test]

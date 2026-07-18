@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "alloc-counter"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "alloc-counter-macros",
  "serde",
@@ -100,7 +100,7 @@ dependencies = [
 [[package]]
 name = "alloc-counter-macros"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -334,7 +334,7 @@ dependencies = [
 [[package]]
 name = "aws-credentials"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-types",
@@ -545,7 +545,7 @@ dependencies = [
 [[package]]
 name = "aws-sigv4-signing"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "aws-credential-types",
  "aws-credentials",
@@ -2476,7 +2476,7 @@ dependencies = [
 [[package]]
 name = "http-request"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3277,7 +3277,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "lru-ttl-cache"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "tokio",
  "tracing",
@@ -3390,7 +3390,7 @@ dependencies = [
 [[package]]
 name = "metrics-facade"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "http 1.4.2",
  "metrics",
@@ -3734,7 +3734,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "opt-loop-probe"
 version = "0.1.0"
-source = "git+https://github.com/u19r/aux-common?rev=2d7b4e57522f75ffaabc458bed889f8b46b73b6a#2d7b4e57522f75ffaabc458bed889f8b46b73b6a"
+source = "git+https://github.com/u19r/aux-common?rev=8191f1e95744d89a8aaaaa69df32eede0bdcfba7#8191f1e95744d89a8aaaaa69df32eede0bdcfba7"
 dependencies = [
  "mimalloc",
  "serde",

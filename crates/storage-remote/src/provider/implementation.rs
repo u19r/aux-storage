@@ -18,9 +18,10 @@ use storage_types::{
     BatchWriteItemResponse, CreateTableRequest, CreateTableResponse, DeleteItemRequest,
     DeleteItemResponse, DeleteTableRequest, DeleteTableResponse, DescribeTableRequest,
     DescribeTableResponse, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, DurationSeconds,
-    GetItemRequest, KeyAttributes, ListTablesRequest, ListTablesResponse, PutItemRequest,
-    PutItemResponse, QueryTableRequest, ScanTableRequest, StorageEnum, StorageError, StorageResult,
-    StoredTableInfo, StreamItemId, StreamName, TableName, TableStatus, TimeToLiveSpecification,
+    GetItemRequest, GetStreamRecordsRequest, GetStreamRecordsResponse, KeyAttributes,
+    ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse, QueryTableRequest,
+    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
+    StreamName, StreamRecord, TableName, TableStatus, TimeToLiveSpecification,
     TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
     UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
     UserStreamName, WireItem,
@@ -786,6 +787,46 @@ impl StreamProvider for RemoteStorageProvider {
         _limit: u32,
     ) -> StreamResult<StreamPage> {
         Err(StreamError::internal("remote streams not implemented"))
+    }
+
+    async fn get_stream_records_from_pointer_stream(
+        &self,
+        pointer_stream_name: StreamName,
+        _key_schema: &[storage_types::KeySchemaElement],
+        starting_item_id: Option<StreamItemId>,
+        limit: Option<u32>,
+    ) -> StreamResult<(Vec<StreamRecord>, Option<StreamItemId>)> {
+        const TABLE_STREAM_SUFFIX: &[u8] = b"/stream-table";
+        let stream_name = pointer_stream_name.as_ref();
+        let table_name = stream_name
+            .strip_suffix(TABLE_STREAM_SUFFIX)
+            .and_then(|name| std::str::from_utf8(name).ok())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                StreamError::internal(format!(
+                    "remote pointer stream is not a table stream: {pointer_stream_name:?}"
+                ))
+            })?;
+        let request = GetStreamRecordsRequest {
+            table_name: TableName::new(table_name),
+            last_evaluated_key: starting_item_id.map(|item_id| item_id.to_string()),
+            limit,
+        };
+        let response: GetStreamRecordsResponse = self
+            .invoke("DynamoDB_20120810.GetStreamRecords", &request)
+            .await
+            .map_err(StreamError::from)?;
+        let last_evaluated_key = response
+            .last_evaluated_key
+            .as_deref()
+            .map(str::parse::<StreamItemId>)
+            .transpose()
+            .map_err(|error| {
+                StreamError::internal(format!(
+                    "remote stream response returned an invalid cursor: {error}"
+                ))
+            })?;
+        Ok((response.records, last_evaluated_key))
     }
 
     async fn create_cursor(
