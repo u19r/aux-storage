@@ -109,3 +109,13 @@ fn storage_guard_and_unsupported_helpers_preserve_internal_messages() {
         "unexpected error: {unsupported:?}"
     );
 }
+
+#[test]
+fn transaction_canceled_errors_are_not_retryable_writes() {
+    let error: StorageError = StorageEnum::TransactionCanceled {
+        reasons: vec!["TransactionConflict".to_string()],
+    }
+    .into();
+
+    assert!(!error.is_retryable_write());
+}

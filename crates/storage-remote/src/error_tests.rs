@@ -139,10 +139,14 @@ fn transaction_cancellation_preserves_conditional_reason_without_retrying_transp
             message: Some("transaction cancelled".to_string()),
             cancellation_reasons: Some(vec![
                 RemoteCancellationReason {
-                    code: "ConditionalCheckFailed".to_string(),
+                    code: Some("ConditionalCheckFailed".to_string()),
+                    message: Some("The conditional request failed.".to_string()),
+                    item: None,
                 },
                 RemoteCancellationReason {
-                    code: "None".to_string(),
+                    code: Some("None".to_string()),
+                    message: None,
+                    item: None,
                 },
             ]),
         },
@@ -153,6 +157,86 @@ fn transaction_cancellation_preserves_conditional_reason_without_retrying_transp
     assert!(matches!(
         error.to_enum(),
         StorageEnum::TransactionCanceled { reasons }
-            if reasons.iter().map(String::as_str).eq(["ConditionalCheckFailed", "None"])
+            if reasons.iter().map(String::as_str).eq([
+                "ConditionalCheckFailed\tThe conditional request failed.",
+                "None"
+            ])
+    ));
+}
+
+#[test]
+fn transaction_cancellation_is_never_retryable_for_any_reason() {
+    for code in [
+        "ItemCollectionSizeLimitExceeded",
+        "TransactionConflict",
+        "ProvisionedThroughputExceeded",
+        "ThrottlingError",
+        "ValidationError",
+    ] {
+        let (_, retryable, _) = classify_error_response(
+            StatusCode::BAD_REQUEST,
+            RemoteErrorResponse {
+                error_type: Some("TransactionCanceledException".to_string()),
+                code: None,
+                message: None,
+                cancellation_reasons: Some(vec![RemoteCancellationReason {
+                    code: Some(code.to_string()),
+                    message: None,
+                    item: None,
+                }]),
+            },
+        );
+        assert!(!retryable, "{code} cancellation must not be retried");
+    }
+}
+
+#[test]
+fn transaction_cancellation_preserves_reason_message_and_item() {
+    let item = serde_json::json!({"pk": {"S": "item-1"}});
+    let (error, retryable, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("TransactionCanceledException".to_string()),
+            code: None,
+            message: None,
+            cancellation_reasons: Some(vec![RemoteCancellationReason {
+                code: Some("ConditionalCheckFailed".to_string()),
+                message: Some("The conditional request failed.".to_string()),
+                item: Some(item),
+            }]),
+        },
+    );
+
+    assert!(!retryable);
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::TransactionCanceled { reasons }
+            if reasons.iter().map(String::as_str).eq([
+                "ConditionalCheckFailed\tThe conditional request failed.\t{\"pk\":{\"S\":\"item-1\"}}"
+            ])
+    ));
+}
+
+#[test]
+fn transaction_cancellation_defaults_null_code_to_none() {
+    let (error, retryable, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("TransactionCanceledException".to_string()),
+            code: None,
+            message: None,
+            cancellation_reasons: Some(vec![RemoteCancellationReason {
+                code: None,
+                message: None,
+                item: None,
+            }]),
+        },
+    );
+
+    assert!(!retryable);
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::TransactionCanceled { reasons }
+            if reasons.iter().map(String::as_str).eq(["None"])
     ));
 }

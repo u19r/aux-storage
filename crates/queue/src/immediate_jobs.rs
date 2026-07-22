@@ -12,8 +12,8 @@ use tokio::{
 };
 
 use crate::{
-    ChangeMessageVisibilityRequest, DeleteMessageRequest, QueueManager, ReceiveMessageRequest,
-    SendMessageRequest,
+    ChangeMessageVisibilityRequest, DeleteMessageRequest, QueueError, QueueManager,
+    ReceiveMessageRequest, SendMessageRequest,
     constants::{
         DEFAULT_JOB_VISIBILITY_TIMEOUT_SECS, JOB_POLL_BATCH_SIZE,
         MAX_IMMEDIATE_JOB_RETRY_VISIBILITY_SECS, METRIC_QUEUE_EMPTY_RECEIVES_TOTAL,
@@ -173,7 +173,7 @@ async fn run_worker(
     handler: Arc<dyn ImmediateJobHandler>,
     stats_tx: mpsc::UnboundedSender<usize>,
     visibility_timeout_secs: u32,
-    stop_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     loop {
         if *stop_rx.borrow() {
@@ -190,7 +190,9 @@ async fn run_worker(
         {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(error = %err, "immediate job runner failed to receive messages");
+                if wait_for_immediate_job_receive_retry(&err, &mut stop_rx).await {
+                    return;
+                }
                 continue;
             }
         };
@@ -261,6 +263,40 @@ async fn run_worker(
                 }
             }
         }
+    }
+}
+
+const SENDER_FAULT_RECEIVE_RETRY_DELAY: Duration = Duration::from_secs(30);
+const TRANSIENT_RECEIVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Returns the shared retry delay for immediate-job receive failures.
+///
+/// Invalid requests cannot recover through immediate retries, while backend
+/// failures should recover promptly without becoming a CPU or log hot loop.
+#[must_use]
+pub(super) fn immediate_job_receive_retry_delay(error: &QueueError) -> Duration {
+    if error.is_sender_fault() {
+        SENDER_FAULT_RECEIVE_RETRY_DELAY
+    } else {
+        TRANSIENT_RECEIVE_RETRY_DELAY
+    }
+}
+
+/// Waits for the receive retry delay and reports whether the worker should
+/// stop.
+pub async fn wait_for_immediate_job_receive_retry(
+    error: &QueueError,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let retry_delay = immediate_job_receive_retry_delay(error);
+    tracing::warn!(
+        error = %error,
+        retry_delay_ms = retry_delay.as_millis(),
+        "immediate job runner failed to receive messages"
+    );
+    tokio::select! {
+        () = tokio::time::sleep(retry_delay) => false,
+        changed = stop_rx.changed() => changed.is_err() || *stop_rx.borrow(),
     }
 }
 

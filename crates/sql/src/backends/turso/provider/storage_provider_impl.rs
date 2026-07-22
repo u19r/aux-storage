@@ -81,270 +81,41 @@ async fn apply_gsi_write_pressure(provider: &TursoStorageProvider) -> StorageRes
     .await
 }
 
-struct TursoReadSequenceReadContext {
-    provider: TursoStorageProvider,
-    connection: tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<TursoConnection>>>,
-}
-
-#[async_trait]
-impl StorageProviderReadContext for TursoReadSequenceReadContext {
-    async fn get_item(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        consistent_read: bool,
-    ) -> StorageResult<Option<WireItem>> {
-        let _ = consistent_read;
-        let table_info = self.provider.get_table_info(&table_name).await?;
-        let guard = self.connection.lock().await;
-        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
-        let item = self
-            .provider
-            .get_item_map_by_key(conn, &table_info, &key)
-            .await?;
-        item.map(|map| WireItem::from_attribute_map(&map))
-            .transpose()
-    }
-
-    async fn batch_get_item(
-        &self,
-        request: BatchGetItemRequest,
-    ) -> StorageResult<BatchGetWireItemResponse> {
-        let guard = self.connection.lock().await;
-        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
-        self.provider
-            .batch_get_item_with_connection(conn, request)
-            .await
-    }
-
-    async fn query_table(
-        &self,
-        request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        let guard = self.connection.lock().await;
-        let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
-        self.provider
-            .query_table_with_connection(conn, request)
-            .await
-    }
-}
-
-impl Drop for TursoReadSequenceReadContext {
-    fn drop(&mut self) {
-        let Ok(mut guard) = self.connection.try_lock() else {
-            return;
-        };
-        let Some(connection) = guard.take() else {
-            return;
-        };
-        tokio::spawn(async move {
-            let _ = connection.execute("ROLLBACK", ()).await;
-        });
-    }
-}
-
-fn turso_read_context_closed() -> StorageError {
-    StorageError::internal("turso read-sequence read context is closed")
-}
-
-async fn run_custom_stream_trim_once(provider: &TursoStorageProvider) -> StorageResult<bool> {
-    let stats = StreamDurationTrimWorker::new(
-        provider.clone(),
-        StreamDurationTrimConfig {
-            marker_page_size: 250,
-            stream_page_size: 1_000,
-        },
-    )
-    .run_due_page(TimestampMillis::now(), TimestampMillis::now())
-    .await?;
-    Ok(stats.did_work())
-}
-
-impl TursoStorageProvider {
-    pub(crate) async fn trim_change_index_markers_older_than(
-        &self,
-        cutoff_created_at_ms: i64,
-    ) -> StorageResult<usize> {
-        let conn = self.connect().await?;
-        let deleted_markers = self
-            .execute(
-                &conn,
-                sql_statements::trim_change_index_markers_older_than(),
-                vec![TursoValue::Integer(cutoff_created_at_ms)],
-            )
-            .await?;
-        usize::try_from(deleted_markers)
-            .map_err(|_| StorageError::internal("turso deleted marker count exceeds usize"))
-    }
-
-    async fn query_table_with_connection<C>(
-        &self,
-        conn: &C,
-        request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)>
-    where
-        C: TursoSqlConnection + ?Sized,
-    {
-        request.validate_for_dynamodb()?;
-        let table_info = self.get_table_info(&request.table_name).await?;
-        let effective_limit = calc_limit(request.limit, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT)?;
-        let exclusive_start_key = decode_exclusive_start(
-            &request.exclusive_start_key,
-            &table_info,
-            &request.index_name,
-        )?;
-
-        let (table_name_safe, key_schema, table_key_schema_for_index, origin_gsi) =
-            if let Some(index_name) = &request.index_name {
-                let gsi = table_info
-                    .global_secondary_indexes
-                    .as_ref()
-                    .and_then(|indexes| {
-                        indexes.iter().find(|index| &index.index_name == index_name)
-                    })
-                    .ok_or_else(|| missing_index_error(&table_info, index_name))?;
-                (
-                    gsi_table_name(&table_info.table_name, index_name),
-                    gsi.key_schema.clone(),
-                    Some(table_info.key_schema.as_slice()),
-                    true,
-                )
-            } else {
-                (
-                    format!("table_{}", table_info.table_name.sanitized_name()),
-                    table_info.key_schema.clone(),
-                    None,
-                    false,
-                )
-            };
-
-        let conditions = parse_key_condition_expression(
-            &request.key_condition_expression,
-            &key_schema,
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_ref(),
-        )?;
-
-        let (sql, values) = build_sql_query(
-            &table_name_safe,
-            &key_schema,
-            Some(conditions),
-            exclusive_start_key,
-            effective_limit,
-            request.scan_index_forward,
-            table_key_schema_for_index,
-        )?;
-
-        let rows = self
-            .query_row_set(
-                conn,
-                &sql,
-                values.into_iter().map(TursoValue::Text).collect(),
-            )
-            .await?;
-
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let wire = if origin_gsi {
-                self.build_wire_item_from_gsi_row_view(row, &table_info, &key_schema)
-                    .await?
-            } else {
-                self.build_wire_item_from_main_row_view(row, &table_info)
-                    .await?
-            };
-            items.push(wire);
-        }
-
-        let has_more = items.len() > effective_limit as usize;
-        if has_more {
-            items.pop();
-        }
-
-        let last_evaluated_key = if has_more {
-            items
-                .last()
-                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-
-        Ok((request.project_wire_items(items)?, last_evaluated_key))
-    }
-
-    async fn batch_get_item_with_connection<C>(
-        &self,
-        conn: &C,
-        request: BatchGetItemRequest,
-    ) -> StorageResult<BatchGetWireItemResponse>
-    where
-        C: TursoSqlConnection + ?Sized,
-    {
-        let mut responses = HashMap::new();
-        for (table_name, keys_and_attributes) in request.request_items {
-            let table_info = self.get_table_info(&table_name).await?;
-            let mut table_items = Vec::new();
-            for key in keys_and_attributes.keys {
-                if let Some(item) = self.get_item_map_by_key(conn, &table_info, &key).await? {
-                    table_items.push(WireItem::from_attribute_map(&item)?);
-                }
-            }
-            responses.insert(table_name, table_items);
-        }
-
-        Ok(BatchGetWireItemResponse {
-            responses: Some(responses),
-            unprocessed_keys: None,
-            consumed_capacity: None,
-        })
-    }
-}
+mod batch_transaction;
+mod item_writes;
+mod lifecycle;
+mod query;
+mod table_writes;
+mod transaction_helpers;
+mod ttl;
 
 #[async_trait]
 impl StorageProvider for TursoStorageProvider {
     fn supports_guarded_writes(&self) -> bool {
-        true
+        self.supports_guarded_writes_operation()
     }
 
     fn supports_custom_stream_duration(&self) -> bool {
-        true
+        self.supports_custom_stream_duration_operation()
     }
 
     fn supports_change_index(&self) -> bool {
-        true
+        self.supports_change_index_operation()
     }
 
     async fn begin_read_sequence_read_context(
         &self,
         consistency: ReadSequenceConsistency,
     ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
-        if consistency != ReadSequenceConsistency::Transactional {
-            return Err(StorageError::unsupported(
-                "turso read-sequence provider contexts are only used for transactional reads",
-            ));
-        }
-        let conn = self.connect().await?;
-        conn.execute("BEGIN", ()).await.map_err(map_turso_error)?;
-        Ok(Box::new(TursoReadSequenceReadContext {
-            provider: self.clone(),
-            connection: tokio::sync::Mutex::new(Some(conn)),
-        }))
+        self.begin_read_sequence_read_context_operation(consistency)
+            .await
     }
 
     async fn write_stream_trim_state(
         &self,
         state: storage_provider::StreamTrimState,
     ) -> StorageResult<()> {
-        let conn = self.connect().await?;
-        self.write_stream_trim_state(
-            &conn,
-            storage_provider::StreamTrimStateWrite {
-                state,
-                next_marker: None,
-            },
-        )
-        .await
+        self.write_stream_trim_state_operation(state).await
     }
 
     async fn list_due_stream_trim_markers(
@@ -352,8 +123,7 @@ impl StorageProvider for TursoStorageProvider {
         due_before: TimestampMillis,
         limit: usize,
     ) -> StorageResult<Vec<storage_provider::StreamTrimDueMarker>> {
-        let conn = self.connect().await?;
-        self.list_due_stream_trim_markers(&conn, due_before, limit)
+        self.list_due_stream_trim_markers_operation(due_before, limit)
             .await
     }
 
@@ -361,123 +131,18 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: ListChangeIndexMarkersRequest,
     ) -> StorageResult<Vec<ChangeIndexMarker>> {
-        let conn = self.connect().await?;
-        let limit = i64::try_from(request.limit)
-            .map_err(|_| StorageError::validation("change index list limit exceeds i64"))?;
-        let rows = self
-            .query_rows(
-                &conn,
-                sql_statements::list_change_index_markers(),
-                vec![
-                    TursoValue::Integer(i64::from(request.slot)),
-                    TursoValue::Text(request.after_versionstamp.unwrap_or_default()),
-                    TursoValue::Integer(limit),
-                ],
-            )
-            .await?;
-        rows.into_iter()
-            .map(|row| {
-                let slot = row
-                    .get("slot")
-                    .ok_or_else(|| StorageError::internal("change index row missing slot"))
-                    .and_then(value_to_i64)
-                    .and_then(|slot| {
-                        u16::try_from(slot).map_err(|_| {
-                            StorageError::internal("change index slot is outside u16 range")
-                        })
-                    })?;
-                let versionstamp = row
-                    .get("versionstamp")
-                    .ok_or_else(|| StorageError::internal("change index row missing versionstamp"))
-                    .and_then(value_to_string)?;
-                let table_id = row
-                    .get("table_id")
-                    .ok_or_else(|| StorageError::internal("change index row missing table_id"))
-                    .and_then(value_to_string)?;
-                Ok(ChangeIndexMarker {
-                    slot,
-                    versionstamp,
-                    table_id: TableName::new(&table_id),
-                })
-            })
-            .collect()
+        self.list_change_index_markers_operation(request).await
     }
 
     async fn initialize_storage(&self) -> StorageResult<()> {
-        let _ddl_guard = self.ddl_lock.lock().await;
-        let this = self.clone();
-        self.with_exclusive_transaction(true, |conn| {
-            let this = this.clone();
-            Box::pin(async move {
-                let _ = this
-                    .execute(conn, sql_statements::create_tables_table(), Vec::new())
-                    .await?;
-                let columns = this
-                    .query_rows(conn, "PRAGMA table_info(tables)", Vec::new())
-                    .await?;
-                let has_column = |column_name: &str| {
-                    columns.iter().any(|row| {
-                        row.get("name").is_some_and(
-                            |value| matches!(value, TursoValue::Text(name) if name == column_name),
-                        )
-                    })
-                };
-                if !has_column("deletion_protection_enabled") {
-                    let _ = this
-                        .execute(
-                            conn,
-                            sql_statements::add_deletion_protection_column(),
-                            Vec::new(),
-                        )
-                        .await?;
-                }
-                if !has_column("table_stream_duration_hours") {
-                    let _ = this
-                        .execute(
-                            conn,
-                            sql_statements::add_table_stream_duration_column(),
-                            Vec::new(),
-                        )
-                        .await?;
-                }
-                if !has_column("default_item_stream_duration_hours") {
-                    let _ = this
-                        .execute(
-                            conn,
-                            sql_statements::add_default_item_stream_duration_column(),
-                            Vec::new(),
-                        )
-                        .await?;
-                }
-                let _ = this
-                    .execute(
-                        conn,
-                        sql_statements::create_gsi_backfill_table(),
-                        Vec::new(),
-                    )
-                    .await?;
-                let _ = this
-                    .execute(conn, sql_statements::create_ttl_config_table(), Vec::new())
-                    .await?;
-                let _ = this
-                    .execute(
-                        conn,
-                        sql_statements::create_item_revisions_table(),
-                        Vec::new(),
-                    )
-                    .await?;
-                this.initialize_stream_duration_tables(conn).await?;
-                Ok(())
-            })
-        })
-        .await
+        self.initialize_storage_operation().await
     }
 
     async fn export_logical_backfill_page(
         &self,
         request: storage_backfill::LogicalExportRequest,
     ) -> StorageResult<storage_backfill::LogicalExportPage> {
-        LogicalBackfillExport::export_logical_page(self, request).await
+        self.export_logical_backfill_page_operation(request).await
     }
 
     async fn import_logical_backfill_chunk(
@@ -485,7 +150,8 @@ impl StorageProvider for TursoStorageProvider {
         manifest: &storage_backfill::LogicalBackfillManifest,
         chunk: storage_backfill::LogicalBackfillChunk,
     ) -> StorageResult<storage_backfill::LogicalBackfillResult> {
-        LogicalBackfillImport::import_logical_chunk(self, manifest, chunk).await
+        self.import_logical_backfill_chunk_operation(manifest, chunk)
+            .await
     }
 
     async fn apply_resolved_sync_mutations(
@@ -493,14 +159,12 @@ impl StorageProvider for TursoStorageProvider {
         metadata: storage_sync::SyncCommitMetadata,
         batch: storage_sync::ResolvedSyncMutationBatch,
     ) -> StorageResult<Vec<storage_sync::SyncMutationResponse>> {
-        crate::backends::turso::logical_backfill::apply_resolved_sync_mutations(
-            self, metadata, batch,
-        )
-        .await
+        self.apply_resolved_sync_mutations_operation(metadata, batch)
+            .await
     }
 
     async fn last_resolved_sync_log_id(&self) -> StorageResult<Option<storage_sync::SyncLogId>> {
-        crate::backends::turso::logical_backfill::last_resolved_sync_log_id(self).await
+        self.last_resolved_sync_log_id_operation().await
     }
 
     async fn persist_resolved_sync_log_entry(
@@ -508,17 +172,15 @@ impl StorageProvider for TursoStorageProvider {
         metadata: &storage_sync::SyncCommitMetadata,
         batch: &storage_sync::ResolvedSyncMutationBatch,
     ) -> StorageResult<()> {
-        crate::backends::turso::logical_backfill::persist_resolved_sync_log_entry(
-            self, metadata, batch,
-        )
-        .await
+        self.persist_resolved_sync_log_entry_operation(metadata, batch)
+            .await
     }
 
     async fn get_resolved_sync_log_entry(
         &self,
         log_id: storage_sync::SyncLogId,
     ) -> StorageResult<Option<storage_sync::ResolvedSyncLogEntry>> {
-        crate::backends::turso::logical_backfill::get_resolved_sync_log_entry(self, log_id).await
+        self.get_resolved_sync_log_entry_operation(log_id).await
     }
 
     async fn resolved_sync_log_entries_after(
@@ -526,138 +188,16 @@ impl StorageProvider for TursoStorageProvider {
         log_id: Option<storage_sync::SyncLogId>,
         limit: usize,
     ) -> StorageResult<Vec<storage_sync::ResolvedSyncLogEntry>> {
-        crate::backends::turso::logical_backfill::resolved_sync_log_entries_after(
-            self, log_id, limit,
-        )
-        .await
+        self.resolved_sync_log_entries_after_operation(log_id, limit)
+            .await
     }
 
     async fn table_exists(&self, table_name: &TableName) -> StorageResult<bool> {
-        let conn = self.connect().await?;
-        let rows = self
-            .query_rows(
-                &conn,
-                sql_statements::table_exists(),
-                vec![TursoValue::Text(table_name.to_string())],
-            )
-            .await?;
-        let count = rows
-            .first()
-            .and_then(|row| row.get("count"))
-            .map(value_to_i64)
-            .transpose()?
-            .unwrap_or_default();
-        Ok(count > 0)
+        self.table_exists_operation(table_name).await
     }
 
     async fn create_table(&self, request: &CreateTableRequest) -> StorageResult<()> {
-        validate_create_table_request(request)?;
-        let table_name = request.table_name.clone();
-        let _ddl_guard = self.ddl_lock.lock().await;
-
-        let metadata = prepare_table_metadata(request)?;
-        let stored_gsis = request
-            .global_secondary_indexes
-            .clone()
-            .map(|indexes| indexes.into_iter().map(Into::into).collect::<Vec<_>>());
-
-        let table_name_for_tx = table_name.clone();
-        let this = self.clone();
-        self.with_exclusive_transaction(true, |conn| {
-            let this = this.clone();
-            let metadata = metadata.clone();
-            let request = request.clone();
-            let stored_gsis = stored_gsis.clone();
-            let table_name_for_tx = table_name_for_tx.clone();
-            Box::pin(async move {
-                if this.table_exists_conn(conn, &table_name_for_tx).await? {
-                    return Err(StorageError::table_already_exists(&table_name_for_tx));
-                }
-
-                let table_id = uuid::Uuid::now_v7().to_string();
-                let table_duration_plan = plan_table_stream_duration(
-                    table_name_for_tx.clone(),
-                    format!("turso-table:{table_id}"),
-                    1,
-                    metadata.table_stream_duration,
-                    metadata.default_item_stream_duration,
-                    metadata.created_at,
-                );
-                let insert_sql = sql_statements::insert_table();
-                let insert_params = vec![
-                    TursoValue::Text(table_id),
-                    TursoValue::Text(table_name_for_tx.to_string()),
-                    TursoValue::Text("CREATING".to_string()),
-                    TursoValue::Integer(*metadata.created_at),
-                    TursoValue::Text(metadata.attribute_definitions_json),
-                    TursoValue::Text(metadata.key_schema_json),
-                    option_string_to_value(metadata.global_secondary_indexes_json),
-                    TursoValue::Integer(0),
-                    TursoValue::Integer(0),
-                    option_string_to_value(metadata.stream_specification_json),
-                    TursoValue::Integer(if metadata.deletion_protection_enabled {
-                        1
-                    } else {
-                        0
-                    }),
-                    TursoValue::Integer(metadata.table_stream_duration.as_hours_wire_value()),
-                    TursoValue::Integer(
-                        metadata.default_item_stream_duration.as_hours_wire_value(),
-                    ),
-                ];
-                let _ = this.execute(conn, insert_sql, insert_params).await?;
-                this.write_stream_trim_state(
-                    conn,
-                    storage_provider::StreamTrimStateWrite {
-                        state: table_duration_plan.trim_state,
-                        next_marker: table_duration_plan.due_marker,
-                    },
-                )
-                .await?;
-
-                let rowid_mode = SqliteTableRowidMode::WithRowid;
-                // TODO: Enable after Turso releases support for WITHOUT ROWID.
-                // let rowid_mode = SqliteTableRowidMode::WithoutRowid;
-
-                let create_sql = build_table_creation_sql(
-                    &request.table_name,
-                    &request.attribute_definitions,
-                    &request.key_schema,
-                    stored_gsis.as_deref(),
-                    rowid_mode,
-                );
-                let _ = this.execute(conn, &create_sql, Vec::new()).await?;
-
-                if let Some(gsis) = stored_gsis.as_ref() {
-                    for sql in build_gsi_creation_sqls(
-                        &request.table_name,
-                        &request.attribute_definitions,
-                        &request.key_schema,
-                        gsis,
-                        rowid_mode,
-                    ) {
-                        let _ = this.execute(conn, &sql, Vec::new()).await?;
-                    }
-                }
-
-                let _ = this
-                    .execute(
-                        conn,
-                        sql_statements::update_table_status(),
-                        vec![
-                            TursoValue::Text("ACTIVE".to_string()),
-                            TursoValue::Text(table_name_for_tx.to_string()),
-                        ],
-                    )
-                    .await?;
-
-                Ok(())
-            })
-        })
-        .await?;
-
-        self.invalidate_table_cache(&table_name).await;
-        Ok(())
+        self.create_table_operation(request).await
     }
 
     async fn update_table_status(
@@ -717,55 +257,7 @@ impl StorageProvider for TursoStorageProvider {
     }
 
     async fn delete_table(&self, table_name: &TableName) -> StorageResult<()> {
-        let _ddl_guard = self.ddl_lock.lock().await;
-        let table_name_clone = table_name.clone();
-        let this = self.clone();
-
-        self.with_exclusive_transaction(true, |conn| {
-            let this = this.clone();
-            let table_name_clone = table_name_clone.clone();
-            Box::pin(async move {
-                let table_info = this
-                    .load_table_info_uncached(conn, &table_name_clone)
-                    .await?;
-                if table_info.deletion_protection_enabled {
-                    return Err(StorageError::deletion_protection_enabled(&table_name_clone));
-                }
-
-                let _ = this
-                    .execute(
-                        conn,
-                        sql_statements::delete_table_metadata(),
-                        vec![TursoValue::Text(table_name_clone.to_string())],
-                    )
-                    .await?;
-                let _ = this
-                    .execute(
-                        conn,
-                        &sql_statements::drop_table(&table_name_clone.sanitized_name()),
-                        Vec::new(),
-                    )
-                    .await?;
-
-                if let Some(gsis) = table_info.global_secondary_indexes.as_ref() {
-                    for gsi in gsis {
-                        let gsi_table = gsi_table_name(&table_info.table_name, &gsi.index_name);
-                        let _ = this
-                            .execute(
-                                conn,
-                                &sql_statements::drop_named_table(&gsi_table),
-                                Vec::new(),
-                            )
-                            .await?;
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await?;
-
-        self.invalidate_table_cache(table_name).await;
-        Ok(())
+        self.delete_table_operation(table_name).await
     }
 
     async fn create_table_storage(
@@ -777,60 +269,7 @@ impl StorageProvider for TursoStorageProvider {
     }
 
     async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse> {
-        let return_old_on_condition_failure =
-            storage_types::return_values_on_condition_check_failure_all_old(
-                request.return_values_on_condition_check_failure.as_ref(),
-            );
-        let PutItemRequest {
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-            aux_item_stream_ttl_hours,
-            ..
-        } = request;
-        apply_gsi_write_pressure(self).await?;
-        let table_info = self.get_table_info(&table_name).await?;
-        let condition = self
-            .parse_condition(
-                condition_expression,
-                &expression_attribute_names,
-                &expression_attribute_values,
-            )
-            .await?;
-        let this = self.clone();
-
-        let old_item = self
-            .with_transaction(true, |conn| {
-                let this = this.clone();
-                let table_info = table_info.clone();
-                let item = item.clone();
-                let condition = condition.clone();
-                Box::pin(async move {
-                    this.put_item_txn(
-                        conn,
-                        &table_info,
-                        &item,
-                        condition.as_ref(),
-                        return_old_on_condition_failure,
-                        aux_item_stream_ttl_hours,
-                    )
-                    .await
-                })
-            })
-            .await?;
-
-        let attributes = if matches!(return_values, Some(AllOld::AllOld)) {
-            old_item
-        } else {
-            None
-        };
-
-        Ok(PutItemResponse {
-            attributes: attributes.map(Into::into),
-        })
+        self.put_item_request_operation(request).await
     }
 
     async fn get_item(
@@ -896,299 +335,32 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: DeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        let return_old_on_condition_failure =
-            storage_types::return_values_on_condition_check_failure_all_old(
-                request.return_values_on_condition_check_failure.as_ref(),
-            );
-        let DeleteItemRequest {
-            table_name,
-            key,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            aux_item_stream_ttl_hours,
-            ..
-        } = request;
-        apply_gsi_write_pressure(self).await?;
-        let table_info = self.get_table_info(&table_name).await?;
-        let condition = self
-            .parse_condition(
-                condition_expression,
-                &expression_attribute_names,
-                &expression_attribute_values,
-            )
-            .await?;
-        let this = self.clone();
-
-        self.with_transaction(true, |conn| {
-            let this = this.clone();
-            let table_info = table_info.clone();
-            let key = key.clone();
-            let condition = condition.clone();
-            Box::pin(async move {
-                this.delete_item_txn_with_replication(
-                    conn,
-                    TursoDeleteItemInput {
-                        table_info: &table_info,
-                        key: &key,
-                        condition: condition.as_ref(),
-                        return_old_on_condition_failure,
-                        replication: None,
-                        item_stream_ttl_hours: aux_item_stream_ttl_hours,
-                    },
-                )
-                .await
-            })
-        })
-        .await
+        self.delete_item_request_operation(request).await
     }
 
     async fn guarded_put_item(
         &self,
         request: GuardedPutItemRequest,
     ) -> StorageResult<PutItemResponse> {
-        apply_gsi_write_pressure(self).await?;
-        let GuardedPutItemRequest {
-            table_name,
-            item,
-            guard,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-        } = request;
-        let table_info = self.get_table_info(&table_name).await?;
-        let key_attributes =
-            StorageProvider::get_key_attributes(self, &item, &table_info.key_schema)?;
-        let condition = self
-            .parse_condition(
-                condition_expression,
-                &expression_attribute_names,
-                &expression_attribute_values,
-            )
-            .await?;
-        let this = self.clone();
-
-        let old_item = self
-            .with_transaction(true, |conn| {
-                let this = this.clone();
-                let table_info = table_info.clone();
-                let item = item.clone();
-                let guard = guard.clone();
-                let key_attributes = key_attributes.clone();
-                let condition = condition.clone();
-                Box::pin(async move {
-                    this.validate_durable_guard(
-                        conn,
-                        &table_info.table_name,
-                        &key_attributes,
-                        &guard,
-                    )
-                    .await?;
-                    this.put_item_txn(conn, &table_info, &item, condition.as_ref(), false, None)
-                        .await
-                })
-            })
-            .await?;
-
-        let attributes = if matches!(return_values, Some(AllOld::AllOld)) {
-            old_item
-        } else {
-            None
-        };
-
-        Ok(PutItemResponse {
-            attributes: attributes.map(Into::into),
-        })
+        self.guarded_put_item_operation(request).await
     }
 
     async fn guarded_delete_item(
         &self,
         request: GuardedDeleteItemRequest,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        apply_gsi_write_pressure(self).await?;
-        let GuardedDeleteItemRequest {
-            table_name,
-            key,
-            guard,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-        } = request;
-        let table_info = self.get_table_info(&table_name).await?;
-        let condition = self
-            .parse_condition(
-                condition_expression,
-                &expression_attribute_names,
-                &expression_attribute_values,
-            )
-            .await?;
-        let this = self.clone();
-
-        self.with_transaction(true, |conn| {
-            let this = this.clone();
-            let table_info = table_info.clone();
-            let key = key.clone();
-            let guard = guard.clone();
-            let condition = condition.clone();
-            Box::pin(async move {
-                this.validate_durable_guard(conn, &table_info.table_name, &key, &guard)
-                    .await?;
-                this.delete_item_txn_with_replication(
-                    conn,
-                    TursoDeleteItemInput {
-                        table_info: &table_info,
-                        key: &key,
-                        condition: condition.as_ref(),
-                        return_old_on_condition_failure: false,
-                        replication: None,
-                        item_stream_ttl_hours: None,
-                    },
-                )
-                .await
-            })
-        })
-        .await
+        self.guarded_delete_item_operation(request).await
     }
 
     async fn apply_replication_mutation(&self, mutation: ReplicationMutation) -> StorageResult<()> {
-        let table_info = self.get_table_info(&mutation.table_name).await?;
-        let metadata = mutation.metadata.clone();
-        let this = self.clone();
-        if let Some(new_image) = mutation.new_image {
-            self.with_transaction(true, |conn| {
-                let this = this.clone();
-                let table_info = table_info.clone();
-                let new_image = new_image.clone();
-                let metadata = metadata.clone();
-                Box::pin(async move {
-                    let split =
-                        split_item_into_key_and_attributes_sync(new_image.clone(), &table_info)?;
-                    let old_item = this
-                        .get_item_map_by_key(conn, &table_info, &split.key_attributes)
-                        .await?;
-                    this.overwrite_item_txn_with_replication(
-                        conn,
-                        &table_info,
-                        &new_image,
-                        old_item.as_ref(),
-                        Some(&metadata),
-                        None,
-                    )
-                    .await
-                })
-            })
-            .await?;
-            return Ok(());
-        }
-
-        self.with_transaction(true, |conn| {
-            let this = this.clone();
-            let table_info = table_info.clone();
-            let key = mutation.key.clone();
-            let metadata = metadata.clone();
-            Box::pin(async move {
-                this.delete_item_txn_with_replication(
-                    conn,
-                    TursoDeleteItemInput {
-                        table_info: &table_info,
-                        key: &key,
-                        condition: None,
-                        return_old_on_condition_failure: false,
-                        replication: Some(&metadata),
-                        item_stream_ttl_hours: None,
-                    },
-                )
-                .await
-                .map(|_| ())
-            })
-        })
-        .await
+        self.apply_replication_mutation_operation(mutation).await
     }
 
     async fn scan_table(
         &self,
         request: &storage_types::ScanTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        let table_info = self.get_table_info(&request.table_name).await?;
-        let effective_limit = calc_limit(request.limit, DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)?;
-        let exclusive_start_key = decode_exclusive_start(
-            &request.exclusive_start_key,
-            &table_info,
-            &request.index_name,
-        )?;
-
-        let (table_name_safe, key_schema, table_key_schema_for_index, origin_gsi) =
-            if let Some(index_name) = &request.index_name {
-                let gsi = table_info
-                    .global_secondary_indexes
-                    .as_ref()
-                    .and_then(|indexes| {
-                        indexes.iter().find(|index| &index.index_name == index_name)
-                    })
-                    .ok_or_else(|| missing_index_error(&table_info, index_name))?;
-                (
-                    gsi_table_name(&table_info.table_name, index_name),
-                    gsi.key_schema.clone(),
-                    Some(table_info.key_schema.as_slice()),
-                    true,
-                )
-            } else {
-                (
-                    format!("table_{}", table_info.table_name.sanitized_name()),
-                    table_info.key_schema.clone(),
-                    None,
-                    false,
-                )
-            };
-
-        let (sql, values) = build_sql_query(
-            &table_name_safe,
-            &key_schema,
-            None,
-            exclusive_start_key,
-            effective_limit,
-            Some(true),
-            table_key_schema_for_index,
-        )?;
-
-        let conn = self.connect().await?;
-        let rows = self
-            .query_row_set(
-                &conn,
-                &sql,
-                values.into_iter().map(TursoValue::Text).collect(),
-            )
-            .await?;
-
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let wire = if origin_gsi {
-                self.build_wire_item_from_gsi_row_view(row, &table_info, &key_schema)
-                    .await?
-            } else {
-                self.build_wire_item_from_main_row_view(row, &table_info)
-                    .await?
-            };
-            items.push(wire);
-        }
-
-        let has_more = items.len() > effective_limit as usize;
-        if has_more {
-            items.pop();
-        }
-
-        let last_evaluated_key = if has_more {
-            items
-                .last()
-                .map(|item| item.last_evaluated_key(&table_info, &request.index_name))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-
-        Ok((items, last_evaluated_key))
+        self.scan_table_operation(request).await
     }
 
     async fn query_table(
@@ -1202,33 +374,10 @@ impl StorageProvider for TursoStorageProvider {
     async fn batch_write_item(
         &self,
         request: BatchWriteItemRequest,
-        _should_write_to_stream: bool,
+        should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse> {
-        apply_gsi_write_pressure(self).await?;
-        let mut prepared_ops: Vec<PreparedBatchOperation> = Vec::new();
-        for (table_name, writes) in request.request_items {
-            let table_info = self.get_table_info(&table_name).await?;
-            for write in writes {
-                prepared_ops.push(prepare_batch_operation(&table_info, write)?);
-            }
-        }
-
-        let this = self.clone();
-        self.with_transaction(true, move |conn| {
-            let this = this.clone();
-            let prepared_ops = prepared_ops.clone();
-            Box::pin(async move {
-                this.execute_prepared_batch_operations(conn, &prepared_ops)
-                    .await
-            })
-        })
-        .await?;
-
-        Ok(BatchWriteItemResponse {
-            unprocessed_items: None,
-            item_collection_metrics: None,
-            consumed_capacity: None,
-        })
+        self.batch_write_item_operation(request, should_write_to_stream)
+            .await
     }
 
     async fn batch_get_item(
@@ -1240,517 +389,28 @@ impl StorageProvider for TursoStorageProvider {
     }
 
     async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse> {
-        apply_gsi_write_pressure(self).await?;
-        let table_info = self.get_table_info(&request.table_name).await?;
-        let UpdateItemRequest {
-            table_name,
-            key,
-            update_expression,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-            return_values_on_condition_check_failure,
-            aux_item_stream_ttl_hours,
-            ..
-        } = request;
-        let this = self.clone();
-        let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
-        let return_old_on_condition_failure =
-            storage_types::return_values_on_condition_check_failure_all_old(
-                return_values_on_condition_check_failure.as_ref(),
-            );
-
-        let (old_item, new_item, response_fields) = self
-            .with_transaction(true, |conn| {
-                let this = this.clone();
-                let table_info = table_info.clone();
-                let key = key.clone();
-                let update_expression = update_expression.clone();
-                let condition_expression = condition_expression.clone();
-                let expression_attribute_names = expression_attribute_names.clone();
-                let expression_attribute_values = expression_attribute_values.clone();
-                Box::pin(async move {
-                    let (operations, condition) = before_update_item_optional(
-                        update_expression.as_deref(),
-                        condition_expression.as_deref(),
-                        expression_attribute_names.as_ref(),
-                        expression_attribute_values.as_ref(),
-                    )?;
-                    let response_fields = if collect_response_fields {
-                        operations
-                            .iter()
-                            .map(|operation| operation.field_name_arc())
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                    let existing_item = this.get_item_map_by_key(conn, &table_info, &key).await?;
-                    let (item_to_update, updated_item) = plan_update_from_existing_item(
-                        existing_item,
-                        &key,
-                        &operations,
-                        condition.as_ref(),
-                        return_old_on_condition_failure,
-                    )?;
-
-                    this.overwrite_item_txn(
-                        conn,
-                        &table_info,
-                        &updated_item,
-                        Some(&item_to_update),
-                        aux_item_stream_ttl_hours,
-                    )
-                    .await?;
-
-                    Ok((item_to_update, updated_item, response_fields))
-                })
-            })
-            .await?;
-
-        let response = update_item_response(
-            &response_fields,
-            Some(old_item),
-            Some(new_item),
-            return_values.as_ref(),
-        )?;
-
-        self.invalidate_table_cache(&table_name).await;
-        Ok(response)
+        self.update_item_operation(request).await
     }
 
     async fn guarded_update_item(
         &self,
         request: GuardedUpdateItemRequest,
     ) -> StorageResult<UpdateItemResponse> {
-        apply_gsi_write_pressure(self).await?;
-        let GuardedUpdateItemRequest { request, guard } = request;
-        let table_info = self.get_table_info(&request.table_name).await?;
-        let UpdateItemRequest {
-            table_name,
-            key,
-            update_expression,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-            aux_item_stream_ttl_hours,
-            ..
-        } = request;
-        let this = self.clone();
-        let collect_response_fields = return_values_need_updated_fields(return_values.as_ref());
-
-        let (old_item, new_item, response_fields) = self
-            .with_transaction(true, |conn| {
-                let this = this.clone();
-                let table_info = table_info.clone();
-                let key = key.clone();
-                let guard = guard.clone();
-                let update_expression = update_expression.clone();
-                let condition_expression = condition_expression.clone();
-                let expression_attribute_names = expression_attribute_names.clone();
-                let expression_attribute_values = expression_attribute_values.clone();
-                Box::pin(async move {
-                    let (operations, condition) = before_update_item_optional(
-                        update_expression.as_deref(),
-                        condition_expression.as_deref(),
-                        expression_attribute_names.as_ref(),
-                        expression_attribute_values.as_ref(),
-                    )?;
-                    let response_fields = if collect_response_fields {
-                        operations
-                            .iter()
-                            .map(|operation| operation.field_name_arc())
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                    this.validate_durable_guard(conn, &table_info.table_name, &key, &guard)
-                        .await?;
-                    let existing_item = this.get_item_map_by_key(conn, &table_info, &key).await?;
-                    let (item_to_update, updated_item) = plan_update_from_existing_item(
-                        existing_item,
-                        &key,
-                        &operations,
-                        condition.as_ref(),
-                        false,
-                    )?;
-
-                    this.overwrite_item_txn(
-                        conn,
-                        &table_info,
-                        &updated_item,
-                        Some(&item_to_update),
-                        aux_item_stream_ttl_hours,
-                    )
-                    .await?;
-
-                    Ok((item_to_update, updated_item, response_fields))
-                })
-            })
-            .await?;
-
-        let response = update_item_response(
-            &response_fields,
-            Some(old_item),
-            Some(new_item),
-            return_values.as_ref(),
-        )?;
-
-        self.invalidate_table_cache(&table_name).await;
-        Ok(response)
+        self.guarded_update_item_operation(request).await
     }
 
     async fn transact_write_items(
         &self,
         request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
-        apply_gsi_write_pressure(self).await?;
-        let this = self.clone();
-        self.with_transaction(true, |conn| {
-            let this = this.clone();
-            let request = request.clone();
-            Box::pin(async move {
-                let mut preflights = Vec::with_capacity(request.transact_items.len());
-                for item in &request.transact_items {
-                    preflights.push(this.preflight_transact_item_key(item).await?);
-                }
-                if let Some(error) = transaction_canceled_for_preflights(&preflights) {
-                    return Err(error);
-                }
-                validate_no_duplicate_transact_item_keys(&preflights)?;
-
-                let item_count = request.transact_items.len();
-                let mut cancellation_reasons = vec![None; item_count];
-                for (index, item) in request.transact_items.into_iter().enumerate() {
-                    let result = async {
-                        if let Some(put) = item.put {
-                            let table_info = this.get_table_info(&put.table_name).await?;
-                            validate_transact_put_item_key(&table_info, &put.item)?;
-                            let old_item = if put.condition_expression.is_some() {
-                                let split_item = split_item_into_key_and_attributes_sync(
-                                    put.item.clone(),
-                                    &table_info,
-                                )?;
-                                this.get_item_map_by_key(
-                                    conn,
-                                    &table_info,
-                                    &split_item.key_attributes,
-                                )
-                                .await?
-                            } else {
-                                None
-                            };
-                            let condition = this
-                                .parse_condition(
-                                    put.condition_expression.clone(),
-                                    &put.expression_attribute_names,
-                                    &put.expression_attribute_values,
-                                )
-                                .await?;
-                            if let Some(condition) = condition.as_ref()
-                                && !evaluate_condition(
-                                    condition_item_ref(old_item.as_ref()),
-                                    condition,
-                                )
-                            {
-                                return Err(transaction_canceled_for_reason(
-                                    index,
-                                    conditional_check_failed_reason(
-                                        all_old(
-                                            put.return_values_on_condition_check_failure.as_ref(),
-                                        )
-                                        .then_some(old_item.as_ref())
-                                        .flatten(),
-                                    )?,
-                                ));
-                            }
-                            let _ = this
-                                .put_item_txn(
-                                    conn,
-                                    &table_info,
-                                    &put.item,
-                                    None,
-                                    false,
-                                    put.aux_item_stream_ttl_hours,
-                                )
-                                .await?;
-                        }
-
-                        if let Some(delete) = item.delete {
-                            let table_info = this.get_table_info(&delete.table_name).await?;
-                            validate_transact_key(&table_info, &delete.key)?;
-                            let old_item = if delete.condition_expression.is_some() {
-                                this.get_item_map_by_key(conn, &table_info, &delete.key)
-                                    .await?
-                            } else {
-                                None
-                            };
-                            let condition = this
-                                .parse_condition(
-                                    delete.condition_expression.clone(),
-                                    &delete.expression_attribute_names,
-                                    &delete.expression_attribute_values,
-                                )
-                                .await?;
-                            if let Some(condition) = condition.as_ref()
-                                && !evaluate_condition(
-                                    condition_item_ref(old_item.as_ref()),
-                                    condition,
-                                )
-                            {
-                                return Err(transaction_canceled_for_reason(
-                                    index,
-                                    conditional_check_failed_reason(
-                                        all_old(
-                                            delete
-                                                .return_values_on_condition_check_failure
-                                                .as_ref(),
-                                        )
-                                        .then_some(old_item.as_ref())
-                                        .flatten(),
-                                    )?,
-                                ));
-                            }
-                            let _ = this
-                                .delete_item_txn_with_replication(
-                                    conn,
-                                    TursoDeleteItemInput {
-                                        table_info: &table_info,
-                                        key: &delete.key,
-                                        condition: None,
-                                        return_old_on_condition_failure: false,
-                                        replication: None,
-                                        item_stream_ttl_hours: delete.aux_item_stream_ttl_hours,
-                                    },
-                                )
-                                .await?;
-                        }
-
-                        if let Some(update) = item.update {
-                            let table_info = this.get_table_info(&update.table_name).await?;
-                            let (operations, condition) = before_update_item(
-                                update.update_expression.as_str(),
-                                update.condition_expression.as_deref(),
-                                update.expression_attribute_names.as_ref(),
-                                update.expression_attribute_values.as_ref(),
-                            )?;
-                            let existing_item = this
-                                .get_item_map_by_key(conn, &table_info, &update.key)
-                                .await?;
-
-                            if let Some(condition) = condition.as_ref()
-                                && !evaluate_condition(
-                                    condition_item_ref(existing_item.as_ref()),
-                                    condition,
-                                )
-                            {
-                                return Err(transaction_canceled_for_reason(
-                                    index,
-                                    conditional_check_failed_reason(
-                                        all_old(
-                                            update
-                                                .return_values_on_condition_check_failure
-                                                .as_ref(),
-                                        )
-                                        .then_some(existing_item.as_ref())
-                                        .flatten(),
-                                    )?,
-                                ));
-                            }
-
-                            let item_to_update =
-                                existing_item.unwrap_or_else(|| update.key.to_attribute_map());
-                            let updated_item =
-                                apply_bound_update_operations(item_to_update, &operations)?;
-                            let _ = this
-                                .put_item_txn(
-                                    conn,
-                                    &table_info,
-                                    &updated_item,
-                                    None,
-                                    false,
-                                    update.aux_item_stream_ttl_hours,
-                                )
-                                .await?;
-                        }
-
-                        if let Some(condition_check) = item.condition_check {
-                            let table_info =
-                                this.get_table_info(&condition_check.table_name).await?;
-                            validate_transact_key(&table_info, &condition_check.key)?;
-                            let existing = this
-                                .get_item_map_by_key(conn, &table_info, &condition_check.key)
-                                .await?;
-                            let parsed = parse_condition_expression(
-                                &condition_check.condition_expression,
-                                condition_check.expression_attribute_names.as_ref(),
-                                condition_check.expression_attribute_values.as_ref(),
-                            )
-                            .map_err(StorageError::validation)?;
-                            if !evaluate_condition(condition_item_ref(existing.as_ref()), &parsed) {
-                                return Err(transaction_canceled_for_reason(
-                                    index,
-                                    conditional_check_failed_reason(
-                                        all_old(
-                                            condition_check
-                                                .return_values_on_condition_check_failure
-                                                .as_ref(),
-                                        )
-                                        .then_some(existing.as_ref())
-                                        .flatten(),
-                                    )?,
-                                ));
-                            }
-                        }
-                        Ok(())
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        let error =
-                            transaction_canceled_for_item_error_with_len(index, item_count, error);
-                        let Some(reason) = transaction_cancellation_reason_at(&error, index) else {
-                            return Err(error);
-                        };
-                        cancellation_reasons[index] = Some(reason);
-                    }
-                }
-                if let Some(error) = transaction_canceled_for_indexed_reasons(cancellation_reasons)
-                {
-                    return Err(error);
-                }
-
-                Ok(TransactWriteItemsResponse {
-                    consumed_capacity: None,
-                    item_collection_metrics: None,
-                })
-            })
-        })
-        .await
+        self.transact_write_items_operation(request).await
     }
 
     async fn update_table(
         &self,
         request: storage_types::UpdateTableRequest,
     ) -> StorageResult<storage_types::UpdateTableResponse> {
-        let mut table_info = self.get_table_info(&request.table_name).await?;
-        if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
-            let conn = self.connect().await?;
-            let _ = self
-                .execute(
-                    &conn,
-                    sql_statements::update_deletion_protection(),
-                    vec![
-                        TursoValue::Integer(if deletion_protection_enabled { 1 } else { 0 }),
-                        TursoValue::Text(request.table_name.to_string()),
-                    ],
-                )
-                .await?;
-            self.invalidate_table_cache(&request.table_name).await;
-            table_info.deletion_protection_enabled = deletion_protection_enabled;
-        }
-        if request.aux_stream_duration_hours.is_some()
-            || request.aux_default_item_stream_duration_hours.is_some()
-        {
-            if let Some(table_stream_duration) = request.aux_stream_duration_hours {
-                table_info.table_stream_duration = table_stream_duration;
-            }
-            if let Some(default_item_stream_duration) =
-                request.aux_default_item_stream_duration_hours
-            {
-                table_info.default_item_stream_duration = default_item_stream_duration;
-            }
-            let table_name = request.table_name.clone();
-            let this = self.clone();
-            let table_stream_duration = table_info.table_stream_duration;
-            let default_item_stream_duration = table_info.default_item_stream_duration;
-            self.with_exclusive_transaction(true, |conn| {
-                let this = this.clone();
-                let table_name = table_name.clone();
-                Box::pin(async move {
-                    let table_scope_id = this.load_table_scope_id(conn, &table_name).await?;
-                    let policy_version = this
-                        .next_table_policy_version(conn, &table_scope_id)
-                        .await?;
-                    let table_duration_plan = plan_table_stream_duration(
-                        table_name.clone(),
-                        table_scope_id,
-                        policy_version,
-                        table_stream_duration,
-                        default_item_stream_duration,
-                        TimestampMillis::now(),
-                    );
-                    let _ = this
-                        .execute(
-                            conn,
-                            sql_statements::update_stream_durations(),
-                            vec![
-                                TursoValue::Integer(table_stream_duration.as_hours_wire_value()),
-                                TursoValue::Integer(
-                                    default_item_stream_duration.as_hours_wire_value(),
-                                ),
-                                TursoValue::Text(table_name.to_string()),
-                            ],
-                        )
-                        .await?;
-                    this.write_stream_trim_state(
-                        conn,
-                        storage_provider::StreamTrimStateWrite {
-                            state: table_duration_plan.trim_state,
-                            next_marker: table_duration_plan.due_marker,
-                        },
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await?;
-            self.invalidate_table_cache(&request.table_name).await;
-        }
-
-        Ok(storage_types::UpdateTableResponse {
-            table_description: storage_types::TableDescription {
-                table_name: table_info.table_name.clone(),
-                table_status: table_info.table_status,
-                created_at: table_info.created_at.into(),
-                attribute_definitions: table_info.attribute_definitions,
-                key_schema: table_info.key_schema,
-                table_size_bytes: table_info.table_size_bytes,
-                item_count: table_info.item_count,
-                table_arn: format!(
-                    "arn:aws:dynamodb:us-east-1:123456789012:table/{}",
-                    table_info.table_name
-                ),
-                replicas: None,
-                multi_region_consistency: None,
-                billing_mode_summary: Some(storage_types::BillingModeSummary {
-                    billing_mode: Some(storage_types::BillingMode::PayPerRequest),
-                    last_update_to_pay_per_request_date_time: None,
-                }),
-                global_secondary_indexes: table_info.global_secondary_indexes.map(|indexes| {
-                    indexes
-                        .into_iter()
-                        .map(|index| storage_types::GlobalSecondaryIndexDescription {
-                            index_name: index.index_name,
-                            key_schema: index.key_schema,
-                            projection: index.projection,
-                            index_status: None,
-                            backfilling: None,
-                            provisioned_throughput: None,
-                            index_size_bytes: None,
-                            item_count: None,
-                            index_arn: None,
-                        })
-                        .collect()
-                }),
-                local_secondary_indexes: None,
-                provisioned_throughput: None,
-                stream_specification: table_info.stream_specification,
-                latest_stream_arn: None,
-                latest_stream_label: None,
-                deletion_protection_enabled: table_info.deletion_protection_enabled,
-            },
-        })
+        self.update_table_operation(request).await
     }
 
     async fn update_time_to_live(
@@ -1789,125 +449,8 @@ impl StorageProvider for TursoStorageProvider {
                 .saturating_sub(CHANGE_INDEX_MARKER_RETENTION_MS);
             self.trim_change_index_markers_older_than(cutoff_created_at_ms)
                 .await?;
-            let _ = run_custom_stream_trim_once(self).await?;
+            let _ = ttl::run_custom_stream_trim_once(self).await?;
         }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl StreamDurationTrimBackend for TursoStorageProvider {
-    async fn list_due_stream_trim_markers(
-        &self,
-        due_before: TimestampMillis,
-        limit: usize,
-    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
-        let conn = self.connect().await?;
-        self.list_due_stream_trim_markers(&conn, due_before, limit)
-            .await
-    }
-
-    async fn load_stream_trim_state(
-        &self,
-        scope: &StreamTrimScope,
-    ) -> StorageResult<Option<StreamTrimState>> {
-        let conn = self.connect().await?;
-        self.load_stream_trim_state_by_scope(&conn, scope).await
-    }
-
-    async fn load_stream_trim_boundaries(
-        &self,
-        scope: &StreamTrimScope,
-    ) -> StorageResult<StreamTrimScopeBoundaries> {
-        let conn = self.connect().await?;
-        self.load_stream_trim_boundaries(&conn, scope).await
-    }
-
-    async fn trim_table_stream_page(
-        &self,
-        request: StreamDurationTrimPageRequest,
-    ) -> StorageResult<StreamDurationTrimPageResult> {
-        self.trim_stream_page(request).await
-    }
-
-    async fn trim_item_stream_page(
-        &self,
-        request: StreamDurationTrimPageRequest,
-    ) -> StorageResult<StreamDurationTrimPageResult> {
-        self.trim_stream_page(request).await
-    }
-
-    async fn finish_stream_trim_marker(
-        &self,
-        marker: StreamTrimDueMarker,
-        write: Option<StreamTrimStateWrite>,
-    ) -> StorageResult<()> {
-        self.finish_stream_trim_marker(marker, write).await
-    }
-}
-
-impl TursoStorageProvider {
-    async fn preflight_transact_item_key(
-        &self,
-        item: &TransactWriteItem,
-    ) -> StorageResult<TransactionKeyPreflight> {
-        let Some(table_name) = transact_item_table_name(item) else {
-            return Ok(TransactionKeyPreflight::default());
-        };
-        let table_info = self.get_table_info(table_name).await?;
-        preflight_transact_item_key_with_table_info(item, &table_info)
-    }
-
-    async fn execute_prepared_batch_operations<C>(
-        &self,
-        conn: &C,
-        prepared_ops: &[PreparedBatchOperation],
-    ) -> StorageResult<()>
-    where
-        C: crate::backends::turso::provider::core::TursoSqlConnection + ?Sized,
-    {
-        for prepared_op in prepared_ops {
-            match prepared_op {
-                PreparedBatchOperation::Put {
-                    table_info,
-                    full_item,
-                    aux_item_stream_ttl_hours,
-                    ..
-                } => {
-                    let _ = self
-                        .put_item_txn(
-                            conn,
-                            table_info,
-                            full_item,
-                            None,
-                            false,
-                            *aux_item_stream_ttl_hours,
-                        )
-                        .await?;
-                }
-                PreparedBatchOperation::Delete {
-                    table_info,
-                    key,
-                    aux_item_stream_ttl_hours,
-                    ..
-                } => {
-                    let _ = self
-                        .delete_item_txn_with_replication(
-                            conn,
-                            TursoDeleteItemInput {
-                                table_info,
-                                key,
-                                condition: None,
-                                return_old_on_condition_failure: false,
-                                replication: None,
-                                item_stream_ttl_hours: *aux_item_stream_ttl_hours,
-                            },
-                        )
-                        .await?;
-                }
-            }
-        }
-
         Ok(())
     }
 }

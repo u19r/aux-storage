@@ -1,14 +1,16 @@
 use std::{collections::HashMap, time::Duration};
 
 use crate::{
+    QueueError, QueueInternalKind, QueueValidationKind,
     constants::{
         JOB_POLL_BATCH_SIZE, MAX_IMMEDIATE_JOB_RETRY_VISIBILITY_SECS, MINIMUM_JOB_WORKERS,
         QUEUE_ATTRIBUTE_SENT_TIMESTAMP, SCALE_DOWN_STREAK_SECONDS,
     },
     immediate_jobs::{
-        ImmediateJobRunnerConfig, immediate_job_receive_request, normalized_max_job_workers,
-        queue_message_delay_ms_at, retry_visibility_timeout_secs, scale_down_threshold,
-        should_count_underutilized_second, should_scale_down, should_scale_up,
+        ImmediateJobRunnerConfig, immediate_job_receive_request, immediate_job_receive_retry_delay,
+        normalized_max_job_workers, queue_message_delay_ms_at, retry_visibility_timeout_secs,
+        scale_down_threshold, should_count_underutilized_second, should_scale_down,
+        should_scale_up, wait_for_immediate_job_receive_retry,
     },
 };
 
@@ -42,6 +44,38 @@ fn immediate_job_receive_request_polls_job_queue_with_sent_timestamp_attribute()
         Some(vec![QUEUE_ATTRIBUTE_SENT_TIMESTAMP.to_string()])
     );
     assert_eq!(request.message_attribute_names, None);
+}
+
+#[test]
+fn immediate_job_receive_retry_distinguishes_sender_and_backend_faults() {
+    assert_eq!(
+        immediate_job_receive_retry_delay(&QueueError::validation(
+            QueueValidationKind::InvalidQueueUrlFormat
+        )),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        immediate_job_receive_retry_delay(&QueueError::internal(
+            QueueInternalKind::ReceiveCoalescerClosed
+        )),
+        Duration::from_secs(1)
+    );
+}
+
+#[tokio::test]
+async fn immediate_job_receive_retry_stops_without_waiting_for_delay() {
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    stop_tx
+        .send(true)
+        .expect("worker stop receiver remains open");
+
+    assert!(
+        wait_for_immediate_job_receive_retry(
+            &QueueError::validation(QueueValidationKind::InvalidQueueUrlFormat),
+            &mut stop_rx
+        )
+        .await
+    );
 }
 
 #[test]

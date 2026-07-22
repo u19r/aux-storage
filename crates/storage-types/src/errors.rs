@@ -194,7 +194,6 @@ impl StorageError {
             self.to_enum(),
             StorageEnum::TransactionConflict { .. }
                 | StorageEnum::TransactionInProgress { .. }
-                | StorageEnum::TransactionCanceled { .. }
                 | StorageEnum::ProvisionedThroughputExceeded { .. }
                 | StorageEnum::Throttled { .. }
                 | StorageEnum::RequestLimitExceeded

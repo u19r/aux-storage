@@ -1,6 +1,0 @@
-rule	path	symbol-or--	metric	owner	reason	removal	approved-by
-FILE001	crates/kv/src/backends/fdb/store.rs	-	physical-lines=3110	aux-storage	mixed-responsibility-risk	physical-lines<=500-at-owner-boundaries	maintainer-2026-07-15
-FILE001	crates/kv/src/queue_provider.rs	-	physical-lines=2244	aux-storage	mixed-responsibility-risk	physical-lines<=500-at-owner-boundaries	maintainer-2026-07-15
-FILE001	crates/sql/src/backends/turso/provider/core.rs	-	physical-lines=2172	aux-storage	mixed-responsibility-risk	physical-lines<=500-at-owner-boundaries	maintainer-2026-07-15
-FILE001	crates/sql/src/backends/turso/provider/storage_provider_impl.rs	-	physical-lines=1912	aux-storage	mixed-responsibility-risk	physical-lines<=500-at-owner-boundaries	maintainer-2026-07-15
-FILE001	crates/storage-types/src/request_response.rs	-	physical-lines=1885	aux-storage	mixed-responsibility-risk	physical-lines<=500-at-owner-boundaries	maintainer-2026-07-15

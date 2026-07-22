@@ -22,7 +22,11 @@ pub struct RemoteErrorResponse {
 #[derive(Debug, Default, Deserialize)]
 pub struct RemoteCancellationReason {
     #[serde(default, rename = "Code", alias = "code")]
-    pub code: String,
+    pub code: Option<String>,
+    #[serde(default, rename = "Message", alias = "message")]
+    pub message: Option<String>,
+    #[serde(default, rename = "Item", alias = "item")]
+    pub item: Option<serde_json::Value>,
 }
 
 pub fn classify_error_response(
@@ -65,15 +69,11 @@ pub fn classify_error_response(
                 .cancellation_reasons
                 .unwrap_or_default()
                 .into_iter()
-                .map(|reason| reason.code)
+                .map(encode_cancellation_reason)
                 .collect::<Vec<_>>();
-            let retryable = reasons.is_empty()
-                || reasons
-                    .iter()
-                    .any(|reason| reason != "None" && reason != "ConditionalCheckFailed");
             (
                 StorageError::Base(StorageEnum::TransactionCanceled { reasons }),
-                retryable,
+                false,
             )
         }
         Some("TransactionInProgressException") => (
@@ -174,4 +174,15 @@ pub fn classify_error_response(
 
 fn normalize_error_code(raw: &str) -> String {
     raw.split('#').next_back().unwrap_or(raw).to_string()
+}
+
+fn encode_cancellation_reason(reason: RemoteCancellationReason) -> String {
+    let code = reason.code.unwrap_or_else(|| "None".to_string());
+    let Some(item) = reason.item else {
+        return reason
+            .message
+            .map_or(code.clone(), |message| format!("{code}\t{message}"));
+    };
+    let item = item.to_string();
+    format!("{code}\t{}\t{item}", reason.message.unwrap_or_default())
 }

@@ -6,7 +6,8 @@ use storage_remote::{MAX_ENDPOINT_RETRIES, RemoteStorageProvider};
 use storage_sync::{SYNC_LEADER_HINT_HEADER, SYNC_NOT_LEADER_ERROR_TYPE};
 use storage_types::{
     AttributeDefinition, AttributeValue, CreateTableRequest, KeyAttributeType, KeySchemaElement,
-    KeyType, StorageError, StreamItemId, StreamName, TableName,
+    KeyType, StorageEnum, StorageError, StreamItemId, StreamName, TableName,
+    TransactWriteItemsRequest, context::WrappedError as _,
 };
 use stream::StreamProvider;
 
@@ -53,6 +54,42 @@ async fn provider_with_endpoints(endpoints: Vec<String>) -> RemoteStorageProvide
     })
     .await
     .expect("remote provider")
+}
+
+#[tokio::test]
+async fn transaction_cancellation_is_returned_once_with_complete_reasons() {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let transaction_mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
+                .path("/");
+            then.status(400).json_body(serde_json::json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+                "message": "Transaction cancelled",
+                "CancellationReasons": [{
+                    "Code": "ConditionalCheckFailed",
+                    "Message": "The conditional request failed.",
+                    "Item": {"pk": {"S": "item-1"}}
+                }]
+            }));
+        })
+        .await;
+
+    let error = provider
+        .transact_write_items(TransactWriteItemsRequest::default())
+        .await
+        .expect_err("transaction cancellation");
+
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::TransactionCanceled { reasons }
+            if reasons.iter().map(String::as_str).eq([
+                "ConditionalCheckFailed\tThe conditional request failed.\t{\"pk\":{\"S\":\"item-1\"}}"
+            ])
+    ));
+    transaction_mock.assert_calls_async(1).await;
 }
 
 #[tokio::test]
