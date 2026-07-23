@@ -208,7 +208,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     pub(super) fn create_stream_record(
-        _table_name: &TableName,
+        table_name: &TableName,
         item: &HashMap<String, AttributeValue>,
         is_deleted: bool,
         stream_spec: Option<&storage_types::StreamSpecification>,
@@ -250,6 +250,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
         StreamRecord {
             cursor: None,
+            source_table_name: Some(table_name.clone()),
             keys,
             sequence_number,
             new_image,

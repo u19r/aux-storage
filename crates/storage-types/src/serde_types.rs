@@ -794,17 +794,29 @@ impl TryFrom<serde_json::Value> for GetStreamRecordsRequest {
         let request: GetStreamRecordsRequest =
             serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
 
-        if request.table_name.as_ref().is_empty() {
-            return Err("TableName cannot be empty".to_string());
+        match (&request.table_name, request.system_stream) {
+            (Some(table_name), false) if table_name.as_ref().is_empty() => {
+                return Err("TableName cannot be empty".to_string());
+            }
+            (Some(_), false) | (None, true) => {}
+            (Some(_), true) => {
+                return Err("TableName and SystemStream cannot be used together".to_string());
+            }
+            (None, false) => {
+                return Err("TableName or SystemStream is required".to_string());
+            }
         }
 
-        if let Some(limit) = request.limit
-            && !(DYNAMODB_STREAM_RECORDS_LIMIT_MIN..=DYNAMODB_STREAM_RECORDS_LIMIT_MAX)
-                .contains(&limit)
-        {
-            return Err(DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE.to_string());
+        if let Some(limit) = request.limit {
+            let maximum = if request.system_stream {
+                crate::SYSTEM_STREAM_RECORDS_LIMIT_MAX
+            } else {
+                DYNAMODB_STREAM_RECORDS_LIMIT_MAX
+            };
+            if !(DYNAMODB_STREAM_RECORDS_LIMIT_MIN..=maximum).contains(&limit) {
+                return Err(format!("Limit must be between 1 and {maximum}"));
+            }
         }
-
         Ok(request)
     }
 }

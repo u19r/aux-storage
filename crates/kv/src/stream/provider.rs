@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, time::Instant};
 
 use async_trait::async_trait;
 use bg_jobs::{BackgroundJob, BackgroundJobName, JobConfig, errors::JobError};
+use futures::{StreamExt, TryStreamExt};
 use storage_types::{
     DurationSeconds, ItemKey, ItemStreamVersion, StorageError, StorageResult, StreamItemId,
     StreamKey, StreamName, TableName, TimestampMillis, UserStreamName, context::ErrorContext,
@@ -518,27 +519,33 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
             )
             .await?;
 
-        let mut records = Vec::with_capacity(item_pointers.items.len());
+        let mut decoded = Vec::with_capacity(item_pointers.items.len());
         for pointer_item in item_pointers.items {
-            match self.decode_pointer_item(&pointer_item).await? {
-                DecodedPointerItem::Embedded { pointer, items } => {
-                    records.push((pointer, items));
-                }
-                DecodedPointerItem::Pointer(pointer) => {
-                    let items = self
-                        .read_item_stream_backward_from_pointer(
-                            pointer.stream_name.clone(),
-                            pointer.stream_item_id,
-                            pointer.item_stream_version,
-                            2,
-                        )
-                        .await
-                        .map(|page| page.items)
-                        .unwrap_or_default();
-                    records.push((pointer, items));
-                }
-            }
+            decoded.push(self.decode_pointer_item(&pointer_item).await?);
         }
+        let records = futures::stream::iter(decoded)
+            .map(|decoded| async move {
+                match decoded {
+                    DecodedPointerItem::Embedded { pointer, items } => {
+                        Ok::<_, StreamError>((pointer, items))
+                    }
+                    DecodedPointerItem::Pointer(pointer) => {
+                        let items = self
+                            .read_item_stream_backward_from_pointer(
+                                pointer.stream_name.clone(),
+                                pointer.stream_item_id,
+                                pointer.item_stream_version,
+                                2,
+                            )
+                            .await?
+                            .items;
+                        Ok((pointer, items))
+                    }
+                }
+            })
+            .buffered(32)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         let last_scanned_key = item_pointers.last_evaluated_key;
         Ok(PointerRecordsResult {

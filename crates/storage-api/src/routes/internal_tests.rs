@@ -265,6 +265,91 @@ async fn internal_stream_reader_returns_records_from_real_table_writes() {
 }
 
 #[tokio::test]
+async fn given_mixed_table_writes_when_system_stream_is_read_then_records_resume_globally() {
+    let db = create_test_db().await;
+    let app_state = Arc::new(AppState::new_with_manager_options(
+        db,
+        StorageApiManagerOptions::default(),
+    ));
+    for table_name in ["system-orders", "system-users"] {
+        let mut create_headers = HeaderMap::new();
+        create_headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("DynamoDB_20120810.CreateTable"),
+        );
+        dynamodb_endpoint(
+            State(app_state.clone()),
+            create_headers,
+            Bytes::from(create_stream_table_body(table_name).to_string()),
+        )
+        .await
+        .expect("create response");
+
+        let mut put_headers = HeaderMap::new();
+        put_headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("DynamoDB_20120810.PutItem"),
+        );
+        dynamodb_endpoint(
+            State(app_state.clone()),
+            put_headers,
+            Bytes::from(
+                json!({
+                    "TableName": table_name,
+                    "Item": {
+                        "pk": { "S": format!("{table_name}#1") },
+                        "status": { "S": "pending" }
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("put response");
+    }
+
+    let first = internal::get_stream_records_endpoint(
+        State(app_state.clone()),
+        Bytes::from(json!({"SystemStream": true, "Limit": 1}).to_string()),
+    )
+    .await
+    .expect("first system stream response");
+    let first_body = body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("first body");
+    let first_json: serde_json::Value =
+        serde_json::from_slice(&first_body).expect("first response json");
+    assert_eq!(first_json["Records"].as_array().expect("records").len(), 1);
+    let cursor = first_json["LastEvaluatedKey"]
+        .as_str()
+        .expect("continuation cursor");
+
+    let second = internal::get_stream_records_endpoint(
+        State(app_state),
+        Bytes::from(
+            json!({
+                "SystemStream": true,
+                "LastEvaluatedKey": cursor,
+                "Limit": 8192
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .expect("second system stream response");
+    let second_body = body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("second body");
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second_body).expect("second response json");
+    let second_records = second_json["Records"].as_array().expect("records");
+    assert_eq!(second_records.len(), 1);
+    assert!(second_records[0]["SourceTableName"].is_string());
+    assert!(second_records[0]["Keys"]["pk"]["S"].is_string());
+    assert!(second_json.get("LastEvaluatedKey").is_none());
+}
+
+#[tokio::test]
 async fn internal_stream_reader_omits_last_evaluated_key_on_final_non_empty_page() {
     let db = create_test_db().await;
     let app_state = Arc::new(AppState::new_with_manager_options(

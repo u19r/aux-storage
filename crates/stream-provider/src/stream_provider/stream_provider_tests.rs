@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +13,7 @@ use storage_types::{
 };
 
 use crate::{
-    CursorName, StreamDataType, StreamItem, StreamPage, StreamProvider,
+    CursorName, StreamDataType, StreamError, StreamItem, StreamPage, StreamProvider,
     errors::StreamResult,
     types::{
         CursorPage, CursorPosition, EmbeddedStreamItem, StoredStreamPointer, Stream, StreamCursor,
@@ -24,6 +24,7 @@ use crate::{
 struct InMemoryStreamProvider {
     pointer_streams: HashMap<StreamName, Vec<StreamItem>>,
     item_streams: HashMap<StreamName, Vec<StreamItem>>,
+    failed_item_streams: HashSet<StreamName>,
     read_backward_calls: Arc<AtomicUsize>,
 }
 
@@ -35,8 +36,14 @@ impl InMemoryStreamProvider {
         Self {
             pointer_streams,
             item_streams,
+            failed_item_streams: HashSet::new(),
             read_backward_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_failed_item_stream(mut self, stream_name: StreamName) -> Self {
+        self.failed_item_streams.insert(stream_name);
+        self
     }
 
     fn read_backward_calls(&self) -> usize {
@@ -113,6 +120,9 @@ impl StreamProvider for InMemoryStreamProvider {
         limit: u32,
     ) -> StreamResult<StreamPage> {
         self.read_backward_calls.fetch_add(1, Ordering::SeqCst);
+        if self.failed_item_streams.contains(&stream_name) {
+            return Err(StreamError::internal("injected item stream read failure"));
+        }
         let mut items = self
             .item_streams
             .get(&stream_name)
@@ -284,6 +294,44 @@ fn pointer_stream_reads_item_stream_images() {
             storage_types::storage_serde::from_bytes(&items[1].data).expect("decode old");
         assert_eq!(decoded_new.get("pk"), new_item.get("pk"));
         assert_eq!(decoded_old.get("pk"), old_item.get("pk"));
+    });
+}
+
+#[test]
+fn given_pointer_target_failure_when_page_is_resolved_then_read_fails() {
+    futures::executor::block_on(async {
+        let pointer_stream = StreamName::new(b"pointer-stream");
+        let item_stream = StreamName::new(b"failed-item-stream");
+        let stored_pointer = StoredStreamPointer::pointer(
+            item_stream.clone(),
+            TableName::new("failed_table"),
+            item_stream_version(1),
+        );
+        let pointer_item = build_stream_item(
+            stream_item_id(1),
+            None,
+            storage_types::storage_serde::to_bytes(&stored_pointer).expect("pointer bytes"),
+            StreamDataType::StreamPointer,
+        );
+        let provider = InMemoryStreamProvider::new(
+            HashMap::from([(pointer_stream.clone(), vec![pointer_item])]),
+            HashMap::new(),
+        )
+        .with_failed_item_stream(item_stream);
+
+        let error = match provider
+            .get_items_from_pointer_stream(pointer_stream, None, Some(10))
+            .await
+        {
+            Ok(_) => panic!("pointer target failure must not become an empty record"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected item stream read failure")
+        );
     });
 }
 

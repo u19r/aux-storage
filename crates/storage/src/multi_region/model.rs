@@ -1182,6 +1182,7 @@ pub(super) fn decode_stream_record_from_item_images(
 
     Ok(Some(StreamRecord {
         cursor: None,
+        source_table_name: None,
         keys,
         sequence_number: ItemStreamVersion::from(new_image.id).to_string(),
         old_image: decoded_old_image,

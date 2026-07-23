@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use storage_types::{
     AttributeValue, DurationSeconds, ItemStreamVersion, KeySchemaElement, StreamItemId, StreamName,
     StreamRecord, UserStreamName,
@@ -240,7 +241,7 @@ pub trait StreamProvider: Send + Sync {
                         item_stream_version,
                         stream_item_id: pointer_item.id,
                     };
-                    let task = async move || {
+                    let task = async move {
                         let target_stream_dbg: String = (&pointer.stream_name).into();
                         tracing::debug!(
                             table = %pointer.table_name,
@@ -287,7 +288,11 @@ pub trait StreamProvider: Send + Sync {
                 }
             }
         }
-        let results = futures::future::join_all(tasks.into_iter().map(|t| t())).await;
+        let mut results = futures::stream::iter(tasks)
+            .buffered(32)
+            .map(Some)
+            .collect::<Vec<_>>()
+            .await;
 
         let last_scanned_key = item_pointers.last_evaluated_key;
         let last_evaluated_key = item_pointers.has_more.then_some(last_scanned_key).flatten();
@@ -299,19 +304,19 @@ pub trait StreamProvider: Send + Sync {
             records: task_order
                 .into_iter()
                 .map(|slot| match slot {
-                    TaskSlot::Ready(record) => record,
-                    TaskSlot::Pending(idx) => {
-                        let (stream_pointer, stream_page_result) = &results[idx];
-                        (
-                            stream_pointer.clone(),
-                            stream_page_result
-                                .as_ref()
-                                .map(|r| r.items.clone())
-                                .unwrap_or_default(),
-                        )
+                    TaskSlot::Ready(record) => Ok(record),
+                    TaskSlot::Pending(index) => {
+                        let (stream_pointer, stream_page_result) =
+                            results[index].take().ok_or_else(|| {
+                                StreamError::internal_with_detail(
+                                    StreamInternalKind::ParseStreamPointer,
+                                    "pointer resolution result was consumed twice",
+                                )
+                            })?;
+                        Ok((stream_pointer, stream_page_result?.items))
                     }
                 })
-                .collect(),
+                .collect::<StreamResult<Vec<_>>>()?,
         })
     }
 
@@ -418,6 +423,7 @@ pub trait StreamProvider: Send + Sync {
 
             let stream_record = StreamRecord {
                 cursor: Some(pointer.stream_item_id.to_string()),
+                source_table_name: Some(pointer.table_name),
                 keys,
                 sequence_number: pointer.stream_item_id.to_string(),
                 old_image: record_old_image,

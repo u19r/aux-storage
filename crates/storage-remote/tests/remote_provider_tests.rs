@@ -139,6 +139,48 @@ async fn table_stream_records_are_forwarded_to_the_remote_storage_api() {
 }
 
 #[tokio::test]
+async fn given_system_stream_when_remote_records_are_read_then_existing_operation_is_reused() {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+
+    let stream_mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.GetStreamRecords")
+                .path("/")
+                .body_includes("\"SystemStream\":true")
+                .body_excludes("TableName");
+            then.status(200).json_body(serde_json::json!({
+                "Records": [{
+                    "SourceTableName": "tenant_a",
+                    "Keys": {"pk": {"S": "metric_batch_1"}},
+                    "SequenceNumber": "000000000000000000000002",
+                    "NewImage": {"value": {"N": "7"}}
+                }]
+            }));
+        })
+        .await;
+
+    let (records, cursor) = provider
+        .get_stream_records_from_pointer_stream(
+            StreamName::system_table_stream(),
+            &[],
+            None,
+            Some(25),
+        )
+        .await
+        .expect("remote system stream records");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].source_table_name.as_ref(),
+        Some(&TableName::new("tenant_a"))
+    );
+    assert!(cursor.is_none());
+    stream_mock.assert_calls_async(1).await;
+}
+
+#[tokio::test]
 async fn create_table_issues_remote_call() {
     let server = MockServer::start_async().await;
     let provider = provider_for(&server).await;

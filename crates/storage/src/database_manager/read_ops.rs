@@ -368,7 +368,7 @@ impl DatabaseManager {
         });
 
         Ok(GetStreamRecordsResponse {
-            table_name: table_name.clone(),
+            table_name: Some(table_name.clone()),
             records: stream_items_response.collect(),
             last_evaluated_key: last_evaluated_key.map(|key| key.to_string()),
         })

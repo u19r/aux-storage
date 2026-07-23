@@ -549,6 +549,31 @@ fn get_stream_records_rejects_limits_outside_supported_range() {
 }
 
 #[test]
+fn given_system_stream_when_large_page_is_requested_then_request_is_valid() {
+    let request = json!({
+        "SystemStream": true,
+        "Limit": 8192
+    });
+
+    let parsed = GetStreamRecordsRequest::try_from(request).expect("valid system stream request");
+
+    assert!(parsed.system_stream);
+    assert!(parsed.table_name.is_none());
+}
+
+#[test]
+fn given_conflicting_stream_source_when_request_is_parsed_then_request_is_rejected() {
+    let request = json!({
+        "TableName": "TestTable",
+        "SystemStream": true
+    });
+
+    let error = GetStreamRecordsRequest::try_from(request).expect_err("conflicting stream source");
+
+    assert_eq!(error, "TableName and SystemStream cannot be used together");
+}
+
+#[test]
 fn batch_and_transaction_requests_reject_structurally_invalid_operations() {
     let batch_write_both_payload = json!({
         "RequestItems": {

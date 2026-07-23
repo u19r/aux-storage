@@ -798,17 +798,24 @@ impl StreamProvider for RemoteStorageProvider {
     ) -> StreamResult<(Vec<StreamRecord>, Option<StreamItemId>)> {
         const TABLE_STREAM_SUFFIX: &[u8] = b"/stream-table";
         let stream_name = pointer_stream_name.as_ref();
-        let table_name = stream_name
-            .strip_suffix(TABLE_STREAM_SUFFIX)
-            .and_then(|name| std::str::from_utf8(name).ok())
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                StreamError::internal(format!(
-                    "remote pointer stream is not a table stream: {pointer_stream_name:?}"
-                ))
-            })?;
+        let (table_name, system_stream) =
+            if pointer_stream_name == StreamName::system_table_stream() {
+                (None, true)
+            } else {
+                let table_name = stream_name
+                    .strip_suffix(TABLE_STREAM_SUFFIX)
+                    .and_then(|name| std::str::from_utf8(name).ok())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        StreamError::internal(format!(
+                            "remote pointer stream is not a table stream: {pointer_stream_name:?}"
+                        ))
+                    })?;
+                (Some(TableName::new(table_name)), false)
+            };
         let request = GetStreamRecordsRequest {
-            table_name: TableName::new(table_name),
+            table_name,
+            system_stream,
             last_evaluated_key: starting_item_id.map(|item_id| item_id.to_string()),
             limit,
         };

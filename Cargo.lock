@@ -5418,6 +5418,7 @@ dependencies = [
  "storage-provider",
  "storage-sync",
  "storage-types",
+ "stream-provider",
  "tokio",
  "tower-http 0.7.0",
  "tracing",

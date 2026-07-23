@@ -11,20 +11,25 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct GetStreamRecordsRequest {
-    pub table_name: TableName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<TableName>,
+
+    #[serde(default)]
+    pub system_stream: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_evaluated_key: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(default = 100, minimum = 1, maximum = 1000)]
+    #[schema(default = 100, minimum = 1, maximum = 8192)]
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct GetStreamRecordsResponse {
-    pub table_name: TableName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<TableName>,
     pub records: Vec<StreamRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_evaluated_key: Option<String>,

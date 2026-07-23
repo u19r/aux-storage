@@ -48,6 +48,7 @@ storage-condition = { path = "../storage-condition" }
 storage-provider = { path = "../storage-provider" }
 storage-sync = { path = "../storage-sync" }
 storage-types = { path = "../storage-types", default-features = false }
+stream-provider = { path = "../stream-provider" }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
