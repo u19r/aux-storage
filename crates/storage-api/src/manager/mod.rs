@@ -51,6 +51,8 @@ mod storage_manager_impl_delete_table_tests;
 #[cfg(test)]
 mod storage_manager_impl_describe_table_tests;
 #[cfg(test)]
+mod storage_manager_impl_get_stream_records_tests;
+#[cfg(test)]
 mod storage_manager_impl_query_perf_tests;
 #[cfg(test)]
 mod storage_manager_impl_read_perf_tests;

@@ -232,16 +232,22 @@ async fn load_key_schema<'a>(
         .ok_or_else(|| HttpApiError::internal_server_error("stream table schema was not cached"))
 }
 
-fn system_stream_record(
+pub(super) fn system_stream_record(
     provider: &dyn StreamProvider,
     pointer: StreamPointer,
     images: &[StreamItem],
     key_schema: &[KeySchemaElement],
 ) -> Result<StreamRecord, HttpApiError> {
     let (old_image, new_image) = decode_images(images)?;
+    let delete_key_image = if old_image.is_none() && new_image.is_none() {
+        Some(decode_delete_key_image(images)?)
+    } else {
+        None
+    };
     let item_for_key = new_image
         .as_ref()
         .or(old_image.as_ref())
+        .or(delete_key_image.as_ref())
         .ok_or_else(|| HttpApiError::internal_server_error("stream pointer has no item image"))?;
     let keys = provider
         .get_key_attributes(item_for_key, key_schema)
@@ -257,6 +263,14 @@ fn system_stream_record(
 }
 
 type ItemImage = HashMap<String, AttributeValue>;
+
+fn decode_delete_key_image(images: &[StreamItem]) -> Result<ItemImage, HttpApiError> {
+    let marker = images
+        .first()
+        .filter(|image| matches!(image.data_type, StreamDataType::DeleteMarker))
+        .ok_or_else(|| HttpApiError::internal_server_error("stream pointer has no item image"))?;
+    storage_types::storage_serde::from_bytes(&marker.data).map_err(Into::into)
+}
 
 fn decode_images(
     images: &[StreamItem],
