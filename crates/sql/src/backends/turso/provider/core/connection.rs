@@ -169,7 +169,7 @@ impl TursoStorageProvider {
         operation: impl for<'a> Fn(&'a TursoTransactionConnection<'a>) -> TxFuture<'a, T>,
     ) -> StorageResult<T> {
         let max_attempts = if retry_conflicts {
-            MAX_PUT_ITEM_ATTEMPTS
+            MAX_TRANSACTION_ATTEMPTS
         } else {
             1
         };

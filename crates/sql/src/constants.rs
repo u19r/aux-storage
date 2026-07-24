@@ -23,6 +23,10 @@ pub const MAX_GSI_COUNT: usize = 20;
 #[cfg(feature = "turso-backend")]
 pub const MAX_PUT_ITEM_ATTEMPTS: u32 = 10;
 
+/// Maximum retry attempts for a complete Turso transaction.
+#[cfg(feature = "turso-backend")]
+pub const MAX_TRANSACTION_ATTEMPTS: u32 = 12;
+
 /// Base backoff duration in milliseconds for exponential backoff on retries.
 #[cfg(feature = "turso-backend")]
 pub const BASE_BACKOFF_MS: u64 = 2;

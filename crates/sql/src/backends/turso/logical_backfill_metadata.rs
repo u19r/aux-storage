@@ -52,6 +52,12 @@ where
                 } else {
                     0
                 }),
+                TursoValue::Integer(table_info.table_stream_duration.as_hours_wire_value()),
+                TursoValue::Integer(
+                    table_info
+                        .default_item_stream_duration
+                        .as_hours_wire_value(),
+                ),
             ],
         )
         .await?;

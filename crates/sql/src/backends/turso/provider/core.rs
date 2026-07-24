@@ -37,7 +37,7 @@ use crate::{
     GsiPhysicalName,
     backends::turso::sql_statements,
     change_index,
-    constants::{BASE_BACKOFF_MS, MAX_PUT_ITEM_ATTEMPTS},
+    constants::{BASE_BACKOFF_MS, MAX_PUT_ITEM_ATTEMPTS, MAX_TRANSACTION_ATTEMPTS},
     provider_core::gsi_write::{
         GsiAttributesBlobStyle, GsiSqlPlanOptions, GsiUpsertStyle, PlaceholderNumbering,
         TableKeyColumnStyle, plan_gsi_sql_statements,
@@ -196,6 +196,8 @@ pub struct TursoStorageProvider {
 }
 
 mod connection;
+#[cfg(test)]
+mod connection_tests;
 mod gsi;
 mod item;
 mod row_decode;
