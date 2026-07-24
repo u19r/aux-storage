@@ -219,7 +219,11 @@ async fn load_key_schema<'a>(
     table_name: &TableName,
 ) -> Result<&'a [KeySchemaElement], HttpApiError> {
     if !schemas.contains_key(table_name) {
-        let table_info = manager.db().get_table_info(table_name).await?;
+        let table_info = manager
+            .db()
+            .storage_provider()
+            .get_table_info(table_name)
+            .await?;
         schemas.insert(table_name.clone(), table_info.key_schema);
     }
     schemas

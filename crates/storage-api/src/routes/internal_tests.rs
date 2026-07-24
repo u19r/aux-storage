@@ -6,7 +6,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
 };
 use serde_json::json;
-use storage_types::{BillingMode, KeyAttributeType, KeyType, TableName};
+use storage_types::{
+    AttributeValue, BillingMode, CreateTableRequest, KeyAttributeType, KeyType, TableName,
+};
 
 use crate::{
     constants::STORAGE_GATEWAY_API_KEY_HEADER,
@@ -347,6 +349,51 @@ async fn given_mixed_table_writes_when_system_stream_is_read_then_records_resume
     assert!(second_records[0]["SourceTableName"].is_string());
     assert!(second_records[0]["Keys"]["pk"]["S"].is_string());
     assert!(second_json.get("LastEvaluatedKey").is_none());
+}
+
+#[tokio::test]
+async fn system_stream_reads_records_from_a_physical_shared_table() {
+    let db = create_test_db().await;
+    let table_name = TableName::new("s00000");
+    let create_request: CreateTableRequest =
+        serde_json::from_value(create_stream_table_body(table_name.as_ref()))
+            .expect("shared table request");
+    db.storage_provider()
+        .create_table(&create_request)
+        .await
+        .expect("create physical shared table");
+    db.storage_provider()
+        .put_item(
+            table_name.clone(),
+            std::collections::HashMap::from([(
+                "pk".to_string(),
+                AttributeValue::S("ns_fixture#USER#1".to_string()),
+            )]),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("write physical shared table");
+    let app_state = Arc::new(AppState::new_with_manager_options(
+        db,
+        StorageApiManagerOptions::default(),
+    ));
+
+    let response = internal::get_stream_records_endpoint(
+        State(app_state),
+        Bytes::from(json!({"SystemStream": true, "Limit": 10}).to_string()),
+    )
+    .await
+    .expect("system stream response");
+    let body = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+    assert_eq!(json["Records"].as_array().expect("records").len(), 1);
+    assert_eq!(json["Records"][0]["SourceTableName"], table_name.as_ref());
 }
 
 #[tokio::test]
