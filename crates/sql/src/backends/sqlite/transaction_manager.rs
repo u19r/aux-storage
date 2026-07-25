@@ -1,3 +1,4 @@
+use rusqlite::TransactionBehavior;
 use storage_types::{StorageError, StorageResult, context::ErrorContext as _};
 use tokio_rusqlite::Connection;
 use tracing::warn;
@@ -28,7 +29,7 @@ where
         let t_id = std::thread::current().id();
         let p_id = std::process::id();
         let txn = conn
-            .unchecked_transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)
             .context("transaction start")?;
         let sqlite = SqliteConn::Transaction(&txn);

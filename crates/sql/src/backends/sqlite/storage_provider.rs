@@ -220,7 +220,7 @@ impl StorageProvider for SQLiteStorageProvider {
         };
         let snapshot_lease = pool.acquire().await?;
         let mut provider = self.clone();
-        provider.connection = Arc::new(snapshot_lease.connection().clone());
+        provider.connection = Arc::new(snapshot_lease.connection()?.clone());
 
         Ok(Box::new(SQLiteReadSequenceReadContext {
             provider,

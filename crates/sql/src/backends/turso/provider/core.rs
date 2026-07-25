@@ -37,7 +37,7 @@ use crate::{
     GsiPhysicalName,
     backends::turso::sql_statements,
     change_index,
-    constants::{BASE_BACKOFF_MS, MAX_PUT_ITEM_ATTEMPTS, MAX_TRANSACTION_ATTEMPTS},
+    constants::{BASE_BACKOFF_MS, MAX_CONFLICT_ATTEMPTS},
     provider_core::gsi_write::{
         GsiAttributesBlobStyle, GsiSqlPlanOptions, GsiUpsertStyle, PlaceholderNumbering,
         TableKeyColumnStyle, plan_gsi_sql_statements,

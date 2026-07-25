@@ -18,14 +18,9 @@ pub const MAX_QUERY_LIMIT: u32 = 10_000;
 /// Maximum number of global secondary indexes per table (`DynamoDB` parity).
 pub const MAX_GSI_COUNT: usize = 20;
 
-/// Maximum retry attempts for optimistic locking conflicts in `put_item`
-/// operations.
+/// Maximum retry attempts for Turso storage conflicts.
 #[cfg(feature = "turso-backend")]
-pub const MAX_PUT_ITEM_ATTEMPTS: u32 = 10;
-
-/// Maximum retry attempts for a complete Turso transaction.
-#[cfg(feature = "turso-backend")]
-pub const MAX_TRANSACTION_ATTEMPTS: u32 = 12;
+pub const MAX_CONFLICT_ATTEMPTS: u32 = 13;
 
 /// Base backoff duration in milliseconds for exponential backoff on retries.
 #[cfg(feature = "turso-backend")]

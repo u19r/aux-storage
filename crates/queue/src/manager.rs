@@ -614,28 +614,4 @@ fn remaining_wait_time(deadline: Option<Instant>) -> Duration {
 }
 
 #[cfg(test)]
-mod batch_error_tests {
-    use queue_provider::{QueueError, QueueInternalKind, QueueValidationKind};
-
-    use super::batch_error_entry;
-
-    #[test]
-    fn batch_error_classifies_request_failures_as_sender_faults() {
-        let entry = batch_error_entry(
-            "request".to_string(),
-            &QueueError::validation(QueueValidationKind::InvalidParameterValue),
-        );
-
-        assert!(entry.sender_fault);
-    }
-
-    #[test]
-    fn batch_error_classifies_internal_failures_as_receiver_faults() {
-        let entry = batch_error_entry(
-            "storage".to_string(),
-            &QueueError::internal(QueueInternalKind::MissingQueuePartitionState),
-        );
-
-        assert!(!entry.sender_fault);
-    }
-}
+mod batch_error_tests;

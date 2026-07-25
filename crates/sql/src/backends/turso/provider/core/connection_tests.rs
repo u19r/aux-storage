@@ -1,11 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::JoinHandle};
 
 use crate::backends::turso::provider::TursoStorageProvider;
 
-#[tokio::test]
-async fn given_sustained_write_contention_when_transaction_retries_then_operation_succeeds() {
+struct ContentionFixture {
+    _temp_dir: tempfile::TempDir,
+    provider: TursoStorageProvider,
+}
+
+async fn create_contention_fixture() -> ContentionFixture {
     let temp_dir = tempfile::tempdir().expect("temporary database directory");
     let database_path = temp_dir.path().join("contention.sqlite");
     let provider = TursoStorageProvider::new(
@@ -31,7 +35,15 @@ async fn given_sustained_write_contention_when_transaction_retries_then_operatio
         .await
         .expect("seed contention row");
     drop(connection);
+    ContentionFixture {
+        _temp_dir: temp_dir,
+        provider,
+    }
+}
 
+async fn hold_contending_write(
+    provider: &TursoStorageProvider,
+) -> JoinHandle<storage_types::StorageResult<()>> {
     let holder_provider = provider.clone();
     let holder_started = Arc::new(Notify::new());
     let holder_started_task = Arc::clone(&holder_started);
@@ -55,10 +67,24 @@ async fn given_sustained_write_contention_when_transaction_retries_then_operatio
             })
             .await
     });
-
     holder_started.notified().await;
-    let retry_provider = provider.clone();
-    provider
+    holder
+}
+
+async fn assert_holder_succeeded(holder: JoinHandle<storage_types::StorageResult<()>>) {
+    holder
+        .await
+        .expect("join contention holder")
+        .expect("contention holder transaction");
+}
+
+#[tokio::test]
+async fn given_sustained_write_contention_when_transaction_retries_then_operation_succeeds() {
+    let fixture = create_contention_fixture().await;
+    let holder = hold_contending_write(&fixture.provider).await;
+    let retry_provider = fixture.provider.clone();
+    fixture
+        .provider
         .with_transaction(true, move |connection| {
             let retry_provider = retry_provider.clone();
             Box::pin(async move {
@@ -74,8 +100,22 @@ async fn given_sustained_write_contention_when_transaction_retries_then_operatio
         })
         .await
         .expect("retry transaction after sustained contention");
-    holder
+    assert_holder_succeeded(holder).await;
+}
+
+#[tokio::test]
+async fn given_sustained_write_contention_when_statement_retries_then_operation_succeeds() {
+    let fixture = create_contention_fixture().await;
+    let holder = hold_contending_write(&fixture.provider).await;
+    let connection = fixture.provider.connect().await.expect("retry connection");
+    fixture
+        .provider
+        .execute(
+            &connection,
+            "UPDATE transaction_contention SET value = 2 WHERE id = 1",
+            Vec::new(),
+        )
         .await
-        .expect("join contention holder")
-        .expect("contention holder transaction");
+        .expect("retry statement after sustained contention");
+    assert_holder_succeeded(holder).await;
 }

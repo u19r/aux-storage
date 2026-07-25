@@ -146,10 +146,10 @@ impl SQLiteSnapshotConnectionPool {
 }
 
 impl SQLiteSnapshotConnectionLease {
-    pub(crate) fn connection(&self) -> &Connection {
+    pub(crate) fn connection(&self) -> StorageResult<&Connection> {
         self.connection
             .as_ref()
-            .expect("sqlite snapshot connection lease must be open")
+            .ok_or_else(|| StorageError::internal("sqlite snapshot connection lease is closed"))
     }
 }
 

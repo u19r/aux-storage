@@ -189,22 +189,16 @@ pub trait StorageProvider: Send + Sync {
         if policy.max_attempts() <= 1 {
             return self.put_item_request(request).await;
         }
-        let mut request = Some(request);
-        for attempt in 0..policy.max_attempts() {
-            let attempt_request = if attempt + 1 == policy.max_attempts() {
-                request.take().expect("put request is available")
-            } else {
-                request.as_ref().expect("put request is available").clone()
-            };
-            match self.put_item_request(attempt_request).await {
+        for _ in 1..policy.max_attempts() {
+            match self.put_item_request(request.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
+                Err(error) if error.is_retryable_write() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("write retry policy always has an attempt")
+        self.put_item_request(request).await
     }
 
     /// Store a wire-encoded item in a table.
@@ -294,25 +288,20 @@ pub trait StorageProvider: Send + Sync {
                 )
                 .await;
         }
-        let mut request = Some(request);
-        for attempt in 0..policy.max_attempts() {
-            let attempt_request = if attempt + 1 == policy.max_attempts() {
-                request.take().expect("put request is available")
-            } else {
-                request.as_ref().expect("put request is available").clone()
-            };
+        for _ in 1..policy.max_attempts() {
             match self
-                .put_item_encode_with_retry(attempt_request, WriteRetryPolicy::no_retry())
+                .put_item_encode_with_retry(request.clone(), WriteRetryPolicy::no_retry())
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
+                Err(error) if error.is_retryable_write() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("write retry policy always has an attempt")
+        self.put_item_encode_with_retry(request, WriteRetryPolicy::no_retry())
+            .await
     }
 
     /// Retrieve an item from a table
@@ -587,22 +576,16 @@ pub trait StorageProvider: Send + Sync {
         if policy.max_attempts() <= 1 {
             return self.transact_write_items_encode(request).await;
         }
-        let mut request = Some(request);
-        for attempt in 0..policy.max_attempts() {
-            let attempt_request = if attempt + 1 == policy.max_attempts() {
-                request.take().expect("retry request")
-            } else {
-                request.as_ref().expect("retry request").clone()
-            };
-            match self.transact_write_items_encode(attempt_request).await {
+        for _ in 1..policy.max_attempts() {
+            match self.transact_write_items_encode(request.clone()).await {
                 Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() && attempt + 1 < policy.max_attempts() => {
+                Err(error) if error.is_retryable_write() => {
                     tokio::time::sleep(policy.delay()).await;
                 }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("write retry loop has at least one attempt")
+        self.transact_write_items_encode(request).await
     }
 
     async fn update_table(

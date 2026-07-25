@@ -37,6 +37,8 @@ pub(crate) mod stream_writer;
 pub mod sync_raft_log_store;
 pub(crate) mod transact_write_impl;
 pub(crate) mod transaction_manager;
+#[cfg(test)]
+mod transaction_manager_tests;
 pub(crate) mod ttl;
 pub(crate) mod ttl_sweep;
 pub(crate) mod update_item_impl;
