@@ -4,6 +4,37 @@ use crate::storage_ops::provider_impl::*;
 impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvider
     for SortedKvDbStorageProvider<S>
 {
+    fn supports_read_sequence_mapped_range(&self) -> bool {
+        #[cfg(feature = "foundationdb-backend")]
+        {
+            self.kv_store.supports_read_sequence_mapped_range()
+        }
+
+        #[cfg(not(feature = "foundationdb-backend"))]
+        {
+            false
+        }
+    }
+
+    async fn execute_read_sequence_plan(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+    ) -> StorageResult<storage_provider::ReadSequenceExecution> {
+        #[cfg(feature = "foundationdb-backend")]
+        {
+            self.execute_read_sequence_plan_mapped_impl(plan, consistency, continuation)
+                .await
+        }
+
+        #[cfg(not(feature = "foundationdb-backend"))]
+        {
+            let _ = (plan, consistency, continuation);
+            Ok(storage_provider::ReadSequenceExecution::unsupported())
+        }
+    }
+
     async fn atomic_item_read_modify_write(
         &self,
         request: AtomicItemReadModifyWriteRequest,
@@ -193,6 +224,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         self.put_item_with_stream_ttl_impl(put_item::PutItemInput {
             table_name: request.table_name,
             item: request.item,
+            indexers: request.indexers,
             condition_expression: request.condition_expression,
             expression_attribute_names: request.expression_attribute_names,
             expression_attribute_values: request.expression_attribute_values,
@@ -227,6 +259,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         self.put_item_encode_impl(put_item::PutItemInput {
             table_name,
             item,
+            indexers: None,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -250,6 +283,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> StorageProvid
         self.put_item_encode_with_stream_ttl_impl(put_item::PutItemInput {
             table_name,
             item,
+            indexers: None,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeDefinition, GlobalSecondaryIndex, IndexName, KeySchemaElement, MultiRegionConsistency,
-    Projection, ReplicaDescription, StorageError, StreamRetentionDuration, StreamSpecification,
-    TableName, TableStatus, TimestampSecondsFractional,
+    AttributeDefinition, GlobalSecondaryIndex, IndexName, KeySchemaElement, MaxIndexers,
+    MultiRegionConsistency, Projection, ReplicaDescription, StorageError, StreamRetentionDuration,
+    StreamSpecification, TableName, TableStatus, TimestampSecondsFractional,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -17,6 +17,10 @@ pub struct CreateTableRequest {
     pub attribute_definitions: Vec<AttributeDefinition>,
 
     pub key_schema: Vec<KeySchemaElement>,
+
+    /// Aux-storage extension: maximum ordered item indexer declarations.
+    #[serde(default, skip_serializing_if = "MaxIndexers::is_zero")]
+    pub max_indexers: MaxIndexers,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_secondary_indexes: Option<Vec<CreateGlobalSecondaryIndex>>,
@@ -88,6 +92,7 @@ impl CreateTableRequest {
             table_name,
             attribute_definitions,
             key_schema,
+            max_indexers: MaxIndexers::ZERO,
             global_secondary_indexes: None,
             stream_specification: None,
             local_secondary_indexes: None,
@@ -189,6 +194,9 @@ pub struct TableDescription {
 
     #[serde(rename = "KeySchema")]
     pub key_schema: Vec<KeySchemaElement>,
+
+    #[serde(rename = "MaxIndexers", default)]
+    pub max_indexers: MaxIndexers,
 
     #[serde(rename = "TableSizeBytes")]
     pub table_size_bytes: u64,

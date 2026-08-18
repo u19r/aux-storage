@@ -67,7 +67,7 @@ pub fn get_table_info() -> &'static str {
 #[must_use]
 pub fn list_table_infos() -> &'static str {
     r"SELECT id, table_name, table_status, created_at,
-       attribute_definitions, key_schema, global_secondary_indexes,
+       attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
        table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables"
@@ -75,7 +75,21 @@ FROM tables"
 
 #[must_use]
 pub fn insert_table() -> &'static str {
-    metadata::insert_table(&TursoDialect, "", "", 0, "", "", None, None, false, 72, 72).sql
+    metadata::insert_table(
+        &TursoDialect,
+        "",
+        "",
+        0,
+        "",
+        "",
+        0,
+        None,
+        None,
+        false,
+        72,
+        72,
+    )
+    .sql
 }
 
 #[must_use]

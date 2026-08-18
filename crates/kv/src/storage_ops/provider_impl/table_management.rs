@@ -48,7 +48,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 Some(bytes) => decode_table_storage_id(bytes)?,
                 None => TableStorageId::new(1),
             };
-            let metadata = table_metadata_for_create_request(table_id, table_name, &table_info);
+            let metadata = table_metadata_for_create_request(
+                table_id,
+                table_name,
+                &table_info,
+                self.kv_store.tenant_keyspace(),
+            );
             let operations = create_table_operations(
                 table_name,
                 table_id,
@@ -84,20 +89,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_name: &TableName,
         status: TableStatus,
     ) -> StorageResult<()> {
-        let metadata = self
-            .get_table_identity_from_name(table_name)
-            .await?
-            .ok_or_else(|| StorageError::table_not_found(&table_name))?;
-        let mut table_info = metadata.table_info.clone();
-        table_info.table_status = status.clone();
-
-        let updated_metadata =
-            StoredTableMetadata::active(metadata.identity.clone(), table_info.clone());
-        let key = compact::table_metadata_key(metadata.identity.table_id);
-        let updated_value = storage_types::storage_serde::to_bytes(&updated_metadata)?;
-        self.kv_store.put(&key, &updated_value, None).await?;
-        self.cache_table_identity(Arc::new(updated_metadata));
-
+        self.mutate_table_info(table_name, |table_info, _identity| {
+            table_info.table_status = status.clone();
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
@@ -211,17 +207,18 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
 
     async fn delete_table_data(&self, table_metadata: &StoredTableMetadata) -> StorageResult<()> {
         let mut data_deletes = vec![delete_range(table_keys::primary_item_prefix(
-            table_metadata.identity.table_id,
+            &table_metadata.identity,
         ))];
         for index in &table_metadata.identity.indexes {
-            data_deletes.push(delete_range(compact::gsi_prefix(
-                table_metadata.identity.table_id,
-                index.index_id,
-            )));
-            data_deletes.push(delete_range(compact::gsi_tombstone_prefix(
-                table_metadata.identity.table_id,
-                index.index_id,
-            )));
+            if let Some(range) = table_keys::gsi_prefix(&table_metadata.identity, &index.index_name)
+            {
+                data_deletes.push(delete_range(range));
+            }
+            if let Some(range) =
+                table_keys::gsi_tombstone_prefix(&table_metadata.identity, &index.index_name)
+            {
+                data_deletes.push(delete_range(range));
+            }
             data_deletes.push(DirectWriteOperation::Delete {
                 key: compact::gsi_backfill_key(table_metadata.identity.table_id, index.index_id),
             });
@@ -246,6 +243,7 @@ fn table_info_for_create_request(
         created_at,
         attribute_definitions: request.attribute_definitions.clone(),
         key_schema: request.key_schema.clone(),
+        max_indexers: request.max_indexers,
         global_secondary_indexes,
         table_size_bytes: 0,
         item_count: 0,
@@ -262,11 +260,13 @@ fn table_metadata_for_create_request(
     table_id: TableStorageId,
     table_name: &TableName,
     table_info: &StoredTableInfo,
+    tenant_keyspace: Vec<u8>,
 ) -> StoredTableMetadata {
-    let identity = TableIdentity::user_indexes_for_table(
+    let identity = TableIdentity::user_indexes_for_table_with_tenant(
         table_id,
         table_name,
         table_info.global_secondary_indexes.as_deref(),
+        tenant_keyspace,
     );
     StoredTableMetadata::active(identity, table_info.clone())
 }

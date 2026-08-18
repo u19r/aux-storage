@@ -15,6 +15,7 @@ fn transact_write_request_preserves_client_request_token() {
                     item.insert("id".to_string(), AttributeValue::S("test".to_string()));
                     item
                 },
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -38,6 +39,7 @@ fn transact_write_item_can_represent_invalid_multiple_operations_for_validation_
             put: Some(TransactPutRequest {
                 table_name: TableName::new("test_table"),
                 item: HashMap::new(),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -48,6 +50,7 @@ fn transact_write_item_can_represent_invalid_multiple_operations_for_validation_
                 table_name: TableName::new("test_table"),
                 key: HashMap::new().into(),
                 update_expression: "SET #a = :val".to_string(),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,

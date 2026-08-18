@@ -211,6 +211,80 @@ fn default_slow_operation_log_threshold_ms() -> u64 {
     DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS
 }
 
+/// Foreground provider admission and overload protection settings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(deny_unknown_fields)]
+pub struct StorageAdmissionConfig {
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_storage_admission_initial_sustainable_throughput_rps")]
+    #[schemars(default = "default_storage_admission_initial_sustainable_throughput_rps")]
+    pub initial_sustainable_throughput_rps: u64,
+    #[serde(default = "default_storage_admission_initial_latency_estimate_ms")]
+    #[schemars(default = "default_storage_admission_initial_latency_estimate_ms")]
+    pub initial_latency_estimate_ms: u64,
+    #[serde(default = "default_storage_admission_minimum_concurrency")]
+    #[schemars(default = "default_storage_admission_minimum_concurrency")]
+    pub minimum_concurrency: usize,
+    #[serde(default = "default_storage_admission_maximum_concurrency")]
+    #[schemars(default = "default_storage_admission_maximum_concurrency")]
+    pub maximum_concurrency: usize,
+    #[serde(default = "default_storage_admission_control_reserve_concurrency")]
+    #[schemars(default = "default_storage_admission_control_reserve_concurrency")]
+    pub control_reserve_concurrency: usize,
+    #[serde(default = "default_storage_admission_queue_capacity")]
+    #[schemars(default = "default_storage_admission_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_storage_admission_max_queue_wait_ms")]
+    #[schemars(default = "default_storage_admission_max_queue_wait_ms")]
+    pub max_queue_wait_ms: u64,
+}
+
+impl Default for StorageAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_sustainable_throughput_rps:
+                default_storage_admission_initial_sustainable_throughput_rps(),
+            initial_latency_estimate_ms: default_storage_admission_initial_latency_estimate_ms(),
+            minimum_concurrency: default_storage_admission_minimum_concurrency(),
+            maximum_concurrency: default_storage_admission_maximum_concurrency(),
+            control_reserve_concurrency: default_storage_admission_control_reserve_concurrency(),
+            queue_capacity: default_storage_admission_queue_capacity(),
+            max_queue_wait_ms: default_storage_admission_max_queue_wait_ms(),
+        }
+    }
+}
+
+const fn default_storage_admission_initial_sustainable_throughput_rps() -> u64 {
+    20_000
+}
+
+const fn default_storage_admission_initial_latency_estimate_ms() -> u64 {
+    5
+}
+
+const fn default_storage_admission_minimum_concurrency() -> usize {
+    4
+}
+
+const fn default_storage_admission_maximum_concurrency() -> usize {
+    1_024
+}
+
+const fn default_storage_admission_control_reserve_concurrency() -> usize {
+    4
+}
+
+const fn default_storage_admission_queue_capacity() -> usize {
+    256
+}
+
+const fn default_storage_admission_max_queue_wait_ms() -> u64 {
+    25
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[schemars(deny_unknown_fields)]
 pub struct Features {
@@ -244,6 +318,55 @@ pub struct Features {
     #[serde(default)]
     #[schemars(default)]
     pub storage_sync_replication: StorageSyncReplicationConfig,
+    #[serde(default)]
+    #[schemars(default)]
+    pub read_sequence: ReadSequenceConfig,
+    #[serde(default)]
+    #[schemars(default)]
+    pub storage_admission: StorageAdmissionConfig,
+}
+
+/// Operational strategy selection for the ReadSequence DAG lowerings.
+///
+/// This is deliberately configuration-only.  The request contract always
+/// validates and executes through the ordinary DAG scheduler; the mode only
+/// controls whether an optional provider lowering may be attempted.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadSequenceExecutionMode {
+    Off,
+    Shadow,
+    #[default]
+    On,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[schemars(deny_unknown_fields)]
+pub struct ReadSequenceConfig {
+    #[serde(default)]
+    #[schemars(default)]
+    pub mode: ReadSequenceExecutionMode,
+    /// Percentage of requests eligible for shadow comparison.  Sampling is
+    /// deterministic from the request digest and is capped at 100.
+    #[serde(default = "default_read_sequence_shadow_sample_percent")]
+    #[schemars(
+        default = "default_read_sequence_shadow_sample_percent",
+        range(min = 0, max = 100)
+    )]
+    pub shadow_sample_percent: u8,
+}
+
+impl Default for ReadSequenceConfig {
+    fn default() -> Self {
+        Self {
+            mode: ReadSequenceExecutionMode::default(),
+            shadow_sample_percent: default_read_sequence_shadow_sample_percent(),
+        }
+    }
+}
+
+const fn default_read_sequence_shadow_sample_percent() -> u8 {
+    1
 }
 
 fn default_backends() -> Backends {

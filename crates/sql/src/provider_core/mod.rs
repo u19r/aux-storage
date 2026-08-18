@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "turso-backend", feature = "postgres-backend"))]
 pub(crate) mod gsi_write;
 #[cfg(test)]
 mod gsi_write_alloc_tests;

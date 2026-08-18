@@ -20,9 +20,10 @@ pub(crate) use provider_impl::{
     ttl_tracking_enabled, wire_item_key_token_from_item_key,
 };
 pub(crate) use provider_impl::{
-    compute_items_bytes, decode_wire_item_from_storage_bytes, encode_wire_item_storage_bytes,
-    now_ms_u64, record_provider_stage, record_query_result, record_read, record_write,
-    should_log_job,
+    compute_items_bytes, decode_indexed_wire_item, decode_wire_item_from_storage_bytes,
+    decode_wire_item_with_indexers_from_storage_bytes, encode_indexed_wire_item,
+    encode_wire_item_storage_bytes, now_ms_u64, record_provider_stage, record_query_result,
+    record_read, record_write, should_log_job,
 };
 #[cfg(test)]
 pub(crate) use write_helpers::CHANGE_INDEX_PREFIX;

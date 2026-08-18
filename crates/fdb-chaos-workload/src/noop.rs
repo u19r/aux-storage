@@ -115,7 +115,7 @@ impl RustWorkload for InvalidWorkload {
             details![
                 "Layer" => "aux-storage",
                 "RequestedWorkload" => &self.requested_name,
-                "SupportedWorkloads" => "noop,kv_smoke,table_atomicity,queue_visibility,pubsub_delivery,partition_family",
+                "SupportedWorkloads" => "noop,kv_smoke,table_atomicity,queue_visibility,pubsub_delivery,partition_family,read_sequence_dag",
             ],
         );
     }

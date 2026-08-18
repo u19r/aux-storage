@@ -20,7 +20,9 @@ xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+anyhow = { workspace = true }
 proptest = { workspace = true }
+quint-connect = { workspace = true }
 
 [lints]
 workspace = true

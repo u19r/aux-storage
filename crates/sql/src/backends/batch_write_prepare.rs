@@ -14,6 +14,7 @@ pub(crate) fn prepare_batch_operation(
             put_request:
                 Some(PutRequest {
                     ref item,
+                    ref indexers,
                     aux_item_stream_ttl_hours,
                 }),
             delete_request: None,
@@ -27,6 +28,7 @@ pub(crate) fn prepare_batch_operation(
 
             let split = split_item_into_key_and_attributes_sync(item.clone(), table_info)?;
             validate_transact_put_item_key(table_info, item).map_err(batch_write_key_error)?;
+            let indexers = indexers.clone();
 
             Ok(PreparedBatchOperation::Put {
                 table_name: table_info.table_name.clone(),
@@ -35,6 +37,7 @@ pub(crate) fn prepare_batch_operation(
                 key_attributes: split.key_attributes,
                 non_key_attributes: split.non_key_attributes,
                 full_item: split.all_attributes,
+                indexers,
                 aux_item_stream_ttl_hours,
             })
         }

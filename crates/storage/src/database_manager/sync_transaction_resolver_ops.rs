@@ -1,7 +1,8 @@
 use storage_types::{StorageError, StorageResult, validate_expression_attribute_usage};
 
 use crate::database_manager::{
-    sync_condition_ops::evaluate_optional_condition, sync_resolver_ops::SyncWriteResolver,
+    sync_condition_ops::evaluate_optional_condition,
+    sync_resolver_ops::{ResolvePutInput, SyncWriteResolver},
     sync_serialization::stable_key_json,
 };
 
@@ -19,18 +20,20 @@ impl SyncWriteResolver<'_> {
         for item in request.transact_items {
             match (item.put, item.update, item.delete, item.condition_check) {
                 (Some(put), None, None, None) => {
-                    self.resolve_put(
-                        put.table_name,
-                        put.item,
-                        put.condition_expression,
-                        put.expression_attribute_names,
-                        put.expression_attribute_values,
-                        None,
-                    )
+                    self.resolve_put(ResolvePutInput {
+                        table_name: put.table_name,
+                        item: put.item,
+                        indexers: put.indexers,
+                        condition_expression: put.condition_expression,
+                        expression_attribute_names: put.expression_attribute_names,
+                        expression_attribute_values: put.expression_attribute_values,
+                        return_values: None,
+                    })
                     .await?;
                 }
                 (None, Some(update), None, None) => {
                     self.resolve_update(storage_types::UpdateItemRequest {
+                        indexers: update.indexers,
                         table_name: update.table_name,
                         key: update.key,
                         update_expression: Some(update.update_expression),

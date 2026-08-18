@@ -21,6 +21,7 @@ fn fixed_key_full_blob_plan_deletes_by_full_gsi_and_table_key() {
         &table,
         Some(&old),
         Some(&new),
+        &[],
         &fixed_key_options(GsiAttributesBlobStyle::FullProjectedItem),
     )
     .unwrap();
@@ -52,6 +53,7 @@ fn non_key_conflict_update_plan_does_not_update_primary_key_columns() {
         &table,
         None,
         Some(&new),
+        &[],
         &fixed_key_non_key_conflict_update_options(GsiAttributesBlobStyle::FullProjectedItem),
     )
     .unwrap();
@@ -74,6 +76,7 @@ fn fixed_key_hash_only_table_plan_omits_missing_table_range_column() {
         &table,
         None,
         Some(&new),
+        &[],
         &fixed_key_non_key_conflict_update_options(GsiAttributesBlobStyle::FullProjectedItem),
     )
     .unwrap();
@@ -96,6 +99,7 @@ fn prefixed_key_non_key_blob_plan_numbers_placeholders_across_statements() {
         &table,
         Some(&old),
         Some(&new),
+        &[],
         &prefixed_key_options(GsiAttributesBlobStyle::NonKeyAttributes),
     )
     .unwrap();
@@ -218,6 +222,7 @@ fn table_info(projection_type: ProjectionType) -> StoredTableInfo {
         created_at: TimestampMillis::now(),
         attribute_definitions: vec![attr("pk"), attr("sk"), attr("gsi_pk"), attr("gsi_sk")],
         key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
             index_name: IndexName::new("gsi"),
             key_schema: vec![key("gsi_pk", KeyType::Hash), key("gsi_sk", KeyType::Range)],
@@ -242,6 +247,7 @@ fn hash_only_table_info(projection_type: ProjectionType) -> StoredTableInfo {
         created_at: TimestampMillis::now(),
         attribute_definitions: vec![attr("pk"), attr("gsi_pk")],
         key_schema: vec![key("pk", KeyType::Hash)],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
             index_name: IndexName::new("gsi"),
             key_schema: vec![key("gsi_pk", KeyType::Hash)],

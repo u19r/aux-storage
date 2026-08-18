@@ -95,8 +95,10 @@ pub(crate) async fn record_storage_operation<T, Fut>(
 where
     Fut: std::future::Future<Output = StorageResult<T>>,
 {
+    let database_call = metrics_facade::begin_database_call(operation);
     let start = Instant::now();
     let result = fut.await;
+    drop(database_call);
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_operation_metrics(operation, elapsed_ms);
     result
@@ -111,8 +113,10 @@ pub(crate) async fn record_storage_operation_for_target<T, Fut>(
 where
     Fut: std::future::Future<Output = StorageResult<T>>,
 {
+    let database_call = metrics_facade::begin_database_call(operation);
     let start = Instant::now();
     let result = fut.await;
+    drop(database_call);
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_routed_operation_metrics(operation, target, elapsed_ms);
     result
@@ -127,8 +131,10 @@ where
     Fut: std::future::Future<Output = StorageResult<T>>,
     T: serde::Serialize,
 {
+    let database_call = metrics_facade::begin_database_call(operation);
     let start = Instant::now();
     let result = fut.await;
+    drop(database_call);
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_operation_metrics(operation, elapsed_ms);
 
@@ -151,8 +157,10 @@ where
     Fut: std::future::Future<Output = StorageResult<T>>,
     T: serde::Serialize,
 {
+    let database_call = metrics_facade::begin_database_call(operation);
     let start = Instant::now();
     let result = fut.await;
+    drop(database_call);
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_routed_operation_metrics(operation, target, elapsed_ms);
 

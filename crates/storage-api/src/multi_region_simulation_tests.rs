@@ -1,6 +1,6 @@
 use std::{sync::OnceLock, time::Duration};
 
-use storage_types::TableName;
+use storage_types::{TableName, context::WrappedError as _};
 use tokio::sync::{Mutex, MutexGuard};
 
 #[cfg(any(feature = "rocksdb", feature = "turso"))]
@@ -133,7 +133,7 @@ async fn simulation_global_table_converges_for_backend(
     harness
         .run_until_idle(200)
         .await
-        .expect("drain replication");
+        .unwrap_or_else(|error| panic!("drain replication: {:?}", error.to_enum()));
     let mut values = Vec::new();
     for region in harness.region_names() {
         values.push((
@@ -226,7 +226,10 @@ async fn simulation_bootstrap_catches_up_empty_replacement_region() {
         .put_item_value("region-a", &table_name, "pk1", "sk1", "bootstrap-value", 0)
         .await
         .expect("put bootstrap value");
-    harness.run_until_idle(20).await.expect("drain bootstrap");
+    harness
+        .run_until_idle(20)
+        .await
+        .unwrap_or_else(|error| panic!("drain bootstrap: {:?}", error.to_enum()));
     assert!(
         harness
             .all_regions_match_value(&table_name, "pk1", "sk1", Some("bootstrap-value"))
@@ -314,7 +317,10 @@ async fn simulation_bootstrap_catches_up_empty_replacement_region_for_backend(
         .put_item_value("region-a", &table_name, "pk1", "sk1", "bootstrap-value", 0)
         .await
         .expect("put bootstrap value");
-    harness.run_until_idle(20).await.expect("drain bootstrap");
+    harness
+        .run_until_idle(20)
+        .await
+        .unwrap_or_else(|error| panic!("drain bootstrap: {:?}", error.to_enum()));
     assert!(
         harness
             .all_regions_match_value(&table_name, "pk1", "sk1", Some("bootstrap-value"))

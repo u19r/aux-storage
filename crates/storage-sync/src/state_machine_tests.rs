@@ -112,6 +112,7 @@ async fn raft_state_machine_installs_logical_snapshot_through_shared_import_barr
             table_name: "users".to_string(),
             key_json: r#"{"pk":{"S":"u#1"}}"#.to_string(),
             item_json: r#"{"pk":{"S":"u#1"}}"#.to_string(),
+            indexers: Vec::new(),
             item_stream_version: ItemStreamVersion::new(3),
         }],
     };
@@ -227,6 +228,7 @@ fn logical_snapshot(log_id: LogId<u64>) -> openraft::Snapshot<SyncTypeConfig> {
             table_name: "users".to_string(),
             key_json: r#"{"pk":{"S":"u#blocked"}}"#.to_string(),
             item_json: r#"{"pk":{"S":"u#blocked"}}"#.to_string(),
+            indexers: Vec::new(),
             item_stream_version: ItemStreamVersion::new(4),
         }],
     };

@@ -21,7 +21,7 @@ impl FoundationDbKvStore {
         value: &[u8],
         condition: Option<Condition>,
     ) -> StorageResult<()> {
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let key_bytes = key.to_vec();
         let value_bytes = value.to_vec();
         let condition = condition.clone();
@@ -32,9 +32,9 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
-            let prefixed_key = Self::prefix_bytes(prefix.as_ref(), &key_bytes);
+            let prefixed_key = Self::prefix_bytes(prefix, &key_bytes);
 
             if let Some(condition) = &condition {
                 let current = trx
@@ -86,15 +86,8 @@ impl FoundationDbKvStore {
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {
                         Ok(mut new_trx) => {
-                            let candidate_keys =
-                                vec![Self::prefix_bytes(prefix.as_ref(), &key_bytes)];
                             self.log_conflict_details(
-                                &new_trx,
-                                "put",
-                                attempt,
-                                retryable,
-                                error_code,
-                                &candidate_keys,
+                                &new_trx, "put", attempt, retryable, error_code, 1,
                             )
                             .await;
                             new_trx.reset();
@@ -110,7 +103,7 @@ impl FoundationDbKvStore {
     }
 
     pub(crate) async fn delete_operation(&self, key: &[u8]) -> StorageResult<()> {
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let key_bytes = key.to_vec();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
@@ -118,9 +111,9 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
-            let prefixed_key = Self::prefix_bytes(prefix.as_ref(), &key_bytes);
+            let prefixed_key = Self::prefix_bytes(prefix, &key_bytes);
             trx.clear(&prefixed_key);
             record_fdb_operation("delete", "clear", 1);
             record_fdb_write_shape("delete", 1, 0);
@@ -135,15 +128,8 @@ impl FoundationDbKvStore {
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {
                         Ok(mut new_trx) => {
-                            let candidate_keys =
-                                vec![Self::prefix_bytes(prefix.as_ref(), &key_bytes)];
                             self.log_conflict_details(
-                                &new_trx,
-                                "delete",
-                                attempt,
-                                retryable,
-                                error_code,
-                                &candidate_keys,
+                                &new_trx, "delete", attempt, retryable, error_code, 1,
                             )
                             .await;
                             new_trx.reset();
@@ -167,7 +153,7 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
             trx.clear_range(&start, &end);
 
             match trx.commit().await {
@@ -177,14 +163,13 @@ impl FoundationDbKvStore {
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {
                         Ok(mut new_trx) => {
-                            let candidate_keys = vec![start.clone(), end.clone()];
                             self.log_conflict_details(
                                 &new_trx,
                                 "delete_prefix",
                                 attempt,
                                 retryable,
                                 error_code,
-                                &candidate_keys,
+                                2,
                             )
                             .await;
                             new_trx.reset();

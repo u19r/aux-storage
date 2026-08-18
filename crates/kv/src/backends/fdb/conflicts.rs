@@ -18,7 +18,7 @@ impl FoundationDbKvStore {
         attempt: u32,
         retryable: bool,
         error_code: i32,
-        candidate_keys: &[Vec<u8>],
+        candidate_key_count: usize,
     ) {
         if !retryable {
             return;
@@ -71,38 +71,22 @@ impl FoundationDbKvStore {
                 .await
                 .unwrap_or_default();
 
-        let conflict_keys: Vec<String> = conflicting
-            .iter()
-            .map(|(key, _)| {
-                let stripped = key.strip_prefix(CONFLICTING_KEYS_PREFIX).unwrap_or(key);
-                self.format_key_with_prefix(stripped)
-            })
-            .collect();
-        let candidate_key_list: Vec<String> = candidate_keys
-            .iter()
-            .take(CONFLICT_LOG_MAX_KEYS)
-            .map(|key| self.format_key_with_prefix(key))
-            .collect();
-        let read_conflict_ranges: Vec<String> = read_ranges
-            .iter()
-            .map(|(key, value)| format!("{} -> {}", hex_encode(key), hex_encode(value)))
-            .collect();
-        let write_conflict_ranges: Vec<String> = write_ranges
-            .iter()
-            .map(|(key, value)| format!("{} -> {}", hex_encode(key), hex_encode(value)))
-            .collect();
+        let conflict_key_count = conflicting.len();
+        let candidate_key_count = candidate_key_count.min(CONFLICT_LOG_MAX_KEYS);
+        let read_conflict_range_count = read_ranges.len();
+        let write_conflict_range_count = write_ranges.len();
         record_fdb_conflict_artifacts(
             operation,
-            u64::try_from(conflict_keys.len()).unwrap_or(u64::MAX),
-            u64::try_from(read_conflict_ranges.len()).unwrap_or(u64::MAX),
-            u64::try_from(write_conflict_ranges.len()).unwrap_or(u64::MAX),
-            u64::try_from(candidate_key_list.len()).unwrap_or(u64::MAX),
+            u64::try_from(conflict_key_count).unwrap_or(u64::MAX),
+            u64::try_from(read_conflict_range_count).unwrap_or(u64::MAX),
+            u64::try_from(write_conflict_range_count).unwrap_or(u64::MAX),
+            u64::try_from(candidate_key_count).unwrap_or(u64::MAX),
         );
 
-        if conflict_keys.is_empty()
-            && read_conflict_ranges.is_empty()
-            && write_conflict_ranges.is_empty()
-            && candidate_key_list.is_empty()
+        if conflict_key_count == 0
+            && read_conflict_range_count == 0
+            && write_conflict_range_count == 0
+            && candidate_key_count == 0
         {
             return;
         }
@@ -111,23 +95,12 @@ impl FoundationDbKvStore {
             operation,
             attempt,
             error_code,
-            conflict_keys = ?conflict_keys,
-            candidate_keys = ?candidate_key_list,
-            read_conflict_ranges = ?read_conflict_ranges,
-            write_conflict_ranges = ?write_conflict_ranges,
+            conflict_key_count,
+            candidate_key_count,
+            read_conflict_range_count,
+            write_conflict_range_count,
             "FoundationDB transaction conflict detected"
         );
-    }
-
-    fn format_key_with_prefix(&self, key: &[u8]) -> String {
-        let config = self.config();
-        if let Some(prefix) = &config.subspace_prefix
-            && key.starts_with(prefix)
-        {
-            let stripped = &key[prefix.len()..];
-            return format!("{} (stripped={})", hex_encode(key), hex_encode(stripped));
-        }
-        hex_encode(key)
     }
 }
 
@@ -163,13 +136,4 @@ async fn read_special_key_prefix(
     }
 
     Ok(out)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }

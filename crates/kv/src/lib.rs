@@ -44,7 +44,11 @@ pub use sorted_kv::SortedKvDbStorageProvider;
 mod helpers_tests;
 #[cfg(test)]
 mod key_template_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "rocksdb-backend",
+    not(feature = "foundationdb-backend")
+))]
 mod kv_key_shape_tests;
 #[cfg(test)]
 mod kv_perf_tests;

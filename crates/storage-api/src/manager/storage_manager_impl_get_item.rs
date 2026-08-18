@@ -1,13 +1,10 @@
 use http_error::HttpApiError;
 use storage_types::{
-    GetItemRequest, StorageEnum, StorageError, context::WrappedError, validate_transact_key,
+    GetItemRequest, StorageEnum, StorageError, context::WrappedError, project_attribute_map,
+    validate_transact_key,
 };
 
-use crate::{
-    get_wire_response::GetWireResponse,
-    manager::{StorageApiManagerImpl, storage_manager_impl_expression::project_attribute_map},
-    types::Response,
-};
+use crate::{get_wire_response::GetWireResponse, manager::StorageApiManagerImpl, types::Response};
 
 impl StorageApiManagerImpl {
     pub(super) async fn get_item_internal(

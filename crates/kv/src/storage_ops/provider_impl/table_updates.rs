@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use storage_types::{UpdateTableRequest, UpdateTableResponse};
 
 use crate::storage_ops::provider_impl::*;
@@ -11,6 +9,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     ) -> StorageResult<UpdateTableResponse> {
         let table_name = request.table_name.clone();
         let mut table_info = self.get_table_info(&table_name).await?;
+        validate_max_indexers_update(table_info.max_indexers, request.max_indexers)?;
 
         self.update_table_status_impl(&table_name, TableStatus::Updating)
             .await?;
@@ -32,16 +31,31 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &mut StoredTableInfo,
         request: &UpdateTableRequest,
     ) -> StorageResult<()> {
-        if let Some(spec) = request.stream_specification.clone() {
-            table_info.stream_specification = Some(spec);
-            self.save_table_info(table_name, table_info).await?;
+        let stream_specification = request.stream_specification.clone();
+        let deletion_protection_enabled = request.deletion_protection_enabled;
+        let max_indexers = request.max_indexers;
+        if stream_specification.is_none()
+            && deletion_protection_enabled.is_none()
+            && max_indexers.is_none()
+        {
+            return Ok(());
         }
 
-        if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
-            table_info.deletion_protection_enabled = deletion_protection_enabled;
-            self.save_table_info(table_name, table_info).await?;
-        }
-
+        let (updated_metadata, ()) = self
+            .mutate_table_info(table_name, |current, _identity| {
+                if let Some(spec) = &stream_specification {
+                    current.stream_specification = Some(spec.clone());
+                }
+                if let Some(enabled) = deletion_protection_enabled {
+                    current.deletion_protection_enabled = enabled;
+                }
+                if let Some(capacity) = max_indexers {
+                    current.max_indexers = capacity;
+                }
+                Ok(())
+            })
+            .await?;
+        *table_info = updated_metadata.table_info;
         Ok(())
     }
 
@@ -57,60 +71,43 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             return Ok(());
         }
 
-        if let Some(duration) = request.aux_stream_duration_hours {
-            table_info.table_stream_duration = duration;
-        }
-        if let Some(duration) = request.aux_default_item_stream_duration_hours {
-            table_info.default_item_stream_duration = duration;
-        }
-
-        let updated_metadata = self
-            .updated_stream_duration_metadata(table_name, table_info)
+        let stream_duration = request.aux_stream_duration_hours;
+        let default_item_stream_duration = request.aux_default_item_stream_duration_hours;
+        let (updated_metadata, _) = self
+            .mutate_table_info_with_operations(
+                table_name,
+                |current, _identity| {
+                    if let Some(duration) = stream_duration {
+                        current.table_stream_duration = duration;
+                    }
+                    if let Some(duration) = default_item_stream_duration {
+                        current.default_item_stream_duration = duration;
+                    }
+                    Ok(plan_table_stream_duration(
+                        table_name.clone(),
+                        kv_table_scope_id(table_name),
+                        crate::storage_ops::stream_duration::table_stream_policy_version(
+                            current.table_stream_duration,
+                            current.default_item_stream_duration,
+                        ),
+                        current.table_stream_duration,
+                        current.default_item_stream_duration,
+                        TimestampMillis::now(),
+                    ))
+                },
+                |metadata, plan| {
+                    stream_trim_state_write_ops_for_identity(
+                        &metadata.identity,
+                        storage_provider::StreamTrimStateWrite {
+                            state: plan.trim_state.clone(),
+                            next_marker: plan.due_marker.clone(),
+                        },
+                    )
+                },
+            )
             .await?;
-        let plan = plan_table_stream_duration(
-            table_name.clone(),
-            kv_table_scope_id(table_name),
-            crate::storage_ops::stream_duration::table_stream_policy_version(
-                table_info.table_stream_duration,
-                table_info.default_item_stream_duration,
-            ),
-            table_info.table_stream_duration,
-            table_info.default_item_stream_duration,
-            TimestampMillis::now(),
-        );
-        let key = compact::table_metadata_key(updated_metadata.identity.table_id);
-        let value = storage_types::storage_serde::to_bytes(&updated_metadata)?;
-        let mut operations = vec![DirectWriteOperation::Put { key, value }];
-        operations.extend(stream_trim_state_write_ops_for_identity(
-            &updated_metadata.identity,
-            storage_provider::StreamTrimStateWrite {
-                state: plan.trim_state,
-                next_marker: plan.due_marker,
-            },
-        )?);
-        self.kv_store.transact_write_unchecked(operations).await?;
-        self.cache_table_identity(Arc::new(updated_metadata));
+        *table_info = updated_metadata.table_info;
         Ok(())
-    }
-
-    async fn updated_stream_duration_metadata(
-        &self,
-        table_name: &TableName,
-        table_info: &StoredTableInfo,
-    ) -> StorageResult<StoredTableMetadata> {
-        let current_metadata = self
-            .get_table_identity_from_name(table_name)
-            .await?
-            .ok_or_else(|| StorageError::table_not_found(table_name))?;
-        let updated_identity = TableIdentity::user_indexes_for_table(
-            current_metadata.identity.table_id,
-            table_name,
-            table_info.global_secondary_indexes.as_deref(),
-        );
-        Ok(StoredTableMetadata::active(
-            updated_identity,
-            table_info.clone(),
-        ))
     }
 
     async fn apply_gsi_updates(
@@ -144,29 +141,34 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &mut StoredTableInfo,
         create: storage_types::CreateGlobalSecondaryIndex,
     ) -> StorageResult<()> {
-        if table_info
-            .global_secondary_indexes
-            .as_ref()
-            .is_some_and(|indexes| indexes.iter().any(|g| g.index_name == create.index_name))
-        {
-            return Err(StorageError::validation(format!(
-                "Global secondary index already exists: {}",
-                create.index_name
-            )));
-        }
+        let (updated_metadata, ()) = self
+            .mutate_table_info(table_name, |current, _identity| {
+                if current
+                    .global_secondary_indexes
+                    .as_ref()
+                    .is_some_and(|indexes| {
+                        indexes
+                            .iter()
+                            .any(|index| index.index_name == create.index_name)
+                    })
+                {
+                    return Err(StorageError::validation(format!(
+                        "Global secondary index already exists: {}",
+                        create.index_name
+                    )));
+                }
 
-        let mut indexes = table_info
-            .global_secondary_indexes
-            .clone()
-            .unwrap_or_default();
-        indexes.push(storage_types::GlobalSecondaryIndex {
-            index_name: create.index_name.clone(),
-            key_schema: create.key_schema.clone(),
-            projection: create.projection.clone(),
-        });
-        table_info.global_secondary_indexes = Some(indexes);
-
-        self.save_table_info(table_name, table_info).await?;
+                let mut indexes = current.global_secondary_indexes.clone().unwrap_or_default();
+                indexes.push(storage_types::GlobalSecondaryIndex {
+                    index_name: create.index_name.clone(),
+                    key_schema: create.key_schema.clone(),
+                    projection: create.projection.clone(),
+                });
+                current.global_secondary_indexes = Some(indexes);
+                Ok(())
+            })
+            .await?;
+        *table_info = updated_metadata.table_info;
 
         let tail = self.capture_stream_tail().await?;
         self.initialize_backfill_record(table_name, &create.index_name, tail)
@@ -179,23 +181,22 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &mut StoredTableInfo,
         delete: storage_types::DeleteGlobalSecondaryIndexAction,
     ) -> StorageResult<()> {
-        let existing_metadata = self
-            .get_table_identity_from_name(table_name)
-            .await?
-            .ok_or_else(|| StorageError::table_not_found(table_name))?;
-        let delete_ranges = table_keys::gsi_prefix(&existing_metadata.identity, &delete.index_name)
-            .into_iter()
-            .chain(table_keys::gsi_tombstone_prefix(
-                &existing_metadata.identity,
-                &delete.index_name,
-            ))
-            .map(delete_range)
-            .collect::<Vec<_>>();
-        let backfill_key =
-            table_keys::gsi_backfill_key(&existing_metadata.identity, &delete.index_name);
-
-        remove_gsi_from_table_info(table_info, &delete.index_name);
-        self.save_table_info(table_name, table_info).await?;
+        let (updated_metadata, (delete_ranges, backfill_key)) = self
+            .mutate_table_info(table_name, |current, identity| {
+                let delete_ranges = table_keys::gsi_prefix(identity, &delete.index_name)
+                    .into_iter()
+                    .chain(table_keys::gsi_tombstone_prefix(
+                        identity,
+                        &delete.index_name,
+                    ))
+                    .map(delete_range)
+                    .collect::<Vec<_>>();
+                let backfill_key = table_keys::gsi_backfill_key(identity, &delete.index_name);
+                remove_gsi_from_table_info(current, &delete.index_name);
+                Ok((delete_ranges, backfill_key))
+            })
+            .await?;
+        *table_info = updated_metadata.table_info;
 
         if !delete_ranges.is_empty() {
             self.kv_store
@@ -207,6 +208,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
         Ok(())
     }
+}
+
+fn validate_max_indexers_update(
+    current: storage_types::MaxIndexers,
+    requested: Option<storage_types::MaxIndexers>,
+) -> StorageResult<()> {
+    if requested.is_some_and(|requested| requested < current) {
+        return Err(StorageError::validation("MaxIndexers:cannot_decrease"));
+    }
+    Ok(())
 }
 
 fn remove_gsi_from_table_info(table_info: &mut StoredTableInfo, index_name: &IndexName) {
@@ -229,6 +240,7 @@ fn update_table_response(table_info: StoredTableInfo) -> UpdateTableResponse {
             created_at: table_info.created_at.into(),
             attribute_definitions: table_info.attribute_definitions.clone(),
             key_schema: table_info.key_schema.clone(),
+            max_indexers: table_info.max_indexers,
             table_size_bytes: table_info.table_size_bytes,
             item_count: table_info.item_count,
             table_arn: format!(

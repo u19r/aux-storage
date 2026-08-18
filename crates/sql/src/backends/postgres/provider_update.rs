@@ -4,10 +4,12 @@ use storage_condition::evaluate_condition;
 use storage_provider::{
     before_update_item_optional, return_values_need_old_item, update_item_response,
 };
-use storage_types::{StorageResult, UpdateItemRequest, UpdateItemResponse, WireItem};
+use storage_types::{StorageResult, UpdateItemRequest, UpdateItemResponse};
 
 use crate::{
-    backends::postgres::{PostgresStorageProvider, record_write},
+    backends::postgres::{
+        PostgresStorageProvider, record_write, transaction_helpers::PostgresUpsertTransactItemInput,
+    },
     billing_metrics::{record_write_cost, serializable_payload_bytes},
     provider_core::write::apply_update_to_existing_or_key,
 };
@@ -28,6 +30,7 @@ impl PostgresStorageProvider {
             return_values,
             return_values_on_condition_check_failure,
             aux_item_stream_ttl_hours,
+            indexers,
             ..
         } = request;
 
@@ -52,6 +55,7 @@ impl PostgresStorageProvider {
                 let condition = condition.clone();
                 let return_values = return_values.clone();
                 let table_info = table_info.clone();
+                let indexers = indexers.clone();
                 async move {
                     let mut client = self.acquire_client("update_item").await?;
                     let _connection_hold = self.connection_hold_timer("update_item");
@@ -65,16 +69,22 @@ impl PostgresStorageProvider {
                     let _transaction_hold = self.transaction_hold_timer("update_item");
 
                     let old_item_started = Instant::now();
-                    let existing_item = self
-                        .get_item_with_client(
+                    let prepared =
+                        Self::prepare_get_item_query(&table_name, &key_attributes, &table_info)?;
+                    let existing = self
+                        .execute_prepared_get_item_query_with_indexers(
                             &transaction,
-                            &table_name,
-                            &key_attributes,
-                            &table_info,
+                            &prepared,
+                            "update_item",
+                            "old_item_query",
                         )
-                        .await?
-                        .map(WireItem::into_attribute_map)
-                        .transpose()?;
+                        .await?;
+                    let (existing_item, stored_indexers) = match existing {
+                        Some(item) => (Some(item.item.into_attribute_map()?), item.indexers),
+                        None => (None, Vec::new()),
+                    };
+                    let effective_indexers =
+                        indexers.as_deref().unwrap_or(stored_indexers.as_slice());
                     self.record_transaction_phase(
                         "update_item",
                         "old_item_read",
@@ -104,11 +114,17 @@ impl PostgresStorageProvider {
                     let transact_put_started = Instant::now();
                     self.upsert_transact_item_with_client(
                         &transaction,
-                        &table_name,
-                        &table_info,
-                        updated_item.clone(),
-                        old_item_for_write.as_ref(),
-                        aux_item_stream_ttl_hours,
+                        PostgresUpsertTransactItemInput {
+                            table_name: &table_name,
+                            table_info: &table_info,
+                            item: updated_item.clone(),
+                            indexers: effective_indexers,
+                            old_item: old_item_for_write.as_ref(),
+                            old_indexers: old_item_for_write
+                                .as_ref()
+                                .map(|_| stored_indexers.as_slice()),
+                            item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                        },
                     )
                     .await?;
                     self.record_transaction_phase(

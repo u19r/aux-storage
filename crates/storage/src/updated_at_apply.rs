@@ -46,7 +46,7 @@ pub(crate) fn stamp_batch_write_encode_request(
     for write_requests in request.request_items.values_mut() {
         for write_request in write_requests {
             if let Some(put_request) = write_request.put_request.as_mut() {
-                stamp_wire_item(&mut put_request.item, updated_at_ms)?;
+                stamp_wire_item(put_request.item.item_mut(), updated_at_ms)?;
             }
         }
     }
@@ -74,7 +74,7 @@ pub(crate) fn refresh_existing_batch_write_encode_timestamps(
     for write_requests in request.request_items.values_mut() {
         for write_request in write_requests {
             if let Some(put_request) = write_request.put_request.as_mut() {
-                refresh_existing_wire_item_timestamp(&mut put_request.item, updated_at_ms)?;
+                refresh_existing_wire_item_timestamp(put_request.item.item_mut(), updated_at_ms)?;
             }
         }
     }
@@ -100,7 +100,7 @@ pub(crate) fn stamp_transact_write_item(item: &mut TransactWriteItem) -> Storage
 pub(crate) fn stamp_transact_encode_item(item: &mut TransactEncodeItem) -> StorageResult<()> {
     let updated_at_ms = current_updated_at_ms();
     if let Some(put) = item.put.as_mut() {
-        stamp_wire_item(&mut put.item, updated_at_ms)?;
+        stamp_wire_item(put.item.item_mut(), updated_at_ms)?;
     }
     if let Some(update) = item.update.as_mut() {
         inject_updated_at_into_update_expression_with_ms(
@@ -128,7 +128,7 @@ pub(crate) fn refresh_existing_transact_encode_item_timestamp(
 ) -> StorageResult<()> {
     let updated_at_ms = current_updated_at_ms();
     if let Some(put) = item.put.as_mut() {
-        refresh_existing_wire_item_timestamp(&mut put.item, updated_at_ms)?;
+        refresh_existing_wire_item_timestamp(put.item.item_mut(), updated_at_ms)?;
     }
     Ok(())
 }

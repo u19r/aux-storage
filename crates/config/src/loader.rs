@@ -98,6 +98,11 @@ fn load_impl(
 
 fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
     validate_backend_details(&root.features.backends, "features.backends")?;
+    if root.features.read_sequence.shadow_sample_percent > 100 {
+        return Err(ConfigError::validation(
+            "features.read_sequence.shadow_sample_percent must be between 0 and 100",
+        ));
+    }
     if let Some(registry) = &root.features.storage_connections {
         if registry.default_connection.trim().is_empty() {
             return Err(ConfigError::validation(
@@ -128,6 +133,7 @@ fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
     validate_queue_config(root)?;
     validate_pubsub_config(root)?;
     validate_storage_sync_replication(&root.features.storage_sync_replication)?;
+    validate_storage_admission_config(&root.features.storage_admission)?;
     if root.features.storage_point_read_cache.capacity == 0 {
         return Err(ConfigError::validation(
             "features.storage_point_read_cache.capacity must be greater than 0",
@@ -150,6 +156,78 @@ fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::validation(
             "features.storage_point_read_cache.max_bytes must be greater than 0 when set",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_admission_config(
+    admission: &crate::StorageAdmissionConfig,
+) -> Result<(), ConfigError> {
+    if admission.initial_sustainable_throughput_rps == 0 {
+        return Err(ConfigError::validation(
+            "features.storage_admission.initial_sustainable_throughput_rps must be greater than 0",
+        ));
+    }
+    if admission.initial_latency_estimate_ms == 0 {
+        return Err(ConfigError::validation(
+            "features.storage_admission.initial_latency_estimate_ms must be greater than 0",
+        ));
+    }
+    if admission.minimum_concurrency == 0 {
+        return Err(ConfigError::validation(
+            "features.storage_admission.minimum_concurrency must be greater than 0",
+        ));
+    }
+    if admission.maximum_concurrency < admission.minimum_concurrency {
+        return Err(ConfigError::validation(
+            "features.storage_admission.maximum_concurrency must be at least minimum_concurrency",
+        ));
+    }
+    if admission.control_reserve_concurrency >= admission.maximum_concurrency {
+        return Err(ConfigError::validation(
+            "features.storage_admission.control_reserve_concurrency must be less than \
+             maximum_concurrency",
+        ));
+    }
+    if admission
+        .maximum_concurrency
+        .saturating_sub(admission.control_reserve_concurrency)
+        < admission.minimum_concurrency
+    {
+        return Err(ConfigError::validation(
+            "features.storage_admission effective foreground maximum must be at least \
+             minimum_concurrency",
+        ));
+    }
+    if admission.max_queue_wait_ms == 0 {
+        return Err(ConfigError::validation(
+            "features.storage_admission.max_queue_wait_ms must be greater than 0",
+        ));
+    }
+    let product = u128::from(admission.initial_sustainable_throughput_rps)
+        .checked_mul(u128::from(admission.initial_latency_estimate_ms))
+        .ok_or_else(|| {
+            ConfigError::validation(
+                "features.storage_admission bootstrap concurrency arithmetic overflow",
+            )
+        })?;
+    let bootstrap = product.checked_add(999).ok_or_else(|| {
+        ConfigError::validation(
+            "features.storage_admission bootstrap concurrency arithmetic overflow",
+        )
+    })? / 1_000;
+    if usize::try_from(
+        bootstrap.min(
+            admission
+                .maximum_concurrency
+                .saturating_sub(admission.control_reserve_concurrency) as u128,
+        ),
+    )
+    .is_err()
+    {
+        return Err(ConfigError::validation(
+            "features.storage_admission bootstrap concurrency does not fit usize",
         ));
     }
     Ok(())

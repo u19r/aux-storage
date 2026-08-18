@@ -15,7 +15,7 @@ postgres = ["storage/postgres", "storage-types/postgres"]
 rocksdb = ["storage/rocksdb", "storage-types/rocksdb"]
 foundationdb = ["storage/foundationdb"]
 queue = ["dep:queue", "dep:queue-provider"]
-pubsub = ["dep:pubsub", "dep:pubsub-provider"]
+pubsub = ["dep:pubsub"]
 remote = ["storage/remote"]
 tokio-console = ["dep:console-subscriber"]
 
@@ -36,7 +36,6 @@ metrics-facade = { workspace = true }
 notify = { workspace = true, default-features = true }
 openraft = { workspace = true }
 pubsub = { path = "../pubsub", default-features = false, optional = true }
-pubsub-provider = { path = "../pubsub-provider", optional = true }
 queue = { path = "../queue", default-features = false, optional = true }
 queue-provider = { path = "../queue-provider", optional = true }
 serde = { workspace = true, features = ["derive"] }

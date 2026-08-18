@@ -1,9 +1,9 @@
-use std::{collections::HashMap, fmt::Write as _};
+use std::{borrow::Cow, collections::HashMap, fmt::Write as _};
 
 use queue_provider::{QueueMessage, ReceiptHandle};
 use storage_types::{
     AttributeDefinition, AttributeValue, GlobalSecondaryIndex, KeyAttributeType, KeyAttributes,
-    KeySchemaElement, KeyType, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    KeySchemaElement, KeyType, MaxIndexers, StorageError, StorageResult, StoredTableInfo,
     TableName,
 };
 
@@ -21,20 +21,15 @@ pub fn dynamodb_type_to_sql_type(attr_type: &KeyAttributeType) -> &'static str {
     }
 }
 
-pub(crate) fn main_table_attributes_blob(
+pub(crate) fn main_table_payload<'a>(
     key_attributes: &KeyAttributes,
-    non_key_attributes: &HashMap<String, AttributeValue>,
-) -> StorageResult<String> {
+    non_key_attributes: &'a HashMap<String, AttributeValue>,
+) -> Cow<'a, HashMap<String, AttributeValue>> {
     let has_number_key = key_attributes
         .iter()
         .any(|(_, value)| matches!(value, AttributeValue::N(_)));
     if !has_number_key {
-        return if non_key_attributes.is_empty() {
-            Ok("{}".to_string())
-        } else {
-            serde_json::to_string(non_key_attributes)
-                .map_err(|error| StorageEnum::Serialization(error).into())
-        };
+        return Cow::Borrowed(non_key_attributes);
     }
 
     let mut attributes = HashMap::with_capacity(key_attributes.len() + non_key_attributes.len());
@@ -48,7 +43,11 @@ pub(crate) fn main_table_attributes_blob(
             .iter()
             .map(|(name, value)| (name.clone(), normalize_wire_number(value))),
     );
-    serde_json::to_string(&attributes).map_err(|error| StorageEnum::Serialization(error).into())
+    Cow::Owned(attributes)
+}
+
+pub(crate) fn indexer_column_name(ordinal: usize) -> String {
+    format!("__aux_indexer_{ordinal}")
 }
 
 fn normalize_wire_number(value: &AttributeValue) -> AttributeValue {
@@ -192,6 +191,7 @@ pub(crate) fn build_table_creation_sql(
     attribute_definitions: &[AttributeDefinition],
     key_schema: &[KeySchemaElement],
     global_secondary_indexes: Option<&[GlobalSecondaryIndex]>,
+    max_indexers: MaxIndexers,
     rowid_mode: SqliteTableRowidMode,
 ) -> String {
     let sanitized_name = table_name.sanitized_name();
@@ -239,6 +239,9 @@ pub(crate) fn build_table_creation_sql(
         "{}, attributes_blob TEXT",
         key_columns.join(", ")
     );
+    for ordinal in 0..max_indexers.as_usize() {
+        let _ = write!(create_sql, ", {} TEXT", indexer_column_name(ordinal));
+    }
 
     // Add primary key constraint
     let mut primary_key_columns = Vec::new();
@@ -270,6 +273,7 @@ pub(crate) fn build_gsi_creation_sqls(
     attribute_definitions: &[AttributeDefinition],
     table_key_schema: &[KeySchemaElement],
     global_secondary_indexes: &[GlobalSecondaryIndex],
+    max_indexers: MaxIndexers,
     rowid_mode: SqliteTableRowidMode,
 ) -> Vec<String> {
     let sanitized_table_name = table_name.sanitized_name();
@@ -314,6 +318,9 @@ pub(crate) fn build_gsi_creation_sqls(
              __aux_item_version INTEGER NOT NULL DEFAULT 0",
             key_columns.join(", ")
         );
+        for ordinal in 0..max_indexers.as_usize() {
+            let _ = write!(create_sql, ", {} TEXT", indexer_column_name(ordinal));
+        }
 
         // Add primary key constraint for GSI: (pk, sk, table_pk, table_sk)
         let mut primary_key_columns = Vec::new();
@@ -386,6 +393,12 @@ pub(crate) fn sql_row_to_stored_stable_info(
     let created_at: i64 = row.get("created_at")?;
     let attribute_definitions: String = row.get("attribute_definitions")?;
     let key_schema: String = row.get("key_schema")?;
+    let max_indexers = row
+        .get::<_, i64>("max_indexers")
+        .ok()
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(|value| storage_types::MaxIndexers::try_new(value).ok())
+        .ok_or(rusqlite::Error::InvalidQuery)?;
     let global_secondary_indexes: Option<String> = row.get("global_secondary_indexes")?;
     let stream_specification: Option<String> = row.get("stream_specification")?;
     let global_secondary_indexes = match global_secondary_indexes {
@@ -404,6 +417,7 @@ pub(crate) fn sql_row_to_stored_stable_info(
         created_at: created_at.into(),
         attribute_definitions: parse_attribute_definitions(&attribute_definitions),
         key_schema: parse_key_schema(&key_schema),
+        max_indexers,
         global_secondary_indexes: global_secondary_indexes
             .map(|gsi| serde_json::from_str(&gsi))
             .transpose()
@@ -477,19 +491,6 @@ fn parse_key_schema(raw: &str) -> Vec<KeySchemaElement> {
             tracing::warn!(error = %err, raw = %normalized, "sqlite.table_json_parse_failed");
             Vec::new()
         }
-    }
-}
-
-pub(crate) fn add_non_key_attributes_from_blob(
-    row: &rusqlite::Row,
-    result: &mut HashMap<String, AttributeValue>,
-) {
-    if let Ok(Some(blob)) = row.get::<_, Option<String>>("attributes_blob")
-        && !blob.is_empty()
-        && blob != "{}"
-        && let Ok(non_key_attrs) = serde_json::from_str::<HashMap<String, AttributeValue>>(&blob)
-    {
-        result.extend(non_key_attrs);
     }
 }
 

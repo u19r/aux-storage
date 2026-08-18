@@ -1368,6 +1368,30 @@ async fn query_projection_reconstructs_nested_maps_and_lists_like_dynamodb() {
 }
 
 #[tokio::test]
+async fn query_attributes_to_get_projects_only_requested_attributes() {
+    let db = setup_test_db().await;
+    create_test_table(db.as_ref(), "AttributesToGetTable").await;
+    put_test_item(db.as_ref(), "AttributesToGetTable", "user1", "Alice", 25).await;
+    let payload = json!({
+        "TableName": "AttributesToGetTable",
+        "KeyConditionExpression": "pk = :pk",
+        "AttributesToGet": ["pk", "name"],
+        "ExpressionAttributeValues": {":pk": {"S": "user1"}}
+    });
+
+    let response =
+        expect_query_response(handle_query(db, payload.try_into().unwrap()).await.unwrap());
+    let items = response.items.expect("projected items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].len(), 2);
+    assert!(items[0].contains_key("pk"));
+    assert_eq!(
+        items[0].get("name"),
+        Some(&AttributeValue::S("Alice".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn query_count_only() {
     let db = setup_test_db().await;
     create_test_table(db.as_ref(), "CountTable").await;

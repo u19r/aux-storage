@@ -172,6 +172,7 @@ fn api_decision(api_case: &ApiCase) -> &'static str {
 fn update_table_request(api_case: &ApiCase) -> UpdateTableRequest {
     UpdateTableRequest {
         table_name: TableName::new("ApiMbt"),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -198,6 +199,7 @@ fn batch_write_request(api_case: &ApiCase) -> BatchWriteItemRequest {
             vec![WriteRequest {
                 put_request: Some(PutRequest {
                     item: item("item"),
+                    indexers: None,
                     aux_item_stream_ttl_hours: api_case
                         .put_ttl
                         .then_some(StreamRetentionDuration::FiniteHours(24)),
@@ -217,6 +219,7 @@ fn transaction_request(api_case: &ApiCase) -> TransactWriteItemsRequest {
                 put: Some(TransactPutRequest {
                     table_name: TableName::new("ApiMbt"),
                     item: item("item"),
+                    indexers: None,
                     condition_expression: None,
                     expression_attribute_names: None,
                     expression_attribute_values: None,
@@ -232,6 +235,7 @@ fn transaction_request(api_case: &ApiCase) -> TransactWriteItemsRequest {
                     table_name: TableName::new("ApiMbt"),
                     key: key("item"),
                     update_expression: "SET #value = :value".to_string(),
+                    indexers: None,
                     condition_expression: None,
                     expression_attribute_names: Some(HashMap::from([(
                         "#value".to_string(),

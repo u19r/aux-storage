@@ -123,9 +123,22 @@ fn apply_network_policy(
         .map_err(|err| map_fdb_error("set disable_client_bypass", err))?;
     builder
         .set_option(options::NetworkOption::Knob(format!(
-            "max_version_cache_lag={grv_cache_lag_ms}"
+            "max_version_cache_lag={}",
+            format_grv_cache_lag_seconds(grv_cache_lag_ms)
         )))
         .map_err(|err| map_fdb_error("set max_version_cache_lag knob", err))
+}
+
+fn format_grv_cache_lag_seconds(lag_ms: u16) -> String {
+    let whole_seconds = lag_ms / 1000;
+    let milliseconds = lag_ms % 1000;
+    if milliseconds == 0 {
+        return whole_seconds.to_string();
+    }
+
+    let fraction = format!("{milliseconds:03}");
+    let fraction = fraction.trim_end_matches('0');
+    format!("{whole_seconds}.{fraction}")
 }
 
 fn init_network_inner(config: &FoundationDbConfig) -> StorageResult<Arc<FoundationDbNetworkInner>> {
@@ -153,7 +166,7 @@ fn init_network_inner(config: &FoundationDbConfig) -> StorageResult<Arc<Foundati
         .build()
         .map_err(|err| map_fdb_error("initialize FoundationDB API", err))?;
     let builder = apply_network_policy(builder, requested_policy)?;
-    let guard = unsafe {
+    let guard = {
         builder
             .boot()
             .map_err(|err| map_fdb_error("start FoundationDB network", err))?
@@ -175,3 +188,6 @@ fn init_network_inner(config: &FoundationDbConfig) -> StorageResult<Arc<Foundati
 
     Ok(network)
 }
+
+#[cfg(test)]
+mod network_tests;

@@ -242,7 +242,7 @@ impl WriteCostTally {
             self.put_ops = self.put_ops.saturating_add(1);
             self.put_bytes = self
                 .put_bytes
-                .saturating_add(put_request.item.payload_len() as u64);
+                .saturating_add(put_request.item.item().payload_len() as u64);
         }
         if let Some(delete_request) = request.delete_request.as_ref() {
             self.delete_ops = self.delete_ops.saturating_add(1);
@@ -284,7 +284,7 @@ impl WriteCostTally {
             self.put_ops = self.put_ops.saturating_add(1);
             self.put_bytes = self
                 .put_bytes
-                .saturating_add(put_request.item.payload_len() as u64);
+                .saturating_add(put_request.item.item().payload_len() as u64);
         }
         if let Some(delete_request) = item.delete.as_ref() {
             self.delete_ops = self.delete_ops.saturating_add(1);

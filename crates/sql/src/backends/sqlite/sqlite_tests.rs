@@ -367,6 +367,7 @@ fn gsi_attribute_type_conversion_bug() {
             attribute_name: "pk".to_string(),
             key_type: KeyType::Hash,
         }],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,

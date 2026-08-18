@@ -17,6 +17,37 @@ use crate::sorted_kv_store::SortedKvStore;
 
 #[async_trait::async_trait]
 pub trait PartitionFamilyKvStore: SortedKvStore {
+    /// Stable namespace identity embedded in FoundationDB Tuple keys. Other
+    /// sorted providers have one logical namespace and therefore use empty
+    /// bytes; FoundationDB supplies its configured tenant identity.
+    fn tenant_keyspace(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Whether this store has the exact physical namespace required by the
+    /// canonical FoundationDB mapped-range descriptor.  Providers must use
+    /// this capability before constructing a mapper; a generic sorted store
+    /// must never infer that its compact keys are Tuple-compatible.
+    fn supports_read_sequence_mapped_range(&self) -> bool {
+        false
+    }
+
+    /// FoundationDB API version proved by the backend binding/configuration.
+    /// A zero value means that mapped range is unavailable.
+    fn read_sequence_mapped_range_api_version(&self) -> u32 {
+        0
+    }
+
+    /// Execute the provider-owned FoundationDB mapped-range primitive.  The
+    /// default is an explicit capability miss; the API layer falls back to the
+    /// ordinary validated DAG without attempting to interpret physical bytes.
+    async fn read_sequence_mapped_range(
+        &self,
+        _request: storage_provider::ReadSequenceMappedRangeRequest,
+    ) -> StorageResult<Option<storage_provider::ReadSequenceMappedRangePage>> {
+        Ok(None)
+    }
+
     fn supports_partition_families(&self) -> bool;
 
     async fn append_partitioned_ordered_log_item(

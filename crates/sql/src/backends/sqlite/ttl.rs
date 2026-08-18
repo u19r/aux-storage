@@ -2,12 +2,9 @@ use std::collections::HashMap;
 
 use rusqlite::OptionalExtension as _;
 use storage_common::ttl::{
-    TtlConfigRecord, parse_ttl_index_key, ttl_index_key_for_item, ttl_index_key_for_wire_item,
-    ttl_index_prefix,
+    TtlConfigRecord, parse_ttl_index_key, ttl_index_key_for_item, ttl_index_prefix,
 };
-use storage_types::{
-    AttributeValue, StorageError, StorageResult, StoredTableInfo, TableName, WireItem,
-};
+use storage_types::{AttributeValue, StorageError, StorageResult, StoredTableInfo, TableName};
 
 use crate::{
     SQLiteStorageProvider,
@@ -161,66 +158,6 @@ impl SQLiteStorageProvider {
 
         let ttl_table = naming::physical_ttl_index_table_name(table_name);
 
-        let prefix = ttl_index_prefix(table_name);
-
-        if let Some(key) = old_key {
-            let (ttl_value, key_token) = parse_ttl_index_key(&key, &prefix)
-                .ok_or_else(|| StorageError::internal("ttl index key parse failed"))?;
-            let sql =
-                format!("DELETE FROM \"{ttl_table}\" WHERE ttl_value = ?1 AND key_token = ?2");
-            sqlite
-                .execute(&sql, rusqlite::params![ttl_value, key_token])
-                .map_err(map_sqlite_error)?;
-        }
-
-        if let Some(key) = new_key {
-            let (ttl_value, key_token) = parse_ttl_index_key(&key, &prefix)
-                .ok_or_else(|| StorageError::internal("ttl index key parse failed"))?;
-            let sql = format!(
-                "INSERT OR REPLACE INTO \"{ttl_table}\" (ttl_value, key_token) VALUES (?1, ?2)"
-            );
-            sqlite
-                .execute(&sql, rusqlite::params![ttl_value, key_token])
-                .map_err(map_sqlite_error)?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn update_ttl_index_entries_wire(
-        sqlite: &SqliteConn<'_>,
-        table_info: &StoredTableInfo,
-        ttl_config: Option<&TtlConfigRecord>,
-        old_item: Option<&WireItem>,
-        new_item: Option<&WireItem>,
-    ) -> StorageResult<()> {
-        let Some(config) = ttl_config else {
-            return Ok(());
-        };
-        if !matches!(
-            config.status,
-            storage_types::TimeToLiveStatus::Enabled | storage_types::TimeToLiveStatus::Enabling
-        ) {
-            return Ok(());
-        }
-
-        let table_name = &table_info.table_name;
-        let old_key = if let Some(item) = old_item {
-            ttl_index_key_for_wire_item(table_name, table_info, &config.attribute_name, item)?
-        } else {
-            None
-        };
-        let new_key = if let Some(item) = new_item {
-            ttl_index_key_for_wire_item(table_name, table_info, &config.attribute_name, item)?
-        } else {
-            None
-        };
-
-        if old_key.is_some() && old_key == new_key {
-            return Ok(());
-        }
-
-        let ttl_table = naming::physical_ttl_index_table_name(table_name);
         let prefix = ttl_index_prefix(table_name);
 
         if let Some(key) = old_key {

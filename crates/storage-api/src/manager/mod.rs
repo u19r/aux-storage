@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod quint_read_sequence_token_tests;
 mod storage_api_manager;
 mod storage_manager_impl_append_table_stream_record;
 mod storage_manager_impl_batch_get_item;
@@ -20,7 +22,18 @@ mod storage_manager_impl_put_item;
 mod storage_manager_impl_query;
 mod storage_manager_impl_read_pagination;
 mod storage_manager_impl_read_sequence;
+#[cfg(test)]
+mod storage_manager_impl_read_sequence_alloc_tests;
+mod storage_manager_impl_read_sequence_inputs;
+#[cfg(test)]
+mod storage_manager_impl_read_sequence_inputs_alloc_tests;
+#[cfg(test)]
+mod storage_manager_impl_read_sequence_inputs_tests;
+#[cfg(test)]
+mod storage_manager_impl_read_sequence_tests;
 mod storage_manager_impl_read_sequence_token;
+#[cfg(test)]
+mod storage_manager_impl_read_sequence_token_tests;
 mod storage_manager_impl_replication;
 mod storage_manager_impl_run_background_job;
 mod storage_manager_impl_scan;
@@ -33,12 +46,10 @@ mod storage_manager_impl_update_time_to_live;
 mod sync_raft_proposal_coalescer;
 mod sync_raft_runtime_adapter;
 
-#[cfg(test)]
-pub use storage_api_manager::ReadSequenceAfterRootStepHook;
 #[allow(unused_imports)]
 pub use storage_api_manager::{
-    StorageApiManager, StorageApiManagerImpl, StorageApiManagerOptions, SyncHealthReporter,
-    SyncReadBarrier, SyncWriteProposer,
+    ReadSequenceExecutionMode, StorageApiManager, StorageApiManagerImpl, StorageApiManagerOptions,
+    SyncHealthReporter, SyncReadBarrier, SyncWriteProposer,
 };
 pub use sync_raft_runtime_adapter::SyncRaftRuntimeAdapter;
 

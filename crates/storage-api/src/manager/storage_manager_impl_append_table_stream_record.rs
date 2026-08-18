@@ -1,5 +1,7 @@
 use http_error::HttpApiError;
+use storage::AdmissionClass;
 use storage_types::{StreamName, TableName};
+use stream_provider::StreamError;
 
 use crate::{manager::StorageApiManagerImpl, types::Response};
 
@@ -28,16 +30,23 @@ impl StorageApiManagerImpl {
 
         let table = TableName::new(table_name);
         let stream_name = StreamName::table_stream(&table);
-        let stream_item_id = self
+        let admitted = self
             .db()
-            .stream_provider()
-            .append_item(stream_name, data.as_bytes(), None)
+            .admit_default_provider(AdmissionClass::Write)
             .await
-            .map_err(|err| {
-                HttpApiError::internal_server_error(format!(
-                    "failed to append table stream record: {err}"
-                ))
-            })?;
+            .map_err(HttpApiError::from)?;
+        let append_result = admitted
+            .run_stream(|provider| async move {
+                provider
+                    .append_item(stream_name, data.as_bytes(), None)
+                    .await
+            })
+            .await;
+        let stream_item_id = append_result.map_err(|err: StreamError| {
+            HttpApiError::internal_server_error(format!(
+                "failed to append table stream record: {err}"
+            ))
+        })?;
 
         let response = serde_json::json!({
             "Message": "Table stream record appended",

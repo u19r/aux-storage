@@ -1,11 +1,17 @@
 use storage_types::{IndexName, ItemKey, StorageError, StorageResult};
 
 use crate::keyspace::{
-    compact::{self, IndexStorageId, KeyRange, TableStorageId},
+    compact::{self, IndexStorageId, KeyRange},
     table_identity::TableIdentity,
 };
 
 pub(crate) fn item_key(table: &TableIdentity, item_key: &ItemKey) -> StorageResult<Vec<u8>> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::item_key(table, item_key)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
     match item_key.index_id() {
         Some(index_name) => {
             let index_id =
@@ -23,6 +29,29 @@ pub(crate) fn item_key(table: &TableIdentity, item_key: &ItemKey) -> StorageResu
     }
 }
 
+pub(crate) fn item_key_prefix(table: &TableIdentity, key: &ItemKey) -> StorageResult<Vec<u8>> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::item_key_prefix(table, key)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
+    item_key(table, key)
+}
+
+pub(crate) fn item_key_prefix_end(
+    table: &TableIdentity,
+    item_key: &ItemKey,
+) -> StorageResult<Vec<u8>> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::item_key_prefix_end(table, item_key)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
+    increment_bytes(item_key_prefix(table, item_key)?)
+}
+
 pub(crate) fn item_key_increment(table: &TableIdentity, key: &ItemKey) -> StorageResult<Vec<u8>> {
     increment_bytes(item_key(table, key)?)
 }
@@ -31,11 +60,23 @@ pub(crate) fn item_key_decrement(table: &TableIdentity, key: &ItemKey) -> Storag
     decrement_bytes(item_key(table, key)?)
 }
 
-pub(crate) fn primary_item_prefix(table_id: TableStorageId) -> KeyRange {
-    compact::primary_item_prefix(table_id)
+pub(crate) fn primary_item_prefix(table: &TableIdentity) -> KeyRange {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::primary_item_prefix(table)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
+    compact::primary_item_prefix(table.table_id)
 }
 
 pub(crate) fn gsi_prefix(table: &TableIdentity, index_name: &IndexName) -> Option<KeyRange> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::gsi_prefix(table, index_name)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
     index_id(table, index_name).map(|index_id| compact::gsi_prefix(table.table_id, index_id))
 }
 
@@ -44,7 +85,14 @@ pub(crate) fn gsi_tombstone_key(
     index_name: &IndexName,
     index_key: &ItemKey,
 ) -> StorageResult<Vec<u8>> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::gsi_tombstone_key(table, index_name, index_key)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
     let index_id = index_id(table, index_name).ok_or_else(|| missing_index_identity(index_name))?;
+    #[cfg(not(feature = "foundationdb-backend"))]
     Ok(compact::gsi_tombstone_key(
         table.table_id,
         index_id,
@@ -56,6 +104,12 @@ pub(crate) fn gsi_tombstone_prefix(
     table: &TableIdentity,
     index_name: &IndexName,
 ) -> Option<KeyRange> {
+    #[cfg(feature = "foundationdb-backend")]
+    {
+        crate::keyspace::tuple_keys::gsi_tombstone_prefix(table, index_name)
+    }
+
+    #[cfg(not(feature = "foundationdb-backend"))]
     index_id(table, index_name)
         .map(|index_id| compact::gsi_tombstone_prefix(table.table_id, index_id))
 }
@@ -72,12 +126,14 @@ fn index_id(table: &TableIdentity, index_name: &IndexName) -> Option<IndexStorag
         .map(|index| index.index_id)
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 fn sorted_key_suffix(item_key: &ItemKey) -> StorageResult<Vec<u8>> {
     item_key
         .sorted_storage_suffix()
         .map_err(|err| StorageError::internal(&format!("item key serialization failed: {err}")))
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 fn missing_index_identity(index_name: &IndexName) -> StorageError {
     StorageError::internal(&format!("missing storage identity for index {index_name}"))
 }

@@ -1,4 +1,4 @@
-use crate::queue_provider::*;
+use crate::{queue_provider::*, sorted_kv_store::TransactionPriority};
 
 impl<S> SortedKvDbStorageProvider<S>
 where S: QueueKvStore + 'static
@@ -345,7 +345,8 @@ where S: QueueKvStore + 'static
         {
             return Ok(());
         }
-        let job = QueuePayloadCleanupJob::new(Arc::new(self.clone()));
+        let cleanup_provider = self.with_transaction_priority(TransactionPriority::Batch);
+        let job = QueuePayloadCleanupJob::new(Arc::new(cleanup_provider));
         let config = JobConfig {
             start_immediately: false,
             sleep_duration: std::time::Duration::from_secs(QUEUE_PAYLOAD_CLEANUP_INTERVAL_SECONDS),

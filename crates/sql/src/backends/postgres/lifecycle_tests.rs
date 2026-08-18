@@ -1,16 +1,16 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use queue_provider::{Queue, QueueMessage, QueueProvider, ReceiptHandle};
 use storage_common::GSI_UPDATE_JOB;
 use storage_provider::StorageProvider;
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchWriteItemRequest, BillingMode,
-    CreateTableRequest, DeleteRequest, DurationSeconds, ItemKey, KeyAttributeType,
+    CreateTableRequest, DeleteRequest, DurationSeconds, IndexName, ItemKey, KeyAttributeType,
     KeySchemaElement, KeyType, KeysAndAttributes, PutRequest, QueryTableRequest,
     ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
     ReplicationMutation, ReplicationWriteSource, ScanTableRequest, StorageEnum, StreamName,
     StreamSpecification, StreamViewType, TableName, TableStatus, TimestampMillis,
-    UpdateItemRequest, UserStreamName, WriteRequest,
+    UpdateItemRequest, UpdateTableRequest, UserStreamName, WriteRequest,
 };
 use stream_provider::{CursorName, CursorPosition, StoredStreamPointer, StreamProvider};
 
@@ -136,6 +136,112 @@ fn sample_replication_metadata(
         origin_commit_ts: TimestampMillis::from_timestamp(physical_ms),
         table_replica_epoch: 4,
         write_source: ReplicationWriteSource::Replicated,
+    }
+}
+
+#[tokio::test]
+async fn postgres_single_connection_initialization_releases_client_before_stream_setup() {
+    let Some(dsn) = postgres_test_dsn() else {
+        return;
+    };
+    let provider = PostgresStorageProvider::new_with_tls(&dsn, 1, 1, false)
+        .await
+        .expect("postgres provider");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        provider
+            .initialize_storage()
+            .await
+            .expect("initialize storage");
+        provider
+            .initialize_stream()
+            .await
+            .expect("initialize stream");
+    })
+    .await
+    .expect("single-connection initialization must not wait on itself");
+}
+
+#[tokio::test]
+async fn postgres_capacity_increase_adds_every_indexer_column_to_base_and_gsi_tables() {
+    let Some(dsn) = postgres_test_dsn() else {
+        return;
+    };
+    let provider = PostgresStorageProvider::new(&dsn, 8)
+        .await
+        .expect("postgres provider");
+    provider
+        .initialize_storage()
+        .await
+        .expect("initialize storage");
+
+    let table_name = TableName::new(&format!("pg_indexer_schema_{}", uuid::Uuid::now_v7()));
+    let index_name = IndexName::new("TestGSI");
+    let mut request = gsi_request(&table_name);
+    request.max_indexers = storage_types::MaxIndexers::try_new(4).expect("valid capacity");
+    provider.create_table(&request).await.expect("create table");
+
+    assert_postgres_indexer_column_count(&provider, &table_name, &index_name, 4).await;
+    provider
+        .update_table(UpdateTableRequest {
+            table_name: table_name.clone(),
+            max_indexers: Some(storage_types::MaxIndexers::try_new(32).expect("valid capacity")),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            table_class: None,
+        })
+        .await
+        .expect("increase capacity");
+    assert_postgres_indexer_column_count(&provider, &table_name, &index_name, 32).await;
+
+    provider
+        .delete_table(&table_name)
+        .await
+        .expect("delete table");
+}
+
+async fn assert_postgres_indexer_column_count(
+    provider: &PostgresStorageProvider,
+    table_name: &TableName,
+    index_name: &IndexName,
+    expected: usize,
+) {
+    let client = provider.pool.get().await.expect("connect");
+    for table in [
+        super::physical_names::physical_table_name(table_name),
+        super::physical_names::physical_gsi_table_name(table_name, index_name),
+    ] {
+        let rows = client
+            .query(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = \
+                 current_schema() AND table_name::text = $1::text",
+                &[&table],
+            )
+            .await
+            .expect("read physical columns");
+        let columns = rows
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.starts_with("__aux_indexer_"))
+                .count(),
+            expected,
+            "physical table {table}",
+        );
+        assert!(columns.contains(&format!("__aux_indexer_{}", expected - 1)));
+        assert!(!columns.contains(&format!("__aux_indexer_{expected}")));
     }
 }
 
@@ -310,6 +416,7 @@ async fn postgres_table_lifecycle_works() {
                                     ("pk".to_string(), AttributeValue::S("u-4".to_string())),
                                     ("name".to_string(), AttributeValue::S("Dee".to_string())),
                                 ]),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
@@ -960,12 +1067,13 @@ async fn postgres_apply_replication_mutation_preserves_replication_metadata() {
         .expect("initialize stream");
 
     let table_name = TableName::new(&format!("pg_replication_{}", uuid::Uuid::now_v7()));
-    let request = basic_create_table_request(&table_name).with_stream_specification(Some(
+    let mut request = basic_create_table_request(&table_name).with_stream_specification(Some(
         StreamSpecification {
             stream_enabled: true,
             stream_view_type: Some(StreamViewType::NewAndOldImages),
         },
     ));
+    request.max_indexers = storage_types::MaxIndexers::try_new(1).expect("valid capacity");
     provider.create_table(&request).await.expect("create table");
 
     let metadata = sample_replication_metadata("eu-west-2", 13);
@@ -977,7 +1085,9 @@ async fn postgres_apply_replication_mutation_preserves_replication_metadata() {
                 ("pk".to_string(), AttributeValue::S("u-99".to_string())),
                 ("name".to_string(), AttributeValue::S("Remote".to_string())),
             ])),
+            new_indexers: Some(vec!["name".to_string()]),
             old_image: None,
+            old_indexers: None,
             metadata: metadata.clone(),
         })
         .await
@@ -990,6 +1100,7 @@ async fn postgres_apply_replication_mutation_preserves_replication_metadata() {
     let stored_pointer: StoredStreamPointer =
         storage_types::storage_serde::from_bytes(&page.items[0].data).expect("decode pointer");
     assert_eq!(stored_pointer.replication_metadata(), Some(&metadata));
+    assert_eq!(stored_pointer.indexers(), ["name"]);
     assert_eq!(
         stored_pointer.target_item_stream_version(),
         storage_types::ItemStreamVersion::new(1)

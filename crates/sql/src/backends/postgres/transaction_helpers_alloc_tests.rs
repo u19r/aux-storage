@@ -49,7 +49,7 @@ fn postgres_transact_condition_allocation_profile_tests() {
 }
 
 #[tokio::test]
-#[ignore = "live Postgres macro perf probe; requires TEST_POSTGRES_DSN or local host=/tmp \
+#[ignore = "live Postgres macro perf probe; requires TEST_POSTGRES_DSN or local host=localhost \
             dbname=postgres"]
 async fn postgres_conditional_put_macro_profile_tests() {
     assert_postgres_conditional_put_macro_uses_cached_wire_condition().await;
@@ -676,6 +676,7 @@ fn realistic_transact_write_request_for_table(table_name: &TableName) -> Transac
                     key: transact_key(index),
                     update_expression: "SET #payload = :payload, #counter = #counter + :inc"
                         .to_string(),
+                    indexers: None,
                     condition_expression: Some(
                         "#status = :active AND begins_with(#search, :prefix)".to_string(),
                     ),
@@ -719,7 +720,7 @@ fn transact_key(index: usize) -> KeyAttributes {
 fn live_postgres_dsn() -> String {
     std::env::var("TEST_POSTGRES_DSN")
         .or_else(|_| std::env::var("CUCUMBER_POSTGRES_DSN"))
-        .unwrap_or_else(|_| "host=/tmp dbname=postgres".to_string())
+        .unwrap_or_else(|_| "host=localhost dbname=postgres".to_string())
 }
 
 async fn setup_live_postgres_macro_table(

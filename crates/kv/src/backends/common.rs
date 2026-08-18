@@ -7,25 +7,29 @@ use storage_common::{
 use storage_condition::{Condition, evaluate_condition};
 use storage_provider::{UpdateOperation, apply_update_operations};
 use storage_types::{
-    AttributeValue, AttributeValueLookup, ItemKey, KeyAttributes, ReplicationEventMetadata,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
-    conditional_check_failed_reason, context::WrappedError as _,
+    AttributeValue, AttributeValueLookup, IndexedWireItem, IndexerDeclaration, ItemKey,
+    KeyAttributes, ReplicationEventMetadata, StorageEnum, StorageError, StorageResult,
+    StoredTableInfo, StreamItemId, conditional_check_failed_reason, context::WrappedError as _,
     normalize_dynamodb_number_for_write, preflight_transact_put_item_key_with_table_info,
     preflight_transact_write_key_with_table_info, return_values_on_condition_check_failure_all_old,
     transaction_canceled_for_indexed_reasons, transaction_canceled_for_item_error,
     transaction_canceled_for_item_error_with_len, transaction_canceled_for_reason,
-    transaction_cancellation_reason_at,
+    transaction_cancellation_reason_at, transaction_key_preflight_from_key_result,
 };
 
+#[cfg(feature = "rocksdb-backend")]
+use crate::keyspace::compact::KeyFamily;
 use crate::{
     helpers::deserialize_item_from_bytes,
     key_template::KeyTemplate,
-    keyspace::{compact::KeyFamily, table_identity::TableIdentity, table_keys},
+    keyspace::{table_identity::TableIdentity, table_keys},
     sorted_kv_store::{
-        OldNewItems, RangeResult, RangeValuesResult, TransactWriteOperation,
+        ItemValueCodec, OldNewItems, RangeResult, RangeValuesResult, TransactWriteOperation,
         TransactWriteTableOperation,
     },
-    storage_ops::{change_index_key, change_index_slot},
+    storage_ops::{
+        change_index_key, change_index_slot, decode_indexed_wire_item, encode_indexed_wire_item,
+    },
     stream::helpers::{StreamEntryContext, create_item_update_stream_entries},
     ttl::{TtlIndexMutation, plan_ttl_index_mutations},
 };
@@ -301,6 +305,7 @@ pub fn plan_table_operation(
     current_bytes: Option<&[u8]>,
     stream_item_id: Option<StreamItemId>,
     immediate_gsi_consistency: bool,
+    codec: ItemValueCodec,
     index: usize,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
     use TransactWriteTableOperation as TableOp;
@@ -310,6 +315,7 @@ pub fn plan_table_operation(
             table_identity,
             table_info,
             item,
+            indexers,
             item_stream_ttl_hours,
             condition,
             return_values_on_condition_check_failure,
@@ -319,6 +325,7 @@ pub fn plan_table_operation(
             table_identity,
             table_info,
             item,
+            indexers.as_deref(),
             condition.as_ref(),
             return_values_on_condition_check_failure.as_ref(),
             current_bytes,
@@ -329,6 +336,7 @@ pub fn plan_table_operation(
             },
             ttl_config.as_ref(),
             *item_stream_ttl_hours,
+            codec,
             index,
         ),
         TableOp::Delete {
@@ -356,21 +364,22 @@ pub fn plan_table_operation(
                 immediate_gsi_consistency,
             },
             ttl_config.as_ref(),
+            codec,
             index,
         ),
         TableOp::Check {
-            table_identity,
             table_info,
             key,
             condition,
             return_values_on_condition_check_failure,
+            ..
         } => plan_table_check(
-            table_identity,
             table_info,
             key,
             condition,
             return_values_on_condition_check_failure.as_ref(),
             current_bytes,
+            codec,
             index,
         ),
         TableOp::Update {
@@ -378,6 +387,7 @@ pub fn plan_table_operation(
             table_info,
             key,
             operations,
+            indexers,
             item_stream_ttl_hours,
             condition,
             return_values_on_condition_check_failure,
@@ -393,6 +403,7 @@ pub fn plan_table_operation(
             condition.as_ref(),
             return_values_on_condition_check_failure.as_ref(),
             current_bytes,
+            indexers.as_deref(),
             TableUpdateContext {
                 stream: TableStreamContext {
                     stream_item_id,
@@ -404,6 +415,7 @@ pub fn plan_table_operation(
                 ttl_config: ttl_config.as_ref(),
                 item_stream_ttl_hours: *item_stream_ttl_hours,
             },
+            codec,
         )
         .map_err(|error| {
             if *transaction_validation {
@@ -421,20 +433,54 @@ pub fn plan_table_write(
     stream_ids: &[Option<StreamItemId>],
     immediate_gsi_consistency: bool,
 ) -> StorageResult<TableWritePlan> {
-    preflight_table_write_operations(operations)?;
-    plan_table_write_preflighted(
+    plan_table_write_with_codec(
         operations,
         current_values,
         stream_ids,
         immediate_gsi_consistency,
+        ItemValueCodec::RocksDbEnvelope,
     )
 }
 
+pub fn plan_table_write_with_codec(
+    operations: &[TransactWriteTableOperation],
+    current_values: Vec<Option<Vec<u8>>>,
+    stream_ids: &[Option<StreamItemId>],
+    immediate_gsi_consistency: bool,
+    codec: ItemValueCodec,
+) -> StorageResult<TableWritePlan> {
+    preflight_table_write_operations(operations)?;
+    plan_table_write_preflighted_with_codec(
+        operations,
+        current_values,
+        stream_ids,
+        immediate_gsi_consistency,
+        codec,
+    )
+}
+
+#[cfg(any(feature = "rocksdb-backend", test))]
 pub(crate) fn plan_table_write_preflighted(
     operations: &[TransactWriteTableOperation],
     current_values: Vec<Option<Vec<u8>>>,
     stream_ids: &[Option<StreamItemId>],
     immediate_gsi_consistency: bool,
+) -> StorageResult<TableWritePlan> {
+    plan_table_write_preflighted_with_codec(
+        operations,
+        current_values,
+        stream_ids,
+        immediate_gsi_consistency,
+        ItemValueCodec::RocksDbEnvelope,
+    )
+}
+
+pub(crate) fn plan_table_write_preflighted_with_codec(
+    operations: &[TransactWriteTableOperation],
+    current_values: Vec<Option<Vec<u8>>>,
+    stream_ids: &[Option<StreamItemId>],
+    immediate_gsi_consistency: bool,
+    codec: ItemValueCodec,
 ) -> StorageResult<TableWritePlan> {
     let mut plan = TableWritePlan {
         results: Vec::with_capacity(operations.len()),
@@ -449,10 +495,11 @@ pub(crate) fn plan_table_write_preflighted(
             current.as_deref(),
             stream_ids[index],
             immediate_gsi_consistency,
+            codec,
             index,
         )
         .map_err(|error| {
-            if matches!(error.to_enum(), StorageEnum::TransactionCanceled { .. }) {
+            if operation_uses_transaction_validation(operation) {
                 transaction_canceled_for_item_error_with_len(index, operations.len(), error)
             } else {
                 error
@@ -490,6 +537,16 @@ pub(crate) fn plan_table_write_preflighted(
 
     collapse_redundant_gsi_mutations(&mut plan);
     Ok(plan)
+}
+
+fn operation_uses_transaction_validation(operation: &TransactWriteTableOperation) -> bool {
+    !matches!(
+        operation,
+        TransactWriteTableOperation::Update {
+            transaction_validation: false,
+            ..
+        }
+    )
 }
 
 pub(crate) fn preflight_table_write_operations(
@@ -544,17 +601,47 @@ fn preflight_table_write_operation(
 ) -> StorageResult<storage_types::TransactionKeyPreflight> {
     match operation {
         TransactWriteTableOperation::Put {
-            table_info, item, ..
-        } => preflight_transact_put_item_key_with_table_info(table_info, item),
+            table_info,
+            item,
+            indexers,
+            ..
+        } => {
+            let indexer_preflight = transaction_key_preflight_from_key_result((|| {
+                let declaration = IndexerDeclaration::try_new(
+                    indexers.clone().unwrap_or_default(),
+                    table_info.max_indexers,
+                )?;
+                IndexedWireItem::extract(item, &declaration)?;
+                Ok(String::new())
+            })())?;
+            if indexer_preflight.validation_reason.is_some() {
+                return Ok(indexer_preflight);
+            }
+            preflight_transact_put_item_key_with_table_info(table_info, item)
+        }
         TransactWriteTableOperation::Delete {
             table_info, key, ..
         }
         | TransactWriteTableOperation::Check {
             table_info, key, ..
-        }
-        | TransactWriteTableOperation::Update {
-            table_info, key, ..
         } => preflight_transact_write_key_with_table_info(table_info, key),
+        TransactWriteTableOperation::Update {
+            table_info,
+            key,
+            indexers,
+            ..
+        } => {
+            if let Some(indexers) = indexers {
+                let indexer_preflight = transaction_key_preflight_from_key_result(
+                    IndexerDeclaration::try_new(indexers.clone(), table_info.max_indexers)
+                        .map(|_| String::new()),
+                )?;
+                if indexer_preflight.validation_reason.is_some() {
+                    return Ok(indexer_preflight);
+                }
+            }
+            preflight_transact_write_key_with_table_info(table_info, key)
+        }
     }
 }
 
@@ -601,13 +688,20 @@ pub(crate) fn gsi_mutation_key(mutation: &KvMutation) -> Option<&[u8]> {
         KvMutation::Put { key, .. } | KvMutation::Delete { key } => key.as_slice(),
         KvMutation::PutTemplate { .. } => return None,
     };
-    matches!(
+    #[cfg(feature = "foundationdb-backend")]
+    if crate::keyspace::tuple_keys::is_gsi_key(key) {
+        return Some(key);
+    }
+    #[cfg(feature = "rocksdb-backend")]
+    if matches!(
         key.first()
             .copied()
             .and_then(|code| KeyFamily::from_code(code).ok()),
         Some(KeyFamily::GsiItem | KeyFamily::GsiTombstone)
-    )
-    .then_some(key)
+    ) {
+        return Some(key);
+    }
+    None
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -615,12 +709,14 @@ fn plan_table_put(
     table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     item: &HashMap<String, AttributeValue>,
+    indexers: Option<&[String]>,
     condition: Option<&Condition>,
     return_values_on_condition_check_failure: Option<&String>,
     current_bytes: Option<&[u8]>,
     stream_context: TableStreamContext<'_>,
     ttl_config: Option<&TtlConfigRecord>,
     item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+    codec: ItemValueCodec,
     index: usize,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
     let item_clone = item.clone();
@@ -631,7 +727,8 @@ fn plan_table_put(
     )?;
     let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
-    let mut current = deserialize_optional_item(current_bytes)?;
+    let (mut current, stored_indexers) =
+        decode_optional_table_item(current_bytes, table_info, codec)?;
     if current_bytes.is_some() {
         merge_key_attributes(&mut current, item, table_info)?;
     }
@@ -645,7 +742,11 @@ fn plan_table_put(
         )?;
     }
 
-    let primary_value = storage_types::storage_serde::to_bytes(&item_clone)?;
+    let declaration = IndexerDeclaration::try_new(
+        indexers.unwrap_or_default().to_vec(),
+        table_info.max_indexers,
+    )?;
+    let primary_value = encode_table_item(codec, &item_clone, &item_clone, &declaration)?;
     let mut mutations = vec![KvMutation::Put {
         key: item_key_bytes,
         value: primary_value,
@@ -665,6 +766,10 @@ fn plan_table_put(
                 table_identity,
                 table_name: &table_info.table_name,
                 item_key: &item_key,
+                indexers: declaration.names(),
+                old_indexers: current_bytes
+                    .is_some()
+                    .then_some(stored_indexers.as_slice()),
             },
             &item_clone,
             old_item,
@@ -687,6 +792,8 @@ fn plan_table_put(
             table_info,
             old_item,
             Some(&item_clone),
+            Some(&declaration),
+            codec,
         )?);
     }
 
@@ -721,6 +828,7 @@ fn plan_table_delete(
     current_bytes: Option<&[u8]>,
     stream_context: TableStreamContext<'_>,
     ttl_config: Option<&TtlConfigRecord>,
+    codec: ItemValueCodec,
     index: usize,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
     let key_item = key_attributes_to_item_map(key, table_info)?;
@@ -731,7 +839,8 @@ fn plan_table_delete(
     )?;
     let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
-    let mut current = deserialize_optional_item(current_bytes)?;
+    let (mut current, stored_indexers) =
+        decode_optional_table_item(current_bytes, table_info, codec)?;
     if current_bytes.is_some() {
         merge_key_attributes(&mut current, key, table_info)?;
     }
@@ -768,6 +877,10 @@ fn plan_table_delete(
                 table_identity,
                 table_name: &table_info.table_name,
                 item_key: &item_key,
+                indexers: &[],
+                old_indexers: current_bytes
+                    .is_some()
+                    .then_some(stored_indexers.as_slice()),
             },
             &key_item,
             old_item,
@@ -790,6 +903,8 @@ fn plan_table_delete(
             table_info,
             old_item,
             None,
+            None,
+            codec,
         )?);
     }
 
@@ -816,23 +931,16 @@ fn plan_table_delete(
 }
 
 fn plan_table_check(
-    table_identity: &TableIdentity,
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
     condition: &Condition,
     return_values_on_condition_check_failure: Option<&String>,
     current_bytes: Option<&[u8]>,
+    codec: ItemValueCodec,
     index: usize,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
-    let item_key = storage_types::ItemKey::from_key_schema(
-        table_info.table_name.clone(),
-        &table_info.key_schema,
-        key,
-    )?;
-    let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
-
     // Even for check we load current item to evaluate condition
-    let mut current = deserialize_optional_item(current_bytes)?;
+    let (mut current, _) = decode_optional_table_item(current_bytes, table_info, codec)?;
     if current_bytes.is_some() {
         merge_key_attributes(&mut current, key, table_info)?;
     }
@@ -844,8 +952,6 @@ fn plan_table_check(
         table_info,
     )?;
 
-    // Return current item for parity with previous implementation
-    let _ = item_key_bytes; // silence unused warning intentionally
     Ok(((Some(current), None), Vec::new()))
 }
 
@@ -858,7 +964,9 @@ fn plan_table_update(
     condition: Option<&Condition>,
     return_values_on_condition_check_failure: Option<&String>,
     current_bytes: Option<&[u8]>,
+    requested_indexers: Option<&[String]>,
     update_context: TableUpdateContext<'_>,
+    codec: ItemValueCodec,
 ) -> StorageResult<(OldNewItems, Vec<KvMutation>)> {
     let item_key = storage_types::ItemKey::from_key_schema(
         table_info.table_name.clone(),
@@ -867,7 +975,8 @@ fn plan_table_update(
     )?;
     let item_key_bytes = table_keys::item_key(table_identity, &item_key)?;
 
-    let mut current = deserialize_optional_item(current_bytes)?;
+    let (mut current, stored_indexers) =
+        decode_optional_table_item(current_bytes, table_info, codec)?;
     if current_bytes.is_some() {
         merge_key_attributes(&mut current, key, table_info)?;
     }
@@ -893,7 +1002,10 @@ fn plan_table_update(
         .filter(|_| current_bytes.is_some());
     let mut new_item = apply_update_operations(current, operations)?;
     merge_key_attributes(&mut new_item, key, table_info)?;
-    let serialized = storage_types::storage_serde::to_bytes(&new_item)?;
+    let effective_indexers = requested_indexers.unwrap_or(&stored_indexers);
+    let declaration =
+        IndexerDeclaration::try_new(effective_indexers.to_vec(), table_info.max_indexers)?;
+    let serialized = encode_table_item(codec, &new_item, &new_item, &declaration)?;
 
     let mut mutations = vec![KvMutation::Put {
         key: item_key_bytes,
@@ -913,6 +1025,10 @@ fn plan_table_update(
                 table_identity,
                 table_name: &table_info.table_name,
                 item_key: &item_key,
+                indexers: declaration.names(),
+                old_indexers: current_bytes
+                    .is_some()
+                    .then_some(stored_indexers.as_slice()),
             },
             &new_item,
             old_item,
@@ -938,6 +1054,8 @@ fn plan_table_update(
             table_info,
             old_item,
             Some(&new_item),
+            Some(&declaration),
+            codec,
         )?);
     }
 
@@ -1012,6 +1130,8 @@ fn plan_immediate_gsi_mutations(
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, AttributeValue>>,
     new_item: Option<&HashMap<String, AttributeValue>>,
+    declaration: Option<&IndexerDeclaration>,
+    codec: ItemValueCodec,
 ) -> StorageResult<Vec<KvMutation>> {
     let mut mutations = Vec::new();
     let mut serialized_all_projection_item = None;
@@ -1033,20 +1153,29 @@ fn plan_immediate_gsi_mutations(
                 table_key,
                 projected_item,
             } => {
+                let declaration = declaration.ok_or_else(|| {
+                    StorageError::internal("GSI put requires an indexer declaration")
+                })?;
+                let logical_item = new_item
+                    .ok_or_else(|| StorageError::internal("GSI put requires a logical item"))?;
                 let key =
                     gsi_item_key_bytes(table_identity, table_info, index, &gsi_key, &table_key)?
                         .ok_or_else(|| StorageError::internal("planned GSI put missing key"))?;
                 let value = if is_all_projection(&index.projection) {
                     if serialized_all_projection_item.is_none() {
-                        serialized_all_projection_item =
-                            Some(storage_types::storage_serde::to_bytes(&projected_item)?);
+                        serialized_all_projection_item = Some(encode_table_item(
+                            codec,
+                            logical_item,
+                            &projected_item,
+                            declaration,
+                        )?);
                     }
                     serialized_all_projection_item
                         .as_ref()
                         .ok_or_else(|| StorageError::internal("missing serialized GSI item"))?
                         .clone()
                 } else {
-                    storage_types::storage_serde::to_bytes(&projected_item)?
+                    encode_table_item(codec, logical_item, &projected_item, declaration)?
                 };
                 mutations.push(KvMutation::Put { key, value });
             }
@@ -1054,6 +1183,34 @@ fn plan_immediate_gsi_mutations(
     }
 
     Ok(mutations)
+}
+
+fn decode_optional_table_item(
+    bytes: Option<&[u8]>,
+    table_info: &StoredTableInfo,
+    codec: ItemValueCodec,
+) -> StorageResult<(HashMap<String, AttributeValue>, Vec<String>)> {
+    let Some(bytes) = bytes else {
+        return Ok((HashMap::new(), Vec::new()));
+    };
+    let indexed = decode_indexed_wire_item(codec, bytes)?;
+    if indexed.slots().len() > table_info.max_indexers.as_usize() {
+        return Err(StorageError::internal(
+            "stored_item_corruption:declaration_exceeds_table_capacity",
+        ));
+    }
+    let (item, declaration) = indexed.into_attribute_map_with_declaration()?;
+    Ok((item, declaration.into_names()))
+}
+
+fn encode_table_item(
+    codec: ItemValueCodec,
+    logical_item: &HashMap<String, AttributeValue>,
+    projected_item: &HashMap<String, AttributeValue>,
+    declaration: &IndexerDeclaration,
+) -> StorageResult<Vec<u8>> {
+    let indexed = IndexedWireItem::extract_projected(logical_item, projected_item, declaration)?;
+    encode_indexed_wire_item(codec, &indexed)
 }
 
 fn is_all_projection(projection: &storage_types::Projection) -> bool {

@@ -14,6 +14,13 @@ use crate::{
 /// callers may retry after partial persistence or process restarts.
 #[async_trait]
 pub trait QueueProvider: Send + Sync {
+    /// Return and clear one backend-pressure signal observed by a queue
+    /// operation. Providers which do not expose a pressure signal keep the
+    /// default; the route still classifies retryable protocol errors.
+    fn take_admission_pressure_signal(&self) -> bool {
+        false
+    }
+
     /// Initialize the queue storage backend.
     async fn initialize(&self) -> QueueResult<()>;
 

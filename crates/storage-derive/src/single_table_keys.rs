@@ -4,9 +4,17 @@ use syn::{DeriveInput, Expr, Lit, LitStr, parse_macro_input};
 
 use crate::derive_helpers::struct_has_timestamp_millis_field;
 
+mod indexers;
+
+pub(crate) use indexers::parse_entity_indexers;
+
 pub(crate) fn derive_single_table_keys_impl(input: TokenStream) -> TokenStream {
     let input_ast = parse_macro_input!(input as DeriveInput);
     let name = &input_ast.ident;
+    let entity_indexers = match parse_entity_indexers(&input_ast) {
+        Ok(indexers) => indexers,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     // Collected raw values from attribute
     let mut entity_type: Option<Expr> = None;
@@ -276,8 +284,40 @@ pub(crate) fn derive_single_table_keys_impl(input: TokenStream) -> TokenStream {
         expr => quote! { #expr },
     };
     let entity_type_expr = quote! { #storage_entity_type_expr };
+    let indexer_descriptors = entity_indexers.iter().map(|indexer| {
+        let attribute_name = &indexer.attribute_name;
+        let ordinal = indexer.ordinal;
+        quote! {
+            storage::types::single_table_entity::EntityIndexer::from_derive(
+                #attribute_name,
+                #ordinal,
+            )
+        }
+    });
+    let indexer_helpers = entity_indexers.iter().map(|indexer| {
+        let method = quote::format_ident!("{}_indexer", indexer.field);
+        let attribute_name = &indexer.attribute_name;
+        let ordinal = indexer.ordinal;
+        quote! {
+            #[must_use]
+            pub const fn #method() -> storage::types::single_table_entity::EntityIndexer {
+                storage::types::single_table_entity::EntityIndexer::from_derive(
+                    #attribute_name,
+                    #ordinal,
+                )
+            }
+        }
+    });
+    let indexer_helpers = quote! { #(#indexer_helpers)* };
+    let indexer_declaration = quote! {
+        const INDEXERS: &'static [storage::types::single_table_entity::EntityIndexer] = &[
+            #(#indexer_descriptors),*
+        ];
+    };
     let key_helpers = quote! {
         impl #name {
+            #indexer_helpers
+
             #[must_use]
             pub fn pk_key(&self) -> storage::types::PartitionKey {
                 storage::types::PartitionKey::string(
@@ -367,6 +407,7 @@ pub(crate) fn derive_single_table_keys_impl(input: TokenStream) -> TokenStream {
             impl storage::types::single_table_entity::SingleTableEntity for #name {
                 const STORAGE_ENTITY_TYPE: &'static str = #storage_entity_type_expr;
                 const ENTITY_TYPE: &'static str = #entity_type_expr;
+                #indexer_declaration
                 fn pk(&self) -> String { #pk_lit_val.to_string() }
                 fn sk(&self) -> String {
                     let v: String = { #sk_expr_code };
@@ -406,6 +447,7 @@ pub(crate) fn derive_single_table_keys_impl(input: TokenStream) -> TokenStream {
             impl storage::types::single_table_entity::SingleTableEntity for #name {
                 const STORAGE_ENTITY_TYPE: &'static str = #storage_entity_type_expr;
                 const ENTITY_TYPE: &'static str = #entity_type_expr;
+                #indexer_declaration
                 fn pk(&self) -> String {
                     let p: String = { #pk_expr_code };
                     #[cfg(debug_assertions)] {

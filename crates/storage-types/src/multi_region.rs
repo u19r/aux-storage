@@ -91,10 +91,10 @@ pub struct ReplicationEventMetadata {
 pub struct ReplicationMutation {
     pub table_name: TableName,
     pub key: KeyAttributes,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub new_image: Option<HashMap<String, AttributeValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_indexers: Option<Vec<String>>,
     pub old_image: Option<HashMap<String, AttributeValue>>,
+    pub old_indexers: Option<Vec<String>>,
     pub metadata: ReplicationEventMetadata,
 }
 

@@ -81,6 +81,7 @@ async fn rocksdb_logical_item_export_import_preserves_target_revision() {
         table_name: table_name.as_ref().to_string(),
         key_json: r#"{"pk":{"S":"item#1"}}"#.to_string(),
         item_json: r#"{"pk":{"S":"item#1"},"status":{"S":"stale"}}"#.to_string(),
+        indexers: Vec::new(),
         item_stream_version: ItemStreamVersion::new(6),
     };
     import_records(
@@ -335,7 +336,9 @@ async fn apply_sync_put(
         table_name: table_name.clone(),
         key_json: serde_json::to_string(&key_map(pk)).expect("encode key"),
         item_json: serde_json::to_string(&item_map(pk, status)).expect("encode item"),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(r#"{"ok":true}"#.to_string()),

@@ -240,6 +240,7 @@ async fn update_table_replica_updates_persist_desired_state() {
     let response = db
         .update_table(UpdateTableRequest {
             table_name: table_name.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -346,6 +347,7 @@ async fn update_table_keeps_stream_updates_working_with_replica_updates() {
     let response = db
         .update_table(UpdateTableRequest {
             table_name: table_name.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -420,6 +422,7 @@ async fn invalid_replica_updates_do_not_mutate_other_table_settings() {
     let error = db
         .update_table(UpdateTableRequest {
             table_name: table_name.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -485,6 +488,7 @@ async fn replica_updates_reject_empty_region_names() {
     let error = db
         .update_table(UpdateTableRequest {
             table_name,
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -600,7 +604,9 @@ async fn apply_replication_mutation_skips_stale_remote_against_legacy_local_winn
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "stale-remote")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("us-east-1", 1, 1_000),
     })
     .await
@@ -646,7 +652,9 @@ async fn apply_replication_mutation_applies_newer_remote_against_legacy_local_wi
             );
             item
         }),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata(
             "us-west-2",
             2,
@@ -685,7 +693,9 @@ async fn apply_replication_mutation_skips_duplicate_remote_replay() {
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "remote")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("eu-west-1", 42, 2_000_000_000_000),
     };
 
@@ -721,7 +731,9 @@ async fn apply_replication_mutation_uses_region_tie_breaker_for_equal_hlc() {
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "region-a")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("ap-southeast-1", 1, 2_000_000_100_000),
     })
     .await
@@ -731,7 +743,9 @@ async fn apply_replication_mutation_uses_region_tie_breaker_for_equal_hlc() {
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "region-u")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("us-east-1", 1, 2_000_000_100_000),
     })
     .await
@@ -762,7 +776,9 @@ async fn apply_replication_mutation_uses_origin_sequence_tie_breaker_within_same
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "first")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("us-east-1", 1, 2_000_000_200_000),
     })
     .await
@@ -772,7 +788,9 @@ async fn apply_replication_mutation_uses_origin_sequence_tie_breaker_within_same
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "second")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("us-east-1", 2, 2_000_000_200_000),
     })
     .await
@@ -801,7 +819,9 @@ async fn apply_replication_mutation_converges_to_latest_winner_under_reordered_c
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "winner")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("eu-west-1", 3, 2_000_000_300_000),
     })
     .await
@@ -811,7 +831,9 @@ async fn apply_replication_mutation_converges_to_latest_winner_under_reordered_c
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "stale-middle")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("us-west-2", 2, 2_000_000_200_000),
     })
     .await
@@ -821,7 +843,9 @@ async fn apply_replication_mutation_converges_to_latest_winner_under_reordered_c
         table_name: table_name.clone(),
         key: key("pk1", "sk1"),
         new_image: Some(item("pk1", "sk1", "stale-oldest")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("ap-southeast-1", 1, 2_000_000_100_000),
     })
     .await
@@ -853,21 +877,27 @@ async fn apply_replication_mutations_with_outcomes_reuses_current_winner_for_sam
                 table_name: table_name.clone(),
                 key: key("pk1", "sk1"),
                 new_image: Some(item("pk1", "sk1", "first")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 1, 2_000_000_400_000),
             },
             ReplicationMutation {
                 table_name: table_name.clone(),
                 key: key("pk1", "sk1"),
                 new_image: Some(item("pk1", "sk1", "second")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 2, 2_000_000_500_000),
             },
             ReplicationMutation {
                 table_name: table_name.clone(),
                 key: key("pk1", "sk1"),
                 new_image: Some(item("pk1", "sk1", "stale")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 1, 2_000_000_300_000),
             },
         ])
@@ -909,28 +939,36 @@ async fn apply_replication_mutations_with_outcomes_preserves_original_order_acro
                 table_name: table_name.clone(),
                 key: key("pk1", "sk1"),
                 new_image: Some(item("pk1", "sk1", "first-a")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 1, 2_000_000_400_000),
             },
             ReplicationMutation {
                 table_name: table_name.clone(),
                 key: key("pk2", "sk2"),
                 new_image: Some(item("pk2", "sk2", "first-b")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 2, 2_000_000_500_000),
             },
             ReplicationMutation {
                 table_name: table_name.clone(),
                 key: key("pk1", "sk1"),
                 new_image: Some(item("pk1", "sk1", "stale-a")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 1, 2_000_000_300_000),
             },
             ReplicationMutation {
                 table_name: table_name.clone(),
                 key: key("pk2", "sk2"),
                 new_image: Some(item("pk2", "sk2", "second-b")),
+                new_indexers: Some(Vec::new()),
                 old_image: None,
+                old_indexers: None,
                 metadata: replication_metadata("us-east-1", 3, 2_000_000_600_000),
             },
         ])
@@ -978,6 +1016,7 @@ async fn read_outbound_replication_batch_returns_local_origin_mutations_only() {
 
     db.update_table(UpdateTableRequest {
         table_name: table_name.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -1015,7 +1054,9 @@ async fn read_outbound_replication_batch_returns_local_origin_mutations_only() {
         table_name: table_name.clone(),
         key: key("pk2", "sk2"),
         new_image: Some(item("pk2", "sk2", "remote")),
+        new_indexers: Some(Vec::new()),
         old_image: None,
+        old_indexers: None,
         metadata: replication_metadata("region-c", 7, 2_000_000_500_000),
     })
     .await
@@ -1061,6 +1102,7 @@ async fn read_outbound_replication_batch_respects_byte_cap_without_skipping_futu
 
     db.update_table(UpdateTableRequest {
         table_name: table_name.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -1156,6 +1198,7 @@ async fn read_outbound_replication_batch_skips_missing_local_delete_stream_noop(
 
     db.update_table(UpdateTableRequest {
         table_name: table_name.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -1267,7 +1310,7 @@ async fn item_stream_len(
         Some(storage_types::AttributeValue::S(sk.to_string())),
     );
     let item_stream = StreamName::table_item_stream(table_name, &item_key).expect("item stream");
-    db.stream_provider()
+    db.initialization_stream_provider()
         .read_forward(item_stream, None, 10)
         .await
         .expect("read item stream")

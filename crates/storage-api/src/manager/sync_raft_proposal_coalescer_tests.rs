@@ -115,6 +115,8 @@ fn item_proposal(id: &str, key: &str, version: u64) -> SyncProposalBatch {
     SyncProposalBatch::new(
         SyncProposalId::new(id).expect("proposal id"),
         ResolvedSyncMutationBatch::new(vec![ResolvedSyncMutation::Put(SyncPutMutation {
+            indexers: Vec::new(),
+            old_indexers: None,
             mutation_id: SyncMutationId::new(format!("{id}#put")).expect("mutation id"),
             table_name: TableName::new("table"),
             key_json: key_json(key),

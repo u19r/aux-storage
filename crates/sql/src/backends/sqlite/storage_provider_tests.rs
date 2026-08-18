@@ -15,11 +15,12 @@ use storage_types::{
     DurablePointReadGuard, DurablePointReadProof, DurablePointReadRequest,
     GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedUpdateItemRequest, IndexName, ItemKey,
     KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType, Projection, ProjectionType,
-    ReadSequenceConsistency, ReplicationEventMetadata, ReplicationHybridLogicalClock,
-    ReplicationMutation, ReplicationWriteSource, ReturnValuesOldNewUpdated, ScanTableRequest,
-    StorageEnum, StorageError, StorageResult, StreamItemId, StreamName, StreamSpecification,
-    StreamViewType, TableName, TimeToLiveSpecification, TimestampMillis, UpdateItemRequest,
-    UpdateTableRequest, UpdateTimeToLiveRequest, UserStreamName, WireItem, context::WrappedError,
+    PutItemRequest, ReadSequenceConsistency, ReplicationEventMetadata,
+    ReplicationHybridLogicalClock, ReplicationMutation, ReplicationWriteSource,
+    ReturnValuesOldNewUpdated, ScanTableRequest, StorageEnum, StorageError, StorageResult,
+    StreamItemId, StreamName, StreamSpecification, StreamViewType, TableName,
+    TimeToLiveSpecification, TimestampMillis, UpdateItemRequest, UpdateTableRequest,
+    UpdateTimeToLiveRequest, UserStreamName, WireItem, context::WrappedError,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamItem, StreamProvider,
@@ -172,7 +173,7 @@ async fn sqlite_read_sequence_eventual_context_reads_through_provider_boundary()
 
 #[tokio::test]
 async fn sqlite_read_sequence_transactional_context_keeps_one_file_backed_snapshot() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = temp_dir.path().join("read-sequence-snapshot.db");
     let table_name = TableName::new("ReadSequenceSnapshot");
     let provider = create_file_backed_revision_test_table(
@@ -241,7 +242,7 @@ async fn sqlite_read_sequence_transactional_context_keeps_one_file_backed_snapsh
 
 #[tokio::test]
 async fn sqlite_read_sequence_transactional_context_reuses_snapshot_connection() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = temp_dir.path().join("read-sequence-reuse.db");
     let provider = create_file_backed_revision_test_table(
         &database_path.to_string_lossy(),
@@ -286,7 +287,7 @@ async fn sqlite_read_sequence_transactional_context_reuses_snapshot_connection()
 
 #[tokio::test]
 async fn sqlite_read_sequence_transactional_context_obeys_snapshot_connection_cap() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = temp_dir.path().join("read-sequence-cap.db");
     let provider =
         create_file_backed_revision_test_table(&database_path.to_string_lossy(), "ReadSequenceCap")
@@ -489,6 +490,7 @@ async fn given_deletion_protection_enabled_when_delete_table_then_rejects_until_
     provider
         .update_table(UpdateTableRequest {
             table_name: table_name.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -644,6 +646,7 @@ async fn sqlite_durable_proof_tracks_put_update_and_delete_revisions() {
             table_name: TableName::new(table_name),
             key: revision_test_key("item#1"),
             update_expression: Some("SET #value = :value".to_string()),
+            indexers: None,
             attribute_updates: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([(
@@ -939,6 +942,7 @@ async fn sqlite_logical_tombstone_import_blocks_older_scan_image() {
                         key_json,
                         item_json: serde_json::to_string(&revision_test_item("item#1", "stale"))
                             .unwrap(),
+                        indexers: Vec::new(),
                         item_stream_version: storage_types::ItemStreamVersion::new(2),
                     },
                 ],
@@ -980,6 +984,7 @@ async fn sqlite_logical_import_keeps_newer_stream_image_over_older_scan_image() 
                         key_json: key_json.clone(),
                         item_json: serde_json::to_string(&revision_test_item("item#1", "stream"))
                             .unwrap(),
+                        indexers: Vec::new(),
                         item_stream_version: storage_types::ItemStreamVersion::new(3),
                     },
                     LogicalBackfillRecord::PresentItem {
@@ -987,6 +992,7 @@ async fn sqlite_logical_import_keeps_newer_stream_image_over_older_scan_image() 
                         key_json,
                         item_json: serde_json::to_string(&revision_test_item("item#1", "scan"))
                             .unwrap(),
+                        indexers: Vec::new(),
                         item_stream_version: storage_types::ItemStreamVersion::new(2),
                     },
                 ],
@@ -1809,6 +1815,7 @@ async fn sqlite_guarded_put_commits_when_absence_proof_matches() {
         .guarded_put_item(GuardedPutItemRequest {
             table_name: TableName::new(table_name),
             item: revision_test_item("item#1", "alpha"),
+            indexers: Vec::new(),
             guard: proof_guard(&absence),
             condition_expression: None,
             expression_attribute_names: None,
@@ -1844,6 +1851,7 @@ async fn sqlite_guarded_put_returns_guard_conflict_when_proof_is_stale() {
         .guarded_put_item(GuardedPutItemRequest {
             table_name: TableName::new(table_name),
             item: revision_test_item("item#1", "bravo"),
+            indexers: Vec::new(),
             guard: proof_guard(&stale_absence),
             condition_expression: None,
             expression_attribute_names: None,
@@ -1879,6 +1887,7 @@ async fn sqlite_guarded_delete_and_update_validate_present_revision() {
                 table_name: TableName::new(table_name),
                 key: revision_test_key("item#1"),
                 update_expression: Some("SET #value = :value".to_string()),
+                indexers: None,
                 attribute_updates: None,
                 condition_expression: None,
                 expression_attribute_names: Some(HashMap::from([(
@@ -1939,7 +1948,7 @@ async fn create_stream_replication_table() -> SQLiteStorageProvider {
     provider.initialize_storage().await.unwrap();
     provider.initialize_stream().await.unwrap();
 
-    let create_request = CreateTableRequest::new(
+    let mut create_request = CreateTableRequest::new(
         TableName::new("ReplicationStreamTable"),
         vec![
             AttributeDefinition {
@@ -1967,9 +1976,106 @@ async fn create_stream_replication_table() -> SQLiteStorageProvider {
         stream_enabled: true,
         stream_view_type: Some(StreamViewType::NewAndOldImages),
     }));
+    create_request.max_indexers = storage_types::MaxIndexers::try_new(2).unwrap();
 
     provider.create_table(&create_request).await.unwrap();
     provider
+}
+
+#[tokio::test]
+async fn given_base_and_gsi_tables_when_capacity_increases_then_actual_schemas_add_every_column() {
+    let provider = SQLiteStorageProvider::new(":memory:").await.unwrap();
+    provider.initialize_storage().await.unwrap();
+    let table_name = TableName::new("IndexerCapacitySchema");
+    let index_name = IndexName::new("by_group");
+    let mut request = CreateTableRequest::new(
+        table_name.clone(),
+        vec![
+            AttributeDefinition {
+                attribute_name: "pk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "gpk".to_string(),
+                attribute_type: KeyAttributeType::S,
+            },
+        ],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        storage_types::BillingMode::PayPerRequest,
+    )
+    .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+        index_name: index_name.clone(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "gpk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        projection: Projection {
+            projection_type: Some(ProjectionType::All),
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+    }]));
+    request.max_indexers = storage_types::MaxIndexers::try_new(4).unwrap();
+    provider.create_table(&request).await.unwrap();
+
+    assert_indexer_column_count(&provider, &table_name, &index_name, 4).await;
+    provider
+        .update_table(UpdateTableRequest {
+            table_name: table_name.clone(),
+            max_indexers: Some(storage_types::MaxIndexers::try_new(32).unwrap()),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            table_class: None,
+        })
+        .await
+        .unwrap();
+    assert_indexer_column_count(&provider, &table_name, &index_name, 32).await;
+}
+
+async fn assert_indexer_column_count(
+    provider: &SQLiteStorageProvider,
+    table_name: &TableName,
+    index_name: &IndexName,
+    expected: usize,
+) {
+    let tables = [
+        naming::physical_table_name(table_name),
+        naming::physical_gsi_table_name(table_name, index_name),
+    ];
+    for table in tables {
+        let table_for_query = table.clone();
+        let columns = call_sqlite(&provider.connection, move |connection| {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info(\"{table_for_query}\")"))
+                .map_err(crate::error_handler::map_sqlite_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(crate::error_handler::map_sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(crate::error_handler::map_sqlite_error)
+        })
+        .await
+        .unwrap();
+        let indexer_columns = columns
+            .iter()
+            .filter(|column| column.starts_with("__aux_indexer_"))
+            .count();
+        assert_eq!(indexer_columns, expected, "physical table {table}");
+        assert!(columns.contains(&format!("__aux_indexer_{}", expected - 1)));
+        assert!(!columns.contains(&format!("__aux_indexer_{expected}")));
+    }
 }
 
 #[tokio::test]
@@ -4492,7 +4598,9 @@ async fn apply_replication_mutation_put_preserves_replication_metadata() {
             ])
             .into(),
             new_image: Some(new_image.clone()),
+            new_indexers: Some(vec!["data".to_string()]),
             old_image: None,
+            old_indexers: None,
             metadata: metadata.clone(),
         })
         .await
@@ -4505,6 +4613,7 @@ async fn apply_replication_mutation_put_preserves_replication_metadata() {
     let stored_pointer: StoredStreamPointer =
         storage_types::storage_serde::from_bytes(&system_page.items[0].data).unwrap();
     assert_eq!(stored_pointer.replication_metadata(), Some(&metadata));
+    assert_eq!(stored_pointer.indexers(), ["data"]);
 
     let stored = provider
         .get_item(
@@ -4539,7 +4648,9 @@ async fn apply_replication_mutation_delete_writes_tombstone_for_missing_item() {
             table_name: table_name.clone(),
             key: key.clone().into(),
             new_image: None,
+            new_indexers: None,
             old_image: None,
+            old_indexers: Some(vec!["data".to_string()]),
             metadata: metadata.clone(),
         })
         .await
@@ -4552,6 +4663,7 @@ async fn apply_replication_mutation_delete_writes_tombstone_for_missing_item() {
     let stored_pointer: StoredStreamPointer =
         storage_types::storage_serde::from_bytes(&system_page.items[0].data).unwrap();
     assert_eq!(stored_pointer.replication_metadata(), Some(&metadata));
+    assert_eq!(stored_pointer.old_indexers().unwrap(), ["data"]);
 
     let item_key = ItemKey::from_key_schema(
         table_name.clone(),
@@ -4596,6 +4708,7 @@ async fn batch_write_item_put_operations() {
                     );
                     item
                 },
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -4611,6 +4724,7 @@ async fn batch_write_item_put_operations() {
                     );
                     item
                 },
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -4816,6 +4930,7 @@ async fn batch_write_item_mixed_operations() {
                     );
                     item
                 },
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -4884,7 +4999,7 @@ async fn gsi_projection_limits_attributes() {
     provider.initialize_stream().await.unwrap();
 
     // Create a table with GSIs having different projection types
-    let create_request = CreateTableRequest::new(
+    let mut create_request = CreateTableRequest::new(
         TableName::new("ProjectionTestTable"),
         vec![
             AttributeDefinition {
@@ -4960,6 +5075,7 @@ async fn gsi_projection_limits_attributes() {
             provisioned_throughput: None,
         },
     ]));
+    create_request.max_indexers = storage_types::MaxIndexers::try_new(1).unwrap();
 
     provider.create_table(&create_request).await.unwrap();
 
@@ -4988,17 +5104,9 @@ async fn gsi_projection_limits_attributes() {
         AttributeValue::S("also_excluded".to_string()),
     );
 
-    provider
-        .put_item(
-            TableName::new("ProjectionTestTable"),
-            item.clone(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    let mut put = PutItemRequest::new(TableName::new("ProjectionTestTable"), item.clone());
+    put.indexers = Some(vec!["excluded_attr".to_string()]);
+    provider.put_item_request(put).await.unwrap();
 
     // Process GSI updates (this would normally be done by the background job)
     provider.process_gsi_updates().await.unwrap();
@@ -5190,6 +5298,7 @@ async fn batch_write_item_with_streams() {
                     );
                     item
                 },
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -5209,6 +5318,7 @@ async fn batch_write_item_with_streams() {
                     );
                     item
                 },
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -5290,6 +5400,7 @@ async fn batch_write_item_reuses_ttl_config_within_transaction() {
                 WriteRequest {
                     put_request: Some(PutRequest {
                         item,
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
@@ -5341,6 +5452,7 @@ async fn batch_write_item_encode_missing_table_returns_not_found() {
             vec![WriteRequest {
                 put_request: Some(PutRequest {
                     item,
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,

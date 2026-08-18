@@ -10,7 +10,7 @@ use storage_types::{
     KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType, PutRequest,
     QueryTableRequest, ReadSequenceConsistency, StorageEnum, StreamItemId, StreamName,
     StreamRetentionDuration, StreamSpecification, StreamViewType, TableName, TimestampMillis,
-    UserStreamName, WriteRequest,
+    UpdateTableRequest, UserStreamName, WriteRequest,
 };
 use stream_provider::{
     CursorName, CursorPosition, StoredStreamPointer, StreamDataType, StreamEnum, StreamProvider,
@@ -49,6 +49,75 @@ fn basic_create_table_request(table_name: &TableName) -> CreateTableRequest {
         }],
         BillingMode::PayPerRequest,
     )
+}
+
+#[tokio::test]
+async fn given_base_and_gsi_tables_when_turso_capacity_increases_then_actual_schemas_add_columns() {
+    let provider = create_test_provider().await;
+    provider.initialize_storage().await.unwrap();
+    let table_name = TableName::new("TursoIndexerCapacitySchema");
+    let index_name = IndexName::new("by_group");
+    let mut request = gsi_create_table_request(&table_name);
+    request.global_secondary_indexes = request.global_secondary_indexes.map(|mut indexes| {
+        indexes[0].index_name = index_name.clone();
+        indexes
+    });
+    request.max_indexers = storage_types::MaxIndexers::try_new(4).unwrap();
+    provider.create_table(&request).await.unwrap();
+    assert_turso_indexer_column_count(&provider, &table_name, &index_name, 4).await;
+
+    provider
+        .update_table(UpdateTableRequest {
+            table_name: table_name.clone(),
+            max_indexers: Some(storage_types::MaxIndexers::try_new(32).unwrap()),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            table_class: None,
+        })
+        .await
+        .unwrap();
+    assert_turso_indexer_column_count(&provider, &table_name, &index_name, 32).await;
+}
+
+async fn assert_turso_indexer_column_count(
+    provider: &TursoStorageProvider,
+    table_name: &TableName,
+    index_name: &IndexName,
+    expected: usize,
+) {
+    let connection = provider.primary_connection().await.unwrap();
+    for table in [
+        crate::naming::physical_table_name(table_name),
+        crate::naming::physical_gsi_table_name(table_name, index_name),
+    ] {
+        let mut rows = connection
+            .query(&format!("PRAGMA table_info(\"{table}\")"), ())
+            .await
+            .unwrap();
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get::<String>(1).unwrap());
+        }
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.starts_with("__aux_indexer_"))
+                .count(),
+            expected,
+            "physical table {table}",
+        );
+        assert!(columns.contains(&format!("__aux_indexer_{}", expected - 1)));
+        assert!(!columns.contains(&format!("__aux_indexer_{expected}")));
+    }
 }
 
 fn gsi_create_table_request(table_name: &TableName) -> CreateTableRequest {
@@ -93,7 +162,7 @@ async fn turso_capabilities_advertise_durable_item_guards_without_transactions()
 
 #[tokio::test]
 async fn turso_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_query() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::sql_test_support::temp_dir("sqlite");
     let db_path = dir.path().join("read-sequence-snapshot.db");
     let provider = TursoStorageProvider::new(db_path.to_string_lossy().as_ref())
         .await
@@ -985,6 +1054,7 @@ async fn turso_batch_write_item_rolls_back_on_validation_error() {
                                     ("pk".to_string(), AttributeValue::S("user-1".to_string())),
                                     ("name".to_string(), AttributeValue::S("Ada".to_string())),
                                 ]),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
@@ -995,6 +1065,7 @@ async fn turso_batch_write_item_rolls_back_on_validation_error() {
                                     "pk".to_string(),
                                     AttributeValue::S("invalid".to_string()),
                                 )]),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: Some(DeleteRequest {
@@ -1055,6 +1126,7 @@ async fn turso_gsi_updates_are_delayed_by_default() {
                                 ("pk".to_string(), AttributeValue::S("user-1".to_string())),
                                 ("gpk".to_string(), AttributeValue::S("group-1".to_string())),
                             ]),
+                            indexers: None,
                             aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
@@ -1130,6 +1202,7 @@ async fn turso_gsi_update_job_drains_write_burst() {
                             AttributeValue::S("group-burst".to_string()),
                         ),
                     ]),
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,

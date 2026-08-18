@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use storage_types::{
-    attribute_map_numbers_need_write_normalization, normalize_attribute_map_numbers_for_write,
+    IndexedWireItem, IndexerDeclaration, attribute_map_numbers_need_write_normalization,
+    normalize_attribute_map_numbers_for_write,
 };
 
 use crate::{
@@ -16,6 +17,14 @@ use crate::{
 
 pub(crate) const CHANGE_INDEX_PREFIX: &str = "__change_index";
 pub(crate) const CHANGE_INDEX_SLOT_COUNT: u16 = 256;
+
+pub(super) struct BatchMutationContext<'a> {
+    pub(super) table_name: &'a TableName,
+    pub(super) table_identity: &'a TableIdentity,
+    pub(super) table_info: &'a StoredTableInfo,
+    pub(super) should_write_to_stream: bool,
+    pub(super) immediate_gsi_consistency: bool,
+}
 
 fn normalized_attribute_map_for_write(
     item: &HashMap<String, AttributeValue>,
@@ -58,14 +67,19 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     pub(super) fn prepare_batch_put_item(
-        table_name: &TableName,
-        table_identity: &TableIdentity,
-        table_info: &StoredTableInfo,
+        &self,
+        context: BatchMutationContext<'_>,
         item: &HashMap<String, AttributeValue>,
-        should_write_to_stream: bool,
+        indexers: Option<&[String]>,
         existing_item: Option<&HashMap<String, AttributeValue>>,
-        immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<BatchItem>> {
+        let BatchMutationContext {
+            table_name,
+            table_identity,
+            table_info,
+            should_write_to_stream,
+            immediate_gsi_consistency,
+        } = context;
         if item.is_empty() {
             return Err(StorageError::validation(
                 "Item must have at least one attribute",
@@ -78,7 +92,15 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             ItemKey::from_key_schema(table_info.table_name.clone(), &table_info.key_schema, item)?;
         let item_key = table_keys::item_key(table_identity, &item_key)?;
 
-        let value = storage_types::storage_serde::to_bytes(&item)?;
+        let declaration = IndexerDeclaration::try_new(
+            indexers.unwrap_or_default().to_vec(),
+            table_info.max_indexers,
+        )?;
+        let indexed = IndexedWireItem::extract(item, &declaration)?;
+        let value = crate::storage_ops::encode_indexed_wire_item(
+            self.kv_store.item_value_codec(),
+            &indexed,
+        )?;
         let mut batch_items = vec![BatchItem {
             key: item_key.clone(),
             value: Some(value),
@@ -95,11 +117,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         if immediate_gsi_consistency {
-            batch_items.extend(Self::gsi_batch_mutations_for_items(
+            batch_items.extend(self.gsi_batch_mutations_for_items(
                 table_identity,
                 table_info,
                 existing_item,
                 Some(item),
+                Some(&declaration),
             )?);
         }
 
@@ -107,14 +130,18 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     pub(super) fn prepare_batch_delete_item(
-        table_name: &TableName,
-        table_identity: &TableIdentity,
-        table_info: &StoredTableInfo,
+        &self,
+        context: BatchMutationContext<'_>,
         key: &KeyAttributes,
-        should_write_to_stream: bool,
         existing_item: Option<&HashMap<String, AttributeValue>>,
-        immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<BatchItem>> {
+        let BatchMutationContext {
+            table_name,
+            table_identity,
+            table_info,
+            should_write_to_stream,
+            immediate_gsi_consistency,
+        } = context;
         if key.is_empty() {
             return Err(StorageError::validation(
                 "Key must have at least one attribute",
@@ -141,10 +168,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         if immediate_gsi_consistency {
-            batch_items.extend(Self::gsi_batch_mutations_for_items(
+            batch_items.extend(self.gsi_batch_mutations_for_items(
                 table_identity,
                 table_info,
                 existing_item,
+                None,
                 None,
             )?);
         }

@@ -31,6 +31,10 @@ pub(crate) fn row_to_table_info(
     let table_size_bytes =
         u64::try_from(row_required_i64(row, "table_size_bytes")?).unwrap_or_default();
     let item_count = u64::try_from(row_required_i64(row, "item_count")?).unwrap_or_default();
+    let max_indexers = storage_types::MaxIndexers::try_new(
+        u8::try_from(row_required_i64(row, "max_indexers")?)
+            .map_err(|_| StorageError::internal("invalid max_indexers metadata"))?,
+    )?;
     let deletion_protection_enabled = row_required_i64(row, "deletion_protection_enabled")? != 0;
     let table_stream_duration = storage_types::StreamRetentionDuration::try_from(row_required_i64(
         row,
@@ -54,6 +58,7 @@ pub(crate) fn row_to_table_info(
         created_at,
         attribute_definitions,
         key_schema,
+        max_indexers,
         global_secondary_indexes,
         table_size_bytes,
         item_count,
@@ -68,56 +73,64 @@ pub(crate) fn row_to_item_map_main(
     row: &HashMap<String, TursoValue>,
     table_info: &StoredTableInfo,
 ) -> StorageResult<HashMap<String, AttributeValue>> {
-    let mut out: HashMap<String, AttributeValue> = row_optional_text(row, "attributes_blob")?
-        .filter(|value| !value.trim().is_empty() && value != "{}")
-        .map(|value| serde_json::from_str(&value))
-        .transpose()
-        .map_err(|error| StorageError::internal(&format!("parse attributes_blob failed: {error}")))?
-        .unwrap_or_default();
+    row_to_decoded_item_main(row, table_info)?
+        .item
+        .into_attribute_map()
+}
 
+pub(crate) fn row_to_decoded_item_main(
+    row: &HashMap<String, TursoValue>,
+    table_info: &StoredTableInfo,
+) -> StorageResult<crate::indexed_item::SqlDecodedItem> {
+    let mut key_attributes = HashMap::with_capacity(table_info.key_schema.len());
     for key in &table_info.key_schema {
-        if out.contains_key(&key.attribute_name) {
-            continue;
-        }
         let value = row
             .get(&key.attribute_name)
             .ok_or_else(StorageError::invalid_or_missing_key)?;
         let key_type = attribute_type_for_key(table_info, &key.attribute_name);
-        out.insert(
+        key_attributes.insert(
             key.attribute_name.clone(),
             key_attr_from_row_value(value, &key_type)?,
         );
     }
-
-    Ok(out)
+    crate::indexed_item::SqlIndexedItem::reconstruct_with_indexers(
+        row_optional_text(row, "attributes_blob")?.unwrap_or_else(|| "{}".to_string()),
+        row_indexer_slots(row, table_info)?,
+        &KeyAttributes::from(key_attributes),
+        table_info.max_indexers,
+    )
 }
 
 pub(crate) fn row_view_to_item_map_main(
     row: TursoRowView<'_>,
     table_info: &StoredTableInfo,
 ) -> StorageResult<HashMap<String, AttributeValue>> {
-    let mut out: HashMap<String, AttributeValue> = row_view_optional_text(row, "attributes_blob")?
-        .filter(|value| !value.trim().is_empty() && value != "{}")
-        .map(|value| serde_json::from_str(&value))
-        .transpose()
-        .map_err(|error| StorageError::internal(&format!("parse attributes_blob failed: {error}")))?
-        .unwrap_or_default();
+    row_view_to_decoded_item_main(row, table_info)?
+        .item
+        .into_attribute_map()
+}
 
+pub(crate) fn row_view_to_decoded_item_main(
+    row: TursoRowView<'_>,
+    table_info: &StoredTableInfo,
+) -> StorageResult<crate::indexed_item::SqlDecodedItem> {
+    let mut key_attributes = HashMap::with_capacity(table_info.key_schema.len());
     for key in &table_info.key_schema {
-        if out.contains_key(&key.attribute_name) {
-            continue;
-        }
         let value = row
             .get(&key.attribute_name)
             .ok_or_else(StorageError::invalid_or_missing_key)?;
         let key_type = attribute_type_for_key(table_info, &key.attribute_name);
-        out.insert(
+        key_attributes.insert(
             key.attribute_name.clone(),
             key_attr_from_row_value(value, &key_type)?,
         );
     }
-
-    Ok(out)
+    crate::indexed_item::SqlIndexedItem::reconstruct_with_indexers(
+        row_view_optional_text(row, "attributes_blob")?.unwrap_or_else(|| "{}".to_string()),
+        row_view_indexer_slots(row, table_info)?,
+        &KeyAttributes::from(key_attributes),
+        table_info.max_indexers,
+    )
 }
 
 pub(crate) fn row_view_to_main_wire_item(
@@ -141,11 +154,24 @@ pub(crate) fn row_view_to_gsi_wire_item(
         &table_info.key_schema,
         KeyColumn::TursoGsiTableKey,
     )?;
-    Ok(WireItem::local_split(
-        primary_key,
-        Some(secondary_key),
-        row_view_optional_text(row, "attributes_blob")?.map(String::into_bytes),
-    ))
+    let mut key_attributes =
+        KeyAttributes::with_capacity(gsi_key_schema.len() + table_info.key_schema.len());
+    append_wire_key_attributes(&mut key_attributes, primary_key);
+    append_wire_key_attributes(&mut key_attributes, secondary_key);
+    crate::indexed_item::SqlIndexedItem::reconstruct_with_indexers(
+        row_view_optional_text(row, "attributes_blob")?.unwrap_or_else(|| "{}".to_string()),
+        row_view_indexer_slots(row, table_info)?,
+        &key_attributes,
+        table_info.max_indexers,
+    )
+    .map(|decoded| decoded.item)
+}
+
+fn append_wire_key_attributes(target: &mut KeyAttributes, source: WireItemKeyAttributes) {
+    target.insert(source.hash_key_name.into_owned(), source.hash_key);
+    if let (Some(name), Some(value)) = (source.sort_key_name, source.sort_key) {
+        target.insert(name.into_owned(), value);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,4 +333,22 @@ fn row_view_optional_text(row: TursoRowView<'_>, column: &str) -> StorageResult<
         TursoValue::Null => Ok(None),
         _ => value_to_string(value).map(Some),
     }
+}
+
+fn row_indexer_slots(
+    row: &HashMap<String, TursoValue>,
+    table_info: &StoredTableInfo,
+) -> StorageResult<Vec<Option<String>>> {
+    (0..table_info.max_indexers.as_usize())
+        .map(|ordinal| row_optional_text(row, &crate::utils::indexer_column_name(ordinal)))
+        .collect()
+}
+
+fn row_view_indexer_slots(
+    row: TursoRowView<'_>,
+    table_info: &StoredTableInfo,
+) -> StorageResult<Vec<Option<String>>> {
+    (0..table_info.max_indexers.as_usize())
+        .map(|ordinal| row_view_optional_text(row, &crate::utils::indexer_column_name(ordinal)))
+        .collect()
 }

@@ -49,6 +49,9 @@ pub struct TransactUpdateRequest {
     pub update_expression: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexers: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

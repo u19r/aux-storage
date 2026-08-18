@@ -1,4 +1,7 @@
-use std::time::Instant;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use foundationdb::{FdbError, KeySelector, RangeOption, Transaction, options};
 use futures_util::TryStreamExt;
@@ -111,7 +114,6 @@ impl FoundationDbKvStore {
             }
         };
 
-        let candidate_keys = vec![begin_pref.key().to_vec(), end_pref_ordered.key().to_vec()];
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         if record_transaction_start {
@@ -132,7 +134,7 @@ impl FoundationDbKvStore {
                         "get FoundationDB read version",
                         attempt,
                         err,
-                        &candidate_keys,
+                        2,
                     )
                     .await?;
                 continue;
@@ -173,7 +175,7 @@ impl FoundationDbKvStore {
                             "scan range",
                             attempt,
                             err,
-                            &candidate_keys,
+                            2,
                         )
                         .await?;
                 }
@@ -187,6 +189,7 @@ impl FoundationDbKvStore {
         start: &[u8],
         exclusive_end: &[u8],
         options: FoundationDbRangeReadOptions,
+        retryable_failure: Option<&AtomicBool>,
     ) -> StorageResult<RangeResult> {
         let FoundationDbRangeReadOptions {
             limit,
@@ -233,10 +236,20 @@ impl FoundationDbKvStore {
                 .saturating_add(end_pref_ordered.key().len()) as u64,
         );
 
-        let attempt_result = self
+        let attempt_result = match self
             .read_range_attempt(trx, &scan, begin_pref, end_pref_ordered)
             .await
-            .map_err(|err| map_fdb_error("scan range", err))?;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if error.is_retryable()
+                    && let Some(retryable_failure) = retryable_failure
+                {
+                    retryable_failure.store(true, Ordering::Release);
+                }
+                return Err(map_fdb_error("scan range", error));
+            }
+        };
 
         record_fdb_operation_latency(metrics_path, "range_read", attempt_result.elapsed);
         record_fdb_operation(metrics_path, "range_entry", attempt_result.entries_seen);

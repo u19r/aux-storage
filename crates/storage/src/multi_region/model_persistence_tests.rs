@@ -214,10 +214,7 @@ fn table_key_schema() -> Vec<KeySchemaElement> {
 }
 
 fn file_backed_sqlite_config(label: &str) -> StorageConfig {
-    let path = std::env::temp_dir().join(format!(
-        "aux-storage-{label}-{}.db",
-        TimestampMillis::now().timestamp_millis()
-    ));
+    let path = crate::storage_test_support::unique_path(&format!("aux-storage-{label}"));
     StorageConfig {
         backend_type: StorageBackend::SQLite,
         connection_string: Some(path.to_string_lossy().to_string()),

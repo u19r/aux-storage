@@ -26,7 +26,19 @@ use crate::types::{
     ReplicationLogicalBackfillImportRequest, Response, UpdateContinuousBackupsRequest,
 };
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadSequenceExecutionMode {
+    /// Execute only the backend-neutral DAG scheduler.
+    Off,
+    /// Run a bounded optimized sample for comparison, but return the ordinary
+    /// DAG response as authoritative.
+    Shadow,
+    /// Use an eligible whole-plan lowering and fall back to the ordinary DAG.
+    #[default]
+    On,
+}
+
+#[derive(Clone)]
 pub struct StorageApiManagerOptions {
     pub self_region: Option<String>,
     pub sync_write_proposer: Option<Arc<dyn SyncWriteProposer>>,
@@ -34,8 +46,23 @@ pub struct StorageApiManagerOptions {
     pub sync_read_barrier: Option<Arc<dyn SyncReadBarrier>>,
     pub sync_health_reporter: Option<Arc<dyn SyncHealthReporter>>,
     pub read_sequence_capabilities: Option<ReadSequenceProviderCapabilities>,
-    #[cfg(test)]
-    pub read_sequence_after_root_step_hook: Option<Arc<dyn ReadSequenceAfterRootStepHook>>,
+    pub read_sequence_execution_mode: ReadSequenceExecutionMode,
+    pub read_sequence_shadow_sample_percent: u8,
+}
+
+impl Default for StorageApiManagerOptions {
+    fn default() -> Self {
+        Self {
+            self_region: None,
+            sync_write_proposer: None,
+            sync_proposal_pipeline_limits: storage_sync::SyncProposalPipelineLimits::default(),
+            sync_read_barrier: None,
+            sync_health_reporter: None,
+            read_sequence_capabilities: None,
+            read_sequence_execution_mode: ReadSequenceExecutionMode::default(),
+            read_sequence_shadow_sample_percent: 1,
+        }
+    }
 }
 
 impl fmt::Debug for StorageApiManagerOptions {
@@ -62,15 +89,15 @@ impl fmt::Debug for StorageApiManagerOptions {
             .field(
                 "read_sequence_capabilities",
                 &self.read_sequence_capabilities,
+            )
+            .field(
+                "read_sequence_execution_mode",
+                &self.read_sequence_execution_mode,
+            )
+            .field(
+                "read_sequence_shadow_sample_percent",
+                &self.read_sequence_shadow_sample_percent,
             );
-        #[cfg(test)]
-        debug_builder.field(
-            "read_sequence_after_root_step_hook",
-            &self
-                .read_sequence_after_root_step_hook
-                .as_ref()
-                .map(|_| "<configured>"),
-        );
         debug_builder.finish()
     }
 }
@@ -93,12 +120,6 @@ pub trait SyncHealthReporter: Send + Sync {
     async fn sync_health(&self) -> Result<storage_sync::SyncHealthResponse, HttpApiError>;
 }
 
-#[cfg(test)]
-#[async_trait]
-pub trait ReadSequenceAfterRootStepHook: Send + Sync {
-    async fn after_root_step(&self) -> Result<(), HttpApiError>;
-}
-
 pub struct StorageApiManagerImpl {
     db: Arc<DatabaseManager>,
     self_region: Option<String>,
@@ -107,8 +128,8 @@ pub struct StorageApiManagerImpl {
     pub(super) sync_read_barrier: Option<Arc<dyn SyncReadBarrier>>,
     pub(super) sync_health_reporter: Option<Arc<dyn SyncHealthReporter>>,
     pub(super) read_sequence_capabilities: ReadSequenceProviderCapabilities,
-    #[cfg(test)]
-    pub(super) read_sequence_after_root_step_hook: Option<Arc<dyn ReadSequenceAfterRootStepHook>>,
+    pub(super) read_sequence_execution_mode: ReadSequenceExecutionMode,
+    pub(super) read_sequence_shadow_sample_percent: u8,
 }
 
 impl StorageApiManagerImpl {
@@ -131,8 +152,10 @@ impl StorageApiManagerImpl {
             sync_read_barrier: options.sync_read_barrier,
             sync_health_reporter: options.sync_health_reporter,
             read_sequence_capabilities,
-            #[cfg(test)]
-            read_sequence_after_root_step_hook: options.read_sequence_after_root_step_hook,
+            read_sequence_execution_mode: options.read_sequence_execution_mode,
+            read_sequence_shadow_sample_percent: options
+                .read_sequence_shadow_sample_percent
+                .min(100),
         }
     }
 

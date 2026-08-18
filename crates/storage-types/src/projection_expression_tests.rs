@@ -4,7 +4,7 @@ use crate::{
     AttributeDefinition, AttributeValue, GlobalSecondaryIndex, IndexName, KeyAttributeType,
     KeySchemaElement, KeyType, Projection, ProjectionType, QueryTableRequest, StoredTableInfo,
     StreamRetentionDuration, TableName, TableStatus, TimestampMillis, WireItem, project_wire_items,
-    validate_gsi_projection_expression,
+    validate_gsi_projection,
 };
 
 fn include_projection_table() -> StoredTableInfo {
@@ -12,6 +12,7 @@ fn include_projection_table() -> StoredTableInfo {
         table_name: TableName::new("tenant_data"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(0),
+        max_indexers: crate::MaxIndexers::ZERO,
         attribute_definitions: vec![
             AttributeDefinition {
                 attribute_name: "pk".to_string(),
@@ -141,10 +142,11 @@ fn query_table_request_rejects_reserved_projection_attribute_name() {
 #[test]
 fn gsi_projection_accepts_keys_included_attributes_and_nested_paths() {
     let table = include_projection_table();
-    validate_gsi_projection_expression(
+    validate_gsi_projection(
         &table,
         Some(&IndexName::new("gsi1")),
         Some("#pk, #gsi, #profile.display_name"),
+        None,
         Some(&HashMap::from([
             ("#pk".to_string(), "pk".to_string()),
             ("#gsi".to_string(), "gsi1pk".to_string()),
@@ -157,10 +159,11 @@ fn gsi_projection_accepts_keys_included_attributes_and_nested_paths() {
 #[test]
 fn gsi_projection_rejects_aliased_unprojected_attributes_in_expression_order() {
     let table = include_projection_table();
-    let error = validate_gsi_projection_expression(
+    let error = validate_gsi_projection(
         &table,
         Some(&IndexName::new("gsi1")),
         Some("#secret.value, missing, #secret.other"),
+        None,
         Some(&HashMap::from([(
             "#secret".to_string(),
             "private_note".to_string(),
@@ -182,11 +185,35 @@ fn all_projection_accepts_any_requested_attribute() {
         .projection
         .projection_type = Some(ProjectionType::All);
 
-    validate_gsi_projection_expression(
+    validate_gsi_projection(
         &table,
         Some(&IndexName::new("gsi1")),
         Some("private_note"),
         None,
+        None,
     )
     .expect("ALL projects every attribute");
+}
+
+#[test]
+fn gsi_projection_validates_attributes_to_get_without_building_an_expression() {
+    let table = include_projection_table();
+    validate_gsi_projection(
+        &table,
+        Some(&IndexName::new("gsi1")),
+        None,
+        Some(&["pk".to_string(), "profile".to_string()]),
+        None,
+    )
+    .expect("requested attributes are projected");
+
+    let error = validate_gsi_projection(
+        &table,
+        Some(&IndexName::new("gsi1")),
+        None,
+        Some(&["private_note".to_string()]),
+        None,
+    )
+    .expect_err("unprojected attribute must fail");
+    assert!(error.to_string().contains("private_note"));
 }

@@ -19,6 +19,32 @@ const SUBSCRIPTION_PREFIX: &str = "subscription:";
 const SUBSCRIPTION_IDENTITY_PREFIX: &str = "subscription_identity:";
 const SUBSCRIPTION_TOPIC_PREFIX: &str = "subscription_topic:";
 const DELIVERY_PREFIX: &str = "delivery:";
+const CLAIM_DELIVERY_RECORDS_SQL: &str = r#"
+    WITH candidates AS (
+        SELECT key, value::jsonb AS value
+        FROM sys_pubsub_kv
+        WHERE key LIKE $1
+          AND value::jsonb ->> 'status' IN ('pending', 'retry_scheduled')
+          AND COALESCE((value::jsonb ->> 'next_attempt_at')::BIGINT, -9223372036854775808) <= $2
+          AND COALESCE((value::jsonb ->> 'lease_expires_at')::BIGINT, -9223372036854775808) <= $2
+        ORDER BY key
+        LIMIT $5
+        FOR UPDATE SKIP LOCKED
+    ), claimed AS (
+        UPDATE sys_pubsub_kv AS delivery
+        SET value = jsonb_set(
+            jsonb_set(
+                jsonb_set(candidates.value, '{lease_owner}', to_jsonb($3::text)),
+                '{lease_expires_at}', to_jsonb($4::BIGINT)
+            ),
+            '{updated_at}', to_jsonb($2::BIGINT)
+        )::text
+        FROM candidates
+        WHERE delivery.key = candidates.key
+        RETURNING delivery.key, delivery.value
+    )
+    SELECT value FROM claimed ORDER BY key
+"#;
 
 #[async_trait]
 impl PubsubProvider for PostgresStorageProvider {
@@ -304,27 +330,37 @@ impl PubsubProvider for PostgresStorageProvider {
         &self,
         request: ClaimDeliveryRecordsRequest,
     ) -> PubsubResult<ClaimDeliveryRecordsResponse> {
-        let mut records = self.scan_json::<DeliveryRecord>(DELIVERY_PREFIX).await?;
-        records.retain(|record| {
-            matches!(
-                record.status,
-                pubsub_provider::DeliveryStatus::Pending
-                    | pubsub_provider::DeliveryStatus::RetryScheduled
-            ) && record
-                .next_attempt_at
-                .is_none_or(|next| next <= request.now)
-                && record
-                    .lease_expires_at
-                    .is_none_or(|expires| expires <= request.now)
-        });
-        records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        records.truncate(request.limit);
-        for record in &mut records {
-            record.lease_owner = Some(request.owner.clone());
-            record.lease_expires_at = Some(request.lease_expires_at);
-            record.updated_at = request.now;
-            self.put_json(&delivery_key(&record.id), record).await?;
-        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| PubsubError::storage(format!("acquire postgres client: {err}")))?;
+        let like = format!("{DELIVERY_PREFIX}%");
+        let now = *request.now;
+        let lease_expires_at = *request.lease_expires_at;
+        let limit = i64::try_from(request.limit)
+            .map_err(|_| PubsubError::storage("delivery claim limit exceeds PostgreSQL range"))?;
+        let rows = client
+            .query(
+                CLAIM_DELIVERY_RECORDS_SQL,
+                &[&like, &now, &request.owner, &lease_expires_at, &limit],
+            )
+            .await
+            .map_err(|err| {
+                PubsubError::storage(format!("claim postgres pubsub deliveries: {err}"))
+            })?;
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                row.try_get::<_, String>("value")
+                    .map_err(|err| {
+                        PubsubError::storage(format!(
+                            "decode claimed postgres pubsub delivery: {err}"
+                        ))
+                    })
+                    .and_then(|value| serde_json::from_str(&value).map_err(PubsubError::from))
+            })
+            .collect::<PubsubResult<Vec<DeliveryRecord>>>()?;
         Ok(ClaimDeliveryRecordsResponse { records })
     }
 
@@ -485,3 +521,6 @@ fn subscription_topic_key(topic_arn: &TopicArn, subscription_arn: &SubscriptionA
 fn delivery_key(id: &DeliveryRecordId) -> String {
     format!("{DELIVERY_PREFIX}{}", id.0)
 }
+
+#[cfg(test)]
+mod pubsub_provider_impl_tests;

@@ -15,6 +15,7 @@ pub enum PreparedBatchOperation {
         key_attributes: KeyAttributes,
         non_key_attributes: HashMap<String, AttributeValue>,
         full_item: HashMap<String, AttributeValue>,
+        indexers: Option<Vec<String>>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     },
     Delete {
@@ -45,6 +46,7 @@ pub struct ScanTableRequest {
 #[derive(Debug, Clone)]
 pub struct ItemVersionedWireItem {
     pub item: WireItem,
+    pub indexers: Vec<String>,
     pub item_stream_version: ItemStreamVersion,
 }
 

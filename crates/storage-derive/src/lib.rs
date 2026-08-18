@@ -17,7 +17,7 @@ mod single_table_keys_tests;
 #[cfg(test)]
 mod wire_attribute_helpers_tests;
 
-#[proc_macro_derive(SingleTableKeys, attributes(single_table))]
+#[proc_macro_derive(SingleTableKeys, attributes(single_table, wire_item))]
 pub fn derive_single_table_keys(input: TokenStream) -> TokenStream {
     single_table_keys::derive_single_table_keys_impl(input)
 }

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -20,6 +21,7 @@ const ITERATIONS: usize = 25_000;
 
 fn realistic_table_info() -> StoredTableInfo {
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: TableName::new("perf_query_table"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(0),
@@ -211,6 +213,27 @@ fn query_key_condition_validation_allocation_profile_tests() {
 
 #[test]
 fn prepared_query_allocation_profile_tests() {
+    const ISOLATED_ENV: &str = "AUX_STORAGE_API_PREPARED_QUERY_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe()
+                .expect("prepared query allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(
+            "manager::storage_manager_impl_query_perf_tests::prepared_query_allocation_profile_tests",
+        )
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated prepared query allocation test child should start");
+        assert!(
+            status.success(),
+            "isolated prepared query allocation test failed"
+        );
+        return;
+    }
+
     let legacy = measure_prepared_query_allocations(legacy_prepared_query_table_input, "legacy");
     let borrowed =
         measure_prepared_query_allocations(borrowed_prepared_query_table_input, "borrowed");

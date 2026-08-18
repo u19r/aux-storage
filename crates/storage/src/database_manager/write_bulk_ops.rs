@@ -8,10 +8,11 @@ use storage_cache::{
 use storage_sync::SyncWriteRequest;
 use storage_types::{
     AttributeValue, AttributeValueLookup, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
-    BatchWriteItemResponse, EncodeWriteRequest, KeySchemaElement, StorageEnum, StorageError,
-    StorageResult, TableName, TableNamespace, TransactEncodeItem, TransactWriteItemsEncodeRequest,
-    TransactWriteItemsResponse, WriteRequest, WriteRetryPolicy, context::WrappedError,
-    validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
+    BatchWriteItemResponse, EncodeWriteRequest, IndexedWireItem, IndexerDeclaration,
+    KeySchemaElement, StorageEnum, StorageError, StorageResult, TableName, TableNamespace,
+    TransactEncodeItem, TransactWriteItemsEncodeRequest, TransactWriteItemsResponse, WriteRequest,
+    WriteRetryPolicy, context::WrappedError, validate_item_key_attributes_for_schema,
+    validate_key_attributes_for_schema,
 };
 
 use crate::{
@@ -145,11 +146,18 @@ impl DatabaseManager {
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
-                let response = record_storage_operation(
-                    "batch_write_item",
-                    self.storage.batch_write_item(request, true),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "batch_write_item",
+                                provider.batch_write_item(request, true),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -181,14 +189,20 @@ impl DatabaseManager {
                 let mut merged_unprocessed: HashMap<TableName, Vec<storage_types::WriteRequest>> =
                     HashMap::new();
                 for (dispatch_key, request) in per_connection {
-                    let provider =
-                        self.provider_for_request_connection(&dispatch_key.connection_id)?;
-                    let response = record_storage_operation_for_target(
-                        "batch_write_item",
-                        dispatch_key.target_role,
-                        provider.batch_write_item(request, true),
-                    )
-                    .await?;
+                    let response = self
+                        .run_admitted(
+                            &dispatch_key.connection_id,
+                            crate::admission::AdmissionClass::Write,
+                            |provider| async move {
+                                record_storage_operation_for_target(
+                                    "batch_write_item",
+                                    dispatch_key.target_role,
+                                    provider.batch_write_item(request, true),
+                                )
+                                .await
+                            },
+                        )
+                        .await?;
                     if let Some(unprocessed) = response.unprocessed_items {
                         merge_unprocessed_batch_write_items(
                             &mut merged_unprocessed,
@@ -232,6 +246,15 @@ impl DatabaseManager {
             };
             let mut seen_keys = Vec::with_capacity(write_requests.len());
             for write_request in write_requests {
+                if let WriteRequest {
+                    put_request: Some(put),
+                    delete_request: None,
+                } = write_request
+                {
+                    let indexers = put.indexers.as_deref().unwrap_or_default();
+                    IndexerDeclaration::validate(indexers, table_info.max_indexers)?;
+                    IndexedWireItem::validate_logical_item_names(&put.item, indexers)?;
+                }
                 let key = batch_write_request_primary_key(write_request, &table_info.key_schema)
                     .map_err(batch_write_key_error)?;
                 if seen_keys.contains(&key) {
@@ -307,11 +330,18 @@ impl DatabaseManager {
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
-                let response = record_storage_operation(
-                    "batch_write_item",
-                    self.storage.batch_write_item_encode(request, true),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "batch_write_item",
+                                provider.batch_write_item_encode(request, true),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -343,14 +373,20 @@ impl DatabaseManager {
                 let mut merged_unprocessed: HashMap<TableName, Vec<storage_types::WriteRequest>> =
                     HashMap::new();
                 for (dispatch_key, request) in per_connection {
-                    let provider =
-                        self.provider_for_request_connection(&dispatch_key.connection_id)?;
-                    let response = record_storage_operation_for_target(
-                        "batch_write_item",
-                        dispatch_key.target_role,
-                        provider.batch_write_item_encode(request, true),
-                    )
-                    .await?;
+                    let response = self
+                        .run_admitted(
+                            &dispatch_key.connection_id,
+                            crate::admission::AdmissionClass::Write,
+                            |provider| async move {
+                                record_storage_operation_for_target(
+                                    "batch_write_item",
+                                    dispatch_key.target_role,
+                                    provider.batch_write_item_encode(request, true),
+                                )
+                                .await
+                            },
+                        )
+                        .await?;
                     if let Some(unprocessed) = response.unprocessed_items {
                         merge_unprocessed_batch_write_items(
                             &mut merged_unprocessed,
@@ -546,12 +582,19 @@ impl DatabaseManager {
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
-                let response = record_storage_operation(
-                    "transact_write_items",
-                    self.storage
-                        .transact_write_items_encode_with_retry(request, retry_policy),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "transact_write_items",
+                                provider
+                                    .transact_write_items_encode_with_retry(request, retry_policy),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -667,14 +710,23 @@ impl DatabaseManager {
             request_for_connection.return_item_collection_metrics =
                 return_item_collection_metrics.clone();
 
-            let provider = self.provider_for_request_connection(&dispatch_key.connection_id)?;
-            let response = record_storage_operation_for_target(
-                "transact_write_items",
-                dispatch_key.target_role,
-                provider
-                    .transact_write_items_encode_with_retry(request_for_connection, retry_policy),
-            )
-            .await?;
+            let response = self
+                .run_admitted(
+                    &dispatch_key.connection_id,
+                    crate::admission::AdmissionClass::Write,
+                    |provider| async move {
+                        record_storage_operation_for_target(
+                            "transact_write_items",
+                            dispatch_key.target_role,
+                            provider.transact_write_items_encode_with_retry(
+                                request_for_connection,
+                                retry_policy,
+                            ),
+                        )
+                        .await
+                    },
+                )
+                .await?;
             if primary_response.is_none() {
                 primary_response = Some(response);
             }

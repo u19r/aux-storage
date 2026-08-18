@@ -1,6 +1,4 @@
-#![allow(dead_code)]
-
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use storage_common::{GsiKeyPart, GsiWriteAction, plan_gsi_write_actions};
 use storage_types::{
@@ -34,6 +32,7 @@ pub(crate) enum PlaceholderNumbering {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum GsiAttributesBlobStyle {
     FullProjectedItem,
     NonKeyAttributes,
@@ -99,6 +98,7 @@ pub(crate) fn plan_gsi_sql_statements<P, Name, Param, Null, Placeholder, Column>
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, AttributeValue>>,
     new_item: Option<&HashMap<String, AttributeValue>>,
+    new_indexers: &[String],
     options: &GsiSqlPlanOptions<'_, P, Name, Param, Null, Placeholder, Column>,
 ) -> StorageResult<WriteMaintenancePlan<P>>
 where
@@ -138,6 +138,10 @@ where
                 &gsi_key,
                 &table_key,
                 &projected_item,
+                new_item.ok_or_else(|| {
+                    StorageError::internal("GSI put plan is missing its logical item")
+                })?,
+                new_indexers,
                 &mut parameter_offset,
                 options,
             )?,
@@ -222,6 +226,8 @@ fn plan_gsi_put_statement<P, Name, Param, Null, Placeholder, Column>(
     gsi_key: &[GsiKeyPart<'_>],
     table_key: &[GsiKeyPart<'_>],
     projected_item: &HashMap<String, AttributeValue>,
+    logical_item: &HashMap<String, AttributeValue>,
+    indexers: &[String],
     parameter_offset: &mut usize,
     options: &GsiSqlPlanOptions<'_, P, Name, Param, Null, Placeholder, Column>,
 ) -> StorageResult<WriteStatement<P>>
@@ -239,6 +245,8 @@ where
         gsi_key,
         table_key,
         projected_item,
+        logical_item,
+        indexers,
         parameter_offset,
         options,
         options.upsert_style,
@@ -252,6 +260,8 @@ fn plan_gsi_put_statement_with_style<P, Name, Param, Null, Placeholder, Column>(
     gsi_key: &[GsiKeyPart<'_>],
     table_key: &[GsiKeyPart<'_>],
     projected_item: &HashMap<String, AttributeValue>,
+    logical_item: &HashMap<String, AttributeValue>,
+    indexers: &[String],
     parameter_offset: &mut usize,
     options: &GsiSqlPlanOptions<'_, P, Name, Param, Null, Placeholder, Column>,
     upsert_style: GsiUpsertStyle,
@@ -285,15 +295,31 @@ where
         .map(|binding| binding.value.clone())
         .collect::<Vec<_>>();
 
+    let payload = projected_attributes(
+        projected_item,
+        &index.key_schema,
+        &table_info.key_schema,
+        options.attributes_blob_style,
+    );
+    let indexed = crate::indexed_item::SqlIndexedItem::extract(
+        logical_item,
+        payload.as_ref(),
+        Some(indexers),
+        table_info.max_indexers,
+    )?;
     columns.push("attributes_blob".to_string());
     params.push((options.scalar_param)(&AttributeValue::S(
-        projected_attributes_blob(
-            projected_item,
-            &index.key_schema,
-            &table_info.key_schema,
-            options.attributes_blob_style,
-        )?,
+        indexed.residual_json().to_owned(),
     ))?);
+    for ordinal in 0..table_info.max_indexers.as_usize() {
+        columns.push(crate::utils::indexer_column_name(ordinal));
+        params.push(
+            match indexed.slots().get(ordinal).and_then(Option::as_ref) {
+                Some(value) => (options.scalar_param)(&AttributeValue::S(value.clone()))?,
+                None => (options.null_param)(),
+            },
+        );
+    }
 
     let placeholders = bindings
         .iter()
@@ -306,9 +332,9 @@ where
             );
             (options.placeholder)(placeholder_index, binding.attribute_type.as_ref())
         })
-        .chain(std::iter::once({
+        .chain((0..=table_info.max_indexers.as_usize()).map(|offset| {
             let placeholder_index = placeholder_index(
-                bindings.len() + 1,
+                bindings.len() + 1 + offset,
                 *parameter_offset,
                 options.placeholder_numbering,
             );
@@ -454,16 +480,14 @@ fn key_part_value<'a>(
         .ok_or_else(StorageError::invalid_or_missing_key)
 }
 
-pub(crate) fn projected_attributes_blob(
-    projected_item: &HashMap<String, AttributeValue>,
+pub(super) fn projected_attributes<'a>(
+    projected_item: &'a HashMap<String, AttributeValue>,
     gsi_key_schema: &[KeySchemaElement],
     table_key_schema: &[KeySchemaElement],
     style: GsiAttributesBlobStyle,
-) -> StorageResult<String> {
+) -> Cow<'a, HashMap<String, AttributeValue>> {
     if matches!(style, GsiAttributesBlobStyle::FullProjectedItem) {
-        return serde_json::to_string(projected_item).map_err(|err| {
-            StorageError::internal(&format!("serialize projected gsi attributes failed: {err}"))
-        });
+        return Cow::Borrowed(projected_item);
     }
 
     let attributes = projected_item
@@ -471,12 +495,7 @@ pub(crate) fn projected_attributes_blob(
         .filter(|(name, _)| !is_projected_key_attribute(name, gsi_key_schema, table_key_schema))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<HashMap<_, _>>();
-    if attributes.is_empty() {
-        return Ok("{}".to_string());
-    }
-    serde_json::to_string(&attributes).map_err(|err| {
-        StorageError::internal(&format!("serialize projected gsi attributes failed: {err}"))
-    })
+    Cow::Owned(attributes)
 }
 
 fn is_projected_key_attribute(

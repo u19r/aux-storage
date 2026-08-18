@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::collections::BTreeSet;
 
 use storage_cache::{
     CacheReadOutcome, CacheState, ObservedRead, ReadRequest, compare_observed_read,
@@ -30,13 +30,9 @@ fn isolated_config(test_name: &str) -> SimulationHarnessConfig {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let sqlite_database_dir = PathBuf::from("/tmp")
-        .join("auxfn-multi-region")
-        .join("sqlite")
-        .join(format!(
-            "storage-api-oracle-{test_name}-{}-{unique}",
-            std::process::id()
-        ));
+    let sqlite_database_dir = crate::storage_api_test_support::unique_path(&format!(
+        "multi-region-sqlite-{test_name}-{unique}"
+    ));
 
     SimulationHarnessConfig {
         sqlite_database_dir: Some(sqlite_database_dir),

@@ -3,7 +3,10 @@ use storage_provider::{
     RocksdbSettings, SqliteSettings, StorageBackend, StorageConnectionConfig, TursoSettings,
 };
 
-use super::construction::read_sequence_capabilities_for_connection;
+use super::construction::{
+    admission_config_for_connection, read_sequence_capabilities_for_connection,
+};
+use crate::admission::AdmissionConfig;
 
 #[test]
 fn sqlite_read_sequence_capabilities_follow_immediate_gsi_setting() {
@@ -168,4 +171,47 @@ fn foundationdb_read_sequence_capabilities_enable_transactional_snapshots() {
     assert!(capabilities.transactional_reads);
     assert!(capabilities.immediate_gsi_consistency);
     assert!(capabilities.transactional_snapshots);
+}
+
+#[test]
+fn postgres_admission_limit_is_clamped_to_foreground_pool_size() {
+    let connection = StorageConnectionConfig {
+        backend_type: StorageBackend::Postgres,
+        connection_string: None,
+        file_path: None,
+        sqlite: None,
+        postgres: Some(PostgresSettings {
+            max_pool_size: 8,
+            ..PostgresSettings::default()
+        }),
+        turso: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    let config = admission_config_for_connection(AdmissionConfig::default(), &connection)
+        .expect("pool-sized admission config");
+    assert_eq!(config.effective_maximum(), 8);
+    assert_eq!(config.maximum_concurrency, 12);
+}
+
+#[test]
+fn postgres_admission_rejects_pool_below_configured_minimum() {
+    let connection = StorageConnectionConfig {
+        backend_type: StorageBackend::Postgres,
+        connection_string: None,
+        file_path: None,
+        sqlite: None,
+        postgres: Some(PostgresSettings {
+            max_pool_size: 2,
+            ..PostgresSettings::default()
+        }),
+        turso: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    let error = admission_config_for_connection(AdmissionConfig::default(), &connection)
+        .expect_err("pool below admission minimum");
+    assert!(error.to_string().contains("max_pool_size"));
 }

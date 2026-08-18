@@ -5,11 +5,18 @@
 
 mod change_index;
 mod config;
+#[cfg(test)]
+mod config_tests;
 mod provider;
 #[cfg(test)]
 mod quint_custom_stream_duration_api_tests;
 #[cfg(test)]
 mod quint_custom_stream_duration_tests;
+#[cfg(test)]
+mod quint_read_sequence_dag_tests;
+mod read_sequence_context;
+#[cfg(test)]
+mod read_sequence_context_tests;
 mod stream_duration_planner;
 #[cfg(test)]
 mod stream_duration_planner_tests;
@@ -21,6 +28,9 @@ mod stream_duration_worker;
 mod stream_duration_worker_tests;
 mod update_logic;
 
+pub use read_sequence_context::{
+    ReadSequenceBatchGetResponse, ReadSequenceReadContext, ReadSequenceReadLimits,
+};
 pub use storage_types::AttributeValue;
 
 pub use crate::{

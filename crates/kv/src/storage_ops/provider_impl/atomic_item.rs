@@ -21,9 +21,24 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let transform = request.transform;
         let metadata_for_transform = Arc::clone(&metadata);
         let read_key_for_transform = read_key.clone();
+        let item_value_codec = self.kv_store.item_value_codec();
         let adapter: AtomicTableWriteTransform = Arc::new(move |current_bytes| {
-            let current = current_bytes.map(deserialize_item_from_bytes).transpose()?;
-            match transform(current.as_ref())? {
+            let current = current_bytes
+                .map(|bytes| {
+                    let indexed = decode_indexed_wire_item(item_value_codec, bytes)?;
+                    if indexed.slots().len()
+                        > metadata_for_transform.table_info.max_indexers.as_usize()
+                    {
+                        return Err(StorageError::internal(
+                            "stored_item_corruption:declaration_exceeds_table_capacity",
+                        ));
+                    }
+                    let (item, declaration) = indexed.into_attribute_map_with_declaration()?;
+                    Ok((item, declaration.into_names()))
+                })
+                .transpose()?;
+            let current_item = current.as_ref().map(|(item, _)| item);
+            match transform(current_item)? {
                 AtomicItemWriteDecision::NoWrite { output } => {
                     Ok(AtomicTableWriteDecision::NoWrite { output })
                 }
@@ -36,7 +51,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     items.push(item);
                     items.extend(additional_items);
                     let mut operations = Vec::with_capacity(items.len());
-                    for mut item in items {
+                    for (index, mut item) in items.into_iter().enumerate() {
                         normalize_attribute_map_numbers_for_write(&mut item);
                         validate_item_key_attributes_for_schema(
                             &metadata_for_transform.table_info.key_schema,
@@ -60,6 +75,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                             table_identity: metadata_for_transform.identity.clone(),
                             table_info: metadata_for_transform.table_info.clone(),
                             item,
+                            indexers: (index == 0)
+                                .then(|| current.as_ref().map(|(_, names)| names.clone()))
+                                .flatten(),
                             item_stream_ttl_hours: None,
                             condition: None,
                             return_values_on_condition_check_failure: None,

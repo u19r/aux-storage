@@ -5,21 +5,28 @@ use bg_jobs::BackgroundJobName;
 use storage_backfill::{LogicalBackfillExport, LogicalBackfillImport};
 use storage_common::{
     GSI_BACKFILL_JOB, GSI_UPDATE_JOB, STREAM_TRIM_JOB, TTL_SWEEP_JOB, apply_gsi_write_pressure,
+    normalize_limit as calc_limit,
     ttl::{TtlConfigRecord, ttl_gsi_name},
 };
 use storage_condition::parse_condition_expression;
 use storage_provider::{
     CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
-    StorageProvider, StorageProviderReadContext, StreamTrimDueMarker, StreamTrimState,
-    StreamTrimStateWrite, plan_table_stream_duration, return_values_need_updated_fields,
+    ReadSequenceExecution, ReadSequenceExecutionBudget, ReadSequenceFlatResult,
+    ReadSequenceFlatRow, ReadSequenceSqlCompileError, ReadSequenceSqlEnvelopeRow,
+    ReadSequenceSqlIdentifier, ReadSequenceSqlKeyType, ReadSequenceSqlMetadata,
+    ReadSequenceSqlNodeMetadata, ReadSequenceSqlOperator, ReadSequenceSqlPredicate,
+    ReadSequenceSqlRowKind, ReadSequenceSqlShape, StorageProvider, StorageProviderReadContext,
+    StreamTrimDueMarker, StreamTrimState, StreamTrimStateWrite, build_read_sequence_sql_ir,
+    decode_read_sequence_sql_rows, emit_sqlite_read_sequence_sql, merge_read_sequence_sql_metadata,
+    plan_table_stream_duration, return_values_need_updated_fields,
 };
 use storage_types::{
     AllOld, AttributeDefinition, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
     DeleteGlobalSecondaryIndexAction, DeleteItemRequest, DurablePointReadProof,
-    DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
+    DurablePointReadRequest, GetItemRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
     GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, KeyAttributeType, KeyAttributes,
-    PreparedBatchOperation, PutItemRequest, PutItemResponse, QueryTableRequest,
+    PreparedBatchOperation, PutItemRequest, PutItemResponse, QueryRequest, QueryTableRequest,
     ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
     StorageResult, StoredTableInfo, StreamRetentionDuration, TableName, TableStatus,
     TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItemsEncodeRequest,
@@ -37,7 +44,7 @@ use crate::{
         WriteCostTally, attr_map_payload_bytes, record_read_cost, record_write_cost,
         serializable_payload_bytes,
     },
-    helpers::MAX_SCAN_LIMIT,
+    helpers::{DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT, MAX_SCAN_LIMIT},
 };
 
 pub(crate) fn record_read(items: usize, bytes: usize) {
@@ -140,30 +147,42 @@ impl StorageProviderReadContext for SQLiteReadSequenceReadContext {
         key: KeyAttributes,
         consistent_read: bool,
     ) -> StorageResult<Option<WireItem>> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.get_item");
         self.ensure_supported()?;
-        <SQLiteStorageProvider as StorageProvider>::get_item(
+        let result = <SQLiteStorageProvider as StorageProvider>::get_item(
             &self.provider,
             table_name,
             key,
             consistent_read,
         )
-        .await
+        .await;
+        drop(database_call);
+        result
     }
 
     async fn batch_get_item(
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.batch_get_item");
         self.ensure_supported()?;
-        <SQLiteStorageProvider as StorageProvider>::batch_get_item(&self.provider, request).await
+        let result =
+            <SQLiteStorageProvider as StorageProvider>::batch_get_item(&self.provider, request)
+                .await;
+        drop(database_call);
+        result
     }
 
     async fn query_table(
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
         self.ensure_supported()?;
-        <SQLiteStorageProvider as StorageProvider>::query_table(&self.provider, request).await
+        let result =
+            <SQLiteStorageProvider as StorageProvider>::query_table(&self.provider, request).await;
+        drop(database_call);
+        result
     }
 }
 
@@ -185,8 +204,995 @@ fn sqlite_read_sequence_snapshot_unsupported() -> StorageError {
     )
 }
 
+pub(super) async fn sqlite_read_sequence_metadata(
+    provider: &SQLiteStorageProvider,
+    node: &storage_types::ReadSequenceNode,
+    query_cursor: Option<&KeyAttributes>,
+) -> StorageResult<Option<(ReadSequenceSqlMetadata, TableName)>> {
+    match &node.operation {
+        storage_types::ReadSequenceNodeOperation::Get(request) => {
+            let table_info = provider
+                .get_table_info_cached_arc(&request.table_name)
+                .await?;
+            Ok(sqlite_get_read_sequence_metadata(request, &table_info)?
+                .map(|metadata| (metadata, request.table_name.clone())))
+        }
+        storage_types::ReadSequenceNodeOperation::BatchGet(request) => {
+            let Some((table_name, keys_and_attributes)) = request.request_items.iter().next()
+            else {
+                return Ok(None);
+            };
+            if request.request_items.len() != 1 || keys_and_attributes.keys.is_empty() {
+                return Ok(None);
+            }
+            if request.return_consumed_capacity.is_some()
+                || keys_and_attributes.attributes_to_get.is_some()
+                || keys_and_attributes.projection_expression.is_some()
+                || keys_and_attributes.expression_attribute_names.is_some()
+                || keys_and_attributes.consistent_read == Some(true)
+            {
+                return Ok(None);
+            }
+            let table_info = provider.get_table_info_cached_arc(table_name).await?;
+            Ok(
+                sqlite_batch_read_sequence_metadata(table_name, keys_and_attributes, &table_info)?
+                    .map(|metadata| (metadata, table_name.clone())),
+            )
+        }
+        storage_types::ReadSequenceNodeOperation::Query(request) => {
+            if request.index_name.is_some() {
+                return Ok(None);
+            }
+            let table_info = provider
+                .get_table_info_cached_arc(&request.table_name)
+                .await?;
+            Ok(
+                sqlite_query_read_sequence_metadata(request, &table_info, query_cursor)?
+                    .map(|metadata| (metadata, request.table_name.clone())),
+            )
+        }
+    }
+}
+
+pub(crate) fn sqlite_query_read_sequence_metadata(
+    request: &QueryRequest,
+    table_info: &StoredTableInfo,
+    query_cursor: Option<&KeyAttributes>,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    if request.filter_expression.is_some()
+        || request.attributes_to_get.is_some()
+        || request.conditional_operator.is_some()
+        || request.query_filter.is_some()
+        || request.projection_expression.is_some()
+        || request.select.is_some()
+        || request.exclusive_start_key.is_some()
+        || request.return_consumed_capacity.is_some()
+        || request.consistent_read == Some(true)
+        || request.scan_index_forward == Some(false)
+    {
+        return Ok(None);
+    }
+    if request.index_name.is_some() && query_cursor.is_some() {
+        return Ok(None);
+    }
+    let (relation_name, query_schema, physical_keys, projected_attributes, exclude_tombstones) =
+        if let Some(index_name) = &request.index_name {
+            let index = table_info
+                .global_secondary_indexes
+                .as_ref()
+                .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+                .ok_or_else(|| crate::errors::missing_index_error(table_info, index_name))?;
+            let mut keys = index
+                .key_schema
+                .iter()
+                .map(|key| (key.attribute_name.clone(), key.attribute_name.clone()))
+                .collect::<Vec<_>>();
+            keys.extend(table_info.key_schema.iter().map(|key| {
+                (
+                    key.attribute_name.clone(),
+                    format!(
+                        "table_{}",
+                        crate::AttributeName::new(&key.attribute_name).sanitized()
+                    ),
+                )
+            }));
+            (
+                crate::naming::physical_gsi_table_name(&request.table_name, index_name),
+                index.key_schema.as_slice(),
+                keys,
+                crate::gsi_lifecycle::gsi_projected_attribute_names(table_info, index),
+                true,
+            )
+        } else {
+            (
+                crate::naming::physical_table_name(&request.table_name),
+                table_info.key_schema.as_slice(),
+                table_info
+                    .key_schema
+                    .iter()
+                    .map(|key| (key.attribute_name.clone(), key.attribute_name.clone()))
+                    .collect(),
+                None,
+                false,
+            )
+        };
+    let relation = ReadSequenceSqlIdentifier::new(relation_name)
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_attribute_names = Vec::with_capacity(physical_keys.len());
+    let mut key_columns = Vec::with_capacity(physical_keys.len());
+    let mut key_types = Vec::with_capacity(physical_keys.len());
+    for (logical_name, physical_name) in physical_keys {
+        let sanitized_name = crate::AttributeName::new(&logical_name)
+            .sanitized()
+            .to_string();
+        if sanitized_name != logical_name || !physical_name.ends_with(&sanitized_name) {
+            return Ok(None);
+        }
+        key_attribute_names.push(logical_name.clone());
+        key_columns.push(
+            ReadSequenceSqlIdentifier::new(physical_name)
+                .map_err(|error| StorageError::internal(&error.to_string()))?,
+        );
+        key_types.push(sqlite_read_sequence_key_type(table_info, &logical_name)?);
+    }
+    let mut predicates = match crate::parse_conditions::parse_read_sequence_query_predicates(
+        &request.key_condition_expression,
+        query_schema,
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    ) {
+        Ok(predicates) => predicates,
+        Err(_) => return Ok(None),
+    };
+    for predicate in &mut predicates {
+        let logical_name = predicate.column.as_str().to_string();
+        predicate.column = ReadSequenceSqlIdentifier::new(
+            crate::AttributeName::new(&logical_name)
+                .sanitized()
+                .to_string(),
+        )
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    }
+    if let Some(cursor) = query_cursor {
+        let Some(range_key) = query_schema
+            .iter()
+            .find(|key| key.key_type == storage_types::KeyType::Range)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = cursor.get(&range_key.attribute_name).cloned() else {
+            return Ok(None);
+        };
+        let column = ReadSequenceSqlIdentifier::new(
+            crate::AttributeName::new(&range_key.attribute_name)
+                .sanitized()
+                .to_string(),
+        )
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+        predicates.push(ReadSequenceSqlPredicate {
+            column,
+            operator: ReadSequenceSqlOperator::GreaterThan,
+            value,
+        });
+    }
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: sqlite_schema_digest(table_info),
+        max_parameters: 999,
+        max_sql_bytes: 1_000_000,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape: ReadSequenceSqlShape::Query,
+                key_attribute_names,
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates,
+                batch_keys: Vec::new(),
+                limit: Some(calc_limit(
+                    request.limit,
+                    DEFAULT_QUERY_LIMIT,
+                    MAX_QUERY_LIMIT,
+                )?),
+                max_indexers: table_info.max_indexers,
+                projected_attributes,
+                exclude_tombstones,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+pub(crate) fn sqlite_get_read_sequence_metadata(
+    request: &GetItemRequest,
+    table_info: &StoredTableInfo,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    if request.attributes_to_get.is_some()
+        || request.projection_expression.is_some()
+        || request.expression_attribute_names.is_some()
+        || request.consistent_read == Some(true)
+        || request.return_consumed_capacity.is_some()
+    {
+        return Ok(None);
+    }
+    let relation =
+        ReadSequenceSqlIdentifier::new(crate::naming::physical_table_name(&request.table_name))
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_columns = Vec::with_capacity(table_info.key_schema.len());
+    let mut key_types = Vec::with_capacity(table_info.key_schema.len());
+    let mut predicates = Vec::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let sanitized_name = crate::AttributeName::new(&key.attribute_name)
+            .sanitized()
+            .to_string();
+        if sanitized_name != key.attribute_name {
+            return Ok(None);
+        }
+        let value = request
+            .key
+            .get(&key.attribute_name)
+            .ok_or_else(StorageError::invalid_or_missing_key)?;
+        let column = ReadSequenceSqlIdentifier::new(sanitized_name)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        key_columns.push(column.clone());
+        key_types.push(sqlite_read_sequence_key_type(
+            table_info,
+            &key.attribute_name,
+        )?);
+        predicates.push(ReadSequenceSqlPredicate {
+            column,
+            operator: ReadSequenceSqlOperator::Equal,
+            value: value.clone(),
+        });
+    }
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: sqlite_schema_digest(table_info),
+        max_parameters: 999,
+        max_sql_bytes: 1_000_000,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape: ReadSequenceSqlShape::Get,
+                key_attribute_names: key_columns
+                    .iter()
+                    .map(|column| column.as_str().to_string())
+                    .collect(),
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates,
+                batch_keys: Vec::new(),
+                limit: None,
+                max_indexers: table_info.max_indexers,
+                projected_attributes: None,
+                exclude_tombstones: false,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+pub(crate) fn sqlite_batch_read_sequence_metadata(
+    table_name: &TableName,
+    request: &storage_types::KeysAndAttributes,
+    table_info: &StoredTableInfo,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    let relation = ReadSequenceSqlIdentifier::new(crate::naming::physical_table_name(table_name))
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_columns = Vec::with_capacity(table_info.key_schema.len());
+    let mut key_types = Vec::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let sanitized_name = crate::AttributeName::new(&key.attribute_name)
+            .sanitized()
+            .to_string();
+        if sanitized_name != key.attribute_name {
+            return Ok(None);
+        }
+        let column = ReadSequenceSqlIdentifier::new(sanitized_name)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        key_columns.push(column);
+        key_types.push(sqlite_read_sequence_key_type(
+            table_info,
+            &key.attribute_name,
+        )?);
+    }
+    let batch_keys = request
+        .keys
+        .iter()
+        .map(|key| {
+            table_info
+                .key_schema
+                .iter()
+                .map(|schema| {
+                    key.get(&schema.attribute_name)
+                        .cloned()
+                        .ok_or_else(StorageError::invalid_or_missing_key)
+                })
+                .collect::<StorageResult<Vec<_>>>()
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: sqlite_schema_digest(table_info),
+        max_parameters: 999,
+        max_sql_bytes: 1_000_000,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape: ReadSequenceSqlShape::BatchGet,
+                key_attribute_names: key_columns
+                    .iter()
+                    .map(|column| column.as_str().to_string())
+                    .collect(),
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates: Vec::new(),
+                batch_keys,
+                limit: None,
+                max_indexers: table_info.max_indexers,
+                projected_attributes: None,
+                exclude_tombstones: false,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+fn sqlite_read_sequence_key_type(
+    table_info: &StoredTableInfo,
+    attribute_name: &str,
+) -> StorageResult<ReadSequenceSqlKeyType> {
+    let attribute_type = table_info
+        .attribute_definitions
+        .iter()
+        .find(|attribute| attribute.attribute_name == attribute_name)
+        .map(|attribute| &attribute.attribute_type)
+        .ok_or_else(|| {
+            StorageError::validation(format!(
+                "missing attribute definition for key '{attribute_name}'"
+            ))
+        })?;
+    Ok(match attribute_type {
+        storage_types::KeyAttributeType::S => ReadSequenceSqlKeyType::String,
+        storage_types::KeyAttributeType::N => ReadSequenceSqlKeyType::Number,
+        storage_types::KeyAttributeType::B => ReadSequenceSqlKeyType::Binary,
+    })
+}
+
+fn sqlite_schema_digest(table_info: &StoredTableInfo) -> String {
+    let bytes = storage_types::canonical_json::to_vec(table_info).unwrap_or_default();
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &bytes).to_string()
+}
+
+pub(crate) fn encode_sql_query_continuation(key: &KeyAttributes) -> StorageResult<String> {
+    let payload = serde_json::to_string(key)
+        .map_err(|error| StorageError::internal(&format!("encode SQL Query cursor: {error}")))?;
+    Ok(format!("read-sequence-sql-v1:{payload}"))
+}
+
+pub(crate) fn decode_sql_query_continuation(value: &str) -> Result<Option<KeyAttributes>, ()> {
+    let Some(payload) = value.strip_prefix("read-sequence-sql-v1:") else {
+        return Err(());
+    };
+    let key = serde_json::from_str::<KeyAttributes>(payload).map_err(|_| ())?;
+    if key.is_empty() {
+        Err(())
+    } else {
+        Ok(Some(key))
+    }
+}
+
+pub(crate) fn sql_item_key_attributes(
+    item: &storage_types::AttributeMap,
+    metadata: &ReadSequenceSqlMetadata,
+) -> KeyAttributes {
+    let mut key = KeyAttributes::with_capacity(2);
+    if let Some(node) = metadata.nodes.values().next() {
+        for attribute_name in &node.key_attribute_names {
+            if let Some(value) = item.get(attribute_name) {
+                key.insert(attribute_name, value.clone());
+            }
+        }
+    }
+    key
+}
+
+pub(crate) fn compile_sqlite_read_sequence_statement(
+    plan: &storage_types::ReadSequencePlan,
+    metadata: &ReadSequenceSqlMetadata,
+) -> StorageResult<Option<storage_provider::ReadSequenceSqlStatement>> {
+    let ir = match build_read_sequence_sql_ir(plan, metadata) {
+        Ok(ir) => ir,
+        Err(ReadSequenceSqlCompileError::ParameterLimit)
+        | Err(ReadSequenceSqlCompileError::StatementLimit)
+        | Err(ReadSequenceSqlCompileError::UnsupportedShape)
+        | Err(ReadSequenceSqlCompileError::InvalidKeyMetadata)
+        | Err(ReadSequenceSqlCompileError::MissingMetadata) => return Ok(None),
+        Err(error) => return Err(StorageError::internal(&error.to_string())),
+    };
+    match emit_sqlite_read_sequence_sql(plan, &ir, metadata.max_sql_bytes, metadata.max_parameters)
+    {
+        Ok(statement) => Ok(Some(statement)),
+        Err(ReadSequenceSqlCompileError::ParameterLimit)
+        | Err(ReadSequenceSqlCompileError::StatementLimit)
+        | Err(ReadSequenceSqlCompileError::UnsupportedShape)
+        | Err(ReadSequenceSqlCompileError::InvalidKeyMetadata)
+        | Err(ReadSequenceSqlCompileError::MissingMetadata) => Ok(None),
+        Err(error) => Err(StorageError::internal(&error.to_string())),
+    }
+}
+
+fn sqlite_sql_row_to_envelope(
+    row: &rusqlite::Row<'_>,
+    metadata: &ReadSequenceSqlMetadata,
+) -> StorageResult<ReadSequenceSqlEnvelopeRow> {
+    let node_ordinal = row
+        .get::<_, i64>("node_ordinal")
+        .map_err(|error| StorageError::internal(&format!("decode SQL node ordinal: {error}")))?;
+    let invocation_ordinal = row.get::<_, i64>("invocation_ordinal").map_err(|error| {
+        StorageError::internal(&format!("decode SQL invocation ordinal: {error}"))
+    })?;
+    let item_ordinal = row
+        .get::<_, i64>("item_ordinal")
+        .map_err(|error| StorageError::internal(&format!("decode SQL item ordinal: {error}")))?;
+    let row_kind = row
+        .get::<_, String>("row_kind")
+        .map_err(|error| StorageError::internal(&format!("decode SQL row kind: {error}")))?;
+    let node = storage_types::ReadSequenceNodeId::from_index(node_ordinal as usize);
+    let node_metadata = metadata
+        .nodes
+        .get(&node)
+        .ok_or_else(|| StorageError::internal("compiled SQL returned an unknown node"))?;
+    let key_values = node_metadata
+        .key_columns
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let value = sqlite_sql_column_string(row, &format!("key_{index}"))?;
+            Ok(match node_metadata.key_types[index] {
+                ReadSequenceSqlKeyType::String => AttributeValue::S(value),
+                ReadSequenceSqlKeyType::Number => AttributeValue::N(value),
+                ReadSequenceSqlKeyType::Binary => AttributeValue::B(value),
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let item_json = match row.get_ref("item_json") {
+        Ok(rusqlite::types::ValueRef::Null) => None,
+        Ok(rusqlite::types::ValueRef::Text(value)) | Ok(rusqlite::types::ValueRef::Blob(value)) => {
+            Some(value.to_vec())
+        }
+        Ok(value) => Some(
+            value
+                .as_str()
+                .map_err(|error| StorageError::internal(&format!("decode SQL item JSON: {error}")))?
+                .as_bytes()
+                .to_vec(),
+        ),
+        Err(error) => {
+            return Err(StorageError::internal(&format!(
+                "decode SQL item JSON column: {error}"
+            )));
+        }
+    };
+    let row_kind = match row_kind.as_str() {
+        "item" => ReadSequenceSqlRowKind::Item,
+        "input_ref" => ReadSequenceSqlRowKind::InputRef,
+        "missing" => ReadSequenceSqlRowKind::Missing,
+        "continuation" => ReadSequenceSqlRowKind::Continuation,
+        _ => {
+            return Err(StorageError::internal(
+                "compiled SQL returned an unknown row kind",
+            ));
+        }
+    };
+    let indexer_json = row
+        .get::<_, String>("indexer_json")
+        .map_err(|error| StorageError::internal(&format!("decode SQL indexer JSON: {error}")))?;
+    let indexer_values = serde_json::from_str::<Vec<Option<String>>>(&indexer_json)
+        .map_err(|error| StorageError::internal(&format!("parse SQL indexer JSON: {error}")))?;
+    Ok(ReadSequenceSqlEnvelopeRow {
+        node_ordinal: u32::try_from(node_ordinal)
+            .map_err(|_| StorageError::internal("compiled SQL node ordinal overflow"))?,
+        invocation_ordinal: u32::try_from(invocation_ordinal)
+            .map_err(|_| StorageError::internal("compiled SQL invocation ordinal overflow"))?,
+        row_kind,
+        item_ordinal: u32::try_from(item_ordinal)
+            .map_err(|_| StorageError::internal("compiled SQL item ordinal overflow"))?,
+        key_values,
+        item_json,
+        indexer_values,
+    })
+}
+
+fn sqlite_sql_column_string(row: &rusqlite::Row<'_>, column: &str) -> StorageResult<String> {
+    match row.get_ref(column) {
+        Ok(rusqlite::types::ValueRef::Null) => Err(StorageError::invalid_or_missing_key()),
+        Ok(rusqlite::types::ValueRef::Integer(value)) => Ok(value.to_string()),
+        Ok(rusqlite::types::ValueRef::Real(value)) => Ok(value.to_string()),
+        Ok(rusqlite::types::ValueRef::Text(value)) | Ok(rusqlite::types::ValueRef::Blob(value)) => {
+            std::str::from_utf8(value)
+                .map(str::to_owned)
+                .map_err(|error| StorageError::internal(&format!("decode SQL key column: {error}")))
+        }
+        Err(error) => Err(StorageError::internal(&format!(
+            "decode SQL key column '{column}': {error}"
+        ))),
+    }
+}
+
+async fn execute_sqlite_read_sequence_mapped(
+    provider: &SQLiteStorageProvider,
+    plan: &storage_types::ReadSequencePlan,
+) -> StorageResult<ReadSequenceExecution> {
+    let Some((parent_id, child_id, source)) =
+        storage_provider::read_sequence_sql_mapped_source(plan)
+    else {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+        ));
+    };
+    let storage_types::ReadSequenceNodeOperation::Query(parent_query) =
+        &plan.nodes[parent_id.index()].operation
+    else {
+        unreachable!("mapped SQL source validates its Query parent");
+    };
+    let parent_info = provider
+        .get_table_info_cached_arc(&parent_query.table_name)
+        .await?;
+    let Some(mut parent_metadata) =
+        sqlite_query_read_sequence_metadata(parent_query, &parent_info, None)?
+    else {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+        ));
+    };
+    parent_metadata
+        .nodes
+        .first_entry()
+        .ok_or_else(|| StorageError::internal("missing mapped parent SQL metadata"))?
+        .into_mut()
+        .limit = None;
+    let storage_types::ReadSequenceNodeOperation::Get(child_get) =
+        &plan.nodes[child_id.index()].operation
+    else {
+        unreachable!("mapped SQL shape validated the child Get");
+    };
+    let child_info = provider
+        .get_table_info_cached_arc(&child_get.table_name)
+        .await?;
+    let Some(child_metadata) = sqlite_mapped_child_metadata(child_get, &child_info, source)? else {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::PhysicalLayout,
+        ));
+    };
+    let mut metadata = None;
+    for (node, value) in [(parent_id, parent_metadata), (child_id, child_metadata)] {
+        merge_read_sequence_sql_metadata(&mut metadata, node, value)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+    }
+    let metadata = metadata.ok_or_else(|| StorageError::internal("missing mapped SQL metadata"))?;
+    let ir = build_read_sequence_sql_ir(plan, &metadata)
+        .map_err(|error| StorageError::internal(&format!("lower mapped SQLite SQL: {error}")))?;
+    let statement =
+        emit_sqlite_read_sequence_sql(plan, &ir, metadata.max_sql_bytes, metadata.max_parameters)
+            .map_err(|error| StorageError::internal(&format!("emit mapped SQLite SQL: {error}")))?;
+    let rows = execute_sqlite_read_sequence_statement(provider, statement, &metadata).await?;
+    let decoded = decode_read_sequence_sql_rows(plan, &ir, rows)
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let rows = match storage_provider::materialize_read_sequence_sql_mapped(plan, &ir, decoded) {
+        Ok(rows) => rows,
+        Err(ReadSequenceSqlCompileError::MappingMiss) => {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::PhysicalLayout,
+            ));
+        }
+        Err(error) => return Err(StorageError::internal(&error.to_string())),
+    };
+    metrics::counter!(
+        "storage.read_sequence.sql.statements.total",
+        "dialect" => "sqlite",
+        "shape" => "mapped_indexer"
+    )
+    .increment(1);
+    Ok(ReadSequenceExecution::Executed(
+        storage_provider::ReadSequenceExecuted {
+            rows,
+            next_continuation: None,
+        },
+    ))
+}
+
+pub(crate) fn sqlite_mapped_child_metadata(
+    request: &GetItemRequest,
+    table_info: &StoredTableInfo,
+    source: storage_provider::ReadSequenceSqlMappedSource,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    let Some(mut metadata) = sqlite_get_read_sequence_metadata(request, table_info)? else {
+        return Ok(None);
+    };
+    let node = metadata
+        .nodes
+        .first_entry()
+        .ok_or_else(|| StorageError::internal("missing mapped child SQL metadata"))?
+        .into_mut();
+    node.predicates.clear();
+    node.mapped_source = Some(source);
+    Ok(Some(metadata))
+}
+
+async fn execute_sqlite_read_sequence_statement(
+    provider: &SQLiteStorageProvider,
+    statement: storage_provider::ReadSequenceSqlStatement,
+    metadata: &ReadSequenceSqlMetadata,
+) -> StorageResult<Vec<ReadSequenceSqlEnvelopeRow>> {
+    let parameters = statement
+        .parameters
+        .iter()
+        .map(|value| {
+            value.inner_string().map_err(|error| {
+                StorageError::validation(format!(
+                    "read-sequence SQL key parameter must be scalar: {error}"
+                ))
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let metadata = metadata.clone();
+    crate::utils::call_sqlite(&provider.connection, move |connection| {
+        let mut statement = connection
+            .prepare(&statement.sql)
+            .map_err(map_sqlite_error)?;
+        let mut query = statement
+            .query(rusqlite::params_from_iter(parameters.iter()))
+            .map_err(map_sqlite_error)?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next().map_err(map_sqlite_error)? {
+            rows.push(sqlite_sql_row_to_envelope(row, &metadata)?);
+        }
+        Ok(rows)
+    })
+    .await
+}
+
+async fn execute_sqlite_read_sequence_independent_roots(
+    provider: &SQLiteStorageProvider,
+    plan: &storage_types::ReadSequencePlan,
+) -> StorageResult<ReadSequenceExecution> {
+    if plan.nodes.len() < 2
+        || plan.nodes.iter().any(|node| {
+            !node.inputs().is_empty() || node.iterate.is_some() || !node.after().is_empty()
+        })
+    {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+        ));
+    }
+
+    let mut metadata = None;
+    let mut table_names = HashMap::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        let node_id = storage_types::ReadSequenceNodeId::from_index(index);
+        let (node_metadata, table_name) = match &node.operation {
+            storage_types::ReadSequenceNodeOperation::Get(_)
+            | storage_types::ReadSequenceNodeOperation::BatchGet(_) => {
+                let Some((node_metadata, table_name)) =
+                    sqlite_read_sequence_metadata(provider, node, None).await?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                };
+                (node_metadata, table_name)
+            }
+            // Independent Query roots require multiple continuation frontiers.
+            // Keep that shape on the ordinary path until the provider-neutral
+            // token carries one cursor per node.
+            storage_types::ReadSequenceNodeOperation::Query(_) => {
+                return Ok(ReadSequenceExecution::Unsupported(
+                    storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                ));
+            }
+        };
+        merge_read_sequence_sql_metadata(&mut metadata, node_id, node_metadata)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        table_names.insert(node_id, table_name);
+    }
+    let Some(metadata) = metadata else {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+        ));
+    };
+    let Some(statement) = compile_sqlite_read_sequence_statement(plan, &metadata)? else {
+        return Ok(ReadSequenceExecution::Unsupported(
+            storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+        ));
+    };
+    let parameters = statement
+        .parameters
+        .iter()
+        .map(|value| {
+            value.inner_string().map_err(|error| {
+                StorageError::validation(format!(
+                    "read-sequence SQL key parameter must be scalar: {error}"
+                ))
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let metadata_for_decode = metadata.clone();
+    let sql = statement.sql;
+    let rows = crate::utils::call_sqlite(&provider.connection, move |conn| {
+        let mut statement = conn.prepare(&sql).map_err(map_sqlite_error)?;
+        let mut query = statement
+            .query(rusqlite::params_from_iter(parameters.iter()))
+            .map_err(map_sqlite_error)?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next().map_err(map_sqlite_error)? {
+            rows.push(sqlite_sql_row_to_envelope(row, &metadata_for_decode)?);
+        }
+        Ok(rows)
+    })
+    .await?;
+    metrics::counter!(
+        "storage.read_sequence.sql.statements.total",
+        "dialect" => "sqlite",
+        "shape" => "independent_roots"
+    )
+    .increment(1);
+    let ir = build_read_sequence_sql_ir(plan, &metadata)
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let decoded = decode_read_sequence_sql_rows(plan, &ir, rows)
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut items_by_node = HashMap::<storage_types::ReadSequenceNodeId, Vec<_>>::new();
+    for row in decoded {
+        items_by_node.entry(row.node).or_default().push(row.item);
+    }
+    let rows = plan
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let node_id = storage_types::ReadSequenceNodeId::from_index(index);
+            let items = items_by_node.remove(&node_id).unwrap_or_default();
+            let result = match &node.operation {
+                storage_types::ReadSequenceNodeOperation::Get(_) => ReadSequenceFlatResult::Get {
+                    item: items.into_iter().next(),
+                },
+                storage_types::ReadSequenceNodeOperation::BatchGet(_) => {
+                    ReadSequenceFlatResult::BatchGet {
+                        responses: [(table_names[&node_id].clone(), items)]
+                            .into_iter()
+                            .collect(),
+                    }
+                }
+                storage_types::ReadSequenceNodeOperation::Query(_) => {
+                    unreachable!("independent Query roots are rejected before SQL execution")
+                }
+            };
+            ReadSequenceFlatRow {
+                node: node_id,
+                invocation_ordinal: 0,
+                input_refs: Default::default(),
+                result,
+            }
+        })
+        .collect();
+    Ok(ReadSequenceExecution::Executed(
+        storage_provider::ReadSequenceExecuted {
+            rows,
+            next_continuation: None,
+        },
+    ))
+}
+
 #[async_trait]
 impl StorageProvider for SQLiteStorageProvider {
+    async fn execute_read_sequence_plan(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if consistency == ReadSequenceConsistency::Eventual
+            && continuation.is_none()
+            && storage_provider::read_sequence_sql_mapped_source(plan).is_some()
+        {
+            return execute_sqlite_read_sequence_mapped(self, plan).await;
+        }
+        // The compiled statement path currently owns eventual reads only.  A
+        // STRONG request must retain the ordinary provider operation, which
+        // applies the backend's consistency contract per read; publishing an
+        // eventual compiled result would silently weaken the request.
+        if consistency != ReadSequenceConsistency::Eventual || plan.nodes.len() != 1 {
+            if consistency == ReadSequenceConsistency::Eventual && plan.nodes.len() > 1 {
+                return execute_sqlite_read_sequence_independent_roots(self, plan).await;
+            }
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        }
+        let Some(node) = plan.nodes.first() else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        if !node.inputs().is_empty() || node.iterate.is_some() || !node.after().is_empty() {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        }
+        let query_cursor = match continuation {
+            Some(token)
+                if matches!(
+                    &node.operation,
+                    storage_types::ReadSequenceNodeOperation::Query(_)
+                ) =>
+            {
+                match decode_sql_query_continuation(token) {
+                    Ok(cursor) => cursor,
+                    Err(()) => {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::Continuation,
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Ok(ReadSequenceExecution::Unsupported(
+                    storage_provider::ReadSequenceUnsupportedReason::Continuation,
+                ));
+            }
+            None => None,
+        };
+        let Some((metadata, table_name)) =
+            sqlite_read_sequence_metadata(self, node, query_cursor.as_ref()).await?
+        else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        let Some(statement) = compile_sqlite_read_sequence_statement(plan, &metadata)? else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+            ));
+        };
+        let parameters = statement
+            .parameters
+            .iter()
+            .map(|value| {
+                value.inner_string().map_err(|error| {
+                    StorageError::validation(format!(
+                        "read-sequence SQL key parameter must be scalar: {error}"
+                    ))
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let metadata_for_decode = metadata.clone();
+        let rows = crate::utils::call_sqlite(&self.connection, move |conn| {
+            let mut statement = conn.prepare(&statement.sql).map_err(map_sqlite_error)?;
+            let mut query = statement
+                .query(rusqlite::params_from_iter(parameters.iter()))
+                .map_err(map_sqlite_error)?;
+            let mut rows = Vec::new();
+            while let Some(row) = query.next().map_err(map_sqlite_error)? {
+                rows.push(sqlite_sql_row_to_envelope(row, &metadata_for_decode)?);
+            }
+            Ok(rows)
+        })
+        .await?;
+        let shape = match &node.operation {
+            storage_types::ReadSequenceNodeOperation::Get(_) => "get",
+            storage_types::ReadSequenceNodeOperation::BatchGet(_) => "batch_get",
+            storage_types::ReadSequenceNodeOperation::Query(_) => "query",
+        };
+        metrics::counter!(
+            "storage.read_sequence.sql.statements.total",
+            "dialect" => "sqlite",
+            "shape" => shape
+        )
+        .increment(1);
+        let ir = build_read_sequence_sql_ir(plan, &metadata)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        let decoded = decode_read_sequence_sql_rows(plan, &ir, rows)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        let (row, next_continuation) = match &node.operation {
+            storage_types::ReadSequenceNodeOperation::Get(_) => (
+                ReadSequenceFlatRow {
+                    node: storage_types::ReadSequenceNodeId::from_index(0),
+                    invocation_ordinal: 0,
+                    input_refs: Default::default(),
+                    result: ReadSequenceFlatResult::Get {
+                        item: decoded.first().map(|row| row.item.clone()),
+                    },
+                },
+                None,
+            ),
+            storage_types::ReadSequenceNodeOperation::BatchGet(_) => {
+                let items = decoded.into_iter().map(|row| row.item).collect();
+                let responses = [(table_name, items)].into_iter().collect();
+                (
+                    ReadSequenceFlatRow {
+                        node: storage_types::ReadSequenceNodeId::from_index(0),
+                        invocation_ordinal: 0,
+                        input_refs: Default::default(),
+                        result: ReadSequenceFlatResult::BatchGet { responses },
+                    },
+                    None,
+                )
+            }
+            storage_types::ReadSequenceNodeOperation::Query(_) => {
+                let limit = metadata
+                    .nodes
+                    .get(&storage_types::ReadSequenceNodeId::from_index(0))
+                    .and_then(|node| node.limit)
+                    .ok_or_else(|| StorageError::internal("compiled Query is missing a limit"))?
+                    as usize;
+                let mut items = decoded.into_iter().map(|row| row.item).collect::<Vec<_>>();
+                let has_more = items.len() > limit;
+                let cursor = has_more
+                    .then(|| {
+                        items
+                            .get(limit.saturating_sub(1))
+                            .map(|item| sql_item_key_attributes(item, &metadata))
+                    })
+                    .flatten();
+                items.truncate(limit);
+                let next = cursor
+                    .as_ref()
+                    .map(encode_sql_query_continuation)
+                    .transpose()?;
+                let count = items.len() as u32;
+                (
+                    ReadSequenceFlatRow {
+                        node: storage_types::ReadSequenceNodeId::from_index(0),
+                        invocation_ordinal: 0,
+                        input_refs: Default::default(),
+                        result: ReadSequenceFlatResult::Query {
+                            items,
+                            count,
+                            scanned_count: count,
+                            last_evaluated_key: cursor,
+                        },
+                    },
+                    next,
+                )
+            }
+        };
+        Ok(ReadSequenceExecution::Executed(
+            storage_provider::ReadSequenceExecuted {
+                rows: vec![row],
+                next_continuation,
+            },
+        ))
+    }
+
+    async fn execute_read_sequence_plan_with_budget(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+        budget: ReadSequenceExecutionBudget,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if budget.is_unbounded() {
+            return self
+                .execute_read_sequence_plan(plan, consistency, continuation)
+                .await;
+        }
+        let bounded_plan = match budget.bounded_query_plan(plan, DEFAULT_QUERY_LIMIT) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(ReadSequenceExecution::Unsupported(reason)),
+        };
+        self.execute_read_sequence_plan(&bounded_plan, consistency, continuation)
+            .await
+    }
+
     fn supports_guarded_writes(&self) -> bool {
         true
     }
@@ -466,6 +1472,7 @@ impl StorageProvider for SQLiteStorageProvider {
         let bytes_written = item.payload_len();
         let response = self
             .put_item_wire_internal(storage_types::PutItemEncodeRequest {
+                indexers: None,
                 table_name,
                 item,
                 condition_expression,
@@ -570,6 +1577,7 @@ impl StorageProvider for SQLiteStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            indexers,
         } = request;
         let condition = parse_optional_condition(
             condition_expression,
@@ -590,6 +1598,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     table_name: &table_name,
                     item: &item_for_write,
                     condition: &condition,
+                    indexers: Some(&indexers),
                     immediate_gsi_consistency,
                     return_old_on_condition_failure: false,
                     replication: None,
@@ -634,6 +1643,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     immediate_gsi_consistency,
                     return_old_on_condition_failure: false,
                     replication: None,
+                    old_indexers: None,
                     item_stream_ttl_hours: None,
                 },
             )
@@ -650,6 +1660,7 @@ impl StorageProvider for SQLiteStorageProvider {
         let UpdateItemRequest {
             table_name,
             key,
+            indexers,
             update_expression,
             condition_expression,
             expression_attribute_names,
@@ -686,6 +1697,7 @@ impl StorageProvider for SQLiteStorageProvider {
                         condition: &condition,
                         table_name: &table_name,
                         key: &key,
+                        indexers: indexers.as_deref(),
                         immediate_gsi_consistency,
                         return_old_on_condition_failure: false,
                         item_stream_ttl_hours: aux_item_stream_ttl_hours,
@@ -1026,7 +2038,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 total_items_updated += 1;
             }
             if let Some(put_request) = &item.put {
-                total_bytes_written += put_request.item.payload_len();
+                total_bytes_written += put_request.item.item().payload_len();
             }
         }
 
@@ -1055,10 +2067,20 @@ impl StorageProvider for SQLiteStorageProvider {
     ) -> StorageResult<storage_types::UpdateTableResponse> {
         let table_name = request.table_name.clone();
         let mut table_info = self.get_table_info(&table_name).await?;
+        let capacity_increase = crate::provider_core::table_lifecycle::requested_capacity_increase(
+            table_info.max_indexers,
+            request.max_indexers,
+        )?;
 
         // Transition to UPDATING
         self.update_table_status(&table_name, TableStatus::Updating)
             .await?;
+
+        if let Some(target) = capacity_increase {
+            self.increase_max_indexers(&table_info, target).await?;
+            table_info.max_indexers = target;
+            self.invalidate_table_info_cache(&table_name).await;
+        }
 
         // Apply StreamSpecification update if present
         if let Some(spec) = request.stream_specification.clone() {
@@ -1152,6 +2174,7 @@ impl StorageProvider for SQLiteStorageProvider {
                 created_at: table_info.created_at.into(),
                 attribute_definitions: table_info.attribute_definitions.clone(),
                 key_schema: table_info.key_schema.clone(),
+                max_indexers: table_info.max_indexers,
                 table_size_bytes: table_info.table_size_bytes,
                 item_count: table_info.item_count,
                 table_arn: format!(
@@ -1208,6 +2231,7 @@ impl StorageProvider for SQLiteStorageProvider {
                         table_name: &table_name,
                         item: &new_image,
                         condition: &None,
+                        indexers: mutation.new_indexers.as_deref(),
                         immediate_gsi_consistency,
                         return_old_on_condition_failure: false,
                         replication: Some(&metadata),
@@ -1233,6 +2257,7 @@ impl StorageProvider for SQLiteStorageProvider {
                     immediate_gsi_consistency,
                     return_old_on_condition_failure: false,
                     replication: Some(&metadata),
+                    old_indexers: mutation.old_indexers.as_deref(),
                     item_stream_ttl_hours: None,
                 },
             )

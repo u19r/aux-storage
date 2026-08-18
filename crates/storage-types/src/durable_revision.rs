@@ -41,6 +41,7 @@ impl DurableAbsenceProof {
 pub enum DurablePointReadProof {
     Present {
         item: Box<WireItem>,
+        indexers: Vec<String>,
         revision: DurableItemRevision,
     },
     Absent {
@@ -58,6 +59,7 @@ pub enum DurablePointReadGuard {
 pub struct GuardedPutItemRequest {
     pub table_name: TableName,
     pub item: HashMap<String, AttributeValue>,
+    pub indexers: Vec<String>,
     pub guard: DurablePointReadGuard,
     pub condition_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,

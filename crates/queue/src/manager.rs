@@ -45,6 +45,13 @@ impl QueueManager {
         Self { storage }
     }
 
+    /// Return and clear pressure signals from the queue backend so the
+    /// enclosing storage admission permit can observe consumed capacity.
+    #[must_use]
+    pub fn take_admission_pressure_signal(&self) -> bool {
+        self.storage.take_admission_pressure_signal()
+    }
+
     #[instrument(skip(self, request), fields(feature = "queue", queue_name = tracing::field::Empty))]
     pub async fn create_queue(
         &self,

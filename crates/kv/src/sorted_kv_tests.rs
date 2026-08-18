@@ -949,7 +949,12 @@ async fn scan_table_with_index() {
         )
         .unwrap()
         .unwrap();
-        let gsi_value = storage_types::storage_serde::to_bytes(&item).unwrap();
+        let gsi_value = crate::kv_support_tests::encode_table_item(
+            provider.kv_store.item_value_codec(),
+            &item,
+            None,
+            table_metadata.max_indexers,
+        );
 
         provider
             .kv_store

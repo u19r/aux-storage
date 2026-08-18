@@ -60,6 +60,7 @@ fn delete_table_response_converts_global_secondary_indexes_to_descriptions() {
 
 fn sample_table_info() -> StoredTableInfo {
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: TableName::new("Orders"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(1_700_000_000_000),

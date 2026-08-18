@@ -108,6 +108,8 @@ fn materialized_stream_id(target_version: i64) -> Result<(i64, bool)> {
             table_identity: &table_identity,
             table_name: &table_name,
             item_key: &item_key,
+            indexers: &[],
+            old_indexers: None,
         },
         br#"{"pk":{"S":"pk#1"}}"#,
         None,

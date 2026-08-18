@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use http_request::{HttpClient, StatusCode};
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, ConfirmSubscriptionRequest, ConfirmSubscriptionResponse,
@@ -18,6 +19,7 @@ use stream_provider::{
     SubscriptionDestination, SubscriptionMessage, SubscriptionMessageSender,
     SubscriptionSendOutcome,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     notification::{
@@ -27,6 +29,43 @@ use crate::{
     protocol::{PubsubAction, PubsubSuccess, SubscriptionView},
 };
 
+#[async_trait]
+pub trait PubsubDeliveryAdmission: Send + Sync {
+    async fn acquire(&self) -> PubsubResult<Box<dyn PubsubDeliveryPermit>>;
+}
+
+pub trait PubsubDeliveryPermit: Send {}
+
+struct BoundedDeliveryAdmission {
+    semaphore: Arc<Semaphore>,
+}
+
+struct BoundedDeliveryPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PubsubDeliveryPermit for BoundedDeliveryPermit {}
+
+#[async_trait]
+impl PubsubDeliveryAdmission for BoundedDeliveryAdmission {
+    async fn acquire(&self) -> PubsubResult<Box<dyn PubsubDeliveryPermit>> {
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map(|permit| {
+                Box::new(BoundedDeliveryPermit { _permit: permit }) as Box<dyn PubsubDeliveryPermit>
+            })
+            .map_err(|_| PubsubError::storage("pubsub delivery admission is closed"))
+    }
+}
+
+fn default_delivery_admission() -> Arc<dyn PubsubDeliveryAdmission> {
+    Arc::new(BoundedDeliveryAdmission {
+        semaphore: Arc::new(Semaphore::new(1)),
+    })
+}
+
 #[derive(Default)]
 pub struct PubsubManagerBuilder {
     provider: Option<Arc<dyn PubsubProvider>>,
@@ -34,6 +73,7 @@ pub struct PubsubManagerBuilder {
     subscription_message_sender: Option<Arc<dyn SubscriptionMessageSender>>,
     notification_signer: Option<Arc<dyn PubsubNotificationSigner>>,
     http_client: Option<HttpClient>,
+    delivery_admission: Option<Arc<dyn PubsubDeliveryAdmission>>,
     delivery_config: PubsubDeliveryConfig,
 }
 
@@ -77,6 +117,12 @@ impl PubsubManagerBuilder {
         self
     }
 
+    #[must_use]
+    pub fn delivery_admission(mut self, admission: Arc<dyn PubsubDeliveryAdmission>) -> Self {
+        self.delivery_admission = Some(admission);
+        self
+    }
+
     pub fn build(self) -> PubsubResult<PubsubManager> {
         let Some(provider) = self.provider else {
             return Err(PubsubError::validation_with_detail(
@@ -93,6 +139,9 @@ impl PubsubManagerBuilder {
                 Some(http_client) => Some(http_client),
                 None => Some(HttpClient::new().map_err(PubsubError::storage)?),
             },
+            delivery_admission: self
+                .delivery_admission
+                .unwrap_or_else(default_delivery_admission),
             delivery_config: self.delivery_config,
         })
     }
@@ -131,6 +180,7 @@ pub struct PubsubManager {
     subscription_message_sender: Option<Arc<dyn SubscriptionMessageSender>>,
     notification_signer: Option<Arc<dyn PubsubNotificationSigner>>,
     http_client: Option<HttpClient>,
+    delivery_admission: Arc<dyn PubsubDeliveryAdmission>,
     delivery_config: PubsubDeliveryConfig,
 }
 
@@ -148,8 +198,16 @@ impl PubsubManager {
             subscription_message_sender: None,
             notification_signer: None,
             http_client: None,
+            delivery_admission: default_delivery_admission(),
             delivery_config: PubsubDeliveryConfig::default(),
         }
+    }
+
+    /// Return and clear pressure signals from the pubsub backend so the
+    /// enclosing storage admission permit can observe consumed capacity.
+    #[must_use]
+    pub fn take_admission_pressure_signal(&self) -> bool {
+        self.provider.take_admission_pressure_signal()
     }
 
     pub async fn create_topic(&self, name: impl Into<String>) -> PubsubResult<CreateTopicResponse> {
@@ -266,6 +324,7 @@ impl PubsubManager {
     }
 
     pub async fn process_due_deliveries(&self, limit: usize) -> PubsubResult<usize> {
+        let _admission_permit = self.delivery_admission.acquire().await?;
         self.provider.materialize_publish_intents(limit).await?;
         let now = TimestampMillis::now();
         let lease_expires_at = TimestampMillis::from_timestamp(

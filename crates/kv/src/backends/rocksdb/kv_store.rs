@@ -211,6 +211,7 @@ impl RocksDbKvStore {
     async fn transact_write_table_once(
         &self,
         operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<OldNewItems>> {
         preflight_table_write_operations(&operations)?;
@@ -241,6 +242,8 @@ impl RocksDbKvStore {
             immediate_gsi_consistency,
         )?;
         apply_mutations(&txn, plan.mutations)?;
+
+        apply_direct_write_operations(&db_guard, &txn, direct_operations)?;
 
         txn.commit().map_err(map_rocksdb_transaction_commit)?;
 
@@ -301,55 +304,7 @@ impl RocksDbKvStore {
         let opts = write_options_sync();
         let otxn_opts = transaction_options_with_snapshot();
         let txn = db_guard.transaction_opt(&opts, &otxn_opts);
-        let mut placeholder_allocations = HashMap::new();
-
-        for operation in operations {
-            match operation {
-                DirectWriteOperation::Put { key, value } => {
-                    txn.put(&key, &value).map_err(|e| {
-                        StorageError::internal(&format!("put key-value failed: {e}"))
-                    })?;
-                }
-                DirectWriteOperation::PutTemplate { template, value } => {
-                    let key = materialize_rocksdb_template_key(
-                        &txn,
-                        &template,
-                        &mut placeholder_allocations,
-                    )?;
-                    txn.put(&key, &value).map_err(|e| {
-                        StorageError::internal(&format!("put templated key-value failed: {e}"))
-                    })?;
-                }
-                DirectWriteOperation::Delete { key } => {
-                    txn.delete(&key)
-                        .map_err(|e| StorageError::internal(&format!("delete key failed: {e}")))?;
-                }
-                DirectWriteOperation::DeleteRange {
-                    start,
-                    exclusive_end,
-                } => {
-                    let keys = range_keys(&db_guard, &start, &exclusive_end)?;
-                    for key in keys {
-                        txn.delete(&key).map_err(|e| {
-                            StorageError::internal(&format!("delete range key failed: {e}"))
-                        })?;
-                    }
-                }
-                DirectWriteOperation::CheckValue {
-                    key,
-                    expected_value,
-                } => {
-                    let current = txn.get_for_update(key.as_slice(), true).map_err(|e| {
-                        StorageError::internal(&format!(
-                            "read key for exact value check failed: {e}"
-                        ))
-                    })?;
-                    if current != expected_value {
-                        return Err(StorageEnum::ConditionalCheckFailed.into());
-                    }
-                }
-            }
-        }
+        apply_direct_write_operations(&db_guard, &txn, operations)?;
 
         txn.commit().map_err(map_rocksdb_transaction_commit)?;
 
@@ -465,7 +420,11 @@ impl SortedKvStore for RocksDbKvStore {
     ) -> StorageResult<Vec<OldNewItems>> {
         for attempt in 0..ROCKSDB_BATCH_WRITE_RETRIES {
             match self
-                .transact_write_table_once(operations.clone(), immediate_gsi_consistency)
+                .transact_write_table_once(
+                    operations.clone(),
+                    Vec::new(),
+                    immediate_gsi_consistency,
+                )
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -479,6 +438,37 @@ impl SortedKvStore for RocksDbKvStore {
             }
         }
         unreachable!("rocksdb table transaction retry loop returns on success or final failure")
+    }
+
+    async fn transact_write_table_with_direct_writes(
+        &self,
+        table_operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
+        for attempt in 0..ROCKSDB_BATCH_WRITE_RETRIES {
+            match self
+                .transact_write_table_once(
+                    table_operations.clone(),
+                    direct_operations.clone(),
+                    immediate_gsi_consistency,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if is_rocksdb_transaction_retryable(&error)
+                        && attempt + 1 < ROCKSDB_BATCH_WRITE_RETRIES =>
+                {
+                    warn!(attempt, error = %error, "rocksdb table transaction with direct writes retry");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!(
+            "rocksdb table transaction with direct writes retry loop returns on success or final \
+             failure"
+        )
     }
 
     async fn transact_write(
@@ -970,6 +960,55 @@ fn apply_mutations(
             KvMutation::Delete { key } => txn
                 .delete(&key)
                 .map_err(|e| StorageError::internal(&format!("delete key failed: {e}")))?,
+        }
+    }
+    Ok(())
+}
+
+fn apply_direct_write_operations(
+    db: &OptimisticTransactionDB,
+    txn: &Transaction<OptimisticTransactionDB>,
+    operations: Vec<DirectWriteOperation>,
+) -> StorageResult<()> {
+    let mut placeholder_allocations = HashMap::new();
+    for operation in operations {
+        match operation {
+            DirectWriteOperation::Put { key, value } => txn.put(&key, &value).map_err(|error| {
+                StorageError::internal(&format!("put key-value failed: {error}"))
+            })?,
+            DirectWriteOperation::PutTemplate { template, value } => {
+                let key =
+                    materialize_rocksdb_template_key(txn, &template, &mut placeholder_allocations)?;
+                txn.put(&key, &value).map_err(|error| {
+                    StorageError::internal(&format!("put templated key-value failed: {error}"))
+                })?;
+            }
+            DirectWriteOperation::Delete { key } => txn
+                .delete(&key)
+                .map_err(|error| StorageError::internal(&format!("delete key failed: {error}")))?,
+            DirectWriteOperation::DeleteRange {
+                start,
+                exclusive_end,
+            } => {
+                for key in range_keys(db, &start, &exclusive_end)? {
+                    txn.delete(&key).map_err(|error| {
+                        StorageError::internal(&format!("delete range key failed: {error}"))
+                    })?;
+                }
+            }
+            DirectWriteOperation::CheckValue {
+                key,
+                expected_value,
+            } => {
+                let current = txn.get_for_update(key.as_slice(), true).map_err(|error| {
+                    StorageError::internal(&format!(
+                        "read key for exact value check failed: {error}"
+                    ))
+                })?;
+                if current != expected_value {
+                    return Err(StorageEnum::ConditionalCheckFailed.into());
+                }
+            }
         }
     }
     Ok(())

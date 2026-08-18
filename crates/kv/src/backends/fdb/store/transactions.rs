@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Instant};
 
-use foundationdb::{Transaction, options};
+use foundationdb::{FdbError, Transaction, options};
 use futures_util::future::try_join_all;
 #[cfg(test)]
 use storage_common::provider_perf;
@@ -9,7 +9,7 @@ use storage_types::{StorageEnum, StorageResult, StreamItemId};
 use crate::{
     backends::{
         common::{
-            KvMutation, operation_requires_stream_entries, plan_table_write_preflighted,
+            KvMutation, operation_requires_stream_entries, plan_table_write_preflighted_with_codec,
             plan_transact_operation, preflight_table_write_operations, table_operation_primary_key,
         },
         fdb::{
@@ -20,16 +20,49 @@ use crate::{
             },
         },
     },
-    key_template::{PlaceholderBinding, PlaceholderId},
+    key_template::{
+        KeyTemplate, PlaceholderBinding, PlaceholderId, VersionstampedWriteConflictPolicy,
+    },
     sorted_kv_store::{
         DirectWriteOperation, OldNewItems, TransactWriteOperation, TransactWriteTableOperation,
     },
 };
 
+fn write_versionstamped_template(
+    trx: &Transaction,
+    template: &KeyTemplate,
+    prefix: &[u8],
+    value: &[u8],
+) -> Result<bool, FdbError> {
+    let Some(mut versioned) = template.foundationdb_key() else {
+        return Ok(false);
+    };
+    let mut composed = Vec::with_capacity(prefix.len() + versioned.len());
+    composed.extend_from_slice(prefix);
+    composed.extend_from_slice(&versioned);
+    adjust_versionstamp_offset(&mut composed, prefix.len());
+    versioned = composed;
+
+    // Only the typed unique-template variant is allowed to omit this conflict
+    // range.
+    if matches!(
+        template.versionstamped_write_conflict_policy(),
+        VersionstampedWriteConflictPolicy::OmitWriteConflictForUniqueKey
+    ) {
+        trx.set_option(options::TransactionOption::NextWriteNoWriteConflictRange)?;
+    }
+    trx.atomic_op(
+        &versioned,
+        value,
+        options::MutationType::SetVersionstampedKey,
+    );
+    Ok(true)
+}
+
 impl FoundationDbKvStore {
     pub(crate) async fn apply_mutations(
         &self,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         trx: &Transaction,
         mutations: Vec<KvMutation>,
         ordered_log_writes: &mut Vec<PendingOrderedLogWrite>,
@@ -65,20 +98,9 @@ impl FoundationDbKvStore {
             if let Some(ordered_log_write) = ordered_log_write {
                 ordered_log_writes.push(ordered_log_write);
             }
-            if let Some(mut versioned) = template.foundationdb_key() {
-                if let Some(prefix_bytes) = prefix {
-                    let mut composed = prefix_bytes.clone();
-                    composed.extend_from_slice(&versioned);
-                    adjust_versionstamp_offset(&mut composed, prefix_bytes.len());
-                    versioned = composed;
-                }
-
-                trx.atomic_op(
-                    &versioned,
-                    value,
-                    options::MutationType::SetVersionstampedKey,
-                );
-            } else {
+            if !write_versionstamped_template(trx, &template, prefix, value)
+                .map_err(|err| map_fdb_error("write versionstamped template", err))?
+            {
                 let key = template.rocks_key();
                 let prefixed = Self::prefix_bytes(prefix, &key);
                 trx.set(&prefixed, value);
@@ -92,7 +114,7 @@ impl FoundationDbKvStore {
         &self,
         trx: &Transaction,
         operations: &[TransactWriteOperation],
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
     ) -> StorageResult<(
         Vec<OldNewItems>,
         HashMap<PlaceholderId, PlaceholderBinding>,
@@ -171,7 +193,7 @@ impl FoundationDbKvStore {
         trx: &Transaction,
         operations: &[TransactWriteTableOperation],
         stream_ids: &[Option<StreamItemId>],
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         immediate_gsi_consistency: bool,
     ) -> Result<FdbTableWriteExecution, FdbTableWriteExecutionError> {
         preflight_table_write_operations(operations)?;
@@ -202,11 +224,12 @@ impl FoundationDbKvStore {
         );
 
         let plan_started = Instant::now();
-        let plan = plan_table_write_preflighted(
+        let plan = plan_table_write_preflighted_with_codec(
             operations,
             current_values,
             stream_ids,
             immediate_gsi_consistency,
+            crate::sorted_kv_store::ItemValueCodec::FoundationDbTuple,
         )?;
         let plan_elapsed = plan_started.elapsed();
         #[cfg(test)]
@@ -278,11 +301,36 @@ impl FoundationDbKvStore {
         })
     }
 
+    pub(crate) async fn execute_transact_write_table_with_direct_writes_tx(
+        &self,
+        trx: &Transaction,
+        table_operations: &[TransactWriteTableOperation],
+        direct_operations: &[DirectWriteOperation],
+        stream_ids: &[Option<StreamItemId>],
+        prefix: &[u8],
+        immediate_gsi_consistency: bool,
+    ) -> Result<FdbTableWriteExecution, FdbTableWriteExecutionError> {
+        let mut execution = self
+            .execute_transact_write_table_tx(
+                trx,
+                table_operations,
+                stream_ids,
+                prefix,
+                immediate_gsi_consistency,
+            )
+            .await?;
+        execution.ordered_log_writes.extend(
+            self.execute_transact_write_unchecked_tx(trx, direct_operations, prefix)
+                .await?,
+        );
+        Ok(execution)
+    }
+
     pub(crate) async fn execute_transact_write_unchecked_tx(
         &self,
         trx: &Transaction,
         operations: &[DirectWriteOperation],
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
     ) -> Result<Vec<PendingOrderedLogWrite>, FdbTableWriteExecutionError> {
         let mut ordered_log_writes = Vec::new();
         let mut ordered_log_family_cache = OrderedLogFamilyCache::new();
@@ -305,20 +353,11 @@ impl FoundationDbKvStore {
                     if let Some(ordered_log_write) = ordered_log_write {
                         ordered_log_writes.push(ordered_log_write);
                     }
-                    if let Some(mut versioned) = template.foundationdb_key() {
-                        if let Some(prefix_bytes) = prefix {
-                            let mut composed = prefix_bytes.clone();
-                            composed.extend_from_slice(&versioned);
-                            adjust_versionstamp_offset(&mut composed, prefix_bytes.len());
-                            versioned = composed;
-                        }
-
-                        trx.atomic_op(
-                            &versioned,
-                            value,
-                            options::MutationType::SetVersionstampedKey,
-                        );
-                    } else {
+                    if !write_versionstamped_template(trx, &template, prefix, value).map_err(
+                        |err| {
+                            FdbTableWriteExecutionError::fdb("write versionstamped template", err)
+                        },
+                    )? {
                         let key = template.rocks_key();
                         let prefixed = Self::prefix_bytes(prefix, &key);
                         trx.set(&prefixed, value);

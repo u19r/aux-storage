@@ -159,7 +159,9 @@ fn proposal(
             table_name: TableName::new("table"),
             key_json: key_json(write_key),
             item_json: format!(r#"{{"pk":{{"S":"{write_key}"}}}}"#),
+            indexers: Vec::new(),
             old_item_json: None,
+            old_indexers: None,
             target_item_stream_version: ItemStreamVersion::new(version),
             response: SyncMutationResponse::default(),
         })

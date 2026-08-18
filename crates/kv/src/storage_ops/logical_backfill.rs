@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     SortedKvDbStorageProvider,
-    backends::common::plan_table_write,
+    backends::common::plan_table_write_with_codec,
     helpers::increment_bytes,
     keyspace::{
         compact::{self, TableStorageId},
@@ -114,10 +114,10 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         request: &ScanTableRequest,
     ) -> StorageResult<(Vec<ItemVersionedWireItem>, Option<String>)> {
-        let (items, next_cursor) = <Self as StorageProvider>::scan_table(self, request).await?;
+        let (items, next_cursor) = self.scan_base_items_with_indexers(request).await?;
         let table_info = self.get_table_info(&request.table_name).await?;
         let mut versioned = Vec::with_capacity(items.len());
-        for item in items {
+        for (item, indexers) in items {
             let item_map = item.to_attribute_map()?;
             let split = split_item_into_key_and_attributes_sync(item_map, &table_info)?;
             let item_stream_version = self
@@ -126,6 +126,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 .unwrap_or_else(|| ItemStreamVersion::new(0));
             versioned.push(ItemVersionedWireItem {
                 item,
+                indexers,
                 item_stream_version,
             });
         }
@@ -137,11 +138,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         request: DurablePointReadRequest,
     ) -> StorageResult<DurablePointReadProof> {
         let item = self
-            .get_item(
-                request.table_name.clone(),
-                request.key.clone(),
-                request.consistent_read,
-            )
+            .get_wire_item_with_indexers(&request.table_name, &request.key, request.consistent_read)
             .await?;
         let revision = self
             .current_item_stream_version(&request.table_name, &request.key)
@@ -150,8 +147,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .to_be_bytes()
             .to_vec();
         Ok(match item {
-            Some(item) => DurablePointReadProof::Present {
+            Some((item, indexers)) => DurablePointReadProof::Present {
                 item: Box::new(item),
+                indexers,
                 revision: DurableItemRevision::new(revision),
             },
             None => DurablePointReadProof::Absent {
@@ -238,6 +236,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     StorageError::validation(format!("logical export key encoding failed: {error}"))
                 })?,
                 item_json: serde_json::to_string(&item)?,
+                indexers: versioned.indexers,
                 item_stream_version: versioned.item_stream_version,
             });
         }
@@ -318,11 +317,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let item_key = table_keys::item_key(&table_metadata.identity, &item_key)?;
         let old_item = self.kv_store.get(&item_key, true).await?;
         let ttl_config = self.load_ttl_config(&table_name).await?;
-        let plan = plan_table_write(
+        let plan = plan_table_write_with_codec(
             &[TransactWriteTableOperation::Put {
                 table_identity: table_metadata.identity.clone(),
                 table_info,
                 item,
+                indexers: None,
                 item_stream_ttl_hours: None,
                 condition: None,
                 return_values_on_condition_check_failure: None,
@@ -332,6 +332,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             vec![old_item],
             &[Some(storage_types::StreamItemId::from(item_stream_version))],
             self.immediate_gsi_consistency,
+            self.kv_store.item_value_codec(),
         )?;
         let mut operations = plan
             .mutations
@@ -371,7 +372,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let item_key = table_keys::item_key(&table_metadata.identity, &item_key)?;
         let old_item = self.kv_store.get(&item_key, true).await?;
         let ttl_config = self.load_ttl_config(&table_name).await?;
-        let plan = plan_table_write(
+        let plan = plan_table_write_with_codec(
             &[TransactWriteTableOperation::Delete {
                 table_identity: table_metadata.identity.clone(),
                 table_info,
@@ -388,6 +389,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 tombstone.item_stream_version,
             ))],
             self.immediate_gsi_consistency,
+            self.kv_store.item_value_codec(),
         )?;
         let mut operations = plan
             .mutations
@@ -413,10 +415,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             None => TableStorageId::new(1),
         };
         let next_table_id = TableStorageId::new(table_id.get().saturating_add(1));
-        let identity = TableIdentity::user_indexes_for_table(
+        let identity = TableIdentity::user_indexes_for_table_with_tenant(
             table_id,
             &table_info.table_name,
             table_info.global_secondary_indexes.as_deref(),
+            self.kv_store.tenant_keyspace(),
         );
         let metadata = StoredTableMetadata::active(identity, table_info.clone());
         let name_lookup_key =

@@ -1,4 +1,4 @@
-use crate::backends::turso::provider::storage_provider_impl::*;
+use crate::{GsiPhysicalName, backends::turso::provider::storage_provider_impl::*};
 
 impl TursoStorageProvider {
     pub(crate) async fn create_table_operation(
@@ -45,6 +45,7 @@ impl TursoStorageProvider {
                     TursoValue::Integer(*metadata.created_at),
                     TursoValue::Text(metadata.attribute_definitions_json),
                     TursoValue::Text(metadata.key_schema_json),
+                    TursoValue::Integer(i64::from(metadata.max_indexers.get())),
                     option_string_to_value(metadata.global_secondary_indexes_json),
                     TursoValue::Integer(0),
                     TursoValue::Integer(0),
@@ -78,6 +79,7 @@ impl TursoStorageProvider {
                     &request.attribute_definitions,
                     &request.key_schema,
                     stored_gsis.as_deref(),
+                    request.max_indexers,
                     rowid_mode,
                 );
                 let _ = this.execute(conn, &create_sql, Vec::new()).await?;
@@ -88,6 +90,7 @@ impl TursoStorageProvider {
                         &request.attribute_definitions,
                         &request.key_schema,
                         gsis,
+                        request.max_indexers,
                         rowid_mode,
                     ) {
                         let _ = this.execute(conn, &sql, Vec::new()).await?;
@@ -171,6 +174,84 @@ impl TursoStorageProvider {
         request: storage_types::UpdateTableRequest,
     ) -> StorageResult<storage_types::UpdateTableResponse> {
         let mut table_info = self.get_table_info(&request.table_name).await?;
+        let capacity_increase = crate::provider_core::table_lifecycle::requested_capacity_increase(
+            table_info.max_indexers,
+            request.max_indexers,
+        )?;
+        if let Some(target) = capacity_increase {
+            let _ddl_guard = self.ddl_lock.lock().await;
+            let this = self.clone();
+            let capacity_table_info = table_info.clone();
+            self.with_exclusive_transaction(true, |conn| {
+                let this = this.clone();
+                let table_info = capacity_table_info.clone();
+                Box::pin(async move {
+                    let _ = this
+                        .execute(
+                            conn,
+                            sql_statements::update_table_status(),
+                            vec![
+                                TursoValue::Text("UPDATING".to_string()),
+                                TursoValue::Text(table_info.table_name.to_string()),
+                            ],
+                        )
+                        .await?;
+                    let mut physical_tables = Vec::with_capacity(
+                        1 + table_info
+                            .global_secondary_indexes
+                            .as_ref()
+                            .map_or(0, Vec::len),
+                    );
+                    physical_tables
+                        .push(format!("table_{}", table_info.table_name.sanitized_name()));
+                    if let Some(gsis) = table_info.global_secondary_indexes.as_ref() {
+                        physical_tables.extend(gsis.iter().map(|gsi| {
+                            GsiPhysicalName::compose(
+                                &table_info.table_name.sanitized_name(),
+                                &gsi.index_name.sanitized_name(),
+                            )
+                            .to_string()
+                        }));
+                    }
+                    for ordinal in table_info.max_indexers.as_usize()..target.as_usize() {
+                        let column = crate::utils::indexer_column_name(ordinal);
+                        for physical_table in &physical_tables {
+                            let _ = this
+                                .execute(
+                                    conn,
+                                    &format!(
+                                        "ALTER TABLE \"{physical_table}\" ADD COLUMN \"{column}\" \
+                                         TEXT"
+                                    ),
+                                    Vec::new(),
+                                )
+                                .await?;
+                        }
+                    }
+                    let changed = this
+                        .execute(
+                            conn,
+                            "UPDATE tables SET max_indexers = ?1, table_status = 'ACTIVE' WHERE \
+                             table_name = ?2",
+                            vec![
+                                TursoValue::Integer(i64::from(target.get())),
+                                TursoValue::Text(table_info.table_name.to_string()),
+                            ],
+                        )
+                        .await?;
+                    if changed != 1 {
+                        return Err(StorageError::internal(
+                            "max indexer metadata update did not affect one table",
+                        ));
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+            table_info.max_indexers = target;
+            table_info.table_status = TableStatus::Active;
+            self.invalidate_table_cache(&request.table_name).await;
+        }
         if let Some(deletion_protection_enabled) = request.deletion_protection_enabled {
             let conn = self.connect().await?;
             let _ = self
@@ -252,6 +333,7 @@ impl TursoStorageProvider {
                 created_at: table_info.created_at.into(),
                 attribute_definitions: table_info.attribute_definitions,
                 key_schema: table_info.key_schema,
+                max_indexers: table_info.max_indexers,
                 table_size_bytes: table_info.table_size_bytes,
                 item_count: table_info.item_count,
                 table_arn: format!(

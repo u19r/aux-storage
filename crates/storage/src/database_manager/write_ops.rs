@@ -7,11 +7,11 @@ use storage_provider::{
 use storage_sync::SyncWriteRequest;
 use storage_types::{
     AllOld, AttributeMap, AttributeValue, ExprNameRef, ExprValueRef, GuardedDeleteItemRequest,
-    GuardedPutItemRequest, GuardedUpdateItemRequest, KeyAttributes, KeyRef, PutItemEncodeRequest,
-    PutItemRequest, PutItemResponse, ReturnValuesOldNewUpdated, StorageEnum, StorageError,
-    StorageResult, TableName, TableNamespace, UpdateItemRequest, UpdateItemResponse, WireItem,
-    WriteRetryPolicy, context::WrappedError as _, expr_names_to_map, expr_values_to_map,
-    validate_expression_attribute_usage,
+    GuardedPutItemRequest, GuardedUpdateItemRequest, IndexedWireItem, IndexerDeclaration,
+    KeyAttributes, KeyRef, PutItemEncodeRequest, PutItemRequest, PutItemResponse,
+    ReturnValuesOldNewUpdated, StorageEnum, StorageError, StorageResult, TableName, TableNamespace,
+    UpdateItemRequest, UpdateItemResponse, WireItem, WriteRetryPolicy, context::WrappedError as _,
+    expr_names_to_map, expr_values_to_map, validate_expression_attribute_usage,
 };
 
 use crate::{
@@ -32,6 +32,7 @@ struct PreparedPutItem {
     operation: ResolvedStorageOperation,
     item: PutItemPayload,
     logical_item: HashMap<String, AttributeValue>,
+    indexers: Option<Vec<String>>,
     condition_expression: Option<String>,
     expression_attribute_names: Option<HashMap<String, String>>,
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -145,6 +146,7 @@ impl DatabaseManager {
         let PutItemInput {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -152,6 +154,8 @@ impl DatabaseManager {
             return_old_on_condition_failure,
             aux_item_stream_ttl_hours,
         } = input;
+        let declaration_names = indexers.as_deref().unwrap_or_default();
+        IndexerDeclaration::validate(declaration_names, operation.table_info.max_indexers)?;
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
@@ -164,6 +168,11 @@ impl DatabaseManager {
             refresh_existing_updated_at_on_put_payload(&mut item)?;
         }
         let logical_item = item.clone().into_attribute_map()?;
+        let declaration = IndexerDeclaration::try_new(
+            declaration_names.to_vec(),
+            operation.table_info.max_indexers,
+        )?;
+        IndexedWireItem::validate_logical_item(&logical_item, &declaration)?;
         storage_types::validate_item_key_attributes_for_schema(
             &operation.table_info.key_schema,
             &logical_item,
@@ -175,6 +184,7 @@ impl DatabaseManager {
             operation,
             item,
             logical_item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -214,6 +224,7 @@ impl DatabaseManager {
         let PreparedPutItem {
             operation,
             logical_item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -227,6 +238,7 @@ impl DatabaseManager {
         let request = PutItemRequest {
             table_name,
             item: logical_item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -271,6 +283,7 @@ impl DatabaseManager {
         let PreparedPutItem {
             operation,
             item,
+            indexers,
             logical_item: _,
             condition_expression,
             expression_attribute_names,
@@ -289,6 +302,7 @@ impl DatabaseManager {
                         PutItemInput {
                             table_name,
                             item,
+                            indexers,
                             condition_expression,
                             expression_attribute_names,
                             expression_attribute_values,
@@ -316,6 +330,7 @@ impl DatabaseManager {
         let PutItemInput {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -325,45 +340,60 @@ impl DatabaseManager {
         } = input;
         match item {
             PutItemPayload::AttributeMap(item) => {
-                record_storage_operation(
-                    "put_item",
-                    self.storage.put_item_request_with_retry(
-                        PutItemRequest {
-                            table_name,
-                            item,
-                            condition_expression,
-                            expression_attribute_names,
-                            expression_attribute_values,
-                            expected: None,
-                            conditional_operator: None,
-                            return_values,
-                            return_consumed_capacity: None,
-                            return_item_collection_metrics: None,
-                            return_values_on_condition_check_failure:
-                                return_old_on_condition_failure.then(|| "ALL_OLD".to_string()),
-                            aux_item_stream_ttl_hours,
-                        },
-                        retry_policy,
-                    ),
+                self.run_default_admitted(
+                    crate::admission::AdmissionClass::Write,
+                    |provider| async move {
+                        record_storage_operation(
+                            "put_item",
+                            provider.put_item_request_with_retry(
+                                PutItemRequest {
+                                    table_name,
+                                    item,
+                                    indexers,
+                                    condition_expression,
+                                    expression_attribute_names,
+                                    expression_attribute_values,
+                                    expected: None,
+                                    conditional_operator: None,
+                                    return_values,
+                                    return_consumed_capacity: None,
+                                    return_item_collection_metrics: None,
+                                    return_values_on_condition_check_failure:
+                                        return_old_on_condition_failure
+                                            .then(|| "ALL_OLD".to_string()),
+                                    aux_item_stream_ttl_hours,
+                                },
+                                retry_policy,
+                            ),
+                        )
+                        .await
+                    },
                 )
                 .await
             }
             PutItemPayload::WireItem(item) => {
-                record_storage_operation(
-                    "put_item",
-                    self.storage.put_item_encode_with_retry(
-                        PutItemEncodeRequest {
-                            table_name,
-                            item: *item,
-                            condition_expression,
-                            expression_attribute_names,
-                            expression_attribute_values,
-                            return_values,
-                            return_old_on_condition_failure,
-                            aux_item_stream_ttl_hours,
-                        },
-                        retry_policy,
-                    ),
+                self.run_default_admitted(
+                    crate::admission::AdmissionClass::Write,
+                    |provider| async move {
+                        record_storage_operation(
+                            "put_item",
+                            provider.put_item_encode_with_retry(
+                                PutItemEncodeRequest {
+                                    table_name,
+                                    item: *item,
+                                    indexers,
+                                    condition_expression,
+                                    expression_attribute_names,
+                                    expression_attribute_values,
+                                    return_values,
+                                    return_old_on_condition_failure,
+                                    aux_item_stream_ttl_hours,
+                                },
+                                retry_policy,
+                            ),
+                        )
+                        .await
+                    },
                 )
                 .await
             }
@@ -378,6 +408,7 @@ impl DatabaseManager {
     ) -> StorageResult<PutItemResponse> {
         let PreparedPutItem {
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -396,6 +427,7 @@ impl DatabaseManager {
 
         let target_count = route.write_targets.len();
         let mut routed_item_map = WriteTargetSet::new(target_count, item_map, "put_item.item")?;
+        let mut routed_indexers = WriteTargetSet::new(target_count, indexers, "put_item.indexers")?;
         let mut routed_condition_expression = WriteTargetSet::new(
             target_count,
             condition_expression,
@@ -424,10 +456,14 @@ impl DatabaseManager {
                 let mut response = self
                     .execute_routed_write_targets(
                         &route,
+                        crate::database_manager::core::AdmissionLane::Foreground(
+                            crate::admission::AdmissionClass::Write,
+                        ),
                         "put_item routing produced no write targets",
                         |provider, target, target_index, target_role| {
                             let table_name = target.table_name.clone();
                             let item = routed_item_map.take(target_index);
+                            let indexers = routed_indexers.take(target_index);
                             let condition_expression =
                                 routed_condition_expression.take(target_index);
                             let expression_attribute_names =
@@ -445,6 +481,7 @@ impl DatabaseManager {
                                         PutItemRequest {
                                             table_name,
                                             item: item?,
+                                            indexers: indexers?,
                                             condition_expression: condition_expression?,
                                             expression_attribute_names: expression_attribute_names?,
                                             expression_attribute_values:
@@ -655,29 +692,36 @@ impl DatabaseManager {
         {
             return Ok(response);
         }
+        let request = storage_types::DeleteItemRequest {
+            table_name,
+            key,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            expected: None,
+            conditional_operator: None,
+            return_values: None,
+            return_consumed_capacity: None,
+            return_item_collection_metrics: None,
+            return_values_on_condition_check_failure: return_old_on_condition_failure
+                .then(|| "ALL_OLD".to_string()),
+            aux_item_stream_ttl_hours,
+        };
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
-                let response = record_storage_operation(
-                    "delete_item",
-                    self.storage
-                        .delete_item_request(storage_types::DeleteItemRequest {
-                            table_name,
-                            key,
-                            condition_expression,
-                            expression_attribute_names,
-                            expression_attribute_values,
-                            expected: None,
-                            conditional_operator: None,
-                            return_values: None,
-                            return_consumed_capacity: None,
-                            return_item_collection_metrics: None,
-                            return_values_on_condition_check_failure:
-                                return_old_on_condition_failure.then(|| "ALL_OLD".to_string()),
-                            aux_item_stream_ttl_hours,
-                        }),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "delete_item",
+                                provider.delete_item_request(request),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -737,6 +781,9 @@ impl DatabaseManager {
                 let mut response = self
                     .execute_routed_write_targets(
                         &route,
+                        crate::database_manager::core::AdmissionLane::Foreground(
+                            crate::admission::AdmissionClass::Write,
+                        ),
                         "delete_item routing produced no write targets",
                         |provider, target, target_index, target_role| {
                             let table_name = target.table_name.clone();
@@ -835,6 +882,7 @@ impl DatabaseManager {
             table_name,
             key,
             update_expression,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -842,6 +890,9 @@ impl DatabaseManager {
             return_old_on_condition_failure,
             aux_item_stream_ttl_hours,
         } = input;
+        if let Some(indexers) = indexers.as_deref() {
+            IndexerDeclaration::validate(indexers, operation.table_info.max_indexers)?;
+        }
         let mut update_expression = update_expression;
         let mut expression_attribute_names = expression_attribute_names;
         let mut expression_attribute_values = expression_attribute_values;
@@ -896,6 +947,7 @@ impl DatabaseManager {
             UpdateItemRequest::builder()
                 .table_name(table_name)
                 .key(key)
+                .indexers(indexers)
                 .condition_expression(condition_expression)
                 .expression_attribute_names(expression_attribute_names)
                 .expression_attribute_values(expression_attribute_values)
@@ -910,6 +962,7 @@ impl DatabaseManager {
                 .table_name(table_name)
                 .key(key)
                 .update_expression(update_expression)
+                .indexers(indexers)
                 .condition_expression(condition_expression)
                 .expression_attribute_names(expression_attribute_names)
                 .expression_attribute_values(expression_attribute_values)
@@ -1007,11 +1060,18 @@ impl DatabaseManager {
         self.execute_with_cache_effects(
             prepared_cache,
             || async {
-                let response = record_storage_operation(
-                    "update_item",
-                    self.storage.update_item(request.clone()),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "update_item",
+                                provider.update_item(request.clone()),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -1076,6 +1136,9 @@ impl DatabaseManager {
                 let mut response = self
                     .execute_routed_write_targets(
                         &route,
+                        crate::database_manager::core::AdmissionLane::Foreground(
+                            crate::admission::AdmissionClass::Write,
+                        ),
                         "update_item routing produced no write targets",
                         |provider, target, target_index, target_role| {
                             let request_for_target = routed_requests.take(target_index);
@@ -1206,6 +1269,7 @@ impl DatabaseManager {
         let PreparedPutItem {
             operation,
             logical_item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -1215,7 +1279,7 @@ impl DatabaseManager {
             ..
         } = prepared;
         let table_name = &operation.logical_table_name;
-        if !self.storage.supports_guarded_writes() {
+        if !self.default_supports_guarded_writes() {
             guarded_write::record_unsupported_fallback("put_item");
             return Ok(None);
         }
@@ -1262,17 +1326,22 @@ impl DatabaseManager {
         let guarded = GuardedPutItemRequest {
             table_name: table_name.clone(),
             item: logical_item.clone(),
+            indexers: indexers.clone().unwrap_or_default(),
             guard: preimage.guard,
             condition_expression: condition_expression.clone(),
             expression_attribute_names: expression_attribute_names.clone(),
             expression_attribute_values: expression_attribute_values.clone(),
             return_values: return_values.clone(),
         };
-        let response = match record_storage_operation(
-            "guarded_put_item",
-            self.storage.guarded_put_item(guarded),
-        )
-        .await
+        let response = match self
+            .run_default_admitted(
+                crate::admission::AdmissionClass::Write,
+                |provider| async move {
+                    record_storage_operation("guarded_put_item", provider.guarded_put_item(guarded))
+                        .await
+                },
+            )
+            .await
         {
             Ok(response) => response,
             Err(error) if guarded_write::should_fallback(&error) => {
@@ -1311,7 +1380,7 @@ impl DatabaseManager {
             return_old_on_condition_failure,
             ..
         } = input;
-        if !self.storage.supports_guarded_writes() {
+        if !self.default_supports_guarded_writes() {
             guarded_write::record_unsupported_fallback("delete_item");
             return Ok(None);
         }
@@ -1357,11 +1426,18 @@ impl DatabaseManager {
             expression_attribute_names,
             expression_attribute_values,
         };
-        let response = match record_storage_operation(
-            "guarded_delete_item",
-            self.storage.guarded_delete_item(guarded),
-        )
-        .await
+        let response = match self
+            .run_default_admitted(
+                crate::admission::AdmissionClass::Write,
+                |provider| async move {
+                    record_storage_operation(
+                        "guarded_delete_item",
+                        provider.guarded_delete_item(guarded),
+                    )
+                    .await
+                },
+            )
+            .await
         {
             Ok(response) => response,
             Err(error) if guarded_write::should_fallback(&error) => {
@@ -1393,7 +1469,7 @@ impl DatabaseManager {
         response_operations: Option<Vec<String>>,
         customer_return_values: Option<ReturnValuesOldNewUpdated>,
     ) -> StorageResult<Option<UpdateItemResponse>> {
-        if !self.storage.supports_guarded_writes() {
+        if !self.default_supports_guarded_writes() {
             guarded_write::record_unsupported_fallback("update_item");
             return Ok(None);
         }
@@ -1452,11 +1528,18 @@ impl DatabaseManager {
             request: request.clone(),
             guard,
         };
-        let provider_response = match record_storage_operation(
-            "guarded_update_item",
-            self.storage.guarded_update_item(guarded),
-        )
-        .await
+        let provider_response = match self
+            .run_default_admitted(
+                crate::admission::AdmissionClass::Write,
+                |provider| async move {
+                    record_storage_operation(
+                        "guarded_update_item",
+                        provider.guarded_update_item(guarded),
+                    )
+                    .await
+                },
+            )
+            .await
         {
             Ok(response) => response,
             Err(error) if guarded_write::should_fallback(&error) => {
@@ -1522,6 +1605,7 @@ impl DatabaseManager {
             table_name,
             key: key.to_map().into(),
             update_expression,
+            indexers: None,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,

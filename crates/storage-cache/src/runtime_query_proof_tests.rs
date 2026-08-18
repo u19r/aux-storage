@@ -566,6 +566,7 @@ fn plan_runtime_query_execution_collapses_whole_page_and_prefix_paths() {
         prefix_only,
         RuntimePreparedQueryExecution::PrefixOnly {
             items: vec!["item1".to_string(), "item2".to_string()],
+            last_evaluated_key: "resume".to_string(),
         }
     );
 }

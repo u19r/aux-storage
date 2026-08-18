@@ -26,6 +26,7 @@ async fn sync_resolver_resolves_put_item_without_writing() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "open"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -83,6 +84,7 @@ async fn sync_resolver_uses_durable_item_revision_for_target_version() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name,
                 item: item("item#1", "closed"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -128,6 +130,7 @@ async fn sync_resolver_reuses_condition_expression_semantics() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name,
                 item: item("item#1", "closed"),
+                indexers: None,
                 condition_expression: Some("attribute_not_exists(pk)".to_string()),
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -165,6 +168,7 @@ async fn sync_resolver_batch_write_uses_overlay_for_later_operations() {
                         WriteRequest {
                             put_request: Some(PutRequest {
                                 item: item("item#1", "open"),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,

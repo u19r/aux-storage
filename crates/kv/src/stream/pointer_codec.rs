@@ -1,14 +1,15 @@
 use storage_types::{
     ItemStreamVersion, ReplicationEventMetadata, StorageError, StorageResult, StreamName, TableName,
 };
-use stream_provider::{EmbeddedStreamItem, StreamDataType, StreamPointer};
+use stream_provider::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
 
 use crate::keyspace::{compact::TableStorageId, table_identity::TableIdentity};
 
 const COMPACT_POINTER_MAGIC: u8 = b'P';
-const COMPACT_POINTER_VERSION: u8 = 1;
+const COMPACT_POINTER_VERSION: u8 = 3;
 const FLAG_EMBEDDED: u8 = 0b0000_0001;
 const FLAG_REPLICATION: u8 = 0b0000_0010;
+const FLAG_OLD_INDEXERS: u8 = 0b0000_0100;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompactStoredStreamPointer {
@@ -17,6 +18,8 @@ pub(crate) struct CompactStoredStreamPointer {
     pub(crate) item_stream_version: ItemStreamVersion,
     pub(crate) items: Option<Vec<EmbeddedStreamItem>>,
     pub(crate) replication: Option<ReplicationEventMetadata>,
+    pub(crate) indexers: Vec<String>,
+    pub(crate) old_indexers: Option<Vec<String>>,
 }
 
 impl CompactStoredStreamPointer {
@@ -25,6 +28,8 @@ impl CompactStoredStreamPointer {
         item_scope: Vec<u8>,
         item_stream_version: ItemStreamVersion,
         replication: Option<ReplicationEventMetadata>,
+        indexers: Vec<String>,
+        old_indexers: Option<Vec<String>>,
     ) -> Self {
         Self {
             table_id: table.table_id,
@@ -32,6 +37,8 @@ impl CompactStoredStreamPointer {
             item_stream_version,
             items: None,
             replication,
+            indexers,
+            old_indexers,
         }
     }
 
@@ -41,6 +48,8 @@ impl CompactStoredStreamPointer {
         item_stream_version: ItemStreamVersion,
         items: Vec<EmbeddedStreamItem>,
         replication: Option<ReplicationEventMetadata>,
+        indexers: Vec<String>,
+        old_indexers: Option<Vec<String>>,
     ) -> Self {
         Self {
             table_id: table.table_id,
@@ -48,24 +57,39 @@ impl CompactStoredStreamPointer {
             item_stream_version,
             items: Some(items),
             replication,
+            indexers,
+            old_indexers,
         }
     }
 
-    pub(crate) fn stream_pointer(
-        &self,
+    pub(crate) fn into_stored_pointer(
+        self,
         table: &TableIdentity,
-        pointer_stream_item_id: storage_types::StreamItemId,
-    ) -> StorageResult<StreamPointer> {
+    ) -> StorageResult<StoredStreamPointer> {
         if table.table_id != self.table_id {
             return Err(StorageError::internal(
                 "compact stream pointer table id does not match metadata",
             ));
         }
-        Ok(StreamPointer {
-            stream_name: item_stream_name(&table.table_name, &self.item_scope),
-            table_name: table.table_name.clone(),
-            item_stream_version: self.item_stream_version,
-            stream_item_id: pointer_stream_item_id,
+        let stream_name = item_stream_name(&table.table_name, &self.item_scope);
+        Ok(match self.items {
+            Some(items) => StoredStreamPointer::Embedded {
+                stream_name,
+                table_name: table.table_name.clone(),
+                item_stream_version: self.item_stream_version,
+                items,
+                indexers: self.indexers,
+                old_indexers: self.old_indexers,
+                replication: self.replication,
+            },
+            None => StoredStreamPointer::Pointer {
+                stream_name,
+                table_name: table.table_name.clone(),
+                item_stream_version: self.item_stream_version,
+                indexers: self.indexers,
+                old_indexers: self.old_indexers,
+                replication: self.replication,
+            },
         })
     }
 }
@@ -80,6 +104,9 @@ pub(crate) fn encode_compact_pointer(
     if pointer.replication.is_some() {
         flags |= FLAG_REPLICATION;
     }
+    if pointer.old_indexers.is_some() {
+        flags |= FLAG_OLD_INDEXERS;
+    }
 
     let item_scope_len = u32::try_from(pointer.item_scope.len())
         .map_err(|_| StorageError::internal("compact stream pointer item scope is too large"))?;
@@ -91,6 +118,21 @@ pub(crate) fn encode_compact_pointer(
     output.extend_from_slice(&pointer.item_stream_version.to_be_bytes());
     output.extend_from_slice(&item_scope_len.to_be_bytes());
     output.extend_from_slice(&pointer.item_scope);
+    let indexer_count = u8::try_from(pointer.indexers.len())
+        .map_err(|_| StorageError::internal("compact stream pointer has too many indexers"))?;
+    output.push(indexer_count);
+    for indexer in &pointer.indexers {
+        append_len_prefixed(&mut output, indexer.as_bytes())?;
+    }
+    if let Some(old_indexers) = &pointer.old_indexers {
+        let count = u8::try_from(old_indexers.len()).map_err(|_| {
+            StorageError::internal("compact stream pointer has too many old indexers")
+        })?;
+        output.push(count);
+        for indexer in old_indexers {
+            append_len_prefixed(&mut output, indexer.as_bytes())?;
+        }
+    }
 
     if let Some(items) = &pointer.items {
         let count = u32::try_from(items.len()).map_err(|_| {
@@ -131,6 +173,32 @@ pub(crate) fn decode_compact_pointer(bytes: &[u8]) -> StorageResult<CompactStore
     let item_scope_len = usize::try_from(read_u32(bytes, &mut cursor)?)
         .map_err(|_| StorageError::internal("compact stream pointer item scope length failed"))?;
     let item_scope = read_exact_slice(bytes, &mut cursor, item_scope_len)?.to_vec();
+    let indexer_count = usize::from(read_u8(bytes, &mut cursor)?);
+    let mut indexers = Vec::with_capacity(indexer_count);
+    for _ in 0..indexer_count {
+        let len = usize::try_from(read_u32(bytes, &mut cursor)?)
+            .map_err(|_| StorageError::internal("compact stream pointer indexer length failed"))?;
+        let value = std::str::from_utf8(read_exact_slice(bytes, &mut cursor, len)?)
+            .map_err(|_| StorageError::internal("compact stream pointer indexer is not UTF-8"))?;
+        indexers.push(value.to_owned());
+    }
+    let old_indexers = if flags & FLAG_OLD_INDEXERS != 0 {
+        let count = usize::from(read_u8(bytes, &mut cursor)?);
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = usize::try_from(read_u32(bytes, &mut cursor)?).map_err(|_| {
+                StorageError::internal("compact stream pointer old indexer length failed")
+            })?;
+            let value =
+                std::str::from_utf8(read_exact_slice(bytes, &mut cursor, len)?).map_err(|_| {
+                    StorageError::internal("compact stream pointer old indexer is not UTF-8")
+                })?;
+            values.push(value.to_owned());
+        }
+        Some(values)
+    } else {
+        None
+    };
 
     let items = if flags & FLAG_EMBEDDED != 0 {
         let count = usize::try_from(read_u32(bytes, &mut cursor)?).map_err(|_| {
@@ -172,6 +240,8 @@ pub(crate) fn decode_compact_pointer(bytes: &[u8]) -> StorageResult<CompactStore
         item_stream_version,
         items,
         replication,
+        indexers,
+        old_indexers,
     })
 }
 

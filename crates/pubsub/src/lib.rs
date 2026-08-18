@@ -10,7 +10,10 @@ pub mod stream {
     pub use ::stream::*;
 }
 
-pub use manager::{PubsubDeliveryConfig, PubsubManager, PubsubManagerBuilder};
+pub use manager::{
+    PubsubDeliveryAdmission, PubsubDeliveryConfig, PubsubDeliveryPermit, PubsubManager,
+    PubsubManagerBuilder,
+};
 pub use notification::{PubsubNotificationSignRequest, PubsubNotificationSigner};
 pub use protocol::{
     PubsubAction, PubsubSuccess, SubscriptionView, decode_query_request, render_query_api_error,

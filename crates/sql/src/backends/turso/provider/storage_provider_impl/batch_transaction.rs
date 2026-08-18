@@ -1,4 +1,4 @@
-use crate::backends::turso::provider::storage_provider_impl::*;
+use crate::backends::turso::provider::{TursoPutItemTxnInput, storage_provider_impl::*};
 
 impl TursoStorageProvider {
     pub(crate) async fn scan_table_operation(
@@ -67,6 +67,11 @@ impl TursoStorageProvider {
             };
             items.push(wire);
         }
+        crate::indexed_item::project_gsi_wire_items(
+            &mut items,
+            &table_info,
+            request.index_name.as_ref(),
+        )?;
 
         let has_more = items.len() > effective_limit as usize;
         if has_more {
@@ -186,10 +191,13 @@ impl TursoStorageProvider {
                                 .put_item_txn(
                                     conn,
                                     &table_info,
-                                    &put.item,
-                                    None,
-                                    false,
-                                    put.aux_item_stream_ttl_hours,
+                                    TursoPutItemTxnInput {
+                                        item: &put.item,
+                                        indexers: put.indexers.as_deref(),
+                                        condition: None,
+                                        return_old_on_condition_failure: false,
+                                        item_stream_ttl_hours: put.aux_item_stream_ttl_hours,
+                                    },
                                 )
                                 .await?;
                         }
@@ -238,6 +246,7 @@ impl TursoStorageProvider {
                                         condition: None,
                                         return_old_on_condition_failure: false,
                                         replication: None,
+                                        old_indexers: None,
                                         item_stream_ttl_hours: delete.aux_item_stream_ttl_hours,
                                     },
                                 )
@@ -252,9 +261,13 @@ impl TursoStorageProvider {
                                 update.expression_attribute_names.as_ref(),
                                 update.expression_attribute_values.as_ref(),
                             )?;
-                            let existing_item = this
-                                .get_item_map_by_key(conn, &table_info, &update.key)
-                                .await?;
+                            let (existing_item, stored_indexers) = this
+                                .get_item_map_with_indexers_by_key(conn, &table_info, &update.key)
+                                .await?
+                                .map_or_else(
+                                    || (None, Vec::new()),
+                                    |(item, indexers)| (Some(item), indexers),
+                                );
 
                             if let Some(condition) = condition.as_ref()
                                 && !evaluate_condition(
@@ -280,14 +293,21 @@ impl TursoStorageProvider {
                                 existing_item.unwrap_or_else(|| update.key.to_attribute_map());
                             let updated_item =
                                 apply_bound_update_operations(item_to_update, &operations)?;
+                            let effective_indexers = update
+                                .indexers
+                                .as_deref()
+                                .unwrap_or(stored_indexers.as_slice());
                             let _ = this
                                 .put_item_txn(
                                     conn,
                                     &table_info,
-                                    &updated_item,
-                                    None,
-                                    false,
-                                    update.aux_item_stream_ttl_hours,
+                                    TursoPutItemTxnInput {
+                                        item: &updated_item,
+                                        indexers: Some(effective_indexers),
+                                        condition: None,
+                                        return_old_on_condition_failure: false,
+                                        item_stream_ttl_hours: update.aux_item_stream_ttl_hours,
+                                    },
                                 )
                                 .await?;
                         }

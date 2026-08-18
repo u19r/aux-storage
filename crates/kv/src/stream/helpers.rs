@@ -7,7 +7,7 @@ use storage_types::{
 use stream_provider::{EmbeddedStreamItem, StreamDataType};
 
 use crate::{
-    key_template::{KeyTemplate, PlaceholderBinding},
+    key_template::{KeyTemplate, UniquePlaceholderBinding},
     keyspace::{stream_keys, table_identity::TableIdentity},
     stream::{
         constants::STREAM_EMBEDDED_MAX_BYTES,
@@ -21,6 +21,8 @@ pub struct StreamEntryContext<'a> {
     pub table_identity: &'a TableIdentity,
     pub table_name: &'a TableName,
     pub item_key: &'a ItemKey,
+    pub indexers: &'a [String],
+    pub old_indexers: Option<&'a [String]>,
 }
 
 /// Create stream items for item updates (put, update, delete operations).
@@ -110,6 +112,8 @@ pub fn create_item_update_stream_entries_wire_encoded(
             target_item_stream_version,
             items,
             replication.cloned(),
+            context.indexers.to_vec(),
+            context.old_indexers.map(<[_]>::to_vec),
         )
     } else {
         CompactStoredStreamPointer::pointer(
@@ -117,6 +121,8 @@ pub fn create_item_update_stream_entries_wire_encoded(
             item_scope.clone(),
             target_item_stream_version,
             replication.cloned(),
+            context.indexers.to_vec(),
+            context.old_indexers.map(<[_]>::to_vec),
         )
     };
 
@@ -143,7 +149,7 @@ pub fn create_item_update_stream_entries_wire_encoded(
     )?;
 
     let fallback = stream_item_id.as_bytes().to_vec();
-    let pointer_binding = PlaceholderBinding::unique(fallback);
+    let pointer_binding = UniquePlaceholderBinding::new(fallback);
     let compact_keys =
         stream_keys::stream_write_keys(context.table_identity, context.item_key, stream_item_id)?;
     let mut item_row_key = compact_keys.item_row;
@@ -153,17 +159,29 @@ pub fn create_item_update_stream_entries_wire_encoded(
 
     Ok(vec![
         (
-            KeyTemplate::placeholder(compact_keys.system_row, Vec::new(), pointer_binding.clone()),
+            KeyTemplate::unique_placeholder(
+                compact_keys.system_row,
+                Vec::new(),
+                pointer_binding.clone(),
+            ),
             pointer_bytes.clone(),
         ),
         (
-            KeyTemplate::placeholder(compact_keys.table_row, Vec::new(), pointer_binding.clone()),
+            KeyTemplate::unique_placeholder(
+                compact_keys.table_row,
+                Vec::new(),
+                pointer_binding.clone(),
+            ),
             pointer_bytes,
         ),
         (KeyTemplate::literal(item_row_key), stream_bytes),
         (KeyTemplate::literal(item_pointer_key), Vec::new()),
         (
-            KeyTemplate::placeholder(compact_keys.table_pointer, Vec::new(), pointer_binding),
+            KeyTemplate::unique_placeholder(
+                compact_keys.table_pointer,
+                Vec::new(),
+                pointer_binding,
+            ),
             Vec::new(),
         ),
     ])

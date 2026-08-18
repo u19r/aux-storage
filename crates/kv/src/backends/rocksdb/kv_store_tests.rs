@@ -5,7 +5,7 @@ use crate::{
     backends::rocksdb::kv_store::{
         rocksdb_durability_policy, rocksdb_options, rocksdb_stream_high_water_key,
     },
-    key_template::{KeyTemplate, PlaceholderBinding},
+    key_template::{KeyTemplate, UniquePlaceholderBinding},
     kv_support_tests::rocksdb_test_path,
     sorted_kv_store::{DirectWriteOperation, SortedKvStore},
 };
@@ -83,10 +83,10 @@ async fn rocksdb_stream_id_allocation_resumes_above_durable_high_water_after_reo
     }
 
     let store = RocksDbKvStore::new(path).unwrap();
-    let template = KeyTemplate::placeholder(
+    let template = KeyTemplate::unique_placeholder(
         b"streams/test/".to_vec(),
         Vec::new(),
-        PlaceholderBinding::unique(stream_id_from_u64(1).as_bytes().to_vec()),
+        UniquePlaceholderBinding::new(stream_id_from_u64(1).as_bytes().to_vec()),
     );
     store
         .transact_write_unchecked(vec![DirectWriteOperation::PutTemplate {

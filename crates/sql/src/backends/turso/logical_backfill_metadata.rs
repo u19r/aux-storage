@@ -43,6 +43,7 @@ where
                 TursoValue::Integer(table_info.created_at.timestamp_millis()),
                 TursoValue::Text(serde_json::to_string(&table_info.attribute_definitions)?),
                 TursoValue::Text(serde_json::to_string(&table_info.key_schema)?),
+                TursoValue::Integer(i64::from(table_info.max_indexers.get())),
                 option_string_to_value(global_secondary_indexes_json),
                 TursoValue::Integer(u64_to_i64(table_info.table_size_bytes, "table size")?),
                 TursoValue::Integer(u64_to_i64(table_info.item_count, "item count")?),
@@ -68,6 +69,7 @@ where
         &table_info.attribute_definitions,
         &table_info.key_schema,
         table_info.global_secondary_indexes.as_deref(),
+        table_info.max_indexers,
         rowid_mode,
     );
     let _ = provider.execute(conn, &create_sql, Vec::new()).await?;
@@ -77,6 +79,7 @@ where
             &table_info.attribute_definitions,
             &table_info.key_schema,
             gsis,
+            table_info.max_indexers,
             rowid_mode,
         ) {
             let _ = provider.execute(conn, &sql, Vec::new()).await?;

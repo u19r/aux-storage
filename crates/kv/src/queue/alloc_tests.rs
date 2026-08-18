@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{process::Command, sync::Arc};
 
 use alloc_counter::{AllocationGuard, count_allocations};
 use queue_provider::{Queue, QueueMessage, QueueProvider};
@@ -14,6 +14,21 @@ const ITERATIONS: usize = 4;
 
 #[test]
 fn queue_send_body_move_and_retry_bytes_allocation_tests() {
+    const ISOLATED_ENV: &str = "AUX_KV_QUEUE_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe().expect("queue allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg("queue::alloc_tests::queue_send_body_move_and_retry_bytes_allocation_tests")
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated queue allocation test child should start");
+        assert!(status.success(), "isolated queue allocation test failed");
+        return;
+    }
+
     for (label, size) in [
         ("1_kib", 1024usize),
         ("64_kib", 64 * 1024),

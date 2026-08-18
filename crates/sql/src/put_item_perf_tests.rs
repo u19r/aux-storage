@@ -179,9 +179,7 @@ async fn create_sqlite_provider() -> StorageResult<ProviderFixture<SQLiteStorage
 async fn create_sqlite_provider_for_shape(
     shape: ProbeShape,
 ) -> StorageResult<ProviderFixture<SQLiteStorageProvider>> {
-    let temp_dir = tempfile::tempdir().map_err(|error| {
-        StorageError::internal(&format!("create SQLite temporary directory: {error}"))
-    })?;
+    let temp_dir = crate::sql_test_support::temp_dir("put-item-sqlite");
     let db_path = temp_dir
         .path()
         .join(format!("put-item-probe-{}.sqlite", shape.name));
@@ -218,9 +216,7 @@ async fn create_turso_provider() -> StorageResult<ProviderFixture<TursoStoragePr
 async fn create_turso_provider_for_shape(
     shape: ProbeShape,
 ) -> StorageResult<ProviderFixture<TursoStorageProvider>> {
-    let temp_dir = tempfile::tempdir().map_err(|error| {
-        StorageError::internal(&format!("create Turso temporary directory: {error}"))
-    })?;
+    let temp_dir = crate::sql_test_support::temp_dir("put-item-turso");
     let db_path = temp_dir
         .path()
         .join(format!("put-item-probe-{}.turso", shape.name));
@@ -266,9 +262,7 @@ async fn create_postgres_provider()
         .create_table(&probe_table_request(&table_name, GSI_COUNT))
         .await?;
 
-    let temp_dir = tempfile::tempdir().map_err(|error| {
-        StorageError::internal(&format!("create Postgres temporary directory: {error}"))
-    })?;
+    let temp_dir = crate::sql_test_support::temp_dir("put-item-postgres");
     Ok(Some(ProviderFixture {
         provider: Arc::new(provider),
         table_name,
@@ -619,6 +613,7 @@ where
         ])
         .into(),
         update_expression: Some("SET payload = :payload, gsi0pk = :gsi0pk".to_string()),
+        indexers: None,
         attribute_updates: None,
         condition_expression: None,
         expression_attribute_names: None,

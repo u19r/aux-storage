@@ -17,6 +17,8 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(super) struct PostgresWriteStreamEntriesInput<'a> {
     pub old_item: Option<&'a HashMap<String, storage_provider::AttributeValue>>,
+    pub indexers: &'a [String],
+    pub old_indexers: Option<&'a [String]>,
     pub is_deleted: bool,
     pub item_stream_version: storage_types::ItemStreamVersion,
     pub replication: Option<&'a ReplicationEventMetadata>,
@@ -106,6 +108,8 @@ impl PostgresStorageProvider {
         }
         let PostgresWriteStreamEntriesInput {
             old_item,
+            indexers,
+            old_indexers,
             is_deleted,
             item_stream_version,
             replication,
@@ -175,6 +179,9 @@ impl PostgresStorageProvider {
                 item_stream_version,
             )
         };
+        let stored_pointer = stored_pointer
+            .with_indexers(indexers.to_vec())
+            .with_old_indexers(old_indexers.map(<[_]>::to_vec));
         let stored_pointer = if let Some(replication) = replication.cloned() {
             stored_pointer.with_replication_metadata(replication)
         } else {

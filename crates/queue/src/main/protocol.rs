@@ -184,13 +184,27 @@ pub(crate) fn api_error_response(
     error: HttpApiError,
 ) -> Response {
     let status = status_code_from_u16(error.status_code);
-    error_response(
+    let mut response = error_response(
         request_id,
         protocol,
         status,
         &error.error_type,
         &error.message,
-    )
+    );
+    add_error_headers(response.headers_mut(), &error);
+    response
+}
+
+fn add_error_headers(headers: &mut HeaderMap, error: &HttpApiError) {
+    for (name, value) in &error.response_headers {
+        let Ok(name) = name.parse::<header::HeaderName>() else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
 }
 
 fn status_code_from_u16(status_code: u16) -> StatusCode {

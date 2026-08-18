@@ -1,4 +1,10 @@
-/// Compact MBT surface for ReadSequence planner/validator parity.
+/// Compact exploratory contract for ReadSequence validation and execution
+/// boundaries. This model deliberately combines planner limits, execution
+/// fanout, and continuation-token state so Quint can search their dangerous
+/// combinations. The Rust conformance adapters live at the owning boundaries
+/// (`read_sequence_dag.qnt` for the planner and storage-api tests for token
+/// execution); this cross-boundary model is not replayed through one synthetic
+/// driver.
 module read_sequence_mbt {
   type ReadSequenceCase = {
     stepCount: int,

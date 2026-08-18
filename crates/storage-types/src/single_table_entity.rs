@@ -1,8 +1,8 @@
-//! Single-table entity trait scaffold.
-//! This will evolve to provide key derivation logic for entities persisted
-//! inside per-tenant single-table physical storage.
+//! Typed single-table entity keys, indexer metadata, and wire encoding.
 
 use std::{borrow::Cow, collections::HashMap};
+
+use serde::Serialize;
 
 /// Keys returned are logical (no tenant id prefix because each tenant has its
 /// own physical table). Implementations should keep pk stable (category token)
@@ -10,6 +10,8 @@ use std::{borrow::Cow, collections::HashMap};
 pub trait SingleTableEntity {
     const STORAGE_ENTITY_TYPE: &'static str;
     const ENTITY_TYPE: &'static str = Self::STORAGE_ENTITY_TYPE;
+    /// Ordered item indexers generated from entity field annotations.
+    const INDEXERS: &'static [EntityIndexer] = &[];
 
     /// Partition key/category token (e.g. "U", "TOG"). Now returns
     /// an owned `String` to permit dynamic composition (e.g. per-user bucket
@@ -68,47 +70,158 @@ pub trait SingleTableEntity {
     }
 }
 
-/// Wrapper used when writing to storage to carry computed keys alongside the
-/// raw entity payload for serialization.
-#[derive(Debug, Clone)]
-pub struct TableEntity<T> {
-    pub pk: String,
-    pub sk: String,
-    pub storage_entity_type: &'static str,
-    pub entity_type: &'static str,
-    pub gsi1: Option<(String, String)>,
-    pub gsi2: Option<(String, String)>,
-    pub gsi3: Option<(String, String)>,
-    pub gsi4: Option<(String, String)>,
-    pub gsi5: Option<(String, String)>,
-    pub payload: T,
+/// One entity-owned item indexer attribute and its public ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityIndexer {
+    attribute_name: &'static str,
+    ordinal: u8,
 }
 
-impl<T: SingleTableEntity> From<T> for TableEntity<T> {
-    fn from(value: T) -> Self {
-        let pk = value.pk();
-        let sk = value.sk();
-        let gsi1 = value.gsi1();
-        let gsi2 = value.gsi2();
-        let gsi3 = value.gsi3();
-        let gsi4 = value.gsi4();
-        let gsi5 = value.gsi5();
+impl EntityIndexer {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_derive(attribute_name: &'static str, ordinal: u8) -> Self {
+        assert!(ordinal < crate::MAX_INDEXERS_CAPACITY);
         Self {
-            pk,
-            sk,
-            storage_entity_type: T::STORAGE_ENTITY_TYPE,
-            entity_type: T::ENTITY_TYPE,
-            gsi1,
-            gsi2,
-            gsi3,
-            gsi4,
-            gsi5,
-            payload: value,
+            attribute_name,
+            ordinal,
+        }
+    }
+
+    #[must_use]
+    pub const fn attribute_name(self) -> &'static str {
+        self.attribute_name
+    }
+
+    #[must_use]
+    pub const fn ordinal(self) -> u8 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub fn one_from_query(
+        self,
+        node: impl Into<String>,
+        on_missing: crate::ReadSequenceOnMissing,
+    ) -> crate::ReadSequenceNodeInput {
+        self.query_input(node, crate::ReadSequenceInputCardinality::One, on_missing)
+    }
+
+    #[must_use]
+    pub fn many_from_query(
+        self,
+        node: impl Into<String>,
+        on_missing: crate::ReadSequenceOnMissing,
+    ) -> crate::ReadSequenceNodeInput {
+        self.query_input(node, crate::ReadSequenceInputCardinality::Many, on_missing)
+    }
+
+    fn query_input(
+        self,
+        node: impl Into<String>,
+        cardinality: crate::ReadSequenceInputCardinality,
+        on_missing: crate::ReadSequenceOnMissing,
+    ) -> crate::ReadSequenceNodeInput {
+        let item = match cardinality {
+            crate::ReadSequenceInputCardinality::One => "0",
+            crate::ReadSequenceInputCardinality::Many => "*",
+        };
+        crate::ReadSequenceNodeInput {
+            from: crate::ReadSequenceFromInput {
+                node: node.into(),
+                select: crate::ReadSequenceSelector(format!(
+                    "$.Query.Items[{item}].{}",
+                    self.attribute_name
+                )),
+            },
+            mapped_key_source: Some(self.into()),
+            cardinality,
+            on_missing,
         }
     }
 }
 
-use crate::{AttributeValue, TryIntoWireItem, WireItem, to_hashmap};
+/// Encoded single-table entity with its generated ordered indexer declaration.
+#[derive(Debug, Clone)]
+pub struct WireEntity {
+    item: WireItem,
+    indexers: WireEntityIndexers,
+}
+
+#[derive(Debug, Clone)]
+enum WireEntityIndexers {
+    Derived(&'static [EntityIndexer]),
+    Request(Option<Vec<String>>),
+}
+
+impl WireEntity {
+    /// Wrap an encoded item that intentionally has no indexer declaration.
+    #[must_use]
+    pub fn unindexed(item: WireItem) -> Self {
+        Self {
+            item,
+            indexers: WireEntityIndexers::Request(None),
+        }
+    }
+
+    #[must_use]
+    pub fn item(&self) -> &WireItem {
+        &self.item
+    }
+
+    #[doc(hidden)]
+    pub fn item_mut(&mut self) -> &mut WireItem {
+        &mut self.item
+    }
+
+    /// Returns the ordered wire attribute names declared for this entity.
+    /// Derived declarations allocate only when a backend needs owned names;
+    /// request declarations remain borrowed.
+    #[must_use]
+    pub fn indexer_names(&self) -> Option<Cow<'_, [String]>> {
+        match &self.indexers {
+            WireEntityIndexers::Derived([]) | WireEntityIndexers::Request(None) => None,
+            WireEntityIndexers::Derived(indexers) => Some(Cow::Owned(
+                indexers
+                    .iter()
+                    .map(|indexer| indexer.attribute_name.to_string())
+                    .collect(),
+            )),
+            WireEntityIndexers::Request(Some(indexers)) => Some(Cow::Borrowed(indexers)),
+        }
+    }
+
+    #[must_use]
+    pub fn into_write_parts(self) -> (WireItem, Option<Vec<String>>) {
+        let indexers = match self.indexers {
+            WireEntityIndexers::Derived([]) => None,
+            WireEntityIndexers::Derived(indexers) => Some(
+                indexers
+                    .iter()
+                    .map(|indexer| indexer.attribute_name.to_string())
+                    .collect(),
+            ),
+            WireEntityIndexers::Request(indexers) => indexers,
+        };
+        (self.item, indexers)
+    }
+
+    pub(crate) fn from_write_parts(item: WireItem, indexers: Option<Vec<String>>) -> Self {
+        Self {
+            item,
+            indexers: WireEntityIndexers::Request(indexers),
+        }
+    }
+
+    fn new<T: SingleTableEntity>(item: WireItem) -> Self {
+        Self {
+            item,
+            indexers: WireEntityIndexers::Derived(T::INDEXERS),
+        }
+    }
+}
+
+use crate::{AttributeValue, TryIntoWireItem, WireItem};
 
 pub const ENTITY_TYPE_ATTR: &str = "et";
 pub const LEGACY_ENTITY_TYPE_ATTR: &str = "entity_type";
@@ -119,87 +232,14 @@ pub const CREATED_AT_ALIAS_ATTR: &str = "c_at";
 pub const UPDATED_AT_ALIAS_ATTR: &str = "u_at";
 pub const EXPIRES_AT_ALIAS_ATTR: &str = "e_at";
 
-/// Build a storage item `HashMap` (attribute name -> `AttributeValue`) from any
-/// `SingleTableEntity` implementor by serializing its payload and adding the
-/// standard single-table metadata keys (pk, sk, `et`, and GSIs when
-/// present). The payload fields must not collide with these reserved names.
-pub fn to_item_map<T: SingleTableEntity + serde::Serialize>(
-    entity: &T,
-) -> Result<std::collections::HashMap<String, AttributeValue>, crate::ConversionError> {
-    let mut map = to_hashmap(entity)?;
-    normalize_timestamp_attribute_aliases(&mut map);
-    // Insert mandatory keys
-    let pk_val = entity.pk_cow().into_owned();
-    let sk_val = entity.sk_cow().into_owned();
-    map.insert("pk".to_string(), AttributeValue::S(pk_val));
-    map.insert("sk".to_string(), AttributeValue::S(sk_val));
-    map.insert(
-        ENTITY_TYPE_ATTR.to_string(),
-        AttributeValue::S(T::ENTITY_TYPE.to_string()),
-    );
-    if let Some((gpk, gsk)) = entity.gsi1() {
-        map.insert("gsi1pk".to_string(), AttributeValue::S(gpk));
-        map.insert("gsi1sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi2() {
-        map.insert("gsi2pk".to_string(), AttributeValue::S(gpk));
-        map.insert("gsi2sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi3() {
-        map.insert("gsi3pk".to_string(), AttributeValue::S(gpk));
-        map.insert("gsi3sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi4() {
-        map.insert("gsi4pk".to_string(), AttributeValue::S(gpk));
-        map.insert("gsi4sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi5() {
-        map.insert("gsi5pk".to_string(), AttributeValue::S(gpk));
-        map.insert("gsi5sk".to_string(), AttributeValue::S(gsk));
-    }
-    Ok(map)
-}
-
-fn normalize_timestamp_attribute_aliases(map: &mut HashMap<String, AttributeValue>) {
-    normalize_timestamp_attribute_alias(map, CREATED_AT_ATTR, CREATED_AT_ALIAS_ATTR);
-    normalize_timestamp_attribute_alias(map, UPDATED_AT_ATTR, UPDATED_AT_ALIAS_ATTR);
-    normalize_timestamp_attribute_alias(map, EXPIRES_AT_ATTR, EXPIRES_AT_ALIAS_ATTR);
-}
-
-fn normalize_timestamp_attribute_alias(
-    map: &mut HashMap<String, AttributeValue>,
-    long_name: &str,
-    short_name: &str,
-) {
-    if map.contains_key(short_name) {
-        let _ = map.remove(long_name);
-        return;
-    }
-    if let Some(value) = map.remove(long_name) {
-        map.insert(short_name.to_string(), value);
-    }
-}
-
-/// Build a write-ready wire item from a `SingleTableEntity`.
-///
-/// This keeps the public API compatible with existing `to_item_map` call sites
-/// while enabling write-path migration toward `WireItem`-based operations.
-pub fn to_wire_item<T: SingleTableEntity + serde::Serialize>(
-    entity: &T,
-) -> Result<WireItem, crate::ConversionError> {
-    let map = to_item_map(entity)?;
-    WireItem::from_attribute_map(&map)
-        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
-}
-
-/// Build a write-ready wire item using the derived write encoder path.
+/// Build a write-ready entity envelope using the derived write encoder path.
 ///
 /// This path avoids materializing a `HashMap<String, AttributeValue>` for the
 /// payload itself and instead stitches key metadata directly into the encoded
 /// Dynamo wire JSON object.
-pub fn to_wire_item_fast<T: SingleTableEntity + TryIntoWireItem>(
+pub fn to_wire_entity<T: SingleTableEntity + TryIntoWireItem>(
     entity: &T,
-) -> Result<WireItem, crate::ConversionError> {
+) -> Result<WireEntity, crate::ConversionError> {
     let payload_data = match entity
         .try_into_wire_item()
         .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?
@@ -215,12 +255,85 @@ pub fn to_wire_item_fast<T: SingleTableEntity + TryIntoWireItem>(
     };
     let metadata_data = encode_single_table_metadata(entity)?;
     let bytes = merge_dynamo_object_bytes(payload_data.as_slice(), metadata_data.as_slice())?;
-    Ok(WireItem::dynamo_json(bytes))
+    Ok(WireEntity::new::<T>(WireItem::dynamo_json(bytes)))
+}
+
+/// Encode an entity as a logical wire item for callers that do not own a
+/// typed write envelope.
+///
+/// New writes that use entity indexers must retain the [`WireEntity`] returned
+/// by [`to_wire_entity`] so the ordered declaration is forwarded alongside the
+/// item. This item-only helper remains for active callers that deliberately
+/// construct the surrounding request themselves; it does not manufacture an
+/// indexer declaration.
+pub fn to_wire_item_fast<T: SingleTableEntity + TryIntoWireItem>(
+    entity: &T,
+) -> Result<WireItem, crate::ConversionError> {
+    Ok(to_wire_entity(entity)?.into_write_parts().0)
+}
+
+/// Encode a manually serialized single-table entity as a logical wire item.
+///
+/// This is the migration seam for entities that have a hand-written
+/// `StoredEntity` implementation rather than the `WireItemEncode` derive.
+/// Typed writes should prefer [`to_wire_entity`] so indexer declarations stay
+/// attached to the item envelope.
+pub fn to_wire_item<T: SingleTableEntity + Serialize>(
+    entity: &T,
+) -> Result<WireItem, crate::ConversionError> {
+    let attributes = to_item_map(entity)?;
+    WireItem::from_attribute_map(&attributes)
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
+}
+
+/// Serialize a single-table entity into the attribute map used by the
+/// non-encoded write builders and test fixtures.
+///
+/// This retains the logical entity metadata (`pk`, `sk`, entity type, and
+/// configured GSIs) alongside the serialized fields. Callers that construct
+/// an encoded write request should prefer [`to_wire_entity`] so indexer
+/// declarations remain attached to the request envelope.
+pub fn to_item_map<T: SingleTableEntity + Serialize>(
+    entity: &T,
+) -> Result<HashMap<String, AttributeValue>, crate::ConversionError> {
+    let value = serde_json::to_value(entity)
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
+    let serde_json::Value::Object(fields) = value else {
+        return Err(crate::ConversionError::Serialization(
+            "single-table entity must serialize as a JSON object".to_string(),
+        ));
+    };
+    let mut attributes = fields
+        .into_iter()
+        .map(|(name, value)| {
+            crate::attribute_value_from_json_value(value).map(|value| (name, value))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    normalize_timestamp_aliases(&mut attributes);
+    attributes.extend(entity_metadata(entity));
+    Ok(attributes)
+}
+
+fn normalize_timestamp_aliases(attributes: &mut HashMap<String, AttributeValue>) {
+    for (long_name, alias) in [
+        (CREATED_AT_ATTR, CREATED_AT_ALIAS_ATTR),
+        (UPDATED_AT_ATTR, UPDATED_AT_ALIAS_ATTR),
+        (EXPIRES_AT_ATTR, EXPIRES_AT_ALIAS_ATTR),
+    ] {
+        if let Some(value) = attributes.remove(long_name) {
+            attributes.entry(alias.to_string()).or_insert(value);
+        }
+    }
 }
 
 fn encode_single_table_metadata<T: SingleTableEntity>(
     entity: &T,
 ) -> Result<Vec<u8>, crate::ConversionError> {
+    serde_json::to_vec(&entity_metadata(entity))
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
+}
+
+fn entity_metadata<T: SingleTableEntity>(entity: &T) -> HashMap<String, AttributeValue> {
     let mut metadata = HashMap::with_capacity(13);
     metadata.insert(
         "pk".to_string(),
@@ -254,8 +367,7 @@ fn encode_single_table_metadata<T: SingleTableEntity>(
         metadata.insert("gsi5pk".to_string(), AttributeValue::S(gpk));
         metadata.insert("gsi5sk".to_string(), AttributeValue::S(gsk));
     }
-    serde_json::to_vec(&metadata)
-        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
+    metadata
 }
 
 fn merge_dynamo_object_bytes(

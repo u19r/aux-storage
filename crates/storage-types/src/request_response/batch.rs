@@ -33,6 +33,9 @@ pub struct WriteRequest {
 pub struct PutRequest {
     pub item: HashMap<String, AttributeValue>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexers: Option<Vec<String>>,
+
     /// Aux-storage extension: item stream retention duration in hours.
     #[serde(
         rename = "AuxItemStreamTtlHours",
@@ -47,6 +50,9 @@ pub struct TransactPutRequest {
     pub table_name: TableName,
 
     pub item: HashMap<String, AttributeValue>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexers: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_expression: Option<String>,

@@ -53,12 +53,12 @@ fn sync_startup_data_dir_uses_node_scoped_raft_database() {
     use crate::sync_replication_startup::sync_raft_test_sqlite_path;
 
     let sync = StorageSyncReplicationConfig {
-        data_dir: Some("/tmp/aux-sync".to_string()),
+        data_dir: Some("run-artifacts/storage-api-data/aux-sync".to_string()),
         ..sync_config()
     };
     let path = sync_raft_test_sqlite_path(&sync, &storage_config(), 7).expect("path");
 
-    assert!(path.ends_with("/tmp/aux-sync/sync-raft-node-7.db"));
+    assert!(path.ends_with("run-artifacts/storage-api-data/aux-sync/sync-raft-node-7.db"));
 }
 
 #[cfg(feature = "sqlite")]
@@ -67,12 +67,12 @@ fn sync_startup_allows_non_sql_storage_with_separate_raft_data_dir() {
     use crate::sync_replication_startup::sync_raft_test_sqlite_path;
 
     let sync = StorageSyncReplicationConfig {
-        data_dir: Some("/tmp/aux-sync-rocks".to_string()),
+        data_dir: Some("run-artifacts/storage-api-data/aux-sync-rocks".to_string()),
         ..sync_config()
     };
     let storage = StorageConfig {
         backend_type: StorageBackend::RocksDB,
-        connection_string: Some("/tmp/aux-rocksdb".to_string()),
+        connection_string: Some("run-artifacts/storage-api-data/aux-rocksdb".to_string()),
         file_path: None,
         sqlite: None,
         postgres: None,
@@ -87,7 +87,7 @@ fn sync_startup_allows_non_sql_storage_with_separate_raft_data_dir() {
         SyncRaftStartupDecision::Allow
     );
     let path = sync_raft_test_sqlite_path(&sync, &storage, 7).expect("path");
-    assert!(path.ends_with("/tmp/aux-sync-rocks/sync-raft-node-7.db"));
+    assert!(path.ends_with("run-artifacts/storage-api-data/aux-sync-rocks/sync-raft-node-7.db"));
 }
 
 #[cfg(feature = "sqlite")]
@@ -95,7 +95,7 @@ fn sync_startup_allows_non_sql_storage_with_separate_raft_data_dir() {
 fn sync_startup_rejects_non_sql_storage_without_separate_raft_data_dir() {
     let storage = StorageConfig {
         backend_type: StorageBackend::RocksDB,
-        connection_string: Some("/tmp/aux-rocksdb".to_string()),
+        connection_string: Some("run-artifacts/storage-api-data/aux-rocksdb".to_string()),
         file_path: None,
         sqlite: None,
         postgres: None,

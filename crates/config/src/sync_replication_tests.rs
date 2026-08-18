@@ -1,22 +1,10 @@
-use std::fs;
-
 use serde_json::json;
 
-use crate::{ConfigError, StorageApiLaunchConfig, load};
-
-fn write_temp_config(value: serde_json::Value) -> tempfile::NamedTempFile {
-    let file = tempfile::NamedTempFile::new().expect("create temporary config file");
-    fs::write(
-        file.path(),
-        serde_json::to_vec_pretty(&value).expect("serialize config"),
-    )
-    .expect("write config");
-    file
-}
+use crate::{ConfigError, StorageApiLaunchConfig, config_test_support::write_config, load};
 
 #[test]
 fn storage_sync_replication_defaults_disabled() {
-    let loaded = load(write_temp_config(json!({})).path()).expect("load defaults");
+    let loaded = load(write_config(json!({})).path()).expect("load defaults");
 
     assert!(!loaded.root.features.storage_sync_replication.enabled);
     assert_eq!(
@@ -39,7 +27,7 @@ fn storage_sync_replication_defaults_disabled() {
 
 #[test]
 fn storage_sync_replication_requires_internal_token_when_enabled() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_sync_replication": {
                 "enabled": true,
@@ -61,7 +49,7 @@ fn storage_sync_replication_requires_internal_token_when_enabled() {
 
 #[test]
 fn storage_sync_replication_loads_enabled_peer_config() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_sync_replication": {
                 "enabled": true,
@@ -93,7 +81,7 @@ fn storage_sync_replication_loads_enabled_peer_config() {
 
 #[test]
 fn storage_sync_replication_validates_learner_join_peer() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_sync_replication": {
                 "enabled": true,
@@ -119,7 +107,7 @@ fn storage_sync_replication_validates_learner_join_peer() {
 
 #[test]
 fn storage_sync_replication_rejects_learner_join_without_bootstrap_peer() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_sync_replication": {
                 "enabled": true,
@@ -139,7 +127,7 @@ fn storage_sync_replication_rejects_learner_join_without_bootstrap_peer() {
 
 #[test]
 fn storage_api_launch_config_exposes_sync_replication_settings() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_sync_replication": {
                 "enabled": true,

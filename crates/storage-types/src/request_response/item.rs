@@ -16,6 +16,11 @@ pub struct PutItemRequest {
 
     pub item: HashMap<String, AttributeValue>,
 
+    /// Aux-storage extension: ordered top-level string attributes addressable
+    /// by read plans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexers: Option<Vec<String>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_expression: Option<String>,
 
@@ -62,6 +67,7 @@ impl PutItemRequest {
         Self {
             table_name,
             item,
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -278,6 +284,11 @@ pub struct UpdateItemRequest {
     pub table_name: TableName,
     #[builder(setter(into))]
     pub key: KeyAttributes,
+    /// Aux-storage extension: omitted preserves, present replaces, and an empty
+    /// list clears.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub indexers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option, into))]
     pub update_expression: Option<String>,

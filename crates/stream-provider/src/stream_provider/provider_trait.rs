@@ -70,6 +70,19 @@ pub trait StreamProvider: Send + Sync {
         limit: u32,
     ) -> StreamResult<StreamPage>;
 
+    /// Decode a provider-owned stream pointer into its logical representation.
+    async fn decode_stored_stream_pointer(
+        &self,
+        pointer_item: &StreamItem,
+    ) -> StreamResult<StoredStreamPointer> {
+        storage_types::storage_serde::from_bytes(&pointer_item.data).map_err(|error| {
+            StreamError::internal_with_detail(
+                StreamInternalKind::ParseStreamPointer,
+                format_args!("pointer {}: {error}", pointer_item.id),
+            )
+        })
+    }
+
     async fn read_item_stream_backward_from_version(
         &self,
         stream_name: StreamName,
@@ -209,6 +222,8 @@ pub trait StreamProvider: Send + Sync {
                     table_name,
                     item_stream_version,
                     items,
+                    indexers,
+                    old_indexers,
                     ..
                 } => {
                     let pointer = StreamPointer {
@@ -216,6 +231,8 @@ pub trait StreamProvider: Send + Sync {
                         table_name,
                         item_stream_version,
                         stream_item_id: pointer_item.id,
+                        indexers,
+                        old_indexers,
                     };
                     let embedded_items = items
                         .into_iter()
@@ -233,6 +250,8 @@ pub trait StreamProvider: Send + Sync {
                     stream_name,
                     table_name,
                     item_stream_version,
+                    indexers,
+                    old_indexers,
                     ..
                 } => {
                     let pointer = StreamPointer {
@@ -240,6 +259,8 @@ pub trait StreamProvider: Send + Sync {
                         table_name,
                         item_stream_version,
                         stream_item_id: pointer_item.id,
+                        indexers,
+                        old_indexers,
                     };
                     let task = async move {
                         let target_stream_dbg: String = (&pointer.stream_name).into();

@@ -1,7 +1,7 @@
 use http_error::HttpApiError;
 use storage::PutItemInput;
 use storage_sync::SyncWriteRequest;
-use storage_types::{PutItemRequest, PutItemResponse};
+use storage_types::{IndexedWireItem, IndexerDeclaration, PutItemRequest, PutItemResponse};
 
 use crate::{
     manager::{
@@ -21,6 +21,9 @@ impl StorageApiManagerImpl {
             .db()
             .resolve_storage_operation(request.table_name.clone())
             .await?;
+        let indexers = request.indexers.as_deref().unwrap_or_default();
+        IndexerDeclaration::validate(indexers, operation.table_info().max_indexers)?;
+        IndexedWireItem::validate_logical_item_names(&request.item, indexers)?;
 
         // Validate that all required key attributes are provided
         for key_element in &operation.table_info().key_schema {
@@ -49,6 +52,7 @@ impl StorageApiManagerImpl {
         let input = PutItemInput {
             table_name: request.table_name,
             item: request.item.into(),
+            indexers: request.indexers,
             condition_expression: request.condition_expression,
             expression_attribute_names: request.expression_attribute_names,
             expression_attribute_values: request.expression_attribute_values,

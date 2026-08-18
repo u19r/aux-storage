@@ -5,7 +5,7 @@ use storage_common::DatabaseJobIntervals;
 
 #[cfg(all(test, feature = "cache-write-planner"))]
 use super::DatabaseManagerTestPauseHandle;
-use crate::cache_coordinator::StorageAuthoritativeCacheOptions;
+use crate::{admission::AdmissionConfig, cache_coordinator::StorageAuthoritativeCacheOptions};
 
 #[derive(Debug, Clone)]
 pub struct DatabaseManagerRuntimeOptions {
@@ -24,6 +24,9 @@ pub struct DatabaseManagerRuntimeOptions {
     pub database_job_intervals: DatabaseJobIntervals,
     pub authoritative_cache_options: StorageAuthoritativeCacheOptions,
     pub metrics_facade: Option<Arc<dyn MetricsFacade>>,
+    /// Per-connection foreground admission settings.  Provider call sites can
+    /// migrate incrementally through `DatabaseManager::acquire_admission`.
+    pub admission_config: AdmissionConfig,
     #[cfg(all(test, feature = "cache-write-planner"))]
     pub(crate) pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
 }
@@ -40,6 +43,7 @@ impl Default for DatabaseManagerRuntimeOptions {
             database_job_intervals: DatabaseJobIntervals::default(),
             authoritative_cache_options: StorageAuthoritativeCacheOptions::default(),
             metrics_facade: None,
+            admission_config: AdmissionConfig::default(),
             #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: None,
         }
@@ -122,6 +126,12 @@ impl DatabaseManagerRuntimeOptionsBuilder {
     #[must_use]
     pub fn metrics_facade(mut self, metrics_facade: Arc<dyn MetricsFacade>) -> Self {
         self.options.metrics_facade = Some(metrics_facade);
+        self
+    }
+
+    #[must_use]
+    pub fn admission_config(mut self, admission_config: AdmissionConfig) -> Self {
+        self.options.admission_config = admission_config;
         self
     }
 

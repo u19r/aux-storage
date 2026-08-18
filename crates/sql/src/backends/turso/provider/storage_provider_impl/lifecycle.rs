@@ -14,6 +14,7 @@ impl StorageProviderReadContext for TursoReadSequenceReadContext {
         consistent_read: bool,
     ) -> StorageResult<Option<WireItem>> {
         let _ = consistent_read;
+        let database_call = metrics_facade::begin_database_call("read_sequence.get_item");
         let table_info = self.provider.get_table_info(&table_name).await?;
         let guard = self.connection.lock().await;
         let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
@@ -21,30 +22,41 @@ impl StorageProviderReadContext for TursoReadSequenceReadContext {
             .provider
             .get_item_map_by_key(conn, &table_info, &key)
             .await?;
-        item.map(|map| WireItem::from_attribute_map(&map))
-            .transpose()
+        let result = item
+            .map(|map| WireItem::from_attribute_map(&map))
+            .transpose();
+        drop(database_call);
+        result
     }
 
     async fn batch_get_item(
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.batch_get_item");
         let guard = self.connection.lock().await;
         let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
-        self.provider
+        let result = self
+            .provider
             .batch_get_item_with_connection(conn, request)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 
     async fn query_table(
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
         let guard = self.connection.lock().await;
         let conn = guard.as_ref().ok_or_else(turso_read_context_closed)?;
-        self.provider
+        let result = self
+            .provider
             .query_table_with_connection(conn, request)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 }
 

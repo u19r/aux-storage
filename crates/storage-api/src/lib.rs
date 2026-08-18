@@ -36,6 +36,8 @@ mod multi_region_simulation_tests;
 #[cfg(test)]
 mod query_wire_response_tests;
 #[cfg(test)]
+mod quint_read_sequence_runtime_tests;
+#[cfg(test)]
 mod quint_sync_peer_auth_transport_tests;
 #[cfg(test)]
 mod quint_sync_raft_startup_policy_tests;
@@ -48,14 +50,16 @@ mod replication_runtime_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(test)]
+mod storage_api_test_support;
+#[cfg(test)]
 mod sync_raft_http_client_tests;
 #[cfg(test)]
 mod sync_replication_startup_tests;
 
 pub use config_watch::{ConfigWatchGuard, spawn as spawn_config_watch};
 pub use manager::{
-    StorageApiManager, StorageApiManagerImpl, StorageApiManagerOptions, SyncHealthReporter,
-    SyncRaftRuntimeAdapter, SyncReadBarrier, SyncWriteProposer,
+    ReadSequenceExecutionMode, StorageApiManager, StorageApiManagerImpl, StorageApiManagerOptions,
+    SyncHealthReporter, SyncRaftRuntimeAdapter, SyncReadBarrier, SyncWriteProposer,
 };
 pub use notify::Result as ConfigWatchResult;
 pub use replication_runtime::{

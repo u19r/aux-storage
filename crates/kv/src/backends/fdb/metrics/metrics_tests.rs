@@ -1,12 +1,13 @@
 use super::{
     foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot,
-    record_fdb_conflict_artifacts, record_fdb_operation, record_fdb_operation_bytes,
-    record_fdb_operation_latency, record_fdb_point_read, record_fdb_range_read,
-    record_fdb_transaction_start, record_fdb_write_shape,
+    foundationdb_operation_metrics_test_guard, record_fdb_conflict_artifacts, record_fdb_operation,
+    record_fdb_operation_bytes, record_fdb_operation_latency, record_fdb_point_read,
+    record_fdb_range_read, record_fdb_transaction_start, record_fdb_write_shape,
 };
 
 #[test]
 fn conflict_artifact_metrics_are_exposed_in_snapshot() {
+    let _metrics_guard = foundationdb_operation_metrics_test_guard();
     foundationdb_operation_metrics_reset();
     record_fdb_conflict_artifacts("queue_claim", 2, 3, 5, 7);
 
@@ -31,6 +32,7 @@ fn conflict_artifact_metrics_are_exposed_in_snapshot() {
 
 #[test]
 fn read_write_shape_metrics_are_exposed_in_snapshot() {
+    let _metrics_guard = foundationdb_operation_metrics_test_guard();
     foundationdb_operation_metrics_reset();
     record_fdb_transaction_start("get");
     record_fdb_point_read("get", false, 2);
@@ -66,6 +68,7 @@ fn read_write_shape_metrics_are_exposed_in_snapshot() {
 
 #[test]
 fn unknown_metric_labels_do_not_allocate_or_emit() {
+    let _metrics_guard = foundationdb_operation_metrics_test_guard();
     foundationdb_operation_metrics_reset();
 
     record_fdb_operation("unknown_path", "get", 10);

@@ -252,7 +252,7 @@ impl NamespaceRequestRewriter {
         request: &mut EncodeWriteRequest,
     ) -> StorageResult<()> {
         if let Some(put) = request.put_request.as_mut() {
-            self.rewrite_wire_item_for_shared_table(namespace, &mut put.item)?;
+            self.rewrite_wire_item_for_shared_table(namespace, put.item.item_mut())?;
         }
         if let Some(delete) = request.delete_request.as_mut() {
             self.rewrite_key_for_shared_table(namespace, &mut delete.key)?;
@@ -304,7 +304,7 @@ impl NamespaceRequestRewriter {
         item: &mut TransactEncodeItem,
     ) -> StorageResult<()> {
         if let Some(put) = item.put.as_mut() {
-            self.rewrite_wire_item_for_shared_table(namespace, &mut put.item)?;
+            self.rewrite_wire_item_for_shared_table(namespace, put.item.item_mut())?;
         }
         if let Some(update) = item.update.as_mut() {
             self.rewrite_key_for_shared_table(namespace, &mut update.key)?;

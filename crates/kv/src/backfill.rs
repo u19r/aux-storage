@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use storage_backfill::{
     BackfillBatchOutcome, BackfillDriver, BackfillState, BackfillStatus, GsiBackfillDescriptor,
 };
 use storage_common::apply_gsi_projection;
 use storage_types::{
-    AttributeValue, IndexName, ItemKey, StorageError, TableName, TimeToLiveStatus, TimestampMillis,
+    IndexName, IndexedWireItem, IndexerDeclaration, ItemKey, StorageError, TableName,
+    TimeToLiveStatus, TimestampMillis,
 };
 use tracing::debug;
 
@@ -15,7 +14,10 @@ use crate::{
     keyspace::{compact, table_identity::StoredTableMetadata, table_keys},
     partition_family::PartitionFamilyKvStore,
     sorted_kv_store::{BatchItem, RawKey},
-    storage_provider::key_schema_for_gsi,
+    storage_ops::{
+        decode_wire_item_with_indexers_from_storage_bytes, encode_indexed_wire_item,
+        key_schema_for_gsi,
+    },
     ttl,
 };
 
@@ -137,7 +139,7 @@ where S: PartitionFamilyKvStore + 'static
 
         let batch_limit = batch_size.clamp(1, 1000);
         let limit = u32::try_from(batch_limit).unwrap_or(1000);
-        let data_range = table_keys::primary_item_prefix(table_metadata.identity.table_id);
+        let data_range = table_keys::primary_item_prefix(&table_metadata.identity);
 
         let page_token = state.scan_lek.as_ref().and_then(|token| {
             ItemKey::item_key_from_next_page_token(token, table_info, &None)
@@ -177,13 +179,21 @@ where S: PartitionFamilyKvStore + 'static
 
         let projection = Self::find_gsi_projection(table_info, &index_name);
         let mut batch = Vec::with_capacity(range.items.len());
-        let mut last_item: Option<HashMap<String, AttributeValue>> = None;
+        let item_count = range.items.len();
+        let has_more = range.has_more;
+        let mut next_token = None;
         let mut processed = 0usize;
 
-        for (_raw_key, raw_value) in &range.items {
-            let item: HashMap<String, AttributeValue> =
-                storage_types::storage_serde::from_bytes(raw_value)?;
-            last_item = Some(item.clone());
+        for (position, (_raw_key, raw_value)) in range.items.into_iter().enumerate() {
+            let (wire_item, indexers) = decode_wire_item_with_indexers_from_storage_bytes(
+                self.kv_store.item_value_codec(),
+                &raw_value,
+                table_info.max_indexers,
+            )?;
+            let item = wire_item.into_attribute_map()?;
+            if has_more && position + 1 == item_count {
+                next_token = ItemKey::last_evaluated_key_from_last_item(&item, table_info, &None)?;
+            }
 
             if is_ttl_index {
                 let Some(ttl_attr) = ttl_attribute_name.as_deref() else {
@@ -216,7 +226,10 @@ where S: PartitionFamilyKvStore + 'static
                 };
                 let projected =
                     apply_gsi_projection(&item, projection, &table_info.key_schema, &gsi_schema);
-                let gsi_value = storage_types::storage_serde::to_bytes(&projected)?;
+                let declaration = IndexerDeclaration::try_new(indexers, table_info.max_indexers)?;
+                let indexed = IndexedWireItem::extract_projected(&item, &projected, &declaration)?;
+                let gsi_value =
+                    encode_indexed_wire_item(self.kv_store.item_value_codec(), &indexed)?;
                 batch.push(BatchItem {
                     key: table_keys::item_key(&table_metadata.identity, &gsi_key)?,
                     value: Some(gsi_value),
@@ -229,17 +242,7 @@ where S: PartitionFamilyKvStore + 'static
             self.kv_store.batch_write(batch).await?;
         }
 
-        let next_token = if range.has_more {
-            if let Some(item) = last_item {
-                ItemKey::last_evaluated_key_from_last_item(&item, table_info, &None)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let done = !range.has_more && next_token.is_none();
+        let done = !has_more && next_token.is_none();
         if done
             && is_ttl_index
             && let Some(mut config) = ttl_config.take()

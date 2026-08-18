@@ -74,6 +74,7 @@ fn round_trip_pagination_token() {
         table_name: TableName::new("test_table"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![
             KeySchemaElement {
                 attribute_name: "pk".to_string(),
@@ -147,6 +148,7 @@ fn key_consistency_across_methods() {
         table_name: TableName::new("consistency_test"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![
             KeySchemaElement {
                 attribute_name: "hash_attr".to_string(),
@@ -276,6 +278,7 @@ fn gsi_round_trip_hash_only() {
         table_name: TableName::new("test_table"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![
             KeySchemaElement {
                 attribute_name: "pk".to_string(),
@@ -384,6 +387,7 @@ fn gsi_round_trip_with_gsi_range() {
         table_name: TableName::new("test_table"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![KeySchemaElement {
             attribute_name: "pk".to_string(),
             key_type: KeyType::Hash,
@@ -489,6 +493,7 @@ fn gsi_round_trip_all_keys() {
         table_name: TableName::new("test_table"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![
             KeySchemaElement {
                 attribute_name: "pk".to_string(),
@@ -611,6 +616,7 @@ fn gsi_invalid_token_parts() {
         table_name: TableName::new("test_table"),
         table_status: TableStatus::Active,
         created_at: 0.into(),
+        max_indexers: crate::MaxIndexers::ZERO,
         key_schema: vec![KeySchemaElement {
             attribute_name: "pk".to_string(),
             key_type: KeyType::Hash,

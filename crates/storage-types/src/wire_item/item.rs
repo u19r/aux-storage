@@ -590,37 +590,23 @@ impl WireItem {
             let gsi_hash_key = hash_key_name(index_key_schema)?;
             let gsi_range_key = range_key_name(index_key_schema);
 
+            // A GSI may reuse a base-table key attribute (for example, the
+            // system table's GSI1 uses `sk` as its range key).  De-duplicate
+            // field names before extracting them; the projection visitor
+            // intentionally records the first matching field only.
             let mut fields = Vec::with_capacity(4);
-            fields.push(gsi_hash_key);
-            if let Some(name) = gsi_range_key {
-                fields.push(name);
-            }
-            fields.push(table_hash_key);
-            if let Some(name) = table_range_key {
-                fields.push(name);
-            }
+            let gsi_hash_index = unique_scalar_field_index(&mut fields, gsi_hash_key);
+            let gsi_range_index =
+                gsi_range_key.map(|field| unique_scalar_field_index(&mut fields, field));
+            let table_hash_index = unique_scalar_field_index(&mut fields, table_hash_key);
+            let table_range_index =
+                table_range_key.map(|field| unique_scalar_field_index(&mut fields, field));
 
             let values = self.scalar_fields(&fields)?;
-            let mut index = 0usize;
-            let gsi_hash = values[index].as_deref();
-            index += 1;
-
-            let gsi_range = if gsi_range_key.is_some() {
-                let value = values[index].as_deref();
-                index += 1;
-                value
-            } else {
-                None
-            };
-
-            let table_hash = values[index].as_deref();
-            index += 1;
-
-            let table_range = if table_range_key.is_some() {
-                values[index].as_deref()
-            } else {
-                None
-            };
+            let gsi_hash = values[gsi_hash_index].as_deref();
+            let gsi_range = gsi_range_index.and_then(|index| values[index].as_deref());
+            let table_hash = values[table_hash_index].as_deref();
+            let table_range = table_range_index.and_then(|index| values[index].as_deref());
 
             let Some(gsi_hash) = gsi_hash else {
                 return Ok(None);
@@ -785,6 +771,15 @@ impl WireItem {
                 Ok(values)
             }
         }
+    }
+}
+
+fn unique_scalar_field_index<'a>(fields: &mut Vec<&'a str>, field: &'a str) -> usize {
+    if let Some(index) = fields.iter().position(|candidate| *candidate == field) {
+        index
+    } else {
+        fields.push(field);
+        fields.len() - 1
     }
 }
 

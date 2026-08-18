@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use storage_types::FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS;
 
 use crate::constants::{
     DEFAULT_REMOTE_REGION, DEFAULT_STORAGE_ROCKS_DB_PATH, DEFAULT_STORAGE_SQLITE_DB_PATH,
@@ -162,8 +163,8 @@ pub struct FoundationdbBackendConfig {
     #[serde(default)]
     #[schemars(default)]
     pub subspace_prefix: Option<String>,
-    #[serde(default)]
-    #[schemars(default)]
+    #[serde(default = "default_foundationdb_cache_read_version_ms")]
+    #[schemars(default = "default_foundationdb_cache_read_version_ms")]
     pub cache_read_version_ms: u16,
     #[serde(default)]
     #[schemars(default)]
@@ -171,6 +172,23 @@ pub struct FoundationdbBackendConfig {
     #[serde(default)]
     #[schemars(default)]
     pub report_conflicting_keys: bool,
+}
+
+impl Default for FoundationdbBackendConfig {
+    fn default() -> Self {
+        Self {
+            cluster_file: None,
+            tenant_name: None,
+            subspace_prefix: None,
+            cache_read_version_ms: default_foundationdb_cache_read_version_ms(),
+            immediate_gsi_consistency: false,
+            report_conflicting_keys: false,
+        }
+    }
+}
+
+fn default_foundationdb_cache_read_version_ms() -> u16 {
+    FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

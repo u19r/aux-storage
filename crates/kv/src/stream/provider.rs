@@ -20,7 +20,7 @@ use crate::{
         STREAM_TTL_CLEANUP_RUNTIME_MS_METRIC, STREAM_TTL_CLEANUP_STREAMS_SCANNED_TOTAL_METRIC,
     },
     helpers::increment_bytes,
-    key_template::{KeyTemplate, PlaceholderBinding},
+    key_template::{KeyTemplate, UniquePlaceholderBinding},
     keyspace::{
         compact,
         stream_keys::{self, CompactStreamRange},
@@ -38,7 +38,7 @@ use crate::{
         stream_partition_marker_key, supports_pointer_stream_partitioning,
     },
     sorted_kv::SortedKvDbStorageProvider,
-    sorted_kv_store::{RangeResult, RawKey, TransactWriteOperation},
+    sorted_kv_store::{RangeResult, RawKey, TransactWriteOperation, TransactionPriority},
     stream::{
         item_codec::{decode_stream_item, encode_stream_item},
         metadata_keys::{stream_cursor_key, stream_cursors_prefix, stream_metadata_key},
@@ -308,9 +308,9 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
                     )
                 }
             };
-            let binding = PlaceholderBinding::unique(item_id.as_bytes().to_vec());
+            let binding = UniquePlaceholderBinding::new(item_id.as_bytes().to_vec());
             let binding_id = binding.id();
-            let template = KeyTemplate::placeholder(template_prefix, Vec::new(), binding);
+            let template = KeyTemplate::unique_placeholder(template_prefix, Vec::new(), binding);
             let output = self
                 .kv_store
                 .transact_write(vec![TransactWriteOperation::PutTemplate {
@@ -327,10 +327,10 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
             return Ok(assigned_id);
         }
 
-        let binding = PlaceholderBinding::unique(item_id.as_bytes().to_vec());
+        let binding = UniquePlaceholderBinding::new(item_id.as_bytes().to_vec());
         let binding_id = binding.id();
         let template =
-            KeyTemplate::placeholder(stream_key_prefix(&stream_name), Vec::new(), binding);
+            KeyTemplate::unique_placeholder(stream_key_prefix(&stream_name), Vec::new(), binding);
 
         let output = self
             .kv_store
@@ -487,6 +487,27 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
             items,
             last_evaluated_key,
             has_more,
+        })
+    }
+
+    async fn decode_stored_stream_pointer(
+        &self,
+        pointer_item: &StreamItem,
+    ) -> StreamResult<StoredStreamPointer> {
+        if let Ok(pointer) = decode_compact_pointer(&pointer_item.data) {
+            let table = self
+                .get_table_identity_from_id(pointer.table_id)
+                .await?
+                .ok_or_else(|| StreamError::internal("compact stream pointer table is missing"))?;
+            return pointer
+                .into_stored_pointer(&table.identity)
+                .map_err(StreamError::from);
+        }
+        storage_types::storage_serde::from_bytes(&pointer_item.data).map_err(|error| {
+            StreamError::internal_with_detail(
+                stream_provider::StreamInternalKind::ParseStreamPointer,
+                format_args!("pointer {}: {error}", pointer_item.id),
+            )
         })
     }
 
@@ -684,7 +705,8 @@ impl<S: PartitionFamilyKvStore + 'static> StreamProvider for SortedKvDbStoragePr
             return Ok(());
         }
 
-        let cleanup_job = TtlCleanupJob::new(std::sync::Arc::new(self.clone()));
+        let cleanup_provider = self.with_transaction_priority(TransactionPriority::Batch);
+        let cleanup_job = TtlCleanupJob::new(std::sync::Arc::new(cleanup_provider));
         let config = JobConfig {
             start_immediately: true,
             sleep_duration: std::time::Duration::from_millis(
@@ -1005,45 +1027,15 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
         &self,
         pointer_item: &StreamItem,
     ) -> StreamResult<DecodedPointerItem> {
-        if let Ok(pointer) = decode_compact_pointer(&pointer_item.data) {
-            let table = self
-                .get_table_identity_from_id(pointer.table_id)
-                .await?
-                .ok_or_else(|| StreamError::internal("compact stream pointer table is missing"))?;
-            let stream_pointer = pointer.stream_pointer(&table.identity, pointer_item.id)?;
-            if let Some(items) = pointer.items {
-                let items = items
-                    .into_iter()
-                    .map(|item| StreamItem {
-                        id: StreamItemId::from(pointer.item_stream_version),
-                        stream_name: None,
-                        data: item.data,
-                        data_type: item.data_type,
-                        created_at: pointer_item.created_at,
-                    })
-                    .collect();
-                return Ok(DecodedPointerItem::Embedded {
-                    pointer: stream_pointer,
-                    items,
-                });
-            }
-            return Ok(DecodedPointerItem::Pointer(stream_pointer));
-        }
-
-        let stored_pointer =
-            storage_types::storage_serde::from_bytes::<StoredStreamPointer>(&pointer_item.data)
-                .map_err(|err| {
-                    StreamError::internal_with_detail(
-                        stream_provider::StreamInternalKind::ParseStreamPointer,
-                        format_args!("pointer {}: {err}", pointer_item.id),
-                    )
-                })?;
+        let stored_pointer = self.decode_stored_stream_pointer(pointer_item).await?;
         match stored_pointer {
             StoredStreamPointer::Embedded {
                 stream_name,
                 table_name,
                 item_stream_version,
                 items,
+                indexers,
+                old_indexers,
                 ..
             } => {
                 let pointer = StreamPointer {
@@ -1051,6 +1043,8 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                     table_name,
                     item_stream_version,
                     stream_item_id: pointer_item.id,
+                    indexers,
+                    old_indexers,
                 };
                 let items = items
                     .into_iter()
@@ -1068,12 +1062,16 @@ impl<S: PartitionFamilyKvStore + 'static> SortedKvDbStorageProvider<S> {
                 stream_name,
                 table_name,
                 item_stream_version,
+                indexers,
+                old_indexers,
                 ..
             } => Ok(DecodedPointerItem::Pointer(StreamPointer {
                 stream_name,
                 table_name,
                 item_stream_version,
                 stream_item_id: pointer_item.id,
+                indexers,
+                old_indexers,
             })),
         }
     }

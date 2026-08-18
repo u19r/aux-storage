@@ -1,7 +1,10 @@
 use config::DEFAULT_STORAGE_SQLITE_DB_PATH;
 use queue::QueueBackend;
 
-use crate::{Args, QueueStorageArg, add_common_headers, queue_config_from_args, queue_url};
+use crate::{
+    Args, QueueStorageArg, add_common_headers, queue_config_from_args, queue_config_overrides,
+    queue_url,
+};
 
 fn base_args(storage: QueueStorageArg) -> Args {
     Args {
@@ -17,7 +20,7 @@ fn base_args(storage: QueueStorageArg) -> Args {
         foundationdb_cluster_file: None,
         foundationdb_subspace_prefix: None,
         foundationdb_tenant_name: None,
-        foundationdb_cache_read_version_ms: 0,
+        foundationdb_cache_read_version_ms: None,
         foundationdb_report_conflicting_keys: false,
         config: None,
         overrides: Vec::new(),
@@ -54,6 +57,19 @@ fn queue_config_from_args_requires_postgres_dsn() {
             .contains("--postgres-dsn is required when --storage postgres"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn queue_cli_explicit_zero_preserves_the_grv_cache_opt_out() {
+    let mut args = base_args(QueueStorageArg::FoundationDb);
+    args.foundationdb_cache_read_version_ms = Some(0);
+
+    let overrides = queue_config_overrides(&args);
+
+    assert!(overrides.contains(&(
+        "features.backends.foundationdb.cache_read_version_ms".to_string(),
+        "0".to_string(),
+    )));
 }
 
 #[test]

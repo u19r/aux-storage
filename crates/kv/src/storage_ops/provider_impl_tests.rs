@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, process::Command};
 
 use alloc_counter::AllocationGuard;
 use storage_common::ttl::TtlConfigRecord;
@@ -54,6 +54,7 @@ fn table_info() -> StoredTableInfo {
                 key_type: KeyType::Range,
             },
         ],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,
@@ -142,6 +143,27 @@ type TransactConditionInput = (
 
 #[test]
 fn transact_condition_binding_cache_reuses_repeated_condition_parse_tests() {
+    const ISOLATED_ENV: &str = "AUX_KV_CONDITION_CACHE_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe()
+                .expect("condition cache allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(
+            "storage_ops::provider_impl_tests::transact_condition_binding_cache_reuses_repeated_condition_parse_tests",
+        )
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated condition cache allocation test child should start");
+        assert!(
+            status.success(),
+            "isolated condition cache allocation test failed"
+        );
+        return;
+    }
+
     let baseline = measure_uncached_transact_condition_binding();
     let cached = measure_cached_transact_condition_binding();
 
@@ -385,7 +407,7 @@ fn ttl_index_direct_operations_delete_old_bucket_and_put_new_bucket_when_ttl_cha
 }
 
 #[test]
-fn encoded_batch_writes_preserve_put_and_delete_semantics_for_legacy_batch_apis() {
+fn encoded_batch_writes_preserve_put_and_delete_semantics() {
     let put_item = wire_item("JOB#1", "42", Some("1700000500"));
     let delete_key = HashMap::from([(
         "pk".to_string(),
@@ -395,7 +417,7 @@ fn encoded_batch_writes_preserve_put_and_delete_semantics_for_legacy_batch_apis(
     let converted = encode_requests_to_write_requests(&[
         EncodeWriteRequest {
             put_request: Some(EncodePutRequest {
-                item: put_item,
+                item: storage_types::WireEntity::unindexed(put_item),
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,

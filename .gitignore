@@ -19,6 +19,7 @@ profile.json.gz
 .cache/
 tmp/
 .foundationdb/
+simfdb/
 run-artifacts/
 tmp/opt-loop/
 _apalache-out/

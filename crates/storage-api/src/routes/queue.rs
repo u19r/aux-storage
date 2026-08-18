@@ -4,6 +4,8 @@
 use std::sync::Arc;
 #[cfg(feature = "queue")]
 use std::sync::Arc;
+#[cfg(feature = "queue")]
+use std::time::Instant;
 
 #[cfg(feature = "queue")]
 use axum::{
@@ -31,6 +33,8 @@ use serde::Serialize;
 #[cfg(feature = "queue")]
 use serde_json::{Value, json};
 #[cfg(feature = "queue")]
+use storage::{AdmissionClass, AdmissionOutcome};
+#[cfg(feature = "queue")]
 use uuid::Uuid;
 
 use crate::types::AppState;
@@ -50,6 +54,10 @@ struct QueueWireRequest {
     protocol: QueueProtocol,
     request: QueueRequest,
 }
+
+#[cfg(feature = "queue")]
+#[derive(Debug, Clone, Copy)]
+struct ProviderPressureResponse;
 
 #[utoipa::path(
     post,
@@ -79,14 +87,44 @@ pub async fn queue_endpoint(
             return validation_response(&request_id, protocol_from_headers(&headers), &message);
         }
     };
-    dispatch_queue_request(
+    let started = Instant::now();
+    let permit = match app_state
+        .db_manager
+        .default_admission_controller()
+        .acquire(AdmissionClass::Write)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            return api_error_response(
+                &request_id,
+                wire_request.protocol,
+                HttpApiError::service_unavailable(rejection.retry_after_seconds),
+            );
+        }
+    };
+    let response = dispatch_queue_request(
         manager,
         app_state.as_ref(),
         &request_id,
         wire_request.protocol,
         wire_request.request,
     )
-    .await
+    .await;
+    let provider_pressure = manager.take_admission_pressure_signal()
+        || response
+            .extensions()
+            .get::<ProviderPressureResponse>()
+            .is_some();
+    let outcome = if provider_pressure {
+        AdmissionOutcome::RetryablePressure(started.elapsed())
+    } else if response.status().is_server_error() {
+        AdmissionOutcome::Failure(started.elapsed())
+    } else {
+        AdmissionOutcome::Success(started.elapsed())
+    };
+    permit.complete(outcome);
+    response
 }
 
 #[utoipa::path(
@@ -332,13 +370,50 @@ fn ok_response<T: Serialize>(
 fn api_error_response(request_id: &str, protocol: QueueProtocol, error: HttpApiError) -> Response {
     let status =
         StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    error_response(
+    let mut response = error_response(
         request_id,
         protocol,
         status,
         &error.error_type,
         &error.message,
+    );
+    add_error_headers(response.headers_mut(), &error);
+    if is_provider_pressure_error(&error) {
+        response.extensions_mut().insert(ProviderPressureResponse);
+    }
+    response
+}
+
+#[cfg(feature = "queue")]
+fn is_provider_pressure_error(error: &HttpApiError) -> bool {
+    let code = error
+        .error_type
+        .rsplit('#')
+        .next()
+        .unwrap_or(&error.error_type);
+    matches!(
+        code,
+        "ServiceUnavailableException"
+            | "ThrottlingException"
+            | "ProvisionedThroughputExceededException"
+            | "LimitExceededException"
+            | "RequestLimitExceeded"
+            | "RequestTimeout"
+            | "RequestTimeoutException"
     )
+}
+
+#[cfg(feature = "queue")]
+fn add_error_headers(headers: &mut HeaderMap, error: &HttpApiError) {
+    for (name, value) in &error.response_headers {
+        let Ok(name) = name.parse::<header::HeaderName>() else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
 }
 
 #[cfg(feature = "queue")]

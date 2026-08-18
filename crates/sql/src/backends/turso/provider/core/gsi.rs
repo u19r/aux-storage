@@ -74,6 +74,7 @@ impl TursoStorageProvider {
                                     table_info,
                                     old_item.as_ref(),
                                     new_item.as_ref(),
+                                    &pointer.indexers,
                                 )
                                 .await?;
                                 batch_did_work = true;

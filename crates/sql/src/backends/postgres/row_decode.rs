@@ -8,7 +8,10 @@ use storage_types::{StorageResult, StoredTableInfo, StreamName, WireItem};
 use stream_provider::{StreamDataType, StreamError, StreamItem, StreamResult};
 use tokio_postgres::{Row, types::ToSql};
 
-use crate::backends::postgres::{PostgresStorageProvider, sql_statements};
+use crate::{
+    backends::postgres::{PostgresStorageProvider, sql_statements},
+    indexed_item::SqlDecodedItem,
+};
 
 impl PostgresStorageProvider {
     #[expect(
@@ -58,6 +61,41 @@ impl PostgresStorageProvider {
         scan_forward: bool,
         effective_limit: u32,
     ) -> StorageResult<(Vec<WireItem>, bool)> {
+        let (items, has_more) = self
+            .load_paginated_decoded_items_with_client(
+                client,
+                physical_name,
+                table_info,
+                primary_key_schema,
+                secondary_key_schema,
+                where_clauses,
+                bind_values,
+                scan_forward,
+                effective_limit,
+            )
+            .await?;
+        Ok((
+            items.into_iter().map(|decoded| decoded.item).collect(),
+            has_more,
+        ))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Unified paginated read needs schemas, predicates, and pagination inputs"
+    )]
+    pub(super) async fn load_paginated_decoded_items_with_client<C: GenericClient + Sync>(
+        &self,
+        client: &C,
+        physical_name: &str,
+        table_info: &StoredTableInfo,
+        primary_key_schema: &[storage_types::KeySchemaElement],
+        secondary_key_schema: Option<&[storage_types::KeySchemaElement]>,
+        where_clauses: &[String],
+        bind_values: &[String],
+        scan_forward: bool,
+        effective_limit: u32,
+    ) -> StorageResult<(Vec<SqlDecodedItem>, bool)> {
         let select_projection = Self::build_select_projection_for_origin(
             table_info,
             primary_key_schema,
@@ -98,10 +136,10 @@ impl PostgresStorageProvider {
             .await
             .map_err(|err| Self::map_postgres_error("load ordered rows", err))?;
 
-        let mut items: Vec<WireItem> = rows
+        let mut items = rows
             .into_iter()
             .map(|row| {
-                Self::row_to_wire_item_for_origin(
+                Self::row_to_decoded_item_for_origin(
                     &row,
                     table_info,
                     primary_key_schema,

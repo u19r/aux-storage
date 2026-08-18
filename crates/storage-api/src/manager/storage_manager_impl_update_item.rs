@@ -2,8 +2,8 @@ use http_error::HttpApiError;
 use storage::UpdateItemInput;
 use storage_sync::SyncWriteRequest;
 use storage_types::{
-    StorageEnum, StorageError, UpdateItemRequest, UpdateItemResponse, context::WrappedError as _,
-    validate_transact_key,
+    IndexerDeclaration, StorageEnum, StorageError, UpdateItemRequest, UpdateItemResponse,
+    context::WrappedError as _, validate_transact_key,
 };
 
 use crate::{
@@ -26,6 +26,9 @@ impl StorageApiManagerImpl {
             .await?;
         validate_transact_key(operation.table_info(), &request.key)
             .map_err(key_validation_error)?;
+        if let Some(indexers) = request.indexers.as_deref() {
+            IndexerDeclaration::validate(indexers, operation.table_info().max_indexers)?;
+        }
         let return_old_on_condition_failure = should_return_old_item_on_condition_failure(
             request.condition_expression.as_deref(),
             request.return_values_on_condition_check_failure.as_ref(),
@@ -46,6 +49,7 @@ impl StorageApiManagerImpl {
             table_name: request.table_name,
             key: request.key,
             update_expression: request.update_expression.unwrap_or_default(),
+            indexers: request.indexers,
             condition_expression: request.condition_expression,
             expression_attribute_names: request.expression_attribute_names,
             expression_attribute_values: request.expression_attribute_values,

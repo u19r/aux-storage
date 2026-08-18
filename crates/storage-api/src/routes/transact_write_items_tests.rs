@@ -276,6 +276,7 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
     .await
     .expect("create table");
     db.put_item(storage::PutItemInput {
+        indexers: None,
         table_name: TableName::new("TxnConditionAllOld"),
         item: std::collections::HashMap::from([
             ("id".to_string(), AttributeValue::S("item1".to_string())),
@@ -341,6 +342,7 @@ async fn competing_transaction_writes_return_the_atomic_winner_as_all_old() {
     .await
     .expect("create table");
     db.put_item(storage::PutItemInput {
+        indexers: None,
         table_name: TableName::new("TxnConditionalAtomicPreimage"),
         item: std::collections::HashMap::from([
             ("pk".to_string(), AttributeValue::S("p".to_string())),

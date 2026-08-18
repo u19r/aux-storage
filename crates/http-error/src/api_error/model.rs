@@ -219,6 +219,15 @@ impl HttpApiError {
         }
     }
 
+    pub fn service_unavailable(retry_after_seconds: u64) -> Self {
+        Self::dynamodb_protocol_error(
+            "ServiceUnavailableException",
+            "Storage is temporarily unavailable.",
+            503,
+        )
+        .with_response_header("Retry-After", retry_after_seconds.max(1).to_string())
+    }
+
     pub fn unauthorized_error(message: impl Into<String>) -> Self {
         Self {
             error_type: "UnrecognizedClientException".to_string(),
@@ -312,6 +321,23 @@ impl IntoApiError for HttpApiError {
     fn error_message(&self) -> Cow<'static, str> {
         Cow::Owned(self.message.clone())
     }
+
+    fn error_response(&self) -> ErrorResponse {
+        ErrorResponse {
+            error_type: self.error_code().into_owned(),
+            message: self.error_message().into_owned(),
+            transaction_message: None,
+            cancellation_reasons: self.cancellation_reasons.clone(),
+            item: self.item.as_ref().map(|item| (**item).clone()),
+            request_id: None,
+            documentation_url: None,
+            retry_after_seconds: self
+                .response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| value.parse::<u64>().ok()),
+        }
+    }
 }
 
 impl From<StorageError> for HttpApiError {
@@ -351,6 +377,10 @@ impl From<StorageError> for HttpApiError {
             StorageEnum::InternalServerError { message } => {
                 Self::dynamodb_protocol_error("InternalServerError", message.clone(), 500)
             }
+            StorageEnum::ServiceUnavailable {
+                retry_after_seconds,
+                ..
+            } => Self::service_unavailable(*retry_after_seconds),
             StorageEnum::GuardConflict { message } => Self::internal_server_error(message.clone()),
             StorageEnum::Unsupported { message } => Self::internal_server_error(message.clone()),
             StorageEnum::TransactionConflict { message } => {
@@ -515,6 +545,11 @@ impl From<HttpApiError> for (axum::http::StatusCode, axum::response::Json<ErrorR
             transaction_message: error.cancellation_reasons.as_ref().map(|_| error.message),
             cancellation_reasons: error.cancellation_reasons,
             item: error.item.map(|item| *item),
+            retry_after_seconds: error
+                .response_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| value.parse::<u64>().ok()),
             ..Default::default()
         };
 

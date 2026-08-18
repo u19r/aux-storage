@@ -339,11 +339,31 @@
             }
           }
         },
+        "read_sequence": {
+          "$ref": "#/$defs/ReadSequenceConfig",
+          "default": {
+            "mode": "on",
+            "shadow_sample_percent": 1
+          }
+        },
         "runtime": {
           "$ref": "#/$defs/RuntimeFeatures",
           "default": {
             "enable_background_workers": true,
             "environment": "production"
+          }
+        },
+        "storage_admission": {
+          "$ref": "#/$defs/StorageAdmissionConfig",
+          "default": {
+            "control_reserve_concurrency": 4,
+            "enabled": true,
+            "initial_latency_estimate_ms": 5,
+            "initial_sustainable_throughput_rps": 20000,
+            "max_queue_wait_ms": 25,
+            "maximum_concurrency": 1024,
+            "minimum_concurrency": 4,
+            "queue_capacity": 256
           }
         },
         "storage_connections": {
@@ -419,7 +439,7 @@
       "additionalProperties": false,
       "properties": {
         "cache_read_version_ms": {
-          "default": 0,
+          "default": 50,
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -639,6 +659,33 @@
       },
       "type": "object"
     },
+    "ReadSequenceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ReadSequenceExecutionMode",
+          "default": "on"
+        },
+        "shadow_sample_percent": {
+          "default": 1,
+          "description": "Percentage of requests eligible for shadow comparison.  Sampling is\ndeterministic from the request digest and is capped at 100.",
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ReadSequenceExecutionMode": {
+      "description": "Operational strategy selection for the ReadSequence DAG lowerings.\n\nThis is deliberately configuration-only.  The request contract always\nvalidates and executes through the ordinary DAG scheduler; the mode only\ncontrols whether an optional provider lowering may be attempted.",
+      "enum": [
+        "off",
+        "shadow",
+        "on"
+      ],
+      "type": "string"
+    },
     "RemoteBackendConfig": {
       "additionalProperties": false,
       "properties": {
@@ -830,6 +877,59 @@
         "immediate_gsi_consistency": {
           "default": false,
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "StorageAdmissionConfig": {
+      "additionalProperties": false,
+      "description": "Foreground provider admission and overload protection settings.",
+      "properties": {
+        "control_reserve_concurrency": {
+          "default": 4,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "initial_latency_estimate_ms": {
+          "default": 5,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "initial_sustainable_throughput_rps": {
+          "default": 20000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_queue_wait_ms": {
+          "default": 25,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_concurrency": {
+          "default": 1024,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_concurrency": {
+          "default": 4,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queue_capacity": {
+          "default": 256,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1316,9 +1416,23 @@
             "bearer_token": null
           }
         },
+        "read_sequence": {
+          "mode": "on",
+          "shadow_sample_percent": 1
+        },
         "runtime": {
           "enable_background_workers": true,
           "environment": "production"
+        },
+        "storage_admission": {
+          "control_reserve_concurrency": 4,
+          "enabled": true,
+          "initial_latency_estimate_ms": 5,
+          "initial_sustainable_throughput_rps": 20000,
+          "max_queue_wait_ms": 25,
+          "maximum_concurrency": 1024,
+          "minimum_concurrency": 4,
+          "queue_capacity": 256
         },
         "storage_connections": null,
         "storage_point_read_cache": {

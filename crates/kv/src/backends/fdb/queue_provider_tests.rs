@@ -15,7 +15,7 @@ use crate::{
     SortedKvDbStorageProvider,
     backends::fdb::fdb_support_tests::{connect_fdb_store, metrics_handle, parse_metric_value},
     constants::{PARTITION_CONTROLLER_LOW_STREAK_TARGET, PARTITION_LOAD_SAMPLE_WINDOW_SECONDS},
-    key_template::{KeyTemplate, PlaceholderBinding},
+    key_template::{KeyTemplate, UniquePlaceholderBinding},
     keyspace::compact::QueueStorageId,
     partition_family::{
         PartitionFamilyKind, PartitionLoadSample, PartitionLoadSampleRecord,
@@ -460,10 +460,10 @@ async fn foundationdb_template_uses_versionstamp_not_fallback() {
 
     let test_future = async move {
         let fallback = b"fallback-literal".to_vec();
-        let binding = PlaceholderBinding::unique(fallback.clone());
+        let binding = UniquePlaceholderBinding::new(fallback.clone());
         let binding_id = binding.id();
         let prefix = format!("tests/fdb/templates/{}/", Uuid::now_v7()).into_bytes();
-        let template = KeyTemplate::placeholder(prefix.clone(), Vec::new(), binding);
+        let template = KeyTemplate::unique_placeholder(prefix.clone(), Vec::new(), binding);
         let payload = b"payload".to_vec();
 
         let output = store

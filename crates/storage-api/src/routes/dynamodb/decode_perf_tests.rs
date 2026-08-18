@@ -1,4 +1,4 @@
-use std::hint::black_box;
+use std::{hint::black_box, process::Command};
 
 use alloc_counter::AllocationGuard;
 use axum::body::Bytes;
@@ -39,6 +39,27 @@ fn measure<T>(
 
 #[test]
 fn given_small_requests_when_decoding_directly_then_allocations_are_reduced() {
+    const ISOLATED_ENV: &str = "AUX_STORAGE_API_DYNAMODB_DECODE_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe()
+                .expect("DynamoDB decode allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(
+            "routes::dynamodb::decode_perf_tests::given_small_requests_when_decoding_directly_then_allocations_are_reduced",
+        )
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated DynamoDB decode allocation test child should start");
+        assert!(
+            status.success(),
+            "isolated DynamoDB decode allocation test failed"
+        );
+        return;
+    }
+
     let legacy_get = measure("get_value_then_typed", || {
         parse_try_into_request::<GetItemRequest>(&Bytes::from_static(GET_BODY))
             .expect("legacy GetItem decode")

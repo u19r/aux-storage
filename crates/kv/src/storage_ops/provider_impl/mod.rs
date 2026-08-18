@@ -20,22 +20,22 @@ use storage_types::{
     AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
     BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
     DeleteItemRequest, DeleteRequest, DescribeTimeToLiveResponse, DurablePointReadProof,
-    DurablePointReadRequest, EncodeWriteRequest, IndexName, ItemKey, ItemVersionedWireItem,
-    KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
-    PutItemEncodeRequest, PutItemRequest, PutItemResponse, PutRequest, QueryTableRequest,
-    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StorageValidationKind, StoredTableInfo, StreamName, StreamRetentionDuration,
-    TTL_PARTITION_ATTRIBUTE, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus,
-    TimestampMillis, TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest,
-    UpdateTimeToLiveResponse, WireItem, WriteRequest, WriteRetryPolicy, context::WrappedError as _,
+    DurablePointReadRequest, EncodeWriteRequest, IndexName, IndexedWireItem, IndexerDeclaration,
+    ItemKey, ItemVersionedWireItem, KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes,
+    Projection, ProjectionType, PutItemEncodeRequest, PutItemRequest, PutItemResponse, PutRequest,
+    QueryTableRequest, ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum,
+    StorageError, StorageResult, StorageValidationKind, StoredTableInfo, StreamName,
+    StreamRetentionDuration, TTL_PARTITION_ATTRIBUTE, TableName, TableStatus,
+    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, TransactWriteItem,
+    TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    WireItem, WriteRequest, WriteRetryPolicy, context::WrappedError as _,
     normalize_attribute_map_numbers_for_write, return_values_on_condition_check_failure_all_old,
     validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
 };
 use tracing::{Span, instrument, warn};
 
 use crate::{
-    helpers::deserialize_item_from_bytes,
     sorted_kv_store::{AtomicTableWriteDecision, AtomicTableWriteTransform, SortedKvReadContext},
     storage_ops::constants::{IDEMPOTENCY_TOKEN_TTL_MS, REPLICATION_APPLY_PARALLELISM_HINT},
     storage_provider::{GsiBackfillJob, GsiUpdateJob},
@@ -49,6 +49,11 @@ mod conditional_errors;
 mod direct_mutations;
 mod gsi_helpers;
 mod item_encoding;
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod item_encoding_tests;
+mod job_priority;
+#[cfg(test)]
+mod job_priority_tests;
 mod jobs;
 mod key_helpers;
 mod metadata_cache;
@@ -57,6 +62,20 @@ mod metrics;
 mod provider_trait;
 mod put_item;
 mod read;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped_bounds;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped_descriptors;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped_layout;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped_metrics;
+#[cfg(feature = "foundationdb-backend")]
+mod read_sequence_mapped_rows;
+#[cfg(all(test, feature = "foundationdb-backend"))]
+mod read_sequence_mapped_tests;
 mod replication;
 mod runtime_helpers;
 mod table_management;
@@ -76,10 +95,12 @@ pub(super) use direct_mutations::{
     kv_mutation_to_direct_with_literal_templates, to_direct_write_operation,
 };
 pub(crate) use item_encoding::{
-    decode_wire_item_from_storage_bytes, encode_requests_to_write_requests,
-    encode_wire_item_storage_bytes, normalized_attribute_map_for_write,
-    normalized_wire_item_for_write,
+    decode_indexed_wire_item, decode_wire_item_from_storage_bytes,
+    decode_wire_item_with_indexers_from_storage_bytes, encode_indexed_wire_item,
+    encode_requests_to_write_requests, encode_wire_item_storage_bytes,
+    normalized_attribute_map_for_write, normalized_wire_item_for_write,
 };
+pub(crate) use job_priority::priority_for_job;
 use key_helpers::key_attributes_for_item;
 pub(super) use metadata_store::kv_table_scope_id;
 pub(crate) use metrics::{
@@ -100,6 +121,7 @@ pub(crate) use ttl_indexing::{
 };
 
 const CREATE_TABLE_CONFLICT_RETRY_ATTEMPTS: usize = 4;
+const TABLE_METADATA_CONFLICT_RETRY_ATTEMPTS: usize = 4;
 
 use storage_common::ttl::TtlConfigRecord;
 

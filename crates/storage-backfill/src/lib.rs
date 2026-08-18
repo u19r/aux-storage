@@ -24,17 +24,17 @@ pub use constants::{
 };
 pub use gsi_catchup::{GsiCatchupApplyCase, GsiCatchupOutcome, plan_gsi_catchup_apply};
 pub use logical::{
-    LogicalBackfillActivationGate, LogicalBackfillCaller, LogicalBackfillCheckpoint,
-    LogicalBackfillChecksum, LogicalBackfillChunk, LogicalBackfillChunkId,
-    LogicalBackfillChunkSummary, LogicalBackfillCommand, LogicalBackfillConflictPolicy,
-    LogicalBackfillDomain, LogicalBackfillError, LogicalBackfillExport, LogicalBackfillId,
-    LogicalBackfillImport, LogicalBackfillManifest, LogicalBackfillPolicy, LogicalBackfillRecord,
-    LogicalBackfillResult, LogicalBackfillTombstone, LogicalBackfillTombstoneCleanup,
-    LogicalBootstrapPreflightCase, LogicalBootstrapPreflightDecision, LogicalExportPage,
-    LogicalExportRequest, LogicalImportApplyCase, LogicalImportApplyDecision,
-    LogicalImportRecordKind, MultiRegionBootstrapPolicy, SyncLearnerCatchupPolicy,
-    plan_logical_bootstrap_preflight, plan_logical_import_apply,
-    validate_logical_chunk_for_manifest,
+    LOGICAL_BACKFILL_PROTOCOL_VERSION, LogicalBackfillActivationGate, LogicalBackfillCaller,
+    LogicalBackfillCheckpoint, LogicalBackfillChecksum, LogicalBackfillChunk,
+    LogicalBackfillChunkId, LogicalBackfillChunkSummary, LogicalBackfillCommand,
+    LogicalBackfillConflictPolicy, LogicalBackfillDomain, LogicalBackfillError,
+    LogicalBackfillExport, LogicalBackfillId, LogicalBackfillImport, LogicalBackfillManifest,
+    LogicalBackfillPolicy, LogicalBackfillRecord, LogicalBackfillResult, LogicalBackfillTombstone,
+    LogicalBackfillTombstoneCleanup, LogicalBootstrapPreflightCase,
+    LogicalBootstrapPreflightDecision, LogicalExportPage, LogicalExportRequest,
+    LogicalImportApplyCase, LogicalImportApplyDecision, LogicalImportRecordKind,
+    MultiRegionBootstrapPolicy, SyncLearnerCatchupPolicy, plan_logical_bootstrap_preflight,
+    plan_logical_import_apply, validate_logical_chunk_for_manifest,
 };
 pub use policy::{
     BackfillControl, BackfillPolicy, GsiBackfillPolicy, GsiKeyMapping, GsiProjection,

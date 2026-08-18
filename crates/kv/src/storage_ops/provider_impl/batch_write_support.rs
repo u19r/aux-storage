@@ -55,7 +55,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         for (position, value) in key_positions.into_iter().zip(values) {
             let wire_item = value
                 .as_deref()
-                .map(decode_wire_item_from_storage_bytes)
+                .map(|bytes| {
+                    decode_wire_item_from_storage_bytes(
+                        self.kv_store.item_value_codec(),
+                        bytes,
+                        table_info.max_indexers,
+                    )
+                })
                 .transpose()?;
             existing_items[position] = wire_item.map(WireItem::into_attribute_map).transpose()?;
         }

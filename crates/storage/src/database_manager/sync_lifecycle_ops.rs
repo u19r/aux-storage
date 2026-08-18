@@ -19,11 +19,7 @@ impl DatabaseManager {
                 let request = serde_json::from_str::<storage_types::CreateTableRequest>(
                     &mutation.request_json,
                 )?;
-                if self
-                    .storage_provider()
-                    .table_exists(&request.table_name)
-                    .await?
-                {
+                if self.table_exists(&request.table_name).await? {
                     let table_info = self.get_table_info(&request.table_name).await?;
                     return sync_response_json(&create_table_response(table_info));
                 }
@@ -157,6 +153,7 @@ fn table_description(
         created_at: table_info.created_at.into(),
         attribute_definitions: table_info.attribute_definitions,
         key_schema: table_info.key_schema,
+        max_indexers: table_info.max_indexers,
         table_size_bytes: table_info.table_size_bytes,
         item_count: table_info.item_count,
         table_arn: format!(

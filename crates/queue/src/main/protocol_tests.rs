@@ -459,6 +459,21 @@ async fn given_api_error_with_invalid_status_code_when_rendering_then_the_respon
     assert_eq!(payload["__type"], "com.amazonaws.sqs#InternalError");
 }
 
+#[tokio::test]
+async fn given_service_unavailable_when_rendering_then_retry_after_is_preserved_for_both_protocols()
+{
+    for protocol in [QueueProtocol::Json, QueueProtocol::Query] {
+        let response =
+            api_error_response("req-api", protocol, HttpApiError::service_unavailable(7));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "7");
+        let _ = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+    }
+}
+
 #[test]
 fn given_invalid_header_values_when_adding_common_headers_then_header_values_fall_back_to_invalid()
 {

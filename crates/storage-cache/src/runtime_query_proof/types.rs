@@ -292,6 +292,7 @@ pub enum RuntimePreparedQueryExecution<Item> {
     },
     PrefixOnly {
         items: Vec<Item>,
+        last_evaluated_key: String,
     },
     None,
 }

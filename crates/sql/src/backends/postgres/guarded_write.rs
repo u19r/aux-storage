@@ -13,7 +13,8 @@ use storage_types::{
 
 use crate::{
     backends::postgres::{
-        PostgresStorageProvider, record_write, transaction_helpers::condition_item_ref,
+        PostgresStorageProvider, record_write,
+        transaction_helpers::{PostgresUpsertTransactItemInput, condition_item_ref},
     },
     billing_metrics::{attr_map_payload_bytes, record_write_cost, serializable_payload_bytes},
 };
@@ -31,6 +32,7 @@ impl PostgresStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            indexers,
         } = request;
         if item.is_empty() {
             return Err(StorageError::validation("Item is empty"));
@@ -48,6 +50,7 @@ impl PostgresStorageProvider {
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
                 let return_values = return_values.clone();
+                let indexers = indexers.clone();
                 let table_info = table_info.clone();
                 async move {
                     let mut client = self.acquire_client("guarded_put_item").await?;
@@ -78,6 +81,7 @@ impl PostgresStorageProvider {
                     self.transact_put_with_client(
                         &transaction,
                         storage_types::TransactPutRequest {
+                            indexers: Some(indexers),
                             table_name: table_name.clone(),
                             item,
                             condition_expression,
@@ -202,6 +206,7 @@ impl PostgresStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            indexers,
             ..
         } = request;
 
@@ -223,6 +228,7 @@ impl PostgresStorageProvider {
                 let return_values = return_values.clone();
                 let table_info = table_info.clone();
                 let guard = guard.clone();
+                let indexers = indexers.clone();
                 async move {
                     let mut client = self.acquire_client("guarded_update_item").await?;
                     let _connection_hold = self.connection_hold_timer("guarded_update_item");
@@ -242,16 +248,22 @@ impl PostgresStorageProvider {
                     )
                     .await?;
 
-                    let existing_item = self
-                        .get_item_with_client(
+                    let prepared =
+                        Self::prepare_get_item_query(&table_name, &key_attributes, &table_info)?;
+                    let existing = self
+                        .execute_prepared_get_item_query_with_indexers(
                             &transaction,
-                            &table_name,
-                            &key_attributes,
-                            &table_info,
+                            &prepared,
+                            "guarded_update_item",
+                            "old_item_query",
                         )
-                        .await?
-                        .map(WireItem::into_attribute_map)
-                        .transpose()?;
+                        .await?;
+                    let (existing_item, stored_indexers) = match existing {
+                        Some(item) => (Some(item.item.into_attribute_map()?), item.indexers),
+                        None => (None, Vec::new()),
+                    };
+                    let effective_indexers =
+                        indexers.as_deref().unwrap_or(stored_indexers.as_slice());
                     if let Some(condition) = &condition
                         && !evaluate_condition(
                             condition_item_ref(existing_item.as_ref()),
@@ -276,11 +288,17 @@ impl PostgresStorageProvider {
                         apply_bound_update_operations(item_to_update.clone(), &operations)?;
                     self.upsert_transact_item_with_client(
                         &transaction,
-                        &table_name,
-                        &table_info,
-                        updated_item.clone(),
-                        old_item_for_write.as_ref(),
-                        None,
+                        PostgresUpsertTransactItemInput {
+                            table_name: &table_name,
+                            table_info: &table_info,
+                            item: updated_item.clone(),
+                            indexers: effective_indexers,
+                            old_item: old_item_for_write.as_ref(),
+                            old_indexers: old_item_for_write
+                                .as_ref()
+                                .map(|_| stored_indexers.as_slice()),
+                            item_stream_ttl_hours: None,
+                        },
                     )
                     .await?;
                     transaction.commit().await.map_err(|err| {

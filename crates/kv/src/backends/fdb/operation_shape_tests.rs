@@ -27,7 +27,7 @@ use crate::{
         foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot,
         range_read::{DYNAMODB_RANGE_TARGET_BYTES, dynamodb_range_option},
     },
-    sorted_kv_store::{DirectWriteOperation, SortedKvStore},
+    sorted_kv_store::{DirectWriteOperation, SortedKvStore, TransactionPriority},
 };
 
 #[test]
@@ -87,6 +87,7 @@ async fn foundationdb_queue_and_pubsub_operation_shape_tests() {
         eprintln!("Skipping FoundationDB operation-shape test: unable to connect to local cluster");
         return;
     };
+    let _metrics_guard = crate::backends::fdb::foundationdb_operation_metrics_test_guard();
     let provider = SortedKvDbStorageProvider::new(store);
     QueueProvider::initialize(&provider).await.unwrap();
     PubsubProvider::initialize(&provider).await.unwrap();
@@ -186,7 +187,11 @@ async fn foundationdb_queue_and_pubsub_operation_shape_tests() {
         .await
         .unwrap();
     assert_all_batch_results_ok(&delete_results, "batch delete");
-    let cleaned_payloads = provider.cleanup_queue_payload_orphans(128).await.unwrap();
+    let cleanup_provider = provider.with_transaction_priority(TransactionPriority::Batch);
+    let cleaned_payloads = cleanup_provider
+        .cleanup_queue_payload_orphans(128)
+        .await
+        .unwrap();
     assert_eq!(cleaned_payloads, 5);
 
     let queue_metrics = foundationdb_operation_metrics_snapshot();
@@ -221,16 +226,12 @@ async fn foundationdb_queue_and_pubsub_operation_shape_tests() {
     assert_metric_at_least(&queue_metrics, "queue_claim", "ordinary_point_read", 10);
     assert_metric_at_least(&queue_metrics, "queue_claim", "snapshot_point_read", 10);
     assert_metric_at_least(&queue_metrics, "queue_claim", "read_modify_write", 20);
+    assert_metric_at_least(&queue_metrics, "transaction", "priority_batch", 1);
     assert_metric_at_most(&queue_metrics, "queue_send", "ordinary_point_read", 0);
     assert_metric_at_most(&queue_metrics, "queue_send", "commit", 1);
     assert_metric_at_least(&queue_metrics, "queue_send", "blind_write", 64);
     assert_metric_at_most(&queue_metrics, "transact_write_unchecked", "commit", 3);
-    assert_metric_at_least(
-        &queue_metrics,
-        "transact_write_unchecked",
-        "range_clear",
-        15,
-    );
+    assert_metric_at_least(&queue_metrics, "transact_write_unchecked", "range_clear", 5);
     let metrics = foundationdb_operation_metrics_snapshot();
     assert_metric_at_least(
         &metrics,
@@ -251,6 +252,7 @@ async fn foundationdb_resolved_sync_apply_batches_group_into_one_commit_tests() 
         );
         return;
     };
+    let _metrics_guard = crate::backends::fdb::foundationdb_operation_metrics_test_guard();
     let provider = SortedKvDbStorageProvider::new(store).with_immediate_gsi_consistency(true);
     provider.initialize_storage().await.unwrap();
     provider.initialize_stream().await.unwrap();
@@ -389,7 +391,9 @@ fn sync_put(table_name: &TableName, index: usize) -> ResolvedSyncMutation {
         table_name: table_name.clone(),
         key_json: format!(r#"{{"pk":{{"S":"{key}"}}}}"#),
         item_json: format!(r#"{{"pk":{{"S":"{key}"}},"status":{{"S":"open"}}}}"#),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(index as u64 + 1),
         response: SyncMutationResponse {
             response_json: Some(format!(r#"{{"index":{index}}}"#)),

@@ -10,7 +10,7 @@ use crate::{
             record_fdb_transaction_start,
         },
         read_context::FoundationDbReadContext,
-        store::{FoundationDbKvStore, read_fdb_keys_sequential},
+        store::{FoundationDbKvStore, read_fdb_keys_concurrently},
     },
     sorted_kv_store::SortedKvReadContext,
 };
@@ -19,15 +19,35 @@ impl FoundationDbKvStore {
     pub(crate) async fn begin_read_context_operation(
         &self,
     ) -> StorageResult<Box<dyn SortedKvReadContext>> {
-        let trx = self.create_transaction()?;
-        self.configure_read_transaction(&trx, None, true)?;
-        self.prepare_uncached_read_version_fdb(&trx, true)
-            .await
-            .map_err(|err| map_fdb_error("read context read version", err))?;
+        let mut trx = self.create_transaction()?;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            self.configure_read_transaction(&trx, None, true)?;
+            match self.prepare_uncached_read_version_fdb(&trx, true).await {
+                Ok(()) => break,
+                Err(error) if error.is_retryable() => {
+                    trx = self
+                        .retry_transaction_after_fdb_error(
+                            trx,
+                            "read_context",
+                            "read context read version",
+                            attempt,
+                            error,
+                            0,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    return Err(map_fdb_error("read context read version", error));
+                }
+            }
+        }
         record_fdb_transaction_start("read_context");
         Ok(Box::new(FoundationDbReadContext {
             store: self.clone(),
             trx,
+            retryable_failure: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
     }
 
@@ -37,7 +57,6 @@ impl FoundationDbKvStore {
         consistent_read: bool,
     ) -> StorageResult<Option<Vec<u8>>> {
         let prefixed_key = self.prefix_slice(key);
-        let candidate_keys = vec![prefixed_key.to_vec()];
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         record_fdb_transaction_start("get");
@@ -56,7 +75,7 @@ impl FoundationDbKvStore {
                         "get read version",
                         attempt,
                         err,
-                        &candidate_keys,
+                        1,
                     )
                     .await?;
                 continue;
@@ -67,14 +86,7 @@ impl FoundationDbKvStore {
                 Ok(value) => value,
                 Err(err) => {
                     trx = self
-                        .retry_transaction_after_fdb_error(
-                            trx,
-                            "get",
-                            "read key",
-                            attempt,
-                            err,
-                            &candidate_keys,
-                        )
+                        .retry_transaction_after_fdb_error(trx, "get", "read key", attempt, err, 1)
                         .await?;
                     continue;
                 }
@@ -111,11 +123,7 @@ impl FoundationDbKvStore {
         loop {
             attempt += 1;
             self.configure_read_transaction(&trx, None, consistent_read)?;
-            let prefix = self.config.subspace_prefix.clone();
-            let candidate_keys = keys
-                .iter()
-                .map(|key| Self::prefix_bytes(prefix.as_ref(), key))
-                .collect::<Vec<_>>();
+            let prefix = self.physical_prefix();
             if let Err(err) = self
                 .prepare_uncached_read_version_fdb(&trx, consistent_read)
                 .await
@@ -127,7 +135,7 @@ impl FoundationDbKvStore {
                         "multi_get read version",
                         attempt,
                         err,
-                        &candidate_keys,
+                        keys.len(),
                     )
                     .await?;
                 continue;
@@ -135,10 +143,14 @@ impl FoundationDbKvStore {
 
             let prefixed_keys = keys
                 .iter()
-                .map(|key| Self::prefix_bytes(prefix.as_ref(), key))
+                .map(|key| Self::prefix_bytes(prefix, key))
                 .collect::<Vec<_>>();
+            let prefixed_key_bytes = prefixed_keys
+                .iter()
+                .map(|key| key.len() as u64)
+                .sum::<u64>();
             let read_started = Instant::now();
-            match read_fdb_keys_sequential(&trx, &prefixed_keys, false).await {
+            match read_fdb_keys_concurrently(&trx, prefixed_keys, false).await {
                 Ok(results) => {
                     record_fdb_operation_latency(
                         "multi_get",
@@ -146,14 +158,7 @@ impl FoundationDbKvStore {
                         read_started.elapsed(),
                     );
                     record_fdb_point_read("multi_get", false, keys.len() as u64);
-                    record_fdb_operation_bytes(
-                        "multi_get",
-                        "read_key",
-                        prefixed_keys
-                            .iter()
-                            .map(|key| key.len() as u64)
-                            .sum::<u64>(),
-                    );
+                    record_fdb_operation_bytes("multi_get", "read_key", prefixed_key_bytes);
                     record_fdb_operation_bytes(
                         "multi_get",
                         "read",
@@ -169,10 +174,7 @@ impl FoundationDbKvStore {
                                     .sum::<u64>(),
                             ),
                     );
-                    return Ok(results
-                        .into_iter()
-                        .map(|value| value.map(|bytes| bytes.to_vec()))
-                        .collect());
+                    return Ok(results);
                 }
                 Err(err) => {
                     trx = self
@@ -182,7 +184,7 @@ impl FoundationDbKvStore {
                             "multi_get",
                             0,
                             err,
-                            &candidate_keys,
+                            keys.len(),
                         )
                         .await?;
                 }

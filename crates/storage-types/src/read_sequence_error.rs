@@ -5,21 +5,60 @@ use crate::{ReadSequenceConsistency, StorageError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadSequenceValidationError {
     EmptySequence,
-    DuplicateStepName {
+    DuplicateNodeName {
         name: String,
     },
-    InvalidStepName {
+    InvalidNodeName {
         name: String,
     },
-    InvalidStepOperation {
-        step: String,
+    InvalidOperation {
+        node: String,
+        message: String,
     },
-    InvalidForEachOperation,
-    UnknownDependency {
-        step: String,
-        dependency: String,
+    UnknownNode {
+        node: String,
+        referenced: String,
     },
-    StepLimitExceeded {
+    UnknownInput {
+        node: String,
+        input: String,
+    },
+    SelfDependency {
+        node: String,
+    },
+    MultipleIterationInputs {
+        node: String,
+    },
+    InputCardinality {
+        node: String,
+        input: String,
+    },
+    InputResolution {
+        node: String,
+        input: String,
+        expected: String,
+        actual: String,
+    },
+    InputType {
+        node: String,
+        input: String,
+        expected: String,
+        actual: String,
+    },
+    InvalidStringTemplate {
+        node: String,
+    },
+    UnreachableNode {
+        node: String,
+    },
+    DependencyCycle {
+        cycle: Vec<String>,
+    },
+    GraphResolutionInvariant {
+        remaining: usize,
+    },
+    EmptyOutputs,
+    NodeLimitExceeded {
         actual: usize,
         limit: u32,
     },
@@ -37,7 +76,7 @@ pub enum ReadSequenceValidationError {
         limit: u32,
     },
     SelectorBindingLimitExceeded {
-        step: String,
+        node: String,
         actual: usize,
         limit: u32,
     },
@@ -54,16 +93,13 @@ pub enum ReadSequenceValidationError {
         expected: &'static str,
         actual: &'static str,
     },
-    TemplateFailure {
-        template: String,
-    },
     UnsupportedConsistency {
         consistency: ReadSequenceConsistency,
     },
     TransactionalGsiRejected,
     StrongGsiRejected,
     ChildQueryLimitRequired {
-        step: String,
+        node: String,
     },
     StaleToken,
     SnapshotExpired,
@@ -75,29 +111,77 @@ pub enum ReadSequenceValidationError {
 impl fmt::Display for ReadSequenceValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptySequence => formatter.write_str("ReadSequence requires at least one step"),
-            Self::DuplicateStepName { name } => {
-                write!(formatter, "ReadSequence step name '{name}' is duplicated")
+            Self::EmptySequence => formatter.write_str("ReadSequence requires at least one node"),
+            Self::DuplicateNodeName { name } => {
+                write!(formatter, "ReadSequence node name '{name}' is duplicated")
             }
-            Self::InvalidStepName { name } => {
-                write!(formatter, "ReadSequence step name '{name}' is invalid")
+            Self::InvalidNodeName { name } => {
+                write!(formatter, "ReadSequence node name '{name}' is invalid")
             }
-            Self::InvalidStepOperation { step } => {
+            Self::InvalidOperation { node, message } => write!(
+                formatter,
+                "ReadSequence node '{node}' has an invalid operation: {message}"
+            ),
+            Self::UnknownNode { node, referenced } => write!(
+                formatter,
+                "ReadSequence node '{node}' references unknown node '{referenced}'"
+            ),
+            Self::UnknownInput { node, input } => write!(
+                formatter,
+                "ReadSequence node '{node}' references undeclared input '{input}'"
+            ),
+            Self::SelfDependency { node } => {
+                write!(formatter, "ReadSequence node '{node}' depends on itself")
+            }
+            Self::MultipleIterationInputs { node } => write!(
+                formatter,
+                "ReadSequence node '{node}' has more than one iteration input"
+            ),
+            Self::InputCardinality { node, input } => write!(
+                formatter,
+                "ReadSequence node '{node}' input '{input}' has invalid cardinality"
+            ),
+            Self::InputResolution {
+                node,
+                input,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "ReadSequence node '{node}' input '{input}' expected {expected} value(s), got \
+                 {actual}"
+            ),
+            Self::InputType {
+                node,
+                input,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "ReadSequence node '{node}' input '{input}' expected {expected}, got {actual}"
+            ),
+            Self::InvalidStringTemplate { node } => write!(
+                formatter,
+                "ReadSequence node '{node}' has an invalid string template"
+            ),
+            Self::UnreachableNode { node } => {
                 write!(
                     formatter,
-                    "ReadSequence step '{step}' must specify exactly one operation"
+                    "ReadSequence node '{node}' is not required by Outputs"
                 )
             }
-            Self::InvalidForEachOperation => {
-                formatter.write_str("ReadSequence ForEach must specify exactly one child operation")
-            }
-            Self::UnknownDependency { step, dependency } => write!(
+            Self::DependencyCycle { cycle } => write!(
                 formatter,
-                "ReadSequence step '{step}' references unknown or later step '{dependency}'"
+                "ReadSequence dependency cycle detected: {}",
+                cycle.join(" -> ")
             ),
-            Self::StepLimitExceeded { actual, limit } => write!(
+            Self::GraphResolutionInvariant { .. } => {
+                formatter.write_str("ReadSequence graph resolution failed")
+            }
+            Self::EmptyOutputs => formatter.write_str("ReadSequence Outputs must not be empty"),
+            Self::NodeLimitExceeded { actual, limit } => write!(
                 formatter,
-                "ReadSequence has {actual} steps, exceeding the limit of {limit}"
+                "ReadSequence has {actual} nodes, exceeding the limit of {limit}"
             ),
             Self::FanoutLimitExceeded { actual, limit } => write!(
                 formatter,
@@ -116,12 +200,12 @@ impl fmt::Display for ReadSequenceValidationError {
                 "ReadSequence {limit_name} {actual} exceeds the hard max of {limit}"
             ),
             Self::SelectorBindingLimitExceeded {
-                step,
+                node,
                 actual,
                 limit,
             } => write!(
                 formatter,
-                "ReadSequence step '{step}' has {actual} selector bindings, exceeding the limit \
+                "ReadSequence node '{node}' has {actual} selector bindings, exceeding the limit \
                  of {limit}"
             ),
             Self::SelectorPathTooDeep {
@@ -143,9 +227,6 @@ impl fmt::Display for ReadSequenceValidationError {
                 formatter,
                 "ReadSequence selector '{selector}' expected {expected}, got {actual}"
             ),
-            Self::TemplateFailure { template } => {
-                write!(formatter, "ReadSequence template '{template}' is invalid")
-            }
             Self::UnsupportedConsistency { consistency } => {
                 write!(
                     formatter,
@@ -159,9 +240,9 @@ impl fmt::Display for ReadSequenceValidationError {
             Self::StrongGsiRejected => {
                 formatter.write_str("ReadSequence STRONG consistency cannot read GSIs")
             }
-            Self::ChildQueryLimitRequired { step } => write!(
+            Self::ChildQueryLimitRequired { node } => write!(
                 formatter,
-                "ReadSequence child query in step '{step}' must specify Limit"
+                "ReadSequence child query in node '{node}' must specify Limit"
             ),
             Self::StaleToken => formatter.write_str("ReadSequence token is stale"),
             Self::SnapshotExpired => formatter.write_str("ReadSequence snapshot expired"),

@@ -2,15 +2,17 @@ use std::time::Duration;
 
 use storage_types::{
     AttributeDefinition, CreateGlobalSecondaryIndex, CreateTableRequest, IndexName,
-    KeyAttributeType, KeySchemaElement, KeyType, Projection, StorageEnum, StorageError,
-    StorageResult, StreamSpecification, StreamViewType, TableName, TableNamespace, TableStatus,
-    UpdateTableRequest, context::WrappedError as _,
+    KeyAttributeType, KeySchemaElement, KeyType, MaxIndexers, Projection, StorageEnum,
+    StorageError, StorageResult, StreamSpecification, StreamViewType, TableName, TableNamespace,
+    TableStatus, UpdateTableRequest, context::WrappedError as _,
 };
 use tokio::time::sleep;
 
 use crate::{
     DatabaseManager,
     constants::{TABLE_ACTIVE_RETRY_ATTEMPTS, TABLE_ACTIVE_RETRY_DELAY_MS},
+    database_manager::ROUTED_DEFAULT_CONNECTION_ID,
+    newtypes::DatabaseTrait,
 };
 
 pub struct Tables;
@@ -21,7 +23,10 @@ impl Tables {
     }
 
     pub async fn create_sys_namespaces_table(db: &DatabaseManager) -> StorageResult<()> {
-        create_sys_namespaces(db).await
+        db.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            create_sys_namespaces(provider.as_ref()).await
+        })
+        .await
     }
 
     #[must_use]
@@ -29,7 +34,10 @@ impl Tables {
         TableName::new("ana")
     }
     pub async fn create_sys_analytics_table(db: &DatabaseManager) -> StorageResult<()> {
-        create_sys_analytics(db).await
+        db.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            create_sys_analytics(provider.as_ref()).await
+        })
+        .await
     }
 
     #[must_use]
@@ -37,7 +45,10 @@ impl Tables {
         TableName::new("job")
     }
     pub async fn create_sys_jobs_table(db: &DatabaseManager) -> StorageResult<()> {
-        create_sys_jobs(db).await
+        db.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            create_sys_jobs(provider.as_ref()).await
+        })
+        .await
     }
 
     #[must_use]
@@ -45,7 +56,10 @@ impl Tables {
         TableName::new("rep")
     }
     pub async fn create_sys_storage_replication_table(db: &DatabaseManager) -> StorageResult<()> {
-        create_sys_storage_replication(db).await
+        db.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            create_sys_storage_replication(provider.as_ref()).await
+        })
+        .await
     }
 
     #[must_use]
@@ -100,7 +114,10 @@ impl Tables {
         db: &DatabaseManager,
         location_code: u16,
     ) -> StorageResult<()> {
-        create_shared_namespace(db, location_code).await
+        db.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            create_shared_namespace(provider.as_ref(), location_code).await
+        })
+        .await
     }
 }
 
@@ -168,10 +185,10 @@ async fn create_table_if_missing(
 }
 
 async fn raw_table_exists(
-    db: &DatabaseManager,
+    provider: &dyn DatabaseTrait,
     table_name: &TableName,
 ) -> Result<bool, StorageError> {
-    match db.storage_provider().get_table_info(table_name).await {
+    match provider.get_table_info(table_name).await {
         Ok(_) => Ok(true),
         Err(error) => {
             if matches!(
@@ -187,12 +204,12 @@ async fn raw_table_exists(
 }
 
 async fn wait_for_raw_table_active(
-    db: &DatabaseManager,
+    provider: &dyn DatabaseTrait,
     table_name: &TableName,
 ) -> Result<(), StorageError> {
     let delay = Duration::from_millis(TABLE_ACTIVE_RETRY_DELAY_MS);
     for _ in 0..TABLE_ACTIVE_RETRY_ATTEMPTS {
-        match db.storage_provider().get_table_info(table_name).await {
+        match provider.get_table_info(table_name).await {
             Ok(info) => match info.table_status {
                 TableStatus::Active => return Ok(()),
                 TableStatus::Creating | TableStatus::Updating => {}
@@ -219,10 +236,10 @@ async fn wait_for_raw_table_active(
 }
 
 async fn create_table_if_missing_raw(
-    db: &DatabaseManager,
+    provider: &dyn DatabaseTrait,
     request: &CreateTableRequest,
 ) -> Result<(), StorageError> {
-    match db.storage_provider().create_table(request).await {
+    match provider.create_table(request).await {
         Ok(()) => Ok(()),
         Err(error) => {
             if matches!(error.to_enum(), StorageEnum::TableAlreadyExists { .. }) {
@@ -234,20 +251,22 @@ async fn create_table_if_missing_raw(
     }
 }
 
-async fn create_sys_namespaces(db: &DatabaseManager) -> Result<(), StorageError> {
+async fn create_sys_namespaces(provider: &dyn DatabaseTrait) -> Result<(), StorageError> {
     let table_name = Tables::sys_namespaces();
-    if raw_table_exists(db, &table_name).await? {
-        ensure_raw_table_stream_enabled(db, &table_name).await?;
+    if raw_table_exists(provider, &table_name).await? {
+        ensure_raw_namespace_table_indexer_capacity(provider, &table_name).await?;
+        ensure_raw_table_stream_enabled(provider, &table_name).await?;
         return Ok(());
     }
-    create_table_if_missing_raw(db, &sys_namespaces_table_request(table_name.clone())).await?;
-    wait_for_raw_table_active(db, &table_name).await?;
-    ensure_raw_table_stream_enabled(db, &table_name).await?;
+    create_table_if_missing_raw(provider, &sys_namespaces_table_request(table_name.clone())?)
+        .await?;
+    wait_for_raw_table_active(provider, &table_name).await?;
+    ensure_raw_table_stream_enabled(provider, &table_name).await?;
     Ok(())
 }
 
-fn sys_namespaces_table_request(table_name: TableName) -> CreateTableRequest {
-    CreateTableRequest::new(
+fn sys_namespaces_table_request(table_name: TableName) -> Result<CreateTableRequest, StorageError> {
+    let mut request = CreateTableRequest::new(
         table_name,
         vec![
             AttributeDefinition {
@@ -344,7 +363,9 @@ fn sys_namespaces_table_request(table_name: TableName) -> CreateTableRequest {
             },
             provisioned_throughput: None,
         },
-    ]))
+    ]));
+    request.max_indexers = MaxIndexers::try_new(2)?;
+    Ok(request)
 }
 
 async fn ensure_table_stream_enabled(
@@ -361,6 +382,7 @@ async fn ensure_table_stream_enabled(
     }
 
     db.update_table(UpdateTableRequest {
+        max_indexers: None,
         table_name: table_name.clone(),
         attribute_definitions: None,
         billing_mode: None,
@@ -381,10 +403,10 @@ async fn ensure_table_stream_enabled(
 }
 
 async fn ensure_raw_table_stream_enabled(
-    db: &DatabaseManager,
+    provider: &dyn DatabaseTrait,
     table_name: &TableName,
 ) -> Result<(), StorageError> {
-    let table_info = db.storage_provider().get_table_info(table_name).await?;
+    let table_info = provider.get_table_info(table_name).await?;
     if table_info
         .stream_specification
         .as_ref()
@@ -393,8 +415,9 @@ async fn ensure_raw_table_stream_enabled(
         return Ok(());
     }
 
-    db.storage_provider()
+    provider
         .update_table(UpdateTableRequest {
+            max_indexers: None,
             table_name: table_name.clone(),
             attribute_definitions: None,
             billing_mode: None,
@@ -410,7 +433,7 @@ async fn ensure_raw_table_stream_enabled(
             aux_default_item_stream_duration_hours: None,
         })
         .await?;
-    wait_for_raw_table_active(db, table_name).await?;
+    wait_for_raw_table_active(provider, table_name).await?;
     Ok(())
 }
 
@@ -421,13 +444,13 @@ fn system_table_stream_specification() -> StreamSpecification {
     }
 }
 
-async fn create_sys_analytics(db: &DatabaseManager) -> Result<(), StorageError> {
+async fn create_sys_analytics(provider: &dyn DatabaseTrait) -> Result<(), StorageError> {
     let table_name = Tables::sys_analytics();
-    if raw_table_exists(db, &table_name).await? {
+    if raw_table_exists(provider, &table_name).await? {
         return Ok(());
     }
     create_table_if_missing_raw(
-        db,
+        provider,
         &CreateTableRequest::new(
             table_name.clone(),
             vec![
@@ -504,17 +527,17 @@ async fn create_sys_analytics(db: &DatabaseManager) -> Result<(), StorageError> 
         ])),
     )
     .await?;
-    wait_for_raw_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(provider, &table_name).await?;
     Ok(())
 }
 
-async fn create_sys_jobs(db: &DatabaseManager) -> Result<(), StorageError> {
+async fn create_sys_jobs(provider: &dyn DatabaseTrait) -> Result<(), StorageError> {
     let table_name = Tables::sys_jobs();
-    if raw_table_exists(db, &table_name).await? {
+    if raw_table_exists(provider, &table_name).await? {
         return Ok(());
     }
     create_table_if_missing_raw(
-        db,
+        provider,
         &CreateTableRequest::new(
             table_name.clone(),
             vec![
@@ -545,17 +568,17 @@ async fn create_sys_jobs(db: &DatabaseManager) -> Result<(), StorageError> {
         })),
     )
     .await?;
-    wait_for_raw_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(provider, &table_name).await?;
     Ok(())
 }
 
-async fn create_sys_storage_replication(db: &DatabaseManager) -> Result<(), StorageError> {
+async fn create_sys_storage_replication(provider: &dyn DatabaseTrait) -> Result<(), StorageError> {
     let table_name = Tables::sys_storage_replication();
-    if raw_table_exists(db, &table_name).await? {
+    if raw_table_exists(provider, &table_name).await? {
         return Ok(());
     }
     create_table_if_missing_raw(
-        db,
+        provider,
         &CreateTableRequest::new(
             table_name.clone(),
             vec![
@@ -586,7 +609,7 @@ async fn create_sys_storage_replication(db: &DatabaseManager) -> Result<(), Stor
         })),
     )
     .await?;
-    wait_for_raw_table_active(db, &table_name).await?;
+    wait_for_raw_table_active(provider, &table_name).await?;
     Ok(())
 }
 
@@ -602,42 +625,99 @@ async fn create_namespace_table_named(
     table_name: TableName,
 ) -> Result<(), StorageError> {
     if table_exists(db, &table_name).await? {
+        ensure_namespace_table_indexer_capacity(db, &table_name).await?;
         ensure_table_stream_enabled(db, &table_name).await?;
         return Ok(());
     }
     // Unified namespace table holds SCIM users, groups, SAML config, MFA records,
     // etc.
-    create_table_if_missing(
-        db,
-        &namespace_table_request(table_name.clone())
-            .with_stream_specification(Some(system_table_stream_specification())),
-    )
-    .await?;
+    let request = namespace_table_request(table_name.clone())?
+        .with_stream_specification(Some(system_table_stream_specification()));
+    create_table_if_missing(db, &request).await?;
     wait_for_table_active(db, &table_name).await?;
     Ok(())
 }
 
 async fn create_shared_namespace(
-    db: &DatabaseManager,
+    provider: &dyn DatabaseTrait,
     location_code: u16,
 ) -> Result<(), StorageError> {
     let table_name = Tables::shared_namespace(location_code);
-    if raw_table_exists(db, &table_name).await? {
-        ensure_raw_table_stream_enabled(db, &table_name).await?;
+    if raw_table_exists(provider, &table_name).await? {
+        ensure_raw_namespace_table_indexer_capacity(provider, &table_name).await?;
+        ensure_raw_table_stream_enabled(provider, &table_name).await?;
         return Ok(());
     }
-    create_table_if_missing_raw(
-        db,
-        &namespace_table_request(table_name.clone())
-            .with_stream_specification(Some(system_table_stream_specification())),
-    )
-    .await?;
-    wait_for_raw_table_active(db, &table_name).await?;
+    let request = namespace_table_request(table_name.clone())?
+        .with_stream_specification(Some(system_table_stream_specification()));
+    create_table_if_missing_raw(provider, &request).await?;
+    wait_for_raw_table_active(provider, &table_name).await?;
     Ok(())
 }
 
-fn namespace_table_request(table_name: TableName) -> CreateTableRequest {
-    CreateTableRequest::new(
+async fn ensure_namespace_table_indexer_capacity(
+    db: &DatabaseManager,
+    table_name: &TableName,
+) -> Result<(), StorageError> {
+    let required = MaxIndexers::try_new(2)?;
+    let table_info = db.get_table_info(table_name).await?;
+    if table_info.max_indexers >= required {
+        return Ok(());
+    }
+
+    db.update_table(UpdateTableRequest {
+        max_indexers: Some(required),
+        table_name: table_name.clone(),
+        attribute_definitions: None,
+        billing_mode: None,
+        provisioned_throughput: None,
+        on_demand_throughput: None,
+        deletion_protection_enabled: None,
+        global_secondary_index_updates: None,
+        replica_updates: None,
+        sse_specification: None,
+        stream_specification: None,
+        table_class: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
+    })
+    .await?;
+    wait_for_table_active(db, table_name).await
+}
+
+async fn ensure_raw_namespace_table_indexer_capacity(
+    provider: &dyn DatabaseTrait,
+    table_name: &TableName,
+) -> Result<(), StorageError> {
+    let required = MaxIndexers::try_new(2)?;
+    let table_info = provider.get_table_info(table_name).await?;
+    if table_info.max_indexers >= required {
+        return Ok(());
+    }
+
+    provider
+        .update_table(UpdateTableRequest {
+            max_indexers: Some(required),
+            table_name: table_name.clone(),
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            table_class: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
+        })
+        .await?;
+    wait_for_raw_table_active(provider, table_name).await
+}
+
+fn namespace_table_request(table_name: TableName) -> Result<CreateTableRequest, StorageError> {
+    let mut request = CreateTableRequest::new(
         table_name,
         vec![
             AttributeDefinition {
@@ -797,5 +877,7 @@ fn namespace_table_request(table_name: TableName) -> CreateTableRequest {
             },
             provisioned_throughput: None,
         },
-    ]))
+    ]));
+    request.max_indexers = MaxIndexers::try_new(2)?;
+    Ok(request)
 }

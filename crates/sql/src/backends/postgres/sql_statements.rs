@@ -403,6 +403,7 @@ pub fn create_storage_metadata_tables() -> &'static str {
         created_at BIGINT NOT NULL,
         attribute_definitions TEXT NOT NULL,
         key_schema TEXT NOT NULL,
+        max_indexers SMALLINT NOT NULL,
         global_secondary_indexes TEXT,
         table_size_bytes BIGINT DEFAULT 0,
         item_count BIGINT DEFAULT 0,
@@ -464,6 +465,7 @@ pub fn insert_table_metadata() -> &'static str {
         0,
         "",
         "",
+        0,
         None,
         None,
         false,
@@ -642,10 +644,14 @@ pub fn create_physical_table(
     physical_table_name: &str,
     key_columns: &[String],
     primary_key_columns: &[String],
+    max_indexers: storage_types::MaxIndexers,
 ) -> String {
     let mut create_sql = format!("CREATE TABLE IF NOT EXISTS \"{physical_table_name}\" (");
     create_sql.push_str(&key_columns.join(", "));
     create_sql.push_str(", attributes_blob TEXT");
+    for ordinal in 0..max_indexers.as_usize() {
+        create_sql.push_str(&format!(", __aux_indexer_{ordinal} TEXT"));
+    }
     if !primary_key_columns.is_empty() {
         create_sql.push_str(", PRIMARY KEY (");
         create_sql.push_str(&primary_key_columns.join(", "));
@@ -660,10 +666,14 @@ pub fn create_gsi_table(
     gsi_table_name: &str,
     key_columns: &[String],
     primary_key_columns: &[String],
+    max_indexers: storage_types::MaxIndexers,
 ) -> String {
     let mut create_sql = format!("CREATE TABLE IF NOT EXISTS \"{gsi_table_name}\" (");
     create_sql.push_str(&key_columns.join(", "));
     create_sql.push_str(", attributes_blob TEXT");
+    for ordinal in 0..max_indexers.as_usize() {
+        create_sql.push_str(&format!(", __aux_indexer_{ordinal} TEXT"));
+    }
     create_sql.push_str(", PRIMARY KEY (");
     create_sql.push_str(&primary_key_columns.join(", "));
     create_sql.push_str("))");

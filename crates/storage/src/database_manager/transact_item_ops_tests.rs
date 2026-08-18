@@ -22,6 +22,7 @@ fn transaction_table_name_uses_the_operation_present_on_the_item() {
         put: Some(TransactPutRequest {
             table_name: table("put_table"),
             item: HashMap::new(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -35,6 +36,7 @@ fn transaction_table_name_uses_the_operation_present_on_the_item() {
             table_name: table("update_table"),
             key: key(),
             update_expression: "SET value = :value".to_string(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -91,6 +93,7 @@ fn setting_transaction_table_name_updates_every_present_operation() {
         put: Some(TransactPutRequest {
             table_name: table("old_put"),
             item: HashMap::new(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -101,6 +104,7 @@ fn setting_transaction_table_name_updates_every_present_operation() {
             table_name: table("old_update"),
             key: key(),
             update_expression: "SET value = :value".to_string(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -163,7 +167,9 @@ fn encoded_transaction_helpers_use_and_update_wire_put_table_names() {
     let mut item = TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: table("wire_put"),
-            item: WireItem::from_attribute_map(&HashMap::new()).expect("wire item"),
+            item: storage_types::WireEntity::unindexed(
+                WireItem::from_attribute_map(&HashMap::new()).expect("wire item"),
+            ),
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,

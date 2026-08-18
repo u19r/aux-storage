@@ -4,8 +4,8 @@ use storage_common::TtlConfigRecord;
 use storage_condition::Condition;
 use storage_provider::UpdateOperation;
 use storage_types::{
-    AttributeValue, IndexName, ItemKey, KeyAttributes, ReplicationEventMetadata, SerializesToKey,
-    StorageError, StorageResult, StoredTableInfo, WireItem,
+    AttributeValue, ItemKey, KeyAttributes, ReplicationEventMetadata, SerializesToKey,
+    StorageError, StorageResult, StoredTableInfo,
 };
 
 use crate::{
@@ -41,34 +41,7 @@ pub struct RangeValuesResult {
     pub has_more: bool,
 }
 
-impl RangeValuesResult {
-    /// # Panics
-    ///
-    /// Will panic if item deserialization fails
-    pub fn into_query_result(
-        self,
-        table_info: &StoredTableInfo,
-        index_name: &Option<IndexName>,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        let mut items = Vec::with_capacity(self.values.len());
-        for data in self.values {
-            let json = storage_types::storage_serde::decompress_bytes(&data)?;
-            items.push(WireItem::dynamo_json(json));
-        }
-
-        let last_evaluated_key = if self.has_more {
-            if let Some(last) = items.last() {
-                last.last_evaluated_key(table_info, index_name)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok((items, last_evaluated_key))
-    }
-}
+impl RangeValuesResult {}
 
 impl RangeResult {
     #[must_use]
@@ -81,18 +54,6 @@ impl RangeResult {
             values,
             has_more: self.has_more,
         }
-    }
-
-    /// # Panics
-    ///
-    /// Will panic if item deserialization fails
-    pub fn into_query_result(
-        self,
-        table_info: &StoredTableInfo,
-        index_name: &Option<IndexName>,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        self.into_values_result()
-            .into_query_result(table_info, index_name)
     }
 }
 
@@ -188,6 +149,7 @@ pub enum TransactWriteTableOperation {
         table_identity: TableIdentity,
         table_info: StoredTableInfo,
         item: HashMap<String, AttributeValue>,
+        indexers: Option<Vec<String>>,
         item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
         condition: Option<Condition>,
         return_values_on_condition_check_failure: Option<String>,
@@ -217,6 +179,7 @@ pub enum TransactWriteTableOperation {
         table_info: StoredTableInfo,
         key: KeyAttributes,
         operations: Arc<[UpdateOperation]>,
+        indexers: Option<Vec<String>>,
         item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
         condition: Option<Condition>,
         return_values_on_condition_check_failure: Option<String>,
@@ -225,53 +188,6 @@ pub enum TransactWriteTableOperation {
         transaction_validation: bool,
         ttl_config: Option<TtlConfigRecord>,
     },
-}
-
-impl TryFrom<&TransactWriteTableOperation> for Option<TransactWriteOperation> {
-    type Error = StorageError;
-    fn try_from(
-        table_op: &TransactWriteTableOperation,
-    ) -> Result<Option<TransactWriteOperation>, StorageError> {
-        match table_op {
-            TransactWriteTableOperation::Put {
-                table_identity,
-                table_info,
-                item,
-                ..
-            } => {
-                let key = storage_types::ItemKey::from_key_schema(
-                    table_info.table_name.clone(),
-                    &table_info.key_schema,
-                    item,
-                )?;
-                let key = crate::keyspace::table_keys::item_key(table_identity, &key)?;
-                let value = storage_types::storage_serde::to_bytes(&item)?;
-                Ok(Some(TransactWriteOperation::Put {
-                    key,
-                    value,
-                    condition: None,
-                }))
-            }
-            TransactWriteTableOperation::Delete {
-                table_identity,
-                table_info,
-                key,
-                ..
-            } => {
-                let key = storage_types::ItemKey::from_key_schema(
-                    table_info.table_name.clone(),
-                    &table_info.key_schema,
-                    key,
-                )?;
-                let key = crate::keyspace::table_keys::item_key(table_identity, &key)?;
-                Ok(Some(TransactWriteOperation::Delete {
-                    key,
-                    condition: None,
-                }))
-            }
-            _ => Ok(None),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +227,10 @@ impl TransactWriteOutput {
 
 #[async_trait::async_trait]
 pub trait SortedKvReadContext: Send + Sync {
+    fn take_retryable_read_failure(&self) -> bool {
+        false
+    }
+
     async fn get(&self, key: &[u8], consistent_read: bool) -> StorageResult<Option<Vec<u8>>>;
 
     async fn multi_get(
@@ -329,8 +249,33 @@ pub trait SortedKvReadContext: Send + Sync {
     ) -> StorageResult<RangeValuesResult>;
 }
 
+/// Scheduling class requested for FoundationDB transactions created by a store
+/// clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionPriority {
+    /// Normal foreground transaction scheduling.
+    Default,
+    /// Low-priority batch scheduling for maintenance work.
+    Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemValueCodec {
+    RocksDbEnvelope,
+    #[cfg(feature = "foundationdb-backend")]
+    FoundationDbTuple,
+}
+
 #[async_trait::async_trait]
 pub trait SortedKvStore: Send + Sync + Clone {
+    fn item_value_codec(&self) -> ItemValueCodec {
+        ItemValueCodec::RocksDbEnvelope
+    }
+
+    fn with_transaction_priority(&self, _priority: TransactionPriority) -> Self {
+        self.clone()
+    }
+
     async fn atomic_read_modify_write_table(
         &self,
         _read_key: Vec<u8>,
@@ -360,6 +305,17 @@ pub trait SortedKvStore: Send + Sync + Clone {
         operations: Vec<TransactWriteTableOperation>,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<OldNewItems>>;
+
+    async fn transact_write_table_with_direct_writes(
+        &self,
+        _table_operations: Vec<TransactWriteTableOperation>,
+        _direct_operations: Vec<DirectWriteOperation>,
+        _immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
+        Err(StorageError::unsupported(
+            "atomic table and direct writes are not supported by this backend",
+        ))
+    }
     async fn batch_write(&self, items: Vec<BatchItem>) -> StorageResult<()>;
 
     async fn begin_read_context(&self) -> StorageResult<Box<dyn SortedKvReadContext>> {

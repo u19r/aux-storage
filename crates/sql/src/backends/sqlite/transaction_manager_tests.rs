@@ -12,7 +12,7 @@ async fn create_file_backed_providers() -> (
     SQLiteStorageProvider,
     SQLiteStorageProvider,
 ) {
-    let temp_dir = tempfile::tempdir().expect("temporary database directory");
+    let temp_dir = crate::sql_test_support::temp_dir("database");
     let database_path = temp_dir.path().join("transaction-contention.sqlite");
     let database_path = database_path
         .to_str()

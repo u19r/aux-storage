@@ -9,10 +9,7 @@ use storage_types::{
 };
 use tracing::{Span, debug, field};
 
-use super::{
-    SQLiteStorageProvider,
-    storage_provider::{record_read, storage_error_to_rusqlite},
-};
+use super::{SQLiteStorageProvider, storage_provider::record_read};
 use crate::{
     billing_metrics::{record_read_cost, wire_items_payload_bytes},
     error_handler::map_sqlite_error,
@@ -20,6 +17,7 @@ use crate::{
         DEFAULT_QUERY_LIMIT, DEFAULT_SCAN_LIMIT, MAX_QUERY_LIMIT, MAX_SCAN_LIMIT,
         decode_exclusive_start,
     },
+    indexed_item::SqlDecodedItem,
     parse_conditions::parse_key_condition_expression,
     provider_core::read::plan_read_target,
     read_path::execute_unified_read,
@@ -32,6 +30,17 @@ impl SQLiteStorageProvider {
         &self,
         request: &ScanTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let (items, last_evaluated_key) = self.do_scan_decoded_table(request).await?;
+        Ok((
+            items.into_iter().map(|decoded| decoded.item).collect(),
+            last_evaluated_key,
+        ))
+    }
+
+    async fn do_scan_decoded_table(
+        &self,
+        request: &ScanTableRequest,
+    ) -> StorageResult<(Vec<SqlDecodedItem>, Option<String>)> {
         if request.consistent_read && request.index_name.is_some() {
             return Err(StorageError::validation(
                 "Consistent reads are not supported on global secondary indexes",
@@ -65,7 +74,6 @@ impl SQLiteStorageProvider {
         )?;
         let start = std::time::Instant::now();
         let index_name_opt = request.index_name.clone();
-        let key_schema_for_origin_cloned = read_target.key_schema;
         let origin = read_target.origin;
         let table_info_for_read = table_info; // move ownership
         let (items, last_evaluated_key) = call_sqlite(&self.connection, move |conn| {
@@ -75,7 +83,6 @@ impl SQLiteStorageProvider {
                 &values,
                 &table_info_for_read,
                 origin,
-                &key_schema_for_origin_cloned,
                 effective_limit,
                 &index_name_opt,
             )?;
@@ -90,7 +97,10 @@ impl SQLiteStorageProvider {
             elapsed_ms,
             "scan_table.complete"
         );
-        let bytes_read = wire_items_payload_bytes(&items) as usize;
+        let bytes_read = items
+            .iter()
+            .map(|decoded| decoded.item.payload_len())
+            .sum::<usize>();
         record_read(items.len(), bytes_read);
         record_read_cost("scan_table", "scan", 1, bytes_read as u64);
         Ok((items, last_evaluated_key))
@@ -107,12 +117,12 @@ impl SQLiteStorageProvider {
         }
 
         let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
-        let (items, last_evaluated_key) = self.do_scan_table(request).await?;
+        let (items, last_evaluated_key) = self.do_scan_decoded_table(request).await?;
         let mut keyed_items = Vec::with_capacity(items.len());
-        for item in items {
-            let item_map = item.to_attribute_map()?;
+        for decoded in items {
+            let item_map = decoded.item.to_attribute_map()?;
             let split = split_item_into_key_and_attributes_sync(item_map, &table_info)?;
-            keyed_items.push((item, split.key_attributes));
+            keyed_items.push((decoded, split.key_attributes));
         }
 
         let table_name = request.table_name.clone();
@@ -136,8 +146,9 @@ impl SQLiteStorageProvider {
             .into_iter()
             .zip(versions)
             .map(
-                |((item, _key), item_stream_version)| ItemVersionedWireItem {
-                    item,
+                |((decoded, _key), item_stream_version)| ItemVersionedWireItem {
+                    item: decoded.item,
+                    indexers: decoded.indexers,
                     item_stream_version,
                 },
             )
@@ -194,7 +205,6 @@ impl SQLiteStorageProvider {
         )?;
         let start = std::time::Instant::now();
         let index_name_opt = request.index_name.clone();
-        let key_schema_cloned = read_target.key_schema;
         let origin = read_target.origin;
         let table_info_for_read = table_info; // move
         let (items, last_evaluated_key) = call_sqlite(&self.connection, move |conn| {
@@ -204,11 +214,16 @@ impl SQLiteStorageProvider {
                 &values,
                 &table_info_for_read,
                 origin,
-                &key_schema_cloned,
                 effective_limit,
                 &index_name_opt,
             )?;
-            Ok::<_, StorageError>((res.items, res.last_evaluated_key))
+            Ok::<_, StorageError>((
+                res.items
+                    .into_iter()
+                    .map(|decoded| decoded.item)
+                    .collect::<Vec<_>>(),
+                res.last_evaluated_key,
+            ))
         })
         .await?;
         let items = request.project_wire_items(items)?;
@@ -277,22 +292,12 @@ impl SQLiteStorageProvider {
 
                     let rows = stmt
                         .query_map(rusqlite::params_from_iter(plan.params.iter()), |row| {
-                            let primary_key =
-                                crate::key_attribute_handler::wire_item_key_attributes_from_row(
-                                    row,
-                                    &table_info_clone.key_schema,
-                                    &table_info_clone.attribute_definitions,
-                                    None,
-                                )
-                                .map_err(|err| storage_error_to_rusqlite(&err))?;
-                            let non_key_attributes_blob = row
-                                .get::<_, Option<String>>("attributes_blob")?
-                                .map(String::into_bytes);
-                            Ok(WireItem::local_split(
-                                primary_key,
+                            crate::indexed_item::sqlite_row_to_decoded_item(
+                                row,
+                                &table_info_clone,
                                 None,
-                                non_key_attributes_blob,
-                            ))
+                            )
+                            .map(|decoded| decoded.item)
                         })
                         .map_err(map_sqlite_error)?;
 

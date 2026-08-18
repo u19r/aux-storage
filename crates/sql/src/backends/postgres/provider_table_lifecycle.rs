@@ -19,44 +19,50 @@ use crate::{
 
 impl PostgresStorageProvider {
     pub(crate) async fn do_initialize_storage(&self) -> StorageResult<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
-        client
-            .batch_execute(sql_statements::create_storage_metadata_tables())
-            .await
-            .map_err(|err| StorageError::internal(&format!("postgres init failed: {err}")))?;
-        client
-            .batch_execute(sql_statements::add_deletion_protection_column())
-            .await
-            .map_err(|err| {
-                StorageError::internal(&format!(
-                    "postgres deletion protection migration failed: {err}"
-                ))
-            })?;
-        client
-            .batch_execute(sql_statements::add_table_stream_duration_column())
-            .await
-            .map_err(|err| {
-                StorageError::internal(&format!(
-                    "postgres table stream duration migration failed: {err}"
-                ))
-            })?;
-        client
-            .batch_execute(sql_statements::add_default_item_stream_duration_column())
-            .await
-            .map_err(|err| {
-                StorageError::internal(&format!(
-                    "postgres default item stream duration migration failed: {err}"
-                ))
-            })?;
+        {
+            let client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            client
+                .batch_execute(sql_statements::create_storage_metadata_tables())
+                .await
+                .map_err(|err| StorageError::internal(&format!("postgres init failed: {err}")))?;
+            client
+                .batch_execute(sql_statements::add_deletion_protection_column())
+                .await
+                .map_err(|err| {
+                    StorageError::internal(&format!(
+                        "postgres deletion protection migration failed: {err}"
+                    ))
+                })?;
+            client
+                .batch_execute(sql_statements::add_table_stream_duration_column())
+                .await
+                .map_err(|err| {
+                    StorageError::internal(&format!(
+                        "postgres table stream duration migration failed: {err}"
+                    ))
+                })?;
+            client
+                .batch_execute(sql_statements::add_default_item_stream_duration_column())
+                .await
+                .map_err(|err| {
+                    StorageError::internal(&format!(
+                        "postgres default item stream duration migration failed: {err}"
+                    ))
+                })?;
+        }
 
         self.initialize_stream().await.map_err(|err| {
             StorageError::internal(&format!("postgres stream init failed: {err}"))
         })?;
         self.initialize_stream_duration_tables().await?;
+
+        if !self.database_jobs_enabled {
+            return Ok(());
+        }
 
         struct PostgresRegistrar<'a> {
             mgr: &'a bg_jobs::JobManager,
@@ -141,7 +147,7 @@ impl PostgresStorageProvider {
                     GSI_UPDATE_JOB,
                     gsi_cfg.update_interval_ms,
                     PostgresGsiUpdateJob {
-                        provider: self.clone(),
+                        provider: self.for_background_operations(),
                         run_budget: gsi_update_run_budget(gsi_cfg.update_interval_ms),
                     },
                 )
@@ -152,7 +158,7 @@ impl PostgresStorageProvider {
                 TTL_SWEEP_JOB,
                 self.database_job_intervals.ttl_sweep_interval_ms,
                 PostgresTtlSweepJob {
-                    provider: self.clone(),
+                    provider: self.for_background_operations(),
                 },
             )
             .await?;
@@ -222,6 +228,7 @@ impl PostgresStorageProvider {
                             &created_at_millis,
                             &metadata.attribute_definitions_json,
                             &metadata.key_schema_json,
+                            &i16::from(metadata.max_indexers.get()),
                             &metadata.global_secondary_indexes_json,
                             &metadata.stream_specification_json,
                             &metadata.deletion_protection_enabled,
@@ -450,6 +457,74 @@ impl PostgresStorageProvider {
     ) -> StorageResult<storage_types::UpdateTableResponse> {
         let table_name = request.table_name.clone();
         let mut table_info = self.get_table_info(&table_name).await?;
+        let capacity_increase = crate::provider_core::table_lifecycle::requested_capacity_increase(
+            table_info.max_indexers,
+            request.max_indexers,
+        )?;
+
+        if let Some(target) = capacity_increase {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            let transaction = client.transaction().await.map_err(|error| {
+                Self::map_postgres_write_error("start max indexers transaction", error)
+            })?;
+            transaction
+                .execute(
+                    sql_statements::update_table_status(),
+                    &[&"UPDATING", &table_name.as_ref()],
+                )
+                .await
+                .map_err(|error| {
+                    Self::map_postgres_write_error("mark max indexers update", error)
+                })?;
+            let mut physical_tables = Vec::with_capacity(
+                1 + table_info
+                    .global_secondary_indexes
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            );
+            physical_tables.push(physical_names::physical_table_name(&table_name));
+            if let Some(gsis) = table_info.global_secondary_indexes.as_ref() {
+                physical_tables.extend(gsis.iter().map(|gsi| {
+                    physical_names::physical_gsi_table_name(&table_name, &gsi.index_name)
+                }));
+            }
+            for ordinal in table_info.max_indexers.as_usize()..target.as_usize() {
+                let column = crate::utils::indexer_column_name(ordinal);
+                for physical_table in &physical_tables {
+                    transaction
+                        .batch_execute(&format!(
+                            "ALTER TABLE \"{physical_table}\" ADD COLUMN \"{column}\" TEXT"
+                        ))
+                        .await
+                        .map_err(|error| {
+                            Self::map_postgres_write_error("add max indexer column", error)
+                        })?;
+                }
+            }
+            let target_value = i16::from(target.get());
+            let changed = transaction
+                .execute(
+                    "UPDATE tables SET max_indexers = $1, table_status = 'ACTIVE' WHERE \
+                     table_name = $2",
+                    &[&target_value, &table_name.as_ref()],
+                )
+                .await
+                .map_err(|error| Self::map_postgres_write_error("persist max indexers", error))?;
+            if changed != 1 {
+                return Err(StorageError::internal(
+                    "max indexer metadata update did not affect one table",
+                ));
+            }
+            transaction.commit().await.map_err(|error| {
+                Self::map_postgres_write_error("commit max indexers transaction", error)
+            })?;
+            table_info.max_indexers = target;
+            self.invalidate_table_info_cache(&table_name).await;
+        }
 
         self.update_table_status(&table_name, TableStatus::Updating)
             .await?;
@@ -616,6 +691,7 @@ impl PostgresStorageProvider {
                         &table_info.attribute_definitions,
                         &table_info.key_schema,
                         std::slice::from_ref(&new_gsi),
+                        table_info.max_indexers,
                     );
                     for create_sql in create_sqls {
                         client
@@ -629,7 +705,7 @@ impl PostgresStorageProvider {
                     backfill_table_info.global_secondary_indexes = Some(vec![create.into()]);
                     loop {
                         let (items, lek) = self
-                            .scan_table(&ScanTableRequest {
+                            .scan_table_with_item_stream_versions(&ScanTableRequest {
                                 table_name: table_name.clone(),
                                 index_name: None,
                                 limit: Some(MAX_SCAN_LIMIT),
@@ -640,13 +716,14 @@ impl PostgresStorageProvider {
                         if items.is_empty() {
                             break;
                         }
-                        for wire_item in items {
-                            let item_map = wire_item.into_attribute_map()?;
+                        for versioned in items {
+                            let item_map = versioned.item.into_attribute_map()?;
                             self.upsert_gsi_entries_for_item_with_client(
                                 &client,
                                 &table_name,
                                 &backfill_table_info,
                                 &item_map,
+                                &versioned.indexers,
                             )
                             .await?;
                         }
@@ -702,6 +779,7 @@ impl PostgresStorageProvider {
                 created_at: table_info.created_at.into(),
                 attribute_definitions: table_info.attribute_definitions.clone(),
                 key_schema: table_info.key_schema.clone(),
+                max_indexers: table_info.max_indexers,
                 table_size_bytes: table_info.table_size_bytes,
                 item_count: table_info.item_count,
                 table_arn: format!(

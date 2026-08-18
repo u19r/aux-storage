@@ -7,6 +7,7 @@ fn sync_write_request_names_supported_write_operations() {
     let put = SyncWriteRequest::PutItem(PutItemRequest {
         table_name: TableName::new("orders"),
         item: [("pk".to_string(), AttributeValue::S("order#1".to_string()))].into(),
+        indexers: None,
         condition_expression: None,
         expression_attribute_names: None,
         expression_attribute_values: None,

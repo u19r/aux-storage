@@ -8,6 +8,7 @@ mod partition_family_runtime;
 mod pubsub_delivery;
 mod pubsub_delivery_runtime;
 mod queue_visibility;
+mod read_sequence_dag;
 mod table_atomicity;
 mod table_atomicity_artifacts;
 mod table_atomicity_check_phase;

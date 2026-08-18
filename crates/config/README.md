@@ -56,6 +56,22 @@ storage-api --config config.json \
 Repeat `--overrides` to avoid fragile shell quoting. Escape literal commas or
 equals in string values with `\,` and `\=`.
 
+## Storage admission
+
+The `features.storage_admission` object configures foreground provider
+admission independently for each storage connection. Defaults are enabled,
+20,000 sustainable requests per second, 5 ms latency, a foreground window of
+4..=1024 permits, a four-permit control reserve, a 256-entry queue, and a
+25 ms maximum queue wait. The controller uses the throughput/latency estimate
+as its initial window and returns a retryable overload response when the queue
+is full or the wait expires.
+
+The same fields are available as `--storage-admission-*` flags. Environment
+variables use `AUX_STORAGE_ADMISSION_*`; the compatibility shorthand
+`AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS` is also accepted; when both
+throughput names are set, the canonical admission name wins. Explicit
+`--overrides` win over flags, which win over environment values and file data.
+
 ## Interpolation
 
 All JSON string values support `${ENV}` and `file::path::`. Resolver expressions

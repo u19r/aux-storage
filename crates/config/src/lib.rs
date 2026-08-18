@@ -1,6 +1,8 @@
 #![doc(hidden)]
 
 #[cfg(test)]
+mod config_test_support;
+#[cfg(test)]
 pub mod src_tests;
 #[cfg(test)]
 mod sync_replication_tests;
@@ -17,7 +19,7 @@ mod backends;
 mod cache;
 mod constants;
 mod error;
-mod launch;
+pub(crate) mod launch;
 mod loader;
 mod messaging;
 mod model;
@@ -48,9 +50,9 @@ pub use loader::{Config, load, load_optional_with_overrides, load_with_overrides
 pub use messaging::{PubsubConfig, QueueConfig};
 pub use model::{
     AppRole, Cors, Features, HttpConfig, HttpRoutesConfig, Jobs, MetricsConfig,
-    PrometheusMetricsConfig, RootConfig, RuntimeEnvironment, RuntimeFeatures,
-    SlowOperationLogThresholds, StorageReplicationConfig, StorageReplicationPeerConfig, Tracing,
-    TracingTrace,
+    PrometheusMetricsConfig, ReadSequenceConfig, ReadSequenceExecutionMode, RootConfig,
+    RuntimeEnvironment, RuntimeFeatures, SlowOperationLogThresholds, StorageAdmissionConfig,
+    StorageReplicationConfig, StorageReplicationPeerConfig, Tracing, TracingTrace,
 };
 pub use sync_replication::{StorageSyncReplicationConfig, StorageSyncReplicationPeerConfig};
 

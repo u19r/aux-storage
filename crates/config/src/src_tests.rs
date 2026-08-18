@@ -4,21 +4,13 @@ use serde_json::json;
 
 use crate::{
     AppRole, Backends, ConfigError, DEFAULT_STORAGE_SQLITE_DB_PATH, RemoteCredentialsConfig,
-    RemoteStaticCredentialsConfig, RootConfig, StorageApiLaunchConfig, load,
-    load_optional_with_overrides,
+    RemoteStaticCredentialsConfig, RootConfig, StorageApiLaunchConfig,
+    config_test_support::{temp_dir, write_config},
+    launch::collect_storage_admission_environment_overrides,
+    load, load_optional_with_overrides,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn write_temp_config(value: serde_json::Value) -> tempfile::NamedTempFile {
-    let file = tempfile::NamedTempFile::new().expect("create temporary config file");
-    fs::write(
-        file.path(),
-        serde_json::to_vec_pretty(&value).expect("serialize config"),
-    )
-    .expect("write config");
-    file
-}
 
 #[test]
 fn loads_storage_defaults() {
@@ -36,11 +28,103 @@ fn loads_storage_defaults() {
             .db_path,
         DEFAULT_STORAGE_SQLITE_DB_PATH
     );
+    assert_eq!(
+        loaded.root.features.read_sequence.mode,
+        crate::ReadSequenceExecutionMode::On
+    );
+    assert_eq!(loaded.root.features.read_sequence.shadow_sample_percent, 1);
+}
+
+#[test]
+fn read_sequence_rollout_modes_and_bounded_shadow_sampling_load() {
+    let file = write_config(json!({
+        "features": {
+            "read_sequence": {
+                "mode": "shadow",
+                "shadow_sample_percent": 37
+            }
+        }
+    }));
+
+    let loaded = load(file.path()).expect("load ReadSequence rollout config");
+
+    assert_eq!(
+        loaded.root.features.read_sequence.mode,
+        crate::ReadSequenceExecutionMode::Shadow
+    );
+    assert_eq!(loaded.root.features.read_sequence.shadow_sample_percent, 37);
+}
+
+#[test]
+fn read_sequence_rollout_rejects_unknown_mode_and_unbounded_sample() {
+    let unknown_mode = write_config(json!({
+        "features": {"read_sequence": {"mode": "experimental"}}
+    }));
+    assert!(load(unknown_mode.path()).is_err());
+
+    let unbounded_sample = write_config(json!({
+        "features": {"read_sequence": {"shadow_sample_percent": 101}}
+    }));
+    load(unbounded_sample.path()).expect_err("sample above 100 must fail");
+}
+
+#[test]
+fn foundationdb_cache_read_version_defaults_to_fifty_milliseconds() {
+    let file = write_config(json!({
+        "features": {
+            "backends": {
+                "sqlite": null,
+                "foundationdb": {}
+            }
+        }
+    }));
+
+    let loaded = load(file.path()).expect("load FoundationDB defaults");
+    assert_eq!(
+        loaded
+            .root
+            .features
+            .backends
+            .foundationdb
+            .as_ref()
+            .expect("FoundationDB backend")
+            .cache_read_version_ms,
+        50
+    );
+}
+
+#[test]
+fn foundationdb_cache_read_version_preserves_explicit_values_including_zero() {
+    for expected in [50, 25, 0] {
+        let file = write_config(json!({
+            "features": {
+                "backends": {
+                    "sqlite": null,
+                    "foundationdb": {
+                        "cache_read_version_ms": expected
+                    }
+                }
+            }
+        }));
+
+        let loaded = load(file.path()).expect("load FoundationDB cache setting");
+        assert_eq!(
+            loaded
+                .root
+                .features
+                .backends
+                .foundationdb
+                .as_ref()
+                .expect("FoundationDB backend")
+                .cache_read_version_ms,
+            expected
+        );
+    }
 }
 
 #[test]
 fn config_schema_can_be_written_for_runtime_discovery() {
-    let dir = tempfile::tempdir().expect("create temporary directory");
+    let dir = temp_dir("config-");
     let schema_path = dir.path().join("config.schema.json");
 
     crate::Config::write_schema_to(&schema_path).expect("write schema");
@@ -66,7 +150,7 @@ fn effective_pretty_reports_the_merged_config_without_requiring_callers_to_seria
 
 #[test]
 fn required_config_file_must_exist() {
-    let dir = tempfile::tempdir().expect("create temporary directory");
+    let dir = temp_dir("config-");
     let missing_path = dir.path().join("missing.json");
 
     let error = load(&missing_path).expect_err("required config file should fail");
@@ -76,7 +160,7 @@ fn required_config_file_must_exist() {
 
 #[test]
 fn optional_config_file_can_be_missing_when_process_defaults_are_acceptable() {
-    let dir = tempfile::tempdir().expect("create temporary directory");
+    let dir = temp_dir("config-");
     let missing_path = dir.path().join("missing.json");
 
     let loaded =
@@ -87,7 +171,7 @@ fn optional_config_file_can_be_missing_when_process_defaults_are_acceptable() {
 
 #[test]
 fn loads_postgres_backend() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -113,7 +197,7 @@ fn loads_postgres_backend() {
 
 #[test]
 fn rejects_multiple_backends() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": {},
@@ -128,7 +212,7 @@ fn rejects_multiple_backends() {
 
 #[test]
 fn rejects_no_storage_backend_after_overlay_disables_the_default_backend() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null
@@ -143,7 +227,7 @@ fn rejects_no_storage_backend_after_overlay_disables_the_default_backend() {
 
 #[test]
 fn rejects_postgres_backend_without_a_dsn() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -163,7 +247,7 @@ fn rejects_postgres_backend_without_a_dsn() {
 
 #[test]
 fn rejects_postgres_backend_without_a_pool() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -183,7 +267,7 @@ fn rejects_postgres_backend_without_a_pool() {
 
 #[test]
 fn rejects_remote_backend_without_endpoint_urls() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -200,7 +284,7 @@ fn rejects_remote_backend_without_endpoint_urls() {
 
 #[test]
 fn rejects_remote_backend_with_blank_region() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -220,7 +304,7 @@ fn rejects_remote_backend_with_blank_region() {
 
 #[test]
 fn rejects_remote_backend_with_conflicting_credential_sources() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": null,
@@ -250,7 +334,7 @@ fn cli_overrides_apply() {
         None,
         &[(
             "features.backends.sqlite.db_path".to_string(),
-            "\"/tmp/aux-storage.db\"".to_string(),
+            "\"run-artifacts/config-data/aux-storage.db\"".to_string(),
         )],
     )
     .expect("load override");
@@ -264,7 +348,7 @@ fn cli_overrides_apply() {
             .as_ref()
             .expect("sqlite backend")
             .db_path,
-        "/tmp/aux-storage.db"
+        "run-artifacts/config-data/aux-storage.db"
     );
 }
 
@@ -344,7 +428,7 @@ fn metrics_config_defaults_to_enabled() {
 
 #[test]
 fn metrics_config_accepts_prometheus_bearer_token() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "metrics": {
                 "enabled": true,
@@ -371,7 +455,7 @@ fn metrics_config_accepts_prometheus_bearer_token() {
 
 #[test]
 fn metrics_config_rejects_empty_prometheus_bearer_token() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "metrics": {
                 "prometheus": {
@@ -389,7 +473,7 @@ fn metrics_config_rejects_empty_prometheus_bearer_token() {
 
 #[test]
 fn queue_config_accepts_runtime_settings_without_backend_selector() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "queue": {
             "account_id": "123456789012",
             "public_base_url": "http://127.0.0.1:3001/queue",
@@ -408,7 +492,7 @@ fn queue_config_accepts_runtime_settings_without_backend_selector() {
 
 #[test]
 fn service_routes_load_from_http_config() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "http": {
             "routes": {
                 "storage": "/storage",
@@ -427,7 +511,7 @@ fn service_routes_load_from_http_config() {
 
 #[test]
 fn queue_config_rejects_empty_public_base_url() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "queue": {
             "public_base_url": ""
         }
@@ -441,7 +525,7 @@ fn queue_config_rejects_empty_public_base_url() {
 
 #[test]
 fn queue_config_rejects_empty_account_id() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "queue": {
             "account_id": " "
         }
@@ -455,7 +539,7 @@ fn queue_config_rejects_empty_account_id() {
 
 #[test]
 fn job_jitter_is_capped_at_one_hundred_percent() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "jobs": {
             "jitter_percent": 101
         }
@@ -468,7 +552,7 @@ fn job_jitter_is_capped_at_one_hundred_percent() {
 
 #[test]
 fn point_read_cache_capacity_must_leave_room_for_entries() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_point_read_cache": {
                 "capacity": 0
@@ -484,7 +568,7 @@ fn point_read_cache_capacity_must_leave_room_for_entries() {
 
 #[test]
 fn point_read_cache_byte_limit_must_be_positive_when_set() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_point_read_cache": {
                 "max_bytes": 0
@@ -500,7 +584,7 @@ fn point_read_cache_byte_limit_must_be_positive_when_set() {
 
 #[test]
 fn storage_connection_registry_must_name_an_existing_default_connection() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_connections": {
                 "default_connection": "replica",
@@ -521,7 +605,7 @@ fn storage_connection_registry_must_name_an_existing_default_connection() {
 
 #[test]
 fn storage_connection_registry_requires_a_non_empty_default_connection_id() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_connections": {
                 "default_connection": " ",
@@ -542,7 +626,7 @@ fn storage_connection_registry_requires_a_non_empty_default_connection_id() {
 
 #[test]
 fn storage_connection_registry_requires_at_least_one_connection() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_connections": {
                 "default_connection": "primary",
@@ -559,7 +643,7 @@ fn storage_connection_registry_requires_at_least_one_connection() {
 
 #[test]
 fn storage_connection_registry_validates_each_connection_backend_selection() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_connections": {
                 "default_connection": "primary",
@@ -579,7 +663,7 @@ fn storage_connection_registry_validates_each_connection_backend_selection() {
 
 #[test]
 fn point_read_cache_budget_loads_fixed_bytes_inside_mode() {
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "storage_point_read_cache": {
                 "memory_budget": {
@@ -608,7 +692,7 @@ fn point_read_cache_budget_loads_fixed_bytes_inside_mode() {
 
 #[test]
 fn empty_backends_keep_default_sqlite() {
-    let file = write_temp_config(json!({}));
+    let file = write_config(json!({}));
     let loaded = load(file.path()).expect("load empty config");
     assert!(matches!(
         loaded.root.features.backends,
@@ -677,6 +761,31 @@ fn storage_api_launch_config_overrides_win_over_top_level_flags() {
 }
 
 #[test]
+fn storage_admission_flags_and_explicit_overrides_are_applied() {
+    let launch = StorageApiLaunchConfig::from_args([
+        "storage-api",
+        "--storage-admission-enabled",
+        "false",
+        "--storage-admission-maximum-concurrency",
+        "8",
+        "--overrides",
+        "features.storage_admission.maximum_concurrency=12",
+    ])
+    .expect("storage admission launch config");
+
+    assert!(!launch.effective.root.features.storage_admission.enabled);
+    assert_eq!(
+        launch
+            .effective
+            .root
+            .features
+            .storage_admission
+            .maximum_concurrency,
+        12
+    );
+}
+
+#[test]
 fn storage_api_launch_config_splits_escaped_override_assignments() {
     let launch = StorageApiLaunchConfig::from_args([
         "storage-api",
@@ -729,11 +838,11 @@ fn interpolation_resolves_partial_environment_values() {
     unsafe {
         std::env::set_var("AUX_CONFIG_TEST_DB_NAME", "interpolated");
     }
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": {
-                    "db_path": "/tmp/${AUX_CONFIG_TEST_DB_NAME}.db"
+                    "db_path": "run-artifacts/config-data/${AUX_CONFIG_TEST_DB_NAME}.db"
                 }
             }
         }
@@ -750,7 +859,7 @@ fn interpolation_resolves_partial_environment_values() {
             .as_ref()
             .expect("sqlite")
             .db_path,
-        "/tmp/interpolated.db"
+        "run-artifacts/config-data/interpolated.db"
     );
     unsafe {
         std::env::remove_var("AUX_CONFIG_TEST_DB_NAME");
@@ -759,7 +868,7 @@ fn interpolation_resolves_partial_environment_values() {
 
 #[test]
 fn interpolation_resolves_files_relative_to_config_file() {
-    let dir = tempfile::tempdir().expect("create temporary directory");
+    let dir = temp_dir("config-");
     fs::write(dir.path().join("dsn.txt"), "postgres://localhost/from-file")
         .expect("write dsn file");
     let config_path = dir.path().join("config.json");
@@ -800,7 +909,7 @@ fn interpolation_reports_missing_environment_values() {
     unsafe {
         std::env::remove_var("AUX_CONFIG_TEST_MISSING");
     }
-    let file = write_temp_config(json!({
+    let file = write_config(json!({
         "features": {
             "backends": {
                 "sqlite": {
@@ -814,4 +923,86 @@ fn interpolation_reports_missing_environment_values() {
 
     assert!(matches!(error, ConfigError::Interpolation { path, message }
         if path.contains("db_path") && message.contains("AUX_CONFIG_TEST_MISSING")));
+}
+
+#[test]
+fn storage_admission_defaults_and_environment_override_are_stable() {
+    let loaded = load_optional_with_overrides(None, &[]).expect("load defaults");
+    assert_eq!(
+        loaded
+            .root
+            .features
+            .storage_admission
+            .initial_sustainable_throughput_rps,
+        20_000
+    );
+    assert_eq!(
+        loaded.root.features.storage_admission.maximum_concurrency,
+        1_024
+    );
+    let partial = load_optional_with_overrides(
+        None,
+        &[("features.storage_admission".to_string(), "{}".to_string())],
+    )
+    .expect("load partial admission defaults");
+    assert_eq!(partial.root.features.storage_admission.queue_capacity, 256);
+
+    let overrides = collect_storage_admission_environment_overrides(|name| match name {
+        "AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS" => Ok("123".to_string()),
+        _ => Err(std::env::VarError::NotPresent),
+    })
+    .expect("environment override");
+    let loaded = load_optional_with_overrides(None, &overrides).expect("load env override");
+    assert_eq!(
+        loaded
+            .root
+            .features
+            .storage_admission
+            .initial_sustainable_throughput_rps,
+        123
+    );
+
+    let overrides = collect_storage_admission_environment_overrides(|name| match name {
+        "AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS" => Ok("123".to_string()),
+        "AUX_STORAGE_ADMISSION_INITIAL_SUSTAINABLE_THROUGHPUT_RPS" => Ok("456".to_string()),
+        _ => Err(std::env::VarError::NotPresent),
+    })
+    .expect("both throughput aliases are accepted");
+    let loaded = load_optional_with_overrides(None, &overrides).expect("load both aliases");
+    assert_eq!(
+        loaded
+            .root
+            .features
+            .storage_admission
+            .initial_sustainable_throughput_rps,
+        456,
+        "the canonical admission environment name wins over the legacy shorthand"
+    );
+}
+
+#[test]
+fn storage_admission_environment_rejects_zero_except_queue_capacity() {
+    let error = collect_storage_admission_environment_overrides(|name| {
+        if name == "AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS" {
+            Ok("0".to_string())
+        } else {
+            Err(std::env::VarError::NotPresent)
+        }
+    })
+    .expect_err("zero throughput must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS")
+    );
+
+    let overrides = collect_storage_admission_environment_overrides(|name| {
+        if name == "AUX_STORAGE_ADMISSION_QUEUE_CAPACITY" {
+            Ok("0".to_string())
+        } else {
+            Err(std::env::VarError::NotPresent)
+        }
+    })
+    .expect("zero queue capacity is valid");
+    assert_eq!(overrides[0].1, "0");
 }

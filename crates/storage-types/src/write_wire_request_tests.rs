@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest, EncodePutRequest,
     EncodeWriteRequest, PutRequest, TableName, TransactEncodeItem, TransactEncodePutRequest,
-    TransactWriteItemsEncodeRequest, WireItem, WriteRequest, WriteRetryPolicy,
+    TransactWriteItemsEncodeRequest, WireEntity, WireItem, WriteRequest, WriteRetryPolicy,
 };
 
 fn sample_wire_item() -> WireItem {
@@ -29,7 +29,9 @@ fn transaction_with_25_four_kib_items() -> TransactWriteItemsEncodeRequest {
                         .put(
                             TransactEncodePutRequest::builder()
                                 .table_name(table_name.clone())
-                                .item(WireItem::dynamo_json(payload.clone()))
+                                .item(WireEntity::unindexed(WireItem::dynamo_json(
+                                    payload.clone(),
+                                )))
                                 .build(),
                         )
                         .build()
@@ -89,7 +91,11 @@ fn batch_write_item_encode_request_converts_put_item_tests() {
             table.clone(),
             vec![
                 EncodeWriteRequest::builder()
-                    .put_request(EncodePutRequest::builder().item(sample_wire_item()).build())
+                    .put_request(
+                        EncodePutRequest::builder()
+                            .item(WireEntity::unindexed(sample_wire_item()))
+                            .build(),
+                    )
                     .build(),
             ],
         )]))
@@ -122,6 +128,7 @@ fn batch_write_item_request_converts_put_item_to_encode_tests() {
                             AttributeValue::S("FIXTURE".to_string()),
                         ),
                     ]),
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -139,11 +146,11 @@ fn batch_write_item_request_converts_put_item_to_encode_tests() {
     assert_eq!(writes.len(), 1);
     let put = writes[0].put_request.as_ref().expect("put request");
     assert_eq!(
-        put.item.attribute_value("pk").expect("pk lookup"),
+        put.item.item().attribute_value("pk").expect("pk lookup"),
         Some(AttributeValue::S("P#1".to_string()))
     );
     assert_eq!(
-        put.item.attribute_value("sk").expect("sk lookup"),
+        put.item.item().attribute_value("sk").expect("sk lookup"),
         Some(AttributeValue::S("S#1".to_string()))
     );
 }
@@ -157,7 +164,7 @@ fn transact_write_items_encode_request_converts_put_item_tests() {
                 .put(
                     TransactEncodePutRequest::builder()
                         .table_name(table)
-                        .item(sample_wire_item())
+                        .item(WireEntity::unindexed(sample_wire_item()))
                         .condition_expression("attribute_not_exists(pk)")
                         .build(),
                 )

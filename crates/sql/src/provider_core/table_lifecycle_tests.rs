@@ -9,6 +9,7 @@ use crate::provider_core::table_lifecycle::validate_create_table_request;
 fn validate_create_table_rejects_duplicate_key_schema_attribute() {
     let request = CreateTableRequest {
         table_name: TableName::new("users"),
+        max_indexers: storage_types::MaxIndexers::ZERO,
         attribute_definitions: vec![AttributeDefinition {
             attribute_name: "pk".into(),
             attribute_type: KeyAttributeType::S,

@@ -16,6 +16,16 @@ impl DatabaseManager {
                 "atomic item read-modify-write does not support namespace routing",
             ));
         }
-        self.storage.atomic_item_read_modify_write(request).await
+        self.run_default_admitted(
+            crate::admission::AdmissionClass::Write,
+            |provider| async move {
+                let database_call =
+                    metrics_facade::begin_database_call("atomic_item_read_modify_write");
+                let result = provider.atomic_item_read_modify_write(request).await;
+                drop(database_call);
+                result
+            },
+        )
+        .await
     }
 }

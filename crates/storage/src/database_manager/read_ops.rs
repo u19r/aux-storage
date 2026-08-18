@@ -136,22 +136,34 @@ impl DatabaseManager {
                 self.request_rewriter
                     .rewrite_key_for_shared_table(&route.namespace, &mut key)?;
             }
-            let provider = self.provider_for_connection(&route.read_target.connection_id)?;
+            let durable_table_name = route.read_target.table_name.clone();
+            let fallback_table_name = route.read_target.table_name.clone();
+            let normal_table_name = route.read_target.table_name.clone();
+            let durable_key = key.clone();
+            let fallback_key = key.clone();
             let mut item = if should_try_strong_read_through_warming(
                 point_read_runtime,
                 prepared_cache_read,
                 consistent_read,
             ) && route.storage_mode != NamespaceStorageMode::SharedTable
             {
-                match record_storage_operation(
-                    "get_item_with_durable_proof",
-                    provider.get_item_with_durable_proof(DurablePointReadRequest {
-                        table_name: route.read_target.table_name.clone(),
-                        key: key.clone(),
-                        consistent_read,
-                    }),
-                )
-                .await
+                match self
+                    .run_admitted(
+                        &route.read_target.connection_id,
+                        crate::admission::AdmissionClass::PointRead,
+                        |provider| async move {
+                            record_storage_operation(
+                                "get_item_with_durable_proof",
+                                provider.get_item_with_durable_proof(DurablePointReadRequest {
+                                    table_name: durable_table_name,
+                                    key: durable_key,
+                                    consistent_read,
+                                }),
+                            )
+                            .await
+                        },
+                    )
+                    .await
                 {
                     Ok(proof) => {
                         item_from_durable_proof_for_cache_warming(
@@ -162,22 +174,36 @@ impl DatabaseManager {
                         .await?
                     }
                     Err(error) if matches!(error.to_enum(), StorageEnum::Unsupported { .. }) => {
-                        record_storage_operation(
-                            "get_item",
-                            provider.get_item(
-                                route.read_target.table_name.clone(),
-                                key,
-                                consistent_read,
-                            ),
+                        self.run_admitted(
+                            &route.read_target.connection_id,
+                            crate::admission::AdmissionClass::PointRead,
+                            |provider| async move {
+                                record_storage_operation(
+                                    "get_item",
+                                    provider.get_item(
+                                        fallback_table_name,
+                                        fallback_key,
+                                        consistent_read,
+                                    ),
+                                )
+                                .await
+                            },
                         )
                         .await?
                     }
                     Err(error) => return Err(error),
                 }
             } else {
-                record_storage_operation(
-                    "get_item",
-                    provider.get_item(route.read_target.table_name.clone(), key, consistent_read),
+                self.run_admitted(
+                    &route.read_target.connection_id,
+                    crate::admission::AdmissionClass::PointRead,
+                    |provider| async move {
+                        record_storage_operation(
+                            "get_item",
+                            provider.get_item(normal_table_name, key, consistent_read),
+                        )
+                        .await
+                    },
                 )
                 .await?
             };
@@ -191,21 +217,31 @@ impl DatabaseManager {
             return Ok(item);
         }
 
+        let durable_table_name = table_name.clone();
+        let durable_key = key.clone();
+        let fallback_table_name = table_name.clone();
+        let fallback_key = key.clone();
         let result = if should_try_strong_read_through_warming(
             point_read_runtime,
             prepared_cache_read,
             consistent_read,
         ) {
-            match record_storage_operation(
-                "get_item_with_durable_proof",
-                self.storage
-                    .get_item_with_durable_proof(DurablePointReadRequest {
-                        table_name: table_name.clone(),
-                        key: key.clone(),
-                        consistent_read,
-                    }),
-            )
-            .await
+            match self
+                .run_default_admitted(
+                    crate::admission::AdmissionClass::PointRead,
+                    |provider| async move {
+                        record_storage_operation(
+                            "get_item_with_durable_proof",
+                            provider.get_item_with_durable_proof(DurablePointReadRequest {
+                                table_name: durable_table_name,
+                                key: durable_key,
+                                consistent_read,
+                            }),
+                        )
+                        .await
+                    },
+                )
+                .await
             {
                 Ok(proof) => {
                     item_from_durable_proof_for_cache_warming(
@@ -216,18 +252,34 @@ impl DatabaseManager {
                     .await?
                 }
                 Err(error) if matches!(error.to_enum(), StorageEnum::Unsupported { .. }) => {
-                    record_storage_operation(
-                        "get_item",
-                        self.storage.get_item(table_name, key, consistent_read),
+                    self.run_default_admitted(
+                        crate::admission::AdmissionClass::PointRead,
+                        |provider| async move {
+                            record_storage_operation(
+                                "get_item",
+                                provider.get_item(
+                                    fallback_table_name,
+                                    fallback_key,
+                                    consistent_read,
+                                ),
+                            )
+                            .await
+                        },
                     )
                     .await?
                 }
                 Err(error) => return Err(error),
             }
         } else {
-            record_storage_operation(
-                "get_item",
-                self.storage.get_item(table_name, key, consistent_read),
+            self.run_default_admitted(
+                crate::admission::AdmissionClass::PointRead,
+                |provider| async move {
+                    record_storage_operation(
+                        "get_item",
+                        provider.get_item(fallback_table_name, fallback_key, consistent_read),
+                    )
+                    .await
+                },
             )
             .await?
         };
@@ -308,11 +360,24 @@ impl DatabaseManager {
                     .rewrite_scan_for_shared_table(&route.namespace, &mut request)?;
             }
             request.table_name = route.read_target.table_name.clone();
-            let provider = self.provider_for_connection(&route.read_target.connection_id)?;
-            return record_storage_operation("scan_table", provider.scan_table(&request)).await;
+            return self
+                .run_admitted(
+                    &route.read_target.connection_id,
+                    crate::admission::AdmissionClass::RangeRead,
+                    |provider| async move {
+                        record_storage_operation("scan_table", provider.scan_table(&request)).await
+                    },
+                )
+                .await;
         }
 
-        record_storage_operation("scan_table", self.storage.scan_table(&request)).await
+        self.run_default_admitted(
+            crate::admission::AdmissionClass::RangeRead,
+            |provider| async move {
+                record_storage_operation("scan_table", provider.scan_table(&request)).await
+            },
+        )
+        .await
     }
 
     pub async fn scan_table_decode<T>(
@@ -338,15 +403,24 @@ impl DatabaseManager {
         let page_token = parse_stream_page_token(page_token)?;
 
         let (stream_items, last_evaluated_key) = self
-            .storage
-            .get_stream_records_from_pointer_stream(
-                table_stream_name,
-                key_schema,
-                page_token,
-                limit,
+            .run_default_admitted(
+                crate::admission::AdmissionClass::RangeRead,
+                |provider| async move {
+                    let database_call = metrics_facade::begin_database_call("get_stream_records");
+                    let result = provider
+                        .get_stream_records_from_pointer_stream(
+                            table_stream_name,
+                            key_schema,
+                            page_token,
+                            limit,
+                        )
+                        .await
+                        .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)));
+                    drop(database_call);
+                    result
+                },
             )
-            .await
-            .map_err(StreamError::into_storage_enum)?;
+            .await?;
 
         let stream_items_response = stream_items.into_iter().map(|mut item| {
             if let Some(stream_view_type) = &stream_spec.stream_view_type {
@@ -401,16 +475,30 @@ impl DatabaseManager {
 
         if self.route_resolver.is_none() {
             let mut response = if batch_request_has_items(&db_request) {
-                warm_strong_batch_read_through(
-                    &batch_get_cache,
-                    self.storage.as_ref(),
-                    &db_request,
-                    None,
+                let warm_request = db_request.clone();
+                let warm_cache = &batch_get_cache;
+                self.run_default_admitted(
+                    crate::admission::AdmissionClass::RangeRead,
+                    |provider| async move {
+                        warm_strong_batch_read_through(
+                            warm_cache,
+                            provider.as_ref(),
+                            &warm_request,
+                            None,
+                        )
+                        .await
+                    },
                 )
                 .await?;
-                record_storage_operation(
-                    "batch_get_item",
-                    self.storage.batch_get_item(db_request.clone()),
+                self.run_default_admitted(
+                    crate::admission::AdmissionClass::RangeRead,
+                    |provider| async move {
+                        record_storage_operation(
+                            "batch_get_item",
+                            provider.batch_get_item(db_request.clone()),
+                        )
+                        .await
+                    },
                 )
                 .await?
             } else {
@@ -502,8 +590,8 @@ impl DatabaseManager {
         let routed_responses = join_all(routed_requests.into_iter().map(|routed| {
             let batch_get_cache = &batch_get_cache;
             async move {
-                let provider = self.provider_for_request_connection(&routed.connection_id)?;
                 if routed.connection_id == ROUTED_DEFAULT_CONNECTION_ID {
+                    let warm_request = routed.request.clone();
                     let (physical_table, target) =
                         routed.targets.iter().next().ok_or_else(|| {
                             StorageError::internal("routed BatchGet request has no response target")
@@ -513,15 +601,22 @@ impl DatabaseManager {
                             "default BatchGet cache warming requires one response target",
                         ));
                     }
-                    warm_strong_batch_read_through(
-                        batch_get_cache,
-                        provider.as_ref(),
-                        &routed.request,
-                        Some(RoutedBatchProofTarget {
-                            logical_table: &target.logical_table,
-                            shared_namespace: target.shared_namespace.as_ref(),
-                            request_rewriter: &self.request_rewriter,
-                        }),
+                    self.run_admitted(
+                        &routed.connection_id,
+                        crate::admission::AdmissionClass::RangeRead,
+                        |provider| async move {
+                            warm_strong_batch_read_through(
+                                batch_get_cache,
+                                provider.as_ref(),
+                                &warm_request,
+                                Some(RoutedBatchProofTarget {
+                                    logical_table: &target.logical_table,
+                                    shared_namespace: target.shared_namespace.as_ref(),
+                                    request_rewriter: &self.request_rewriter,
+                                }),
+                            )
+                            .await
+                        },
                     )
                     .await?;
                     if !routed.request.request_items.contains_key(physical_table) {
@@ -530,11 +625,19 @@ impl DatabaseManager {
                         ));
                     }
                 }
-                let response = record_storage_operation(
-                    "batch_get_item",
-                    provider.batch_get_item(routed.request),
-                )
-                .await?;
+                let response = self
+                    .run_admitted(
+                        &routed.connection_id,
+                        crate::admission::AdmissionClass::RangeRead,
+                        |provider| async move {
+                            record_storage_operation(
+                                "batch_get_item",
+                                provider.batch_get_item(routed.request),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 Ok::<_, StorageError>((routed.targets, response))
             }
         }))
@@ -698,12 +801,14 @@ async fn warm_strong_batch_read_through(
     let Some(strong_request) = strong_only_batch_get_request(db_request) else {
         return Ok(());
     };
-    let mut proof = match provider
+    let database_call = metrics_facade::begin_database_call("batch_get_item.durable_proof");
+    let proof_result = provider
         .batch_get_item_with_durable_proofs(storage_types::DurableBatchPointReadRequest {
             request_items: strong_request.request_items,
         })
-        .await
-    {
+        .await;
+    drop(database_call);
+    let mut proof = match proof_result {
         Ok(proof) => proof,
         Err(error) if matches!(error.to_enum(), StorageEnum::Unsupported { .. }) => return Ok(()),
         Err(error) => return Err(error),

@@ -10,6 +10,7 @@ doctest = false
 [dependencies]
 async-trait = { workspace = true }
 bg-jobs = { path = "../bg-jobs" }
+metrics-facade = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 storage-backfill = { path = "../storage-backfill" }

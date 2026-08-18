@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::context::WrappedError as _;
+
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct TestRecord {
     pk: String,
@@ -40,13 +42,11 @@ fn medium_json_is_stored_raw_to_avoid_read_path_decompression() {
     let json = serde_json::to_vec(&value).expect("serialize fixture");
 
     let encoded = crate::storage_serde::compress_json_bytes(&json);
-    let legacy_compressed = lz4_flex::compress_prepend_size(&json);
     let decoded = crate::storage_serde::decompress_owned_bytes(encoded.clone())
         .expect("decode owned medium raw json");
 
     assert!(json.len() > 1_024);
     assert!(json.len() <= crate::STORAGE_SERDE_RAW_JSON_LIMIT_BYTES);
-    assert!(legacy_compressed.len() < json.len());
     assert_eq!(encoded.len(), json.len() + 8);
     assert_eq!(decoded, json);
 }
@@ -68,11 +68,15 @@ fn large_compressible_json_uses_compressed_encoding_and_round_trips() {
 }
 
 #[test]
-fn legacy_lz4_bytes_still_decode() {
-    let json = br#"{"pk":"tenant#1","sk":"item#1","payload":"legacy"}"#;
-    let legacy = lz4_flex::compress_prepend_size(json);
+fn given_unversioned_lz4_when_decoded_then_unknown_format_is_rejected() {
+    let unversioned = lz4_flex::compress_prepend_size(br#"{"pk":"tenant#1"}"#);
 
-    let decoded = crate::storage_serde::decompress_bytes(&legacy).expect("decode legacy lz4");
+    let error = crate::storage_serde::decompress_bytes(&unversioned)
+        .expect_err("unversioned storage data must fail closed");
 
-    assert_eq!(decoded, json);
+    assert!(matches!(
+        error.to_enum(),
+        crate::StorageEnum::InternalServerError { message }
+            if message == "storage serde: unknown format header"
+    ));
 }

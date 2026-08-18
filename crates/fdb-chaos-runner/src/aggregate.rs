@@ -34,12 +34,86 @@ enum CheckerRunStatus {
     Skipped,
     Checked,
 }
-pub(crate) fn post_process_artifacts(_args: &CliArgs, artifact_dir: &Path) -> Result<(), String> {
+pub(crate) fn post_process_artifacts(args: &CliArgs, artifact_dir: &Path) -> Result<(), String> {
+    if args.workload == "read_sequence_dag" {
+        run_read_sequence_checker(artifact_dir)?;
+    }
     for checker in AGGREGATE_CHECKERS {
         (checker.run)(artifact_dir)
             .map_err(|err| format!("aggregate checker '{}' failed: {err}", checker.name))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct ReadSequenceDagCheckReport {
+    attempts: u64,
+    published: u64,
+    oracle_checks: u64,
+    mismatches: u64,
+    errors: u64,
+}
+
+fn run_read_sequence_checker(artifact_dir: &Path) -> Result<(), String> {
+    let metrics_path = artifact_dir.join("metrics.log");
+    let metrics = fs::read_to_string(&metrics_path)
+        .map_err(|err| format!("failed to read {}: {err}", metrics_path.display()))?;
+    let report = parse_read_sequence_metrics(&metrics)?;
+    write_json(&artifact_dir.join("read-sequence-dag-check.json"), &report)?;
+    if report.mismatches > 0 || report.errors > 0 {
+        return Err(format!(
+            "read-sequence DAG checker found {} mismatches and {} errors; see {}",
+            report.mismatches,
+            report.errors,
+            artifact_dir.join("read-sequence-dag-check.json").display()
+        ));
+    }
+    if report.attempts != report.published || report.attempts != report.oracle_checks {
+        return Err(format!(
+            "read-sequence DAG checker found incomplete publication: attempts={}, published={}, \
+             oracle_checks={}; see {}",
+            report.attempts,
+            report.published,
+            report.oracle_checks,
+            artifact_dir.join("read-sequence-dag-check.json").display()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_read_sequence_metrics(input: &str) -> Result<ReadSequenceDagCheckReport, String> {
+    let mut report = ReadSequenceDagCheckReport::default();
+    let mut found_metric = false;
+    for line in input.lines() {
+        let Some((metric, value)) = line.strip_prefix("Metric ").and_then(metric_line) else {
+            continue;
+        };
+        let Some(field) = metric.strip_prefix("External.") else {
+            continue;
+        };
+        let value = value.parse::<u64>().map_err(|err| {
+            format!("invalid read-sequence metric value {value:?} for {field}: {err}")
+        })?;
+        found_metric = true;
+        match field {
+            "aux_storage_read_sequence_dag_attempts" => report.attempts += value,
+            "aux_storage_read_sequence_dag_published" => report.published += value,
+            "aux_storage_read_sequence_dag_oracle_checks" => report.oracle_checks += value,
+            "aux_storage_read_sequence_dag_mismatches" => report.mismatches += value,
+            "aux_storage_read_sequence_dag_errors" => report.errors += value,
+            _ => {}
+        }
+    }
+    found_metric
+        .then_some(report)
+        .ok_or_else(|| "read-sequence DAG metrics were not emitted".to_string())
+}
+
+fn metric_line(line: &str) -> Option<(&str, &str)> {
+    let (_, body) = line.split_once(": ")?;
+    let (metric, values) = body.split_once(',')?;
+    let (_, value) = values.rsplit_once(',')?;
+    Some((metric, value.trim()))
 }
 
 fn run_background_lease_checker(artifact_dir: &Path) -> Result<CheckerRunStatus, String> {
@@ -219,3 +293,6 @@ pub(crate) fn read_background_lease_event_groups(
     }
     Ok(event_groups)
 }
+
+#[cfg(test)]
+mod aggregate_tests;

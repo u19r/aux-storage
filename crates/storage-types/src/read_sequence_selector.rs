@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::{AttributeMap, AttributeValue, ReadSequenceSelector, ReadSequenceValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,50 +23,149 @@ impl ParsedReadSequenceSelector {
         }
     }
 
+    #[must_use]
+    pub fn segments(&self) -> &[ReadSequenceSelectorSegment] {
+        &self.segments
+    }
+
     pub fn evaluate_item(
         &self,
         item: &AttributeMap,
     ) -> Result<Option<AttributeValue>, ReadSequenceValidationError> {
-        let mut current = AttributeValue::M(item.clone().into());
-        for segment in &self.segments {
-            current = match segment {
-                ReadSequenceSelectorSegment::Attribute(name) => match current {
-                    AttributeValue::M(mut values) => {
-                        let Some(value) = values.remove(name) else {
-                            return Ok(None);
-                        };
-                        value
-                    }
-                    other => {
-                        return Err(ReadSequenceValidationError::SelectorTypeMismatch {
-                            selector: self.raw.clone(),
-                            expected: "map",
-                            actual: attribute_value_type_name(&other),
-                        });
-                    }
-                },
-                ReadSequenceSelectorSegment::Index(index) => match current {
-                    AttributeValue::L(values) => {
-                        let Some(value) = values.get(*index).cloned() else {
-                            return Ok(None);
-                        };
-                        value
-                    }
-                    other => {
-                        return Err(ReadSequenceValidationError::SelectorTypeMismatch {
-                            selector: self.raw.clone(),
-                            expected: "list",
-                            actual: attribute_value_type_name(&other),
-                        });
-                    }
-                },
-                ReadSequenceSelectorSegment::Wildcard => current,
-                ReadSequenceSelectorSegment::AttributeValueType(value_type) => {
-                    return scalar_for_type(&self.raw, current, *value_type).map(Some);
-                }
-            };
+        let mut first = None;
+        self.for_each_item_value(item, |value| {
+            if first.is_none() {
+                first = Some(value);
+            }
+        })?;
+        Ok(first)
+    }
+
+    pub fn evaluate_item_values(
+        &self,
+        item: &AttributeMap,
+    ) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+        let mut values = Vec::new();
+        self.for_each_item_value(item, |value| values.push(value))?;
+        Ok(values)
+    }
+
+    pub fn for_each_item_value(
+        &self,
+        item: &AttributeMap,
+        mut visit: impl FnMut(AttributeValue),
+    ) -> Result<(), ReadSequenceValidationError> {
+        let Some((first, remaining)) = self.segments.split_first() else {
+            visit(AttributeValue::M(item.clone().into()));
+            return Ok(());
+        };
+        let ReadSequenceSelectorSegment::Attribute(name) = first else {
+            for value in self.evaluate_values(&AttributeValue::M(item.clone().into()))? {
+                visit(value);
+            }
+            return Ok(());
+        };
+        let Some(value) = item.get(name).cloned() else {
+            return Ok(());
+        };
+        if remaining.is_empty() {
+            visit(value);
+            return Ok(());
         }
-        Ok(Some(current))
+        let mut values = vec![value];
+        for segment in remaining {
+            values = evaluate_selector_segment(&self.raw, values, segment)?;
+        }
+        for value in values {
+            visit(value);
+        }
+        Ok(())
+    }
+
+    pub fn evaluate_values(
+        &self,
+        root: &AttributeValue,
+    ) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+        let mut values = vec![root.clone()];
+        for segment in &self.segments {
+            values = evaluate_selector_segment(&self.raw, values, segment)?;
+        }
+        Ok(values)
+    }
+}
+
+fn evaluate_selector_segment(
+    selector: &str,
+    values: Vec<AttributeValue>,
+    segment: &ReadSequenceSelectorSegment,
+) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+    values
+        .into_iter()
+        .try_fold(Vec::new(), |mut next, current| {
+            next.extend(evaluate_selector_value(selector, current, segment)?);
+            Ok(next)
+        })
+}
+
+fn evaluate_selector_value(
+    selector: &str,
+    current: AttributeValue,
+    segment: &ReadSequenceSelectorSegment,
+) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+    match segment {
+        ReadSequenceSelectorSegment::Attribute(name) => evaluate_attribute(selector, current, name),
+        ReadSequenceSelectorSegment::Index(index) => evaluate_index(selector, current, *index),
+        ReadSequenceSelectorSegment::Wildcard => evaluate_wildcard(selector, current),
+        ReadSequenceSelectorSegment::AttributeValueType(value_type) => {
+            scalar_for_type(selector, current, *value_type).map(|value| vec![value])
+        }
+    }
+}
+
+fn evaluate_attribute(
+    selector: &str,
+    current: AttributeValue,
+    name: &str,
+) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+    match current {
+        AttributeValue::M(values) => Ok(values.get(name).cloned().into_iter().collect()),
+        other => Err(selector_type_mismatch(selector, "map", &other)),
+    }
+}
+
+fn evaluate_index(
+    selector: &str,
+    current: AttributeValue,
+    index: usize,
+) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+    match current {
+        AttributeValue::L(values) => Ok(values.get(index).cloned().into_iter().collect()),
+        other => Err(selector_type_mismatch(selector, "list", &other)),
+    }
+}
+
+fn evaluate_wildcard(
+    selector: &str,
+    current: AttributeValue,
+) -> Result<Vec<AttributeValue>, ReadSequenceValidationError> {
+    match current {
+        AttributeValue::L(values) => Ok(values),
+        AttributeValue::SS(values) => Ok(values.into_iter().map(AttributeValue::S).collect()),
+        AttributeValue::NS(values) => Ok(values.into_iter().map(AttributeValue::N).collect()),
+        AttributeValue::BS(values) => Ok(values.into_iter().map(AttributeValue::B).collect()),
+        other => Err(selector_type_mismatch(selector, "list", &other)),
+    }
+}
+
+fn selector_type_mismatch(
+    selector: &str,
+    expected: &'static str,
+    actual: &AttributeValue,
+) -> ReadSequenceValidationError {
+    ReadSequenceValidationError::SelectorTypeMismatch {
+        selector: selector.to_string(),
+        expected,
+        actual: attribute_value_type_name(actual),
     }
 }
 
@@ -96,63 +193,16 @@ pub enum ReadSequenceAttributeValueType {
     BS,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ReadSequenceSelectedContext {
-    values: BTreeMap<String, AttributeValue>,
-}
-
-impl ReadSequenceSelectedContext {
-    pub fn insert(&mut self, name: impl Into<String>, value: AttributeValue) {
-        self.values.insert(name.into(), value);
-    }
-
-    pub fn get(&self, name: &str) -> Option<&AttributeValue> {
-        self.values.get(name)
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
-
-pub fn bind_read_sequence_attribute_value(
-    value: &AttributeValue,
-    context: &ReadSequenceSelectedContext,
-) -> Result<AttributeValue, ReadSequenceValidationError> {
-    match value {
-        AttributeValue::S(value) => bind_scalar(value, context).map(AttributeValue::S),
-        AttributeValue::N(value) => bind_scalar(value, context).map(AttributeValue::N),
-        AttributeValue::B(value) => bind_scalar(value, context).map(AttributeValue::B),
-        AttributeValue::SS(values) => bind_string_set(values, context, SetKind::String),
-        AttributeValue::NS(values) => bind_string_set(values, context, SetKind::Number),
-        AttributeValue::BS(values) => bind_string_set(values, context, SetKind::Binary),
-        AttributeValue::BOOL(value) => Ok(AttributeValue::BOOL(*value)),
-        AttributeValue::NULL(value) => Ok(AttributeValue::NULL(*value)),
-        AttributeValue::L(values) => values
-            .iter()
-            .map(|value| bind_read_sequence_attribute_value(value, context))
-            .collect::<Result<Vec<_>, _>>()
-            .map(AttributeValue::L),
-        AttributeValue::M(values) => values
-            .iter()
-            .map(|(name, value)| {
-                bind_read_sequence_attribute_value(value, context)
-                    .map(|bound| (name.clone(), bound))
-            })
-            .collect::<Result<std::collections::HashMap<_, _>, _>>()
-            .map(AttributeValue::M),
-    }
-}
-
 pub fn validate_selector_depth(
     selector: &ReadSequenceSelector,
     max_depth: u32,
 ) -> Result<ParsedReadSequenceSelector, ReadSequenceValidationError> {
     let parsed = ParsedReadSequenceSelector::parse(selector)?;
+    if parsed.dependency_root().is_some() {
+        return Err(ReadSequenceValidationError::SelectorFailure {
+            selector: selector.0.clone(),
+        });
+    }
     if parsed.depth() > max_depth {
         Err(ReadSequenceValidationError::SelectorPathTooDeep {
             selector: selector.0.clone(),
@@ -202,41 +252,53 @@ fn parse_selector_part(
             selector: raw.to_string(),
         });
     }
-    if let Some((name, rest)) = part.split_once('[') {
-        if !name.is_empty() {
-            push_named_segment(name, segments);
-        }
-        let mut remainder = rest;
-        loop {
-            let Some((index, rest)) = remainder.split_once(']') else {
-                return Err(ReadSequenceValidationError::SelectorFailure {
-                    selector: raw.to_string(),
-                });
-            };
-            if index == "*" {
-                segments.push(ReadSequenceSelectorSegment::Wildcard);
-            } else {
-                let parsed = index.parse::<usize>().map_err(|_| {
-                    ReadSequenceValidationError::SelectorFailure {
-                        selector: raw.to_string(),
-                    }
-                })?;
-                segments.push(ReadSequenceSelectorSegment::Index(parsed));
-            }
-            if rest.is_empty() {
-                break;
-            }
-            let Some(next) = rest.strip_prefix('[') else {
-                return Err(ReadSequenceValidationError::SelectorFailure {
-                    selector: raw.to_string(),
-                });
-            };
-            remainder = next;
-        }
-    } else {
+    let Some((name, remainder)) = part.split_once('[') else {
         push_named_segment(part, segments);
+        return Ok(());
+    };
+    if !name.is_empty() {
+        push_named_segment(name, segments);
     }
-    Ok(())
+    parse_selector_indexes(raw, remainder, segments)
+}
+
+fn parse_selector_indexes(
+    raw: &str,
+    mut remainder: &str,
+    segments: &mut Vec<ReadSequenceSelectorSegment>,
+) -> Result<(), ReadSequenceValidationError> {
+    loop {
+        let Some((index, rest)) = remainder.split_once(']') else {
+            return Err(ReadSequenceValidationError::SelectorFailure {
+                selector: raw.to_string(),
+            });
+        };
+        segments.push(parse_selector_index(raw, index)?);
+        if rest.is_empty() {
+            return Ok(());
+        }
+        remainder =
+            rest.strip_prefix('[')
+                .ok_or_else(|| ReadSequenceValidationError::SelectorFailure {
+                    selector: raw.to_string(),
+                })?;
+    }
+}
+
+fn parse_selector_index(
+    raw: &str,
+    index: &str,
+) -> Result<ReadSequenceSelectorSegment, ReadSequenceValidationError> {
+    if index == "*" {
+        Ok(ReadSequenceSelectorSegment::Wildcard)
+    } else {
+        index
+            .parse::<usize>()
+            .map(ReadSequenceSelectorSegment::Index)
+            .map_err(|_| ReadSequenceValidationError::SelectorFailure {
+                selector: raw.to_string(),
+            })
+    }
 }
 
 fn push_named_segment(name: &str, segments: &mut Vec<ReadSequenceSelectorSegment>) {
@@ -304,89 +366,4 @@ fn attribute_value_type_name(value: &AttributeValue) -> &'static str {
         AttributeValue::L(_) => "L",
         AttributeValue::M(_) => "M",
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SetKind {
-    String,
-    Number,
-    Binary,
-}
-
-fn bind_string_set(
-    values: &[String],
-    context: &ReadSequenceSelectedContext,
-    kind: SetKind,
-) -> Result<AttributeValue, ReadSequenceValidationError> {
-    if values.len() == 1
-        && let Some(name) = whole_template_name(&values[0])
-        && let Some(value) = context.get(name)
-    {
-        return match (kind, value) {
-            (SetKind::String, AttributeValue::SS(values)) => Ok(AttributeValue::SS(values.clone())),
-            (SetKind::Number, AttributeValue::NS(values)) => Ok(AttributeValue::NS(values.clone())),
-            (SetKind::Binary, AttributeValue::BS(values)) => Ok(AttributeValue::BS(values.clone())),
-            (_, other) => Err(ReadSequenceValidationError::SelectorTypeMismatch {
-                selector: name.to_string(),
-                expected: "matching set AttributeValue type",
-                actual: attribute_value_type_name(other),
-            }),
-        };
-    }
-    values
-        .iter()
-        .map(|value| bind_scalar(value, context))
-        .collect::<Result<Vec<_>, _>>()
-        .map(|values| match kind {
-            SetKind::String => AttributeValue::SS(values),
-            SetKind::Number => AttributeValue::NS(values),
-            SetKind::Binary => AttributeValue::BS(values),
-        })
-}
-
-fn bind_scalar(
-    template: &str,
-    context: &ReadSequenceSelectedContext,
-) -> Result<String, ReadSequenceValidationError> {
-    let mut output = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some((prefix, after_start)) = rest.split_once("${") {
-        output.push_str(prefix);
-        let Some((name, after_end)) = after_start.split_once('}') else {
-            return Err(ReadSequenceValidationError::TemplateFailure {
-                template: template.to_string(),
-            });
-        };
-        let value =
-            context
-                .get(name)
-                .ok_or_else(|| ReadSequenceValidationError::TemplateFailure {
-                    template: template.to_string(),
-                })?;
-        output.push_str(scalar_value(name, value)?);
-        rest = after_end;
-    }
-    output.push_str(rest);
-    Ok(output)
-}
-
-fn scalar_value<'a>(
-    name: &str,
-    value: &'a AttributeValue,
-) -> Result<&'a str, ReadSequenceValidationError> {
-    match value {
-        AttributeValue::S(value) | AttributeValue::N(value) | AttributeValue::B(value) => Ok(value),
-        other => Err(ReadSequenceValidationError::SelectorTypeMismatch {
-            selector: name.to_string(),
-            expected: "S/N/B scalar",
-            actual: attribute_value_type_name(other),
-        }),
-    }
-}
-
-fn whole_template_name(template: &str) -> Option<&str> {
-    template
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .filter(|name| !name.is_empty() && !name.contains("${"))
 }

@@ -9,7 +9,10 @@ use storage_types::{
 use crate::{
     SQLiteStorageProvider,
     error_handler::map_sqlite_error,
-    stream_writer::{should_write_stream_entries_for_gsi_mode, write_stream_entries},
+    stream_writer::{
+        SqliteWriteStreamEntriesInput, should_write_stream_entries_for_gsi_mode,
+        write_stream_entries,
+    },
 };
 
 pub(crate) struct DeleteItemInput<'a> {
@@ -19,6 +22,7 @@ pub(crate) struct DeleteItemInput<'a> {
     pub(crate) immediate_gsi_consistency: bool,
     pub(crate) return_old_on_condition_failure: bool,
     pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) old_indexers: Option<&'a [String]>,
     pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
@@ -34,6 +38,7 @@ impl SQLiteStorageProvider {
             immediate_gsi_consistency,
             return_old_on_condition_failure,
             replication,
+            old_indexers: declared_old_indexers,
             item_stream_ttl_hours,
         } = input;
         let table_name_safe = table_name.sanitized_name();
@@ -46,7 +51,11 @@ impl SQLiteStorageProvider {
         }
 
         // First, get the item to return it if it exists
-        let existing_item = Self::do_get_item(table_name, key, sqlite)?;
+        let (existing_item, existing_indexers) =
+            Self::do_get_item_with_indexers(table_name, key, sqlite)?.map_or_else(
+                || (None, Vec::new()),
+                |(item, indexers)| (Some(item), indexers),
+            );
         let table_info = Self::do_get_table_info(table_name, sqlite)?;
         let should_write_stream =
             should_write_stream_entries_for_gsi_mode(&table_info, immediate_gsi_consistency);
@@ -62,10 +71,14 @@ impl SQLiteStorageProvider {
                         sqlite,
                         &table_info,
                         &key_item,
-                        None,
-                        true,
-                        item_stream_version,
-                        replication,
+                        SqliteWriteStreamEntriesInput {
+                            old_item: None,
+                            indexers: &[],
+                            old_indexers: declared_old_indexers,
+                            is_deleted: true,
+                            item_stream_version,
+                            replication,
+                        },
                     )?;
                     return Ok(None);
                 }
@@ -112,10 +125,14 @@ impl SQLiteStorageProvider {
                 sqlite,
                 &table_info,
                 &key_item,
-                Some(&item_for_stream),
-                true,
-                item_stream_version,
-                replication,
+                SqliteWriteStreamEntriesInput {
+                    old_item: Some(&item_for_stream),
+                    indexers: &[],
+                    old_indexers: declared_old_indexers.or(Some(&existing_indexers)),
+                    is_deleted: true,
+                    item_stream_version,
+                    replication,
+                },
             )?;
         }
 
@@ -125,6 +142,7 @@ impl SQLiteStorageProvider {
                 &table_info,
                 existing_item.as_ref(),
                 None,
+                &[],
                 item_stream_version,
             )?;
         }

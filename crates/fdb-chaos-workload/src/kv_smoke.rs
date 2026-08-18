@@ -6,11 +6,13 @@ pub(crate) struct KvSmokeWorkload {
     artifact_root: String,
     client_id: i32,
     client_count: i32,
+    operation_count: u64,
     setup_count: u64,
     start_count: u64,
     check_count: u64,
     write_count: u64,
     read_count: u64,
+    multi_get_count: u64,
     audit_count: u64,
     error_count: u64,
     context: WorkloadContext,
@@ -19,7 +21,7 @@ pub(crate) struct KvSmokeWorkload {
 impl KvSmokeWorkload {
     pub(crate) fn new(name: String, context: WorkloadContext) -> Self {
         let profile = option_or_default_string(&context, OPTION_PROFILE, "smoke");
-        let _: u64 = option_or_default(&context, OPTION_OPERATION_COUNT, 1_u64);
+        let operation_count = option_or_default(&context, OPTION_OPERATION_COUNT, 1_u64);
         let _: u64 = option_or_default(&context, OPTION_HISTORY_SAMPLE_LIMIT, 0_u64);
         let artifact_root =
             option_or_default_string(&context, OPTION_ARTIFACT_ROOT, "run-artifacts/fdb-chaos");
@@ -31,11 +33,13 @@ impl KvSmokeWorkload {
             artifact_root,
             client_id,
             client_count,
+            operation_count,
             setup_count: 0,
             start_count: 0,
             check_count: 0,
             write_count: 0,
             read_count: 0,
+            multi_get_count: 0,
             audit_count: 0,
             error_count: 0,
             context,
@@ -155,7 +159,72 @@ impl RustWorkload for KvSmokeWorkload {
             }
         }
 
-        match store.direct_audit_scan_prefix(b"phase1/", 10).await {
+        let batch_keys = (0..100)
+            .map(|index| format!("phase1/batch/{index}").into_bytes())
+            .collect::<Vec<_>>();
+        let batch_items = batch_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| BatchItem {
+                key: key.clone(),
+                value: Some(format!("batch-value-{index}").into_bytes()),
+            })
+            .collect();
+        if let Err(err) = store.batch_write(batch_items).await {
+            self.trace_error("multi_get_write", storage_error_detail(&err));
+            return;
+        }
+        let repeat_count = self.operation_count.max(100);
+        for _ in 0..repeat_count {
+            let missing_key = b"phase1/batch/missing".to_vec();
+            let mut requested_keys = Vec::with_capacity(batch_keys.len() + 2);
+            requested_keys.push(batch_keys[0].clone());
+            requested_keys.push(batch_keys[0].clone());
+            requested_keys.extend(batch_keys.iter().skip(1).cloned());
+            requested_keys.push(missing_key);
+            let values = match store.multi_get(requested_keys.clone(), false).await {
+                Ok(values) => values,
+                Err(err) => {
+                    self.trace_error("multi_get", storage_error_detail(&err));
+                    return;
+                }
+            };
+            let duplicate_matches = values.first() == values.get(1);
+            let missing_is_none = values.last().is_some_and(Option::is_none);
+            let present_values_match = values
+                .iter()
+                .skip(2)
+                .take(batch_keys.len().saturating_sub(1))
+                .enumerate()
+                .all(|(index, value)| {
+                    value.as_deref() == Some(format!("batch-value-{}", index + 1).as_bytes())
+                });
+            if values.len() != requested_keys.len()
+                || !duplicate_matches
+                || !missing_is_none
+                || !present_values_match
+            {
+                self.trace_error(
+                    "multi_get",
+                    format!(
+                        "multi-key result mismatch: requested={} returned={} duplicate_matches={} \
+                         missing_is_none={} present_values_match={}",
+                        requested_keys.len(),
+                        values.len(),
+                        duplicate_matches,
+                        missing_is_none,
+                        present_values_match,
+                    ),
+                );
+                return;
+            }
+            self.multi_get_count += 1;
+        }
+
+        match store
+            .direct_audit_scan_prefix(b"phase1/kv-smoke-key", 10)
+            .await
+        {
             Ok(range) if range.items.len() == 1 => {
                 self.audit_count += 1;
             }
@@ -183,6 +252,7 @@ impl RustWorkload for KvSmokeWorkload {
             metric_val_u64("aux_storage_kv_smoke_check_count", self.check_count),
             metric_val_u64("aux_storage_kv_smoke_write_count", self.write_count),
             metric_val_u64("aux_storage_kv_smoke_read_count", self.read_count),
+            metric_val_u64("aux_storage_kv_smoke_multi_get_count", self.multi_get_count),
             metric_val_u64("aux_storage_kv_smoke_audit_count", self.audit_count),
             metric_val_u64("aux_storage_kv_smoke_error_count", self.error_count),
         ]);

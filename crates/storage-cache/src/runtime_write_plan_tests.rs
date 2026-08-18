@@ -6,7 +6,7 @@ use storage_types::{
     KeyAttributes, KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest,
     StoredTableInfo, TableName, TableStatus, TimestampMillis, TransactDeleteRequest,
     TransactEncodeItem, TransactEncodePutRequest, TransactPutRequest, TransactUpdateRequest,
-    TransactWriteItem, WireItem, WriteRequest,
+    TransactWriteItem, WireEntity, WireItem, WriteRequest,
 };
 
 use crate::runtime_write_plan::{
@@ -45,6 +45,7 @@ fn table_info() -> StoredTableInfo {
             attribute_name: "pk".into(),
             key_type: KeyType::Hash,
         }],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,
@@ -230,6 +231,7 @@ fn collect_base_writes_for_batch_write_expands_puts_and_deletes() {
                 WriteRequest {
                     put_request: Some(PutRequest {
                         item: item(),
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
@@ -266,6 +268,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
                 WriteRequest {
                     put_request: Some(PutRequest {
                         item: item(),
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
@@ -298,6 +301,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
         put: Some(TransactPutRequest {
             table_name: table_name.clone(),
             item: item(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -308,6 +312,7 @@ fn collect_point_read_mutations_for_batch_and_transact_requests() {
             table_name: table_name.clone(),
             key: key(),
             update_expression: "SET #v = :v".into(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([("#v".into(), "v".into())])),
             expression_attribute_values: Some(HashMap::from([(
@@ -357,7 +362,7 @@ fn collect_point_read_mutations_for_encode_requests_preserves_wire_items() {
             table_name.clone(),
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
-                    item: wire_item.clone(),
+                    item: WireEntity::unindexed(wire_item.clone()),
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -378,7 +383,7 @@ fn collect_point_read_mutations_for_encode_requests_preserves_wire_items() {
     let transact_items = vec![TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: table_name.clone(),
-            item: wire_item,
+            item: WireEntity::unindexed(wire_item),
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -504,6 +509,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
                 WriteRequest {
                     put_request: Some(PutRequest {
                         item: item(),
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
@@ -533,6 +539,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
         put: Some(TransactPutRequest {
             table_name: table_name.clone(),
             item: item(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -543,6 +550,7 @@ fn query_proof_target_collectors_expand_batch_and_transact_request_shapes() {
             table_name: table_name.clone(),
             key: key(),
             update_expression: "SET #v = :v".into(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([("#v".into(), "v".into())])),
             expression_attribute_values: Some(HashMap::from([(
@@ -581,7 +589,7 @@ fn encode_query_proof_target_collectors_convert_wire_items_once() {
             table_name.clone(),
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
-                    item: wire_item.clone(),
+                    item: WireEntity::unindexed(wire_item.clone()),
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: Some(DeleteRequest {
@@ -602,7 +610,7 @@ fn encode_query_proof_target_collectors_convert_wire_items_once() {
     let transact_items = vec![TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: table_name.clone(),
-            item: wire_item,
+            item: WireEntity::unindexed(wire_item),
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -675,6 +683,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
         put: Some(TransactPutRequest {
             table_name: table_a.clone(),
             item: item(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -685,6 +694,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
             table_name: table_a.clone(),
             key: key(),
             update_expression: "SET #v = :v".into(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([("#v".into(), "v".into())])),
             expression_attribute_values: Some(HashMap::from([(
@@ -713,7 +723,7 @@ fn collect_transact_table_names_deduplicates_plain_and_encode_requests() {
     let transact_encode_items = vec![TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: table_a.clone(),
-            item: WireItem::from_attribute_map(&item()).expect("wire item"),
+            item: WireEntity::unindexed(WireItem::from_attribute_map(&item()).expect("wire item")),
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,

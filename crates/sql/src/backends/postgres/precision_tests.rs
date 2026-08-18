@@ -52,6 +52,7 @@ fn table_info_with_numeric_keys() -> StoredTableInfo {
             },
         ],
         key_schema: key_schema.clone(),
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
             index_name: IndexName::new("gsi_precision"),
             key_schema: gsi_key_schema,
@@ -115,6 +116,7 @@ fn postgres_table_and_gsi_creation_use_numeric_for_number_keys() {
         &attribute_definitions,
         &key_schema,
         Some(&gsis),
+        storage_types::MaxIndexers::ZERO,
     );
     assert_eq!(table_sqls.len(), 1);
     let table_sql = &table_sqls[0];
@@ -127,6 +129,7 @@ fn postgres_table_and_gsi_creation_use_numeric_for_number_keys() {
         &attribute_definitions,
         &key_schema,
         &gsis,
+        storage_types::MaxIndexers::ZERO,
     );
     assert_eq!(gsi_sqls.len(), 1);
     let gsi_sql = &gsi_sqls[0];

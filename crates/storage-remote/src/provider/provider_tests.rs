@@ -5,6 +5,7 @@ use std::{
 };
 
 use http_request::reqwest::Client;
+use storage_provider::StorageProvider;
 use storage_types::{AttributeValue, StorageEnum, StorageError, TableName};
 
 use crate::{
@@ -12,7 +13,10 @@ use crate::{
     provider::{
         NO_ENDPOINT, RemoteStorageProvider,
         implementation::WriteCostTally,
-        provider_helpers::{build_endpoints, compute_backoff},
+        provider_helpers::{
+            RetryTokenBucket, build_endpoints, compute_backoff, full_jitter_delay,
+            retry_backoff_cap,
+        },
     },
 };
 
@@ -29,6 +33,9 @@ fn provider_with_urls(urls: &[&str]) -> RemoteStorageProvider {
         credential_source: "test",
         primary_endpoint: AtomicUsize::new(0),
         probation_endpoint: AtomicUsize::new(NO_ENDPOINT),
+        pressure_signals: AtomicUsize::new(0),
+        retry_budget: RetryTokenBucket::new(),
+        request_timeout: None,
     }
 }
 
@@ -90,7 +97,43 @@ fn restore_primary_clears_probation() {
 #[test]
 fn compute_backoff_behaviour() {
     assert_eq!(compute_backoff(0), Duration::ZERO);
-    assert!(compute_backoff(1) >= Duration::from_millis(BASE_BACKOFF_MS));
+    assert!(compute_backoff(1) <= retry_backoff_cap(1));
+    assert_eq!(full_jitter_delay(1, 0), Duration::ZERO);
+    assert_eq!(
+        full_jitter_delay(1, BASE_BACKOFF_MS),
+        Duration::from_millis(BASE_BACKOFF_MS)
+    );
+}
+
+#[test]
+fn retry_token_bucket_refills_with_a_fake_monotonic_clock() {
+    let bucket = RetryTokenBucket::new();
+    let now = std::time::Instant::now();
+    for _ in 0..100 {
+        assert!(bucket.try_take_at(now));
+    }
+    assert!(!bucket.try_take_at(now));
+    assert!(bucket.try_take_at(now + Duration::from_secs(1)));
+}
+
+#[test]
+fn admission_pressure_signal_is_empty_without_underflow() {
+    let provider = provider_with_urls(&["http://a.test"]);
+    assert!(!provider.take_admission_pressure_signal());
+
+    provider.pressure_signals.fetch_add(1, Ordering::Relaxed);
+    assert!(provider.take_admission_pressure_signal());
+    assert!(!provider.take_admission_pressure_signal());
+}
+
+#[test]
+fn admission_pressure_signal_drains_all_retry_markers_at_the_boundary() {
+    let provider = provider_with_urls(&["http://a.test"]);
+    provider.pressure_signals.store(5, Ordering::Relaxed);
+
+    assert!(provider.take_admission_pressure_signal());
+    assert_eq!(provider.pressure_signals.load(Ordering::Acquire), 0);
+    assert!(!provider.take_admission_pressure_signal());
 }
 
 #[test]
@@ -147,6 +190,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
     tally.record_write_request(&storage_types::WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            indexers: None,
             aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
@@ -173,6 +217,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
         put: Some(storage_types::TransactPutRequest {
             table_name: TableName::new("tenant_t1"),
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -184,6 +229,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))])
                 .into(),
             update_expression: "SET #v = :v".to_string(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([(
                 "#v".to_string(),

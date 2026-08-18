@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bg_jobs::JobManager;
+use bg_jobs::{JobManager, JobStartGate};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustls::{ClientConfig, RootCertStore};
 use storage_common::{DatabaseJobIntervals, GsiPropagationGovernor};
@@ -26,6 +26,8 @@ pub struct PostgresStorageProvider {
     pub(crate) table_info_cache: Arc<RwLock<HashMap<TableName, Arc<StoredTableInfo>>>>,
     pub(crate) ttl_config_cache: Arc<RwLock<HashMap<TableName, CachedTtlConfig>>>,
     pub(crate) immediate_gsi_consistency: bool,
+    pub(crate) database_jobs_enabled: bool,
+    pub(crate) job_start_gate: Option<JobStartGate>,
     pub(crate) database_job_intervals: DatabaseJobIntervals,
     pub(crate) gsi_propagation_governor: Arc<GsiPropagationGovernor>,
 }
@@ -112,10 +114,15 @@ impl PostgresStorageProvider {
         lane: &'static str,
         pool: &Pool,
     ) -> StorageResult<deadpool_postgres::Client> {
-        let _ = (operation, lane);
-        pool.get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)
+        let started = Instant::now();
+        let result = pool.get().await;
+        metrics::histogram!(
+            "storage.postgres.pool.wait.ms",
+            "lane" => lane,
+            "operation" => operation
+        )
+        .record(started.elapsed().as_secs_f64() * 1_000.0);
+        result.map_err(Self::map_postgres_client_acquire_error)
     }
 
     pub(crate) async fn acquire_background_work_permit(
@@ -134,14 +141,16 @@ impl PostgresStorageProvider {
         &self,
         operation: &'static str,
     ) -> StorageResult<OwnedSemaphorePermit> {
-        let _ = operation;
-        self.foreground_write_limit
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|err| {
-                StorageError::internal(&format!("postgres foreground write limit closed: {err}"))
-            })
+        let started = Instant::now();
+        let result = self.foreground_write_limit.clone().acquire_owned().await;
+        metrics::histogram!(
+            "storage.postgres.foreground_write.wait.ms",
+            "operation" => operation
+        )
+        .record(started.elapsed().as_secs_f64() * 1_000.0);
+        result.map_err(|err| {
+            StorageError::internal(&format!("postgres foreground write limit closed: {err}"))
+        })
     }
 
     pub(crate) async fn begin_transaction<'a>(
@@ -161,16 +170,20 @@ impl PostgresStorageProvider {
         &self,
         operation: &'static str,
     ) -> PostgresConnectionHoldTimer {
-        let _ = operation;
-        PostgresConnectionHoldTimer
+        PostgresConnectionHoldTimer {
+            operation,
+            started: Instant::now(),
+        }
     }
 
     pub(crate) fn transaction_hold_timer(
         &self,
         operation: &'static str,
     ) -> PostgresTransactionHoldTimer {
-        let _ = operation;
-        PostgresTransactionHoldTimer
+        PostgresTransactionHoldTimer {
+            operation,
+            started: Instant::now(),
+        }
     }
 
     pub(crate) fn record_transaction_phase(
@@ -179,7 +192,12 @@ impl PostgresStorageProvider {
         phase: &'static str,
         elapsed: Duration,
     ) {
-        let _ = (operation, phase, elapsed);
+        metrics::histogram!(
+            "storage.postgres.transaction.phase.ms",
+            "operation" => operation,
+            "phase" => phase
+        )
+        .record(elapsed.as_secs_f64() * 1_000.0);
     }
 
     pub async fn new(connection_string: &str, max_pool_size: usize) -> StorageResult<Self> {
@@ -226,6 +244,8 @@ impl PostgresStorageProvider {
             table_info_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl_config_cache: Arc::new(RwLock::new(HashMap::new())),
             immediate_gsi_consistency: false,
+            database_jobs_enabled: true,
+            job_start_gate: None,
             database_job_intervals: DatabaseJobIntervals::default(),
             gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
         })
@@ -246,9 +266,35 @@ impl PostgresStorageProvider {
             table_info_cache: Arc::new(RwLock::new(HashMap::new())),
             ttl_config_cache: Arc::new(RwLock::new(HashMap::new())),
             immediate_gsi_consistency: false,
+            database_jobs_enabled: true,
+            job_start_gate: None,
             database_job_intervals: DatabaseJobIntervals::default(),
             gsi_propagation_governor: Arc::new(GsiPropagationGovernor::default()),
         }
+    }
+
+    /// Return a provider view for background database work.
+    ///
+    /// Job-lock reads and writes must not consume a foreground connection. A
+    /// one-connection foreground pool is a supported deployment when the
+    /// admission controller reserves its control lane, so the distributed
+    /// lock store and maintenance jobs use the independent background pool
+    /// instead.
+    pub fn for_background_operations(&self) -> Self {
+        let mut provider = self.clone();
+        provider.pool = Arc::clone(&self.background_pool);
+        provider
+    }
+
+    /// Attach a one-shot startup barrier to jobs registered by this provider.
+    ///
+    /// The storage manager opens the barrier after all system tables are
+    /// created.  Keeping the gate on the provider means cloned background
+    /// job views observe the same lifecycle state.
+    #[must_use]
+    pub fn with_job_start_gate(mut self, gate: JobStartGate) -> Self {
+        self.job_start_gate = Some(gate);
+        self
     }
 
     #[must_use]
@@ -264,15 +310,47 @@ impl PostgresStorageProvider {
     }
 
     #[must_use]
+    pub fn with_database_jobs_enabled(mut self, enabled: bool) -> Self {
+        self.database_jobs_enabled = enabled;
+        self
+    }
+
+    #[must_use]
     pub fn with_database_job_intervals(mut self, intervals: DatabaseJobIntervals) -> Self {
         self.database_job_intervals = intervals;
         self
     }
 }
 
-pub(crate) struct PostgresConnectionHoldTimer;
+pub(crate) struct PostgresConnectionHoldTimer {
+    operation: &'static str,
+    started: Instant,
+}
 
-pub(crate) struct PostgresTransactionHoldTimer;
+pub(crate) struct PostgresTransactionHoldTimer {
+    operation: &'static str,
+    started: Instant,
+}
+
+impl Drop for PostgresConnectionHoldTimer {
+    fn drop(&mut self) {
+        metrics::histogram!(
+            "storage.postgres.connection.hold.ms",
+            "operation" => self.operation
+        )
+        .record(self.started.elapsed().as_secs_f64() * 1_000.0);
+    }
+}
+
+impl Drop for PostgresTransactionHoldTimer {
+    fn drop(&mut self) {
+        metrics::histogram!(
+            "storage.postgres.transaction.hold.ms",
+            "operation" => self.operation
+        )
+        .record(self.started.elapsed().as_secs_f64() * 1_000.0);
+    }
+}
 
 fn default_background_pool_size(max_pool_size: usize) -> usize {
     (max_pool_size / 4).clamp(1, 4)

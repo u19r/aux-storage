@@ -100,6 +100,7 @@ fn put_item(pk: &str) -> TransactWriteItem {
         put: Some(TransactPutRequest {
             table_name: table_name(),
             item: item(pk),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,

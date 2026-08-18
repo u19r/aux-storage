@@ -11,9 +11,9 @@
 //! duplication and making future additions (`FilterExpression`,
 //! `ProjectionExpression`) simpler.
 
-use storage_types::{StoredTableInfo, WireItem};
+use storage_types::{StorageError, StoredTableInfo};
 
-use crate::key_attribute_handler::wire_item_key_attributes_from_row;
+use crate::indexed_item::SqlDecodedItem;
 
 /// Mode for mapping rows: either the logical base table or a GSI physical table
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,17 +24,13 @@ pub enum RowOrigin {
 
 /// Result of executing a unified read
 pub struct UnifiedReadResult {
-    pub items: Vec<WireItem>,
+    pub items: Vec<SqlDecodedItem>,
     pub last_evaluated_key: Option<String>,
 }
 
 /// Execute a prepared SQL query returning up to `limit` items (internally
 /// fetches limit+1).
-///
-/// `key_schema_for_origin` must be the key schema of the physical table queried
-/// (main or GSI).
 #[expect(
-    clippy::too_many_arguments,
     clippy::ref_option,
     reason = "Central read path signature maintained for consistency"
 )]
@@ -44,7 +40,6 @@ pub fn execute_unified_read(
     values: &[String],
     table_info: &StoredTableInfo,
     origin: RowOrigin,
-    key_schema_for_origin: &[storage_types::KeySchemaElement],
     effective_limit: u32,
     index_name: &Option<storage_types::IndexName>,
 ) -> Result<UnifiedReadResult, storage_types::StorageError> {
@@ -54,48 +49,21 @@ pub fn execute_unified_read(
 
     let rows = stmt
         .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            let primary_key = match origin {
-                RowOrigin::Main => wire_item_key_attributes_from_row(
-                    row,
-                    &table_info.key_schema,
-                    &table_info.attribute_definitions,
-                    None,
-                )
-                .map_err(|err| storage_error_to_rusqlite(&err))?,
-                RowOrigin::Gsi => wire_item_key_attributes_from_row(
-                    row,
-                    key_schema_for_origin,
-                    &table_info.attribute_definitions,
-                    None,
-                )
-                .map_err(|err| storage_error_to_rusqlite(&err))?,
-            };
-            let secondary_key = match origin {
-                RowOrigin::Main => None,
-                RowOrigin::Gsi => Some(
-                    wire_item_key_attributes_from_row(
-                        row,
-                        &table_info.key_schema,
-                        &table_info.attribute_definitions,
-                        Some("table_"),
-                    )
-                    .map_err(|err| storage_error_to_rusqlite(&err))?,
-                ),
-            };
-            let non_key_attributes_blob = row
-                .get::<_, Option<String>>("attributes_blob")?
-                .map(String::into_bytes);
-            Ok(WireItem::local_split(
-                primary_key,
-                secondary_key,
-                non_key_attributes_blob,
-            ))
+            let prefix = matches!(origin, RowOrigin::Gsi).then_some("table_");
+            crate::indexed_item::sqlite_row_to_decoded_item(row, table_info, prefix)
         })
         .map_err(crate::error_handler::map_sqlite_error)?;
 
-    let mut items: Vec<WireItem> = Vec::with_capacity(effective_limit.saturating_add(1) as usize);
+    let mut items = Vec::with_capacity(effective_limit.saturating_add(1) as usize);
     for row in rows {
         items.push(row.map_err(crate::error_handler::map_sqlite_error)?);
+    }
+
+    if matches!(origin, RowOrigin::Gsi) {
+        let index_name = index_name
+            .as_ref()
+            .ok_or_else(|| StorageError::internal("GSI read target is missing its index name"))?;
+        crate::indexed_item::project_gsi_decoded_items(&mut items, table_info, Some(index_name))?;
     }
 
     let has_more = items.len() > effective_limit as usize;
@@ -105,7 +73,7 @@ pub fn execute_unified_read(
 
     let last_evaluated_key = if has_more {
         if let Some(last_item) = items.last() {
-            last_item.last_evaluated_key(table_info, index_name)?
+            last_item.item.last_evaluated_key(table_info, index_name)?
         } else {
             None
         }
@@ -117,15 +85,4 @@ pub fn execute_unified_read(
         items,
         last_evaluated_key,
     })
-}
-
-fn storage_error_to_rusqlite(err: &storage_types::StorageError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            err.to_string(),
-        )),
-    )
 }

@@ -3,10 +3,14 @@ use std::time::Instant;
 use crate::{
     keyspace::table_keys,
     sorted_kv_store::{RawKey, SortedKvReadContext},
-    storage_ops::imports::{
-        AttributeValue, ItemKey, KeyType, QueryTableRequest, SortedKvDbStorageProvider, Span,
-        StorageEnum, StorageError, StorageResult, WireItem, helpers, key_schema_for_gsi,
-        record_provider_stage, record_query_result,
+    storage_ops::{
+        decode_wire_item_from_storage_bytes,
+        imports::{
+            AttributeValue, ItemKey, KeyType, QueryTableRequest, SortedKvDbStorageProvider, Span,
+            StorageEnum, StorageError, StorageResult, WireItem, helpers, key_schema_for_gsi,
+            record_provider_stage, record_query_result,
+        },
+        project_gsi_item,
     },
 };
 
@@ -85,8 +89,12 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
             .map(RawKey);
 
         let encode_key = |key: &ItemKey| table_keys::item_key(&table_metadata.identity, key);
+        let encode_prefix =
+            |key: &ItemKey| table_keys::item_key_prefix(&table_metadata.identity, key);
         let increment_key =
             |key: &ItemKey| table_keys::item_key_increment(&table_metadata.identity, key);
+        let increment_prefix =
+            |key: &ItemKey| table_keys::item_key_prefix_end(&table_metadata.identity, key);
         let decrement_key =
             |key: &ItemKey| table_keys::item_key_decrement(&table_metadata.identity, key);
 
@@ -235,11 +243,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     match operator {
                         "<" => {
                             let end_key = build_full_key(hash_value, comparison_value);
-                            let start_key = {
-                                let mut start_bytes = encode_key(&hash_prefix)?;
-                                start_bytes.push(0x00);
-                                start_bytes
-                            };
+                            let start_key = { encode_prefix(&hash_prefix)? };
 
                             let (start, end) = if scan_forward {
                                 (start_key, encode_key(&end_key)?)
@@ -260,9 +264,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         }
                         "<=" => {
                             let end_key = build_full_key(hash_value, comparison_value);
-                            let mut start_key = encode_key(&hash_prefix)?;
-
-                            start_key.push(0x00);
+                            let start_key = encode_prefix(&hash_prefix)?;
 
                             let (start, end) = if scan_forward {
                                 (start_key, increment_key(&end_key)?)
@@ -283,7 +285,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         }
                         ">" => {
                             let start_key = build_full_key(hash_value, comparison_value);
-                            let end_key = increment_key(&hash_prefix)?;
+                            let end_key = increment_prefix(&hash_prefix)?;
 
                             let (start, end) = if scan_forward {
                                 (increment_key(&start_key)?, end_key)
@@ -304,7 +306,7 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                         }
                         ">=" => {
                             let start_key = build_full_key(hash_value, comparison_value);
-                            let end_key = increment_key(&hash_prefix)?;
+                            let end_key = increment_prefix(&hash_prefix)?;
 
                             let (start, end) = if scan_forward {
                                 (encode_key(&start_key)?, end_key)
@@ -337,12 +339,12 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                 ) {
                     Ok(Some((hash_value, prefix_value))) => {
                         let start_key = build_full_key(hash_value, prefix_value);
-                        let end_key = increment_key(&start_key)?;
+                        let end_key = increment_prefix(&start_key)?;
 
                         let (start, end) = if scan_forward {
-                            (encode_key(&start_key)?, end_key)
+                            (encode_prefix(&start_key)?, end_key)
                         } else {
-                            (end_key, encode_key(&start_key)?)
+                            (end_key, encode_prefix(&start_key)?)
                         };
 
                         return self
@@ -367,10 +369,13 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     let hash_prefix = build_hash_key_prefix(hash_value);
 
                     let (start, end) = if scan_forward {
-                        (encode_key(&hash_prefix)?, increment_key(&hash_prefix)?)
+                        (
+                            encode_prefix(&hash_prefix)?,
+                            increment_prefix(&hash_prefix)?,
+                        )
                     } else {
-                        let end_bytes = encode_key(&hash_prefix)?;
-                        let start_bytes = increment_key(&hash_prefix)?;
+                        let end_bytes = encode_prefix(&hash_prefix)?;
+                        let start_bytes = increment_prefix(&hash_prefix)?;
                         (start_bytes, end_bytes)
                     };
 
@@ -391,9 +396,15 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
                     );
 
                     let (start, end) = if scan_forward {
-                        (encode_key(&hash_prefix)?, increment_key(&hash_prefix)?)
+                        (
+                            encode_prefix(&hash_prefix)?,
+                            increment_prefix(&hash_prefix)?,
+                        )
                     } else {
-                        (encode_key(&hash_prefix)?, decrement_key(&hash_prefix)?)
+                        (
+                            increment_prefix(&hash_prefix)?,
+                            encode_prefix(&hash_prefix)?,
+                        )
                     };
 
                     return self
@@ -455,12 +466,13 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
             )
             .await?;
         let query_result =
-            Self::materialize_query_result(range_result, table_info, &request.index_name)?;
+            self.materialize_query_result(range_result, table_info, &request.index_name)?;
         let (items, last_evaluated_key) = record_query_result(query_result);
         Ok((request.project_wire_items(items)?, last_evaluated_key))
     }
 
     fn materialize_query_result(
+        &self,
         range_result: crate::sorted_kv_store::RangeValuesResult,
         table_info: &storage_types::StoredTableInfo,
         index_name: &Option<storage_types::IndexName>,
@@ -468,8 +480,30 @@ impl<S: crate::sorted_kv_store::SortedKvStore + 'static> SortedKvDbStorageProvid
         let decode_started = Instant::now();
         let mut items = Vec::with_capacity(range_result.values.len());
         for data in range_result.values {
-            let json = storage_types::storage_serde::decompress_owned_bytes(data)?;
-            items.push(WireItem::dynamo_json(json));
+            let mut item = decode_wire_item_from_storage_bytes(
+                self.kv_store.item_value_codec(),
+                &data,
+                table_info.max_indexers,
+            )?;
+            if let Some(index_name) = index_name {
+                let index = table_info
+                    .global_secondary_indexes
+                    .as_ref()
+                    .and_then(|indexes| {
+                        indexes.iter().find(|index| index.index_name == *index_name)
+                    })
+                    .ok_or_else(|| {
+                        StorageError::internal("validated query index is missing from metadata")
+                    })?;
+                let logical = item.into_attribute_map()?;
+                item = WireItem::from_attribute_map(&project_gsi_item(
+                    logical,
+                    &index.projection,
+                    &table_info.key_schema,
+                    &index.key_schema,
+                ))?;
+            }
+            items.push(item);
         }
         record_provider_stage("query", "decode", decode_started.elapsed());
 

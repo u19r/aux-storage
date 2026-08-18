@@ -34,9 +34,9 @@ use crate::{
         prepare_batch_operation,
         turso::{
             provider::{
-                TursoDeleteItemInput, TursoSqlConnection, TursoStorageProvider, gsi_table_name,
-                map_turso_error, option_string_to_value, row_to_table_info, value_to_i64,
-                value_to_string,
+                TursoDeleteItemInput, TursoSqlConnection, TursoStorageProvider,
+                canonical_revision_key, gsi_table_name, map_turso_error, option_string_to_value,
+                row_to_table_info, row_view_to_decoded_item_main, value_to_i64, value_to_string,
             },
             sql_statements,
         },
@@ -85,12 +85,39 @@ mod batch_transaction;
 mod item_writes;
 mod lifecycle;
 mod query;
+mod read_sequence;
 mod table_writes;
 mod transaction_helpers;
 mod ttl;
 
 #[async_trait]
 impl StorageProvider for TursoStorageProvider {
+    async fn execute_read_sequence_plan(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+    ) -> StorageResult<storage_provider::ReadSequenceExecution> {
+        self.execute_read_sequence_plan_operation(plan, consistency, continuation)
+            .await
+    }
+
+    async fn execute_read_sequence_plan_with_budget(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+        budget: storage_provider::ReadSequenceExecutionBudget,
+    ) -> StorageResult<storage_provider::ReadSequenceExecution> {
+        self.execute_read_sequence_plan_with_budget_operation(
+            plan,
+            consistency,
+            continuation,
+            budget,
+        )
+        .await
+    }
+
     fn supports_guarded_writes(&self) -> bool {
         self.supports_guarded_writes_operation()
     }
@@ -289,21 +316,102 @@ impl StorageProvider for TursoStorageProvider {
         &self,
         request: &ScanTableRequest,
     ) -> StorageResult<(Vec<ItemVersionedWireItem>, Option<String>)> {
+        if request.index_name.is_some() {
+            return Err(StorageError::validation(
+                "versioned internal scans are supported only on base tables",
+            ));
+        }
         let table_info = self.get_table_info(&request.table_name).await?;
         let conn = self.connect().await?;
-        let (items, next_cursor) = self.scan_table(request).await?;
-        let mut versioned = Vec::with_capacity(items.len());
-        for item in items {
-            let item_map = item.to_attribute_map()?;
-            let split = split_item_into_key_and_attributes_sync(item_map, &table_info)?;
-            let revision = self
-                .get_item_revision(&conn, &request.table_name, &split.key_attributes)
-                .await?;
-            versioned.push(ItemVersionedWireItem {
-                item,
-                item_stream_version: storage_types::ItemStreamVersion::try_from(revision)?,
-            });
+        let effective_limit = calc_limit(request.limit, DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)?;
+        let start = decode_exclusive_start(&request.exclusive_start_key, &table_info, &None)?;
+        let physical_name = format!("table_{}", table_info.table_name.sanitized_name());
+        let (sql, values) = build_sql_query(
+            &physical_name,
+            &table_info.key_schema,
+            None,
+            start,
+            effective_limit,
+            Some(true),
+            None,
+        )?;
+        let rows = self
+            .query_row_set(
+                &conn,
+                &sql,
+                values.into_iter().map(TursoValue::Text).collect(),
+            )
+            .await?;
+        let mut items = rows
+            .iter()
+            .map(|row| row_view_to_decoded_item_main(row, &table_info))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let has_more = items.len() > effective_limit as usize;
+        if has_more {
+            items.pop();
         }
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| item.item.last_evaluated_key(&table_info, &None))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let mut keyed = Vec::with_capacity(items.len());
+        let mut revision_keys = Vec::with_capacity(items.len());
+        for item in items {
+            let logical = item.item.to_attribute_map()?;
+            let key = split_item_into_key_and_attributes_sync(logical, &table_info)?.key_attributes;
+            let key_json = canonical_revision_key(&key)?;
+            revision_keys.push(key_json.clone());
+            keyed.push((item, key_json));
+        }
+        let revisions = if revision_keys.is_empty() {
+            HashMap::new()
+        } else {
+            let placeholders = (2..revision_keys.len() + 2)
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT key_json, revision FROM item_revisions WHERE table_name = ?1 AND key_json \
+                 IN ({placeholders})"
+            );
+            let mut params = Vec::with_capacity(revision_keys.len() + 1);
+            params.push(TursoValue::Text(request.table_name.to_string()));
+            params.extend(revision_keys.into_iter().map(TursoValue::Text));
+            self.query_rows(&conn, &sql, params)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let key = row
+                        .get("key_json")
+                        .map(value_to_string)
+                        .transpose()?
+                        .ok_or_else(|| StorageError::internal("missing scan revision key"))?;
+                    let revision = row
+                        .get("revision")
+                        .map(value_to_i64)
+                        .transpose()?
+                        .ok_or_else(|| StorageError::internal("missing scan revision"))?;
+                    Ok((key, revision))
+                })
+                .collect::<StorageResult<HashMap<_, _>>>()?
+        };
+        let versioned = keyed
+            .into_iter()
+            .map(|(item, key)| {
+                Ok(ItemVersionedWireItem {
+                    item: item.item,
+                    indexers: item.indexers,
+                    item_stream_version: storage_types::ItemStreamVersion::try_from(
+                        revisions.get(&key).copied().unwrap_or_default(),
+                    )?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
         Ok((versioned, next_cursor))
     }
 
@@ -314,15 +422,16 @@ impl StorageProvider for TursoStorageProvider {
         let table_info = self.get_table_info(&request.table_name).await?;
         let conn = self.connect().await?;
         let item = self
-            .get_item_map_by_key(&conn, &table_info, &request.key)
+            .get_item_map_with_indexers_by_key(&conn, &table_info, &request.key)
             .await?;
         let revision = self
             .get_item_revision(&conn, &request.table_name, &request.key)
             .await?;
 
         Ok(match item {
-            Some(item) => DurablePointReadProof::Present {
+            Some((item, indexers)) => DurablePointReadProof::Present {
                 item: Box::new(WireItem::from_attribute_map(&item)?),
+                indexers,
                 revision: DurableItemRevision::new(revision.to_be_bytes().to_vec()),
             },
             None => DurablePointReadProof::Absent {

@@ -4,17 +4,16 @@ use storage_cache::RuntimePreparedQueryExecution;
 use storage_types::{
     AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, QueryTableRequest, StorageError,
     StorageResult, TableNamespace, TryFromWireItem, WireItem,
-    subset_expression_attribute_names_for_expression, validate_gsi_projection_expression,
+    subset_expression_attribute_names_for_expression, validate_gsi_projection,
 };
 
 use crate::{
     QueryIndexInput, QueryTableInput,
     database_manager::{
-        DatabaseManager, decode_wire_items_to_decoded, decode_wire_items_to_maps,
-        normalize_wire_items_for_shared_table, record_storage_operation,
+        DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, decode_wire_items_to_decoded,
+        decode_wire_items_to_maps, normalize_wire_items_for_shared_table, record_storage_operation,
     },
     namespace_routing::NamespaceStorageMode,
-    newtypes::DatabaseTrait,
 };
 
 impl DatabaseManager {
@@ -100,7 +99,10 @@ impl DatabaseManager {
                 cache_query_runtime.record_partial_hit();
                 return Ok((merged_items, suffix_lek));
             }
-            RuntimePreparedQueryExecution::PrefixOnly { items } => return Ok((items, None)),
+            RuntimePreparedQueryExecution::PrefixOnly {
+                items,
+                last_evaluated_key,
+            } => return Ok((items, Some(last_evaluated_key))),
             RuntimePreparedQueryExecution::None => {}
         }
         cache_query_runtime.record_miss_if_eventual(request.consistent_read);
@@ -113,7 +115,7 @@ impl DatabaseManager {
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
         request.validate_for_dynamodb()?;
         let logical_request = request.clone();
-        let mut provider: std::sync::Arc<dyn DatabaseTrait> = std::sync::Arc::clone(&self.storage);
+        let mut connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
         let mut normalize_namespace: Option<TableNamespace> = None;
         let mut project_after_namespace_normalization = false;
 
@@ -138,15 +140,11 @@ impl DatabaseManager {
                 }
             }
             request.table_name = route.read_target.table_name.clone();
-            provider = self.provider_for_connection(&route.read_target.connection_id)?;
+            connection_id = route.read_target.connection_id.clone();
         }
 
         if let Some(index_name) = request.index_name.as_ref() {
-            let table_info = record_storage_operation(
-                "get_table_info",
-                provider.get_table_info(&request.table_name),
-            )
-            .await?;
+            let table_info = self.get_table_info_arc(&logical_request.table_name).await?;
             let has_index = table_info
                 .global_secondary_indexes
                 .as_ref()
@@ -157,16 +155,24 @@ impl DatabaseManager {
                      specified index: {index_name}"
                 )));
             }
-            validate_gsi_projection_expression(
+            validate_gsi_projection(
                 &table_info,
                 Some(index_name),
                 request.projection_expression.as_deref(),
+                None,
                 request.expression_attribute_names.as_ref(),
             )?;
         }
 
-        let (mut items, mut lek) =
-            record_storage_operation("query_table", provider.query_table(&request)).await?;
+        let (mut items, mut lek) = self
+            .run_admitted(
+                &connection_id,
+                crate::admission::AdmissionClass::RangeRead,
+                |provider| async move {
+                    record_storage_operation("query_table", provider.query_table(&request)).await
+                },
+            )
+            .await?;
         if let Some(namespace) = normalize_namespace.as_ref() {
             normalize_wire_items_for_shared_table(&self.request_rewriter, namespace, &mut items)?;
             lek = self

@@ -1076,7 +1076,7 @@ async fn transact_write_encode_put_replaces_authoritative_absence_with_present_i
         transact_items: vec![TransactEncodeItem {
             put: Some(TransactEncodePutRequest {
                 table_name: table_name.clone(),
-                item: wire_item("user#1", "created"),
+                item: storage_types::WireEntity::unindexed(wire_item("user#1", "created")),
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -1518,6 +1518,7 @@ async fn cached_transaction_guard_conflict_falls_back_and_commits_atomically() {
                         ("pk".to_string(), AttributeValue::S("user#2".to_string())),
                         ("payload".to_string(), AttributeValue::S("beta".to_string())),
                     ]),
+                    indexers: None,
                     condition_expression: None,
                     expression_attribute_names: None,
                     expression_attribute_values: None,

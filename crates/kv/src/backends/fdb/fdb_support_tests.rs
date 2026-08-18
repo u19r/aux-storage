@@ -26,18 +26,33 @@ fn local_cluster_file_path() -> Option<PathBuf> {
 }
 
 pub(crate) async fn connect_fdb_store(test_scope: &str) -> Option<FoundationDbKvStore> {
+    connect_fdb_store_with_cache(test_scope, 0).await
+}
+
+pub(crate) async fn connect_fdb_store_with_cache(
+    test_scope: &str,
+    cache_read_version_ms: u16,
+) -> Option<FoundationDbKvStore> {
     let cluster_file_path = local_cluster_file_path()?;
     let prefix = format!("tests/{test_scope}/{}/", Uuid::now_v7()).into_bytes();
-    let store = FoundationDbKvStore::connect(FoundationDbConfig {
+    let store = match FoundationDbKvStore::connect(FoundationDbConfig {
         cluster_file_path: Some(cluster_file_path.to_string_lossy().to_string()),
         tenant_name: None,
         subspace_prefix: Some(prefix),
-        cache_read_version_ms: 0,
+        cache_read_version_ms,
         immediate_gsi_consistency: false,
         report_conflicting_keys: false,
-    })
-    .ok()?;
-    store.check_reachable(Duration::from_secs(3)).await.ok()?;
+    }) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("Skipping FoundationDB test: unable to connect: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = store.check_reachable(Duration::from_secs(3)).await {
+        eprintln!("Skipping FoundationDB test: reachability check failed: {error}");
+        return None;
+    }
     Some(store)
 }
 

@@ -15,18 +15,24 @@ use storage_condition::{
 };
 use storage_provider::{
     CHANGE_INDEX_MARKER_RETENTION_MS, ChangeIndexMarker, ListChangeIndexMarkersRequest,
-    StorageProvider, StorageProviderReadContext, split_item_into_key_and_attributes_sync,
+    ReadSequenceExecution, ReadSequenceExecutionBudget, ReadSequenceFlatResult,
+    ReadSequenceFlatRow, ReadSequenceSqlIdentifier, ReadSequenceSqlKeyType,
+    ReadSequenceSqlMetadata, ReadSequenceSqlNodeMetadata, ReadSequenceSqlOperator,
+    ReadSequenceSqlPredicate, ReadSequenceSqlShape, StorageProvider, StorageProviderReadContext,
+    build_read_sequence_sql_ir, emit_postgresql_read_sequence_sql,
+    merge_read_sequence_sql_metadata, split_item_into_key_and_attributes_sync,
 };
 use storage_types::{
-    AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
-    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest,
-    DurableAbsenceProof, DurableItemRevision, DurablePointReadProof, DurablePointReadRequest,
-    GuardedDeleteItemRequest, GuardedPutItemRequest, GuardedUpdateItemRequest,
-    ItemVersionedWireItem, KeyAttributes, PutItemRequest, PutItemResponse, QueryTableRequest,
-    ReadSequenceConsistency, ReplicationMutation, ScanTableRequest, StorageEnum, StorageError,
-    StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName, TableStatus,
-    TimeToLiveDescription, TimeToLiveStatus, TimestampMillis, UpdateItemRequest,
-    UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
+    AllOld, AttributeValue, BatchGetItemRequest, BatchGetWireItemResponse,
+    BatchWriteItemEncodeRequest, BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest,
+    DeleteItemRequest, DurableAbsenceProof, DurableItemRevision, DurablePointReadProof,
+    DurablePointReadRequest, GetItemRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
+    GuardedUpdateItemRequest, ItemVersionedWireItem, KeyAttributes, PutItemRequest,
+    PutItemResponse, QueryRequest, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
+    ScanTableRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo, StreamItemId,
+    StreamName, TableName, TableStatus, TimeToLiveDescription, TimeToLiveStatus, TimestampMillis,
+    UpdateItemRequest, UpdateItemResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    WireItem,
 };
 use stream_provider::{CursorName, CursorPosition, StreamDataType, StreamItem, StreamProvider};
 use tokio_postgres::types::ToSql;
@@ -104,32 +110,43 @@ impl StorageProviderReadContext for PostgresReadSequenceReadContext {
         consistent_read: bool,
     ) -> StorageResult<Option<WireItem>> {
         let _ = consistent_read;
+        let database_call = metrics_facade::begin_database_call("read_sequence.get_item");
         let table_info = self.provider.get_table_info_cached_arc(&table_name).await?;
         let guard = self.client.lock().await;
         let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
-        self.provider
+        let result = self
+            .provider
             .get_item_with_client(client, &table_name, &key, &table_info)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 
     async fn batch_get_item(
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.batch_get_item");
         let guard = self.client.lock().await;
         let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
-        self.provider
+        let result = self
+            .provider
             .batch_get_item_with_client(client, request)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 
     async fn query_table(
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+        let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
         let guard = self.client.lock().await;
         let client = guard.as_ref().ok_or_else(postgres_read_context_closed)?;
-        self.provider.query_table_with_client(client, request).await
+        let result = self.provider.query_table_with_client(client, request).await;
+        drop(database_call);
+        result
     }
 }
 
@@ -152,6 +169,108 @@ fn postgres_read_context_closed() -> StorageError {
 }
 
 impl PostgresStorageProvider {
+    async fn execute_read_sequence_mapped(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+    ) -> StorageResult<ReadSequenceExecution> {
+        let Some((parent_id, child_id, source)) =
+            storage_provider::read_sequence_sql_mapped_source(plan)
+        else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        let storage_types::ReadSequenceNodeOperation::Query(parent_query) =
+            &plan.nodes[parent_id.index()].operation
+        else {
+            unreachable!("mapped SQL shape validated the parent Query");
+        };
+        let parent_info = self
+            .get_table_info_cached_arc(&parent_query.table_name)
+            .await?;
+        let Some(mut parent_metadata) =
+            postgres_query_read_sequence_metadata(parent_query, &parent_info, None)?
+        else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        parent_metadata
+            .nodes
+            .first_entry()
+            .ok_or_else(|| StorageError::internal("missing mapped parent SQL metadata"))?
+            .into_mut()
+            .limit = None;
+        let storage_types::ReadSequenceNodeOperation::Get(child_get) =
+            &plan.nodes[child_id.index()].operation
+        else {
+            unreachable!("mapped SQL shape validated the child Get");
+        };
+        let child_info = self
+            .get_table_info_cached_arc(&child_get.table_name)
+            .await?;
+        let Some(child_metadata) = postgres_mapped_child_metadata(child_get, &child_info, source)?
+        else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::PhysicalLayout,
+            ));
+        };
+        let mut metadata = None;
+        for (node, value) in [(parent_id, parent_metadata), (child_id, child_metadata)] {
+            merge_read_sequence_sql_metadata(&mut metadata, node, value)
+                .map_err(|error| StorageError::internal(&error.to_string()))?;
+        }
+        let metadata =
+            metadata.ok_or_else(|| StorageError::internal("missing mapped PostgreSQL metadata"))?;
+        let Some(statement) = compile_postgres_read_sequence_statement(plan, &metadata)? else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+            ));
+        };
+        let client = self.acquire_client("read_sequence_mapped_indexer").await?;
+        let parameters = postgres_read_sequence_parameters(&statement, false)?;
+        let params = parameters
+            .iter()
+            .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let sql_rows = client
+            .query(&statement.sql, &params)
+            .await
+            .map_err(|error| {
+                Self::map_postgres_error("read_sequence mapped indexer", format_args!("{error:?}"))
+            })?;
+        let rows = sql_rows
+            .iter()
+            .map(|row| postgres_sql_row_to_envelope(row, &metadata))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let ir = build_read_sequence_sql_ir(plan, &metadata)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        let decoded = storage_provider::decode_read_sequence_sql_rows(plan, &ir, rows)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        let rows = match storage_provider::materialize_read_sequence_sql_mapped(plan, &ir, decoded)
+        {
+            Ok(rows) => rows,
+            Err(storage_provider::ReadSequenceSqlCompileError::MappingMiss) => {
+                return Ok(ReadSequenceExecution::Unsupported(
+                    storage_provider::ReadSequenceUnsupportedReason::PhysicalLayout,
+                ));
+            }
+            Err(error) => return Err(StorageError::internal(&error.to_string())),
+        };
+        metrics::counter!(
+            "storage.read_sequence.sql.statements.total",
+            "dialect" => "postgres",
+            "shape" => "mapped_indexer"
+        )
+        .increment(1);
+        Ok(ReadSequenceExecution::Executed(
+            storage_provider::ReadSequenceExecuted {
+                rows,
+                next_continuation: None,
+            },
+        ))
+    }
+
     pub(crate) async fn trim_change_index_markers_older_than(
         &self,
         cutoff_created_at_ms: i64,
@@ -251,7 +370,7 @@ impl PostgresStorageProvider {
             where_clauses.push(format!("({predicate})"));
         }
 
-        let (items, has_more) = self
+        let (mut items, has_more) = self
             .load_paginated_wire_items_with_client(
                 client,
                 &physical_name,
@@ -264,6 +383,11 @@ impl PostgresStorageProvider {
                 effective_limit,
             )
             .await?;
+        crate::indexed_item::project_gsi_wire_items(
+            &mut items,
+            &table_info,
+            request.index_name.as_ref(),
+        )?;
 
         let last_evaluated_key = if has_more {
             items
@@ -336,6 +460,10 @@ impl PostgresStorageProvider {
                 }
             }
             select_projection.push("item.attributes_blob AS attributes_blob".to_string());
+            select_projection.extend((0..table_info.max_indexers.as_usize()).map(|ordinal| {
+                let column = crate::utils::indexer_column_name(ordinal);
+                format!("item.{column} AS {column}")
+            }));
             let select_projection = select_projection.join(", ");
 
             let mut bind_values =
@@ -432,6 +560,498 @@ impl PostgresStorageProvider {
 
 #[async_trait]
 impl StorageProvider for PostgresStorageProvider {
+    async fn execute_read_sequence_plan(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if consistency == ReadSequenceConsistency::Eventual
+            && continuation.is_none()
+            && storage_provider::read_sequence_sql_mapped_source(plan).is_some()
+        {
+            return self.execute_read_sequence_mapped(plan).await;
+        }
+        // The compiled statement path currently owns eventual reads only.  A
+        // STRONG request must retain the ordinary provider operation, which
+        // applies the backend's consistency contract per read; publishing an
+        // eventual compiled result would silently weaken the request.
+        if consistency != ReadSequenceConsistency::Eventual || plan.nodes.len() != 1 {
+            if consistency == ReadSequenceConsistency::Eventual && plan.nodes.len() > 1 {
+                return self.execute_read_sequence_independent_roots(plan).await;
+            }
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        }
+        let Some(node) = plan.nodes.first() else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        if !node.inputs().is_empty() || node.iterate.is_some() || !node.after().is_empty() {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        }
+        let query_cursor = match continuation {
+            Some(token)
+                if matches!(
+                    &node.operation,
+                    storage_types::ReadSequenceNodeOperation::Query(_)
+                ) =>
+            {
+                match decode_sql_query_continuation(token) {
+                    Ok(cursor) => cursor,
+                    Err(()) => {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::Continuation,
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Ok(ReadSequenceExecution::Unsupported(
+                    storage_provider::ReadSequenceUnsupportedReason::Continuation,
+                ));
+            }
+            None => None,
+        };
+        let mut next_continuation = None;
+        let row = match &node.operation {
+            storage_types::ReadSequenceNodeOperation::Get(request) => {
+                let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
+                let Some(metadata) = postgres_read_sequence_metadata(
+                    request,
+                    &table_info,
+                    ReadSequenceSqlShape::Get,
+                )?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                };
+                let Some(statement) = compile_postgres_read_sequence_statement(plan, &metadata)?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+                    ));
+                };
+                let client = self.acquire_client("read_sequence_compiled_get").await?;
+                let parameters = statement
+                    .parameters
+                    .iter()
+                    .map(|value| Self::scalar_key_value(value, "read_sequence"))
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let params = parameters
+                    .iter()
+                    .map(|value| value as &(dyn ToSql + Sync))
+                    .collect::<Vec<_>>();
+                let rows = client
+                    .query(&statement.sql, &params)
+                    .await
+                    .map_err(|error| {
+                        Self::map_postgres_error("read_sequence compiled get", error)
+                    })?;
+                metrics::counter!(
+                    "storage.read_sequence.sql.statements.total",
+                    "dialect" => "postgres",
+                    "shape" => "get"
+                )
+                .increment(1);
+                let item = rows
+                    .first()
+                    .map(|row| {
+                        postgres_compiled_row_to_map(
+                            row,
+                            &metadata,
+                            storage_types::ReadSequenceNodeId::from_index(0),
+                        )
+                    })
+                    .transpose()?;
+                ReadSequenceFlatRow {
+                    node: storage_types::ReadSequenceNodeId::from_index(0),
+                    invocation_ordinal: 0,
+                    input_refs: Default::default(),
+                    result: ReadSequenceFlatResult::Get { item },
+                }
+            }
+            storage_types::ReadSequenceNodeOperation::BatchGet(request) => {
+                let Some((table_name, keys_and_attributes)) = request.request_items.iter().next()
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                };
+                if request.request_items.len() != 1 || keys_and_attributes.keys.is_empty() {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                }
+                if request.return_consumed_capacity.is_some()
+                    || keys_and_attributes.attributes_to_get.is_some()
+                    || keys_and_attributes.projection_expression.is_some()
+                    || keys_and_attributes.expression_attribute_names.is_some()
+                    || keys_and_attributes.consistent_read == Some(true)
+                {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                }
+                let table_info = self.get_table_info_cached_arc(table_name).await?;
+                let Some(metadata) = postgres_batch_read_sequence_metadata(
+                    table_name,
+                    keys_and_attributes,
+                    &table_info,
+                )?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                };
+                let Some(statement) = compile_postgres_read_sequence_statement(plan, &metadata)?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+                    ));
+                };
+                let client = self.acquire_client("read_sequence_compiled_batch").await?;
+                let parameters = statement
+                    .parameters
+                    .iter()
+                    .map(|value| Self::scalar_key_value(value, "read_sequence"))
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let params = parameters
+                    .iter()
+                    .map(|value| value as &(dyn ToSql + Sync))
+                    .collect::<Vec<_>>();
+                let rows = client
+                    .query(&statement.sql, &params)
+                    .await
+                    .map_err(|error| {
+                        Self::map_postgres_error("read_sequence compiled batch", error)
+                    })?;
+                metrics::counter!(
+                    "storage.read_sequence.sql.statements.total",
+                    "dialect" => "postgres",
+                    "shape" => "batch_get"
+                )
+                .increment(1);
+                let items = rows
+                    .iter()
+                    .map(|row| {
+                        postgres_compiled_row_to_map(
+                            row,
+                            &metadata,
+                            storage_types::ReadSequenceNodeId::from_index(0),
+                        )
+                    })
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let responses = [(table_name.clone(), items)].into_iter().collect();
+                ReadSequenceFlatRow {
+                    node: storage_types::ReadSequenceNodeId::from_index(0),
+                    invocation_ordinal: 0,
+                    input_refs: Default::default(),
+                    result: ReadSequenceFlatResult::BatchGet { responses },
+                }
+            }
+            storage_types::ReadSequenceNodeOperation::Query(request) => {
+                if request.index_name.is_some() {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                }
+                let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
+                let Some(metadata) = postgres_query_read_sequence_metadata(
+                    request,
+                    &table_info,
+                    query_cursor.as_ref(),
+                )?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                };
+                let Some(statement) = compile_postgres_read_sequence_statement(plan, &metadata)?
+                else {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+                    ));
+                };
+                let client = self.acquire_client("read_sequence_compiled_query").await?;
+                let parameters = statement
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, value)| -> StorageResult<Box<dyn ToSql + Send + Sync>> {
+                            // PostgreSQL resolves a LIMIT placeholder to INT4, while
+                            // DynamoDB key values are stored in the SQL tables as
+                            // text (including numeric keys).  Bind only the final
+                            // compiler-owned fetch limit as an integer; all
+                            // request predicates remain text values.
+                            if index + 1 == statement.parameters.len() {
+                                let limit = Self::scalar_key_value(value, "read_sequence")?
+                                    .parse::<i32>()
+                                    .map_err(|error| {
+                                        StorageError::internal(&format!(
+                                            "compiled Query limit is not an integer: {error}"
+                                        ))
+                                    })?;
+                                Ok(Box::new(limit))
+                            } else {
+                                Ok(Box::new(Self::scalar_key_value(value, "read_sequence")?))
+                            }
+                        },
+                    )
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let params = parameters
+                    .iter()
+                    .map(|value| value.as_ref() as &(dyn ToSql + Sync))
+                    .collect::<Vec<_>>();
+                let rows = client
+                    .query(&statement.sql, &params)
+                    .await
+                    .map_err(|error| {
+                        Self::map_postgres_error("read_sequence compiled query", error)
+                    })?;
+                metrics::counter!(
+                    "storage.read_sequence.sql.statements.total",
+                    "dialect" => "postgres",
+                    "shape" => "query"
+                )
+                .increment(1);
+                let mut items = rows
+                    .iter()
+                    .map(|row| {
+                        postgres_compiled_row_to_map(
+                            row,
+                            &metadata,
+                            storage_types::ReadSequenceNodeId::from_index(0),
+                        )
+                    })
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let limit = metadata
+                    .nodes
+                    .get(&storage_types::ReadSequenceNodeId::from_index(0))
+                    .and_then(|node| node.limit)
+                    .ok_or_else(|| StorageError::internal("compiled Query is missing a limit"))?
+                    as usize;
+                let has_more = items.len() > limit;
+                let cursor = has_more
+                    .then(|| {
+                        items
+                            .get(limit.saturating_sub(1))
+                            .map(|item| sql_item_key_attributes(item, &metadata))
+                    })
+                    .flatten();
+                items.truncate(limit);
+                let count = items.len() as u32;
+                let cursor_continuation = cursor
+                    .as_ref()
+                    .map(encode_sql_query_continuation)
+                    .transpose()?;
+                // The provider return type carries the continuation outside
+                // the row; stash it in a temporary encoded marker handled by
+                // the enclosing result below.
+                next_continuation = cursor_continuation;
+                ReadSequenceFlatRow {
+                    node: storage_types::ReadSequenceNodeId::from_index(0),
+                    invocation_ordinal: 0,
+                    input_refs: Default::default(),
+                    result: ReadSequenceFlatResult::Query {
+                        items,
+                        count,
+                        scanned_count: count,
+                        last_evaluated_key: cursor,
+                    },
+                }
+            }
+        };
+        Ok(ReadSequenceExecution::Executed(
+            storage_provider::ReadSequenceExecuted {
+                rows: vec![row],
+                next_continuation,
+            },
+        ))
+    }
+
+    async fn execute_read_sequence_plan_with_budget(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+        budget: ReadSequenceExecutionBudget,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if budget.is_unbounded() {
+            return self
+                .execute_read_sequence_plan(plan, consistency, continuation)
+                .await;
+        }
+        let bounded_plan = match budget.bounded_query_plan(plan, DEFAULT_QUERY_LIMIT) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(ReadSequenceExecution::Unsupported(reason)),
+        };
+        self.execute_read_sequence_plan(&bounded_plan, consistency, continuation)
+            .await
+    }
+
+    async fn execute_read_sequence_independent_roots(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if plan.nodes.len() < 2
+            || plan.nodes.iter().any(|node| {
+                !node.inputs().is_empty() || node.iterate.is_some() || !node.after().is_empty()
+            })
+        {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        }
+
+        let mut metadata = None;
+        let mut table_names = HashMap::new();
+        for (index, node) in plan.nodes.iter().enumerate() {
+            let node_id = storage_types::ReadSequenceNodeId::from_index(index);
+            let (node_metadata, table_name) = match &node.operation {
+                storage_types::ReadSequenceNodeOperation::Get(request) => {
+                    let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
+                    let Some(metadata) = postgres_read_sequence_metadata(
+                        request,
+                        &table_info,
+                        ReadSequenceSqlShape::Get,
+                    )?
+                    else {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                        ));
+                    };
+                    (metadata, request.table_name.clone())
+                }
+                storage_types::ReadSequenceNodeOperation::BatchGet(request) => {
+                    let Some((table_name, keys_and_attributes)) =
+                        request.request_items.iter().next()
+                    else {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                        ));
+                    };
+                    if request.request_items.len() != 1
+                        || keys_and_attributes.keys.is_empty()
+                        || request.return_consumed_capacity.is_some()
+                        || keys_and_attributes.attributes_to_get.is_some()
+                        || keys_and_attributes.projection_expression.is_some()
+                        || keys_and_attributes.expression_attribute_names.is_some()
+                        || keys_and_attributes.consistent_read == Some(true)
+                    {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                        ));
+                    }
+                    let table_info = self.get_table_info_cached_arc(table_name).await?;
+                    let Some(metadata) = postgres_batch_read_sequence_metadata(
+                        table_name,
+                        keys_and_attributes,
+                        &table_info,
+                    )?
+                    else {
+                        return Ok(ReadSequenceExecution::Unsupported(
+                            storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                        ));
+                    };
+                    (metadata, table_name.clone())
+                }
+                // Independent Query roots require multiple continuation
+                // frontiers.  Keep that shape on the ordinary path until the
+                // provider-neutral token carries one cursor per node.
+                storage_types::ReadSequenceNodeOperation::Query(_) => {
+                    return Ok(ReadSequenceExecution::Unsupported(
+                        storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+                    ));
+                }
+            };
+            merge_read_sequence_sql_metadata(&mut metadata, node_id, node_metadata)
+                .map_err(|error| StorageError::internal(&error.to_string()))?;
+            table_names.insert(node_id, table_name);
+        }
+        let Some(metadata) = metadata else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::OperationShape,
+            ));
+        };
+        let Some(statement) = compile_postgres_read_sequence_statement(plan, &metadata)? else {
+            return Ok(ReadSequenceExecution::Unsupported(
+                storage_provider::ReadSequenceUnsupportedReason::ParameterLimit,
+            ));
+        };
+        let client = self.acquire_client("read_sequence_compiled_roots").await?;
+        let parameters = statement
+            .parameters
+            .iter()
+            .map(|value| Self::scalar_key_value(value, "read_sequence"))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let params = parameters
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let rows = client
+            .query(&statement.sql, &params)
+            .await
+            .map_err(|error| Self::map_postgres_error("read_sequence compiled roots", error))?;
+        metrics::counter!(
+            "storage.read_sequence.sql.statements.total",
+            "dialect" => "postgres",
+            "shape" => "independent_roots"
+        )
+        .increment(1);
+
+        let mut items_by_node = HashMap::<storage_types::ReadSequenceNodeId, Vec<_>>::new();
+        for row in &rows {
+            let node_id = postgres_compiled_row_node(row)?;
+            let item = postgres_compiled_row_to_map(row, &metadata, node_id)?;
+            items_by_node.entry(node_id).or_default().push(item);
+        }
+        let rows = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let node_id = storage_types::ReadSequenceNodeId::from_index(index);
+                let items = items_by_node.remove(&node_id).unwrap_or_default();
+                let result = match &node.operation {
+                    storage_types::ReadSequenceNodeOperation::Get(_) => {
+                        ReadSequenceFlatResult::Get {
+                            item: items.into_iter().next(),
+                        }
+                    }
+                    storage_types::ReadSequenceNodeOperation::BatchGet(_) => {
+                        ReadSequenceFlatResult::BatchGet {
+                            responses: [(table_names[&node_id].clone(), items)]
+                                .into_iter()
+                                .collect(),
+                        }
+                    }
+                    storage_types::ReadSequenceNodeOperation::Query(_) => {
+                        unreachable!("independent Query roots are rejected before SQL execution")
+                    }
+                };
+                ReadSequenceFlatRow {
+                    node: node_id,
+                    invocation_ordinal: 0,
+                    input_refs: Default::default(),
+                    result,
+                }
+            })
+            .collect();
+        Ok(ReadSequenceExecution::Executed(
+            storage_provider::ReadSequenceExecuted {
+                rows,
+                next_continuation: None,
+            },
+        ))
+    }
+
     fn supports_guarded_writes(&self) -> bool {
         true
     }
@@ -531,6 +1151,13 @@ impl StorageProvider for PostgresStorageProvider {
 
     async fn initialize_storage(&self) -> StorageResult<()> {
         self.do_initialize_storage().await
+    }
+
+    async fn complete_initialization(&self) -> StorageResult<()> {
+        if let Some(gate) = &self.job_start_gate {
+            gate.open();
+        }
+        Ok(())
     }
 
     async fn export_logical_backfill_page(
@@ -646,6 +1273,7 @@ impl StorageProvider for PostgresStorageProvider {
             expression_attribute_values,
             return_values,
             aux_item_stream_ttl_hours,
+            indexers,
             ..
         } = request;
         let _write_permit = self.acquire_foreground_write_permit("put_item").await?;
@@ -659,6 +1287,7 @@ impl StorageProvider for PostgresStorageProvider {
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
                 let return_values = return_values.clone();
+                let indexers = indexers.clone();
                 async move {
                     let condition = crate::storage_provider::parse_optional_condition(
                         condition_expression,
@@ -672,70 +1301,32 @@ impl StorageProvider for PostgresStorageProvider {
 
                     let table_info = self.get_table_info_cached_arc(&table_name).await?;
                     let split_item = split_item_into_key_and_attributes_sync(item, &table_info)?;
-                    let key_bindings = Self::key_column_bindings_for_schema(
-                        &table_info,
-                        &table_info.key_schema,
-                        &split_item.key_attributes,
-                        None,
-                    )?;
                     let key_absence_condition =
                         is_key_absence_condition(condition.as_ref(), &table_info)
                             && !return_old_on_condition_failure;
-                    let attributes_blob = if split_item.non_key_attributes.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        serde_json::to_string(&split_item.non_key_attributes).map_err(|err| {
-                            Self::map_postgres_error("serialize non-key attributes", err)
-                        })?
-                    };
+                    let prepared_write = Self::prepare_main_row_write(
+                        &table_info,
+                        &split_item.key_attributes,
+                        &split_item.all_attributes,
+                        &split_item.non_key_attributes,
+                        indexers.as_deref(),
+                    )?;
                     let physical_table_name = physical_names::physical_table_name(&table_name);
-                    let key_columns = key_bindings
-                        .iter()
-                        .map(|binding| binding.column.clone())
-                        .collect::<Vec<_>>();
-                    let columns_sql = key_columns
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once("attributes_blob".to_string()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut value_placeholders = key_bindings
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, binding)| {
-                            Self::postgres_placeholder_for_type(idx + 1, &binding.attribute_type)
-                        })
-                        .collect::<Vec<_>>();
-                    value_placeholders.push(format!("${}", key_bindings.len() + 1));
-                    let values_placeholders = value_placeholders.join(", ");
-                    let conflict_target = key_columns.join(", ");
-                    let assignments = key_columns
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once("attributes_blob".to_string()))
-                        .map(|column| format!("{column} = EXCLUDED.{column}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     let sql = if key_absence_condition {
                         sql_statements::insert_main_row_returning(
                             &physical_table_name,
-                            &columns_sql,
-                            &values_placeholders,
+                            &prepared_write.columns_sql,
+                            &prepared_write.values_sql,
                         )
                     } else {
                         sql_statements::upsert_main_row_returning(
                             &physical_table_name,
-                            &columns_sql,
-                            &values_placeholders,
-                            &conflict_target,
-                            &assignments,
+                            &prepared_write.columns_sql,
+                            &prepared_write.values_sql,
+                            &prepared_write.conflict_target,
+                            &prepared_write.assignments,
                         )
                     };
-                    let mut bind_values = key_bindings
-                        .iter()
-                        .map(|binding| binding.value.clone())
-                        .collect::<Vec<_>>();
-                    bind_values.push(attributes_blob);
                     let revision_key_json = split_item
                         .key_attributes
                         .canonical_dynamo_json()
@@ -745,17 +1336,17 @@ impl StorageProvider for PostgresStorageProvider {
                             ))
                         })?;
                     let revision_sql = sql_statements::bump_item_revision_with_placeholders(
-                        &format!("${}", bind_values.len() + 1),
-                        &format!("${}", bind_values.len() + 2),
+                        &format!("${}", prepared_write.bind_values.len() + 1),
+                        &format!("${}", prepared_write.bind_values.len() + 2),
                     );
                     let combined_sql = sql_statements::dml_ctes_returning_last_column(
                         &[sql, revision_sql],
                         "revision",
                     );
                     let table_name_value = table_name.to_string();
-                    let mut combined_bind_values = bind_values;
-                    combined_bind_values.push(table_name_value);
-                    combined_bind_values.push(revision_key_json);
+                    let mut combined_bind_values = prepared_write.bind_values;
+                    combined_bind_values.push(Some(table_name_value));
+                    combined_bind_values.push(Some(revision_key_json));
                     let params: Vec<&(dyn ToSql + Sync)> = combined_bind_values
                         .iter()
                         .map(|value| value as &(dyn ToSql + Sync))
@@ -775,7 +1366,7 @@ impl StorageProvider for PostgresStorageProvider {
                     } else {
                         let main_read_started = Instant::now();
                         let old_item = self
-                            .get_item_with_client(
+                            .get_item_with_indexers_with_client(
                                 &transaction,
                                 &table_name,
                                 &split_item.key_attributes,
@@ -798,8 +1389,10 @@ impl StorageProvider for PostgresStorageProvider {
 
                     if !key_absence_condition && let Some(condition) = &condition {
                         let condition_started = Instant::now();
-                        let condition_matches =
-                            evaluate_wire_condition(old_item.as_ref(), condition)?;
+                        let condition_matches = evaluate_wire_condition(
+                            old_item.as_ref().map(|item| &item.item),
+                            condition,
+                        )?;
                         self.record_transaction_phase(
                             "put_item",
                             "condition_eval",
@@ -808,7 +1401,7 @@ impl StorageProvider for PostgresStorageProvider {
                         if !condition_matches {
                             let old_item = old_item
                                 .as_ref()
-                                .map(WireItem::to_attribute_map)
+                                .map(|item| item.item.to_attribute_map())
                                 .transpose()?;
                             return Err(crate::provider_core::write::conditional_failure(
                                 old_item.as_ref(),
@@ -844,7 +1437,7 @@ impl StorageProvider for PostgresStorageProvider {
                     let ttl_materialize_started = Instant::now();
                     let old_item_for_ttl = old_item
                         .as_ref()
-                        .map(WireItem::to_attribute_map)
+                        .map(|item| item.item.to_attribute_map())
                         .transpose()?;
                     self.record_transaction_phase(
                         "put_item",
@@ -859,6 +1452,7 @@ impl StorageProvider for PostgresStorageProvider {
                             &table_info,
                             old_item_for_ttl.as_ref(),
                             Some(&split_item.all_attributes),
+                            indexers.as_deref().unwrap_or_default(),
                         )
                         .await?;
                         self.record_transaction_phase(
@@ -885,6 +1479,8 @@ impl StorageProvider for PostgresStorageProvider {
                         &split_item.all_attributes,
                         PostgresWriteStreamEntriesInput {
                             old_item: old_item_for_ttl.as_ref(),
+                            indexers: indexers.as_deref().unwrap_or_default(),
+                            old_indexers: old_item.as_ref().map(|item| item.indexers.as_slice()),
                             is_deleted: false,
                             item_stream_version,
                             replication: None,
@@ -919,7 +1515,9 @@ impl StorageProvider for PostgresStorageProvider {
 
                     let return_values_started = Instant::now();
                     let attributes = if matches!(return_values, Some(AllOld::AllOld)) {
-                        old_item.map(WireItem::into_attribute_map).transpose()?
+                        old_item
+                            .map(|item| item.item.into_attribute_map())
+                            .transpose()?
                     } else {
                         None
                     };
@@ -966,27 +1564,102 @@ impl StorageProvider for PostgresStorageProvider {
         &self,
         request: &ScanTableRequest,
     ) -> StorageResult<(Vec<ItemVersionedWireItem>, Option<String>)> {
+        if request.index_name.is_some() {
+            return Err(StorageError::validation(
+                "versioned internal scans are supported only on base tables",
+            ));
+        }
         let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
         let client = self
             .acquire_client("scan_table_with_item_stream_versions")
             .await?;
         let _connection_hold = self.connection_hold_timer("scan_table_with_item_stream_versions");
-        let (items, next_cursor) = self.scan_table(request).await?;
-        let mut versioned = Vec::with_capacity(items.len());
-        for item in items {
-            let item_map = item.to_attribute_map()?;
-            let split = split_item_into_key_and_attributes_sync(item_map, &table_info)?;
-            let revision = Self::get_item_revision_with_client(
+        let effective_limit = calc_limit(request.limit, DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT)?;
+        let exclusive_start_key =
+            decode_exclusive_start(&request.exclusive_start_key, &table_info, &None)?;
+        let ordered_columns =
+            Self::ordered_key_columns_for_origin(&table_info, &table_info.key_schema, None)?;
+        let mut where_clauses = Vec::new();
+        let mut bind_values = Vec::new();
+        if let Some(start_key) = exclusive_start_key.as_ref()
+            && let Some(predicate) = Self::build_exclusive_start_predicate(
+                &ordered_columns,
+                start_key,
+                true,
+                &mut bind_values,
+            )?
+        {
+            where_clauses.push(format!("({predicate})"));
+        }
+        let (items, has_more) = self
+            .load_paginated_decoded_items_with_client(
                 &client,
-                &request.table_name,
-                &split.key_attributes,
+                &physical_names::physical_table_name(&request.table_name),
+                &table_info,
+                &table_info.key_schema,
+                None,
+                &where_clauses,
+                &bind_values,
+                true,
+                effective_limit,
             )
             .await?;
-            versioned.push(ItemVersionedWireItem {
-                item,
-                item_stream_version: storage_types::ItemStreamVersion::try_from(revision)?,
-            });
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| item.item.last_evaluated_key(&table_info, &None))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let mut keyed = Vec::with_capacity(items.len());
+        let mut revision_keys = Vec::with_capacity(items.len());
+        for item in items {
+            let logical = item.item.to_attribute_map()?;
+            let key = split_item_into_key_and_attributes_sync(logical, &table_info)?.key_attributes;
+            let key_json = key.canonical_dynamo_json().map_err(|error| {
+                StorageError::validation(format!("revision key encoding failed: {error}"))
+            })?;
+            revision_keys.push(key_json.clone());
+            keyed.push((item, key_json));
         }
+        let table_name = request.table_name.to_string();
+        let revisions = if revision_keys.is_empty() {
+            HashMap::new()
+        } else {
+            client
+                .query(
+                    "SELECT key_json, revision FROM item_revisions WHERE table_name = $1 AND \
+                     key_json = ANY($2)",
+                    &[&table_name, &revision_keys],
+                )
+                .await
+                .map_err(|error| Self::map_postgres_error("bulk scan revisions", error))?
+                .into_iter()
+                .map(|row| {
+                    let key = row.try_get::<_, String>("key_json").map_err(|error| {
+                        Self::map_postgres_error("decode scan revision key", error)
+                    })?;
+                    let revision = row
+                        .try_get::<_, i64>("revision")
+                        .map_err(|error| Self::map_postgres_error("decode scan revision", error))?;
+                    Ok((key, revision))
+                })
+                .collect::<StorageResult<HashMap<_, _>>>()?
+        };
+        let versioned = keyed
+            .into_iter()
+            .map(|(item, key)| {
+                Ok(ItemVersionedWireItem {
+                    item: item.item,
+                    indexers: item.indexers,
+                    item_stream_version: storage_types::ItemStreamVersion::try_from(
+                        revisions.get(&key).copied().unwrap_or_default(),
+                    )?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
         Ok((versioned, next_cursor))
     }
 
@@ -997,15 +1670,23 @@ impl StorageProvider for PostgresStorageProvider {
         let table_info = self.get_table_info_cached_arc(&request.table_name).await?;
         let client = self.acquire_client("get_item_with_durable_proof").await?;
         let _connection_hold = self.connection_hold_timer("get_item_with_durable_proof");
+        let prepared =
+            Self::prepare_get_item_query(&request.table_name, &request.key, &table_info)?;
         let item = self
-            .get_item_with_client(&client, &request.table_name, &request.key, &table_info)
+            .execute_prepared_get_item_query_with_indexers(
+                &client,
+                &prepared,
+                "get_item_with_durable_proof",
+                "db_query",
+            )
             .await?;
         let revision =
             Self::get_item_revision_with_client(&client, &request.table_name, &request.key).await?;
 
         Ok(match item {
             Some(item) => DurablePointReadProof::Present {
-                item: Box::new(item),
+                item: Box::new(item.item),
+                indexers: item.indexers,
                 revision: DurableItemRevision::new(revision.to_be_bytes().to_vec()),
             },
             None => DurablePointReadProof::Absent {
@@ -1061,7 +1742,7 @@ impl StorageProvider for PostgresStorageProvider {
                         .await?;
                     let _transaction_hold = self.transaction_hold_timer("delete_item");
                     let old_item = self
-                        .get_item_with_client(
+                        .get_item_with_indexers_with_client(
                             &transaction,
                             &table_name,
                             &key_attributes,
@@ -1070,11 +1751,14 @@ impl StorageProvider for PostgresStorageProvider {
                         .await?;
 
                     if let Some(condition) = &condition
-                        && !evaluate_wire_condition(old_item.as_ref(), condition)?
+                        && !evaluate_wire_condition(
+                            old_item.as_ref().map(|item| &item.item),
+                            condition,
+                        )?
                     {
                         let old_item = old_item
                             .as_ref()
-                            .map(WireItem::to_attribute_map)
+                            .map(|item| item.item.to_attribute_map())
                             .transpose()?;
                         return Err(crate::provider_core::write::conditional_failure(
                             old_item.as_ref(),
@@ -1112,7 +1796,8 @@ impl StorageProvider for PostgresStorageProvider {
                         )
                         .await?,
                     )?;
-                    let old_map = old_item.into_attribute_map()?;
+                    let old_indexers = old_item.indexers;
+                    let old_map = old_item.item.into_attribute_map()?;
                     if self.immediate_gsi_consistency {
                         self.delete_gsi_entries_for_item_with_client(
                             &transaction,
@@ -1135,6 +1820,8 @@ impl StorageProvider for PostgresStorageProvider {
                         &old_map,
                         PostgresWriteStreamEntriesInput {
                             old_item: Some(&old_map),
+                            indexers: &[],
+                            old_indexers: Some(&old_indexers),
                             is_deleted: true,
                             item_stream_version,
                             replication: None,
@@ -1250,7 +1937,7 @@ impl StorageProvider for PostgresStorageProvider {
             where_clauses.push(format!("({predicate})"));
         }
 
-        let (items, has_more) = self
+        let (mut items, has_more) = self
             .load_paginated_wire_items(
                 &physical_name,
                 &table_info,
@@ -1262,6 +1949,11 @@ impl StorageProvider for PostgresStorageProvider {
                 effective_limit,
             )
             .await?;
+        crate::indexed_item::project_gsi_wire_items(
+            &mut items,
+            &table_info,
+            request.index_name.as_ref(),
+        )?;
 
         let last_evaluated_key = if has_more {
             items
@@ -1687,6 +2379,7 @@ impl PostgresStorageProvider {
                         table_info,
                         old_item.as_ref(),
                         new_item.as_ref(),
+                        &pointer.indexers,
                     )
                     .await?;
                     did_work = true;
@@ -1751,6 +2444,534 @@ fn postgres_user_gsi_table_info(table_info: &StoredTableInfo) -> Option<StoredTa
         .as_ref()
         .filter(|gsis| !gsis.is_empty())?;
     Some(filtered)
+}
+
+pub(super) fn postgres_read_sequence_metadata(
+    request: &storage_types::GetItemRequest,
+    table_info: &StoredTableInfo,
+    shape: ReadSequenceSqlShape,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    if request.attributes_to_get.is_some()
+        || request.projection_expression.is_some()
+        || request.expression_attribute_names.is_some()
+        || request.consistent_read == Some(true)
+        || request.return_consumed_capacity.is_some()
+    {
+        return Ok(None);
+    }
+    let relation =
+        ReadSequenceSqlIdentifier::new(physical_names::physical_table_name(&request.table_name))
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_columns = Vec::with_capacity(table_info.key_schema.len());
+    let mut key_types = Vec::with_capacity(table_info.key_schema.len());
+    let mut predicates = Vec::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let sanitized_name = PostgresStorageProvider::sanitize_column_name(&key.attribute_name);
+        if sanitized_name != key.attribute_name {
+            // The compiled decoder exposes key columns in the public item map
+            // and continuation cursor.  Without a logical-to-physical name
+            // map, sanitizing here would change the DynamoDB attribute name;
+            // use the ordinary path instead of publishing a wrong shape.
+            return Ok(None);
+        }
+        let value = request
+            .key
+            .get(&key.attribute_name)
+            .ok_or_else(StorageError::invalid_or_missing_key)?;
+        let column = ReadSequenceSqlIdentifier::new(sanitized_name)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        let attribute_type =
+            PostgresStorageProvider::key_attribute_type(table_info, &key.attribute_name)?;
+        key_columns.push(column.clone());
+        key_types.push(read_sequence_sql_key_type(&attribute_type));
+        predicates.push(ReadSequenceSqlPredicate {
+            column,
+            operator: ReadSequenceSqlOperator::Equal,
+            value: value.clone(),
+        });
+    }
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: postgres_schema_digest(table_info),
+        max_parameters: 65_535,
+        max_sql_bytes: 1_048_576,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape,
+                key_attribute_names: key_columns
+                    .iter()
+                    .map(|column| column.as_str().to_string())
+                    .collect(),
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates,
+                batch_keys: Vec::new(),
+                limit: None,
+                max_indexers: table_info.max_indexers,
+                projected_attributes: None,
+                exclude_tombstones: false,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+pub(super) fn postgres_batch_read_sequence_metadata(
+    table_name: &storage_types::TableName,
+    request: &storage_types::KeysAndAttributes,
+    table_info: &StoredTableInfo,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    let relation = ReadSequenceSqlIdentifier::new(physical_names::physical_table_name(table_name))
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_columns = Vec::with_capacity(table_info.key_schema.len());
+    let mut key_types = Vec::with_capacity(table_info.key_schema.len());
+    for key in &table_info.key_schema {
+        let sanitized_name = PostgresStorageProvider::sanitize_column_name(&key.attribute_name);
+        if sanitized_name != key.attribute_name {
+            return Ok(None);
+        }
+        let column = ReadSequenceSqlIdentifier::new(sanitized_name)
+            .map_err(|error| StorageError::internal(&error.to_string()))?;
+        key_columns.push(column);
+        key_types.push(read_sequence_sql_key_type(
+            &PostgresStorageProvider::key_attribute_type(table_info, &key.attribute_name)?,
+        ));
+    }
+    let batch_keys = request
+        .keys
+        .iter()
+        .map(|key| {
+            table_info
+                .key_schema
+                .iter()
+                .map(|schema| {
+                    key.get(&schema.attribute_name)
+                        .cloned()
+                        .ok_or_else(StorageError::invalid_or_missing_key)
+                })
+                .collect::<StorageResult<Vec<_>>>()
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: postgres_schema_digest(table_info),
+        max_parameters: 65_535,
+        max_sql_bytes: 1_048_576,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape: ReadSequenceSqlShape::BatchGet,
+                key_attribute_names: key_columns
+                    .iter()
+                    .map(|column| column.as_str().to_string())
+                    .collect(),
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates: Vec::new(),
+                batch_keys,
+                limit: None,
+                max_indexers: table_info.max_indexers,
+                projected_attributes: None,
+                exclude_tombstones: false,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+pub(super) fn postgres_query_read_sequence_metadata(
+    request: &QueryRequest,
+    table_info: &StoredTableInfo,
+    query_cursor: Option<&KeyAttributes>,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    if request.filter_expression.is_some()
+        || request.attributes_to_get.is_some()
+        || request.conditional_operator.is_some()
+        || request.query_filter.is_some()
+        || request.projection_expression.is_some()
+        || request.select.is_some()
+        || request.exclusive_start_key.is_some()
+        || request.return_consumed_capacity.is_some()
+        || request.consistent_read == Some(true)
+        || request.scan_index_forward == Some(false)
+    {
+        return Ok(None);
+    }
+    if request.index_name.is_some() && query_cursor.is_some() {
+        return Ok(None);
+    }
+    let (relation_name, query_schema, physical_keys, projected_attributes, exclude_tombstones) =
+        if let Some(index_name) = &request.index_name {
+            let index = table_info
+                .global_secondary_indexes
+                .as_ref()
+                .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+                .ok_or_else(|| missing_index_error(table_info, index_name))?;
+            let mut keys = index
+                .key_schema
+                .iter()
+                .map(|key| (key.attribute_name.clone(), key.attribute_name.clone()))
+                .collect::<Vec<_>>();
+            keys.extend(table_info.key_schema.iter().map(|key| {
+                let physical = PostgresStorageProvider::sanitize_column_name(&key.attribute_name);
+                (key.attribute_name.clone(), format!("table_{physical}"))
+            }));
+            (
+                physical_names::physical_gsi_table_name(&request.table_name, index_name),
+                index.key_schema.as_slice(),
+                keys,
+                crate::gsi_lifecycle::gsi_projected_attribute_names(table_info, index),
+                false,
+            )
+        } else {
+            (
+                physical_names::physical_table_name(&request.table_name),
+                table_info.key_schema.as_slice(),
+                table_info
+                    .key_schema
+                    .iter()
+                    .map(|key| (key.attribute_name.clone(), key.attribute_name.clone()))
+                    .collect(),
+                None,
+                false,
+            )
+        };
+    let relation = ReadSequenceSqlIdentifier::new(relation_name)
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    let mut key_attribute_names = Vec::with_capacity(physical_keys.len());
+    let mut key_columns = Vec::with_capacity(physical_keys.len());
+    let mut key_types = Vec::with_capacity(physical_keys.len());
+    for (logical_name, physical_name) in physical_keys {
+        let sanitized_name = PostgresStorageProvider::sanitize_column_name(&logical_name);
+        if sanitized_name != logical_name || !physical_name.ends_with(&sanitized_name) {
+            return Ok(None);
+        }
+        key_attribute_names.push(logical_name.clone());
+        key_columns.push(
+            ReadSequenceSqlIdentifier::new(physical_name)
+                .map_err(|error| StorageError::internal(&error.to_string()))?,
+        );
+        key_types.push(read_sequence_sql_key_type(
+            &PostgresStorageProvider::key_attribute_type(table_info, &logical_name)?,
+        ));
+    }
+    let mut predicates = match crate::parse_conditions::parse_read_sequence_query_predicates(
+        &request.key_condition_expression,
+        query_schema,
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    ) {
+        Ok(predicates) => predicates,
+        Err(_) => return Ok(None),
+    };
+    for predicate in &mut predicates {
+        let logical_name = predicate.column.as_str().to_string();
+        predicate.column = ReadSequenceSqlIdentifier::new(
+            PostgresStorageProvider::sanitize_column_name(&logical_name),
+        )
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+    }
+    if let Some(cursor) = query_cursor {
+        let Some(range_key) = query_schema
+            .iter()
+            .find(|key| key.key_type == storage_types::KeyType::Range)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = cursor.get(&range_key.attribute_name).cloned() else {
+            return Ok(None);
+        };
+        let column = ReadSequenceSqlIdentifier::new(PostgresStorageProvider::sanitize_column_name(
+            &range_key.attribute_name,
+        ))
+        .map_err(|error| StorageError::internal(&error.to_string()))?;
+        predicates.push(ReadSequenceSqlPredicate {
+            column,
+            operator: ReadSequenceSqlOperator::GreaterThan,
+            value,
+        });
+    }
+    Ok(Some(ReadSequenceSqlMetadata {
+        schema_digest: postgres_schema_digest(table_info),
+        max_parameters: 65_535,
+        max_sql_bytes: 1_048_576,
+        nodes: [(
+            storage_types::ReadSequenceNodeId::from_index(0),
+            ReadSequenceSqlNodeMetadata {
+                relation,
+                shape: ReadSequenceSqlShape::Query,
+                key_attribute_names,
+                key_columns: key_columns.clone(),
+                key_types,
+                order_columns: key_columns,
+                predicates,
+                batch_keys: Vec::new(),
+                limit: Some(calc_limit(
+                    request.limit,
+                    DEFAULT_QUERY_LIMIT,
+                    MAX_QUERY_LIMIT,
+                )?),
+                max_indexers: table_info.max_indexers,
+                projected_attributes,
+                exclude_tombstones,
+                mapped_source: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }))
+}
+
+pub(super) fn compile_postgres_read_sequence_statement(
+    plan: &storage_types::ReadSequencePlan,
+    metadata: &ReadSequenceSqlMetadata,
+) -> StorageResult<Option<storage_provider::ReadSequenceSqlStatement>> {
+    let ir = match build_read_sequence_sql_ir(plan, metadata) {
+        Ok(ir) => ir,
+        Err(storage_provider::ReadSequenceSqlCompileError::ParameterLimit)
+        | Err(storage_provider::ReadSequenceSqlCompileError::StatementLimit)
+        | Err(storage_provider::ReadSequenceSqlCompileError::UnsupportedShape)
+        | Err(storage_provider::ReadSequenceSqlCompileError::InvalidKeyMetadata)
+        | Err(storage_provider::ReadSequenceSqlCompileError::MissingMetadata) => return Ok(None),
+        Err(error) => return Err(StorageError::internal(&error.to_string())),
+    };
+    match emit_postgresql_read_sequence_sql(
+        plan,
+        &ir,
+        metadata.max_sql_bytes,
+        metadata.max_parameters,
+    ) {
+        Ok(statement) => Ok(Some(statement)),
+        Err(storage_provider::ReadSequenceSqlCompileError::ParameterLimit)
+        | Err(storage_provider::ReadSequenceSqlCompileError::StatementLimit)
+        | Err(storage_provider::ReadSequenceSqlCompileError::UnsupportedShape)
+        | Err(storage_provider::ReadSequenceSqlCompileError::InvalidKeyMetadata)
+        | Err(storage_provider::ReadSequenceSqlCompileError::MissingMetadata) => Ok(None),
+        Err(error) => Err(StorageError::internal(&error.to_string())),
+    }
+}
+
+fn postgres_mapped_child_metadata(
+    request: &GetItemRequest,
+    table_info: &StoredTableInfo,
+    source: storage_provider::ReadSequenceSqlMappedSource,
+) -> StorageResult<Option<ReadSequenceSqlMetadata>> {
+    let Some(mut metadata) =
+        postgres_read_sequence_metadata(request, table_info, ReadSequenceSqlShape::Get)?
+    else {
+        return Ok(None);
+    };
+    let node = metadata
+        .nodes
+        .first_entry()
+        .ok_or_else(|| StorageError::internal("missing mapped child SQL metadata"))?
+        .into_mut();
+    node.predicates.clear();
+    node.mapped_source = Some(source);
+    Ok(Some(metadata))
+}
+
+fn postgres_read_sequence_parameters(
+    statement: &storage_provider::ReadSequenceSqlStatement,
+    has_limit: bool,
+) -> StorageResult<Vec<Box<dyn ToSql + Send + Sync>>> {
+    statement
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if has_limit && index + 1 == statement.parameters.len() {
+                let limit = PostgresStorageProvider::scalar_key_value(value, "read_sequence")?
+                    .parse::<i32>()
+                    .map_err(|error| {
+                        StorageError::internal(&format!(
+                            "compiled Query limit is not an integer: {error}"
+                        ))
+                    })?;
+                Ok(Box::new(limit) as Box<dyn ToSql + Send + Sync>)
+            } else {
+                Ok(Box::new(PostgresStorageProvider::scalar_key_value(
+                    value,
+                    "read_sequence",
+                )?) as Box<dyn ToSql + Send + Sync>)
+            }
+        })
+        .collect()
+}
+
+fn postgres_sql_row_to_envelope(
+    row: &tokio_postgres::Row,
+    metadata: &ReadSequenceSqlMetadata,
+) -> StorageResult<storage_provider::ReadSequenceSqlEnvelopeRow> {
+    let node_ordinal = row
+        .try_get::<_, i32>("node_ordinal")
+        .map_err(|error| StorageError::internal(&format!("decode SQL node ordinal: {error}")))?;
+    let invocation_ordinal = row
+        .try_get::<_, i64>("invocation_ordinal")
+        .map_err(|error| {
+            StorageError::internal(&format!("decode SQL invocation ordinal: {error}"))
+        })?;
+    let item_ordinal = row
+        .try_get::<_, i64>("item_ordinal")
+        .map_err(|error| StorageError::internal(&format!("decode SQL item ordinal: {error}")))?;
+    let node = storage_types::ReadSequenceNodeId::from_index(
+        usize::try_from(node_ordinal)
+            .map_err(|_| StorageError::internal("negative SQL node ordinal"))?,
+    );
+    let node_metadata = metadata
+        .nodes
+        .get(&node)
+        .ok_or_else(|| StorageError::internal("compiled SQL returned an unknown node"))?;
+    let key_values = node_metadata
+        .key_types
+        .iter()
+        .enumerate()
+        .map(|(index, key_type)| {
+            let value = row
+                .try_get::<_, String>(format!("key_{index}").as_str())
+                .map_err(|error| {
+                    StorageError::internal(&format!("decode SQL key column: {error}"))
+                })?;
+            Ok(match key_type {
+                ReadSequenceSqlKeyType::String => AttributeValue::S(value),
+                ReadSequenceSqlKeyType::Number => AttributeValue::N(value),
+                ReadSequenceSqlKeyType::Binary => AttributeValue::B(value),
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let item_json = row
+        .try_get::<_, Option<String>>("item_json")
+        .map_err(|error| StorageError::internal(&format!("decode SQL item JSON: {error}")))?
+        .map(String::into_bytes);
+    let indexer_json = row
+        .try_get::<_, String>("indexer_json")
+        .map_err(|error| StorageError::internal(&format!("decode SQL indexers: {error}")))?;
+    let indexer_values = serde_json::from_str(&indexer_json)
+        .map_err(|error| StorageError::internal(&format!("parse SQL indexers: {error}")))?;
+    Ok(storage_provider::ReadSequenceSqlEnvelopeRow {
+        node_ordinal: u32::try_from(node_ordinal)
+            .map_err(|_| StorageError::internal("negative SQL node ordinal"))?,
+        invocation_ordinal: u32::try_from(invocation_ordinal)
+            .map_err(|_| StorageError::internal("SQL invocation ordinal overflow"))?,
+        row_kind: storage_provider::ReadSequenceSqlRowKind::Item,
+        item_ordinal: u32::try_from(item_ordinal)
+            .map_err(|_| StorageError::internal("SQL item ordinal overflow"))?,
+        key_values,
+        item_json,
+        indexer_values,
+    })
+}
+
+fn postgres_compiled_row_to_map(
+    row: &tokio_postgres::Row,
+    metadata: &ReadSequenceSqlMetadata,
+    node_id: storage_types::ReadSequenceNodeId,
+) -> StorageResult<storage_types::AttributeMap> {
+    let node = metadata
+        .nodes
+        .get(&node_id)
+        .ok_or_else(|| StorageError::internal("compiled read-sequence metadata has no node"))?;
+    let residual_json = row
+        .try_get::<_, Option<String>>("item_json")
+        .map_err(|error| StorageError::internal(&format!("decode compiled item JSON: {error}")))
+        .map(|json| json.unwrap_or_else(|| "{}".to_string()))?;
+    let indexer_json = row
+        .try_get::<_, String>("indexer_json")
+        .map_err(|error| StorageError::internal(&format!("decode compiled indexers: {error}")))?;
+    let slots = serde_json::from_str::<Vec<Option<String>>>(&indexer_json)
+        .map_err(|error| StorageError::internal(&format!("parse compiled indexers: {error}")))?;
+    let mut key = storage_types::KeyAttributes::with_capacity(node.key_columns.len());
+    for (index, column) in node.key_columns.iter().enumerate() {
+        let alias = format!("key_{index}");
+        let value = match node.key_types[index] {
+            ReadSequenceSqlKeyType::String => row
+                .try_get::<_, String>(alias.as_str())
+                .map(storage_types::AttributeValue::S),
+            ReadSequenceSqlKeyType::Number => row
+                .try_get::<_, String>(alias.as_str())
+                .map(storage_types::AttributeValue::N),
+            ReadSequenceSqlKeyType::Binary => row
+                .try_get::<_, String>(alias.as_str())
+                .map(storage_types::AttributeValue::B),
+        }
+        .map_err(|error| StorageError::internal(&format!("decode compiled key column: {error}")))?;
+        key.insert(column.as_str(), value);
+    }
+    crate::indexed_item::SqlIndexedItem::reconstruct_with_indexers(
+        residual_json,
+        slots,
+        &key,
+        node.max_indexers,
+    )?
+    .item
+    .into_attribute_map()
+    .map(storage_types::AttributeMap::from)
+}
+
+fn postgres_compiled_row_node(
+    row: &tokio_postgres::Row,
+) -> StorageResult<storage_types::ReadSequenceNodeId> {
+    let ordinal = row.try_get::<_, i32>("node_ordinal").map_err(|error| {
+        StorageError::internal(&format!("decode compiled node ordinal: {error}"))
+    })?;
+    let ordinal = usize::try_from(ordinal)
+        .map_err(|_| StorageError::internal("compiled node ordinal is negative"))?;
+    Ok(storage_types::ReadSequenceNodeId::from_index(ordinal))
+}
+
+fn read_sequence_sql_key_type(
+    attribute_type: &storage_types::KeyAttributeType,
+) -> ReadSequenceSqlKeyType {
+    match attribute_type {
+        storage_types::KeyAttributeType::S => ReadSequenceSqlKeyType::String,
+        storage_types::KeyAttributeType::N => ReadSequenceSqlKeyType::Number,
+        storage_types::KeyAttributeType::B => ReadSequenceSqlKeyType::Binary,
+    }
+}
+
+fn postgres_schema_digest(table_info: &StoredTableInfo) -> String {
+    let bytes = storage_types::canonical_json::to_vec(table_info).unwrap_or_default();
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &bytes).to_string()
+}
+
+fn encode_sql_query_continuation(key: &KeyAttributes) -> StorageResult<String> {
+    let payload = serde_json::to_string(key)
+        .map_err(|error| StorageError::internal(&format!("encode SQL Query cursor: {error}")))?;
+    Ok(format!("read-sequence-sql-v1:{payload}"))
+}
+
+fn decode_sql_query_continuation(value: &str) -> Result<Option<KeyAttributes>, ()> {
+    let Some(payload) = value.strip_prefix("read-sequence-sql-v1:") else {
+        return Err(());
+    };
+    let key = serde_json::from_str::<KeyAttributes>(payload).map_err(|_| ())?;
+    if key.is_empty() {
+        Err(())
+    } else {
+        Ok(Some(key))
+    }
+}
+
+fn sql_item_key_attributes(
+    item: &storage_types::AttributeMap,
+    metadata: &ReadSequenceSqlMetadata,
+) -> KeyAttributes {
+    let mut key = KeyAttributes::with_capacity(2);
+    if let Some(node) = metadata.nodes.values().next() {
+        for column in &node.key_columns {
+            if let Some(value) = item.get(column.as_str()) {
+                key.insert(column.as_str(), value.clone());
+            }
+        }
+    }
+    key
 }
 
 type PostgresGsiImage = Option<HashMap<String, storage_provider::AttributeValue>>;

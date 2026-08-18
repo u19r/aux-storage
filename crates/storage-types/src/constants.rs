@@ -23,6 +23,9 @@ pub const DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE: &str =
     "The transaction with the given request token is already in progress.";
 pub const DYNAMODB_UNRECOGNIZED_CLIENT_MESSAGE: &str =
     "The Access Key ID or security token is invalid.";
+/// Default maximum configured lag, in milliseconds, for a FoundationDB cached
+/// read version.
+pub const FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS: u16 = 50;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MIN: u32 = 1;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MAX: u32 = 1000;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE: &str = "Limit must be between 1 and 1000";

@@ -5,22 +5,21 @@ use std::{
 };
 
 use futures::{StreamExt, stream as futures_stream};
-use serde::Deserialize;
 use storage_types::{
-    AttributeValue, ItemKey, ItemStreamVersion, KeyAttributes, KeySchemaElement,
-    ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
-    ReplicationWriteSource, StorageError, StorageResult, StreamName, TableName,
+    AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, ReplicationEventMetadata,
+    ReplicationHybridLogicalClock, ReplicationMutation, ReplicationWriteSource, StorageError,
+    StorageResult, StreamName, TableName,
 };
 use stream::{StreamError, StreamItem};
 
 use crate::{
     constants::STORAGE_MULTI_REGION_CONFLICT_TOTAL_METRIC,
-    database_manager::{DatabaseManager, record_storage_operation},
+    database_manager::{DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, record_storage_operation},
     namespace_routing::{NamespaceRoute, NamespaceStorageMode},
     newtypes::DatabaseTrait,
 };
 
-const LEGACY_LOCAL_REPLICATION_ORIGIN_REGION: &str = "__legacy_local__";
+const UNTRACKED_LOCAL_REPLICATION_ORIGIN_REGION: &str = "__local__";
 
 struct PreparedReplicationMutation {
     original_index: usize,
@@ -47,53 +46,6 @@ struct PreparedReplicationBatchGroupKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PreparedReplicationConnectionBucketKey(Option<String>);
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum StoredStreamPointerReplicationView {
-    Pointer {
-        stream_name: StreamName,
-        item_stream_version: ItemStreamVersion,
-        #[serde(default)]
-        replication: Option<ReplicationEventMetadata>,
-    },
-    Embedded {
-        stream_name: StreamName,
-        item_stream_version: ItemStreamVersion,
-        #[serde(default)]
-        replication: Option<ReplicationEventMetadata>,
-    },
-}
-
-impl StoredStreamPointerReplicationView {
-    pub(super) fn matches_item_version(
-        &self,
-        item_stream_name: &StreamName,
-        item_stream_version: ItemStreamVersion,
-    ) -> bool {
-        match self {
-            StoredStreamPointerReplicationView::Pointer {
-                stream_name,
-                item_stream_version: target_version,
-                ..
-            }
-            | StoredStreamPointerReplicationView::Embedded {
-                stream_name,
-                item_stream_version: target_version,
-                ..
-            } => stream_name == item_stream_name && *target_version == item_stream_version,
-        }
-    }
-
-    pub(super) fn replication_metadata(&self) -> Option<&ReplicationEventMetadata> {
-        match self {
-            StoredStreamPointerReplicationView::Pointer { replication, .. }
-            | StoredStreamPointerReplicationView::Embedded { replication, .. } => {
-                replication.as_ref()
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationMutationApplyOutcome {
@@ -166,12 +118,21 @@ impl DatabaseManager {
             let key_schema = if let Some(cached) = key_schema_cache.get(&read_target_key) {
                 cached.clone()
             } else {
-                let schema = record_storage_operation(
-                    "get_table_info",
-                    read_provider.get_table_info(&read_table_name),
-                )
-                .await?
-                .key_schema;
+                let admission_connection_id = connection_id
+                    .as_deref()
+                    .unwrap_or(ROUTED_DEFAULT_CONNECTION_ID);
+                let schema =
+                    record_storage_operation(
+                        "get_table_info",
+                        self.run_control_admitted(admission_connection_id, {
+                            let read_table_name = read_table_name.clone();
+                            move |provider| async move {
+                                provider.get_table_info(&read_table_name).await
+                            }
+                        }),
+                    )
+                    .await?
+                    .key_schema;
                 key_schema_cache.insert(read_target_key, schema.clone());
                 schema
             };
@@ -234,18 +195,15 @@ impl DatabaseManager {
             ))
         })?;
 
-        let stored_pointer =
-            replication_pointer_view(pointer_item.data.as_slice()).map_err(|error| {
-                StorageError::internal(&format!(
-                    "decode table stream pointer for multi-region conflict resolution: {error}"
-                ))
-            })?;
-
+        let stored_pointer = provider
+            .decode_stored_stream_pointer(&pointer_item)
+            .await
+            .map_err(StreamError::into_storage_enum)?;
         Ok(Some(
             stored_pointer
                 .replication_metadata()
                 .cloned()
-                .unwrap_or_else(|| synthesize_legacy_local_replication_metadata(&latest_item)),
+                .unwrap_or_else(|| synthesize_untracked_local_replication_metadata(&latest_item)),
         ))
     }
 
@@ -253,13 +211,25 @@ impl DatabaseManager {
         &self,
         prepared: PreparedReplicationMutation,
     ) -> StorageResult<ReplicationMutationApplyOutcome> {
+        let connection_id = prepared
+            .connection_id
+            .as_deref()
+            .unwrap_or(ROUTED_DEFAULT_CONNECTION_ID);
         let current_winner = self
-            .resolve_current_replication_winner(
-                Arc::clone(&prepared.read_provider),
-                &prepared.read_table_name,
-                &prepared.key_schema,
-                &prepared.mutation.key,
-            )
+            .run_control_admitted(connection_id, {
+                let table_name = prepared.read_table_name.clone();
+                let key_schema = prepared.key_schema.clone();
+                let key = prepared.mutation.key.clone();
+                move |provider| async move {
+                    self.resolve_current_replication_winner(
+                        provider,
+                        &table_name,
+                        &key_schema,
+                        &key,
+                    )
+                    .await
+                }
+            })
             .await?;
 
         self.apply_prepared_replication_mutation_against_current_winner(prepared, current_winner)
@@ -291,6 +261,7 @@ impl DatabaseManager {
         if let Some(route) = prepared.route.as_ref() {
             self.execute_routed_write_targets(
                 route,
+                crate::database_manager::core::AdmissionLane::Control,
                 "replication mutation route had no write targets",
                 |provider, target, _target_index, target_role| {
                     let mut provider_mutation = prepared.mutation.clone();
@@ -309,12 +280,17 @@ impl DatabaseManager {
             return Ok(());
         }
 
-        record_storage_operation(
-            "apply_replication_mutation",
-            prepared
-                .read_provider
-                .apply_replication_mutation(prepared.mutation),
-        )
+        let connection_id = prepared
+            .connection_id
+            .as_deref()
+            .unwrap_or(ROUTED_DEFAULT_CONNECTION_ID);
+        self.run_control_admitted(connection_id, |provider| async move {
+            record_storage_operation(
+                "apply_replication_mutation",
+                provider.apply_replication_mutation(prepared.mutation),
+            )
+            .await
+        })
         .await?;
         Ok(())
     }
@@ -409,15 +385,17 @@ impl DatabaseManager {
         table_name: &TableName,
         key: &HashMap<String, AttributeValue>,
     ) -> StorageResult<Option<ReplicationEventMetadata>> {
-        let provider = Arc::clone(self.database_trait_provider());
-        let key_schema =
-            record_storage_operation("get_table_info", provider.get_table_info(table_name))
-                .await?
-                .key_schema;
-
         let key = storage_types::KeyAttributes::from(key.clone());
-        self.resolve_current_replication_winner(provider, table_name, &key_schema, &key)
-            .await
+        let table_name = table_name.clone();
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+            let key_schema =
+                record_storage_operation("get_table_info", provider.get_table_info(&table_name))
+                    .await?
+                    .key_schema;
+            self.resolve_current_replication_winner(provider, &table_name, &key_schema, &key)
+                .await
+        })
+        .await
     }
 
     async fn apply_prepared_replication_mutation_group(
@@ -427,13 +405,25 @@ impl DatabaseManager {
         let first = group
             .first()
             .ok_or_else(|| StorageError::internal("missing grouped replication mutation"))?;
+        let connection_id = first
+            .connection_id
+            .as_deref()
+            .unwrap_or(ROUTED_DEFAULT_CONNECTION_ID);
         let mut current_winner = self
-            .resolve_current_replication_winner(
-                Arc::clone(&first.read_provider),
-                &first.read_table_name,
-                &first.key_schema,
-                &first.mutation.key,
-            )
+            .run_control_admitted(connection_id, {
+                let table_name = first.read_table_name.clone();
+                let key_schema = first.key_schema.clone();
+                let key = first.mutation.key.clone();
+                move |provider| async move {
+                    self.resolve_current_replication_winner(
+                        provider,
+                        &table_name,
+                        &key_schema,
+                        &key,
+                    )
+                    .await
+                }
+            })
             .await?;
         let mut outcomes = Vec::with_capacity(group.len());
         for prepared_mutation in group {
@@ -467,9 +457,12 @@ async fn find_table_stream_pointer_for_item_version(
             .await
             .map_err(StreamError::into_storage_enum)?;
         for pointer_item in &page.items {
-            if replication_pointer_view(pointer_item.data.as_slice())
-                .map(|pointer| pointer.matches_item_version(item_stream_name, item_stream_version))
-                .unwrap_or(false)
+            let pointer = provider
+                .decode_stored_stream_pointer(pointer_item)
+                .await
+                .map_err(StreamError::into_storage_enum)?;
+            if pointer.stream_name() == item_stream_name
+                && pointer.target_item_stream_version() == item_stream_version
             {
                 return Ok(Some(pointer_item.clone()));
             }
@@ -482,12 +475,6 @@ async fn find_table_stream_pointer_for_item_version(
             return Ok(None);
         }
     }
-}
-
-pub(super) fn replication_pointer_view(
-    data: &[u8],
-) -> StorageResult<StoredStreamPointerReplicationView> {
-    storage_types::storage_serde::from_bytes::<StoredStreamPointerReplicationView>(data)
 }
 
 fn compare_replication_lww(
@@ -568,9 +555,9 @@ fn prepared_replication_batch_group_key(
     })
 }
 
-fn synthesize_legacy_local_replication_metadata(item: &StreamItem) -> ReplicationEventMetadata {
+fn synthesize_untracked_local_replication_metadata(item: &StreamItem) -> ReplicationEventMetadata {
     ReplicationEventMetadata {
-        origin_region: LEGACY_LOCAL_REPLICATION_ORIGIN_REGION.to_string(),
+        origin_region: UNTRACKED_LOCAL_REPLICATION_ORIGIN_REGION.to_string(),
         origin_sequence: item.id,
         origin_hlc: ReplicationHybridLogicalClock {
             physical_ms: item.created_at,

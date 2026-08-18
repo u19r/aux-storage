@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use storage_types::{StorageError, StorageResult};
+use storage_types::{FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS, StorageError, StorageResult};
 
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -75,13 +75,25 @@ pub struct RocksdbSettings {
     pub immediate_gsi_consistency: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FoundationDbSettings {
     pub cluster_file: Option<String>,
     pub tenant_name: Option<String>,
     pub subspace_prefix: Option<String>,
     pub cache_read_version_ms: u16,
     pub immediate_gsi_consistency: bool,
+}
+
+impl Default for FoundationDbSettings {
+    fn default() -> Self {
+        Self {
+            cluster_file: None,
+            tenant_name: None,
+            subspace_prefix: None,
+            cache_read_version_ms: FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS,
+            immediate_gsi_consistency: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

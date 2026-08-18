@@ -5,19 +5,22 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         &self,
         table_name: &TableName,
         item: &WireItem,
+        indexers: Option<&[String]>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<usize> {
         if aux_item_stream_ttl_hours.is_some() {
             let payload_len = item.payload_len();
-            self.put_item_with_stream_ttl(
-                table_name.clone(),
-                item.clone().into_attribute_map()?,
-                None,
-                None,
-                None,
-                None,
+            self.put_item_with_stream_ttl_impl(put_item::PutItemInput {
+                table_name: table_name.clone(),
+                item: item.clone().into_attribute_map()?,
+                indexers: indexers.map(<[String]>::to_vec),
+                condition_expression: None,
+                expression_attribute_names: None,
+                expression_attribute_values: None,
+                return_values: None,
+                return_old_on_condition_failure: false,
                 aux_item_stream_ttl_hours,
-            )
+            })
             .await?;
             return Ok(payload_len);
         }
@@ -51,7 +54,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         } else {
             None
         };
-        let value = encode_wire_item_storage_bytes(item)?;
+        let value = encode_wire_item_storage_bytes(
+            self.kv_store.item_value_codec(),
+            item,
+            indexers,
+            table_info.max_indexers,
+        )?;
 
         if should_write_gsi_immediately {
             self.apply_batch_encode_put_item_with_immediate_gsi(
@@ -60,6 +68,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 &table_info,
                 ttl_config.as_ref(),
                 item,
+                indexers,
                 &item_key_bytes,
                 &value,
                 should_write_stream,
@@ -72,6 +81,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 &table_info,
                 ttl_config.as_ref(),
                 item,
+                indexers,
                 &item_key,
                 item_key_bytes,
                 item_key_token.as_deref(),
@@ -110,7 +120,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 ));
             };
 
-            let item = normalized_wire_item_for_write(&put_request.item)?;
+            let item = normalized_wire_item_for_write(put_request.item.item())?;
             let mapped_item = item.to_attribute_map()?;
             let item_key = ItemKey::from_key_schema(
                 table_info.table_name.clone(),
@@ -118,10 +128,20 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 &mapped_item,
             )?;
             let item_key = table_keys::item_key(table_identity, &item_key)?;
+            let declaration = IndexerDeclaration::try_new(
+                put_request
+                    .item
+                    .indexer_names()
+                    .map_or_else(Vec::new, std::borrow::Cow::into_owned),
+                table_info.max_indexers,
+            )?;
             total_bytes_written += item.payload_len();
             keys.push(item_key);
-            planned_values.push(encode_wire_item_storage_bytes(item.as_ref())?);
-            planned_items.push(mapped_item);
+            planned_values.push(encode_indexed_wire_item(
+                self.kv_store.item_value_codec(),
+                &IndexedWireItem::extract(&mapped_item, &declaration)?,
+            )?);
+            planned_items.push((mapped_item, declaration));
         }
 
         let old_values = self.kv_store.multi_get(keys, true).await?;
@@ -130,16 +150,22 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             self.requires_immediate_gsi_updates(table_info),
         );
         let mut operations = Vec::with_capacity(write_requests.len() * 7);
-        for ((mapped_item, value), old_value) in
+        for (((mapped_item, declaration), value), old_value) in
             planned_items.iter().zip(planned_values).zip(old_values)
         {
             let old_item = old_value
                 .as_deref()
-                .map(decode_wire_item_from_storage_bytes)
+                .map(|bytes| {
+                    decode_wire_item_with_indexers_from_storage_bytes(
+                        self.kv_store.item_value_codec(),
+                        bytes,
+                        table_info.max_indexers,
+                    )
+                })
                 .transpose()?;
             let old_item_map = old_item
                 .as_ref()
-                .map(WireItem::to_attribute_map)
+                .map(|(item, _)| item.to_attribute_map())
                 .transpose()?;
             if mapped_item.is_empty() {
                 return Err(StorageError::validation(
@@ -158,29 +184,31 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             });
             if should_write_stream {
                 let stream_item_id = next_stream_item_id();
-                let stream_entries =
-                    crate::stream::helpers::create_item_update_stream_entries_wire_encoded(
-                        crate::stream::helpers::StreamEntryContext {
-                            table_identity,
-                            table_name: &table_info.table_name,
-                            item_key: &item_key,
-                        },
-                        value.as_slice(),
-                        old_value.as_deref(),
-                        stream_item_id,
-                        false,
-                        None,
-                    )?;
+                let stream_entries = crate::stream::helpers::create_item_update_stream_entries(
+                    crate::stream::helpers::StreamEntryContext {
+                        table_identity,
+                        table_name: &table_info.table_name,
+                        item_key: &item_key,
+                        indexers: declaration.names(),
+                        old_indexers: old_item.as_ref().map(|(_, indexers)| indexers.as_slice()),
+                    },
+                    mapped_item,
+                    old_item_map.as_ref(),
+                    stream_item_id,
+                    false,
+                    None,
+                )?;
                 operations.extend(stream_entries.into_iter().map(|(template, value)| {
                     DirectWriteOperation::PutTemplate { template, value }
                 }));
             }
             operations.extend(
-                Self::gsi_batch_mutations_for_items(
+                self.gsi_batch_mutations_for_items(
                     table_identity,
                     table_info,
                     old_item_map.as_ref(),
                     Some(mapped_item),
+                    Some(declaration),
                 )?
                 .into_iter()
                 .map(|item| match item.value {
@@ -262,6 +290,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &StoredTableInfo,
         ttl_config: Option<&TtlConfigRecord>,
         item: &WireItem,
+        indexers: Option<&[String]>,
         item_key_bytes: &[u8],
         value: &[u8],
         should_write_stream: bool,
@@ -271,21 +300,30 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .get(item_key_bytes, true)
             .await?
             .as_deref()
-            .map(decode_wire_item_from_storage_bytes)
+            .map(|bytes| {
+                decode_wire_item_from_storage_bytes(
+                    self.kv_store.item_value_codec(),
+                    bytes,
+                    table_info.max_indexers,
+                )
+            })
             .transpose()?;
         let old_item_map = old_item
             .as_ref()
             .map(WireItem::to_attribute_map)
             .transpose()?;
         let mapped_item = item.to_attribute_map()?;
-        let mut batch_items = Self::prepare_batch_put_item(
-            table_name,
-            &table_metadata.identity,
-            table_info,
+        let mut batch_items = self.prepare_batch_put_item(
+            crate::storage_ops::write_helpers::BatchMutationContext {
+                table_name,
+                table_identity: &table_metadata.identity,
+                table_info,
+                should_write_to_stream: should_write_stream,
+                immediate_gsi_consistency: true,
+            },
             &mapped_item,
-            should_write_stream,
+            indexers,
             old_item_map.as_ref(),
-            true,
         )?;
         batch_items.extend(Self::ttl_index_mutations_for_items(
             table_name,
@@ -310,6 +348,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &StoredTableInfo,
         ttl_config: Option<&TtlConfigRecord>,
         item: &WireItem,
+        indexers: Option<&[String]>,
         item_key: &ItemKey,
         item_key_bytes: Vec<u8>,
         item_key_token: Option<&str>,
@@ -319,31 +358,43 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         should_track_ttl: bool,
     ) -> StorageResult<()> {
         let old_bytes = self.kv_store.get(&item_key_bytes, true).await?;
-        let old_item = if should_track_ttl {
+        let old_item = if should_write_stream || should_track_ttl {
             old_bytes
                 .as_deref()
-                .map(decode_wire_item_from_storage_bytes)
+                .map(|bytes| {
+                    decode_wire_item_with_indexers_from_storage_bytes(
+                        self.kv_store.item_value_codec(),
+                        bytes,
+                        table_info.max_indexers,
+                    )
+                })
                 .transpose()?
         } else {
             None
         };
+        let item_map = item.to_attribute_map()?;
+        let old_item_map = old_item
+            .as_ref()
+            .map(|(item, _)| item.to_attribute_map())
+            .transpose()?;
 
         let mut operations = Vec::with_capacity(6);
         if should_write_stream {
             let stream_item_id = next_stream_item_id();
-            let stream_entries =
-                crate::stream::helpers::create_item_update_stream_entries_wire_encoded(
-                    crate::stream::helpers::StreamEntryContext {
-                        table_identity: &table_metadata.identity,
-                        table_name,
-                        item_key,
-                    },
-                    value.as_slice(),
-                    old_bytes.as_deref(),
-                    stream_item_id,
-                    false,
-                    None,
-                )?;
+            let stream_entries = crate::stream::helpers::create_item_update_stream_entries(
+                crate::stream::helpers::StreamEntryContext {
+                    table_identity: &table_metadata.identity,
+                    table_name,
+                    item_key,
+                    indexers: indexers.unwrap_or_default(),
+                    old_indexers: old_item.as_ref().map(|(_, indexers)| indexers.as_slice()),
+                },
+                &item_map,
+                old_item_map.as_ref(),
+                stream_item_id,
+                false,
+                None,
+            )?;
             operations.extend(stream_entries.into_iter().map(|(template, value)| {
                 TransactWriteOperation::PutTemplate {
                     template,
@@ -358,7 +409,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 &table_metadata.identity,
                 table_info,
                 ttl_config,
-                old_item.as_ref(),
+                old_item.as_ref().map(|(item, _)| item),
                 Some(item),
                 item_key_token,
                 projected_ttl_value,

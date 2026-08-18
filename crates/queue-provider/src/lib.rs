@@ -3,6 +3,8 @@
 //! This is the stable provider surface for queue consumers.
 
 mod config;
+#[cfg(test)]
+mod config_tests;
 mod constants;
 mod errors;
 mod newtypes;

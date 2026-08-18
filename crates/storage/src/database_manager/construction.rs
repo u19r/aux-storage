@@ -11,6 +11,7 @@ use stream::StreamProvider;
 use tokio::sync::RwLock;
 
 use crate::{
+    admission::AdmissionRegistry,
     cache_coordinator::{StorageAuthoritativeCacheOptions, StorageCacheServices},
     create_storage_provider_bundle,
     database_manager::{DatabaseManager, DatabaseManagerRuntimeOptions},
@@ -250,9 +251,28 @@ impl DatabaseManager {
         let supports_multi_region_replication_control_plane = default_connection
             .backend_type
             .supports_multi_region_replication_control_plane();
+        let supports_read_sequence_mapped_range =
+            connection_supports_read_sequence_mapped_range(default_connection);
+        let admission_configs = registry
+            .connections
+            .iter()
+            .map(|(connection_id, connection)| {
+                admission_config_for_connection(runtime_options.admission_config, connection)
+                    .map(|config| (connection_id.clone(), config))
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let admission_registry = AdmissionRegistry::new_with_connection_configs(
+            registry.default_connection_id.clone(),
+            admission_configs,
+            runtime_options.admission_config,
+        )
+        .map_err(|error| StorageError::validation(error.to_string()))?;
+        let default_admission_controller = admission_registry.default_controller().clone();
         let read_sequence_capabilities =
             read_sequence_capabilities_for_connection(default_connection);
         let mut providers: HashMap<String, Arc<dyn DatabaseTrait>> =
+            HashMap::with_capacity(registry.connections.len());
+        let mut background_providers: HashMap<String, Arc<dyn DatabaseTrait>> =
             HashMap::with_capacity(registry.connections.len());
         let mut queue_providers: HashMap<String, Arc<dyn queue_provider::QueueProvider>> =
             HashMap::with_capacity(registry.connections.len());
@@ -278,6 +298,7 @@ impl DatabaseManager {
             )
             .await
             .with_context(|| format!("create storage provider for connection {connection_id}"))?;
+            let background_provider = bundle.background_database;
             let provider = bundle.database;
             provider
                 .initialize_storage()
@@ -294,6 +315,9 @@ impl DatabaseManager {
             if let Some(pubsub_provider) = bundle.pubsub {
                 pubsub_providers.insert(connection_id.clone(), pubsub_provider);
             }
+            if let Some(background_provider) = background_provider {
+                background_providers.insert(connection_id.clone(), background_provider);
+            }
             providers.insert(connection_id.clone(), Arc::from(provider));
         }
 
@@ -306,6 +330,9 @@ impl DatabaseManager {
                     registry.default_connection_id
                 ))
             })?;
+        let default_background_provider = background_providers
+            .get(&registry.default_connection_id)
+            .cloned();
 
         let run_gsi_maintenance = runtime_options
             .run_gsi_maintenance_after_write
@@ -320,22 +347,13 @@ impl DatabaseManager {
             Arc::clone(&default_provider),
             runtime_options.enable_background_refresh,
         ));
-        // Best effort preload to warm ST routes on process boot.
-        let _ = route_resolver.preload_shared_table_namespaces().await;
-        let cutover_watcher_task = if runtime_options.enable_background_watchers {
-            Some(
-                Arc::new(CutoverWatcher::new(
-                    Arc::clone(&route_resolver),
-                    Arc::clone(&default_provider),
-                ))
-                .start(),
-            )
-        } else {
-            None
-        };
-
-        let manager = Self {
+        // Start the watcher only after the manager has created its system
+        // tables. The watcher performs a control-plane query immediately;
+        // starting it here races that query with creation of `sys` and can
+        // consume the only foreground connection in a one-connection pool.
+        let mut manager = Self {
             storage: default_provider,
+            background_storage: default_background_provider,
             queue_provider: queue_providers
                 .get(&registry.default_connection_id)
                 .cloned(),
@@ -343,6 +361,7 @@ impl DatabaseManager {
                 .get(&registry.default_connection_id)
                 .cloned(),
             connection_registry: Some(providers),
+            admission_registry,
             route_resolver: Some(route_resolver),
             request_rewriter: NamespaceRequestRewriter::new(),
             single_node_sync_mode: runtime_options.enable_single_node_sync_mode,
@@ -352,17 +371,30 @@ impl DatabaseManager {
                 query_proof_cache,
                 runtime_options.authoritative_cache_options,
             ),
-            cutover_watcher_task,
+            cutover_watcher_task: None,
             run_gsi_maintenance,
             #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: runtime_options.pause_after_storage_write.clone(),
             supports_multi_region_replication_control_plane,
+            supports_read_sequence_mapped_range,
             read_sequence_capabilities,
             table_info_cache: RwLock::new(HashMap::new()),
         };
         Tables::create_sys_namespaces_table(&manager)
             .await
             .context("create sys namespaces table during database manager construction")?;
+        // Best effort preload to warm ST routes on process boot. This is a
+        // control-plane query and must use the reserved admission lane.
+        if let Some(route_resolver) = manager.route_resolver.as_ref().cloned() {
+            let _ = manager
+                .run_control_admitted(
+                    registry.default_connection_id.as_str(),
+                    move |_provider| async move {
+                        route_resolver.preload_shared_table_namespaces().await
+                    },
+                )
+                .await;
+        }
         Tables::create_sys_analytics_table(&manager)
             .await
             .context("create sys analytics table during database manager construction")?;
@@ -373,22 +405,59 @@ impl DatabaseManager {
             .maybe_create_sys_storage_replication_table()
             .await
             .context("create sys storage replication table during database manager construction")?;
+        if let Some(providers) = manager.connection_registry.as_ref() {
+            for provider in providers.values() {
+                provider
+                    .complete_initialization()
+                    .await
+                    .context("complete storage provider initialization")?;
+            }
+        }
+        if runtime_options.enable_background_watchers
+            && let Some(route_resolver) = manager.route_resolver.as_ref().cloned()
+        {
+            manager.cutover_watcher_task = Some(
+                Arc::new(CutoverWatcher::new(
+                    route_resolver,
+                    Arc::clone(&manager.storage),
+                    default_admission_controller,
+                ))
+                .start(),
+            );
+        }
         Ok(manager)
     }
 
+    /// Return the provider for bounded background/control work which cannot
+    /// use the request-oriented `DatabaseManager` methods directly.
+    ///
+    /// Postgres returns a provider backed by its independent background pool;
+    /// backends without a separate pool use the foreground provider. Foreground
+    /// request paths must use an admitted provider handle instead.
     #[must_use]
-    pub fn storage_provider(&self) -> Arc<dyn StorageProvider> {
-        self.storage.clone()
+    pub fn maintenance_provider(&self) -> Arc<dyn StorageProvider> {
+        self.background_storage
+            .clone()
+            .map(|provider| provider as Arc<dyn StorageProvider>)
+            .unwrap_or_else(|| self.storage.clone())
     }
 
-    pub fn new_with_mocks<T>(storage: Arc<T>) -> Self
+    pub fn new_with_mocks<T>(storage: Arc<T>) -> StorageResult<Self>
     where T: StorageProvider + StreamProvider + 'static {
         let storage: Arc<dyn DatabaseTrait> = storage;
-        Self {
+        let admission_registry = AdmissionRegistry::new(
+            "default",
+            ["default".to_string()],
+            crate::admission::AdmissionConfig::default(),
+        )
+        .map_err(|error| StorageError::validation(error.to_string()))?;
+        Ok(Self {
             storage,
+            background_storage: None,
             queue_provider: None,
             pubsub_provider: None,
             connection_registry: None,
+            admission_registry,
             route_resolver: None,
             request_rewriter: NamespaceRequestRewriter::new(),
             single_node_sync_mode: false,
@@ -403,10 +472,15 @@ impl DatabaseManager {
             #[cfg(all(test, feature = "cache-write-planner"))]
             pause_after_storage_write: None,
             supports_multi_region_replication_control_plane: true,
+            supports_read_sequence_mapped_range: false,
             read_sequence_capabilities: ReadSequenceProviderCapabilities::default(),
             table_info_cache: RwLock::new(HashMap::new()),
-        }
+        })
     }
+}
+
+fn connection_supports_read_sequence_mapped_range(connection: &StorageConnectionConfig) -> bool {
+    matches!(connection.backend_type, StorageBackend::FoundationDb)
 }
 
 pub(super) fn read_sequence_capabilities_for_connection(
@@ -468,4 +542,40 @@ fn connection_immediate_gsi_consistency(connection: &StorageConnectionConfig) ->
             .is_some_and(|settings| settings.immediate_gsi_consistency),
         StorageBackend::Remote => false,
     }
+}
+
+pub(super) fn admission_config_for_connection(
+    common: crate::admission::AdmissionConfig,
+    connection: &StorageConnectionConfig,
+) -> StorageResult<crate::admission::AdmissionConfig> {
+    if !matches!(connection.backend_type, StorageBackend::Postgres) {
+        return Ok(common);
+    }
+
+    let pool_size = connection
+        .postgres
+        .as_ref()
+        .map(|settings| settings.max_pool_size)
+        .ok_or_else(|| StorageError::validation("postgres connection is missing pool settings"))?;
+    if pool_size == 0 {
+        return Err(StorageError::validation(
+            "postgres max_pool_size must be greater than zero",
+        ));
+    }
+
+    let effective_maximum = common.effective_maximum().min(pool_size);
+    if effective_maximum < common.minimum_concurrency {
+        return Err(StorageError::validation(format!(
+            "postgres max_pool_size ({pool_size}) is below admission minimum_concurrency ({})",
+            common.minimum_concurrency
+        )));
+    }
+    let maximum_concurrency = effective_maximum
+        .checked_add(common.control_reserve_concurrency)
+        .ok_or_else(|| StorageError::validation("postgres admission maximum overflow"))?;
+    crate::admission::AdmissionConfig::try_new(crate::admission::AdmissionConfig {
+        maximum_concurrency,
+        ..common
+    })
+    .map_err(|error| StorageError::validation(error.to_string()))
 }

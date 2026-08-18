@@ -37,6 +37,7 @@ impl StorageApiManagerImpl {
             key_schema: table_info.key_schema,
             table_size_bytes: table_info.table_size_bytes,
             item_count: table_info.item_count,
+            max_indexers: table_info.max_indexers,
             table_arn: Self::table_arn(&table_info.table_name),
             replicas: None,
             multi_region_consistency: None,

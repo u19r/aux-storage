@@ -284,8 +284,16 @@ fn default_database_dir(backend: &str, seed: u64) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let run_id = format!("{}-{}-{}", std::process::id(), seed, started_at_nanos);
-    Path::new("/tmp")
-        .join("auxfn-multi-region")
+    workspace_root()
+        .join("run-artifacts/storage-api-multi-region")
         .join(backend)
         .join(run_id)
+}
+
+fn workspace_root() -> PathBuf {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map_or_else(|| manifest_dir.to_path_buf(), Path::to_path_buf)
 }

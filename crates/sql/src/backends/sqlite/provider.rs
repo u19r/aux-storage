@@ -190,11 +190,8 @@ impl SQLiteStorageProvider {
         database_path: &str,
         settings: SqliteSettings,
     ) -> StorageResult<Self> {
-        let use_memory_db = database_path == ":memory:"
-            || (!settings.force_file_backed_database
-                && (cfg!(test)
-                    || std::env::var("RUST_TEST_THREADS").is_ok()
-                    || database_path.contains("test")));
+        let use_memory_db =
+            database_path == ":memory:" || (!settings.force_file_backed_database && cfg!(test));
 
         let final_path = if use_memory_db {
             ":memory:".to_string()

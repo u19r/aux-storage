@@ -159,6 +159,15 @@ pub enum StorageEnum {
     #[error("Rate of requests exceeds the allowed throughput.")]
     Throttled { message: String },
 
+    /// Local admission rejected work before a provider operation started.
+    /// This is intentionally distinct from upstream throttling, which maps to
+    /// DynamoDB's 429 response.
+    #[error("Storage is temporarily unavailable.")]
+    ServiceUnavailable {
+        message: String,
+        retry_after_seconds: u64,
+    },
+
     #[error("Too many operations for a given subscriber.")]
     LimitExceeded { message: String },
 
@@ -233,6 +242,13 @@ impl StorageError {
         // Message stored for diagnostics but not exposed in Display (AWS parity).
         Self::Base(StorageEnum::InternalServerError {
             message: message.to_string(),
+        })
+    }
+
+    pub fn service_unavailable(retry_after_seconds: u64) -> Self {
+        Self::Base(StorageEnum::ServiceUnavailable {
+            message: "Storage is temporarily unavailable.".to_string(),
+            retry_after_seconds: retry_after_seconds.max(1),
         })
     }
 

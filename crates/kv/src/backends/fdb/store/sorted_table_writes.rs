@@ -11,7 +11,7 @@ use crate::{
         metrics::{record_fdb_operation, record_fdb_operation_latency},
         store::{FdbTableWriteExecutionError, FoundationDbKvStore},
     },
-    sorted_kv_store::{BatchItem, OldNewItems, TransactWriteTableOperation},
+    sorted_kv_store::{BatchItem, DirectWriteOperation, OldNewItems, TransactWriteTableOperation},
 };
 
 impl FoundationDbKvStore {
@@ -20,12 +20,26 @@ impl FoundationDbKvStore {
         operations: Vec<TransactWriteTableOperation>,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<OldNewItems>> {
+        self.transact_write_table_with_direct_writes_operation(
+            operations,
+            Vec::new(),
+            immediate_gsi_consistency,
+        )
+        .await
+    }
+
+    pub(crate) async fn transact_write_table_with_direct_writes_operation(
+        &self,
+        operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
         if operations.is_empty() {
             return Ok(Vec::new());
         }
 
         let stream_ids = self.build_stream_ids(&operations).await;
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
 
@@ -33,17 +47,18 @@ impl FoundationDbKvStore {
             attempt += 1;
             #[cfg(test)]
             provider_perf::record_amount("foundationdb", "table_write_attempt", 1);
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
             trx.set_option(options::TransactionOption::ReadYourWritesDisable)
                 .map_err(|err| map_fdb_error("disable table-write read-your-writes", err))?;
 
             let execute_started = Instant::now();
             match self
-                .execute_transact_write_table_tx(
+                .execute_transact_write_table_with_direct_writes_tx(
                     &trx,
                     &operations,
+                    &direct_operations,
                     &stream_ids,
-                    prefix.as_ref(),
+                    prefix,
                     immediate_gsi_consistency,
                 )
                 .await
@@ -125,17 +140,13 @@ impl FoundationDbKvStore {
                             );
                             match retry_result {
                                 Ok(mut new_trx) => {
-                                    let candidate_keys = Self::collect_transact_write_table_keys(
-                                        prefix.as_ref(),
-                                        &operations,
-                                    );
                                     self.log_conflict_details(
                                         &new_trx,
                                         "transact_write_table",
                                         attempt,
                                         retryable,
                                         error_code,
-                                        &candidate_keys,
+                                        operations.len(),
                                     )
                                     .await;
                                     new_trx.reset();
@@ -155,8 +166,6 @@ impl FoundationDbKvStore {
                     return Err(storage_err);
                 }
                 Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
-                    let candidate_keys =
-                        Self::collect_transact_write_table_keys(prefix.as_ref(), &operations);
                     trx = self
                         .retry_transaction_after_fdb_error(
                             trx,
@@ -164,7 +173,7 @@ impl FoundationDbKvStore {
                             scope,
                             attempt,
                             error,
-                            &candidate_keys,
+                            operations.len(),
                         )
                         .await?;
                 }
@@ -177,11 +186,11 @@ impl FoundationDbKvStore {
             return Ok(());
         }
 
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let prefixed_items: Vec<BatchItem> = items
             .into_iter()
             .map(|item| BatchItem {
-                key: Self::prefix_bytes(prefix.as_ref(), &item.key),
+                key: Self::prefix_bytes(prefix, &item.key),
                 value: item.value,
             })
             .collect();
@@ -190,7 +199,7 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
             for item in &prefixed_items {
                 match &item.value {
@@ -206,15 +215,13 @@ impl FoundationDbKvStore {
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {
                         Ok(mut new_trx) => {
-                            let candidate_keys: Vec<Vec<u8>> =
-                                prefixed_items.iter().map(|item| item.key.clone()).collect();
                             self.log_conflict_details(
                                 &new_trx,
                                 "batch_write",
                                 attempt,
                                 retryable,
                                 error_code,
-                                &candidate_keys,
+                                prefixed_items.len(),
                             )
                             .await;
                             new_trx.reset();

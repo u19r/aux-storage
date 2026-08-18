@@ -8,7 +8,8 @@ use crate::{
     DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, DYNAMODB_THROTTLING_MESSAGE,
     DYNAMODB_TRANSACTION_CANCELED_MESSAGE, DYNAMODB_TRANSACTION_CONFLICT_MESSAGE,
     DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE, DYNAMODB_UNRECOGNIZED_CLIENT_MESSAGE, StorageEnum,
-    StorageError, StorageValidationKind, dynamodb_table_not_found_message,
+    StorageError, StorageValidationKind, context::WrappedError as _,
+    dynamodb_table_not_found_message,
 };
 
 fn display(err: StorageError) -> String {
@@ -105,6 +106,27 @@ fn throttling_message_canonical() {
     }
     .into();
     assert_eq!(display(err), DYNAMODB_THROTTLING_MESSAGE);
+}
+
+#[test]
+fn local_admission_rejection_is_safe_retryable_and_distinct_from_throttling() {
+    let error = StorageError::service_unavailable(0);
+    let StorageEnum::ServiceUnavailable {
+        message,
+        retry_after_seconds,
+    } = error.to_enum()
+    else {
+        panic!("local admission must use the ServiceUnavailable variant");
+    };
+
+    assert_eq!(message, "Storage is temporarily unavailable.");
+    assert_eq!(*retry_after_seconds, 1);
+    assert_eq!(display(error), "Storage is temporarily unavailable.");
+
+    let upstream = StorageError::Base(StorageEnum::Throttled {
+        message: "provider pressure".to_string(),
+    });
+    assert!(matches!(upstream.to_enum(), StorageEnum::Throttled { .. }));
 }
 
 #[test]

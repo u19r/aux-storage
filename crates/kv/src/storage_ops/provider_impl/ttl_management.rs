@@ -83,8 +83,15 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             TimeToLiveStatus::Enabling,
         );
         if !ttl_gsi_exists(table_info, &gsi_name) {
-            add_ttl_gsi(table_info, gsi_name.clone(), attribute_name);
-            self.save_table_info(table_name, table_info).await?;
+            let (updated_metadata, ()) = self
+                .mutate_table_info(table_name, |current, _identity| {
+                    if !ttl_gsi_exists(current, &gsi_name) {
+                        add_ttl_gsi(current, gsi_name.clone(), attribute_name.clone());
+                    }
+                    Ok(())
+                })
+                .await?;
+            *table_info = updated_metadata.table_info;
         }
         self.save_ttl_config(table_name, &config).await?;
 
@@ -105,8 +112,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         existing_config: Option<TtlConfigRecord>,
     ) -> StorageResult<UpdateTimeToLiveResponse> {
         if let Some(config) = existing_config {
-            remove_ttl_gsi(table_info, &config);
-            self.save_table_info(table_name, table_info).await?;
+            let (updated_metadata, ()) = self
+                .mutate_table_info(table_name, |current, _identity| {
+                    remove_ttl_gsi(current, &config);
+                    Ok(())
+                })
+                .await?;
+            *table_info = updated_metadata.table_info;
             self.delete_ttl_storage(table_name, &config).await?;
             self.delete_ttl_config(table_name).await?;
             time_to_live_specification.attribute_name = config.attribute_name;

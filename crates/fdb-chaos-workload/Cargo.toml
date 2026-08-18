@@ -5,6 +5,9 @@ license.workspace = true
 name = "fdb-chaos-workload"
 version = "0.1.0"
 
+[package.metadata.cargo-machete]
+ignored = ["foundationdb"]
+
 [lib]
 doctest = false
 name = "aux_storage_fdb_chaos"

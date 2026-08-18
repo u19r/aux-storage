@@ -19,6 +19,8 @@ struct SurfaceGate {
     table_metadata_imported: bool,
     #[serde(rename = "itemRecordsImported")]
     item_records_imported: bool,
+    #[serde(rename = "indexerMetadataImported")]
+    indexer_metadata_imported: bool,
     #[serde(rename = "durableRevisionsImported")]
     durable_revisions_imported: bool,
     #[serde(rename = "streamRecordsImported")]
@@ -88,6 +90,7 @@ impl Default for PromotedLearnerSurfaceDriver {
                 learner_promoted: false,
                 table_metadata_imported: false,
                 item_records_imported: false,
+                indexer_metadata_imported: false,
                 durable_revisions_imported: false,
                 stream_records_imported: false,
                 ttl_records_imported: false,
@@ -121,6 +124,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                 learnerPromoted: bool,
                 tableMetadataImported: bool,
                 itemRecordsImported: bool,
+                indexerMetadataImported: bool,
                 durableRevisionsImported: bool,
                 streamRecordsImported: bool,
                 ttlRecordsImported: bool,
@@ -141,6 +145,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                     learner_promoted: learnerPromoted,
                     table_metadata_imported: tableMetadataImported,
                     item_records_imported: itemRecordsImported,
+                    indexer_metadata_imported: indexerMetadataImported,
                     durable_revisions_imported: durableRevisionsImported,
                     stream_records_imported: streamRecordsImported,
                     ttl_records_imported: ttlRecordsImported,
@@ -162,6 +167,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                 learnerPromoted: bool?,
                 tableMetadataImported: bool?,
                 itemRecordsImported: bool?,
+                indexerMetadataImported: bool?,
                 durableRevisionsImported: bool?,
                 streamRecordsImported: bool?,
                 ttlRecordsImported: bool?,
@@ -182,6 +188,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                     Some(learner_promoted),
                     Some(table_metadata_imported),
                     Some(item_records_imported),
+                    Some(indexer_metadata_imported),
                     Some(durable_revisions_imported),
                     Some(stream_records_imported),
                     Some(ttl_records_imported),
@@ -201,6 +208,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                     learnerPromoted,
                     tableMetadataImported,
                     itemRecordsImported,
+                    indexerMetadataImported,
                     durableRevisionsImported,
                     streamRecordsImported,
                     ttlRecordsImported,
@@ -221,6 +229,7 @@ impl Driver for PromotedLearnerSurfaceDriver {
                         learner_promoted,
                         table_metadata_imported,
                         item_records_imported,
+                        indexer_metadata_imported,
                         durable_revisions_imported,
                         stream_records_imported,
                         ttl_records_imported,
@@ -250,6 +259,7 @@ impl PromotedLearnerSurfaceDriver {
                 learner_promoted: gate.learner_promoted,
                 table_metadata_imported: gate.table_metadata_imported,
                 item_records_imported: gate.item_records_imported,
+                indexer_metadata_imported: gate.indexer_metadata_imported,
                 durable_revisions_imported: gate.durable_revisions_imported,
                 stream_records_imported: gate.stream_records_imported,
                 ttl_records_imported: gate.ttl_records_imported,
@@ -287,6 +297,9 @@ fn decision_name(decision: SyncPromotedLearnerSurfaceDecision) -> &'static str {
             SyncPromotedLearnerSurfaceBlockReason::LearnerNotPromoted => "learner_not_promoted",
             SyncPromotedLearnerSurfaceBlockReason::TableMetadataMissing => "table_metadata_missing",
             SyncPromotedLearnerSurfaceBlockReason::ItemRecordsMissing => "item_records_missing",
+            SyncPromotedLearnerSurfaceBlockReason::IndexerMetadataMissing => {
+                "indexer_metadata_missing"
+            }
             SyncPromotedLearnerSurfaceBlockReason::DurableRevisionsMissing => {
                 "durable_revisions_missing"
             }
@@ -420,6 +433,7 @@ fn ready_promoted_learner_surface_gate() -> SyncPromotedLearnerSurfaceGate {
         learner_promoted: true,
         table_metadata_imported: true,
         item_records_imported: true,
+        indexer_metadata_imported: true,
         durable_revisions_imported: true,
         stream_records_imported: true,
         ttl_records_imported: true,

@@ -1,5 +1,5 @@
 use http_error::HttpApiError;
-use storage::Tables;
+use storage::{AdmissionClass, Tables};
 use storage_types::{
     DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE, DYNAMODB_STREAM_RECORDS_LIMIT_MAX,
     DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE, DYNAMODB_STREAM_RECORDS_LIMIT_MIN,
@@ -250,10 +250,17 @@ impl StorageApiManagerImpl {
         &self,
         table_name: &TableName,
     ) -> Result<Option<String>, HttpApiError> {
-        let page = self
+        let admitted = self
             .db()
-            .stream_provider()
-            .read_backward(storage_types::StreamName::table_stream(table_name), None, 1)
+            .admit_default_provider(AdmissionClass::RangeRead)
+            .await
+            .map_err(HttpApiError::from)?;
+        let page = admitted
+            .run_stream(|provider| async move {
+                provider
+                    .read_backward(storage_types::StreamName::table_stream(table_name), None, 1)
+                    .await
+            })
             .await
             .map_err(stream_error)?;
         Ok(page.items.first().map(|item| item.id.to_string()))

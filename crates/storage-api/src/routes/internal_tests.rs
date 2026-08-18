@@ -358,11 +358,11 @@ async fn system_stream_reads_records_from_a_physical_shared_table() {
     let create_request: CreateTableRequest =
         serde_json::from_value(create_stream_table_body(table_name.as_ref()))
             .expect("shared table request");
-    db.storage_provider()
+    db.maintenance_provider()
         .create_table(&create_request)
         .await
         .expect("create physical shared table");
-    db.storage_provider()
+    db.maintenance_provider()
         .put_item(
             table_name.clone(),
             std::collections::HashMap::from([(
@@ -777,6 +777,7 @@ async fn replication_logical_backfill_import_route_imports_valid_chunk() {
             json!({
                 "SourceRegion": "region-a",
                 "Manifest": {
+                    "protocol_version": 2,
                     "id": "bootstrap-1",
                     "caller": "multi_region_bootstrap",
                     "activation_gate": "replica_activation_cursor",

@@ -9,16 +9,13 @@ use storage_types::{
     AttributeMap, AttributeValue, BatchGetItemRequest, BatchGetItemResponse,
     BatchGetWireItemResponse, KeyAttributes, KeySchemaElement, KeysAndAttributes, StorageEnum,
     StorageError, StoredTableInfo, context::WrappedError as _, normalize_dynamodb_number_for_write,
-    validate_key_attributes_for_schema, validate_transact_key,
+    project_attribute_map, validate_key_attributes_for_schema, validate_transact_key,
 };
 
 use crate::{
     batch_get_wire_response::BatchGetWireResponse,
     manager::{
-        StorageApiManagerImpl,
-        storage_manager_impl_expression::{
-            apply_projection_expression_refs, project_attribute_map,
-        },
+        StorageApiManagerImpl, storage_manager_impl_expression::apply_projection_expression_refs,
     },
     types::Response,
 };

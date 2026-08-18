@@ -163,11 +163,18 @@ impl DatabaseManager {
         self.execute_with_cache_effects(
             PreparedCacheWrite::Effects(cache_effects.clone()),
             || async {
-                let response = record_storage_operation(
-                    "transact_write_items",
-                    self.storage.transact_write_items(request),
-                )
-                .await?;
+                let response = self
+                    .run_default_admitted(
+                        crate::admission::AdmissionClass::Write,
+                        |provider| async move {
+                            record_storage_operation(
+                                "transact_write_items",
+                                provider.transact_write_items(request),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
                 self.maybe_pause_after_storage_write_for_test().await;
                 self.maybe_run_gsi_maintenance().await;
                 Ok(response)
@@ -286,16 +293,23 @@ impl DatabaseManager {
             request_for_connection.return_item_collection_metrics =
                 return_item_collection_metrics.clone();
 
-            let provider = self.provider_for_request_connection(&dispatch_key.connection_id)?;
-            let response = record_storage_operation_for_target(
-                "transact_write_items",
-                dispatch_key.target_role,
-                provider.transact_write_items(batch.request),
-            )
-            .await
-            .map_err(|error| {
-                self.normalize_routed_transaction_error(error, &batch.shared_table_namespaces)
-            })?;
+            let response = self
+                .run_admitted(
+                    &dispatch_key.connection_id,
+                    crate::admission::AdmissionClass::Write,
+                    |provider| async move {
+                        record_storage_operation_for_target(
+                            "transact_write_items",
+                            dispatch_key.target_role,
+                            provider.transact_write_items(batch.request),
+                        )
+                        .await
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    self.normalize_routed_transaction_error(error, &batch.shared_table_namespaces)
+                })?;
             if primary_response.is_none() {
                 primary_response = Some(response);
             }
@@ -355,7 +369,7 @@ impl DatabaseManager {
         if !self.cache_services.authoritative_write_preimages_enabled() {
             return Ok(None);
         }
-        if !self.storage.supports_guarded_transaction_writes() {
+        if !self.default_supports_guarded_transaction_writes() {
             guarded_write::record_unsupported_fallback("transact_write_items");
             return Ok(None);
         }
@@ -373,11 +387,18 @@ impl DatabaseManager {
             request: request.clone(),
             guards,
         };
-        let response = match record_storage_operation(
-            "guarded_transact_write_items",
-            self.storage.guarded_transact_write_items(guarded_request),
-        )
-        .await
+        let response = match self
+            .run_default_admitted(
+                crate::admission::AdmissionClass::Write,
+                |provider| async move {
+                    record_storage_operation(
+                        "guarded_transact_write_items",
+                        provider.guarded_transact_write_items(guarded_request),
+                    )
+                    .await
+                },
+            )
+            .await
         {
             Ok(response) => response,
             Err(error) if guarded_write::should_fallback(&error) => {

@@ -192,7 +192,7 @@ impl StorageCacheServices {
     ) -> StorageResult<()> {
         let version = self.point_read_cache.claim_write_version();
         match proof {
-            DurablePointReadProof::Present { item, revision } => {
+            DurablePointReadProof::Present { item, revision, .. } => {
                 self.point_read_cache
                     .write_put_with_revision(request, &item, revision, version)
                     .await

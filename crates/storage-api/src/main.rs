@@ -4,12 +4,12 @@ use axum::http::HeaderValue;
 use config::{self, StorageApiLaunchConfig, Tracing};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use storage_api::{
-    AppState, HttpReplicationPeerClient, MetricsEndpointConfig, ReplicationRuntimeConfig,
-    ServiceRoutePaths, StorageApiManagerOptions, StorageReplicationRuntime, SyncHealthReporter,
-    SyncLearnerJoinHandler, SyncRaftRpcHandler, SyncReadBarrier, SyncWriteProposer,
-    build_sync_raft_runtime_adapter, ensure_backend_matches, resolve_filter,
-    server_router_with_metrics_and_routes, shutdown_grace_period, spawn_config_watch,
-    storage_config_from_backends,
+    AppState, HttpReplicationPeerClient, MetricsEndpointConfig, ReadSequenceExecutionMode,
+    ReplicationRuntimeConfig, ServiceRoutePaths, StorageApiManagerOptions,
+    StorageReplicationRuntime, SyncHealthReporter, SyncLearnerJoinHandler, SyncRaftRpcHandler,
+    SyncReadBarrier, SyncWriteProposer, build_sync_raft_runtime_adapter, ensure_backend_matches,
+    resolve_filter, server_router_with_metrics_and_routes, shutdown_grace_period,
+    spawn_config_watch, storage_config_from_backends,
 };
 pub use storage_provider::{StorageBackend, StorageConfig};
 use storage_types::{StorageEnum, StorageError, StorageResult, context::WrappedError as _};
@@ -166,11 +166,6 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
         roles = ?effective.root.roles,
         "Loaded configuration"
     );
-    tracing::debug!(
-        target: "config",
-        effective = %config_arc.effective_pretty(),
-        "Effective configuration (after overrides)"
-    );
     let cors_layer = cors_layer(&effective.cors);
 
     let db_manager = Arc::new(
@@ -196,7 +191,7 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     .await?;
     #[cfg(feature = "queue")]
     let queue_manager = {
-        let queue_provider = db_manager.queue_provider().ok_or_else(|| {
+        let queue_provider = db_manager.initialization_queue_provider().ok_or_else(|| {
             StorageError::internal("configured backend does not expose a queue provider")
         })?;
         queue_provider.initialize().await.map_err(|err| {
@@ -207,7 +202,7 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
 
     #[cfg(feature = "pubsub")]
     let pubsub_manager = {
-        let pubsub_provider = db_manager.pubsub_provider().ok_or_else(|| {
+        let pubsub_provider = db_manager.initialization_pubsub_provider().ok_or_else(|| {
             StorageError::internal("configured backend does not expose a pubsub provider")
         })?;
         pubsub_provider.initialize().await.map_err(|err| {
@@ -218,6 +213,9 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
         if let Some(queue_manager) = queue_manager.clone() {
             builder = builder.queue_manager(queue_manager);
         }
+        builder = builder.delivery_admission(Arc::new(StoragePubsubDeliveryAdmission {
+            database: db_manager.clone(),
+        }));
         Some(Arc::new(builder.build().map_err(|err| {
             StorageError::internal(&format!("failed to initialize pubsub manager: {err}"))
         })?))
@@ -238,6 +236,16 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
             sync_health_reporter: sync_raft_runtime
                 .as_ref()
                 .map(|adapter| adapter.clone() as Arc<dyn SyncHealthReporter>),
+            read_sequence_execution_mode: match effective.root.features.read_sequence.mode {
+                config::ReadSequenceExecutionMode::Off => ReadSequenceExecutionMode::Off,
+                config::ReadSequenceExecutionMode::Shadow => ReadSequenceExecutionMode::Shadow,
+                config::ReadSequenceExecutionMode::On => ReadSequenceExecutionMode::On,
+            },
+            read_sequence_shadow_sample_percent: effective
+                .root
+                .features
+                .read_sequence
+                .shadow_sample_percent,
             ..StorageApiManagerOptions::default()
         },
     );
@@ -348,6 +356,33 @@ async fn run(launch: StorageApiLaunchConfig) -> StorageResult<()> {
     server_result.map_err(|err| StorageError::internal(&err.to_string()))?;
 
     Ok(())
+}
+
+#[cfg(feature = "pubsub")]
+struct StoragePubsubDeliveryAdmission {
+    database: Arc<storage::DatabaseManager>,
+}
+
+#[cfg(feature = "pubsub")]
+struct StoragePubsubDeliveryPermit {
+    _permit: storage::ControlPermit,
+}
+
+#[cfg(feature = "pubsub")]
+impl pubsub::PubsubDeliveryPermit for StoragePubsubDeliveryPermit {}
+
+#[cfg(feature = "pubsub")]
+#[async_trait::async_trait]
+impl pubsub::PubsubDeliveryAdmission for StoragePubsubDeliveryAdmission {
+    async fn acquire(&self) -> pubsub::PubsubResult<Box<dyn pubsub::PubsubDeliveryPermit>> {
+        self.database
+            .acquire_default_control_permit()
+            .map(|permit| {
+                Box::new(StoragePubsubDeliveryPermit { _permit: permit })
+                    as Box<dyn pubsub::PubsubDeliveryPermit>
+            })
+            .map_err(pubsub::PubsubError::storage)
+    }
 }
 
 #[cfg(feature = "pubsub")]

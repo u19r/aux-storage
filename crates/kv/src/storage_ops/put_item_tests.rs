@@ -180,6 +180,7 @@ async fn kv_batch_write_put_applies_item_stream_duration_markers() {
                         WriteRequest {
                             put_request: Some(PutRequest {
                                 item: item("A", "1"),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: Some(
                                     StreamRetentionDuration::FiniteHours(1),
                                 ),
@@ -189,6 +190,7 @@ async fn kv_batch_write_put_applies_item_stream_duration_markers() {
                         WriteRequest {
                             put_request: Some(PutRequest {
                                 item: item("B", "1"),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: Some(
                                     StreamRetentionDuration::FiniteHours(2),
                                 ),
@@ -224,6 +226,7 @@ async fn kv_cancelled_transaction_does_not_write_item_duration_marker() {
                     put: Some(TransactPutRequest {
                         table_name: table.clone(),
                         item: item("A", "1"),
+                        indexers: None,
                         condition_expression: None,
                         expression_attribute_names: None,
                         expression_attribute_values: None,

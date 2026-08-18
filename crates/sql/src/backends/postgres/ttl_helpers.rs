@@ -58,20 +58,21 @@ impl PostgresStorageProvider {
         #[cfg(test)]
         provider_perf::record("postgres", "ttl_config_db_lookup", started.elapsed());
         let Some(row) = row else {
-            self.ttl_config_cache
-                .write()
-                .await
-                .insert(table_name.clone(), CachedTtlConfig::new(None));
+            if let Ok(mut cache) = self.ttl_config_cache.try_write() {
+                cache.insert(table_name.clone(), CachedTtlConfig::new(None));
+            }
             return Ok(None);
         };
         let blob: Vec<u8> = row
             .try_get("config_blob")
             .map_err(|err| Self::map_postgres_error("decode ttl config blob", err))?;
         let config: TtlConfigRecord = storage_types::storage_serde::from_bytes(&blob)?;
-        self.ttl_config_cache.write().await.insert(
-            table_name.clone(),
-            CachedTtlConfig::new(Some(config.clone())),
-        );
+        if let Ok(mut cache) = self.ttl_config_cache.try_write() {
+            cache.insert(
+                table_name.clone(),
+                CachedTtlConfig::new(Some(config.clone())),
+            );
+        }
         Ok(Some(config))
     }
 
@@ -111,18 +112,20 @@ impl PostgresStorageProvider {
         config: &TtlConfigRecord,
     ) -> StorageResult<()> {
         let blob = storage_types::storage_serde::to_bytes(config)?;
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
-        client
-            .execute(
-                sql_statements::upsert_ttl_config(),
-                &[&table_name.as_ref(), &blob],
-            )
-            .await
-            .map_err(|err| Self::map_postgres_error("save ttl config", err))?;
+        {
+            let client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            client
+                .execute(
+                    sql_statements::upsert_ttl_config(),
+                    &[&table_name.as_ref(), &blob],
+                )
+                .await
+                .map_err(|err| Self::map_postgres_error("save ttl config", err))?;
+        }
         self.ttl_config_cache.write().await.insert(
             table_name.clone(),
             CachedTtlConfig::new(Some(config.clone())),
@@ -131,15 +134,17 @@ impl PostgresStorageProvider {
     }
 
     pub(super) async fn delete_ttl_config(&self, table_name: &TableName) -> StorageResult<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(Self::map_postgres_client_acquire_error)?;
-        client
-            .execute(sql_statements::delete_ttl_config(), &[&table_name.as_ref()])
-            .await
-            .map_err(|err| Self::map_postgres_error("delete ttl config", err))?;
+        {
+            let client = self
+                .pool
+                .get()
+                .await
+                .map_err(Self::map_postgres_client_acquire_error)?;
+            client
+                .execute(sql_statements::delete_ttl_config(), &[&table_name.as_ref()])
+                .await
+                .map_err(|err| Self::map_postgres_error("delete ttl config", err))?;
+        }
         self.ttl_config_cache
             .write()
             .await

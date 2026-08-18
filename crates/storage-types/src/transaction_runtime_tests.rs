@@ -166,6 +166,7 @@ fn number_table_info() -> StoredTableInfo {
         table_name: TableName::new("transaction_runtime_number_keys"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::now(),
+        max_indexers: crate::MaxIndexers::ZERO,
         attribute_definitions: vec![
             AttributeDefinition {
                 attribute_name: "pk".to_string(),

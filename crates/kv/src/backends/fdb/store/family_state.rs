@@ -17,7 +17,7 @@ use crate::{
 impl FoundationDbKvStore {
     pub(crate) async fn load_partition_family_state_tx(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         family_kind: PartitionFamilyKind,
         family_component: &str,
     ) -> StorageResult<Option<ResolvedPartitionFamily>> {
@@ -56,7 +56,7 @@ impl FoundationDbKvStore {
 
     pub(crate) async fn load_partition_family_state_tx_retryable(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         family_kind: PartitionFamilyKind,
         family_component: &str,
     ) -> Result<Option<ResolvedPartitionFamily>, FdbTransactionAttemptError> {
@@ -97,7 +97,7 @@ impl FoundationDbKvStore {
 
     pub(crate) fn save_partition_family_state_tx(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         family_kind: PartitionFamilyKind,
         family_component: &str,
         family: &ResolvedPartitionFamily,
@@ -131,7 +131,7 @@ impl FoundationDbKvStore {
 
     pub(crate) async fn ensure_ordered_log_family_state_tx(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         stream_name: &StreamName,
     ) -> StorageResult<ResolvedPartitionFamily> {
         let family_component = ordered_log_family_component(stream_name);
@@ -165,7 +165,7 @@ impl FoundationDbKvStore {
 
     pub(crate) async fn ensure_ordered_log_family_state_tx_retryable(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         stream_name: &StreamName,
     ) -> Result<ResolvedPartitionFamily, FdbTransactionAttemptError> {
         let family_component = ordered_log_family_component(stream_name);
@@ -199,7 +199,7 @@ impl FoundationDbKvStore {
 
     pub(crate) async fn ensure_ordered_log_family_state_cached_tx(
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         stream_name: &StreamName,
         cache: &mut OrderedLogFamilyCache,
     ) -> StorageResult<ResolvedPartitionFamily> {

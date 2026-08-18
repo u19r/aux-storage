@@ -20,7 +20,7 @@ fn base_args(storage: Option<PubsubStorageArg>) -> Args {
         foundationdb_cluster_file: None,
         foundationdb_subspace_prefix: None,
         foundationdb_tenant_name: None,
-        foundationdb_cache_read_version_ms: 0,
+        foundationdb_cache_read_version_ms: None,
         foundationdb_report_conflicting_keys: false,
         config: None,
         overrides: Vec::new(),
@@ -118,7 +118,7 @@ fn pubsub_config_overrides_include_foundationdb_runtime_options() {
     args.foundationdb_cluster_file = Some("cluster-file".to_string());
     args.foundationdb_subspace_prefix = Some("pubsub".to_string());
     args.foundationdb_tenant_name = Some("tenant".to_string());
-    args.foundationdb_cache_read_version_ms = 25;
+    args.foundationdb_cache_read_version_ms = Some(25);
     args.foundationdb_report_conflicting_keys = true;
 
     let overrides = pubsub_config_overrides(&args);
@@ -142,6 +142,19 @@ fn pubsub_config_overrides_include_foundationdb_runtime_options() {
     assert!(overrides.contains(&(
         "features.backends.foundationdb.report_conflicting_keys".to_string(),
         "true".to_string(),
+    )));
+}
+
+#[test]
+fn pubsub_cli_explicit_zero_preserves_the_grv_cache_opt_out() {
+    let mut args = base_args(Some(PubsubStorageArg::FoundationDb));
+    args.foundationdb_cache_read_version_ms = Some(0);
+
+    let overrides = pubsub_config_overrides(&args);
+
+    assert!(overrides.contains(&(
+        "features.backends.foundationdb.cache_read_version_ms".to_string(),
+        "0".to_string(),
     )));
 }
 

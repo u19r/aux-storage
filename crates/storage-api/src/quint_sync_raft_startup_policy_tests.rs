@@ -138,7 +138,9 @@ fn storage_config(input: &StartupInput) -> StorageConfig {
 
 fn sync_config(input: &StartupInput) -> StorageSyncReplicationConfig {
     StorageSyncReplicationConfig {
-        data_dir: input.data_dir_configured.then(|| "/tmp/sync".to_string()),
+        data_dir: input
+            .data_dir_configured
+            .then(|| "run-artifacts/storage-api-data/sync".to_string()),
         ..StorageSyncReplicationConfig::default()
     }
 }

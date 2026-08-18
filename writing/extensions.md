@@ -115,12 +115,153 @@ For user-facing invariants, permissions, routing, and account-state lookups, the
 
 Operators should monitor write p95 and p99 latency, transaction retries, item size limits, and backend write pressure when enabling immediate consistency on tables with several GSIs and large item sizes.
 
+## Ordered Item Indexers
+
+`Indexers` is an aux-storage write extension that makes selected top-level
+string attributes directly addressable by provider read plans. It is not a
+DynamoDB secondary index: it does not create a new query surface or change the
+logical item. `GetItem`, `Query`, streams, expressions, projections, billing,
+replication, and backfill continue to see ordinary DynamoDB attributes.
+
+Set the table's maximum declaration length when creating it:
+
+```json
+{
+  "TableName": "ApplicationData",
+  "AttributeDefinitions": [
+    { "AttributeName": "pk", "AttributeType": "S" },
+    { "AttributeName": "sk", "AttributeType": "S" }
+  ],
+  "KeySchema": [
+    { "AttributeName": "pk", "KeyType": "HASH" },
+    { "AttributeName": "sk", "KeyType": "RANGE" }
+  ],
+  "BillingMode": "PAY_PER_REQUEST",
+  "MaxIndexers": 4
+}
+```
+
+`MaxIndexers` defaults to `0` and may be increased, up to `32`, with
+`UpdateTable`. It cannot be decreased. Increasing it updates the base table and
+every GSI atomically from the API's perspective.
+
+Each put may declare a different ordered list of attribute names:
+
+```json
+{
+  "TableName": "ApplicationData",
+  "Item": {
+    "pk": { "S": "tenant#42" },
+    "sk": { "S": "order#7" },
+    "customer_id": { "S": "customer#9" },
+    "related_pk": { "S": "entity#42#sub_model#7#v1" }
+  },
+  "Indexers": ["customer_id", "related_pk", "optional_id"]
+}
+```
+
+The declaration belongs to this item, not the table. Ordinal `0` means
+`customer_id` for this row, but another row may use a different name at ordinal
+`0`. A declared value must be a non-empty top-level `S`; an absent attribute is
+valid and occupies a null slot. Empty strings and every non-string DynamoDB
+type are rejected.
+
+For `PutItem`, batch puts, and transactional puts, omitting `Indexers` means an
+empty declaration. For `UpdateItem` and transactional updates:
+
+- omitting `Indexers` preserves the stored names and order and recomputes their
+  values from the updated logical item;
+- supplying a list replaces the complete declaration; and
+- supplying `[]` clears the declaration while preserving the attributes in the
+  logical item.
+
+Batch puts store `Indexers` inside each `PutRequest`. Transactional puts and
+updates store it inside their respective `Put` or `Update` action. Deletes and
+condition checks do not accept it.
+
+### Declare Indexers on Rust Entities
+
+Rust entity code should declare indexers on fields instead of repeating wire
+attribute names and ordinals at each write and read site:
+
+```rust
+use serde::Serialize;
+use storage::{
+    derive::{SingleTableKeys, WireItemEncode},
+    types::TimestampMillis,
+};
+
+#[derive(Serialize, SingleTableKeys, WireItemEncode)]
+#[single_table(
+    entity_type = "ORDER",
+    pk_lit = "ORDER",
+    sk_expr = "format!(\"ORDER#{}\", self.order_id)"
+)]
+struct Order {
+    order_id: String,
+
+    #[single_table(indexer = 0)]
+    customer_id: String,
+
+    #[single_table(indexer = 1)]
+    related_pk: Option<String>,
+
+    updated_at: TimestampMillis,
+}
+```
+
+Ordinals must be unique and contiguous from `0`. The derive rejects gaps,
+duplicates, more than 32 fields, and duplicate effective wire names. If a field
+uses `#[wire_item(rename = "...")]`, `#[serde(rename = "...")]`, or a supported
+struct `rename_all`, the generated declaration uses that wire name.
+
+`SingleTableKeys` generates the canonical declaration and a typed accessor for
+each indexed field. In this example, `Order::customer_id_indexer()` returns
+`customer_id` at ordinal `0`, while `Order::related_pk_indexer()` returns
+`related_pk` at ordinal `1`. The accessor owns both facts, so application code
+does not repeat either one.
+
+Use the entity write helpers for individual puts and updates. They always apply
+the generated declaration:
+
+```rust
+db.put_item_entity_encode(
+    PutItemEntityEncodeInput::builder()
+        .table_name(table_name.clone())
+        .item(&order)
+        .build(),
+).await?;
+
+db.update_item_entity::<Order>(update).await?;
+```
+
+For a batch or transaction, encode the same typed envelope and place it in the
+put action. The envelope keeps the item and its declaration together through
+retry and provider routing:
+
+```rust
+let item = storage::types::single_table_entity::to_wire_entity(&order)?;
+let put = storage::types::EncodePutRequest::builder()
+    .item(item)
+    .build();
+```
+
+`TransactEncodePutRequest` accepts the same `WireEntity`. Raw encoded items must
+opt out explicitly with `WireEntity::unindexed(wire_item)`; use that only when
+the item intentionally has no declaration.
+
+FoundationDB stores indexed strings in ordered Tuple value slots. SQL stores
+them in nullable `__aux_indexer_n` columns, and RocksDB uses the same versioned
+logical envelope. These representations are internal. Existing data written
+with the superseded value layout is deliberately unsupported; reset and
+recreate development tables when deploying this breaking format.
+
 ## ReadSequence
 
 `ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded
-N+1 read workflows. It runs an ordered sequence of `Get`, `BatchGet`, and
-`Query` steps, lets later steps bind selected attributes from earlier results,
-and returns a nested response that preserves the parent-child relationships.
+N+1 read workflows. It validates a directed acyclic graph of `Get`, `BatchGet`,
+and `Query` nodes, lets nodes bind typed values selected from earlier results,
+and returns flat node and invocation results with explicit input references.
 
 Use it when a workflow cannot be expressed as independent point reads and would
 otherwise require a client to issue one read, inspect the result, then issue a
@@ -143,53 +284,494 @@ x-amz-target: DynamoDB_20120810.ReadSequence
 content-type: application/x-amz-json-1.0
 ```
 
-The request body contains a top-level `ReadConsistency` value and an ordered
-`Sequence` of named read steps. `EVENTUAL` is the default consistency mode.
+The request body contains a top-level `ReadConsistency` value and a `Nodes`
+array. Node array order is only a stable request ordinal; `After` and `Inputs`
+define execution dependencies, so a node may refer to a node declared later in
+the array. `EVENTUAL` is the default consistency mode.
 
 ### Example: Read a User and Its Organization
 
 ```json
 {
   "ReadConsistency": "EVENTUAL",
-  "Sequence": [
+  "Nodes": [
     {
       "Name": "user",
-      "Get": {
-        "TableName": "Users",
-        "Key": {
-          "pk": { "S": "user#1" }
+      "Operation": {
+        "Get": {
+          "TableName": "Users",
+          "Key": {
+            "pk": { "S": "user#1" }
+          }
         }
       },
-      "Select": {
-        "org_id": "$.org_id"
-      }
+      "Inputs": {},
+      "After": []
     },
     {
       "Name": "org",
-      "ForEach": {
-        "From": "user.Item.org_id",
-        "As": "org_id",
-        "OnMissing": "ERROR",
+      "Operation": {
         "Get": {
           "TableName": "Organizations",
           "Key": {
-            "pk": { "S": "${org_id}" }
+            "pk": { "FromInput": "org_id" }
           }
-        },
-        "Join": {
-          "To": "user",
-          "As": "org",
-          "Type": "REQUIRED_ONE"
         }
-      }
+      },
+      "Inputs": {
+        "org_id": {
+          "From": {
+            "Node": "user",
+            "Select": "$.Get.Item.org_id"
+          },
+          "Cardinality": "ONE",
+          "OnMissing": "ERROR"
+        }
+      },
+      "After": []
     }
-  ]
+  ],
+  "Outputs": ["user", "org"]
 }
 ```
 
-The first step reads the user and selects `org_id`. The second step binds that
-selected value into an organization key and attaches the organization result to
-the user result as `org`.
+The second node depends on `user` through its typed `org_id` input. The
+`FromInput` marker is replaced with the selected DynamoDB value before the
+read. `After` may add an ordering dependency that does not bind data. The
+response contains one flat result entry per output node; each invocation
+records the input references that produced it.
+
+#### Input Binding Forms
+
+Use `FromInput` when the selected DynamoDB value should replace the complete
+attribute value. It preserves the selected type, so an `N` remains an `N`, a
+`B` remains a `B`, and an `S` remains an `S`:
+
+```json
+"pk": { "FromInput": "organization_id" }
+```
+
+Use `StringTemplate` when a string key or expression value combines fixed text
+with one or more declared string inputs:
+
+```json
+"pk": {
+  "StringTemplate": "entity#{id}#sub_model#{sub_id}#v1"
+}
+```
+
+Each `{name}` placeholder refers to an entry in the node's `Inputs` object.
+The example above resolves `id = "42"` and `sub_id = "7"` to the DynamoDB
+string value `entity#42#sub_model#7#v1`. A placeholder may appear more than
+once, and one template may combine inputs selected from different earlier
+nodes. The node still has one `Iterate` input: that `MANY` value changes for
+each invocation, while every other input uses its single selected value.
+
+`StringTemplate` always produces an `S` attribute and accepts only selected
+`S` values. It does not coerce `N`, `B`, Boolean, collection, or null values to
+text. A template must contain at least one placeholder; placeholder names use
+ASCII letters, numbers, and underscores, and literal braces are not supported.
+Malformed templates, undeclared placeholders, missing `ERROR` inputs, and
+non-string values fail rather than producing an ambiguous key.
+
+Templates work anywhere `ReadSequence` can bind an attribute value: `Get` and
+`BatchGet` keys, `Query.ExpressionAttributeValues`, a concrete
+`ExclusiveStartKey`, and values nested inside `L` or `M`. Backend whole-plan
+optimizations accept only shapes whose physical keys prove the same binding.
+
+For example, a dependent query can compose an index partition key without
+copying the complete value into its source item:
+
+```json
+"ExpressionAttributeValues": {
+  ":entity": {
+    "StringTemplate": "entity#{entity_id}"
+  }
+}
+```
+
+### Example: Compose and Fan Out Single-Table Keys
+
+This example queries one entity's GSI rows, then exposes each matching item
+through a dependent `Get` result. On FoundationDB, the dependent result comes
+from the stored GSI projection; it does not fetch the base-table row. Configure
+the index projection with every attribute the child returns.
+
+```json
+{
+  "ReadConsistency": "EVENTUAL",
+  "MaxFanoutPerStep": 25,
+  "MaxTotalReadItems": 100,
+  "Nodes": [
+    {
+      "Name": "sub_models",
+      "Operation": {
+        "Query": {
+          "TableName": "ApplicationData",
+          "IndexName": "by_entity",
+          "KeyConditionExpression": "gsi1pk = :entity",
+          "ExpressionAttributeValues": {
+            ":entity": { "S": "entity#42" }
+          }
+        }
+      },
+      "Inputs": {},
+      "After": []
+    },
+    {
+      "Name": "versioned_sub_model",
+      "Operation": {
+        "Get": {
+          "TableName": "ApplicationData",
+          "Key": {
+            "pk": {
+              "StringTemplate": "entity#{entity_id}#sub_model#{sub_id}#v1"
+            }
+          }
+        }
+      },
+      "Inputs": {
+        "entity_id": {
+          "From": {
+            "Node": "sub_models",
+            "Select": "$.Query.Items[0].entity_id"
+          },
+          "Cardinality": "ONE",
+          "OnMissing": "ERROR"
+        },
+        "sub_id": {
+          "From": {
+            "Node": "sub_models",
+            "Select": "$.Query.Items[*].sub_id"
+          },
+          "Cardinality": "MANY",
+          "OnMissing": "SKIP"
+        }
+      },
+      "Iterate": "sub_id",
+      "After": []
+    }
+  ],
+  "Outputs": ["sub_models", "versioned_sub_model"]
+}
+```
+
+For each `sub_id`, `versioned_sub_model` receives the same scalar `entity_id`
+and the current iterated `sub_id`. If the query returns `7` and `9`, the two
+point reads use `entity#42#sub_model#7#v1` and
+`entity#42#sub_model#9#v1`. Each result's `InputRefs` identifies both source
+item ordinals: `entity_id` refers to item `0`, while `sub_id` refers to the
+current iterated item.
+
+For this example, each GSI row must describe the same base item that the
+template names. A representative projected GSI item is:
+
+```json
+{
+  "pk": { "S": "entity#42#sub_model#7#v1" },
+  "gsi1pk": { "S": "entity#42" },
+  "entity_id": { "S": "42" },
+  "sub_id": { "S": "7" }
+}
+```
+
+Configure the GSI projection to include `entity_id`, `sub_id`, and every child
+result attribute. DynamoDB GSI projections already include the base-table key
+`pk`. Use `ProjectionType: ALL` when the child omits `ProjectionExpression` and
+therefore requests the complete item. With `KEYS_ONLY` or `INCLUDE`, the child
+must explicitly project only attributes present in the index. aux-storage
+returns a validation error instead of reading the base item to fill a gap.
+
+#### FoundationDB Mapped Execution
+
+FoundationDB's mapped-range language substitutes complete Tuple elements; it
+does not concatenate fragments inside one element. aux-storage can source a
+target key element from a physical parent key Tuple element or from one
+declared item indexer. Public indexer ordinal `n` compiles to FoundationDB value
+slot `{V[2+n]}`; Tuple value slots `0` and `1` hold the format header and
+residual payload.
+
+Name and ordinal are both required on the dependent input:
+
+```json
+"customer": {
+  "From": {
+    "Node": "orders",
+    "Select": "$.Query.Items[*].customer_id"
+  },
+  "MappedKeySource": {
+    "AttributeName": "customer_id",
+    "Indexer": 0
+  },
+  "Cardinality": "MANY",
+  "OnMissing": "SKIP"
+}
+```
+
+The ordinal locates the physical slot. `AttributeName` verifies the row-owned
+declaration before any child is published, preventing one entity type from
+accidentally using another type's value at the same ordinal. SQLite, Turso, and
+PostgreSQL apply the same check to `__aux_indexer_0`.
+
+In Rust, use the generated accessor to construct both the selector and mapped
+source consistently:
+
+```rust
+let input = Order::customer_id_indexer()
+    .many_from_query("orders", ReadSequenceOnMissing::Skip);
+```
+
+`many_from_query` selects `$.Query.Items[*].customer_id`, sets cardinality to
+`MANY`, and emits the matching `MappedKeySource`. Use `one_from_query` for
+`$.Query.Items[0].customer_id` and `ONE` cardinality. This is the preferred
+construction path for entity-owned indexers; the JSON form remains available
+for non-Rust clients.
+
+The Rust request types default every optional limit and omit absent `Inputs`
+and `After` fields. Use `ReadSequenceNode::new` for an independent node and the
+builder when a dependent node has inputs:
+
+```rust
+use std::collections::BTreeMap;
+use storage::types::{
+    GetItemRequest, KeyAttributes, ReadSequenceNode, ReadSequenceNodeOperation,
+    ReadSequenceOnMissing, ReadSequenceRequest, TableName,
+    read_sequence_input_marker,
+};
+use storage_api::StorageApiManager;
+
+let related_pk_input = Order::related_pk_indexer()
+    .many_from_query("orders", ReadSequenceOnMissing::Skip);
+
+let invoices = ReadSequenceNode::builder()
+    .name("invoices")
+    .operation(ReadSequenceNodeOperation::Get(GetItemRequest::new(
+        TableName::new("Invoices"),
+        KeyAttributes::from([(
+            "pk".to_string(),
+            read_sequence_input_marker("related_pk"),
+        )]),
+    )))
+    .inputs(BTreeMap::from([(
+        "related_pk".to_string(),
+        related_pk_input,
+    )]))
+    .iterate("related_pk")
+    .build();
+
+let request = ReadSequenceRequest {
+    nodes: vec![
+        ReadSequenceNode::new(
+            "orders",
+            ReadSequenceNodeOperation::Query(orders_query),
+        ),
+        invoices,
+    ],
+    outputs: Some(vec!["orders".to_string(), "invoices".to_string()]),
+    max_fanout_per_step: Some(25),
+    max_total_read_items: Some(100),
+    ..Default::default()
+};
+
+let response = manager.read_sequence(request).await?;
+```
+
+`ReadSequenceNode` does not implement `Default`: a node without a name and
+operation is not valid. Its constructor and builder default only the genuinely
+optional fields while keeping those required values compile-time mandatory.
+
+For a composite relationship key, write the complete key into the indexed
+field when constructing the entity:
+
+```rust
+let order = Order {
+    related_pk: Some(format!(
+        "entity#{id}#sub_model#{sub_id}#v1"
+    )),
+    // remaining fields
+};
+```
+
+Then bind the complete value directly rather than asking the FoundationDB
+mapper to concatenate fragments:
+
+```json
+"Key": {
+  "pk": { "FromInput": "related_pk" }
+},
+"Inputs": {
+  "related_pk": {
+    "From": {
+      "Node": "orders",
+      "Select": "$.Query.Items[*].related_pk"
+    },
+    "MappedKeySource": {
+      "AttributeName": "related_pk",
+      "Indexer": 1
+    },
+    "Cardinality": "MANY",
+    "OnMissing": "SKIP"
+  }
+},
+"Iterate": "related_pk"
+```
+
+In Rust, `Order::related_pk_indexer().many_from_query("orders", ... )`
+constructs that input metadata without repeating `related_pk` or ordinal `1`.
+
+For the same-item example above, the GSI Tuple already contains the complete
+base key and the GSI value contains the configured projection. aux-storage
+evaluates the public `StringTemplate`, requires it to equal that physical base
+key, and materializes the child from the GSI value. The provider uses one
+primary range read and performs no secondary base-table read.
+
+For a child in another table, FoundationDB copies the selected source key's
+complete type/value Tuple pairs into a mapper containing the resolved target
+table ID. Both source and target may use hash-only or hash+range keys. The
+target table name is constant metadata; inputs cannot choose a table.
+
+The example above uses FoundationDB mapped execution when all of these
+conditions hold:
+
+- the parent is an eventual, unbounded base-table or GSI `Query`;
+- the Query key condition resolves to a physical hash or hash+range prefix;
+- direct inputs select physical source-key attributes, a `StringTemplate`
+  reconstructs a complete physical source-key attribute, or one direct input
+  names a verified `MappedKeySource` indexer;
+- a `MANY` + `SKIP` iterate input uses
+  `$.Query.Items[*].attribute`, or a non-iterated `ONE` input uses
+  `$.Query.Items[0].attribute`;
+- the child is a point `Get` whose complete hash or hash+range key is derived
+  from those physical source-key attributes;
+- `FilterExpression`, `ProjectionExpression`, `AttributesToGet`, reverse order,
+  and a complete `ExclusiveStartKey` are evaluated with normal Query/Get
+  semantics; and
+- a same-item GSI child requests only attributes stored in the GSI projection.
+
+Mapped execution still rejects a Query `Limit`, legacy `QueryFilter` or
+`ConditionalOperator`, consumed-capacity results, strong/transactional reads,
+dynamic tables, and target keys that require combining several item values
+inside one Tuple element. Those valid graph shapes use ordinary DAG execution.
+A native mapped page whose single FoundationDB `more` bit cannot prove complete
+secondary results is also discarded and retried through the ordinary DAG.
+
+`StringTemplate` does not make FoundationDB concatenate mapper fragments. In
+`entity#{id}#sub_model#{sub_id}#v1`, the composed `pk` must already be one
+complete physical source-key element. The projected `id` and `sub_id` values
+prove that the public binding names the same key before results are published.
+The public template always works through ordinary DAG execution. To make that
+relationship eligible for a value-based mapped lookup, write the complete key
+once as a non-empty string such as `related_pk =
+entity#42#sub_model#7#v1`, include `related_pk` in `Indexers`, bind the child key
+with `FromInput`, and declare its `MappedKeySource` name and ordinal. This avoids
+parsing the residual payload and lets FoundationDB copy one complete Tuple
+element.
+
+An absent indexed attribute is stored as Tuple Nil and returns an empty child
+association without a point read. FoundationDB 7.4.5 reports error 2030 when a
+row's declaration is shorter than the requested `{V[n]}` slot. aux-storage
+treats only that error as an optimization miss, discards the complete mapped
+attempt, and reruns the validated graph through ordinary reads. A slot whose
+declaration names another attribute or whose returned child key does not match
+the compiled target follows the same whole-attempt fallback. Malformed stored
+headers, payloads, or markers remain corruption errors.
+
+Mapped ranges use serializable reads with FoundationDB read-your-writes support
+enabled. The 7.4.5 client rejects mapped ranges in snapshot mode or when
+read-your-writes is disabled. ReadSequence does not expose those invalid
+transaction modes.
+
+On the measured composite-key fixture, one public ReadSequence request replaced
+an average 5.50 standard DynamoDB Query/Get/BatchGet HTTP calls. Native mapped
+execution achieved 670.3 requests/s at 4.23 ms p95; client composition achieved
+313.7 requests/s at 21.18 ms p95, with zero errors in both runs. These figures
+describe the local 100-item benchmark, not a production latency guarantee. See
+the [ordered indexer benchmark](../docs/benchmarks/indexers-20260810.md) for the
+fixture, commands, provider counters, and interpretation.
+
+For a GSI parent, aux-storage reads only the stored GSI projection and never
+follows the entry to the base item. A child without `ProjectionExpression`
+requires an `ALL` projection. With `KEYS_ONLY` or `INCLUDE`, every selected
+input, filter attribute, and requested child attribute must be covered by the
+GSI; otherwise the request fails rather than silently fetching the base row.
+
+### Example: Map Composite Keys Across Tables
+
+This FoundationDB-eligible example queries a base table in reverse, resumes
+after a complete hash+range key, filters source rows client-side, and maps the
+two physical source-key attributes directly to a differently named composite
+key in another table:
+
+```json
+{
+  "ReadConsistency": "EVENTUAL",
+  "Nodes": [
+    {
+      "Name": "events",
+      "Operation": {
+        "Query": {
+          "TableName": "Events",
+          "KeyConditionExpression": "pk = :pk",
+          "FilterExpression": "enabled = :enabled",
+          "ProjectionExpression": "pk, sk",
+          "ExpressionAttributeValues": {
+            ":pk": { "S": "tenant#42" },
+            ":enabled": { "BOOL": true }
+          },
+          "ScanIndexForward": false,
+          "ExclusiveStartKey": {
+            "pk": { "S": "tenant#42" },
+            "sk": { "S": "event#900" }
+          }
+        }
+      },
+      "Inputs": {},
+      "After": []
+    },
+    {
+      "Name": "archive",
+      "Operation": {
+        "Get": {
+          "TableName": "EventArchive",
+          "Key": {
+            "account": { "FromInput": "partition" },
+            "event": { "FromInput": "sort" }
+          },
+          "ProjectionExpression": "account, event, payload"
+        }
+      },
+      "Inputs": {
+        "partition": {
+          "From": {
+            "Node": "events",
+            "Select": "$.Query.Items[0].pk"
+          },
+          "Cardinality": "ONE",
+          "OnMissing": "ERROR"
+        },
+        "sort": {
+          "From": {
+            "Node": "events",
+            "Select": "$.Query.Items[*].sk"
+          },
+          "Cardinality": "MANY",
+          "OnMissing": "SKIP"
+        }
+      },
+      "Iterate": "sort",
+      "After": []
+    }
+  ],
+  "Outputs": ["events", "archive"]
+}
+```
+
+`Events.pk` and `Events.sk` are physical source-key attributes. The mapper
+copies their complete Tuple type/value pairs to `EventArchive.account` and
+`EventArchive.event`; the different attribute names do not matter because the
+declared inputs make the mapping explicit. The source filter runs before
+fan-out, source and child projections run before publication, and input item
+ordinals refer to the filtered source item order.
 
 ### Example: Query Orders and Fetch Dependent Invoices
 
@@ -198,52 +780,64 @@ the user result as `org`.
   "ReadConsistency": "EVENTUAL",
   "MaxFanoutPerStep": 25,
   "MaxTotalReadItems": 100,
-  "Sequence": [
+  "Nodes": [
     {
       "Name": "orders",
-      "Query": {
-        "TableName": "Orders",
-        "IndexName": "by_customer",
-        "KeyConditionExpression": "customer_id = :customer_id",
-        "ExpressionAttributeValues": {
-          ":customer_id": { "S": "cust#123" }
-        },
-        "ProjectionExpression": "pk, sk, invoice_id, status",
-        "Limit": 25
+      "Operation": {
+        "Query": {
+          "TableName": "Orders",
+          "IndexName": "by_customer",
+          "KeyConditionExpression": "customer_id = :customer_id",
+          "ExpressionAttributeValues": {
+            ":customer_id": { "S": "cust#123" }
+          },
+          "ProjectionExpression": "pk, sk, invoice_id, status",
+          "Limit": 25
+        }
       },
-      "Select": {
-        "invoice_id": "$.invoice_id"
-      }
+      "Inputs": {},
+      "After": []
     },
     {
       "Name": "invoice",
-      "ForEach": {
-        "From": "orders.Items",
-        "As": "order",
-        "OnMissing": "NULL",
+      "Operation": {
         "Get": {
           "TableName": "Invoices",
           "Key": {
-            "pk": { "S": "invoice#${order.invoice_id.S}" },
+            "pk": { "FromInput": "invoice_id" },
             "sk": { "S": "meta" }
           },
           "ProjectionExpression": "pk, sk, total, status"
-        },
-        "Join": {
-          "To": "orders",
-          "As": "invoice",
-          "Type": "LEFT_ONE"
         }
-      }
+      },
+      "Inputs": {
+        "invoice_id": {
+          "From": {
+            "Node": "orders",
+            "Select": "$.Query.Items[*].invoice_id"
+          },
+          "Cardinality": "MANY",
+          "OnMissing": "SKIP"
+        }
+      },
+      "Iterate": "invoice_id",
+      "After": []
     }
-  ]
+  ],
+  "Outputs": ["orders", "invoice"]
 }
 ```
 
-This collapses a common query-plus-child-get workflow into one bounded request.
-aux-storage may return a top-level `Warning` when a query-plus-get sequence is
-better modeled as a GSI. The warning names the suggested key shape but does not
-include raw user data values.
+`Cardinality: MANY` with `Iterate` creates one bounded child invocation per
+selected order. `OnMissing: SKIP` omits missing child invocations; use `NULL`
+for an explicit null binding or `ERROR` to reject the request. This collapses a
+common query-plus-child-get workflow into one bounded graph request without an
+implicit Cartesian product.
+
+Here `invoice_id` is a projected non-key value and the child also adds a
+literal sort key, so this relationship deliberately uses ordinary DAG
+execution. Model both target key components in physical source-key attributes
+when this relationship needs FoundationDB mapped execution.
 
 ### Consistency Modes
 
@@ -265,19 +859,60 @@ providers can run bounded non-transactional sequences by composing ordinary
 DynamoDB-compatible operations, but reject transactional `ReadSequence` because
 they cannot prove one backend snapshot across multiple remote calls.
 
+#### Standard DynamoDB Remote Execution
+
+Send `ReadSequence` to aux-storage even when its remote provider points at an
+AWS DynamoDB table or another service that implements only the standard
+DynamoDB API. aux-storage plans the graph locally; it does not forward the
+custom `DynamoDB_20120810.ReadSequence` target to the remote endpoint.
+
+The fallback uses the ordinary API operations represented by the graph:
+
+- a single point read uses `GetItem`;
+- multiple dependent `Get` invocations for one node are deduplicated into
+  standard `BatchGetItem` requests of at most 100 keys each;
+- an explicit `BatchGet` node remains a standard `BatchGetItem` request; and
+- each dependent `Query` invocation becomes a standard `Query` request, so two
+  selected partition keys produce two remote Query calls.
+
+BatchGet responses are unordered. aux-storage matches each returned item by
+the table's complete hash or hash+range key, restores invocation order, then
+applies the child `Get` projection. Repeated dependent keys within each
+100-key request chunk are sent once and may still produce repeated ordered
+invocations. A malformed remote response
+that omits key attributes or returns an unrequested key fails instead of being
+joined to the wrong parent.
+
+This fallback supports the same input selectors, `FromInput`,
+`StringTemplate`, `ONE`, `MANY`, projections, filters, base tables, GSIs, and
+multiple table names as ordinary local DAG execution. The remote tables do not
+need aux-storage's `MaxIndexers` metadata or indexed value layout. Provider-only
+optimizations such as FoundationDB mapped ranges are simply unavailable; they
+do not change the public request syntax.
+
+A remote GSI read uses only the item projected into that GSI. aux-storage does
+not follow the GSI entry with a base-table read. Configure the GSI to project
+every attribute used by selectors, filters, projections, and child operations;
+an unprojected filter or projection fails before the Query, and a missing child
+input follows its explicit `OnMissing` rule. Use `OnMissing: ERROR` when the
+child cannot be correct without that projected value.
+
 ### Pagination and Tokens
 
-`ReadSequence` can stop before the logical sequence is exhausted when it reaches
-a root page, child page, fanout boundary, response byte limit, total read limit,
+`ReadSequence` can stop before the logical graph is exhausted when it reaches a
+root page, child page, fanout boundary, response byte limit, total read limit,
 or backend transaction budget. In those cases the response includes
 `NextSequenceToken`.
 
 Treat `NextSequenceToken` as opaque. Tokens are tied to the request shape and
 service state needed for safe continuation. Stale, mismatched, or tampered
-tokens fail validation instead of producing incomplete or duplicated joins.
+tokens fail validation instead of producing incomplete or duplicated results.
 
-Remote `BatchGetItem` partial responses with `UnprocessedKeys` are returned as
-retryable throttling errors rather than incomplete joined data.
+Remote `BatchGetItem` partial responses are never published as complete joined
+data. aux-storage retries only `UnprocessedKeys` with bounded exponential
+backoff and merges successful responses. If keys remain after four attempts,
+the sequence fails with a retryable throttling error containing the remaining
+key count.
 
 ### Backend Availability
 
@@ -290,7 +925,7 @@ retryable throttling errors rather than incomplete joined data.
 | Turso        | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
 | RocksDB / KV | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
 | FoundationDB | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
-| Remote       | Supported for non-transactional eligible reads. | Rejected.               | Rejected.               |
+| Remote       | Supported through standard DynamoDB calls; the custom target is not forwarded. | Rejected.               | Rejected.               |
 
 For production environments, verify the exact backend, service version, and GSI
 consistency setting before accepting `ReadSequence` traffic from application

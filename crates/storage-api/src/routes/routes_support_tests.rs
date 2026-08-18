@@ -20,6 +20,46 @@ use crate::{
     types::Response,
 };
 
+#[test]
+fn given_request_path_sources_when_scanned_then_provider_calls_are_admitted() {
+    let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = Vec::new();
+    for directory in ["manager", "routes"] {
+        let mut directories = vec![source_root.join(directory)];
+        while let Some(directory) = directories.pop() {
+            let entries = std::fs::read_dir(&directory).expect("request-path source directory");
+            for entry in entries {
+                let path = entry.expect("request-path source entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                    continue;
+                }
+                let file_name = path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default();
+                if file_name.ends_with("_tests.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("request-path source file");
+                for accessor in ["stream_provider()", "queue_provider()", "pubsub_provider()"] {
+                    if source.contains(accessor) {
+                        violations.push(format!("{} contains {accessor}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "request paths must use an admitted provider handle:\n{}",
+        violations.join("\n")
+    );
+}
+
 pub async fn create_test_db() -> Arc<DatabaseManager> {
     Arc::new(
         DatabaseManager::new_for_test()
@@ -65,68 +105,72 @@ impl ConformanceTestBackend {
 }
 
 pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {
-    let mut backends = Vec::new();
-
-    #[cfg(feature = "sqlite")]
-    backends.push(ConformanceTestBackend {
-        name: "sqlite",
-        config: StorageConfig {
-            backend_type: StorageBackend::SQLite,
-            connection_string: Some(":memory:".to_string()),
-            file_path: None,
-            sqlite: Some(storage_provider::SqliteSettings {
-                immediate_gsi_consistency: true,
-                ..storage_provider::SqliteSettings::default()
-            }),
-            postgres: None,
-            turso: None,
-            rocksdb: None,
-            foundationdb: None,
-            remote: None,
+    let backends = vec![
+        #[cfg(feature = "sqlite")]
+        ConformanceTestBackend {
+            name: "sqlite",
+            config: StorageConfig {
+                backend_type: StorageBackend::SQLite,
+                connection_string: Some(":memory:".to_string()),
+                file_path: None,
+                sqlite: Some(storage_provider::SqliteSettings {
+                    immediate_gsi_consistency: true,
+                    ..storage_provider::SqliteSettings::default()
+                }),
+                postgres: None,
+                turso: None,
+                rocksdb: None,
+                foundationdb: None,
+                remote: None,
+            },
+            #[cfg(feature = "postgres")]
+            postgres_cleanup: None,
         },
-        #[cfg(feature = "postgres")]
-        postgres_cleanup: None,
-    });
-
-    #[cfg(feature = "turso")]
-    backends.push(ConformanceTestBackend {
-        name: "turso",
-        config: StorageConfig {
-            backend_type: StorageBackend::Turso,
-            connection_string: Some(":memory:".to_string()),
-            file_path: None,
-            sqlite: None,
-            postgres: None,
-            turso: Some(storage_provider::TursoSettings {
-                immediate_gsi_consistency: true,
-            }),
-            rocksdb: None,
-            foundationdb: None,
-            remote: None,
+        #[cfg(feature = "turso")]
+        ConformanceTestBackend {
+            name: "turso",
+            config: StorageConfig {
+                backend_type: StorageBackend::Turso,
+                connection_string: Some(":memory:".to_string()),
+                file_path: None,
+                sqlite: None,
+                postgres: None,
+                turso: Some(storage_provider::TursoSettings {
+                    immediate_gsi_consistency: true,
+                }),
+                rocksdb: None,
+                foundationdb: None,
+                remote: None,
+            },
+            #[cfg(feature = "postgres")]
+            postgres_cleanup: None,
         },
-        #[cfg(feature = "postgres")]
-        postgres_cleanup: None,
-    });
-
-    #[cfg(feature = "rocksdb")]
-    backends.push(ConformanceTestBackend {
-        name: "rocksdb",
-        config: StorageConfig {
-            backend_type: StorageBackend::RocksDB,
-            connection_string: None,
-            file_path: Some(unique_test_path("rocksdb-conformance")),
-            sqlite: None,
-            postgres: None,
-            turso: None,
-            rocksdb: Some(storage_provider::RocksdbSettings {
-                immediate_gsi_consistency: true,
-            }),
-            foundationdb: None,
-            remote: None,
+        #[cfg(feature = "rocksdb")]
+        ConformanceTestBackend {
+            name: "rocksdb",
+            config: StorageConfig {
+                backend_type: StorageBackend::RocksDB,
+                connection_string: None,
+                file_path: Some(
+                    crate::storage_api_test_support::unique_path("rocksdb-conformance")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                sqlite: None,
+                postgres: None,
+                turso: None,
+                rocksdb: Some(storage_provider::RocksdbSettings {
+                    immediate_gsi_consistency: true,
+                }),
+                foundationdb: None,
+                remote: None,
+            },
+            #[cfg(feature = "postgres")]
+            postgres_cleanup: None,
         },
-        #[cfg(feature = "postgres")]
-        postgres_cleanup: None,
-    });
+    ];
+    #[cfg(any(feature = "postgres", feature = "foundationdb"))]
+    let mut backends = backends;
 
     #[cfg(feature = "postgres")]
     if let Ok(dsn) = std::env::var("AUX_STORAGE_CONFORMANCE_POSTGRES_DSN") {
@@ -166,7 +210,11 @@ pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {
                 turso: None,
                 rocksdb: None,
                 foundationdb: Some(storage_provider::FoundationDbSettings {
-                    subspace_prefix: Some(unique_test_path("fdb-conformance")),
+                    subspace_prefix: Some(
+                        crate::storage_api_test_support::unique_path("fdb-conformance")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     immediate_gsi_consistency: true,
                     ..storage_provider::FoundationDbSettings::default()
                 }),
@@ -178,13 +226,6 @@ pub fn default_conformance_backends() -> Vec<ConformanceTestBackend> {
     }
 
     backends
-}
-
-fn unique_test_path(prefix: &str) -> String {
-    std::env::temp_dir()
-        .join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
-        .to_string_lossy()
-        .into_owned()
 }
 
 #[cfg(feature = "postgres")]

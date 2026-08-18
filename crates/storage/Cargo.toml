@@ -61,6 +61,8 @@ typed-builder = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
 
 [lints]
 workspace = true

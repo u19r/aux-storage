@@ -264,27 +264,32 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 EncodeWriteRequest {
                     put_request: Some(put_request),
                     delete_request: None,
-                } => match self
-                    .apply_batch_encode_put_item(
-                        table_name,
-                        &put_request.item,
-                        put_request.aux_item_stream_ttl_hours,
-                    )
-                    .await
-                {
-                    Ok(item_bytes) => {
-                        result.items_updated += 1;
-                        result.bytes_written += item_bytes;
-                    }
-                    Err(error) if is_terminal_batch_item_error(&error) => return Err(error),
-                    Err(_error) => result.unprocessed_items.push(WriteRequest {
-                        put_request: Some(PutRequest {
-                            item: put_request.item.clone().into_attribute_map()?,
-                            aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+                } => {
+                    let indexers = put_request.item.indexer_names();
+                    match self
+                        .apply_batch_encode_put_item(
+                            table_name,
+                            put_request.item.item(),
+                            indexers.as_deref(),
+                            put_request.aux_item_stream_ttl_hours,
+                        )
+                        .await
+                    {
+                        Ok(item_bytes) => {
+                            result.items_updated += 1;
+                            result.bytes_written += item_bytes;
+                        }
+                        Err(error) if is_terminal_batch_item_error(&error) => return Err(error),
+                        Err(_error) => result.unprocessed_items.push(WriteRequest {
+                            put_request: Some(PutRequest {
+                                item: put_request.item.item().to_attribute_map()?,
+                                indexers: indexers.map(std::borrow::Cow::into_owned),
+                                aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+                            }),
+                            delete_request: None,
                         }),
-                        delete_request: None,
-                    }),
-                },
+                    }
+                }
                 EncodeWriteRequest {
                     put_request: None,
                     delete_request:
@@ -348,6 +353,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 put_request:
                     Some(PutRequest {
                         item,
+                        indexers,
                         aux_item_stream_ttl_hours,
                     }),
                 delete_request: None,
@@ -355,6 +361,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 context,
                 existing_item,
                 item,
+                indexers.as_deref(),
                 *aux_item_stream_ttl_hours,
             ),
             WriteRequest {
@@ -379,17 +386,21 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         context: &BatchWriteTableContext<'_>,
         existing_item: Option<&HashMap<String, AttributeValue>>,
         item: &HashMap<String, AttributeValue>,
+        indexers: Option<&[String]>,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<PreparedBatchWriteItem>> {
         let item = normalized_attribute_map_for_write(item);
-        let mut items = Self::prepare_batch_put_item(
-            context.table_name,
-            &context.table_metadata.identity,
-            context.table_info,
+        let mut items = self.prepare_batch_put_item(
+            crate::storage_ops::write_helpers::BatchMutationContext {
+                table_name: context.table_name,
+                table_identity: &context.table_metadata.identity,
+                table_info: context.table_info,
+                should_write_to_stream: context.should_write_to_stream,
+                immediate_gsi_consistency: context.requires_immediate_gsi_updates,
+            },
             item.as_ref(),
-            context.should_write_to_stream,
+            indexers,
             existing_item,
-            context.requires_immediate_gsi_updates,
         )?;
         items.extend(Self::ttl_index_mutations_for_items(
             context.table_name,
@@ -422,14 +433,16 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         key: &KeyAttributes,
         aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     ) -> StorageResult<Option<PreparedBatchWriteItem>> {
-        let mut items = Self::prepare_batch_delete_item(
-            context.table_name,
-            &context.table_metadata.identity,
-            context.table_info,
+        let mut items = self.prepare_batch_delete_item(
+            crate::storage_ops::write_helpers::BatchMutationContext {
+                table_name: context.table_name,
+                table_identity: &context.table_metadata.identity,
+                table_info: context.table_info,
+                should_write_to_stream: context.should_write_to_stream,
+                immediate_gsi_consistency: context.requires_immediate_gsi_updates,
+            },
             key,
-            context.should_write_to_stream,
             existing_item,
-            context.requires_immediate_gsi_updates,
         )?;
         items.extend(Self::ttl_index_mutations_for_items(
             context.table_name,

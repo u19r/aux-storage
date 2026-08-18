@@ -49,7 +49,9 @@ pub fn decompress_bytes(bytes: &[u8]) -> StorageResult<Vec<u8>> {
         return decompress_lz4_json_bytes(encoded);
     }
 
-    decompress_lz4_json_bytes(bytes)
+    Err(StorageError::internal(
+        "storage serde: unknown format header",
+    ))
 }
 
 pub fn decompress_owned_bytes(mut bytes: Vec<u8>) -> StorageResult<Vec<u8>> {
@@ -62,7 +64,9 @@ pub fn decompress_owned_bytes(mut bytes: Vec<u8>) -> StorageResult<Vec<u8>> {
         return decompress_lz4_json_bytes(&bytes[ENCODED_PREFIX_LEN..]);
     }
 
-    decompress_lz4_json_bytes(&bytes)
+    Err(StorageError::internal(
+        "storage serde: unknown format header",
+    ))
 }
 
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> StorageResult<T> {

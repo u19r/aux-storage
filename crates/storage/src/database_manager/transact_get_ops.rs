@@ -66,11 +66,18 @@ impl DatabaseManager {
         validate_no_duplicate_transact_item_keys(&preflights)?;
 
         let connection_id = transact_get_connection_id(&tables)?;
-        let provider = self.provider_for_request_connection(connection_id)?;
-        let read_context = provider
-            .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
-            .await
-            .map_err(transact_get_snapshot_capability_error)?;
+        let read_context = self
+            .run_admitted(
+                connection_id,
+                crate::admission::AdmissionClass::RangeRead,
+                |provider| async move {
+                    provider
+                        .begin_read_sequence_read_context(ReadSequenceConsistency::Transactional)
+                        .await
+                        .map_err(transact_get_snapshot_capability_error)
+                },
+            )
+            .await?;
         let prepared_reads = transact_items
             .into_iter()
             .zip(table_indexes)
@@ -79,9 +86,16 @@ impl DatabaseManager {
             })
             .collect::<StorageResult<Vec<_>>>()?;
         let items = try_join_all(prepared_reads.iter().map(|read| {
-            record_storage_operation(
-                "get_item",
-                read_context.get_item(read.table_name.clone(), read.key.clone(), true),
+            self.run_admitted_operation(
+                connection_id,
+                crate::admission::AdmissionClass::RangeRead,
+                || async {
+                    record_storage_operation(
+                        "get_item",
+                        read_context.get_item(read.table_name.clone(), read.key.clone(), true),
+                    )
+                    .await
+                },
             )
         }))
         .await?;
@@ -139,10 +153,20 @@ impl DatabaseManager {
                 )
             },
         );
-        let provider = self.provider_for_request_connection(&connection_id)?;
-        let mut logical_table_info =
-            record_storage_operation("get_table_info", provider.get_table_info(&physical_table))
-                .await?;
+        let physical_table_for_read = physical_table.clone();
+        let mut logical_table_info = self
+            .run_admitted(
+                &connection_id,
+                crate::admission::AdmissionClass::PointRead,
+                |provider| async move {
+                    record_storage_operation(
+                        "get_table_info",
+                        provider.get_table_info(&physical_table_for_read),
+                    )
+                    .await
+                },
+            )
+            .await?;
         logical_table_info.table_name = logical_table.clone();
         Ok(PreparedTransactGetTable {
             logical_table: logical_table.clone(),

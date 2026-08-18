@@ -1,5 +1,6 @@
 use storage_types::{
-    CreateTableRequest, StorageError, StorageResult, StreamRetentionDuration, TimestampMillis,
+    CreateTableRequest, MaxIndexers, StorageError, StorageResult, StreamRetentionDuration,
+    TimestampMillis,
 };
 
 use crate::constants::MAX_GSI_COUNT;
@@ -9,6 +10,7 @@ pub(crate) struct PreparedTableMetadata {
     pub(crate) created_at: TimestampMillis,
     pub(crate) attribute_definitions_json: String,
     pub(crate) key_schema_json: String,
+    pub(crate) max_indexers: MaxIndexers,
     pub(crate) global_secondary_indexes_json: Option<String>,
     pub(crate) stream_specification_json: Option<String>,
     pub(crate) deletion_protection_enabled: bool,
@@ -53,12 +55,26 @@ pub(crate) fn prepare_table_metadata(
         created_at,
         attribute_definitions_json,
         key_schema_json,
+        max_indexers: request.max_indexers,
         global_secondary_indexes_json,
         stream_specification_json,
         deletion_protection_enabled,
         table_stream_duration,
         default_item_stream_duration,
     })
+}
+
+pub(crate) fn requested_capacity_increase(
+    current: MaxIndexers,
+    requested: Option<MaxIndexers>,
+) -> StorageResult<Option<MaxIndexers>> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested < current {
+        return Err(StorageError::validation("MaxIndexers:cannot_decrease"));
+    }
+    Ok((requested > current).then_some(requested))
 }
 
 fn validate_key_schema_attributes(request: &CreateTableRequest) -> StorageResult<()> {

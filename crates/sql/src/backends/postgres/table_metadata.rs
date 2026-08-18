@@ -55,6 +55,9 @@ impl PostgresStorageProvider {
         let key_schema: String = row
             .try_get("key_schema")
             .map_err(|err| Self::map_postgres_error("row decode key_schema", err))?;
+        let max_indexers: i16 = row
+            .try_get("max_indexers")
+            .map_err(|err| Self::map_postgres_error("row decode max_indexers", err))?;
         let global_secondary_indexes: Option<String> = row
             .try_get("global_secondary_indexes")
             .map_err(|err| Self::map_postgres_error("row decode global_secondary_indexes", err))?;
@@ -95,6 +98,10 @@ impl PostgresStorageProvider {
             created_at: TimestampMillis::from(created_at),
             attribute_definitions,
             key_schema,
+            max_indexers: storage_types::MaxIndexers::try_new(
+                u8::try_from(max_indexers)
+                    .map_err(|_| StorageError::internal("invalid max_indexers metadata"))?,
+            )?,
             global_secondary_indexes,
             table_size_bytes: u64::try_from(table_size_bytes).unwrap_or_default(),
             item_count: u64::try_from(item_count).unwrap_or_default(),
@@ -142,9 +149,11 @@ impl PostgresStorageProvider {
         if let Some(cached) = self.table_info_cache.read().await.get(table_name).cloned() {
             return Ok(cached);
         }
-        let client = self.acquire_client("get_table_info_cached").await?;
-        let _connection_hold = self.connection_hold_timer("get_table_info_cached");
-        let table_info = Arc::new(self.get_table_info_with_client(&client, table_name).await?);
+        let table_info = {
+            let client = self.acquire_client("get_table_info_cached").await?;
+            let _connection_hold = self.connection_hold_timer("get_table_info_cached");
+            Arc::new(self.get_table_info_with_client(&client, table_name).await?)
+        };
         self.table_info_cache
             .write()
             .await

@@ -651,7 +651,7 @@ pub fn collect_base_writes_for_batch_write_encode(
                 base_writes.push(RuntimeBaseWrite::Put {
                     table_name: table_name.clone(),
                     table_info: table_info.clone(),
-                    item: put_request.item.to_attribute_map()?,
+                    item: put_request.item.item().to_attribute_map()?,
                 });
             }
             if let Some(delete_request) = write_request.delete_request.as_ref() {
@@ -677,11 +677,11 @@ pub fn collect_point_read_mutations_for_batch_write_encode(
         };
         for write_request in write_requests {
             if let Some(put_request) = write_request.put_request.as_ref() {
-                let item = put_request.item.to_attribute_map()?;
+                let item = put_request.item.item().to_attribute_map()?;
                 mutations.push(point_read_put_from_wire_item(
                     table_name,
                     extract_primary_key_from_item(&table_info.key_schema, &item)?,
-                    put_request.item.clone(),
+                    put_request.item.item().clone(),
                 ));
             }
             if let Some(delete_request) = write_request.delete_request.as_ref() {
@@ -703,7 +703,7 @@ pub fn collect_query_proof_targets_for_batch_write_encode(
         };
         for write_request in write_requests {
             if let Some(put_request) = write_request.put_request.as_ref() {
-                let new_item = put_request.item.to_attribute_map()?;
+                let new_item = put_request.item.item().to_attribute_map()?;
                 targets.push(RuntimeIndexTransitionTarget {
                     table_name: table_name.clone(),
                     table_info: table_info.clone(),
@@ -863,7 +863,7 @@ pub fn collect_base_writes_for_transact_write_items_encode(
             base_writes.push(RuntimeBaseWrite::Put {
                 table_name: put.table_name.clone(),
                 table_info,
-                item: put.item.to_attribute_map()?,
+                item: put.item.item().to_attribute_map()?,
             });
         }
         if let Some(update) = item.update.as_ref()
@@ -916,11 +916,11 @@ pub fn collect_point_read_mutations_for_transact_write_items_encode(
         if let Some(put) = item.put.as_ref()
             && let Some(table_info) = table_infos.get(&put.table_name)
         {
-            let item_map = put.item.to_attribute_map()?;
+            let item_map = put.item.item().to_attribute_map()?;
             mutations.push(point_read_put_from_wire_item(
                 &put.table_name,
                 extract_primary_key_from_item(&table_info.key_schema, &item_map)?,
-                put.item.clone(),
+                put.item.item().clone(),
             ));
         }
         if let Some(update) = item.update.as_ref() {
@@ -942,7 +942,7 @@ pub fn collect_pending_query_proof_targets_for_transact_write_items_encode(
         if let Some(put) = item.put.as_ref()
             && let Some(table_info) = table_infos.get(&put.table_name).cloned()
         {
-            let new_item = put.item.to_attribute_map()?;
+            let new_item = put.item.item().to_attribute_map()?;
             targets.push(RuntimePendingIndexTransitionTarget {
                 table_name: put.table_name.clone(),
                 table_info: table_info.clone(),

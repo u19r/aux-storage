@@ -13,7 +13,7 @@ use crate::{SQLiteStorageProvider, SqliteSyncRaftLogStore};
 
 #[tokio::test]
 async fn vote_log_entries_and_committed_metadata_persist_across_reopen() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = tempdir.path().join("sync-raft.db");
 
     let provider = file_backed_provider(&database_path).await;
@@ -50,7 +50,7 @@ async fn vote_log_entries_and_committed_metadata_persist_across_reopen() {
 
 #[tokio::test]
 async fn truncate_and_purge_update_persistent_log_state() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = tempdir.path().join("sync-raft.db");
 
     let provider = file_backed_provider(&database_path).await;
@@ -98,7 +98,7 @@ async fn truncate_and_purge_update_persistent_log_state() {
 
 #[tokio::test]
 async fn command_dedupe_response_persists_across_reopen() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = tempdir.path().join("sync-raft.db");
 
     let provider = file_backed_provider(&database_path).await;

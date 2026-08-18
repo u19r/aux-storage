@@ -3,6 +3,7 @@ use crate::storage_ops::provider_impl::*;
 pub(super) struct PutItemInput<T> {
     pub(super) table_name: TableName,
     pub(super) item: T,
+    pub(super) indexers: Option<Vec<String>>,
     pub(super) condition_expression: Option<String>,
     pub(super) expression_attribute_names: Option<HashMap<String, String>>,
     pub(super) expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -14,6 +15,7 @@ pub(super) struct PutItemInput<T> {
 struct PutItemTransactionInput {
     table_name: TableName,
     item: HashMap<String, AttributeValue>,
+    indexers: Option<Vec<String>>,
     condition_expression: Option<String>,
     expression_attribute_names: Option<HashMap<String, String>>,
     expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -29,6 +31,7 @@ struct WireNativePutInput<'a> {
     should_track_ttl: bool,
     table_name: &'a TableName,
     item: &'a WireItem,
+    indexers: Option<&'a [String]>,
 }
 
 struct WireNativePutEffectsInput<'a> {
@@ -39,6 +42,7 @@ struct WireNativePutEffectsInput<'a> {
     should_track_ttl: bool,
     table_name: &'a TableName,
     item: &'a WireItem,
+    indexers: Option<&'a [String]>,
     item_key: ItemKey,
     item_key_bytes: Vec<u8>,
     item_key_token: Option<String>,
@@ -54,6 +58,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let PutItemInput {
             table_name,
             mut item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -73,6 +78,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .execute_put_item(PutItemTransactionInput {
                 table_name,
                 item,
+                indexers,
                 condition_expression,
                 expression_attribute_names,
                 expression_attribute_values,
@@ -101,6 +107,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let PutItemInput {
             table_name,
             mut item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -114,6 +121,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 .put_item_after_pressure(PutItemInput {
                     table_name,
                     item,
+                    indexers,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
@@ -135,6 +143,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .execute_put_item(PutItemTransactionInput {
                 table_name,
                 item,
+                indexers,
                 condition_expression,
                 expression_attribute_names,
                 expression_attribute_values,
@@ -163,6 +172,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let PutItemInput {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -194,6 +204,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 .put_item_after_pressure(PutItemInput {
                     table_name,
                     item: item.into_attribute_map()?,
+                    indexers,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
@@ -213,6 +224,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 should_track_ttl,
                 table_name: &table_name,
                 item: &item,
+                indexers: indexers.as_deref(),
             })
             .await?;
         record_write(1, bytes_written);
@@ -236,6 +248,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let PutItemInput {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -249,6 +262,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 .put_item_encode_after_pressure(PutItemInput {
                     table_name,
                     item,
+                    indexers,
                     condition_expression,
                     expression_attribute_names,
                     expression_attribute_values,
@@ -261,6 +275,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         self.put_item_with_stream_ttl_after_pressure(PutItemInput {
             table_name,
             item: item.into_attribute_map()?,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -280,6 +295,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         self.put_item_with_stream_ttl_after_pressure(PutItemInput {
             table_name: request.table_name,
             item: request.item,
+            indexers: request.indexers,
             condition_expression: request.condition_expression,
             expression_attribute_names: request.expression_attribute_names,
             expression_attribute_values: request.expression_attribute_values,
@@ -301,6 +317,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         self.put_item_encode_with_stream_ttl_after_pressure(PutItemInput {
             table_name: request.table_name,
             item: request.item,
+            indexers: request.indexers,
             condition_expression: request.condition_expression,
             expression_attribute_names: request.expression_attribute_names,
             expression_attribute_values: request.expression_attribute_values,
@@ -331,6 +348,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let PutItemTransactionInput {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -356,6 +374,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     table_identity: table_metadata.identity.clone(),
                     table_info,
                     item,
+                    indexers,
                     item_stream_ttl_hours: aux_item_stream_ttl_hours,
                     condition,
                     return_values_on_condition_check_failure: return_old_on_condition_failure
@@ -383,6 +402,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             should_track_ttl,
             table_name,
             item,
+            indexers,
         } = input;
         let ttl_attribute = should_track_ttl
             .then(|| ttl_config.map(|config| config.attribute_name.as_str()))
@@ -393,7 +413,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let item_key_token = should_track_ttl
             .then(|| wire_item_key_token_from_item_key(&item_key))
             .transpose()?;
-        let bytes = encode_wire_item_storage_bytes(item)?;
+        let bytes = encode_wire_item_storage_bytes(
+            self.kv_store.item_value_codec(),
+            item,
+            indexers,
+            table_info.max_indexers,
+        )?;
         let bytes_written = bytes.len();
 
         if should_write_stream || should_track_ttl {
@@ -405,6 +430,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 should_track_ttl,
                 table_name,
                 item,
+                indexers,
                 item_key,
                 item_key_bytes,
                 item_key_token,
@@ -431,6 +457,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             should_track_ttl,
             table_name,
             item,
+            indexers,
             item_key,
             item_key_bytes,
             item_key_token,
@@ -438,31 +465,57 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             bytes,
         } = input;
         let old_bytes = self.kv_store.get(&item_key_bytes, true).await?;
-        let old_item = if should_track_ttl {
+        let old_item = if should_write_stream || should_track_ttl {
             old_bytes
                 .as_deref()
-                .map(decode_wire_item_from_storage_bytes)
+                .map(|bytes| {
+                    decode_wire_item_with_indexers_from_storage_bytes(
+                        self.kv_store.item_value_codec(),
+                        bytes,
+                        table_info.max_indexers,
+                    )
+                })
                 .transpose()?
         } else {
             None
         };
+        let item_map = item.to_attribute_map()?;
+        let old_item_map = old_item
+            .as_ref()
+            .map(|(item, _)| item.to_attribute_map())
+            .transpose()?;
 
         let mut operations = Vec::with_capacity(6);
         if should_write_stream {
-            operations.extend(wire_native_stream_operations(
-                &table_metadata.identity,
-                table_name,
-                &item_key,
-                bytes.as_slice(),
-                old_bytes.as_deref(),
-            )?);
+            let stream_item_id = next_stream_item_id();
+            let entries = crate::stream::helpers::create_item_update_stream_entries(
+                crate::stream::helpers::StreamEntryContext {
+                    table_identity: &table_metadata.identity,
+                    table_name,
+                    item_key: &item_key,
+                    indexers: indexers.unwrap_or_default(),
+                    old_indexers: old_item.as_ref().map(|(_, indexers)| indexers.as_slice()),
+                },
+                &item_map,
+                old_item_map.as_ref(),
+                stream_item_id,
+                false,
+                None,
+            )?;
+            operations.extend(entries.into_iter().map(|(template, value)| {
+                TransactWriteOperation::PutTemplate {
+                    template,
+                    value,
+                    condition: None,
+                }
+            }));
         }
         if should_track_ttl {
             operations.extend(ttl_index_direct_operations_for_wire_items(
                 &table_metadata.identity,
                 table_info,
                 ttl_config,
-                old_item.as_ref(),
+                old_item.as_ref().map(|(item, _)| item),
                 Some(item),
                 item_key_token.as_deref(),
                 projected_ttl_value,
@@ -517,35 +570,4 @@ fn condition_binding(
             })
         })
         .transpose()
-}
-
-fn wire_native_stream_operations(
-    table_identity: &TableIdentity,
-    table_name: &TableName,
-    item_key: &ItemKey,
-    bytes: &[u8],
-    old_bytes: Option<&[u8]>,
-) -> StorageResult<Vec<TransactWriteOperation>> {
-    let stream_item_id = next_stream_item_id();
-    let stream_entries = crate::stream::helpers::create_item_update_stream_entries_wire_encoded(
-        crate::stream::helpers::StreamEntryContext {
-            table_identity,
-            table_name,
-            item_key,
-        },
-        bytes,
-        old_bytes,
-        stream_item_id,
-        false,
-        None,
-    )?;
-
-    Ok(stream_entries
-        .into_iter()
-        .map(|(template, value)| TransactWriteOperation::PutTemplate {
-            template,
-            value,
-            condition: None,
-        })
-        .collect())
 }

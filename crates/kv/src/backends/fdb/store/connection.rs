@@ -8,49 +8,55 @@ use storage_types::{StorageError, StorageResult};
 use tokio::time;
 
 use crate::{
-    backends::{
-        common::table_operation_primary_key,
-        fdb::{
-            error::map_fdb_error,
-            keyspace,
-            metrics::{record_fdb_operation, record_fdb_operation_latency},
-            network::{
-                FoundationDbNetworkOwnership, init_network, open_database,
-                validate_simulated_database_config,
-            },
-            store::{FoundationDbConfig, FoundationDbKvStore, adjust_versionstamp_offset},
+    backends::fdb::{
+        error::map_fdb_error,
+        keyspace,
+        metrics::{record_fdb_operation, record_fdb_operation_latency},
+        network::{
+            FoundationDbNetworkOwnership, init_network, open_database,
+            validate_simulated_database_config,
         },
+        store::{FoundationDbConfig, FoundationDbKvStore},
     },
     constants::FOUNDATIONDB_GET_READ_VERSION_LATENCY_MS_METRIC,
     helpers::increment_bytes,
     partition_runtime_load::RuntimePartitionLoadTracker,
-    sorted_kv_store::{
-        DirectWriteOperation, RangeResult, SortedKvStore, TransactWriteOperation,
-        TransactWriteTableOperation,
-    },
+    sorted_kv_store::{DirectWriteOperation, RangeResult, SortedKvStore, TransactionPriority},
 };
 
 impl FoundationDbKvStore {
     pub fn connect(config: FoundationDbConfig) -> StorageResult<Self> {
         let network = init_network(&config)?;
         let database = open_database(&config)?;
+        let physical_prefix = keyspace::encode_prefix(config.subspace_prefix.as_deref());
         Ok(Self {
             database: Arc::new(database),
             _network: network,
             config: Arc::new(config),
+            physical_prefix: Arc::new(physical_prefix),
             runtime_partition_load_tracker: RuntimePartitionLoadTracker::default(),
+            transaction_priority: TransactionPriority::Default,
         })
     }
 
     pub async fn check_reachable(&self, timeout: Duration) -> StorageResult<()> {
         let check = async {
-            let trx = self.create_transaction()?;
-            Self::configure_transaction(&trx, Some("kv.startup_check"), true)?;
-            let _ = trx
-                .get(b"__aux_healthcheck", false)
-                .await
-                .map_err(|err| map_fdb_error("foundationdb healthcheck read", err))?;
-            Ok::<(), StorageError>(())
+            let mut trx = self.create_transaction()?;
+            loop {
+                self.configure_transaction(&trx, Some("kv.startup_check"), true)?;
+                match trx.get(b"__aux_healthcheck", false).await {
+                    Ok(_) => return Ok::<(), StorageError>(()),
+                    Err(err) if err.is_retryable() => {
+                        trx = trx.on_error(err).await.map_err(|retry_err| {
+                            map_fdb_error("retry FoundationDB healthcheck", retry_err)
+                        })?;
+                        trx.reset();
+                    }
+                    Err(err) => {
+                        return Err(map_fdb_error("foundationdb healthcheck read", err));
+                    }
+                }
+            }
         };
 
         match time::timeout(timeout, check).await {
@@ -74,11 +80,14 @@ impl FoundationDbKvStore {
         database: Arc<Database>,
     ) -> StorageResult<Self> {
         validate_simulated_database_config(&config)?;
+        let physical_prefix = keyspace::encode_prefix(config.subspace_prefix.as_deref());
         Ok(Self {
             database,
             _network: FoundationDbNetworkOwnership::Simulated,
             config: Arc::new(config),
+            physical_prefix: Arc::new(physical_prefix),
             runtime_partition_load_tracker: RuntimePartitionLoadTracker::default(),
+            transaction_priority: TransactionPriority::Default,
         })
     }
 
@@ -123,7 +132,7 @@ impl FoundationDbKvStore {
         debug_id: Option<&str>,
         consistent_read: bool,
     ) -> StorageResult<()> {
-        Self::configure_transaction(trx, debug_id, consistent_read)?;
+        self.configure_transaction(trx, debug_id, consistent_read)?;
         if !self.uses_grv_cache(consistent_read) {
             return Ok(());
         }
@@ -154,7 +163,7 @@ impl FoundationDbKvStore {
         scope: &'static str,
         attempt: u32,
         err: FdbError,
-        candidate_keys: &[Vec<u8>],
+        candidate_key_count: usize,
     ) -> StorageResult<Transaction> {
         record_fdb_operation(operation, "retry", 1);
         let error_code = err.code();
@@ -170,7 +179,7 @@ impl FoundationDbKvStore {
                     attempt,
                     retryable,
                     error_code,
-                    candidate_keys,
+                    candidate_key_count,
                 )
                 .await;
                 new_trx.reset();
@@ -181,6 +190,7 @@ impl FoundationDbKvStore {
     }
 
     pub(crate) fn configure_transaction(
+        &self,
         trx: &Transaction,
         debug_id: Option<&str>,
         consistent_read: bool,
@@ -201,10 +211,16 @@ impl FoundationDbKvStore {
                 .map_err(|err| map_fdb_error("disable snapshot read-your-writes", err))?;
         }
 
+        if self.transaction_priority == TransactionPriority::Batch {
+            trx.set_option(options::TransactionOption::PriorityBatch)
+                .map_err(|err| map_fdb_error("set batch transaction priority", err))?;
+            record_fdb_operation("transaction", "priority_batch", 1);
+        }
+
         Ok(())
     }
 
-    pub(crate) fn prefix_bytes(prefix: Option<&Vec<u8>>, key: &[u8]) -> Vec<u8> {
+    pub(crate) fn prefix_bytes(prefix: &[u8], key: &[u8]) -> Vec<u8> {
         keyspace::prefix_bytes(prefix, key)
     }
 
@@ -219,95 +235,27 @@ impl FoundationDbKvStore {
     }
 
     pub(crate) fn strip_prefix<'a>(&self, key: &'a [u8]) -> &'a [u8] {
-        keyspace::strip_prefix(key, self.config.subspace_prefix.as_ref())
+        keyspace::strip_prefix(key, &self.physical_prefix)
     }
 
     pub(crate) fn prefix_slice(&self, key: &[u8]) -> Vec<u8> {
-        Self::prefix_bytes(self.config.subspace_prefix.as_ref(), key)
+        Self::prefix_bytes(&self.physical_prefix, key)
     }
 
-    pub(crate) fn collect_transact_write_keys(
-        prefix: Option<&Vec<u8>>,
-        operations: &[TransactWriteOperation],
-    ) -> Vec<Vec<u8>> {
-        let mut keys = Vec::new();
-        for operation in operations {
-            match operation {
-                TransactWriteOperation::Put { key, .. }
-                | TransactWriteOperation::Delete { key, .. }
-                | TransactWriteOperation::Check { key, .. }
-                | TransactWriteOperation::CheckValue { key, .. }
-                | TransactWriteOperation::Update { key, .. } => {
-                    keys.push(Self::prefix_bytes(prefix, key));
-                }
-                TransactWriteOperation::PutTemplate { template, .. } => {
-                    if let Some(mut versioned) = template.foundationdb_key() {
-                        if let Some(prefix_bytes) = prefix {
-                            let mut composed = prefix_bytes.clone();
-                            composed.extend_from_slice(&versioned);
-                            adjust_versionstamp_offset(&mut composed, prefix_bytes.len());
-                            versioned = composed;
-                        }
-                        keys.push(versioned);
-                    } else {
-                        let key = template.rocks_key();
-                        keys.push(Self::prefix_bytes(prefix, &key));
-                    }
-                }
-            }
-        }
-        keys
+    pub(crate) fn physical_prefix(&self) -> &[u8] {
+        self.physical_prefix.as_slice()
     }
 
-    pub(crate) fn collect_unchecked_write_keys(
-        prefix: Option<&Vec<u8>>,
-        operations: &[DirectWriteOperation],
-    ) -> Vec<Vec<u8>> {
-        let mut keys = Vec::new();
-        for operation in operations {
-            match operation {
-                DirectWriteOperation::Put { key, .. }
-                | DirectWriteOperation::Delete { key }
-                | DirectWriteOperation::CheckValue { key, .. } => {
-                    keys.push(Self::prefix_bytes(prefix, key));
-                }
-                DirectWriteOperation::DeleteRange {
-                    start,
-                    exclusive_end,
-                } => {
-                    keys.push(Self::prefix_bytes(prefix, start));
-                    keys.push(Self::prefix_bytes(prefix, exclusive_end));
-                }
-                DirectWriteOperation::PutTemplate { template, .. } => {
-                    if let Some(mut versioned) = template.foundationdb_key() {
-                        if let Some(prefix_bytes) = prefix {
-                            let mut composed = prefix_bytes.clone();
-                            composed.extend_from_slice(&versioned);
-                            adjust_versionstamp_offset(&mut composed, prefix_bytes.len());
-                            versioned = composed;
-                        }
-                        keys.push(versioned);
-                    } else {
-                        let key = template.rocks_key();
-                        keys.push(Self::prefix_bytes(prefix, &key));
-                    }
-                }
-            }
-        }
-        keys
-    }
-
-    pub(crate) fn collect_transact_write_table_keys(
-        prefix: Option<&Vec<u8>>,
-        operations: &[TransactWriteTableOperation],
-    ) -> Vec<Vec<u8>> {
-        let mut keys = Vec::new();
-        for operation in operations {
-            if let Ok(key) = table_operation_primary_key(operation) {
-                keys.push(Self::prefix_bytes(prefix, &key));
-            }
-        }
-        keys
+    pub(crate) fn direct_write_candidate_key_count(operations: &[DirectWriteOperation]) -> usize {
+        operations
+            .iter()
+            .map(|operation| {
+                usize::from(matches!(
+                    operation,
+                    DirectWriteOperation::DeleteRange { .. }
+                )) + 1
+            })
+            .sum()
     }
 
     pub(crate) async fn read_key_prefix(

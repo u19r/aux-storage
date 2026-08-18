@@ -13,6 +13,7 @@ fn stored_table_info_defaults_stream_duration_metadata_when_omitted() {
         "global_secondary_indexes": null,
         "table_size_bytes": 0,
         "item_count": 0,
+        "max_indexers": 0,
         "stream_specification": null
     });
 
@@ -40,6 +41,7 @@ fn stored_table_info_serializes_finite_and_forever_stream_duration_metadata() {
         "global_secondary_indexes": null,
         "table_size_bytes": 0,
         "item_count": 0,
+        "max_indexers": 0,
         "stream_specification": null,
         "table_stream_duration": 24,
         "default_item_stream_duration": -1

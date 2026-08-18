@@ -6,16 +6,14 @@ use storage_common::GSI_UPDATE_JOB;
 use storage_provider::{StorageBackend, StorageConnectionConfig, StorageConnectionRegistry};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, CreateTableRequest, KeyAttributeType,
-    KeySchemaElement, KeyType, KeysAndAttributes, ReadSequenceConsistency, StorageEnum,
-    StorageError, TableName, TableNamespace, TransactConditionCheckRequest, TransactEncodeItem,
-    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest,
-    context::WrappedError as _,
+    KeySchemaElement, KeyType, KeysAndAttributes, StorageEnum, StorageError, TableName,
+    TableNamespace, TransactConditionCheckRequest, TransactEncodeItem, TransactUpdateRequest,
+    TransactWriteItem, TransactWriteItemsRequest, UpdateItemRequest, context::WrappedError as _,
 };
 
 use crate::{
-    CutoverWatcher, DatabaseManager, DeleteItemInput, InProcessReadSequenceLimits,
-    NamespaceRequestRewriter, PutItemInput, QueryTableInput, ScanTableInput, Tables,
-    UpdateItemInput, is_retryable_pause_error,
+    CutoverWatcher, DatabaseManager, DeleteItemInput, NamespaceRequestRewriter, PutItemInput,
+    QueryTableInput, ScanTableInput, Tables, UpdateItemInput, is_retryable_pause_error,
     namespace_routing::reject_direct_shared_table_access, namespace_source_table,
 };
 
@@ -52,57 +50,6 @@ async fn new_multi_connection_routed_db() -> DatabaseManager {
     })
     .await
     .expect("multi-connection database manager")
-}
-
-#[tokio::test]
-async fn given_routed_transactional_provider_when_sequence_begins_then_default_capabilities_do_not_apply()
- {
-    let path = std::env::temp_dir().join(format!(
-        "aux-storage-routed-read-sequence-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let db = DatabaseManager::new_with_connection_registry(StorageConnectionRegistry {
-        default_connection_id: "default".to_string(),
-        connections: HashMap::from([
-            ("default".to_string(), sqlite_connection(":memory:")),
-            (
-                "tenant-store".to_string(),
-                sqlite_connection(path.to_string_lossy().as_ref()),
-            ),
-        ]),
-    })
-    .await
-    .expect("multi-connection database manager");
-    put_location_dictionary(&db, &[(2, "tenant-store")]).await;
-    let namespace = TableNamespace::from_seed("routed-read-sequence");
-    put_dedicated_namespace_route_metadata(&db, &namespace, 2).await;
-    let table = Tables::namespace(&namespace);
-    create_simple_table_on_connection(&db, "tenant-store", table.clone()).await;
-    let limits = InProcessReadSequenceLimits::try_new(3, 4, 2, 64 * 1024).expect("limits");
-
-    let default_error =
-        match db.read_sequence_executor(ReadSequenceConsistency::Transactional, limits) {
-            Ok(_) => panic!("in-memory default connection lacks transactional snapshots"),
-            Err(error) => error,
-        };
-    assert!(matches!(
-        default_error.to_enum(),
-        StorageEnum::Unsupported { .. }
-    ));
-    let sequence = db
-        .read_sequence_executor_for_table(&table, ReadSequenceConsistency::Transactional, limits)
-        .await
-        .expect("routed file-backed connection supports a transactional snapshot");
-
-    drop(sequence);
-    drop(db);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("db-shm"));
-    let _ = std::fs::remove_file(path.with_extension("db-wal"));
 }
 
 async fn create_simple_shared_table(db: &DatabaseManager, loc: u16) {
@@ -387,7 +334,7 @@ async fn shared_table_routing_rewrites_keys_and_blocks_unsafe_forms() {
     .await
     .expect("put routed item");
 
-    let provider = db.storage_provider();
+    let provider = db.maintenance_provider();
     let prefixed_key = HashMap::from([
         (
             "pk".to_string(),
@@ -537,6 +484,7 @@ async fn routed_transaction_failure_returns_logical_all_old_item() {
                     ])
                     .into(),
                     update_expression: "SET #state = :next".to_string(),
+                    indexers: None,
                     condition_expression: Some("#state = :expected".to_string()),
                     expression_attribute_names: Some(HashMap::from([(
                         "#state".to_string(),
@@ -615,7 +563,7 @@ async fn resolved_get_uses_one_route_snapshot_across_cutover() {
     .await
     .expect("seed old route");
 
-    db.storage_provider()
+    db.maintenance_provider()
         .put_item(
             Tables::shared_namespace(2),
             HashMap::from([
@@ -653,10 +601,14 @@ async fn resolved_get_uses_one_route_snapshot_across_cutover() {
     .await;
     db.run_job(GSI_UPDATE_JOB).await;
     let resolver = db.route_resolver_for_tests().expect("route resolver");
-    CutoverWatcher::new(resolver, db.default_storage_for_tests())
-        .poll_once()
-        .await
-        .expect("apply cutover");
+    CutoverWatcher::new(
+        resolver,
+        db.default_storage_for_tests(),
+        db.default_admission_controller(),
+    )
+    .poll_once()
+    .await
+    .expect("apply cutover");
 
     let snapshot_item = db
         .get_item_with_resolved_operation(resolved, true)
@@ -759,77 +711,6 @@ async fn batch_get_keeps_logical_namespaces_that_share_one_physical_table_separa
             .expect("second value"),
         Some(AttributeValue::S("second".to_string()))
     );
-}
-
-#[tokio::test]
-async fn in_process_batch_get_round_trips_one_shared_namespace() {
-    let db = new_routed_db().await;
-    Tables::create_sys_namespaces_table(&db)
-        .await
-        .expect("create namespace routing table");
-    create_simple_shared_table(&db, 1).await;
-    put_location_dictionary(&db, &[(1, "default")]).await;
-    let namespace = TableNamespace::from_seed("sequence-batch");
-    put_shared_namespace_route_metadata(&db, &namespace, 1).await;
-    let table = Tables::namespace(&namespace);
-    let logical_key = HashMap::from([
-        ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
-        ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
-    ]);
-    db.put_item(
-        PutItemInput::builder()
-            .table_name(table.clone())
-            .item(HashMap::from([
-                ("pk".to_string(), AttributeValue::S("ITEM#1".to_string())),
-                ("sk".to_string(), AttributeValue::S("VALUE".to_string())),
-                (
-                    "value".to_string(),
-                    AttributeValue::S("logical".to_string()),
-                ),
-            ]))
-            .build(),
-    )
-    .await
-    .expect("put routed item");
-    let mut sequence = db
-        .read_sequence_executor_for_table(
-            &table,
-            ReadSequenceConsistency::Eventual,
-            InProcessReadSequenceLimits::try_new(1, 1, 1, 64 * 1024).expect("limits"),
-        )
-        .await
-        .expect("route-bound sequence");
-
-    let response = sequence
-        .batch_get_item(
-            table.clone(),
-            KeysAndAttributes {
-                keys: vec![logical_key.clone().into()].into(),
-                attributes_to_get: None,
-                consistent_read: None,
-                projection_expression: None,
-                expression_attribute_names: None,
-            },
-        )
-        .await
-        .expect("sequence batch get")
-        .responses
-        .expect("responses");
-    let item = &response[&table][0];
-
-    assert_eq!(
-        item.attribute_value("value").expect("value"),
-        Some(AttributeValue::S("logical".to_string()))
-    );
-    assert_eq!(
-        item.clone()
-            .into_attribute_map()
-            .expect("item map")
-            .get("pk"),
-        logical_key.get("pk")
-    );
-    assert_eq!(sequence.stats().operations_completed(), 1);
-    assert_eq!(sequence.stats().requested_items(), 1);
 }
 
 #[tokio::test]
@@ -1128,7 +1009,7 @@ async fn shared_table_update_routes_to_physical_table_and_returns_logical_attrib
         Some(&AttributeValue::S("after".to_string()))
     );
 
-    let provider = db.storage_provider();
+    let provider = db.maintenance_provider();
     let physical = provider
         .get_item(
             Tables::shared_namespace(1),
@@ -1277,7 +1158,11 @@ async fn cutover_watcher_applies_late_and_scheduled_events() {
     put_cutover_event(&db, &namespace, "late-cutover", 1, 2, now_ms - 25).await;
     db.run_job(GSI_UPDATE_JOB).await;
 
-    let watcher = CutoverWatcher::new(resolver.clone(), db.default_storage_for_tests());
+    let watcher = CutoverWatcher::new(
+        resolver.clone(),
+        db.default_storage_for_tests(),
+        db.default_admission_controller(),
+    );
     watcher.poll_once().await.expect("poll late cutover");
 
     let route_after_late = resolver
@@ -1337,7 +1222,11 @@ async fn dual_write_route_dedupes_same_physical_write_target() {
 async fn cutover_watcher_ignores_missing_m_table() {
     let db = new_routed_db().await;
     let resolver = db.route_resolver_for_tests().expect("route resolver");
-    let watcher = CutoverWatcher::new(resolver, db.default_storage_for_tests());
+    let watcher = CutoverWatcher::new(
+        resolver,
+        db.default_storage_for_tests(),
+        db.default_admission_controller(),
+    );
 
     watcher
         .poll_once()
@@ -1608,6 +1497,7 @@ async fn shared_table_routing_rewrites_partition_assignments_inside_if_not_exist
             update_expression: "SET pk = if_not_exists(pk, :pk), gsi2pk = if_not_exists(gsi2pk, \
                                 :gsi2pk)"
                 .to_string(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: Some(HashMap::from([

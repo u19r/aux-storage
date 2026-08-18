@@ -12,6 +12,13 @@ use crate::{
 
 #[async_trait]
 pub trait PubsubProvider: Send + Sync {
+    /// Return and clear one backend-pressure signal observed by a pubsub
+    /// operation. Providers which do not expose a pressure signal keep the
+    /// default; the route still classifies retryable protocol errors.
+    fn take_admission_pressure_signal(&self) -> bool {
+        false
+    }
+
     async fn initialize(&self) -> PubsubResult<()>;
 
     async fn create_topic(&self, request: CreateTopicRequest) -> PubsubResult<Topic>;

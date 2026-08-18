@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    IndexName, KeyAttributeType, KeySchemaElement, StreamRetentionDuration, TableName,
+    IndexName, KeyAttributeType, KeySchemaElement, MaxIndexers, StreamRetentionDuration, TableName,
     TimestampMillis,
 };
 
@@ -14,6 +14,7 @@ pub struct StoredTableInfo {
     pub created_at: TimestampMillis,
     pub attribute_definitions: Vec<AttributeDefinition>,
     pub key_schema: Vec<KeySchemaElement>,
+    pub max_indexers: MaxIndexers,
     pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndex>>,
     pub table_size_bytes: u64,
     pub item_count: u64,

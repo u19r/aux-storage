@@ -14,10 +14,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     pub(in crate::storage_ops) fn gsi_batch_mutations_for_items(
+        &self,
         table_identity: &TableIdentity,
         table_info: &StoredTableInfo,
         old_item: Option<&HashMap<String, AttributeValue>>,
         new_item: Option<&HashMap<String, AttributeValue>>,
+        declaration: Option<&IndexerDeclaration>,
     ) -> StorageResult<Vec<BatchItem>> {
         let Some(gsis) = table_info.global_secondary_indexes.as_ref() else {
             return Ok(Vec::new());
@@ -41,6 +43,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             }
 
             if let (Some(item), Some(key)) = (new_item, new_key) {
+                let declaration = declaration.ok_or_else(|| {
+                    StorageError::internal("GSI put requires an indexer declaration")
+                })?;
                 let projected = storage_common::apply_gsi_projection(
                     item,
                     Some(&gsi.projection),
@@ -49,7 +54,10 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 );
                 mutations.push(BatchItem {
                     key,
-                    value: Some(storage_types::storage_serde::to_bytes(&projected)?),
+                    value: Some(encode_indexed_wire_item(
+                        self.kv_store.item_value_codec(),
+                        &IndexedWireItem::extract_projected(item, &projected, declaration)?,
+                    )?),
                 });
             }
         }

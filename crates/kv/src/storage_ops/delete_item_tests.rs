@@ -60,7 +60,12 @@ async fn kv_delete_condition_injects_key_attributes() {
 
     let mut stored_item = HashMap::new();
     stored_item.insert("value".to_string(), AttributeValue::S("old".to_string()));
-    let stored_bytes = storage_types::storage_serde::to_bytes(&stored_item).unwrap();
+    let stored_bytes = crate::kv_support_tests::encode_table_item(
+        provider.kv_store.item_value_codec(),
+        &stored_item,
+        None,
+        table_metadata.table_info.max_indexers,
+    );
     provider
         .kv_store
         .put(&item_key, &stored_bytes, None)

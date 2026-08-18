@@ -43,8 +43,47 @@ Common options and flags:
 | `--db-path <path>`                | Local data path for embedded backends.                                                            |
 | `--postgres-dsn <dsn>`            | Postgres connection string.                                                                       |
 | `--postgres-max-pool-size <n>`    | Postgres pool size.                                                                               |
+| `--storage-admission-enabled <bool>` | Enable or disable foreground storage admission.                                                |
+| `--storage-admission-<parameter>` | Override a `features.storage_admission` sizing or queue parameter.                              |
 | `--enable-internal-helper-routes` | Enable test/helper routes                                                                         |
 | `--immediate-consistency-gsis`    | Enable immediate consistency for Global Secondary Indexes (GSIs) instead of eventual consistency. |
+
+### Foreground storage admission
+
+`features.storage_admission` controls the optional per-connection adaptive
+admission controller. It is enabled by default and starts at the configured
+Little's Law estimate (`throughput_rps * latency_ms / 1000`), bounded by the
+foreground minimum and maximum. A small control reserve remains available for
+health and recovery work. Set `enabled` to `false` to retain only the bounded
+maximum-minus-reserve gate; the queue and wait deadline remain bounded.
+
+```json
+{
+  "features": {
+    "storage_admission": {
+      "enabled": true,
+      "initial_sustainable_throughput_rps": 20000,
+      "initial_latency_estimate_ms": 5,
+      "minimum_concurrency": 4,
+      "maximum_concurrency": 1024,
+      "control_reserve_concurrency": 4,
+      "queue_capacity": 256,
+      "max_queue_wait_ms": 25
+    }
+  }
+}
+```
+
+The standalone binary also accepts `--storage-admission-*` flags. Environment
+overrides use `AUX_STORAGE_ADMISSION_*` names (for example,
+`AUX_STORAGE_ADMISSION_ENABLED=false`); the original throughput shorthand
+`AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS` is supported as well. If both
+throughput names are set, the canonical `AUX_STORAGE_ADMISSION_*` name wins. The
+precedence order is file, environment, flags, then explicit `--overrides`.
+
+Each connection gets an independent controller. Queue saturation or an
+expired queue wait is returned as HTTP 503 with a bounded `Retry-After` hint;
+control permits are reserved so recovery and health work can still proceed.
 
 Service route defaults are configured at `http.routes.storage`,
 `http.routes.queue`, and `http.routes.pubsub`, with defaults `/storage`,

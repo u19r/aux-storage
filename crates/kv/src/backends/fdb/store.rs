@@ -1,15 +1,19 @@
 use std::{collections::HashMap, convert::TryFrom, sync::Arc};
 
 use foundationdb::{Database, FdbError, Transaction};
-use storage_types::StorageError;
+use futures_util::future::try_join_all;
+use storage_types::{FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS, StorageError};
 
 use super::network::FoundationDbNetworkOwnership;
 use crate::{
-    partition_family::ResolvedPartitionFamily, partition_runtime_load::RuntimePartitionLoadTracker,
-    sorted_kv_store::OldNewItems,
+    partition_family::ResolvedPartitionFamily,
+    partition_runtime_load::RuntimePartitionLoadTracker,
+    sorted_kv_store::{OldNewItems, TransactionPriority},
 };
 
-#[derive(Clone, Debug, Default)]
+const FDB_POINT_READ_CONCURRENCY: usize = 8;
+
+#[derive(Clone, Debug)]
 pub struct FoundationDbConfig {
     pub cluster_file_path: Option<String>,
     pub tenant_name: Option<Vec<u8>>,
@@ -19,16 +23,45 @@ pub struct FoundationDbConfig {
     pub report_conflicting_keys: bool,
 }
 
+impl Default for FoundationDbConfig {
+    fn default() -> Self {
+        Self {
+            cluster_file_path: None,
+            tenant_name: None,
+            subspace_prefix: None,
+            cache_read_version_ms: FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS,
+            immediate_gsi_consistency: false,
+            report_conflicting_keys: false,
+        }
+    }
+}
+
 type OrderedLogFamilyCache = HashMap<String, ResolvedPartitionFamily>;
 
-async fn read_fdb_keys_sequential(
+pub(crate) async fn read_fdb_keys_concurrently(
     trx: &Transaction,
-    keys: &[Vec<u8>],
+    keys: Vec<Vec<u8>>,
     snapshot: bool,
 ) -> Result<Vec<Option<Vec<u8>>>, FdbError> {
     let mut values = Vec::with_capacity(keys.len());
-    for key in keys {
-        values.push(trx.get(key, snapshot).await?.map(|value| value.to_vec()));
+    let mut remaining_keys = keys.into_iter();
+    loop {
+        let window_keys = remaining_keys
+            .by_ref()
+            .take(FDB_POINT_READ_CONCURRENCY)
+            .collect::<Vec<_>>();
+        if window_keys.is_empty() {
+            break;
+        }
+        let window_values = try_join_all(window_keys.into_iter().map(|key| async move {
+            // The key is moved into the future so the native binding cannot observe a
+            // reclaimed buffer while the request is in flight.
+            trx.get(&key, snapshot)
+                .await
+                .map(|value| value.map(|value| value.to_vec()))
+        }))
+        .await?;
+        values.extend(window_values);
     }
     Ok(values)
 }
@@ -79,7 +112,9 @@ pub struct FoundationDbKvStore {
     database: Arc<Database>,
     _network: FoundationDbNetworkOwnership,
     config: Arc<FoundationDbConfig>,
+    physical_prefix: Arc<Vec<u8>>,
     runtime_partition_load_tracker: RuntimePartitionLoadTracker,
+    transaction_priority: TransactionPriority,
 }
 
 #[derive(Clone)]
@@ -144,7 +179,10 @@ mod queue_provider;
 mod queue_write;
 mod sorted_kv_provider;
 mod sorted_reads;
+
 mod sorted_table_writes;
 mod sorted_transactions;
 mod sorted_writes;
+#[cfg(test)]
+mod store_tests;
 mod transactions;

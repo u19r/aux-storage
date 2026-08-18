@@ -3,10 +3,12 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Json},
     routing::{get, post},
 };
+use http_error::{ErrorResponse, HttpApiError};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
 use storage::DatabaseManager;
@@ -65,7 +67,13 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/up", get(up))
         .route("/ready", get(ready))
         .route("/health", get(health_status))
-        .route("/", post(crate::routes::dynamodb::dynamodb_endpoint))
+        .route(
+            "/",
+            post(crate::routes::dynamodb::dynamodb_endpoint).layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                fixed_ingress_ceiling,
+            )),
+        )
         .with_state(app_state)
         .layer(DefaultBodyLimit::max(DYNAMODB_JSON_BODY_LIMIT_BYTES))
 }
@@ -102,7 +110,13 @@ pub fn server_router_with_metrics_and_routes(
         .route("/up", get(up))
         .route("/ready", get(ready))
         .route("/health", get(health_status))
-        .route("/", post(crate::routes::dynamodb::dynamodb_endpoint))
+        .route(
+            "/",
+            post(crate::routes::dynamodb::dynamodb_endpoint).layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                fixed_ingress_ceiling,
+            )),
+        )
         .with_state(app_state.clone())
         .nest(&routes.storage, prefixed_router)
         .nest(
@@ -116,6 +130,10 @@ pub fn server_router_with_metrics_and_routes(
             &routes.queue,
             Router::new()
                 .route("/", post(crate::routes::queue::queue_endpoint))
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    fixed_ingress_ceiling,
+                ))
                 .with_state(app_state.clone()),
         );
     }
@@ -126,6 +144,10 @@ pub fn server_router_with_metrics_and_routes(
             &routes.pubsub,
             Router::new()
                 .route("/", post(crate::routes::pubsub::pubsub_endpoint))
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    fixed_ingress_ceiling,
+                ))
                 .with_state(app_state.clone()),
         );
     }
@@ -142,6 +164,20 @@ pub fn server_router_with_metrics_and_routes(
         router
     }
     .layer(DefaultBodyLimit::max(DYNAMODB_JSON_BODY_LIMIT_BYTES))
+}
+
+async fn fixed_ingress_ceiling(
+    State(app_state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let Ok(permit) = app_state.ingress_semaphore.clone().try_acquire_owned() else {
+        let error: (StatusCode, Json<ErrorResponse>) = HttpApiError::service_unavailable(1).into();
+        return error.into_response();
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 fn prometheus_metrics_router(config: PrometheusMetricsEndpointConfig) -> Router {
@@ -251,6 +287,18 @@ pub fn internal_helper_router(app_state: Arc<AppState>) -> Router {
             "/_internal/storage/streams/records",
             post(crate::routes::internal::get_stream_records_endpoint),
         )
+        .route(
+            "/_internal/test/admission/hold",
+            post(crate::routes::internal::hold_admission_endpoint),
+        )
+        .route(
+            "/_internal/test/admission/release",
+            post(crate::routes::internal::release_admission_endpoint),
+        )
+        .route(
+            "/_internal/test/admission/diagnostics",
+            get(crate::routes::internal::admission_diagnostics_endpoint),
+        )
         .with_state(app_state)
 }
 
@@ -357,7 +405,7 @@ pub async fn health_status(State(app_state): State<Arc<AppState>>) -> (StatusCod
 }
 
 async fn check_storage_ready(db: &DatabaseManager) -> Result<(), StorageError> {
-    db.list_tables(Some(1), None)
+    db.check_ready()
         .await
         .map(|_| ())
         .map_err(|err| StorageError::internal(&format!("storage readiness check failed: {err}")))

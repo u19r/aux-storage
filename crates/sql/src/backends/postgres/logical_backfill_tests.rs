@@ -251,21 +251,24 @@ async fn postgres_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
         .await
         .expect("initialize postgres storage");
 
-    let table_name_value = format!("sync_pg_{}", TimestampMillis::now().timestamp_millis());
-    let table_name = TableName::new(&table_name_value);
+    let table_name = unique_table_name("sync_pg");
     provider
         .create_table(&basic_create_table_request(&table_name))
         .await
         .expect("create table");
+    let mutation_suffix = uuid::Uuid::now_v7().simple();
 
     let key_json = r#"{"pk":{"S":"item#1"}}"#.to_string();
     let item_json = r#"{"pk":{"S":"item#1"},"status":{"S":"open"}}"#.to_string();
     let put = ResolvedSyncMutation::Put(SyncPutMutation {
-        mutation_id: SyncMutationId::new("mutation-1").expect("mutation id"),
+        mutation_id: SyncMutationId::new(format!("mutation-put-{mutation_suffix}"))
+            .expect("mutation id"),
         table_name: table_name.clone(),
         key_json: key_json.clone(),
         item_json,
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(11),
         response: SyncMutationResponse {
             response_json: Some(r#"{"ok":true}"#.to_string()),
@@ -273,10 +276,12 @@ async fn postgres_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
     });
     let delete_key_json = r#"{"pk":{"S":"item#2"}}"#.to_string();
     let delete = ResolvedSyncMutation::Delete(SyncDeleteMutation {
-        mutation_id: SyncMutationId::new("mutation-2").expect("mutation id"),
+        mutation_id: SyncMutationId::new(format!("mutation-delete-{mutation_suffix}"))
+            .expect("mutation id"),
         table_name: table_name.clone(),
         key_json: delete_key_json.clone(),
         old_item_json: Some(r#"{"pk":{"S":"item#2"},"status":{"S":"closed"}}"#.to_string()),
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(12),
         response: SyncMutationResponse {
             response_json: Some(r#"{"deleted":true}"#.to_string()),
@@ -512,7 +517,9 @@ async fn apply_sync_put(
         table_name: table_name.clone(),
         key_json: serde_json::to_string(&key_map(pk)).expect("encode key"),
         item_json: serde_json::to_string(&item_map(pk, status)).expect("encode item"),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(r#"{"ok":true}"#.to_string()),
@@ -543,7 +550,9 @@ fn sync_put(
         table_name: table_name.clone(),
         key_json: serde_json::to_string(&key_map(pk)).expect("encode key"),
         item_json: serde_json::to_string(&item_map(pk, status)).expect("encode item"),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(format!(r#"{{"mutation":"{mutation_id}"}}"#)),
@@ -629,10 +638,7 @@ fn export_request(
 }
 
 fn unique_table_name(prefix: &str) -> TableName {
-    TableName::new(&format!(
-        "{prefix}_{}",
-        TimestampMillis::now().timestamp_millis()
-    ))
+    TableName::new(&format!("{prefix}_{}", uuid::Uuid::now_v7().simple()))
 }
 
 fn key_map(pk: &str) -> HashMap<String, AttributeValue> {

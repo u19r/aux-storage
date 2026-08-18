@@ -10,7 +10,7 @@ struct ContentionFixture {
 }
 
 async fn create_contention_fixture() -> ContentionFixture {
-    let temp_dir = tempfile::tempdir().expect("temporary database directory");
+    let temp_dir = crate::sql_test_support::temp_dir("database");
     let database_path = temp_dir.path().join("contention.sqlite");
     let provider = TursoStorageProvider::new(
         database_path

@@ -10,7 +10,10 @@ use storage_types::{
     context::{ErrorContext as _, WrappedError as _},
 };
 
-use crate::{DatabaseManager, migration_index_keys::MigrationIndexKeyCodec, tables::Tables};
+use crate::{
+    DatabaseManager, database_manager::ROUTED_DEFAULT_CONNECTION_ID,
+    migration_index_keys::MigrationIndexKeyCodec, tables::Tables,
+};
 
 const NAMESPACE_ROUTE_PK_PREFIX: &str = "NS#";
 const NAMESPACE_ROUTE_SK: &str = "META";
@@ -118,20 +121,20 @@ impl DualWriteCoordinator {
                  registry)",
             )
         })?;
-        let route = resolver.resolve_route(&input.namespace).await?;
+        let route_resolver = Arc::clone(&resolver);
+        let route_namespace = input.namespace.clone();
+        let route = self
+            .db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |_provider| async move {
+                route_resolver.resolve_route(&route_namespace).await
+            })
+            .await?;
         let source_target = resolver
             .resolve_target_for_loc(&input.namespace, route.storage_mode, input.source_loc)
             .await?;
         let destination_target = resolver
             .resolve_target_for_loc(&input.namespace, route.storage_mode, input.destination_loc)
             .await?;
-
-        let source_provider = self
-            .db
-            .provider_for_connection_for_migration(&source_target.connection_id)?;
-        let destination_provider = self
-            .db
-            .provider_for_connection_for_migration(&destination_target.connection_id)?;
 
         let mut copied_total = 0usize;
         let mut entity_summaries = Vec::with_capacity(input.entity_types.len());
@@ -161,7 +164,13 @@ impl DualWriteCoordinator {
                     consistent_read: false,
                 };
 
-                let (projected_items, token) = source_provider.query_table(&request).await?;
+                let source_connection_id = source_target.connection_id.clone();
+                let (projected_items, token) = self
+                    .db
+                    .run_control_admitted(&source_connection_id, move |provider| async move {
+                        provider.query_table(&request).await
+                    })
+                    .await?;
                 let mut keys: Vec<storage_types::KeyAttributes> =
                     Vec::with_capacity(projected_items.len());
 
@@ -175,19 +184,24 @@ impl DualWriteCoordinator {
                 }
 
                 if !keys.is_empty() {
-                    let response = source_provider
-                        .batch_get_item(BatchGetItemRequest {
-                            request_items: HashMap::from([(
-                                source_target.table_name.clone(),
-                                KeysAndAttributes {
-                                    keys: keys.into(),
-                                    attributes_to_get: None,
-                                    projection_expression: None,
-                                    expression_attribute_names: None,
-                                    consistent_read: Some(true),
-                                },
-                            )]),
-                            return_consumed_capacity: None,
+                    let batch_request = BatchGetItemRequest {
+                        request_items: HashMap::from([(
+                            source_target.table_name.clone(),
+                            KeysAndAttributes {
+                                keys: keys.into(),
+                                attributes_to_get: None,
+                                projection_expression: None,
+                                expression_attribute_names: None,
+                                consistent_read: Some(true),
+                            },
+                        )]),
+                        return_consumed_capacity: None,
+                    };
+                    let source_connection_id = source_target.connection_id.clone();
+                    let response = self
+                        .db
+                        .run_control_admitted(&source_connection_id, move |provider| async move {
+                            provider.batch_get_item(batch_request).await
                         })
                         .await?;
 
@@ -211,23 +225,33 @@ impl DualWriteCoordinator {
                         let updated_at_ms = required_updated_at_millis(&map)?;
                         let pk = pk.to_string();
                         let sk = sk.to_string();
-                        match destination_provider
-                            .put_item(
-                                destination_target.table_name.clone(),
-                                map,
-                                Some(BACKFILL_RECENCY_CONDITION.to_string()),
-                                Some(HashMap::from([(
-                                    "#updated_at".to_string(),
-                                    UPDATED_AT_ATTR.to_string(),
-                                )])),
-                                Some(HashMap::from([(
-                                    ":updated_at".to_string(),
-                                    AttributeValue::N(updated_at_ms.to_string()),
-                                )])),
-                                None,
+                        let destination_connection_id = destination_target.connection_id.clone();
+                        let destination_table_name = destination_target.table_name.clone();
+                        let put_result = self
+                            .db
+                            .run_control_admitted(
+                                &destination_connection_id,
+                                move |provider| async move {
+                                    provider
+                                        .put_item(
+                                            destination_table_name,
+                                            map,
+                                            Some(BACKFILL_RECENCY_CONDITION.to_string()),
+                                            Some(HashMap::from([(
+                                                "#updated_at".to_string(),
+                                                UPDATED_AT_ATTR.to_string(),
+                                            )])),
+                                            Some(HashMap::from([(
+                                                ":updated_at".to_string(),
+                                                AttributeValue::N(updated_at_ms.to_string()),
+                                            )])),
+                                            None,
+                                        )
+                                        .await
+                                },
                             )
-                            .await
-                        {
+                            .await;
+                        match put_result {
                             Ok(_) => {}
                             Err(error)
                                 if matches!(
@@ -294,15 +318,19 @@ impl DualWriteCoordinator {
             input.effective_at_ms,
             CUTOVER_STATUS_SCHEDULED,
         );
-        self.control_plane()
-            .put_item(
-                Tables::sys_namespaces(),
-                cutover_item,
-                None,
-                None,
-                None,
-                None,
-            )
+        self.db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                provider
+                    .put_item(
+                        Tables::sys_namespaces(),
+                        cutover_item,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
             .await?;
 
         if let Some(resolver) = self.db.route_resolver() {
@@ -345,15 +373,19 @@ impl DualWriteCoordinator {
             "updated_at".to_string(),
             AttributeValue::N(TimestampMillis::now().timestamp_millis().to_string()),
         );
-        self.control_plane()
-            .put_item(
-                Tables::sys_namespaces(),
-                cutover_item,
-                None,
-                None,
-                None,
-                None,
-            )
+        self.db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                provider
+                    .put_item(
+                        Tables::sys_namespaces(),
+                        cutover_item,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
             .await?;
 
         if let Some(resolver) = self.db.route_resolver() {
@@ -376,8 +408,12 @@ impl DualWriteCoordinator {
                 AttributeValue::S(NAMESPACE_ROUTE_SK.to_string()),
             ),
         ]);
-        self.control_plane()
-            .get_item(Tables::sys_namespaces(), key.into(), true)
+        self.db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                provider
+                    .get_item(Tables::sys_namespaces(), key.into(), true)
+                    .await
+            })
             .await?
             .ok_or_else(|| {
                 StorageError::table_not_found(&format!(
@@ -392,8 +428,12 @@ impl DualWriteCoordinator {
         &self,
         item: HashMap<String, AttributeValue>,
     ) -> StorageResult<()> {
-        self.control_plane()
-            .put_item(Tables::sys_namespaces(), item, None, None, None, None)
+        self.db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                provider
+                    .put_item(Tables::sys_namespaces(), item, None, None, None, None)
+                    .await
+            })
             .await
             .map(|_| ())
     }
@@ -405,15 +445,15 @@ impl DualWriteCoordinator {
         effective_at_ms: TimestampMillis,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
         let key = cutover_item_key(namespace, migration_id, effective_at_ms);
-        self.control_plane()
-            .get_item(Tables::sys_namespaces(), key.into(), true)
+        self.db
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                provider
+                    .get_item(Tables::sys_namespaces(), key.into(), true)
+                    .await
+            })
             .await?
             .map(|item| item.into_attribute_map())
             .transpose()
-    }
-
-    fn control_plane(&self) -> Arc<dyn crate::newtypes::DatabaseTrait> {
-        self.db.control_plane_for_migration()
     }
 }
 

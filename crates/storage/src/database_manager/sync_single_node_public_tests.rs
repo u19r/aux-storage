@@ -135,6 +135,7 @@ async fn public_update_item_routes_through_single_node_sync_log() {
         table_name: table_name.clone(),
         key: HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]).into(),
         update_expression: "SET #value = :value".to_string(),
+        indexers: None,
         condition_expression: Some("#value = :old".to_string()),
         expression_attribute_names: Some(HashMap::from([(
             "#value".to_string(),
@@ -194,6 +195,7 @@ async fn public_update_item_return_values_are_resolved_in_single_node_sync_mode(
             key: HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))])
                 .into(),
             update_expression: "SET #value = :value".to_string(),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: Some(HashMap::from([(
                 "#value".to_string(),
@@ -229,6 +231,7 @@ async fn public_batch_write_item_routes_through_single_node_sync_log() {
                 vec![WriteRequest {
                     put_request: Some(PutRequest {
                         item: item("item#1", "open"),
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
@@ -270,6 +273,7 @@ async fn public_transact_write_items_routes_through_single_node_sync_log() {
                 put: Some(storage_types::TransactPutRequest {
                     table_name: table_name.clone(),
                     item: item("item#1", "open"),
+                    indexers: None,
                     condition_expression: Some("attribute_not_exists(pk)".to_string()),
                     expression_attribute_names: None,
                     expression_attribute_values: None,
@@ -290,6 +294,7 @@ async fn public_transact_write_items_routes_through_single_node_sync_log() {
                     )])
                     .into(),
                     update_expression: "SET #value = :value".to_string(),
+                    indexers: None,
                     condition_expression: Some("#value = :old".to_string()),
                     expression_attribute_names: Some(HashMap::from([(
                         "#value".to_string(),

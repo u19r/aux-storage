@@ -34,6 +34,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     pub(super) async fn run_job_impl(&self, name: BackgroundJobName) -> StorageResult<()> {
+        let provider = self.with_transaction_priority(priority_for_job(name));
+        provider.run_unprioritized_job_impl(name).await
+    }
+
+    async fn run_unprioritized_job_impl(&self, name: BackgroundJobName) -> StorageResult<()> {
         match name {
             storage_common::GSI_UPDATE_JOB => self.run_gsi_update_job().await,
             storage_common::GSI_BACKFILL_JOB => self.run_gsi_backfill_job().await,
@@ -150,7 +155,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             std::sync::Arc::new(self.clone()),
             gsi_cfg.update_interval_ms,
         );
-        let backfill_job = GsiBackfillJob::new(std::sync::Arc::new(self.clone()));
+        let backfill_provider = self.with_transaction_priority(priority_for_job(GSI_BACKFILL_JOB));
+        let backfill_job = GsiBackfillJob::new(std::sync::Arc::new(backfill_provider));
         if self.immediate_gsi_consistency {
             registrar
                 .register_timed_job(GSI_BACKFILL_JOB, gsi_cfg.backfill_interval_ms, backfill_job)
@@ -167,7 +173,9 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     async fn register_ttl_job(&self, registrar: &KvRegistrar<'_>) -> StorageResult<()> {
-        let ttl_job = crate::ttl::TtlSweepJob::new(std::sync::Arc::new(self.clone()));
+        let ttl_provider =
+            self.with_transaction_priority(priority_for_job(storage_common::TTL_SWEEP_JOB));
+        let ttl_job = crate::ttl::TtlSweepJob::new(std::sync::Arc::new(ttl_provider));
         registrar
             .register_timed_job(
                 storage_common::TTL_SWEEP_JOB,
@@ -179,7 +187,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
     }
 
     async fn register_stream_trim_job(&self, registrar: &KvRegistrar<'_>) -> StorageResult<()> {
-        let trim_job = crate::stream::StreamTrimJob::new(std::sync::Arc::new(self.clone()));
+        let trim_provider = self.with_transaction_priority(priority_for_job(STREAM_TRIM_JOB));
+        let trim_job = crate::stream::StreamTrimJob::new(std::sync::Arc::new(trim_provider));
         registrar
             .register_timed_job(
                 STREAM_TRIM_JOB,

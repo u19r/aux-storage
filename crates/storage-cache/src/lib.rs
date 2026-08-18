@@ -122,6 +122,8 @@ mod proof_exhaustive_tests;
 #[cfg(test)]
 mod quint_parity_tests;
 #[cfg(test)]
+mod quint_transition_mbt_tests;
+#[cfg(test)]
 mod runtime_query_proof_tests;
 #[cfg(test)]
 mod runtime_write_plan_tests;

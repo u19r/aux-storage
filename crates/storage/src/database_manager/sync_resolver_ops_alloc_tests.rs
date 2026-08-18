@@ -190,6 +190,7 @@ fn update_request(table_name: &TableName, iteration: usize) -> UpdateItemRequest
             AttributeValue::S(format!("item#{iteration:04}")),
         )])),
         update_expression: Some("SET #status = :status, #payload = :payload".to_string()),
+        indexers: None,
         attribute_updates: None,
         condition_expression: Some("#status = :old_status".to_string()),
         expression_attribute_names: Some(HashMap::from([
@@ -225,6 +226,7 @@ fn transact_write_request(table_name: &TableName, iteration: usize) -> TransactW
                 put: Some(TransactPutRequest {
                     table_name: table_name.clone(),
                     item: realistic_update_item(put_id, "open"),
+                    indexers: None,
                     condition_expression: Some("attribute_not_exists(pk)".to_string()),
                     expression_attribute_names: None,
                     expression_attribute_values: None,
@@ -244,6 +246,7 @@ fn transact_write_request(table_name: &TableName, iteration: usize) -> TransactW
                         AttributeValue::S(format!("item#{iteration:04}")),
                     )])),
                     update_expression: "SET #status = :status, #payload = :payload".to_string(),
+                    indexers: None,
                     condition_expression: Some("#status = :old_status".to_string()),
                     expression_attribute_names: Some(HashMap::from([
                         ("#status".to_string(), "status".to_string()),
@@ -286,6 +289,7 @@ fn batch_write_request(table_name: &TableName, iteration: usize) -> BatchWriteIt
                     ),
                     ("payload".to_string(), AttributeValue::S("x".repeat(1024))),
                 ]),
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,

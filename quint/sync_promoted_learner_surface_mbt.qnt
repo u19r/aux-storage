@@ -10,6 +10,7 @@ module sync_promoted_learner_surface_mbt {
     learnerPromoted: bool,
     tableMetadataImported: bool,
     itemRecordsImported: bool,
+    indexerMetadataImported: bool,
     durableRevisionsImported: bool,
     streamRecordsImported: bool,
     ttlRecordsImported: bool,
@@ -38,6 +39,8 @@ module sync_promoted_learner_surface_mbt {
       "table_metadata_missing"
     } else if (not(gate.itemRecordsImported)) {
       "item_records_missing"
+    } else if (not(gate.indexerMetadataImported)) {
+      "indexer_metadata_missing"
     } else if (not(gate.durableRevisionsImported)) {
       "durable_revisions_missing"
     } else if (not(gate.streamRecordsImported)) {
@@ -76,6 +79,7 @@ module sync_promoted_learner_surface_mbt {
       learnerPromoted: false,
       tableMetadataImported: false,
       itemRecordsImported: false,
+      indexerMetadataImported: false,
       durableRevisionsImported: false,
       streamRecordsImported: false,
       ttlRecordsImported: false,
@@ -99,6 +103,7 @@ module sync_promoted_learner_surface_mbt {
     nondet learnerPromoted = Set(false, true).oneOf()
     nondet tableMetadataImported = Set(false, true).oneOf()
     nondet itemRecordsImported = Set(false, true).oneOf()
+    nondet indexerMetadataImported = Set(false, true).oneOf()
     nondet durableRevisionsImported = Set(false, true).oneOf()
     nondet streamRecordsImported = Set(false, true).oneOf()
     nondet ttlRecordsImported = Set(false, true).oneOf()
@@ -118,6 +123,7 @@ module sync_promoted_learner_surface_mbt {
       learnerPromoted: learnerPromoted,
       tableMetadataImported: tableMetadataImported,
       itemRecordsImported: itemRecordsImported,
+      indexerMetadataImported: indexerMetadataImported,
       durableRevisionsImported: durableRevisionsImported,
       streamRecordsImported: streamRecordsImported,
       ttlRecordsImported: ttlRecordsImported,
@@ -148,6 +154,7 @@ module sync_promoted_learner_surface_mbt {
         lastGate.learnerPromoted,
         lastGate.tableMetadataImported,
         lastGate.itemRecordsImported,
+        lastGate.indexerMetadataImported,
         lastGate.durableRevisionsImported,
         lastGate.streamRecordsImported,
         lastGate.ttlRecordsImported,
@@ -170,6 +177,7 @@ module sync_promoted_learner_surface_mbt {
       learnerPromoted: true,
       tableMetadataImported: true,
       itemRecordsImported: true,
+      indexerMetadataImported: true,
       durableRevisionsImported: true,
       streamRecordsImported: true,
       ttlRecordsImported: true,
@@ -192,6 +200,7 @@ module sync_promoted_learner_surface_mbt {
       learnerPromoted: true,
       tableMetadataImported: true,
       itemRecordsImported: true,
+      indexerMetadataImported: true,
       durableRevisionsImported: true,
       streamRecordsImported: true,
       ttlRecordsImported: true,
@@ -214,6 +223,7 @@ module sync_promoted_learner_surface_mbt {
       learnerPromoted: true,
       tableMetadataImported: true,
       itemRecordsImported: true,
+      indexerMetadataImported: true,
       durableRevisionsImported: true,
       streamRecordsImported: true,
       ttlRecordsImported: true,

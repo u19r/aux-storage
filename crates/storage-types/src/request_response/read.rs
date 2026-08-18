@@ -199,7 +199,6 @@ pub struct QueryRequest {
     #[serde(default)]
     pub key_condition_expression: String,
 
-    /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes_to_get: Option<Vec<String>>,
 

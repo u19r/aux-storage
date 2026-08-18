@@ -1,5 +1,5 @@
 use storage_provider::split_item_into_key_and_attributes_sync;
-use storage_types::{ReplicationMutation, StorageResult, WireItem};
+use storage_types::{ReplicationMutation, StorageResult};
 use tokio_postgres::types::ToSql;
 
 use crate::backends::postgres::{
@@ -24,11 +24,13 @@ impl PostgresStorageProvider {
                     let table_info = self.get_table_info_cached_arc(&table_name).await?;
                     let split_item =
                         split_item_into_key_and_attributes_sync(new_image, &table_info)?;
-                    let key_bindings = Self::key_column_bindings_for_schema(
+                    let new_indexers = mutation.new_indexers.as_deref().unwrap_or_default();
+                    let prepared_write = Self::prepare_main_row_write(
                         &table_info,
-                        &table_info.key_schema,
                         &split_item.key_attributes,
-                        None,
+                        &split_item.all_attributes,
+                        &split_item.non_key_attributes,
+                        Some(new_indexers),
                     )?;
                     let mut client = self
                         .pool
@@ -42,7 +44,7 @@ impl PostgresStorageProvider {
                         )
                     })?;
                     let old_item = self
-                        .get_item_with_client(
+                        .get_item_with_indexers_with_client(
                             &transaction,
                             &table_name,
                             &split_item.key_attributes,
@@ -50,59 +52,16 @@ impl PostgresStorageProvider {
                         )
                         .await?;
 
-                    let attributes_blob = if split_item.non_key_attributes.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        serde_json::to_string(&split_item.non_key_attributes).map_err(|err| {
-                            Self::map_postgres_error(
-                                "serialize replication non-key attributes",
-                                err,
-                            )
-                        })?
-                    };
-
                     let physical_table_name = physical_names::physical_table_name(&table_name);
-                    let key_columns = key_bindings
-                        .iter()
-                        .map(|binding| binding.column.clone())
-                        .collect::<Vec<_>>();
-                    let columns_sql = key_columns
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once("attributes_blob".to_string()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut value_placeholders = key_bindings
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, binding)| {
-                            Self::postgres_placeholder_for_type(idx + 1, &binding.attribute_type)
-                        })
-                        .collect::<Vec<_>>();
-                    value_placeholders.push(format!("${}", key_bindings.len() + 1));
-                    let values_placeholders = value_placeholders.join(", ");
-                    let conflict_target = key_columns.join(", ");
-                    let assignments = key_columns
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once("attributes_blob".to_string()))
-                        .map(|column| format!("{column} = EXCLUDED.{column}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
                     let sql = sql_statements::upsert_main_row(
                         &physical_table_name,
-                        &columns_sql,
-                        &values_placeholders,
-                        &conflict_target,
-                        &assignments,
+                        &prepared_write.columns_sql,
+                        &prepared_write.values_sql,
+                        &prepared_write.conflict_target,
+                        &prepared_write.assignments,
                     );
-
-                    let mut bind_values = key_bindings
-                        .iter()
-                        .map(|binding| binding.value.clone())
-                        .collect::<Vec<_>>();
-                    bind_values.push(attributes_blob);
-                    let params: Vec<&(dyn ToSql + Sync)> = bind_values
+                    let params: Vec<&(dyn ToSql + Sync)> = prepared_write
+                        .bind_values
                         .iter()
                         .map(|value| value as &(dyn ToSql + Sync))
                         .collect();
@@ -123,7 +82,7 @@ impl PostgresStorageProvider {
 
                     let old_item_for_ttl = old_item
                         .as_ref()
-                        .map(WireItem::to_attribute_map)
+                        .map(|item| item.item.to_attribute_map())
                         .transpose()?;
                     if self.immediate_gsi_consistency {
                         self.apply_gsi_entries_for_item_change_with_client(
@@ -132,6 +91,7 @@ impl PostgresStorageProvider {
                             &table_info,
                             old_item_for_ttl.as_ref(),
                             Some(&split_item.all_attributes),
+                            new_indexers,
                         )
                         .await?;
                     }
@@ -148,6 +108,11 @@ impl PostgresStorageProvider {
                         &split_item.all_attributes,
                         PostgresWriteStreamEntriesInput {
                             old_item: old_item_for_ttl.as_ref(),
+                            indexers: new_indexers,
+                            old_indexers: mutation
+                                .old_indexers
+                                .as_deref()
+                                .or_else(|| old_item.as_ref().map(|item| item.indexers.as_slice())),
                             is_deleted: false,
                             item_stream_version,
                             replication: Some(&metadata),
@@ -177,7 +142,12 @@ impl PostgresStorageProvider {
                     )
                 })?;
                 let old_item = self
-                    .get_item_with_client(&transaction, &table_name, &key_attributes, &table_info)
+                    .get_item_with_indexers_with_client(
+                        &transaction,
+                        &table_name,
+                        &key_attributes,
+                        &table_info,
+                    )
                     .await?;
 
                 let key_bindings = Self::key_column_bindings_for_schema(
@@ -208,7 +178,7 @@ impl PostgresStorageProvider {
 
                 let old_map = old_item
                     .as_ref()
-                    .map(WireItem::to_attribute_map)
+                    .map(|item| item.item.to_attribute_map())
                     .transpose()?;
                 if self.immediate_gsi_consistency {
                     self.apply_gsi_entries_for_item_change_with_client(
@@ -217,6 +187,7 @@ impl PostgresStorageProvider {
                         &table_info,
                         old_map.as_ref(),
                         None,
+                        &[],
                     )
                     .await?;
                 }
@@ -233,6 +204,11 @@ impl PostgresStorageProvider {
                     &mutation.key.to_attribute_map(),
                     PostgresWriteStreamEntriesInput {
                         old_item: old_map.as_ref(),
+                        indexers: &[],
+                        old_indexers: mutation
+                            .old_indexers
+                            .as_deref()
+                            .or_else(|| old_item.as_ref().map(|item| item.indexers.as_slice())),
                         is_deleted: true,
                         item_stream_version,
                         replication: Some(&metadata),

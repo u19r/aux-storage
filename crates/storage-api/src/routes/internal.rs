@@ -10,6 +10,7 @@ use axum::{
 };
 use http_error::{ErrorResponse, HttpApiError};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
+use storage::AdmissionClass;
 use storage_sync::{SyncNodeId, SyncTypeConfig};
 use storage_types::{
     GetStreamRecordsRequest, ReplicationApplyRequest, ReplicationHeartbeatRequest,
@@ -73,6 +74,68 @@ pub async fn run_background_job_endpoint(
 
 pub async fn cache_diagnostics_endpoint() -> Json<storage::StorageCacheReadDiagnostics> {
     Json(storage::storage_cache_read_diagnostics())
+}
+
+/// Test-only synchronization primitive mounted only with the existing
+/// internal-helper flag.  It holds a real foreground permit so BDD and local
+/// canary checks exercise the production admission queue without injecting
+/// fake provider latency.
+pub async fn hold_admission_endpoint(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let permit = app_state
+        .db_manager
+        .default_admission_controller()
+        .acquire(AdmissionClass::PointRead)
+        .await
+        .map_err(|rejection| -> (StatusCode, Json<ErrorResponse>) {
+            HttpApiError::from(storage::StorageError::service_unavailable(
+                rejection.retry_after_seconds,
+            ))
+            .into()
+        })?;
+    let released = app_state.admission_test_release.notified();
+    app_state.admission_test_holds.lock().await.push(permit);
+    released.await;
+    Ok(Json(serde_json::json!({"status": "released"})))
+}
+
+pub async fn release_admission_endpoint(
+    State(app_state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let held = std::mem::take(&mut *app_state.admission_test_holds.lock().await);
+    drop(held);
+    app_state.admission_test_release.notify_waiters();
+    Json(serde_json::json!({"released": true}))
+}
+
+pub async fn admission_diagnostics_endpoint(
+    State(app_state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let snapshot = app_state
+        .db_manager
+        .default_admission_controller()
+        .snapshot();
+    Json(serde_json::json!({
+        "connection_id": snapshot.connection_id,
+        "enabled": snapshot.enabled,
+        "state": format!("{:?}", snapshot.state),
+        "limit": snapshot.desired_limit,
+        "queue_capacity": app_state
+            .db_manager
+            .default_admission_controller()
+            .config()
+            .queue_capacity,
+        "max_queue_wait_ms": app_state
+            .db_manager
+            .default_admission_controller()
+            .config()
+            .max_queue_wait_ms,
+        "in_flight": snapshot.in_flight,
+        "control_in_flight": snapshot.control_in_flight,
+        "queue_depth": snapshot.queue_depth,
+        "rejection_count": snapshot.rejection_count,
+    }))
 }
 
 #[utoipa::path(

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use storage_types::{AttributeValue, MaxIndexers, WireItem};
 use uuid::Uuid;
 
 #[cfg(not(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend"))))]
@@ -48,6 +51,17 @@ pub fn create_test_store() -> TestStore {
 #[must_use]
 pub fn create_test_provider() -> TestProvider {
     TestProvider::new(create_test_store())
+}
+
+pub fn encode_table_item(
+    codec: crate::sorted_kv_store::ItemValueCodec,
+    item: &HashMap<String, AttributeValue>,
+    indexers: Option<&[String]>,
+    capacity: MaxIndexers,
+) -> Vec<u8> {
+    let item = WireItem::from_attribute_map(item).expect("encode test item");
+    crate::storage_ops::encode_wire_item_storage_bytes(codec, &item, indexers, capacity)
+        .expect("encode test table item")
 }
 
 pub async fn cleanup_store(store: &TestStore) {

@@ -1,29 +1,46 @@
 use storage_sync::{SyncApply, SyncMutationResolver, SyncWriteProposalRequest, SyncWriteRequest};
 use storage_types::{StorageError, StorageResult, TimestampMillis};
 
-use crate::DatabaseManager;
+use crate::database_manager::{DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID};
 
 impl DatabaseManager {
     pub async fn last_resolved_sync_log_id(
         &self,
     ) -> StorageResult<Option<storage_sync::SyncLogId>> {
-        self.storage_provider().last_resolved_sync_log_id().await
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            let database_call = metrics_facade::begin_database_call("last_resolved_sync_log_id");
+            let result = provider.last_resolved_sync_log_id().await;
+            drop(database_call);
+            result
+        })
+        .await
     }
 
     pub async fn get_resolved_sync_log_entry(
         &self,
         log_id: storage_sync::SyncLogId,
     ) -> StorageResult<Option<storage_sync::ResolvedSyncLogEntry>> {
-        self.storage_provider()
-            .get_resolved_sync_log_entry(log_id)
-            .await
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+            let database_call = metrics_facade::begin_database_call("get_resolved_sync_log_entry");
+            let result = provider.get_resolved_sync_log_entry(log_id).await;
+            drop(database_call);
+            result
+        })
+        .await
     }
 
     pub async fn replay_resolved_sync_log_entries(&self, limit: usize) -> StorageResult<usize> {
         let last_applied = self.last_resolved_sync_log_id().await?;
         let entries = self
-            .storage_provider()
-            .resolved_sync_log_entries_after(last_applied, limit)
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+                let database_call =
+                    metrics_facade::begin_database_call("resolved_sync_log_entries_after");
+                let result = provider
+                    .resolved_sync_log_entries_after(last_applied, limit)
+                    .await;
+                drop(database_call);
+                result
+            })
             .await?;
         let mut applied = 0;
         for entry in entries {
@@ -49,9 +66,18 @@ impl DatabaseManager {
             committed_at: TimestampMillis::now(),
             leader_node_id: "single-node".to_string(),
         };
-        self.storage_provider()
-            .persist_resolved_sync_log_entry(&metadata, &proposal.batch)
-            .await?;
+        let metadata_ref = &metadata;
+        let batch_ref = &proposal.batch;
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+            let database_call =
+                metrics_facade::begin_database_call("persist_resolved_sync_log_entry");
+            let result = provider
+                .persist_resolved_sync_log_entry(metadata_ref, batch_ref)
+                .await;
+            drop(database_call);
+            result
+        })
+        .await?;
         let responses = self
             .apply_resolved_sync_mutations(metadata, proposal.batch)
             .await?;

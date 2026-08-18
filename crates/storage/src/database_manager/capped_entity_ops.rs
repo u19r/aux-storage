@@ -17,7 +17,7 @@ impl DatabaseManager {
         input: CreateCappedEntityInput<'_, T>,
     ) -> Result<(), CappedStorageError>
     where
-        T: storage_types::single_table_entity::SingleTableEntity + serde::Serialize,
+        T: storage_types::single_table_entity::SingleTableEntity + storage_types::TryIntoWireItem,
     {
         let CreateCappedEntityInput {
             table_name,
@@ -28,7 +28,7 @@ impl DatabaseManager {
         } = input;
         let counter_index = 1 + additional_transact_items.len();
         let item_key = item.table_key_map();
-        let wire_item = storage_types::single_table_entity::to_wire_item(item)
+        let wire_item = storage_types::single_table_entity::to_wire_entity(item)
             .map_err(|err| StorageError::internal(&err.to_string()))?;
 
         let mut transact_items = Vec::with_capacity(counter_index + 1);
@@ -50,6 +50,7 @@ impl DatabaseManager {
                 table_name: table_name.clone(),
                 key: capped_entity_counter_key(&counted_entity_type).into(),
                 update_expression: CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION.to_string(),
+                indexers: None,
                 condition_expression: Some(CAPPED_ENTITY_COUNTER_CREATE_CONDITION.to_string()),
                 expression_attribute_names: Some(capped_entity_counter_expression_names()),
                 expression_attribute_values: Some(capped_entity_counter_expression_values(
@@ -110,6 +111,7 @@ impl DatabaseManager {
             },
             TransactEncodeItem {
                 update: Some(TransactUpdateRequest {
+                    indexers: None,
                     table_name: table_name.clone(),
                     key: capped_entity_counter_key(&counted_entity_type).into(),
                     update_expression: CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION.to_string(),

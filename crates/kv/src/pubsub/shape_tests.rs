@@ -135,6 +135,22 @@ impl SortedKvStore for ObservingPubsubKvStore {
             .await
     }
 
+    async fn transact_write_table_with_direct_writes(
+        &self,
+        table_operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
+        self.record_serial_await();
+        self.inner
+            .transact_write_table_with_direct_writes(
+                table_operations,
+                direct_operations,
+                immediate_gsi_consistency,
+            )
+            .await
+    }
+
     async fn batch_write(&self, items: Vec<BatchItem>) -> StorageResult<()> {
         self.record_serial_await();
         self.inner.batch_write(items).await

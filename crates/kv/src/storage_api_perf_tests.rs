@@ -544,6 +544,7 @@ async fn api_update_in_keyspace(
             table_name: table,
             key: key_for("write", target).into(),
             update_expression: Some("SET payload = :payload, counter = :counter".to_string()),
+            indexers: None,
             attribute_updates: None,
             condition_expression: None,
             expression_attribute_names: None,
@@ -575,6 +576,7 @@ async fn api_batch_write(
         .map(|offset| WriteRequest {
             put_request: Some(PutRequest {
                 item: item_for("batch", id * BATCH_WRITE_WIDTH + offset),
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -603,6 +605,7 @@ async fn api_transact_write(
             put: Some(TransactPutRequest {
                 table_name: table.clone(),
                 item: item_for("transact", id * TRANSACT_WIDTH + offset),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,

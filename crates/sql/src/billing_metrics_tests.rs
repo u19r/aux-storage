@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, process::Command};
 
 use alloc_counter::AllocationGuard;
 use storage_types::{
@@ -19,6 +19,7 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
     tally.record_write_request(&WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            indexers: None,
             aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
@@ -43,11 +44,13 @@ fn write_cost_tally_tracks_encode_batch_puts_and_deletes() {
     let mut tally = WriteCostTally::default();
     tally.record_encode_write_request(&EncodeWriteRequest {
         put_request: Some(EncodePutRequest {
-            item: storage_types::WireItem::from_attribute_map(&HashMap::from([(
-                "pk".to_string(),
-                AttributeValue::S("tenant#1".to_string()),
-            )]))
-            .expect("wire item"),
+            item: storage_types::WireEntity::unindexed(
+                storage_types::WireItem::from_attribute_map(&HashMap::from([(
+                    "pk".to_string(),
+                    AttributeValue::S("tenant#1".to_string()),
+                )]))
+                .expect("wire item"),
+            ),
             aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
@@ -74,6 +77,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
         table_name: TableName::new("tenant_t1"),
         key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]).into(),
         update_expression: "SET #v = :v".to_string(),
+        indexers: None,
         condition_expression: None,
         expression_attribute_names: Some(HashMap::from([("#v".to_string(), "value".to_string())])),
         expression_attribute_values: Some(HashMap::from([(
@@ -95,6 +99,7 @@ fn write_cost_tally_tracks_transact_item_kinds() {
         put: Some(TransactPutRequest {
             table_name: TableName::new("tenant_t1"),
             item: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -136,6 +141,7 @@ fn write_cost_tally_tracks_transact_encode_item_kinds() {
         table_name: TableName::new("tenant_t1"),
         key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#1".to_string()))]).into(),
         update_expression: "SET #v = :v".to_string(),
+        indexers: None,
         condition_expression: None,
         expression_attribute_names: Some(HashMap::from([("#v".to_string(), "value".to_string())])),
         expression_attribute_values: Some(HashMap::from([(
@@ -161,7 +167,7 @@ fn write_cost_tally_tracks_transact_encode_item_kinds() {
     tally.record_transact_encode_item(&TransactEncodeItem {
         put: Some(TransactEncodePutRequest {
             table_name: TableName::new("tenant_t1"),
-            item: put_item.clone(),
+            item: storage_types::WireEntity::unindexed(put_item.clone()),
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -207,6 +213,7 @@ fn subtract_removes_unprocessed_write_cost() {
     requested.record_write_request(&WriteRequest {
         put_request: Some(storage_types::PutRequest {
             item: put_item.clone(),
+            indexers: None,
             aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
@@ -234,6 +241,21 @@ fn subtract_removes_unprocessed_write_cost() {
 
 #[test]
 fn sql_billing_metrics_skip_empty_cost_records() {
+    const ISOLATED_ENV: &str = "AUX_SQL_BILLING_METRICS_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe().expect("billing metrics test executable should be available"),
+        )
+        .arg("--exact")
+        .arg("billing_metrics_tests::sql_billing_metrics_skip_empty_cost_records")
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("billing metrics allocation test child should start");
+        assert!(status.success(), "isolated billing metrics test failed");
+        return;
+    }
+
     let empty_guard = AllocationGuard::start(
         module_path!(),
         "sql_billing_metrics_skip_empty_cost_records",

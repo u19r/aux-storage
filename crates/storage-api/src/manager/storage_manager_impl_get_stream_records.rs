@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use http_error::HttpApiError;
+use storage::AdmissionClass;
 use storage_types::{
     AttributeValue, DYNAMODB_STREAM_RECORDS_LIMIT_MAX, DYNAMODB_STREAM_RECORDS_LIMIT_MIN,
     GetStreamRecordsRequest, GetStreamRecordsResponse, KeySchemaElement,
@@ -78,18 +79,27 @@ impl StorageApiManagerImpl {
         request: &GetStreamRecordsRequest,
     ) -> Result<GetStreamRecordsResponse, HttpApiError> {
         let mut cursor = parse_cursor(request.last_evaluated_key.as_deref())?;
-        let provider = self.db().stream_provider();
         let max_bytes = STREAM_RECORDS_MAX_ENCODED_BYTES;
         let mut remaining = request.limit.unwrap_or(100);
         let mut builder = SystemResponseBuilder::new(max_bytes, remaining as usize);
         let has_more = loop {
             let page_limit = remaining.min(PROVIDER_PAGE_MAX_RECORDS);
-            let page = provider
-                .get_items_from_pointer_stream(
-                    StreamName::system_table_stream(),
-                    cursor,
-                    Some(page_limit),
-                )
+            let admitted = self
+                .db()
+                .admit_default_provider(AdmissionClass::RangeRead)
+                .await;
+            let (page, provider) = admitted
+                .map_err(HttpApiError::from)?
+                .run_stream(|provider| async move {
+                    let page = provider
+                        .get_items_from_pointer_stream(
+                            StreamName::system_table_stream(),
+                            cursor,
+                            Some(page_limit),
+                        )
+                        .await?;
+                    Ok::<_, StreamError>((page, provider))
+                })
                 .await
                 .map_err(stream_http_error)?;
             let previous_count = builder.records.len();
@@ -221,8 +231,7 @@ async fn load_key_schema<'a>(
     if !schemas.contains_key(table_name) {
         let table_info = manager
             .db()
-            .storage_provider()
-            .get_table_info(table_name)
+            .get_stream_source_table_info(table_name)
             .await?;
         schemas.insert(table_name.clone(), table_info.key_schema);
     }

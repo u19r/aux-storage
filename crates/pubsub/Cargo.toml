@@ -33,6 +33,7 @@ foundationdb = [
 ]
 
 [dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 config = { path = "../config" }

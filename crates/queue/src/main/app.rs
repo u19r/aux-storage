@@ -57,8 +57,8 @@ pub(crate) struct Args {
     pub(crate) foundationdb_subspace_prefix: Option<String>,
     #[arg(long)]
     pub(crate) foundationdb_tenant_name: Option<String>,
-    #[arg(long, default_value_t = 0)]
-    pub(crate) foundationdb_cache_read_version_ms: u16,
+    #[arg(long)]
+    pub(crate) foundationdb_cache_read_version_ms: Option<u16>,
     #[arg(long)]
     pub(crate) foundationdb_report_conflicting_keys: bool,
     #[arg(long)]
@@ -177,7 +177,7 @@ fn queue_bind_addr(args: &Args, configured: &str) -> Result<SocketAddr, std::net
     }
 }
 
-fn queue_config_overrides(args: &Args) -> Vec<(String, String)> {
+pub(crate) fn queue_config_overrides(args: &Args) -> Vec<(String, String)> {
     let mut overrides = Vec::new();
     if let Some(storage) = args.storage.clone() {
         select_queue_backend(storage, &mut overrides);
@@ -228,10 +228,10 @@ fn queue_config_overrides(args: &Args) -> Vec<(String, String)> {
             tenant.clone(),
         ));
     }
-    if args.foundationdb_cache_read_version_ms > 0 {
+    if let Some(cache_read_version_ms) = args.foundationdb_cache_read_version_ms {
         overrides.push((
             "features.backends.foundationdb.cache_read_version_ms".to_string(),
-            args.foundationdb_cache_read_version_ms.to_string(),
+            cache_read_version_ms.to_string(),
         ));
     }
     if args.foundationdb_report_conflicting_keys {

@@ -1,0 +1,14 @@
+[[test]]
+testTitle = "AuxStorageFdbChaosReadSequenceDag"
+
+  [[test.workload]]
+  testName = "External"
+  workloadName = "read_sequence_dag"
+  libraryPath = "target/release"
+  libraryName = "aux_storage_fdb_chaos"
+  useCAPI = true
+  profile = "smoke"
+  operationCount = 1
+  activeClientCount = 1
+  historySampleLimit = 128
+  artifactRoot = "run-artifacts/fdb-chaos"

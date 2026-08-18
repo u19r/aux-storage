@@ -35,8 +35,7 @@ fn sqlite_connection(path: &str) -> StorageConnectionConfig {
 fn temp_sqlite_path(prefix: &str) -> String {
     let namespace = TableNamespace::new();
     let suffix = namespace.storage_key().to_string();
-    std::env::temp_dir()
-        .join(format!("auxfn-{prefix}-{suffix}.db"))
+    crate::storage_test_support::unique_path(&format!("auxfn-{prefix}-{suffix}.db"))
         .to_string_lossy()
         .to_string()
 }

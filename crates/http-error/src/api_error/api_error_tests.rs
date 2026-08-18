@@ -182,6 +182,30 @@ fn storage_throttle_and_auth_errors_map_to_aws_error_types() {
 }
 
 #[test]
+fn admission_rejection_maps_to_503_with_retry_hint() {
+    let storage_err = StorageError::service_unavailable(2);
+    let handler: HttpApiError = storage_err.into();
+
+    assert_eq!(handler.status_code, 503);
+    assert_eq!(
+        handler.error_type,
+        "com.amazonaws.dynamodb.v20120810#ServiceUnavailableException"
+    );
+    assert_eq!(
+        handler
+            .response_headers
+            .iter()
+            .find(|(name, _)| name == "Retry-After")
+            .map(|(_, value)| value.as_str()),
+        Some("2")
+    );
+
+    let (status, axum::response::Json(body)): (StatusCode, _) = handler.into();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body.retry_after_seconds, Some(2));
+}
+
+#[test]
 fn storage_validation_adds_dynamodb_prefix_for_update_expression_messages() {
     let storage_err: StorageError = StorageEnum::Validation {
         message: "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"SET\""

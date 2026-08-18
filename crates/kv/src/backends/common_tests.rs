@@ -40,6 +40,7 @@ fn plan_table_put_includes_ttl_index_mutation_in_same_plan() {
             table_identity,
             table_info,
             item: new_item,
+            indexers: None,
             item_stream_ttl_hours: None,
             condition: None,
             return_values_on_condition_check_failure: None,
@@ -76,8 +77,12 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
         crate::ttl::compact_ttl_index_key_for_item(&table_identity, &table_info, "ttl", &new_item)
             .expect("new ttl key result")
             .expect("new ttl key");
-    let current_bytes =
-        storage_types::storage_serde::to_bytes(&old_item).expect("serialize current item");
+    let current_bytes = crate::kv_support_tests::encode_table_item(
+        crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+        &old_item,
+        None,
+        table_info.max_indexers,
+    );
 
     let plan = plan_table_write(
         &[TransactWriteTableOperation::Update {
@@ -88,6 +93,7 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
                 field: "ttl".to_string().into(),
                 value: new_ttl,
             }]),
+            indexers: None,
             item_stream_ttl_hours: None,
             condition: None,
             return_values_on_condition_check_failure: None,
@@ -115,6 +121,55 @@ fn plan_table_update_replaces_ttl_index_mutations_in_same_plan() {
 }
 
 #[test]
+fn direct_table_update_preserves_runtime_validation_error() {
+    let table_info = ttl_table_info("direct_update_validation_plan");
+    let table_identity = table_identity(&table_info);
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("pk".to_string())),
+        ("sk".to_string(), AttributeValue::S("sk".to_string())),
+        ("n".to_string(), AttributeValue::N("3".to_string())),
+        ("s".to_string(), AttributeValue::S("old".to_string())),
+    ]);
+    let current_bytes = crate::kv_support_tests::encode_table_item(
+        crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+        &item,
+        None,
+        table_info.max_indexers,
+    );
+    let operations = storage_provider::parse_update_expression("SET n = n + s", None, None)
+        .expect("update expression");
+
+    let result = plan_table_write(
+        &[TransactWriteTableOperation::Update {
+            table_identity,
+            table_info,
+            key: key_attrs("pk", "sk").into(),
+            operations: operations.into(),
+            indexers: None,
+            item_stream_ttl_hours: None,
+            condition: None,
+            return_values_on_condition_check_failure: None,
+            replication: None,
+            preserve_old_item: false,
+            transaction_validation: false,
+            ttl_config: None,
+        }],
+        vec![Some(current_bytes)],
+        &[None],
+        false,
+    );
+    let Err(error) = result else {
+        panic!("invalid update should fail");
+    };
+
+    assert!(matches!(error.to_enum(), StorageEnum::Validation { .. }));
+    assert_eq!(
+        error.to_string(),
+        "An operand in the update expression has an incorrect data type"
+    );
+}
+
+#[test]
 fn plan_table_delete_accepts_equivalent_scientific_number_key() {
     let table_info = number_table_info("number_delete_plan");
     let current = HashMap::from([
@@ -127,8 +182,12 @@ fn plan_table_delete_accepts_equivalent_scientific_number_key() {
         ),
         ("sk".to_string(), AttributeValue::N("1".to_string())),
     ]);
-    let current_bytes =
-        storage_types::storage_serde::to_bytes(&current).expect("serialize current item");
+    let current_bytes = crate::kv_support_tests::encode_table_item(
+        crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+        &current,
+        None,
+        table_info.max_indexers,
+    );
 
     let plan = plan_table_write(
         &[TransactWriteTableOperation::Delete {
@@ -167,6 +226,7 @@ fn plan_table_write_collects_cancellation_reasons_after_first_failure() {
         .expect("condition expression");
     let current_one = item_with_status("pk", "sk-1", "open");
     let current_two = item_with_status("pk", "sk-2", "open");
+    let max_indexers = table_info.max_indexers;
 
     let error = plan_table_write(
         &[
@@ -186,8 +246,18 @@ fn plan_table_write_collects_cancellation_reasons_after_first_failure() {
             },
         ],
         vec![
-            Some(storage_types::storage_serde::to_bytes(&current_one).expect("item one")),
-            Some(storage_types::storage_serde::to_bytes(&current_two).expect("item two")),
+            Some(crate::kv_support_tests::encode_table_item(
+                crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+                &current_one,
+                None,
+                max_indexers,
+            )),
+            Some(crate::kv_support_tests::encode_table_item(
+                crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+                &current_two,
+                None,
+                max_indexers,
+            )),
         ],
         &[None, None],
         false,
@@ -209,6 +279,41 @@ fn plan_table_write_collects_cancellation_reasons_after_first_failure() {
 }
 
 #[test]
+fn given_invalid_indexer_value_when_planning_transaction_then_cancel_with_indexed_reason() {
+    let mut table_info = ttl_table_info("transaction_indexer_validation");
+    table_info.max_indexers = storage_types::MaxIndexers::try_new(1).expect("capacity");
+    let mut invalid_item = item_with_status("pk", "sk", "open");
+    invalid_item.insert("status".to_string(), AttributeValue::N("1".to_string()));
+
+    let result = plan_table_write(
+        &[TransactWriteTableOperation::Put {
+            table_identity: table_identity(&table_info),
+            table_info,
+            item: invalid_item,
+            indexers: Some(vec!["status".to_string()]),
+            item_stream_ttl_hours: None,
+            condition: None,
+            return_values_on_condition_check_failure: None,
+            replication: None,
+            ttl_config: None,
+        }],
+        vec![None],
+        &[None],
+        false,
+    );
+    let Err(error) = result else {
+        panic!("invalid indexer value should cancel the transaction");
+    };
+    let StorageEnum::TransactionCanceled { reasons } = error.to_enum() else {
+        panic!("expected transaction cancellation, got {error:?}");
+    };
+    assert_eq!(
+        reasons,
+        &vec!["ValidationError\tIndexers:attribute_must_be_string".to_string()]
+    );
+}
+
+#[test]
 fn plan_table_write_rejects_duplicate_transaction_item_targets() {
     let table_info = ttl_table_info("duplicate_transaction_targets_plan");
     let result = plan_table_write(
@@ -217,6 +322,7 @@ fn plan_table_write_rejects_duplicate_transaction_item_targets() {
                 table_identity: table_identity(&table_info),
                 table_info: table_info.clone(),
                 item: item_with_status("pk", "sk", "open"),
+                indexers: None,
                 item_stream_ttl_hours: None,
                 condition: None,
                 return_values_on_condition_check_failure: None,
@@ -342,6 +448,7 @@ fn ttl_table_info(name: &str) -> StoredTableInfo {
             attr("sk", KeyAttributeType::S),
         ],
         key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,
@@ -362,6 +469,7 @@ fn number_table_info(name: &str) -> StoredTableInfo {
             attr("sk", KeyAttributeType::N),
         ],
         key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,

@@ -131,7 +131,9 @@ fn put(id: &str, version: u64) -> ResolvedSyncMutation {
         table_name: TableName::new("orders"),
         key_json: format!(r#"{{"pk":{{"S":"{id}"}}}}"#),
         item_json: format!(r#"{{"pk":{{"S":"{id}"}},"status":{{"S":"open"}}}}"#),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse::default(),
     })
@@ -143,6 +145,7 @@ fn delete(id: &str, version: u64) -> ResolvedSyncMutation {
         table_name: TableName::new("orders"),
         key_json: format!(r#"{{"pk":{{"S":"{id}"}}}}"#),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse::default(),
     })

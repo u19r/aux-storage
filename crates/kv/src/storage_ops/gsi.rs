@@ -9,7 +9,7 @@ use crate::{
         SortedKvDbStorageProvider, StorageError, StorageResult, StoredTableInfo, StreamDataType,
         StreamItem, StreamItemId, StreamName, StreamPointer, StreamProvider, TableName,
         TimeToLiveStatus, TtlConfigRecord, async_trait, constants, info, now_ms_u64,
-        project_gsi_item, should_log_job, ttl,
+        should_log_job, ttl,
     },
 };
 
@@ -273,6 +273,8 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                     table_info,
                     gsi,
                     ttl_attr,
+                    &stream_pointer.indexers,
+                    self.kv_store.item_value_codec(),
                 )?;
                 operations.push(op);
             }
@@ -441,12 +443,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         table_info: &StoredTableInfo,
         gsi: &storage_types::GlobalSecondaryIndex,
         ttl_attribute: Option<&str>,
+        indexers: &[String],
+        codec: crate::sorted_kv_store::ItemValueCodec,
     ) -> StorageResult<StreamBatchWrite> {
         let table_name = table_info.table_name.clone();
         let table_schema = &table_info.key_schema;
         let gsi_name = &gsi.index_name;
         let gsi_schema = &gsi.key_schema;
-        let gsi_projection = &gsi.projection;
         let tombstone_key = |index_key: Option<&ItemKey>| {
             index_key
                 .and_then(|key| table_keys::gsi_tombstone_key(table_identity, gsi_name, key).ok())
@@ -517,8 +520,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         let Some(si2) = stream_item.get(1) else {
-            let filtered_item = project_gsi_item(item1, gsi_projection, table_schema, gsi_schema);
-            let put_item_value = storage_types::storage_serde::to_bytes(&filtered_item)?;
+            let put_item_value = encode_gsi_stream_value(codec, &item1, indexers, table_info, gsi)?;
 
             return Ok(StreamBatchWrite {
                 put_item_value: Some(put_item_value),
@@ -529,8 +531,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         };
 
         if si2.data_type == StreamDataType::DeleteMarker {
-            let filtered_item = project_gsi_item(item1, gsi_projection, table_schema, gsi_schema);
-            let put_item_value = storage_types::storage_serde::to_bytes(&filtered_item)?;
+            let put_item_value = encode_gsi_stream_value(codec, &item1, indexers, table_info, gsi)?;
 
             return Ok(StreamBatchWrite {
                 put_item_value: Some(put_item_value),
@@ -577,8 +578,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             && gsi2 == gsi1
         {
             // Same key, treat as update
-            let filtered_item = project_gsi_item(item1, gsi_projection, table_schema, gsi_schema);
-            let put_item_value = storage_types::storage_serde::to_bytes(&filtered_item)?;
+            let put_item_value = encode_gsi_stream_value(codec, &item1, indexers, table_info, gsi)?;
             return Ok(StreamBatchWrite {
                 put_item_value: Some(put_item_value),
                 put_item_key: first_gsi_key,
@@ -588,8 +588,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         }
 
         // different key, delete previous
-        let filtered_item = project_gsi_item(item1, gsi_projection, table_schema, gsi_schema);
-        let put_item_value = storage_types::storage_serde::to_bytes(&filtered_item)?;
+        let put_item_value = encode_gsi_stream_value(codec, &item1, indexers, table_info, gsi)?;
         Ok(StreamBatchWrite {
             put_item_value: Some(put_item_value),
             put_item_key: first_gsi_key,
@@ -618,6 +617,27 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             ])
             .await
     }
+}
+
+fn encode_gsi_stream_value(
+    codec: crate::sorted_kv_store::ItemValueCodec,
+    logical_item: &HashMap<String, AttributeValue>,
+    indexers: &[String],
+    table_info: &StoredTableInfo,
+    gsi: &storage_types::GlobalSecondaryIndex,
+) -> StorageResult<Vec<u8>> {
+    let declaration =
+        storage_types::IndexerDeclaration::try_new(indexers.to_vec(), table_info.max_indexers)?;
+    let projected = storage_common::apply_gsi_projection(
+        logical_item,
+        Some(&gsi.projection),
+        &table_info.key_schema,
+        &gsi.key_schema,
+    );
+    crate::storage_ops::encode_indexed_wire_item(
+        codec,
+        &storage_types::IndexedWireItem::extract_projected(logical_item, &projected, &declaration)?,
+    )
 }
 
 /// Background job for updating global secondary indexes

@@ -15,6 +15,7 @@ pub(crate) struct UpdateItemInput<'a> {
     pub(crate) condition: &'a Option<Condition>,
     pub(crate) table_name: &'a TableName,
     pub(crate) key: &'a KeyAttributes,
+    pub(crate) indexers: Option<&'a [String]>,
     pub(crate) immediate_gsi_consistency: bool,
     pub(crate) return_old_on_condition_failure: bool,
     pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
@@ -33,12 +34,18 @@ impl SQLiteStorageProvider {
             condition,
             table_name,
             key,
+            indexers,
             immediate_gsi_consistency,
             return_old_on_condition_failure,
             item_stream_ttl_hours,
         } = input;
         // First, get the item to return it if it exists
-        let existing_item = Self::do_get_item(table_name, key, sqlite)?;
+        let existing = Self::do_get_item_with_indexers(table_name, key, sqlite)?;
+        let (existing_item, existing_indexers) = match existing {
+            Some((item, indexers)) => (Some(item), indexers),
+            None => (None, Vec::new()),
+        };
+        let effective_indexers = indexers.unwrap_or(&existing_indexers);
         let (item_to_update, updated_item) = plan_update_from_existing_item(
             existing_item,
             key,
@@ -54,6 +61,7 @@ impl SQLiteStorageProvider {
                 table_name,
                 item: &updated_item,
                 condition: &None,
+                indexers: Some(effective_indexers),
                 immediate_gsi_consistency,
                 return_old_on_condition_failure: false,
                 replication: None,

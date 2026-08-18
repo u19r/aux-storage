@@ -23,6 +23,7 @@ async fn single_node_sync_write_persists_log_entry_and_applies_command() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "open"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -75,6 +76,7 @@ async fn single_node_sync_write_increments_persistent_log_index() {
         SyncWriteRequest::PutItem(PutItemRequest {
             table_name: table_name.clone(),
             item: item("item#1", "first"),
+            indexers: None,
             condition_expression: None,
             expression_attribute_names: None,
             expression_attribute_values: None,
@@ -161,6 +163,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))])
                 .into(),
             update_expression: "SET #value = :value".to_string(),
+            indexers: None,
             condition_expression: Some("#value = :old".to_string()),
             expression_attribute_names: Some(HashMap::from([(
                 "#value".to_string(),
@@ -185,6 +188,7 @@ async fn single_node_sync_supported_writes_match_ordinary_storage_results() {
                 vec![WriteRequest {
                     put_request: Some(PutRequest {
                         item: item("item#2", "batch"),
+                        indexers: None,
                         aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,

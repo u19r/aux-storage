@@ -9,7 +9,7 @@ use storage_types::{
     AttributeValue, IndexName, QueryTableRequest, StorageError, StorageResult, TableNamespace,
     TimestampMillis, from_hashmap,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
     namespace_routing::{
@@ -34,33 +34,74 @@ const NAMESPACE_ROUTE_PK_PREFIX: &str = "NS#";
 const SHARED_TABLE_LOOKUP_MARKER: &str = "ST#1";
 const SHARED_TABLE_LOOKUP_QUERY: &str = "gsi2pk = :pk";
 const DEFAULT_CUTOVER_PAUSE_MS: i64 = 250;
+const ROUTE_PROVIDER_CONCURRENCY: usize = 8;
 
-pub struct NamespaceRouteResolver {
+pub(crate) struct NamespaceRouteResolver {
     default_connection_id: String,
     control_plane: Arc<dyn DatabaseTrait>,
     namespace_routes: FetchingLruTtlCache<TableNamespace, NamespaceRouteRecord, StorageError>,
     location_descriptors: FetchingLruTtlCache<u16, LocationDescriptorSerde, StorageError>,
+    provider_access: Arc<Semaphore>,
     cutover_overrides: RwLock<HashMap<TableNamespace, CutoverOverride>>,
     write_pause_ms: i64,
 }
 
+/// Background cache refreshes do not own a foreground or control permit, but
+/// remote providers still publish connection-wide pressure markers. Drain the
+/// marker at this boundary so a refresh cannot misclassify the next admitted
+/// foreground operation on the same connection.
+struct ProviderPressureDrainGuard {
+    provider: Arc<dyn DatabaseTrait>,
+}
+
+impl Drop for ProviderPressureDrainGuard {
+    fn drop(&mut self) {
+        let _ = self.provider.take_admission_pressure_signal();
+    }
+}
+
 impl NamespaceRouteResolver {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         default_connection_id: String,
         control_plane: Arc<dyn DatabaseTrait>,
         enable_background_refresh: bool,
     ) -> Self {
+        // Cache misses and background refreshes share a bounded maintenance
+        // lane.  The resolver is also called from admitted request paths, but
+        // the cache's refresh tasks cannot borrow that request permit.
+        let provider_access = Arc::new(Semaphore::new(ROUTE_PROVIDER_CONCURRENCY));
         let route_provider = Arc::clone(&control_plane);
+        let route_access = Arc::clone(&provider_access);
         let route_fetch = arc_fetch_fn(move |namespace: TableNamespace| {
             let route_provider = Arc::clone(&route_provider);
-            async move { fetch_namespace_route_record(route_provider, namespace).await }
+            let route_access = Arc::clone(&route_access);
+            async move {
+                let _permit = route_access
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| StorageError::internal("namespace route provider lane closed"))?;
+                let _pressure_guard = ProviderPressureDrainGuard {
+                    provider: Arc::clone(&route_provider),
+                };
+                fetch_namespace_route_record(route_provider, namespace).await
+            }
         });
 
         let descriptor_provider = Arc::clone(&control_plane);
+        let descriptor_access = Arc::clone(&provider_access);
         let descriptor_fetch = arc_fetch_fn(move |loc: u16| {
             let descriptor_provider = Arc::clone(&descriptor_provider);
-            async move { fetch_location_descriptor(descriptor_provider, loc).await }
+            let descriptor_access = Arc::clone(&descriptor_access);
+            async move {
+                let _permit = descriptor_access.acquire_owned().await.map_err(|_| {
+                    StorageError::internal("location descriptor provider lane closed")
+                })?;
+                let _pressure_guard = ProviderPressureDrainGuard {
+                    provider: Arc::clone(&descriptor_provider),
+                };
+                fetch_location_descriptor(descriptor_provider, loc).await
+            }
         });
 
         let mut namespace_routes = CacheConfig::new()
@@ -85,12 +126,13 @@ impl NamespaceRouteResolver {
             control_plane,
             namespace_routes: FetchingLruTtlCache::new(namespace_routes),
             location_descriptors: FetchingLruTtlCache::new(location_descriptors),
+            provider_access,
             cutover_overrides: RwLock::new(HashMap::new()),
             write_pause_ms: DEFAULT_CUTOVER_PAUSE_MS,
         }
     }
 
-    pub async fn preload_shared_table_namespaces(&self) -> StorageResult<()> {
+    pub(crate) async fn preload_shared_table_namespaces(&self) -> StorageResult<()> {
         let mut next: Option<String> = None;
         loop {
             let request = QueryTableRequest {
@@ -108,6 +150,11 @@ impl NamespaceRouteResolver {
                 scan_index_forward: Some(true),
                 consistent_read: false,
             };
+            let _permit = self
+                .provider_access
+                .acquire()
+                .await
+                .map_err(|_| StorageError::internal("namespace route provider lane closed"))?;
             let (items, token) = self.control_plane.query_table(&request).await?;
             for item in items {
                 let map = item.into_attribute_map()?;
@@ -123,7 +170,10 @@ impl NamespaceRouteResolver {
         Ok(())
     }
 
-    pub async fn resolve_route(&self, namespace: &TableNamespace) -> StorageResult<NamespaceRoute> {
+    pub(crate) async fn resolve_route(
+        &self,
+        namespace: &TableNamespace,
+    ) -> StorageResult<NamespaceRoute> {
         let route_record = self
             .namespace_routes
             .get_or_fetch(namespace)
@@ -134,11 +184,62 @@ impl NamespaceRouteResolver {
         self.route_for_record(namespace, &route_record).await
     }
 
+    /// Resolve a route only when its namespace record and every location
+    /// descriptor are already resident.  This path performs no fetch or
+    /// refresh side effect, so callers can use it before deciding whether a
+    /// provider admission permit is needed.
+    pub(crate) async fn cached_route(
+        &self,
+        namespace: &TableNamespace,
+    ) -> StorageResult<Option<NamespaceRoute>> {
+        let Some(route_record) = self.namespace_routes.peek(namespace) else {
+            return Ok(None);
+        };
+        self.route_for_record_inner(namespace, &route_record, true)
+            .await
+    }
+
     pub(crate) async fn route_for_record(
         &self,
         namespace: &TableNamespace,
         route_record: &NamespaceRouteRecord,
     ) -> StorageResult<NamespaceRoute> {
+        self.route_for_record_inner(namespace, route_record, false)
+            .await?
+            .ok_or_else(|| StorageError::internal("route resolution unexpectedly missed a target"))
+    }
+
+    pub(crate) async fn cached_route_for_record(
+        &self,
+        namespace: &TableNamespace,
+        route_record: &NamespaceRouteRecord,
+    ) -> StorageResult<Option<NamespaceRoute>> {
+        self.route_for_record_inner(namespace, route_record, true)
+            .await
+    }
+
+    pub(crate) fn seed_single_route(
+        &self,
+        namespace: TableNamespace,
+        storage_mode: NamespaceStorageMode,
+        loc: u16,
+    ) {
+        self.namespace_routes.insert(
+            namespace,
+            NamespaceRouteRecord {
+                storage_mode,
+                loc,
+                migration_mode: NamespaceStorageMigrationMode::Single,
+            },
+        );
+    }
+
+    async fn route_for_record_inner(
+        &self,
+        namespace: &TableNamespace,
+        route_record: &NamespaceRouteRecord,
+        cached_only: bool,
+    ) -> StorageResult<Option<NamespaceRoute>> {
         let now_ms = TimestampMillis::now().timestamp_millis();
         let override_loc = self.effective_cutover_override(namespace, now_ms).await;
 
@@ -175,56 +276,46 @@ impl NamespaceRouteResolver {
             }
         }
 
-        let read_target = self
-            .target_for_loc(namespace, route_record.storage_mode, read_loc)
-            .await?;
+        let Some(read_target) = self
+            .target_for_loc_with_mode(namespace, route_record.storage_mode, read_loc, cached_only)
+            .await?
+        else {
+            return Ok(None);
+        };
 
         let mut write_targets = Vec::with_capacity(write_locs.len());
         let mut seen_write_targets = HashSet::with_capacity(write_locs.len());
         for loc in write_locs {
-            let target = self
-                .target_for_loc(namespace, route_record.storage_mode, loc)
-                .await?;
+            let Some(target) = self
+                .target_for_loc_with_mode(namespace, route_record.storage_mode, loc, cached_only)
+                .await?
+            else {
+                return Ok(None);
+            };
             let dedupe_key = (target.connection_id.clone(), target.table_name.clone());
             if seen_write_targets.insert(dedupe_key) {
                 write_targets.push(target);
             }
         }
 
-        Ok(NamespaceRoute {
+        Ok(Some(NamespaceRoute {
             namespace: namespace.clone(),
             storage_mode: route_record.storage_mode,
             read_target,
             write_targets,
             writes_paused,
-        })
+        }))
     }
 
-    pub fn invalidate_namespace(&self, namespace: &TableNamespace) {
+    pub(crate) fn invalidate_namespace(&self, namespace: &TableNamespace) {
         self.namespace_routes.remove(namespace);
     }
 
-    pub fn seed_single_route(
-        &self,
-        namespace: TableNamespace,
-        storage_mode: NamespaceStorageMode,
-        loc: u16,
-    ) {
-        self.namespace_routes.insert(
-            namespace,
-            NamespaceRouteRecord {
-                storage_mode,
-                loc,
-                migration_mode: NamespaceStorageMigrationMode::Single,
-            },
-        );
-    }
-
-    pub fn invalidate_location(&self, loc: u16) {
+    pub(crate) fn invalidate_location(&self, loc: u16) {
         self.location_descriptors.remove(&loc);
     }
 
-    pub async fn apply_cutover_event(&self, event: &CutoverEvent) -> StorageResult<()> {
+    pub(crate) async fn apply_cutover_event(&self, event: &CutoverEvent) -> StorageResult<()> {
         match event.status {
             CutoverEventStatus::Canceled | CutoverEventStatus::Failed => {
                 self.cutover_overrides
@@ -279,7 +370,32 @@ impl NamespaceRouteResolver {
         })
     }
 
-    pub async fn resolve_target_for_loc(
+    async fn target_for_loc_with_mode(
+        &self,
+        namespace: &TableNamespace,
+        mode: NamespaceStorageMode,
+        loc: u16,
+        cached_only: bool,
+    ) -> StorageResult<Option<RouteTarget>> {
+        if !cached_only {
+            return self.target_for_loc(namespace, mode, loc).await.map(Some);
+        }
+        let connection_id = if loc == 0 {
+            self.default_connection_id.clone()
+        } else {
+            let Some(descriptor) = self.location_descriptors.peek(&loc) else {
+                return Ok(None);
+            };
+            descriptor.connection_id.clone()
+        };
+        Ok(Some(RouteTarget {
+            connection_id,
+            table_name: mode.source_table_name(namespace, loc),
+            loc,
+        }))
+    }
+
+    pub(crate) async fn resolve_target_for_loc(
         &self,
         namespace: &TableNamespace,
         mode: NamespaceStorageMode,

@@ -6,6 +6,7 @@ pub(crate) const WORKLOAD_PARTITION_FAMILY: &str = "partition_family";
 pub(crate) const WORKLOAD_PUBSUB_DELIVERY: &str = "pubsub_delivery";
 pub(crate) const WORKLOAD_QUEUE_VISIBILITY: &str = "queue_visibility";
 pub(crate) const WORKLOAD_TABLE_ATOMICITY: &str = "table_atomicity";
+pub(crate) const WORKLOAD_READ_SEQUENCE_DAG: &str = "read_sequence_dag";
 pub(crate) const OPTION_PROFILE: &str = "profile";
 pub(crate) const OPTION_OPERATION_COUNT: &str = "operationCount";
 pub(crate) const OPTION_HISTORY_SAMPLE_LIMIT: &str = "historySampleLimit";
@@ -14,6 +15,11 @@ pub(crate) const OPTION_KEY_COUNT: &str = "keyCount";
 pub(crate) const OPTION_ACTIVE_CLIENT_COUNT: &str = "activeClientCount";
 pub(crate) const OPTION_SHARED_KEY_COUNT: &str = "sharedKeyCount";
 pub(crate) const OPTION_SHARED_OPERATION_PERCENT: &str = "sharedOperationPercent";
+// Keep workload-local controls distinct from fdbserver's reserved simulation
+// options.  The runner still sets the process-wide seed/buggify flags, while
+// these values let a workload use the same CLI choices deterministically.
+pub(crate) const OPTION_SEED: &str = "readSequenceSeed";
+pub(crate) const OPTION_BUGGIFY: &str = "readSequenceBuggify";
 pub(crate) const GSI_INDEX_NAME: &str = "by_category_score";
 pub(crate) const GSI_CATEGORY_ATTR: &str = "category";
 pub(crate) const GSI_SCORE_ATTR: &str = "score";
@@ -144,4 +150,6 @@ pub(crate) fn consume_noop_options(context: &WorkloadContext) {
     let _: Option<String> = context.get_option(OPTION_ACTIVE_CLIENT_COUNT);
     let _: Option<String> = context.get_option(OPTION_SHARED_KEY_COUNT);
     let _: Option<String> = context.get_option(OPTION_SHARED_OPERATION_PERCENT);
+    let _: Option<String> = context.get_option(OPTION_SEED);
+    let _: Option<String> = context.get_option(OPTION_BUGGIFY);
 }

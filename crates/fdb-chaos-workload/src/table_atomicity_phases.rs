@@ -49,6 +49,7 @@ impl TableAtomicityWorkload {
                         .put_item(PutItemInput {
                             table_name: self.table_name(),
                             item: self.item(&key, &value).into(),
+                            indexers: None,
                             condition_expression: None,
                             expression_attribute_names: None,
                             expression_attribute_values: None,
@@ -83,6 +84,7 @@ impl TableAtomicityWorkload {
                         .put_item(PutItemInput {
                             table_name: self.table_name(),
                             item: self.item(&key, &value).into(),
+                            indexers: None,
                             condition_expression: Some("attribute_not_exists(pk)".to_string()),
                             expression_attribute_names: None,
                             expression_attribute_values: None,
@@ -143,6 +145,7 @@ impl TableAtomicityWorkload {
                             table_name: self.table_name(),
                             key: self.key_attributes(&key).into(),
                             update_expression,
+                            indexers: None,
                             condition_expression: None,
                             expression_attribute_names: None,
                             expression_attribute_values: Some(expression_attribute_values),
@@ -287,6 +290,7 @@ impl TableAtomicityWorkload {
                                     put: Some(TransactPutRequest {
                                         table_name: self.table_name(),
                                         item: self.item(&key, &value),
+                                        indexers: None,
                                         condition_expression: None,
                                         expression_attribute_names: None,
                                         expression_attribute_values: None,
@@ -302,6 +306,7 @@ impl TableAtomicityWorkload {
                                     put: Some(TransactPutRequest {
                                         table_name: self.table_name(),
                                         item: self.item(&second_key, &value),
+                                        indexers: None,
                                         condition_expression: None,
                                         expression_attribute_names: None,
                                         expression_attribute_values: None,

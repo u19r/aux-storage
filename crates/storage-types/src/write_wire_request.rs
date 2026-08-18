@@ -6,13 +6,14 @@ use crate::{
     AllOld, AttributeValue, BatchWriteItemRequest, DeleteRequest, PutRequest,
     StreamRetentionDuration, TableName, TransactConditionCheckRequest, TransactDeleteRequest,
     TransactPutRequest, TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest,
-    WireItem, WriteRequest,
+    WireItem, WriteRequest, single_table_entity::WireEntity,
 };
 
 #[derive(Debug, Clone)]
 pub struct PutItemEncodeRequest {
     pub table_name: TableName,
     pub item: WireItem,
+    pub indexers: Option<Vec<String>>,
     pub condition_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -75,7 +76,7 @@ pub struct EncodeWriteRequest {
 #[derive(Debug, Clone, TypedBuilder)]
 pub struct EncodePutRequest {
     #[builder(setter(!strip_option))]
-    pub item: WireItem,
+    pub item: WireEntity,
     #[builder(default, setter(strip_option))]
     pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
@@ -89,10 +90,14 @@ impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
             let mut converted = Vec::with_capacity(write_requests.len());
             for write_request in write_requests {
                 let put_request = match write_request.put_request {
-                    Some(put_request) => Some(PutRequest {
-                        item: put_request.item.into_attribute_map()?,
-                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
-                    }),
+                    Some(put_request) => {
+                        let (item, indexers) = put_request.item.into_write_parts();
+                        Some(PutRequest {
+                            item: item.into_attribute_map()?,
+                            indexers,
+                            aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+                        })
+                    }
                     None => None,
                 };
 
@@ -122,7 +127,10 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
             for write_request in write_requests {
                 let put_request = match write_request.put_request {
                     Some(put_request) => Some(EncodePutRequest {
-                        item: WireItem::from_attribute_map(&put_request.item)?,
+                        item: WireEntity::from_write_parts(
+                            WireItem::from_attribute_map(&put_request.item)?,
+                            put_request.indexers,
+                        ),
                         aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     }),
                     None => None,
@@ -170,7 +178,7 @@ pub struct TransactEncodePutRequest {
     #[builder(!default, setter(!strip_option))]
     pub table_name: TableName,
     #[builder(!default, setter(!strip_option))]
-    pub item: WireItem,
+    pub item: WireEntity,
     pub condition_expression: Option<String>,
     pub expression_attribute_names: Option<HashMap<String, String>>,
     pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
@@ -185,16 +193,20 @@ impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
         let mut transact_items = Vec::with_capacity(value.transact_items.len());
         for item in value.transact_items {
             let put = match item.put {
-                Some(put_request) => Some(TransactPutRequest {
-                    table_name: put_request.table_name,
-                    item: put_request.item.into_attribute_map()?,
-                    condition_expression: put_request.condition_expression,
-                    expression_attribute_names: put_request.expression_attribute_names,
-                    expression_attribute_values: put_request.expression_attribute_values,
-                    return_values_on_condition_check_failure: put_request
-                        .return_values_on_condition_check_failure,
-                    aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
-                }),
+                Some(put_request) => {
+                    let (item, indexers) = put_request.item.into_write_parts();
+                    Some(TransactPutRequest {
+                        table_name: put_request.table_name,
+                        item: item.into_attribute_map()?,
+                        indexers,
+                        condition_expression: put_request.condition_expression,
+                        expression_attribute_names: put_request.expression_attribute_names,
+                        expression_attribute_values: put_request.expression_attribute_values,
+                        return_values_on_condition_check_failure: put_request
+                            .return_values_on_condition_check_failure,
+                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
+                    })
+                }
                 None => None,
             };
 

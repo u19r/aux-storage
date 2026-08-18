@@ -20,6 +20,7 @@ pub mod sql_types;
 mod sqlite_cache_config;
 #[cfg(all(test, feature = "sqlite-backend"))]
 mod sqlite_cache_config_tests;
+#[cfg(any(test, feature = "turso-backend", feature = "postgres-backend"))]
 mod write_plan;
 #[cfg(feature = "postgres-backend")]
 pub use backends::postgres::PostgresStorageProvider;
@@ -45,6 +46,7 @@ mod helpers;
 mod names;
 pub use names::{AttributeName, GsiPhysicalName, PhysicalTableName};
 mod gsi_lifecycle;
+mod indexed_item;
 mod key_attribute_handler;
 mod naming;
 mod read_path;
@@ -55,8 +57,10 @@ mod utils;
 mod gsi_lifecycle_alloc_tests;
 #[cfg(test)]
 mod gsi_lifecycle_tests;
-#[cfg(all(test, any(feature = "postgres-backend", feature = "turso-backend")))]
+#[cfg(all(test, any(feature = "postgres-tests", feature = "turso-backend")))]
 mod gsi_profile_support_tests;
+#[cfg(all(test, feature = "sqlite-backend"))]
+mod indexer_sql_performance_tests;
 #[cfg(test)]
 mod pagination_tests;
 #[cfg(all(test, feature = "turso-backend"))]
@@ -70,3 +74,5 @@ mod utils_tests;
 
 #[cfg(test)]
 mod billing_metrics_tests;
+#[cfg(test)]
+mod sql_test_support;

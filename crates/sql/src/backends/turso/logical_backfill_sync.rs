@@ -45,6 +45,8 @@ pub(crate) async fn apply_resolved_sync_mutations(
                             &table_info,
                             &split_item.key_attributes,
                             &split_item.all_attributes,
+                            &split_item.non_key_attributes,
+                            Some(&mutation.indexers),
                         )
                         .await?;
                         set_item_revision(
@@ -61,6 +63,8 @@ pub(crate) async fn apply_resolved_sync_mutations(
                             &split_item.all_attributes,
                             TursoWriteStreamEntriesInput {
                                 old_item: old_item.as_ref(),
+                                indexers: &mutation.indexers,
+                                old_indexers: mutation.old_indexers.as_deref(),
                                 is_deleted: false,
                                 item_stream_version: mutation.target_item_stream_version,
                                 replication: None,
@@ -73,6 +77,7 @@ pub(crate) async fn apply_resolved_sync_mutations(
                                 &table_info,
                                 old_item.as_ref(),
                                 Some(&split_item.all_attributes),
+                                &mutation.indexers,
                             )
                             .await?;
                         }
@@ -113,6 +118,8 @@ pub(crate) async fn apply_resolved_sync_mutations(
                             &key_attributes.to_attribute_map(),
                             TursoWriteStreamEntriesInput {
                                 old_item: old_item.as_ref(),
+                                indexers: &[],
+                                old_indexers: mutation.old_indexers.as_deref(),
                                 is_deleted: true,
                                 item_stream_version: mutation.target_item_stream_version,
                                 replication: None,
@@ -125,6 +132,7 @@ pub(crate) async fn apply_resolved_sync_mutations(
                                 &table_info,
                                 old_item.as_ref(),
                                 None,
+                                &[],
                             )
                             .await?;
                         }

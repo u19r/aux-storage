@@ -4,7 +4,7 @@ use storage_backfill::{
 };
 use storage_types::StorageResult;
 
-use crate::DatabaseManager;
+use crate::database_manager::{DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID};
 
 #[async_trait::async_trait]
 impl storage_backfill::LogicalBackfillExport for DatabaseManager {
@@ -32,9 +32,13 @@ impl DatabaseManager {
         &self,
         request: LogicalExportRequest,
     ) -> StorageResult<LogicalExportPage> {
-        self.storage_provider()
-            .export_logical_backfill_page(request)
-            .await
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+            let database_call = metrics_facade::begin_database_call("export_logical_backfill_page");
+            let result = provider.export_logical_backfill_page(request).await;
+            drop(database_call);
+            result
+        })
+        .await
     }
 
     pub async fn import_logical_backfill_chunk(
@@ -42,8 +46,15 @@ impl DatabaseManager {
         manifest: &LogicalBackfillManifest,
         chunk: LogicalBackfillChunk,
     ) -> StorageResult<LogicalBackfillResult> {
-        self.storage_provider()
-            .import_logical_backfill_chunk(manifest, chunk)
-            .await
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+            let database_call =
+                metrics_facade::begin_database_call("import_logical_backfill_chunk");
+            let result = provider
+                .import_logical_backfill_chunk(manifest, chunk)
+                .await;
+            drop(database_call);
+            result
+        })
+        .await
     }
 }

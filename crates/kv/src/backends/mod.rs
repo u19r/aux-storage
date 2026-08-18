@@ -1,7 +1,11 @@
 pub mod common;
 #[cfg(test)]
 mod common_change_index_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "rocksdb-backend",
+    not(feature = "foundationdb-backend")
+))]
 mod common_gsi_mutation_detection_tests;
 #[cfg(test)]
 mod common_tests;

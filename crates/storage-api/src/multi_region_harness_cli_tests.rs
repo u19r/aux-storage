@@ -20,11 +20,11 @@ fn args_for(scenario: HarnessScenarioArg) -> HarnessCliRunArgs {
         ],
         sqlite_database_dir: Some(PathBuf::from("dbs")),
         postgres_dsn_template: Some(
-            "host=/tmp dbname=postgres options='-csearch_path=mr_{node_id}'".to_string(),
+            "host=localhost dbname=postgres options='-csearch_path=mr_{node_id}'".to_string(),
         ),
         postgres_max_pool_size: 4,
         postgres_tls: false,
-        foundationdb_cluster_file: Some("/tmp/fdb.cluster".to_string()),
+        foundationdb_cluster_file: Some("run-artifacts/storage-api-data/fdb.cluster".to_string()),
         foundationdb_subspace_prefix: Some("mr-prefix".to_string()),
         duration_secs: 11,
         warmup_secs: 2,
@@ -113,13 +113,13 @@ fn explicit_args_build_complete_harness_run_config() {
     );
     assert_eq!(
         config.postgres_dsn_template.as_deref(),
-        Some("host=/tmp dbname=postgres options='-csearch_path=mr_{node_id}'")
+        Some("host=localhost dbname=postgres options='-csearch_path=mr_{node_id}'")
     );
     assert_eq!(config.postgres_max_pool_size, 4);
     assert!(!config.postgres_tls);
     assert_eq!(
         config.foundationdb_cluster_file.as_deref(),
-        Some("/tmp/fdb.cluster")
+        Some("run-artifacts/storage-api-data/fdb.cluster")
     );
     assert_eq!(
         config.foundationdb_subspace_prefix.as_deref(),

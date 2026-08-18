@@ -39,6 +39,7 @@ fn include_update_for_projected_attribute_writes_gsi() {
 
 fn table_info(projection: Projection) -> StoredTableInfo {
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: TableName::new("table"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::now(),

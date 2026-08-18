@@ -120,7 +120,7 @@ async fn sqlite_resolved_sync_apply_is_idempotent_and_persists_sync_log() {
 
 #[tokio::test]
 async fn sqlite_resolved_sync_apply_state_persists_across_reopen() {
-    let tempdir = tempfile::tempdir().expect("tempdir");
+    let tempdir = crate::sql_test_support::temp_dir("sqlite");
     let database_path = tempdir.path().join("resolved-sync.db");
     let database_path = database_path.to_string_lossy().to_string();
     let provider = file_backed_provider(&database_path)
@@ -487,7 +487,9 @@ fn sync_put(
         table_name: table_name.clone(),
         key_json: format!(r#"{{"pk":{{"S":"{key}"}}}}"#),
         item_json: format!(r#"{{"pk":{{"S":"{key}"}},"status":{{"S":"{status}"}}}}"#),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(format!(r#"{{"mutation":"{mutation_id}"}}"#)),
@@ -537,6 +539,7 @@ fn sync_delete(
         old_item_json: Some(format!(
             r#"{{"pk":{{"S":"{key}"}},"status":{{"S":"{old_status}"}}}}"#
         )),
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(format!(r#"{{"mutation":"{mutation_id}"}}"#)),

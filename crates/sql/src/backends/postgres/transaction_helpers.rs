@@ -59,8 +59,9 @@ pub(super) struct PreparedPostgresPut {
     old_item_query: PreparedGetItemQuery,
     key_attributes: KeyAttributes,
     full_item: HashMap<String, AttributeValue>,
+    indexers: Vec<String>,
     combined_sql: String,
-    combined_bind_values: Vec<String>,
+    combined_bind_values: Vec<Option<String>>,
     aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
@@ -73,6 +74,16 @@ pub(super) struct PreparedPostgresDelete {
     sql: String,
     bind_values: Vec<String>,
     aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+}
+
+pub(super) struct PostgresUpsertTransactItemInput<'a> {
+    pub(super) table_name: &'a TableName,
+    pub(super) table_info: &'a StoredTableInfo,
+    pub(super) item: HashMap<String, AttributeValue>,
+    pub(super) indexers: &'a [String],
+    pub(super) old_item: Option<&'a HashMap<String, AttributeValue>>,
+    pub(super) old_indexers: Option<&'a [String]>,
+    pub(super) item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 fn conditional_check_failed_reason_for_wire_item(
@@ -101,64 +112,28 @@ impl PostgresStorageProvider {
                 key_attributes,
                 non_key_attributes,
                 full_item,
+                indexers,
                 aux_item_stream_ttl_hours,
                 ..
             } => {
-                let attributes_blob = if non_key_attributes.is_empty() {
-                    "{}".to_string()
-                } else {
-                    serde_json::to_string(&non_key_attributes).map_err(|err| {
-                        Self::map_postgres_error("serialize non-key attributes", err)
-                    })?
-                };
-                let key_bindings = Self::key_column_bindings_for_schema(
+                let prepared_write = Self::prepare_main_row_write(
                     &table_info,
-                    &table_info.key_schema,
                     &key_attributes,
-                    None,
+                    &full_item,
+                    &non_key_attributes,
+                    indexers.as_deref(),
                 )?;
                 let physical_table_name = physical_names::physical_table_name(&table_name);
                 let old_item_query =
                     Self::prepare_get_item_query(&table_name, &key_attributes, &table_info)?;
-                let key_columns = key_bindings
-                    .iter()
-                    .map(|binding| binding.column.clone())
-                    .collect::<Vec<_>>();
-                let columns_sql = key_columns
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once("attributes_blob".to_string()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut placeholders = key_bindings
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, binding)| {
-                        Self::postgres_placeholder_for_type(idx + 1, &binding.attribute_type)
-                    })
-                    .collect::<Vec<_>>();
-                placeholders.push(format!("${}", key_bindings.len() + 1));
-                let placeholders = placeholders.join(", ");
-                let conflict_target = key_columns.join(", ");
-                let assignments = key_columns
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once("attributes_blob".to_string()))
-                    .map(|column| format!("{column} = EXCLUDED.{column}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 let sql = sql_statements::upsert_main_row_returning(
                     &physical_table_name,
-                    &columns_sql,
-                    &placeholders,
-                    &conflict_target,
-                    &assignments,
+                    &prepared_write.columns_sql,
+                    &prepared_write.values_sql,
+                    &prepared_write.conflict_target,
+                    &prepared_write.assignments,
                 );
-                let mut bind_values = key_bindings
-                    .iter()
-                    .map(|binding| binding.value.clone())
-                    .collect::<Vec<_>>();
-                bind_values.push(attributes_blob);
+                let mut bind_values = prepared_write.bind_values;
                 let revision_key_json = key_attributes.canonical_dynamo_json().map_err(|err| {
                     StorageError::validation(format!(
                         "revision key must be Dynamo JSON encodable: {err}"
@@ -172,8 +147,8 @@ impl PostgresStorageProvider {
                     &[sql, revision_sql],
                     "revision",
                 );
-                bind_values.push(table_name.to_string());
-                bind_values.push(revision_key_json);
+                bind_values.push(Some(table_name.to_string()));
+                bind_values.push(Some(revision_key_json));
 
                 Ok(PreparedPostgresBatchOperation::Put(PreparedPostgresPut {
                     table_name,
@@ -181,6 +156,7 @@ impl PostgresStorageProvider {
                     old_item_query,
                     key_attributes,
                     full_item,
+                    indexers: indexers.unwrap_or_default(),
                     combined_sql,
                     combined_bind_values: bind_values,
                     aux_item_stream_ttl_hours,
@@ -244,7 +220,7 @@ impl PostgresStorageProvider {
     ) -> StorageResult<()> {
         let old_item_started = std::time::Instant::now();
         let old_item = self
-            .execute_prepared_get_item_query(
+            .execute_prepared_get_item_query_with_indexers(
                 client,
                 &prepared.old_item_query,
                 "batch_write_item",
@@ -258,7 +234,7 @@ impl PostgresStorageProvider {
         );
         let old_item_for_condition = old_item
             .as_ref()
-            .map(WireItem::to_attribute_map)
+            .map(|item| item.item.to_attribute_map())
             .transpose()?;
         let params: Vec<&(dyn ToSql + Sync)> = prepared
             .combined_bind_values
@@ -290,6 +266,7 @@ impl PostgresStorageProvider {
                 &prepared.table_info,
                 old_item_for_condition.as_ref(),
                 Some(&prepared.full_item),
+                &prepared.indexers,
             )
             .await?;
             self.record_transaction_phase("batch_write_item", "gsi_sync", gsi_started.elapsed());
@@ -310,6 +287,8 @@ impl PostgresStorageProvider {
             &prepared.full_item,
             PostgresWriteStreamEntriesInput {
                 old_item: old_item_for_condition.as_ref(),
+                indexers: &prepared.indexers,
+                old_indexers: old_item.as_ref().map(|item| item.indexers.as_slice()),
                 is_deleted: false,
                 item_stream_version,
                 replication: None,
@@ -334,7 +313,7 @@ impl PostgresStorageProvider {
     ) -> StorageResult<()> {
         let old_item_started = std::time::Instant::now();
         let old_item = self
-            .execute_prepared_get_item_query(
+            .execute_prepared_get_item_query_with_indexers(
                 client,
                 &prepared.old_item_query,
                 "batch_write_item",
@@ -379,7 +358,8 @@ impl PostgresStorageProvider {
             revision_started.elapsed(),
         );
 
-        let old_map = old_item.into_attribute_map()?;
+        let old_indexers = old_item.indexers;
+        let old_map = old_item.item.into_attribute_map()?;
         if self.immediate_gsi_consistency {
             let gsi_started = std::time::Instant::now();
             self.delete_gsi_entries_for_item_with_client(
@@ -402,6 +382,8 @@ impl PostgresStorageProvider {
             &old_map,
             PostgresWriteStreamEntriesInput {
                 old_item: Some(&old_map),
+                indexers: &[],
+                old_indexers: Some(&old_indexers),
                 is_deleted: true,
                 item_stream_version,
                 replication: None,
@@ -431,23 +413,29 @@ impl PostgresStorageProvider {
             &request.expression_attribute_values,
         )?;
         let table_name = request.table_name;
+        let indexers = request.indexers;
         let table_info = self.get_table_info_cached_arc(&table_name).await?;
         validate_transact_put_item_key(&table_info, &request.item)?;
         let return_all_old = all_old(request.return_values_on_condition_check_failure.as_ref());
         let split_item = split_item_into_key_and_attributes_sync(request.item, &table_info)?;
         let old_item = self
-            .get_item_with_client(client, &table_name, &split_item.key_attributes, &table_info)
+            .get_item_with_indexers_with_client(
+                client,
+                &table_name,
+                &split_item.key_attributes,
+                &table_info,
+            )
             .await?;
 
         if let Some(condition) = &condition
-            && !evaluate_wire_condition(old_item.as_ref(), condition)?
+            && !evaluate_wire_condition(old_item.as_ref().map(|item| &item.item), condition)?
         {
             if let Some(item_index) = item_index {
                 return Err(transaction_canceled_for_reason(
                     item_index,
                     conditional_check_failed_reason_for_wire_item(
                         return_all_old,
-                        old_item.as_ref(),
+                        old_item.as_ref().map(|item| &item.item),
                     )?,
                 ));
             }
@@ -455,15 +443,19 @@ impl PostgresStorageProvider {
         }
         let old_item_for_condition = old_item
             .as_ref()
-            .map(WireItem::to_attribute_map)
+            .map(|item| item.item.to_attribute_map())
             .transpose()?;
         self.upsert_transact_item_with_client(
             client,
-            &table_name,
-            &table_info,
-            split_item.all_attributes,
-            old_item_for_condition.as_ref(),
-            request.aux_item_stream_ttl_hours,
+            PostgresUpsertTransactItemInput {
+                table_name: &table_name,
+                table_info: &table_info,
+                item: split_item.all_attributes,
+                indexers: indexers.as_deref().unwrap_or_default(),
+                old_item: old_item_for_condition.as_ref(),
+                old_indexers: old_item.as_ref().map(|item| item.indexers.as_slice()),
+                item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
+            },
         )
         .await
     }
@@ -471,67 +463,36 @@ impl PostgresStorageProvider {
     pub(super) async fn upsert_transact_item_with_client<C: GenericClient + Sync>(
         &self,
         client: &C,
-        table_name: &TableName,
-        table_info: &StoredTableInfo,
-        item: HashMap<String, AttributeValue>,
-        old_item_for_condition: Option<&HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
+        input: PostgresUpsertTransactItemInput<'_>,
     ) -> StorageResult<()> {
+        let PostgresUpsertTransactItemInput {
+            table_name,
+            table_info,
+            item,
+            indexers,
+            old_item,
+            old_indexers,
+            item_stream_ttl_hours,
+        } = input;
         validate_transact_put_item_key(table_info, &item)?;
         let split_item = split_item_into_key_and_attributes_sync(item, table_info)?;
 
-        let attributes_blob = if split_item.non_key_attributes.is_empty() {
-            "{}".to_string()
-        } else {
-            serde_json::to_string(&split_item.non_key_attributes)
-                .map_err(|err| Self::map_postgres_error("serialize non-key attributes", err))?
-        };
-        let key_bindings = Self::key_column_bindings_for_schema(
+        let prepared_write = Self::prepare_main_row_write(
             table_info,
-            &table_info.key_schema,
             &split_item.key_attributes,
-            None,
+            &split_item.all_attributes,
+            &split_item.non_key_attributes,
+            Some(indexers),
         )?;
         let physical_table_name = physical_names::physical_table_name(table_name);
-        let key_columns = key_bindings
-            .iter()
-            .map(|binding| binding.column.clone())
-            .collect::<Vec<_>>();
-        let columns_sql = key_columns
-            .iter()
-            .cloned()
-            .chain(std::iter::once("attributes_blob".to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut placeholders = key_bindings
-            .iter()
-            .enumerate()
-            .map(|(idx, binding)| {
-                Self::postgres_placeholder_for_type(idx + 1, &binding.attribute_type)
-            })
-            .collect::<Vec<_>>();
-        placeholders.push(format!("${}", key_bindings.len() + 1));
-        let placeholders = placeholders.join(", ");
-        let conflict_target = key_columns.join(", ");
-        let assignments = key_columns
-            .iter()
-            .cloned()
-            .chain(std::iter::once("attributes_blob".to_string()))
-            .map(|column| format!("{column} = EXCLUDED.{column}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sql = sql_statements::upsert_main_row_returning(
             &physical_table_name,
-            &columns_sql,
-            &placeholders,
-            &conflict_target,
-            &assignments,
+            &prepared_write.columns_sql,
+            &prepared_write.values_sql,
+            &prepared_write.conflict_target,
+            &prepared_write.assignments,
         );
-        let mut bind_values = key_bindings
-            .iter()
-            .map(|binding| binding.value.clone())
-            .collect::<Vec<_>>();
-        bind_values.push(attributes_blob);
+        let bind_values = prepared_write.bind_values;
         let revision_key_json =
             split_item
                 .key_attributes
@@ -548,8 +509,8 @@ impl PostgresStorageProvider {
         let combined_sql =
             sql_statements::dml_ctes_returning_last_column(&[sql, revision_sql], "revision");
         let mut combined_bind_values = bind_values;
-        combined_bind_values.push(table_name.to_string());
-        combined_bind_values.push(revision_key_json);
+        combined_bind_values.push(Some(table_name.to_string()));
+        combined_bind_values.push(Some(revision_key_json));
         let params: Vec<&(dyn ToSql + Sync)> = combined_bind_values
             .iter()
             .map(|value| value as &(dyn ToSql + Sync))
@@ -570,15 +531,16 @@ impl PostgresStorageProvider {
                 client,
                 table_name,
                 table_info,
-                old_item_for_condition,
+                old_item,
                 Some(&split_item.all_attributes),
+                indexers,
             )
             .await?;
         }
         self.sync_ttl_index_entries_with_client(
             client,
             table_info,
-            old_item_for_condition,
+            old_item,
             Some(&split_item.all_attributes),
         )
         .await?;
@@ -587,7 +549,9 @@ impl PostgresStorageProvider {
             table_info,
             &split_item.all_attributes,
             PostgresWriteStreamEntriesInput {
-                old_item: old_item_for_condition,
+                old_item,
+                indexers,
+                old_indexers,
                 is_deleted: false,
                 item_stream_version,
                 replication: None,
@@ -598,7 +562,7 @@ impl PostgresStorageProvider {
             client,
             table_info,
             &split_item.key_attributes,
-            aux_item_stream_ttl_hours,
+            item_stream_ttl_hours,
         )
         .await?;
         Ok(())
@@ -625,17 +589,17 @@ impl PostgresStorageProvider {
         let key_attributes = request.key.clone();
         validate_transact_key(&table_info, &key_attributes)?;
         let old_item = self
-            .get_item_with_client(client, &table_name, &key_attributes, &table_info)
+            .get_item_with_indexers_with_client(client, &table_name, &key_attributes, &table_info)
             .await?;
         if let Some(condition) = &condition
-            && !evaluate_wire_condition(old_item.as_ref(), condition)?
+            && !evaluate_wire_condition(old_item.as_ref().map(|item| &item.item), condition)?
         {
             if let Some(item_index) = item_index {
                 return Err(transaction_canceled_for_reason(
                     item_index,
                     conditional_check_failed_reason_for_wire_item(
                         all_old(request.return_values_on_condition_check_failure.as_ref()),
-                        old_item.as_ref(),
+                        old_item.as_ref().map(|item| &item.item),
                     )?,
                 ));
             }
@@ -667,7 +631,8 @@ impl PostgresStorageProvider {
             Self::bump_item_revision_with_client(client, &table_name, &key_attributes).await?,
         )?;
 
-        let old_map = old_item.into_attribute_map()?;
+        let old_indexers = old_item.indexers;
+        let old_map = old_item.item.into_attribute_map()?;
         if self.immediate_gsi_consistency {
             self.delete_gsi_entries_for_item_with_client(
                 client,
@@ -685,6 +650,8 @@ impl PostgresStorageProvider {
             &old_map,
             PostgresWriteStreamEntriesInput {
                 old_item: Some(&old_map),
+                indexers: &[],
+                old_indexers: Some(&old_indexers),
                 is_deleted: true,
                 item_stream_version,
                 replication: None,
@@ -716,26 +683,33 @@ impl PostgresStorageProvider {
         let table_name = request.table_name.clone();
         let table_info = self.get_table_info_cached_arc(&table_name).await?;
         let key_attributes = request.key.clone();
+        let prepared = Self::prepare_get_item_query(&table_name, &key_attributes, &table_info)?;
         let existing_item = self
-            .get_item_with_client(client, &table_name, &key_attributes, &table_info)
+            .execute_prepared_get_item_query_with_indexers(
+                client,
+                &prepared,
+                "transact_update",
+                "old_item_query",
+            )
             .await?;
         if let Some(condition) = &condition
-            && !evaluate_wire_condition(existing_item.as_ref(), condition)?
+            && !evaluate_wire_condition(existing_item.as_ref().map(|item| &item.item), condition)?
         {
             if let Some(item_index) = item_index {
                 return Err(transaction_canceled_for_reason(
                     item_index,
                     conditional_check_failed_reason_for_wire_item(
                         all_old(request.return_values_on_condition_check_failure.as_ref()),
-                        existing_item.as_ref(),
+                        existing_item.as_ref().map(|item| &item.item),
                     )?,
                 ));
             }
             return Err(StorageEnum::ConditionalCheckFailed.into());
         }
-        let existing_item = existing_item
-            .map(WireItem::into_attribute_map)
-            .transpose()?;
+        let (existing_item, stored_indexers) = match existing_item {
+            Some(existing) => (Some(existing.item.into_attribute_map()?), existing.indexers),
+            None => (None, Vec::new()),
+        };
         let item_to_update = existing_item.unwrap_or_else(|| request.key.to_attribute_map());
         let updated_item =
             apply_bound_update_operations(item_to_update, &operations).map_err(|error| {
@@ -748,6 +722,7 @@ impl PostgresStorageProvider {
         self.transact_put_with_client(
             client,
             storage_types::TransactPutRequest {
+                indexers: request.indexers.or(Some(stored_indexers)),
                 table_name,
                 item: updated_item,
                 condition_expression: None,

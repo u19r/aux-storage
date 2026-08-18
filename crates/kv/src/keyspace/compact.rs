@@ -20,6 +20,8 @@ pub enum CompactKeyError {
         kind: u8,
     },
     U48OutOfRange(u64),
+    /// FoundationDB no longer decodes the superseded compact item/GSI families.
+    LegacyItemFamily(KeyFamily),
 }
 
 impl fmt::Display for CompactKeyError {
@@ -47,6 +49,11 @@ impl fmt::Display for CompactKeyError {
             Self::U48OutOfRange(value) => {
                 write!(formatter, "value {value} exceeds u48 maximum {U48_MAX}")
             }
+            Self::LegacyItemFamily(family) => write!(
+                formatter,
+                "compact item/GSI family {} is not decoded by the FoundationDB backend",
+                family.code() as char
+            ),
         }
     }
 }
@@ -924,6 +931,7 @@ pub fn table_name_lookup_key(table_name: &[u8]) -> Vec<u8> {
     key
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn primary_item_key(table_id: TableStorageId, encoded_key: &[u8]) -> Vec<u8> {
     let mut key = fixed_table_key(KeyFamily::PrimaryItem, table_id);
@@ -931,6 +939,7 @@ pub fn primary_item_key(table_id: TableStorageId, encoded_key: &[u8]) -> Vec<u8>
     key
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn gsi_item_key(table_id: TableStorageId, index_id: IndexStorageId, suffix: &[u8]) -> Vec<u8> {
     let mut key = fixed_table_index_key(KeyFamily::GsiItem, table_id, index_id);
@@ -938,6 +947,7 @@ pub fn gsi_item_key(table_id: TableStorageId, index_id: IndexStorageId, suffix: 
     key
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn gsi_tombstone_key(
     table_id: TableStorageId,
@@ -1268,11 +1278,13 @@ pub fn partition_control_key(
     key
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn primary_item_prefix(table_id: TableStorageId) -> KeyRange {
     range_for_prefix(fixed_table_key(KeyFamily::PrimaryItem, table_id))
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn gsi_prefix(table_id: TableStorageId, index_id: IndexStorageId) -> KeyRange {
     range_for_prefix(fixed_table_index_key(
@@ -1282,6 +1294,7 @@ pub fn gsi_prefix(table_id: TableStorageId, index_id: IndexStorageId) -> KeyRang
     ))
 }
 
+#[cfg(not(feature = "foundationdb-backend"))]
 #[must_use]
 pub fn gsi_tombstone_prefix(table_id: TableStorageId, index_id: IndexStorageId) -> KeyRange {
     range_for_prefix(fixed_table_index_key(
@@ -1360,6 +1373,7 @@ pub fn parse_compact_key(key: &[u8]) -> Result<ParsedCompactKey<'_>, CompactKeyE
         KeyFamily::TableNameLookup => Ok(ParsedCompactKey::TableNameLookup {
             table_name: payload,
         }),
+        #[cfg(not(feature = "foundationdb-backend"))]
         KeyFamily::PrimaryItem => {
             require_len(family, key, 5)?;
             Ok(ParsedCompactKey::PrimaryItem {
@@ -1367,6 +1381,7 @@ pub fn parse_compact_key(key: &[u8]) -> Result<ParsedCompactKey<'_>, CompactKeyE
                 key: &payload[4..],
             })
         }
+        #[cfg(not(feature = "foundationdb-backend"))]
         KeyFamily::GsiItem | KeyFamily::GsiTombstone => {
             require_len(family, key, 7)?;
             let parsed = (
@@ -1387,6 +1402,10 @@ pub fn parse_compact_key(key: &[u8]) -> Result<ParsedCompactKey<'_>, CompactKeyE
                     suffix: parsed.2,
                 })
             }
+        }
+        #[cfg(feature = "foundationdb-backend")]
+        KeyFamily::PrimaryItem | KeyFamily::GsiItem | KeyFamily::GsiTombstone => {
+            Err(CompactKeyError::LegacyItemFamily(family))
         }
         KeyFamily::GsiBackfill => {
             require_len(family, key, 7)?;

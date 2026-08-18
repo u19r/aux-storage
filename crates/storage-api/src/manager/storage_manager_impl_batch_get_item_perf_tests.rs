@@ -91,6 +91,7 @@ fn batch_get_key_identity_normalizes_equivalent_numbers() {
 
 fn table_info() -> StoredTableInfo {
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: TableName::new("batch_get_fingerprint"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(0),

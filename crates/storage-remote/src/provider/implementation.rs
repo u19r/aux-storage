@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -236,16 +236,17 @@ use aws_sigv4_signing::{AwsRequestSigner, AwsStaticCredentials, CredentialSource
 
 use super::{
     provider_helpers::{
-        attempt_internal, attempt_signing, attempt_transport, build_client, build_endpoints,
-        build_query_request, build_scan_request, compute_backoff, error_label, extract_operation,
-        record_latency, signing_error_to_storage_error, to_table_info,
+        RetryTokenBucket, attempt_internal, attempt_signing, attempt_transport, build_client,
+        build_endpoints, build_query_request, build_scan_request, compute_backoff, error_label,
+        extract_operation, record_latency, signing_error_to_storage_error, to_table_info,
     },
     wire_item_helper::{parse_batch_get_wire, parse_get_item_wire, parse_scan_query_wire},
 };
 use crate::{
     constants::{
         AWS_SERVICE_NAME, FAILURE_ALERT_THRESHOLD, MANAGED_TABLE_TTL_ATTRIBUTE,
-        MAX_ENDPOINT_RETRIES, MAX_REMOTE_RETRIES, PITR_RETRY_ATTEMPTS, PITR_RETRY_DELAY_SECS,
+        MAX_ENDPOINT_RETRIES, MAX_REMOTE_RETRIES, MAX_RETRY_AFTER_SECS,
+        MIN_RETRY_ATTEMPT_BUDGET_MS, PITR_RETRY_ATTEMPTS, PITR_RETRY_DELAY_SECS,
         REMOTE_STORAGE_REQUEST_BYTES_TOTAL_METRIC, REMOTE_STORAGE_RESPONSE_BYTES_TOTAL_METRIC,
         STORAGE_BILLED_ITEM_OPS_TOTAL_METRIC, STORAGE_LOGICAL_ITEM_BYTES_TOTAL_METRIC,
         TABLE_ACTIVE_RETRY_ATTEMPTS, TABLE_ACTIVE_RETRY_DELAY_MS,
@@ -259,6 +260,7 @@ pub(super) struct AttemptError {
     code: Option<String>,
     status: Option<StatusCode>,
     leader_hint: Option<String>,
+    retry_after: Option<Duration>,
 }
 
 impl AttemptError {
@@ -274,11 +276,17 @@ impl AttemptError {
             code,
             status,
             leader_hint: None,
+            retry_after: None,
         }
     }
 
     fn with_leader_hint(mut self, leader_hint: Option<String>) -> Self {
         self.leader_hint = leader_hint;
+        self
+    }
+
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
         self
     }
 }
@@ -308,6 +316,9 @@ pub struct RemoteStorageProvider {
     pub credential_source: &'static str,
     pub primary_endpoint: AtomicUsize,
     pub probation_endpoint: AtomicUsize,
+    pub(crate) pressure_signals: AtomicUsize,
+    pub(crate) retry_budget: RetryTokenBucket,
+    pub(crate) request_timeout: Option<Duration>,
 }
 
 pub(super) const NO_ENDPOINT: usize = usize::MAX;
@@ -327,6 +338,10 @@ struct PointInTimeRecoverySpecification {
 
 #[async_trait]
 impl StorageProvider for RemoteStorageProvider {
+    fn take_admission_pressure_signal(&self) -> bool {
+        self.pressure_signals.swap(0, Ordering::AcqRel) > 0
+    }
+
     async fn initialize_storage(&self) -> StorageResult<()> {
         Ok(())
     }
@@ -931,6 +946,11 @@ impl RemoteStorageProvider {
 
         let client =
             build_client(settings.timeouts.as_ref()).context("build remote storage HTTP client")?;
+        let request_timeout = settings
+            .timeouts
+            .as_ref()
+            .and_then(|timeouts| timeouts.request_timeout_ms)
+            .map(Duration::from_millis);
 
         Ok(Self {
             client,
@@ -939,6 +959,9 @@ impl RemoteStorageProvider {
             credential_source,
             primary_endpoint: AtomicUsize::new(0),
             probation_endpoint: AtomicUsize::new(NO_ENDPOINT),
+            pressure_signals: AtomicUsize::new(0),
+            retry_budget: RetryTokenBucket::new(),
+            request_timeout,
         })
     }
 
@@ -1065,6 +1088,7 @@ impl RemoteStorageProvider {
     ) -> StorageResult<UpdateTableResponse> {
         let request = UpdateTableRequest {
             table_name: table_name.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,
@@ -1255,6 +1279,13 @@ impl RemoteStorageProvider {
         let mut last_error: Option<StorageError> = None;
         let mut visited = 0;
         let mut total_attempts = 0;
+        // Admission observes one pressure marker per logical request.  A
+        // remote request may retry several times, but recording every retry
+        // leaves connection-wide markers behind for later requests.
+        let mut pressure_signalled = false;
+        let deadline = self
+            .request_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
 
         while visited < total_endpoints {
             let endpoint = &self.endpoints[current_index];
@@ -1286,6 +1317,9 @@ impl RemoteStorageProvider {
                                 "remote storage request succeeded after retry"
                             );
                         }
+                        if total_attempts == 1 && visited == 0 {
+                            self.retry_budget.refund_one();
+                        }
                         if using_probation {
                             self.restore_primary_if_match(current_index);
                         }
@@ -1296,6 +1330,7 @@ impl RemoteStorageProvider {
                         let code = attempt_error.code.clone();
                         let status = attempt_error.status;
                         let leader_hint = attempt_error.leader_hint.clone();
+                        let retry_after = attempt_error.retry_after;
                         let error = attempt_error.error;
                         let outcome = error_label(&error);
                         let normal_operation_error = Self::is_normal_operation_error(&error);
@@ -1333,7 +1368,15 @@ impl RemoteStorageProvider {
                         }
 
                         if !retryable {
+                            if replay_safety_blocks_retry(code.as_deref()) {
+                                record_retry_suppressed("replay_safety");
+                            }
                             return Err(error);
+                        }
+
+                        if !pressure_signalled && is_provider_pressure_error(&error) {
+                            self.pressure_signals.fetch_add(1, Ordering::Relaxed);
+                            pressure_signalled = true;
                         }
 
                         last_error = Some(error);
@@ -1359,14 +1402,36 @@ impl RemoteStorageProvider {
                         }
 
                         if total_attempts >= MAX_REMOTE_RETRIES {
+                            record_retry_suppressed("attempt_budget");
                             break;
                         }
 
                         if attempts_on_endpoint >= MAX_ENDPOINT_RETRIES {
+                            record_retry_suppressed("attempt_budget");
                             break;
                         }
 
-                        let delay = compute_backoff(attempts_on_endpoint);
+                        let delay = retry_after
+                            .unwrap_or(Duration::ZERO)
+                            .max(compute_backoff(attempts_on_endpoint));
+                        if !self.retry_budget.try_take() {
+                            record_retry_suppressed("token_budget");
+                            let Some(error) = last_error.take() else {
+                                return Err(StorageError::internal(
+                                    "remote retry budget exhausted without a recorded error",
+                                ));
+                            };
+                            return Err(error);
+                        }
+                        if !retry_deadline_allows(deadline, delay) {
+                            record_retry_suppressed("deadline");
+                            let Some(error) = last_error.take() else {
+                                return Err(StorageError::internal(
+                                    "remote retry deadline reached without a recorded error",
+                                ));
+                            };
+                            return Err(error);
+                        }
                         if delay > Duration::ZERO {
                             tracing::info!(
                                 retry_delay_ms = delay.as_millis(),
@@ -1392,6 +1457,25 @@ impl RemoteStorageProvider {
                 next_override.unwrap_or_else(|| self.next_endpoint_index(current_index));
             if next_index == current_index {
                 break;
+            }
+
+            if !self.retry_budget.try_take() {
+                record_retry_suppressed("token_budget");
+                let Some(error) = last_error.take() else {
+                    return Err(StorageError::internal(
+                        "remote retry budget exhausted without a recorded error",
+                    ));
+                };
+                return Err(error);
+            }
+            if !retry_deadline_allows(deadline, Duration::ZERO) {
+                record_retry_suppressed("deadline");
+                let Some(error) = last_error.take() else {
+                    return Err(StorageError::internal(
+                        "remote retry deadline reached without a recorded error",
+                    ));
+                };
+                return Err(error);
             }
 
             metrics_facade::counter!(
@@ -1483,7 +1567,9 @@ impl RemoteStorageProvider {
             .map_err(|err| attempt_transport(&err))?;
 
         let status = response.status();
-        let leader_hint = leader_hint_header(response.headers());
+        let response_headers = response.headers().clone();
+        let leader_hint = leader_hint_header(&response_headers);
+        let retry_after = parse_retry_after(&response_headers);
         let bytes = response
             .bytes()
             .await
@@ -1499,8 +1585,10 @@ impl RemoteStorageProvider {
             let error_body: RemoteErrorResponse =
                 serde_json::from_slice(&bytes).unwrap_or_default();
             let (error, retryable, code) = classify_error_response(status, error_body);
+            let error = preserve_retry_after(error, retry_after);
             return Err(AttemptError::new(error, retryable, code, Some(status))
-                .with_leader_hint(leader_hint));
+                .with_leader_hint(leader_hint)
+                .with_retry_after(retry_after));
         }
 
         Ok(bytes.to_vec())
@@ -1537,6 +1625,47 @@ fn leader_hint_header(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+pub(super) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    let delay = value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|date| date.duration_since(SystemTime::now()).ok())
+        })?;
+    Some(delay.min(Duration::from_secs(MAX_RETRY_AFTER_SECS)))
+}
+
+pub(super) fn preserve_retry_after(
+    error: StorageError,
+    retry_after: Option<Duration>,
+) -> StorageError {
+    let Some(retry_after) = retry_after else {
+        return error;
+    };
+    if !matches!(error.to_enum(), StorageEnum::ServiceUnavailable { .. }) {
+        return error;
+    }
+    let retry_after_seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1);
+    StorageError::service_unavailable(retry_after_seconds)
+}
+
+fn retry_deadline_allows(deadline: Option<Instant>, delay: Duration) -> bool {
+    let Some(deadline) = deadline else {
+        return true;
+    };
+    let minimum_attempt_budget = Duration::from_millis(MIN_RETRY_ATTEMPT_BUDGET_MS);
+    Instant::now()
+        .checked_add(delay.saturating_add(minimum_attempt_budget))
+        .is_some_and(|next| next < deadline)
+}
+
 fn normalized_endpoint_match_key(endpoint: &str) -> &str {
     endpoint.trim_end_matches('/')
 }
@@ -1550,5 +1679,41 @@ fn increment_remote_leader_cache(outcome: &'static str) {
             "reason" => reason
         )
         .increment(1),
+    }
+}
+
+fn record_retry_suppressed(reason: &'static str) {
+    metrics::counter!("storage.remote.retry.suppressed.total", "reason" => reason).increment(1);
+}
+
+fn replay_safety_blocks_retry(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("ConditionalCheckFailedException" | "TransactionCanceledException")
+    )
+}
+
+fn is_provider_pressure_error(error: &StorageError) -> bool {
+    match error.to_enum() {
+        StorageEnum::ProvisionedThroughputExceeded { .. }
+        | StorageEnum::Throttled { .. }
+        | StorageEnum::LimitExceeded { .. }
+        | StorageEnum::RequestLimitExceeded
+        | StorageEnum::ServiceUnavailable { .. }
+        | StorageEnum::InternalServerError { .. } => true,
+        StorageEnum::AwsService {
+            code: Some(code), ..
+        } => matches!(
+            code.as_str(),
+            "ServiceUnavailable"
+                | "ServiceUnavailableException"
+                | "RequestTimeout"
+                | "RequestTimeoutException"
+                | "ThrottlingException"
+                | "ProvisionedThroughputExceededException"
+                | "LimitExceededException"
+        ),
+        StorageEnum::AwsService { code: None, .. } => true,
+        _ => false,
     }
 }

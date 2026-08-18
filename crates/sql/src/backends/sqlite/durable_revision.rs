@@ -13,12 +13,13 @@ impl SQLiteStorageProvider {
         request: &DurablePointReadRequest,
         sqlite: &SqliteConn<'_>,
     ) -> StorageResult<DurablePointReadProof> {
-        let item = Self::do_get_wire_item(&request.table_name, &request.key, sqlite)?;
+        let item = Self::do_get_wire_item_with_indexers(&request.table_name, &request.key, sqlite)?;
         let revision = Self::do_get_item_revision(&request.table_name, &request.key, sqlite)?;
 
         Ok(match item {
-            Some(item) => DurablePointReadProof::Present {
+            Some((item, indexers)) => DurablePointReadProof::Present {
                 item: Box::new(item),
+                indexers,
                 revision: DurableItemRevision::new(revision.to_be_bytes().to_vec()),
             },
             None => DurablePointReadProof::Absent {

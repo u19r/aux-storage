@@ -14,6 +14,7 @@ use crate::{
     backends::postgres::{
         KeyColumnBinding, OrderedKeyColumn, PostgresStorageProvider, physical_names, sql_statements,
     },
+    indexed_item::{SqlDecodedItem, SqlIndexedItem},
     provider_core::gsi_write::{
         GsiSqlPlanOptions, GsiUpsertStyle, PlaceholderNumbering, TableKeyColumnStyle,
         plan_gsi_sql_statements,
@@ -28,7 +29,71 @@ pub(super) struct PreparedGetItemQuery {
     bind_values: Vec<String>,
 }
 
+pub(super) struct PreparedMainRowWrite {
+    pub(super) columns_sql: String,
+    pub(super) values_sql: String,
+    pub(super) conflict_target: String,
+    pub(super) assignments: String,
+    pub(super) bind_values: Vec<Option<String>>,
+}
+
 impl PostgresStorageProvider {
+    pub(super) fn prepare_main_row_write(
+        table_info: &StoredTableInfo,
+        key_attributes: &KeyAttributes,
+        full_item: &HashMap<String, storage_provider::AttributeValue>,
+        payload_item: &HashMap<String, storage_provider::AttributeValue>,
+        indexers: Option<&[String]>,
+    ) -> StorageResult<PreparedMainRowWrite> {
+        let key_bindings = Self::key_column_bindings_for_schema(
+            table_info,
+            &table_info.key_schema,
+            key_attributes,
+            None,
+        )?;
+        let indexed =
+            SqlIndexedItem::extract(full_item, payload_item, indexers, table_info.max_indexers)?;
+        let mut columns = key_bindings
+            .iter()
+            .map(|binding| binding.column.clone())
+            .collect::<Vec<_>>();
+        let conflict_target = columns.join(", ");
+        columns.push("attributes_blob".to_string());
+        columns
+            .extend((0..table_info.max_indexers.as_usize()).map(crate::utils::indexer_column_name));
+
+        let mut bind_values = key_bindings
+            .iter()
+            .map(|binding| Some(binding.value.clone()))
+            .collect::<Vec<_>>();
+        bind_values.push(Some(indexed.residual_json().to_owned()));
+        bind_values.extend(
+            (0..table_info.max_indexers.as_usize())
+                .map(|ordinal| indexed.slots().get(ordinal).cloned().flatten()),
+        );
+        let mut values = key_bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                Self::postgres_placeholder_for_type(index + 1, &binding.attribute_type)
+            })
+            .collect::<Vec<_>>();
+        values.extend((key_bindings.len() + 1..=columns.len()).map(|index| format!("${index}")));
+        let assignments = columns
+            .iter()
+            .map(|column| format!("{column} = EXCLUDED.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Ok(PreparedMainRowWrite {
+            columns_sql: columns.join(", "),
+            values_sql: values.join(", "),
+            conflict_target,
+            assignments,
+            bind_values,
+        })
+    }
+
     pub(super) fn key_attribute_type(
         table_info: &StoredTableInfo,
         attribute_name: &str,
@@ -87,6 +152,7 @@ impl PostgresStorageProvider {
         attribute_definitions: &[storage_types::AttributeDefinition],
         key_schema: &[storage_types::KeySchemaElement],
         global_secondary_indexes: Option<&[storage_types::GlobalSecondaryIndex]>,
+        max_indexers: storage_types::MaxIndexers,
     ) -> Vec<String> {
         let physical_table_name = physical_names::physical_table_name(table_name);
         let mut key_columns = Vec::new();
@@ -131,6 +197,7 @@ impl PostgresStorageProvider {
             &physical_table_name,
             &key_columns,
             &primary_key_columns,
+            max_indexers,
         )]
     }
 
@@ -139,6 +206,7 @@ impl PostgresStorageProvider {
         attribute_definitions: &[storage_types::AttributeDefinition],
         table_key_schema: &[storage_types::KeySchemaElement],
         global_secondary_indexes: &[storage_types::GlobalSecondaryIndex],
+        max_indexers: storage_types::MaxIndexers,
     ) -> Vec<String> {
         let mut gsi_sqls = Vec::new();
         for gsi in global_secondary_indexes {
@@ -187,6 +255,7 @@ impl PostgresStorageProvider {
                 &gsi_table_name,
                 &key_columns,
                 &primary_key_columns,
+                max_indexers,
             ));
         }
         gsi_sqls
@@ -210,6 +279,7 @@ impl PostgresStorageProvider {
             &request.attribute_definitions,
             &request.key_schema,
             gsi_storage_indexes.as_deref(),
+            request.max_indexers,
         );
         let gsi_sqls = gsi_storage_indexes
             .as_ref()
@@ -219,6 +289,7 @@ impl PostgresStorageProvider {
                     &request.attribute_definitions,
                     &request.key_schema,
                     indexes,
+                    request.max_indexers,
                 )
             })
             .unwrap_or_default();
@@ -611,33 +682,49 @@ impl PostgresStorageProvider {
         primary_key_schema: &[storage_types::KeySchemaElement],
         secondary_key_schema: Option<&[storage_types::KeySchemaElement]>,
     ) -> StorageResult<WireItem> {
-        let primary_key_attributes =
-            Self::row_key_attributes(row, table_info, primary_key_schema, None)?;
-        let primary_key = storage_types::WireItemKeyAttributes::from_key_schema(
+        Ok(Self::row_to_decoded_item_for_origin(
+            row,
+            table_info,
             primary_key_schema,
-            &primary_key_attributes,
-        )?;
+            secondary_key_schema,
+        )?
+        .item)
+    }
 
-        let secondary_key = if let Some(schema) = secondary_key_schema {
-            let attributes = Self::row_key_attributes(row, table_info, schema, Some("table_"))?;
-            Some(storage_types::WireItemKeyAttributes::from_key_schema(
+    pub(super) fn row_to_decoded_item_for_origin(
+        row: &Row,
+        table_info: &StoredTableInfo,
+        primary_key_schema: &[storage_types::KeySchemaElement],
+        secondary_key_schema: Option<&[storage_types::KeySchemaElement]>,
+    ) -> StorageResult<SqlDecodedItem> {
+        let mut key_attributes =
+            Self::row_key_attributes(row, table_info, primary_key_schema, None)?;
+        if let Some(schema) = secondary_key_schema {
+            key_attributes.extend(Self::row_key_attributes(
+                row,
+                table_info,
                 schema,
-                &attributes,
-            )?)
-        } else {
-            None
-        };
-
-        let non_key_attributes_blob = row
+                Some("table_"),
+            )?);
+        }
+        let residual_json = row
             .try_get::<_, Option<String>>("attributes_blob")
             .map_err(|err| Self::map_postgres_error("row decode attributes_blob", err))?
-            .map(String::into_bytes);
-
-        Ok(WireItem::local_split(
-            primary_key,
-            secondary_key,
-            non_key_attributes_blob,
-        ))
+            .unwrap_or_else(|| "{}".to_string());
+        let mut slots = Vec::with_capacity(table_info.max_indexers.as_usize());
+        for ordinal in 0..table_info.max_indexers.as_usize() {
+            let column = crate::utils::indexer_column_name(ordinal);
+            slots.push(
+                row.try_get::<_, Option<String>>(column.as_str())
+                    .map_err(|err| Self::map_postgres_error("row decode indexer", err))?,
+            );
+        }
+        SqlIndexedItem::reconstruct_with_indexers(
+            residual_json,
+            slots,
+            &KeyAttributes::from(key_attributes),
+            table_info.max_indexers,
+        )
     }
 
     pub(super) fn row_to_wire_item(
@@ -680,6 +767,8 @@ impl PostgresStorageProvider {
             )?);
         }
         projection.push("attributes_blob".to_string());
+        projection
+            .extend((0..table_info.max_indexers.as_usize()).map(crate::utils::indexer_column_name));
         Ok(projection.join(", "))
     }
 
@@ -696,6 +785,7 @@ impl PostgresStorageProvider {
             table_info,
             Some(item),
             None,
+            &[],
         )
         .await
     }
@@ -707,10 +797,11 @@ impl PostgresStorageProvider {
         table_info: &StoredTableInfo,
         old_item: Option<&HashMap<String, storage_provider::AttributeValue>>,
         new_item: Option<&HashMap<String, storage_provider::AttributeValue>>,
+        new_indexers: &[String],
     ) -> StorageResult<()> {
         #[cfg(test)]
         let plan_started = Instant::now();
-        let plan = plan_postgres_gsi_sql_statements(table_info, old_item, new_item)?;
+        let plan = plan_postgres_gsi_sql_statements(table_info, old_item, new_item, new_indexers)?;
 
         #[cfg(test)]
         {
@@ -750,6 +841,7 @@ impl PostgresStorageProvider {
         table_name: &TableName,
         table_info: &StoredTableInfo,
         item: &HashMap<String, storage_provider::AttributeValue>,
+        indexers: &[String],
     ) -> StorageResult<()> {
         self.apply_gsi_entries_for_item_change_with_client(
             client,
@@ -757,6 +849,7 @@ impl PostgresStorageProvider {
             table_info,
             None,
             Some(item),
+            indexers,
         )
         .await
     }
@@ -764,7 +857,7 @@ impl PostgresStorageProvider {
     async fn execute_postgres_write_plan<C: GenericClient + Sync>(
         &self,
         client: &C,
-        plan: &WriteMaintenancePlan<String>,
+        plan: &WriteMaintenancePlan<Option<String>>,
         error_context: &'static str,
         _perf_counter: &'static str,
     ) -> StorageResult<()> {
@@ -809,9 +902,23 @@ impl PostgresStorageProvider {
         key_attributes: &KeyAttributes,
         table_info: &StoredTableInfo,
     ) -> StorageResult<Option<WireItem>> {
-        let prepared = Self::prepare_get_item_query(table_name, key_attributes, table_info)?;
-        self.execute_prepared_get_item_query(client, &prepared, "get_item", "db_query")
+        self.get_item_with_indexers_with_client(client, table_name, key_attributes, table_info)
             .await
+            .map(|item| item.map(|decoded| decoded.item))
+    }
+
+    pub(super) async fn get_item_with_indexers_with_client<C: GenericClient + Sync>(
+        &self,
+        client: &C,
+        table_name: &TableName,
+        key_attributes: &KeyAttributes,
+        table_info: &StoredTableInfo,
+    ) -> StorageResult<Option<SqlDecodedItem>> {
+        let prepared = Self::prepare_get_item_query(table_name, key_attributes, table_info)?;
+        self.execute_prepared_get_item_query_with_indexers(
+            client, &prepared, "get_item", "db_query",
+        )
+        .await
     }
 
     pub(super) fn prepare_get_item_query(
@@ -845,6 +952,18 @@ impl PostgresStorageProvider {
         operation: &'static str,
         phase: &'static str,
     ) -> StorageResult<Option<WireItem>> {
+        self.execute_prepared_get_item_query_with_indexers(client, prepared, operation, phase)
+            .await
+            .map(|item| item.map(|decoded| decoded.item))
+    }
+
+    pub(super) async fn execute_prepared_get_item_query_with_indexers<C: GenericClient + Sync>(
+        &self,
+        client: &C,
+        prepared: &PreparedGetItemQuery,
+        operation: &'static str,
+        phase: &'static str,
+    ) -> StorageResult<Option<SqlDecodedItem>> {
         let params: Vec<&(dyn ToSql + Sync)> = prepared
             .bind_values
             .iter()
@@ -856,8 +975,15 @@ impl PostgresStorageProvider {
             .await
             .map_err(|err| Self::map_postgres_error("get_item query", err))?;
         self.record_transaction_phase(operation, phase, started.elapsed());
-        row.map(|row| Self::row_to_wire_item(&row, &prepared.table_info))
-            .transpose()
+        row.map(|row| {
+            Self::row_to_decoded_item_for_origin(
+                &row,
+                &prepared.table_info,
+                &prepared.table_info.key_schema,
+                None,
+            )
+        })
+        .transpose()
     }
 }
 
@@ -876,15 +1002,16 @@ fn plan_postgres_gsi_sql_statements(
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, storage_provider::AttributeValue>>,
     new_item: Option<&HashMap<String, storage_provider::AttributeValue>>,
-) -> StorageResult<WriteMaintenancePlan<String>> {
+    new_indexers: &[String],
+) -> StorageResult<WriteMaintenancePlan<Option<String>>> {
     let options = GsiSqlPlanOptions::new(
         physical_names::physical_gsi_table_name,
         |value: &storage_provider::AttributeValue| {
-            value.inner_string().map_err(|err| {
+            value.inner_string().map(Some).map_err(|err| {
                 StorageError::validation(format!("key attribute must be scalar: {err}"))
             })
         },
-        String::new,
+        || None,
         |index, attribute_type| match attribute_type {
             Some(attribute_type) => {
                 PostgresStorageProvider::postgres_placeholder_for_type(index, attribute_type)
@@ -897,5 +1024,5 @@ fn plan_postgres_gsi_sql_statements(
         PlaceholderNumbering::AcrossPlan,
         crate::provider_core::gsi_write::GsiAttributesBlobStyle::NonKeyAttributes,
     );
-    plan_gsi_sql_statements(table_info, old_item, new_item, &options)
+    plan_gsi_sql_statements(table_info, old_item, new_item, new_indexers, &options)
 }

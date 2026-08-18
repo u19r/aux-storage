@@ -5,6 +5,8 @@
 //! backend-neutral helpers. Implementation crates remain available inside the
 //! workspace, but this crate is the supported downstream surface.
 
+extern crate self as storage;
+
 pub mod common {
     pub use storage_common::*;
 }
@@ -30,6 +32,7 @@ pub use kv::{RocksDbKvStore, SortedKvDbStorageProvider};
 #[cfg(feature = "foundationdb")]
 pub use kv::{foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot};
 
+pub mod admission;
 mod builder;
 pub mod cache;
 #[cfg(feature = "cache-write-planner")]
@@ -60,13 +63,17 @@ pub mod startup;
 mod updated_at_apply;
 #[cfg(test)]
 mod updated_at_apply_tests;
+pub use admission::{
+    AdmissionClass, AdmissionConfig, AdmissionConfigError, AdmissionController, AdmissionOutcome,
+    AdmissionPermit, AdmissionRegistry, AdmissionRejection, AdmissionRejectionReason,
+    AdmissionSnapshot, AdmissionState, ControlPermit,
+};
 #[cfg(all(test, feature = "cache-write-planner"))]
 pub(crate) use database_manager::DatabaseManagerTestPauseHandle;
 pub use database_manager::{
-    CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,
-    DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput, DeleteItemInput,
-    InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
-    PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
+    AdmittedProvider, CappedStorageError, CreateCappedEntityInput, DatabaseManager,
+    DatabaseManagerRuntimeOptions, DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput,
+    DeleteItemInput, PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
     ReplicationMutationApplyOutcome, ResolvedBatchGetPlan, ResolvedGetItem,
     ResolvedStorageOperation, ScanTableInput, UpdateItemInput,
 };
@@ -84,10 +91,12 @@ pub use namespace_migration::{
     BeginDualWriteInput, CompleteCutoverInput, DualWriteCoordinator,
     MigrationBackfillEntitySummary, MigrationBackfillInput, MigrationBackfillSummary,
 };
+#[cfg(test)]
+pub(crate) use namespace_routing::CutoverWatcher;
 pub use namespace_routing::{
-    CutoverEvent, CutoverEventStatus, CutoverWatcher, NamespaceRequestRewriter, NamespaceRoute,
-    NamespaceRouteResolver, NamespaceSourceTable, NamespaceStorageMigrationMode,
-    NamespaceStorageMode, RouteTarget, is_retryable_pause_error, namespace_source_table,
+    CutoverEvent, CutoverEventStatus, NamespaceRequestRewriter, NamespaceRoute,
+    NamespaceSourceTable, NamespaceStorageMigrationMode, NamespaceStorageMode, RouteTarget,
+    is_retryable_pause_error, namespace_source_table,
 };
 pub use point_read_cache::{
     AuthoritativePointReadHit, AuthoritativePointReadPurpose, AuthoritativePointReadResult,
@@ -117,3 +126,5 @@ mod storage_tests;
 
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod storage_test_support;

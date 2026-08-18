@@ -11,6 +11,7 @@ use storage_types::{
 use tokio::sync::Mutex;
 
 use crate::{
+    admission::AdmissionController,
     namespace_routing::{
         CutoverEvent, CutoverEventSerde, CutoverEventStatus, NamespaceRouteResolver,
         is_missing_sys_namespaces_table_error, is_retryable_cutover_watcher_error,
@@ -25,24 +26,37 @@ const CUTOVER_POLL_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const CUTOVER_LOOKAHEAD: Duration = Duration::from_secs(60 * 10);
 const CUTOVER_OVERLAP: Duration = CUTOVER_POLL_INTERVAL;
 
-pub struct CutoverWatcher {
+pub(crate) struct CutoverWatcher {
     resolver: Arc<NamespaceRouteResolver>,
     control_plane: Arc<dyn DatabaseTrait>,
+    admission_controller: AdmissionController,
     poll_interval: Duration,
     lookahead: Duration,
     overlap: Duration,
     scheduled: Arc<Mutex<HashSet<String>>>,
 }
 
+struct ProviderPressureDrainGuard {
+    provider: Arc<dyn DatabaseTrait>,
+}
+
+impl Drop for ProviderPressureDrainGuard {
+    fn drop(&mut self) {
+        let _ = self.provider.take_admission_pressure_signal();
+    }
+}
+
 impl CutoverWatcher {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         resolver: Arc<NamespaceRouteResolver>,
         control_plane: Arc<dyn DatabaseTrait>,
+        admission_controller: AdmissionController,
     ) -> Self {
         Self {
             resolver,
             control_plane,
+            admission_controller,
             poll_interval: CUTOVER_POLL_INTERVAL,
             lookahead: CUTOVER_LOOKAHEAD,
             overlap: CUTOVER_OVERLAP,
@@ -50,7 +64,7 @@ impl CutoverWatcher {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub(crate) fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move { self.run().await })
     }
 
@@ -67,11 +81,24 @@ impl CutoverWatcher {
         }
     }
 
-    pub async fn poll_once(&self) -> StorageResult<()> {
+    pub(crate) async fn poll_once(&self) -> StorageResult<()> {
         let now_ms = TimestampMillis::now().timestamp_millis();
         let from = TimestampMillis::from_timestamp(now_ms - self.overlap.as_millis() as i64);
         let to = TimestampMillis::from_timestamp(now_ms + self.lookahead.as_millis() as i64);
-        let events = query_cutover_events(Arc::clone(&self.control_plane), from, to).await?;
+        let permit = self
+            .admission_controller
+            .try_acquire_control()
+            .map_err(|rejection| {
+                StorageError::service_unavailable(rejection.retry_after_seconds)
+            })?;
+        let events = {
+            let _pressure_guard = ProviderPressureDrainGuard {
+                provider: Arc::clone(&self.control_plane),
+            };
+            query_cutover_events(Arc::clone(&self.control_plane), from, to).await
+        };
+        drop(permit);
+        let events = events?;
         for event in events {
             self.schedule_or_apply(event).await;
         }

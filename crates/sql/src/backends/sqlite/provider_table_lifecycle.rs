@@ -219,6 +219,7 @@ impl SQLiteStorageProvider {
                 &metadata.created_at,
                 &metadata.attribute_definitions_json,
                 &metadata.key_schema_json,
+                metadata.max_indexers,
                 metadata.global_secondary_indexes_json.as_deref(),
                 metadata.stream_specification_json.as_deref(),
                 metadata.deletion_protection_enabled,

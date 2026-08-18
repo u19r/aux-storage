@@ -1,12 +1,16 @@
-use storage_types::{
-    AttributeValue, GlobalSecondaryIndex, IndexName, ItemKey, KeySchemaElement, KeyType,
-    Projection, TableKey, TableName,
-};
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
+use storage_types::IndexName;
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
+use storage_types::TableKey;
+use storage_types::{AttributeValue, ItemKey, TableName};
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
+use storage_types::{GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection};
 
 use crate::keyspace::{
     compact::TableStorageId, table_identity::TableIdentity, table_keys::item_key,
 };
 
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
 #[test]
 fn primary_item_key_uses_compact_table_id_prefix() {
     let table = TableIdentity::new(
@@ -29,6 +33,7 @@ fn primary_item_key_uses_compact_table_id_prefix() {
     );
 }
 
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
 #[test]
 fn gsi_item_key_uses_compact_index_id_prefix() {
     let table = TableIdentity::user_indexes_for_table(
@@ -62,6 +67,33 @@ fn gsi_item_key_uses_compact_index_id_prefix() {
     );
 }
 
+#[cfg(feature = "foundationdb-backend")]
+#[test]
+fn foundationdb_item_keys_use_the_canonical_tuple_family() {
+    let table = TableIdentity::new(
+        TableStorageId::new(42),
+        TableName::new("orders"),
+        Vec::new(),
+    );
+    let item = ItemKey::table_key(
+        TableName::new("orders"),
+        AttributeValue::S("pk".to_string()),
+        None,
+    );
+    let key = item_key(&table, &item).expect("key");
+    let tuple = foundationdb::tuple::unpack::<Vec<foundationdb::tuple::Element<'_>>>(&key)
+        .expect("tuple key");
+    assert!(
+        matches!(tuple.get(1), Some(foundationdb::tuple::Element::Bytes(_))),
+        "tenant keyspace must occupy the canonical tuple element"
+    );
+    assert!(
+        matches!(tuple.get(2), Some(foundationdb::tuple::Element::String(value)) if value == "item")
+    );
+    assert!(!key.starts_with(b"p\0\0\0"));
+}
+
+#[cfg(all(feature = "rocksdb-backend", not(feature = "foundationdb-backend")))]
 fn gsi(name: &str) -> GlobalSecondaryIndex {
     GlobalSecondaryIndex {
         index_name: IndexName::new(name),

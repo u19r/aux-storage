@@ -94,6 +94,11 @@ impl TursoStorageProvider {
             };
             items.push(wire);
         }
+        crate::indexed_item::project_gsi_wire_items(
+            &mut items,
+            &table_info,
+            request.index_name.as_ref(),
+        )?;
 
         let has_more = items.len() > effective_limit as usize;
         if has_more {

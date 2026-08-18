@@ -113,7 +113,8 @@ impl TableAtomicityWorkload {
     }
 
     pub(crate) async fn manager(&self, db: SimDatabase) -> Result<DatabaseManager, String> {
-        Ok(DatabaseManager::new_with_mocks(self.provider(db).await?))
+        DatabaseManager::new_with_mocks(self.provider(db).await?)
+            .map_err(|error| storage_error_detail(&error))
     }
 
     pub(crate) fn table_name(&self) -> TableName {

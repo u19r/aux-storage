@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, process::Command, time::Instant};
 
 use alloc_counter::AllocationGuard;
 use storage_common::{GsiKeyParts, key_parts_to_map, plan_gsi_write_actions};
@@ -58,6 +58,7 @@ fn table_info() -> StoredTableInfo {
         created_at: TimestampMillis::now(),
         attribute_definitions: vec![attr("pk"), attr("sk"), attr("gsi_pk"), attr("gsi_sk")],
         key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
             index_name: IndexName::new("gsi"),
             key_schema: vec![key("gsi_pk", KeyType::Hash), key("gsi_sk", KeyType::Range)],
@@ -229,13 +230,19 @@ fn selected_projected_blob_work(
     new_item: Option<&HashMap<String, AttributeValue>>,
 ) -> StorageResult<usize> {
     let (index, _, _, projected_item) = first_put_action(table_info, old_item, new_item)?;
-    let blob = projected_attributes_blob(
+    let payload = projected_attributes(
         &projected_item,
         &index.key_schema,
         &table_info.key_schema,
         GsiAttributesBlobStyle::NonKeyAttributes,
+    );
+    let indexed = crate::indexed_item::SqlIndexedItem::extract(
+        new_item.ok_or_else(|| StorageError::internal("missing projected item"))?,
+        payload.as_ref(),
+        None,
+        table_info.max_indexers,
     )?;
-    Ok(blob.len())
+    Ok(indexed.residual_json().len())
 }
 
 fn measure_work(
@@ -266,6 +273,21 @@ fn measure_work(
 
 #[test]
 fn sql_gsi_planner_allocation_profile_tests() {
+    const ISOLATED_ENV: &str = "AUX_SQL_GSI_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe().expect("GSI allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg("provider_core::gsi_write_alloc_tests::sql_gsi_planner_allocation_profile_tests")
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated GSI allocation test child should start");
+        assert!(status.success(), "isolated GSI allocation test failed");
+        return;
+    }
+
     assert_sql_gsi_planner_avoids_key_part_hashmaps();
     assert_sql_gsi_planner_projected_blob_uses_lower_allocation_path();
 }

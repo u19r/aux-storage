@@ -132,6 +132,7 @@ fn base_table_info(table_name: &TableName) -> storage_types::StoredTableInfo {
                 key_type: KeyType::Range,
             },
         ],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,
@@ -1449,15 +1450,17 @@ async fn transact_write_items_encode_put_refreshes_previously_empty_gsi_query_pr
         transact_items: vec![TransactEncodeItem {
             put: Some(TransactEncodePutRequest {
                 table_name: table_name.clone(),
-                item: gsi_item(
-                    "TD#example.test",
-                    "META",
-                    "tenant#1",
-                    "example.test",
-                    "domain",
-                )
-                .try_into_wire_item()
-                .expect("encode domain-like item"),
+                item: storage_types::WireEntity::unindexed(
+                    gsi_item(
+                        "TD#example.test",
+                        "META",
+                        "tenant#1",
+                        "example.test",
+                        "domain",
+                    )
+                    .try_into_wire_item()
+                    .expect("encode domain-like item"),
+                ),
                 condition_expression: Some("attribute_not_exists(pk)".to_string()),
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -1857,6 +1860,7 @@ async fn database_manager_update_rewrites_gsi_sort_order_after_refresh() {
         ])
         .into(),
         update_expression: "SET gsi1sk = :gsi1sk".to_string(),
+        indexers: None,
         condition_expression: None,
         expression_attribute_names: None,
         expression_attribute_values: Some(HashMap::from([(
@@ -1930,6 +1934,7 @@ async fn database_manager_batch_write_moves_gsi_membership_without_invalidating_
             vec![WriteRequest {
                 put_request: Some(PutRequest {
                     item: gsi_item("item#0", "sk#1", "team#2", "001", "moved"),
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -2017,10 +2022,12 @@ async fn database_manager_batch_write_encode_moves_gsi_membership_without_invali
             table_name.clone(),
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
-                    item: WireItem::from_attribute_map(&gsi_item(
-                        "item#0", "sk#1", "team#2", "001", "moved",
-                    ))
-                    .expect("encode put item"),
+                    item: storage_types::WireEntity::unindexed(
+                        WireItem::from_attribute_map(&gsi_item(
+                            "item#0", "sk#1", "team#2", "001", "moved",
+                        ))
+                        .expect("encode put item"),
+                    ),
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -2105,6 +2112,7 @@ async fn database_manager_transact_update_rewrites_gsi_sort_order_without_invali
                 ])
                 .into(),
                 update_expression: "SET gsi1sk = :gsi1sk".to_string(),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: Some(HashMap::from([(
@@ -2191,10 +2199,12 @@ async fn database_manager_transact_write_items_encode_put_moves_gsi_membership_w
         transact_items: vec![TransactEncodeItem {
             put: Some(TransactEncodePutRequest {
                 table_name: table_name.clone(),
-                item: WireItem::from_attribute_map(&gsi_item(
-                    "item#0", "sk#1", "team#2", "001", "moved",
-                ))
-                .expect("encode transact put item"),
+                item: storage_types::WireEntity::unindexed(
+                    WireItem::from_attribute_map(&gsi_item(
+                        "item#0", "sk#1", "team#2", "001", "moved",
+                    ))
+                    .expect("encode transact put item"),
+                ),
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,

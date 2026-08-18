@@ -10,9 +10,6 @@ mod logical_backfill_ops;
 mod operation_metrics;
 mod query_ops;
 mod read_ops;
-mod read_sequence_executor;
-#[cfg(test)]
-mod read_sequence_executor_tests;
 mod replication_ops;
 mod routed_write_ops;
 mod runtime_options;
@@ -29,6 +26,8 @@ mod transaction_write_coordinator;
 mod wire_item_ops;
 mod write_bulk_ops;
 mod write_ops;
+
+pub use core::AdmittedProvider;
 
 pub use runtime_options::{DatabaseManagerRuntimeOptions, DatabaseManagerRuntimeOptionsBuilder};
 
@@ -73,13 +72,12 @@ pub use crate::database_manager::{
         ResolvedBatchGetPlan, ResolvedGetItem, ResolvedStorageOperation, ScanTableInput,
         UpdateItemInput,
     },
-    read_sequence_executor::{
-        InProcessReadSequence, InProcessReadSequenceLimits, InProcessReadSequenceStats,
-    },
     replication_ops::ReplicationMutationApplyOutcome,
     wire_item_ops::PutItemPayload,
 };
 
+#[cfg(test)]
+mod admission_pressure_tests;
 #[cfg(test)]
 mod construction_tests;
 #[cfg(test)]
@@ -90,6 +88,8 @@ mod read_ops_tests;
 mod replication_ops_tests;
 #[cfg(test)]
 mod routed_write_ops_tests;
+#[cfg(test)]
+mod runtime_options_tests;
 #[cfg(test)]
 mod sync_apply_manager_tests;
 #[cfg(test)]

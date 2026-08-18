@@ -287,6 +287,7 @@ async fn describe_table_includes_multi_region_replica_state() {
     );
     db.create_table(&request).await.expect("create table");
     db.update_table(UpdateTableRequest {
+        max_indexers: None,
         table_name: table.clone(),
         attribute_definitions: None,
         billing_mode: None,

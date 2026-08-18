@@ -24,6 +24,22 @@ struct StorageApiArgs {
     postgres_background_max_pool_size: Option<usize>,
     #[arg(long)]
     postgres_tls: Option<bool>,
+    #[arg(long)]
+    storage_admission_enabled: Option<bool>,
+    #[arg(long)]
+    storage_admission_initial_sustainable_throughput_rps: Option<u64>,
+    #[arg(long)]
+    storage_admission_initial_latency_estimate_ms: Option<u64>,
+    #[arg(long)]
+    storage_admission_minimum_concurrency: Option<usize>,
+    #[arg(long)]
+    storage_admission_maximum_concurrency: Option<usize>,
+    #[arg(long)]
+    storage_admission_control_reserve_concurrency: Option<usize>,
+    #[arg(long)]
+    storage_admission_queue_capacity: Option<usize>,
+    #[arg(long)]
+    storage_admission_max_queue_wait_ms: Option<u64>,
     #[arg(short, long)]
     port: Option<String>,
     #[arg(long)]
@@ -91,7 +107,8 @@ impl StorageApiLaunchConfig {
     }
 
     fn from_parsed_args(args: StorageApiArgs) -> Result<Self, ConfigError> {
-        let mut top_level_overrides = Vec::new();
+        let mut top_level_overrides =
+            collect_storage_admission_environment_overrides(|key| std::env::var(key))?;
         collect_top_level_overrides(&args, &mut top_level_overrides);
 
         let json_path_overrides = parse_override_args(&args.overrides)?;
@@ -179,6 +196,153 @@ fn collect_top_level_overrides(args: &StorageApiArgs, overrides: &mut Vec<(Strin
             tls.to_string(),
         ));
     }
+    push_optional_override(
+        overrides,
+        "features.storage_admission.enabled",
+        args.storage_admission_enabled,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.initial_sustainable_throughput_rps",
+        args.storage_admission_initial_sustainable_throughput_rps,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.initial_latency_estimate_ms",
+        args.storage_admission_initial_latency_estimate_ms,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.minimum_concurrency",
+        args.storage_admission_minimum_concurrency,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.maximum_concurrency",
+        args.storage_admission_maximum_concurrency,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.control_reserve_concurrency",
+        args.storage_admission_control_reserve_concurrency,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.queue_capacity",
+        args.storage_admission_queue_capacity,
+    );
+    push_optional_override(
+        overrides,
+        "features.storage_admission.max_queue_wait_ms",
+        args.storage_admission_max_queue_wait_ms,
+    );
+}
+
+fn push_optional_override<T: ToString>(
+    overrides: &mut Vec<(String, String)>,
+    path: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        overrides.push((path.to_string(), value.to_string()));
+    }
+}
+
+/// Collect admission environment overrides without reading or mutating global
+/// state in the helper itself.  The launcher supplies `std::env::var`; tests
+/// can provide a deterministic lookup function.
+pub(crate) fn collect_storage_admission_environment_overrides<F>(
+    lookup: F,
+) -> Result<Vec<(String, String)>, ConfigError>
+where F: for<'a> Fn(&'a str) -> Result<String, std::env::VarError> {
+    const VARIABLES: &[(&str, &str, bool)] = &[
+        (
+            "AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS",
+            "features.storage_admission.initial_sustainable_throughput_rps",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_INITIAL_SUSTAINABLE_THROUGHPUT_RPS",
+            "features.storage_admission.initial_sustainable_throughput_rps",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_ENABLED",
+            "features.storage_admission.enabled",
+            true,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_INITIAL_LATENCY_ESTIMATE_MS",
+            "features.storage_admission.initial_latency_estimate_ms",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_MINIMUM_CONCURRENCY",
+            "features.storage_admission.minimum_concurrency",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_MAXIMUM_CONCURRENCY",
+            "features.storage_admission.maximum_concurrency",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_CONTROL_RESERVE_CONCURRENCY",
+            "features.storage_admission.control_reserve_concurrency",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_QUEUE_CAPACITY",
+            "features.storage_admission.queue_capacity",
+            false,
+        ),
+        (
+            "AUX_STORAGE_ADMISSION_MAX_QUEUE_WAIT_MS",
+            "features.storage_admission.max_queue_wait_ms",
+            false,
+        ),
+    ];
+    let mut overrides = Vec::new();
+    for (variable, path, is_bool) in VARIABLES {
+        let Ok(value) = lookup(variable) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ConfigError::argument(format!(
+                "environment variable {variable} for {path} must not be empty"
+            )));
+        }
+        if *is_bool {
+            if !matches!(value, "true" | "false" | "1" | "0") {
+                return Err(ConfigError::argument(format!(
+                    "environment variable {variable} for {path} must be true or false"
+                )));
+            }
+            overrides.push((
+                (*path).to_string(),
+                matches!(value, "true" | "1").to_string(),
+            ));
+        } else {
+            let parsed = value.parse::<u128>().map_err(|_| {
+                ConfigError::argument(format!(
+                    "environment variable {variable} for {path} must be a non-negative integer"
+                ))
+            })?;
+            if parsed == 0 && !path.ends_with("queue_capacity") {
+                return Err(ConfigError::argument(format!(
+                    "environment variable {variable} for {path} must be greater than zero"
+                )));
+            }
+            let parsed = usize::try_from(parsed).map_err(|_| {
+                ConfigError::argument(format!(
+                    "environment variable {variable} for {path} is out of range"
+                ))
+            })?;
+            overrides.push(((*path).to_string(), parsed.to_string()));
+        }
+    }
+    Ok(overrides)
 }
 
 fn select_storage_backend(backend: &StorageBackendArg, overrides: &mut Vec<(String, String)>) {

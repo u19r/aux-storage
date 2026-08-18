@@ -10,6 +10,8 @@ use std::time::Duration;
     feature = "postgres"
 ))]
 use bg_job_store::SysJobLockStore;
+#[cfg(feature = "postgres")]
+use bg_jobs::{GatedJobLockStore, JobStartGate};
 #[cfg(any(
     feature = "foundationdb",
     feature = "rocksdb",
@@ -42,6 +44,10 @@ use crate::newtypes::DatabaseTrait;
 
 pub struct StorageProviderBundle {
     pub database: Box<dyn DatabaseTrait>,
+    /// Provider view for maintenance and job work. Postgres uses its
+    /// independent background pool; backends without a separate pool fall
+    /// back to the foreground provider in `DatabaseManager`.
+    pub background_database: Option<Arc<dyn DatabaseTrait>>,
     pub queue: Option<Arc<dyn queue_provider::QueueProvider>>,
     pub pubsub: Option<Arc<dyn pubsub_provider::PubsubProvider>>,
 }
@@ -110,6 +116,7 @@ pub async fn create_storage_provider_bundle(
                 .with_database_job_intervals(database_job_intervals);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
+                background_database: None,
                 queue: Some(Arc::new(provider.clone())),
                 pubsub: Some(Arc::new(provider)),
             })
@@ -141,6 +148,7 @@ pub async fn create_storage_provider_bundle(
             let provider = provider.with_job_manager(job_manager);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
+                background_database: None,
                 queue: Some(Arc::new(provider.clone())),
                 pubsub: Some(Arc::new(provider)),
             })
@@ -160,16 +168,23 @@ pub async fn create_storage_provider_bundle(
             )
             .await?
             .with_immediate_gsi_consistency(settings.immediate_gsi_consistency);
+            let job_start_gate = JobStartGate::new();
             let lock_backend: Arc<dyn storage_provider::StorageProvider> =
-                Arc::new(provider.clone());
-            let lock_store =
-                Arc::new(SysJobLockStore::new(lock_backend, default_worker_id()).await?);
+                Arc::new(provider.for_background_operations());
+            let lock_store = Arc::new(GatedJobLockStore::new(
+                Arc::new(SysJobLockStore::new(lock_backend, default_worker_id()).await?),
+                job_start_gate.clone(),
+            ));
             let job_manager = JobManager::new(lock_store);
             let provider = provider
                 .with_job_manager(job_manager)
+                .with_job_start_gate(job_start_gate)
+                .with_database_jobs_enabled(enable_database_jobs)
                 .with_database_job_intervals(database_job_intervals);
+            let background_provider = Arc::new(provider.for_background_operations());
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
+                background_database: Some(background_provider),
                 queue: Some(Arc::new(provider.clone())),
                 pubsub: Some(Arc::new(provider)),
             })
@@ -206,6 +221,7 @@ pub async fn create_storage_provider_bundle(
 
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
+                background_database: None,
                 queue: Some(Arc::new(provider.clone())),
                 pubsub: Some(Arc::new(provider)),
             })
@@ -237,6 +253,7 @@ pub async fn create_storage_provider_bundle(
                 .with_database_job_intervals(database_job_intervals);
             Ok(StorageProviderBundle {
                 database: Box::new(provider.clone()),
+                background_database: None,
                 queue: Some(Arc::new(provider.clone())),
                 pubsub: Some(Arc::new(provider)),
             })
@@ -249,6 +266,7 @@ pub async fn create_storage_provider_bundle(
             let provider = RemoteStorageProvider::new(settings).await?;
             Ok(StorageProviderBundle {
                 database: Box::new(provider),
+                background_database: None,
                 queue: None,
                 pubsub: None,
             })

@@ -21,60 +21,56 @@ rand = "0.10.2"
 # tokio-rs
 axum = "0.8.9"
 deadpool-postgres = "0.14.1"
-rustls = "0.23.41"
+rustls = "0.23.43"
 rustls-native-certs = "0.8.4"
-tokio = { version = "1.52.3", features = ["full", "tracing"] }
+tokio = { version = "1.53.1", features = ["full", "tracing"] }
 tokio-postgres = "0.7.18"
 tokio-postgres-rustls = "0.14.0"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = [
-    "env-filter",
-    "fmt",
-    "json",
-] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 ############################################
 # futures-rs (rust-lang)
-futures = "0.3.31"
-futures-util = "0.3.31"
+futures = "0.3.34"
+futures-util = "0.3.34"
 
 ############################################
 # hyperium
-bytes = "1.12.0"
-http = "1.4.2"
+bytes = "1.12.1"
+http = "1.5.0"
 httpdate = "1.0.3"
 tower-http = { version = "0.7.0", features = ["catch-panic", "cors"] }
 
 ############################################
 # serde-rs
 md5 = "0.8"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 url = "2.5.8"
 
 ############################################
 # awslabs
-aws-config = "1.8.18"
-aws-credential-types = "1.2.14"
-aws-sdk-dynamodb = "1.116.0"
-aws-sdk-sns = "1.104.0"
-aws-sdk-sqs = "1.102.0"
-aws-sigv4 = "1.4.5"
-aws-smithy-runtime-api = "1.12.3"
-aws-smithy-types = "1.5.0"
+aws-config = "1.10.1"
+aws-credential-types = "1.3.0"
+aws-sdk-dynamodb = "1.120.0"
+aws-sdk-sns = "1.107.0"
+aws-sdk-sqs = "1.105.0"
+aws-sigv4 = "1.5.1"
+aws-smithy-runtime-api = "1.14.0"
+aws-smithy-types = "1.6.2"
 
 ############################################
 # dtolnay
-anyhow = "1.0.103"
-async-trait = "0.1.89"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
 inventory = "0.3.24"
-quote = "1.0.46"
-syn = { version = "2.0.118", features = ["full"] }
-thiserror = "2.0.18"
+quote = "1.0.47"
+syn = { version = "3.0.3", features = ["full"] }
+thiserror = "2.0.20"
 
 ############################################
 # marshallpierce
-base64 = "0.22.1"
+base64 = "0.23.1"
 hex = "0.4.3"
 
 ############################################
@@ -87,15 +83,7 @@ cucumber = "0.23.0"
 
 ############################################
 # seanmonstar
-reqwest = { version = "0.13.4", default-features = false, features = [
-    "blocking",
-    "form",
-    "json",
-    "multipart",
-    "query",
-    "rustls",
-    "stream",
-] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
 
 ############################################
 # rust-rocksdb
@@ -103,11 +91,11 @@ rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
 
 ############################################
 # clap-rs
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 
 ############################################
 # uuid-rs
-uuid = { version = "1.23.4", features = ["serde", "v4", "v5", "v7"] }
+uuid = { version = "1.24.1", features = ["serde", "v4", "v5", "v7"] }
 
 ############################################
 # idanarye
@@ -119,7 +107,7 @@ hashring = "0.3.6"
 
 ############################################
 # datafuselabs
-openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
 
 ############################################
 # Stebalien
@@ -130,20 +118,12 @@ tempfile = "3.27.0"
 base32 = "0.5.1"
 cargo_metadata = "0.23.1"
 #0.10.0 with fix for rust 1.91
-foundationdb = { version = "0.10.0", features = [
-    "embedded-fdb-include",
-    "fdb-7_4",
-], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
-foundationdb-simulation = { version = "0.2.3", features = [
-    "embedded-fdb-include",
-    "fdb-7_4",
-], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "de6e39558568e6e06090f85283cea2f7eaa9d673" }
+foundationdb = { version = "0.11.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "6030bbba92809e6fad73b54161f723f294ce839b" }
+foundationdb-simulation = { version = "0.3.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "6030bbba92809e6fad73b54161f723f294ce839b" }
 hostname = "0.4"
 httpmock = "0.8.3"
 ipnet = "2.12.0"
-jsonschema = { version = "0.46.10", default-features = false, features = [
-    "resolve-file",
-] }
+jsonschema = { version = "0.46.10", default-features = false, features = ["resolve-file"] }
 lz4_flex = "0.13.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
@@ -151,29 +131,29 @@ notify = "8.2.0"
 proptest = "1.11.0"
 quint-connect = "0.1.2"
 rust_decimal = "1.42.1"
-schemars = "1.2.1"
+schemars = "1.2.2"
 smallvec = { version = "1.15.2", features = ["serde"] }
-toml = "1.1.2"
+toml = "1.1.4"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
 turso = { version = "0.6.1", default-features = false }
 utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
-xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 ############################################
 # Public aux-common shared crates.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "8191f1e95744d89a8aaaaa69df32eede0bdcfba7" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
 
 ############################################
 # Local path dependencies
 tokio-rusqlite = { path = "vended/tokio-rusqlite" }
 
-rusqlite = { version = "0.40.1", features = ["bundled", "uuid"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "uuid"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

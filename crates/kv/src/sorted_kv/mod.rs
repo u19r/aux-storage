@@ -29,7 +29,7 @@ use crate::{
         ResolvedPartitionFamily,
     },
     partition_runtime_load::RuntimePartitionLoadTracker,
-    sorted_kv_store::SortedKvStore,
+    sorted_kv_store::{SortedKvStore, TransactionPriority},
 };
 
 pub(crate) struct TtlConfigCacheEntry {
@@ -101,6 +101,12 @@ impl<S: SortedKvStore + 'static> SortedKvDbStorageProvider<S> {
             immediate_gsi_consistency: false,
             gsi_propagation_governor: Arc::new(storage_common::GsiPropagationGovernor::default()),
         }
+    }
+
+    pub(crate) fn with_transaction_priority(&self, priority: TransactionPriority) -> Self {
+        let mut provider = self.clone();
+        provider.kv_store = self.kv_store.with_transaction_priority(priority);
+        provider
     }
 
     #[must_use]

@@ -136,6 +136,7 @@ fn promoted_surface_gate(
         learner_promoted,
         table_metadata_imported: domains_complete,
         item_records_imported: domains_complete,
+        indexer_metadata_imported: domains_complete,
         durable_revisions_imported: domains_complete,
         stream_records_imported: domains_complete,
         ttl_records_imported: domains_complete,

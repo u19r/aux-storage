@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use storage_condition::evaluate_condition;
 use storage_provider::{
-    apply_bound_update_operations, before_update_item_optional, update_item_response,
+    StorageProvider, apply_bound_update_operations, before_update_item_optional,
+    update_item_response,
 };
 use storage_sync::{
     ResolvedSyncMutation, ResolvedSyncMutationBatch, SyncCreateTableMutation, SyncDeleteMutation,
@@ -12,20 +13,30 @@ use storage_sync::{
     SyncUpdateTimeToLiveMutation, SyncWriteProposalRequest, SyncWriteRequest,
 };
 use storage_types::{
-    AttributeValue, DurablePointReadProof, DurablePointReadRequest, ItemStreamVersion,
-    KeyAttributes, StorageEnum, StorageError, StorageResult, TableName,
-    validate_expression_attribute_usage,
+    AttributeValue, DurablePointReadProof, DurablePointReadRequest, IndexedWireItem,
+    IndexerDeclaration, ItemStreamVersion, KeyAttributes, StorageEnum, StorageError, StorageResult,
+    TableName, validate_expression_attribute_usage,
 };
 
 use crate::{
     DatabaseManager,
     database_manager::{
-        PutItemPayload, refresh_existing_updated_at_on_put_payload,
+        PutItemPayload, ROUTED_DEFAULT_CONNECTION_ID, refresh_existing_updated_at_on_put_payload,
         sync_condition_ops::evaluate_optional_condition,
         sync_serialization::{stable_attribute_json, stable_key_json},
         validate_update_expression_usage,
     },
 };
+
+pub(super) struct ResolvePutInput {
+    pub(super) table_name: TableName,
+    pub(super) item: HashMap<String, AttributeValue>,
+    pub(super) indexers: Option<Vec<String>>,
+    pub(super) condition_expression: Option<String>,
+    pub(super) expression_attribute_names: Option<HashMap<String, String>>,
+    pub(super) expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub(super) return_values: Option<storage_types::AllOld>,
+}
 
 #[async_trait]
 impl SyncMutationResolver for DatabaseManager {
@@ -39,14 +50,15 @@ impl SyncMutationResolver for DatabaseManager {
         match request.request {
             SyncWriteRequest::PutItem(request) => {
                 resolver
-                    .resolve_put(
-                        request.table_name,
-                        request.item,
-                        request.condition_expression,
-                        request.expression_attribute_names,
-                        request.expression_attribute_values,
-                        request.return_values,
-                    )
+                    .resolve_put(ResolvePutInput {
+                        table_name: request.table_name,
+                        item: request.item,
+                        indexers: request.indexers,
+                        condition_expression: request.condition_expression,
+                        expression_attribute_names: request.expression_attribute_names,
+                        expression_attribute_values: request.expression_attribute_values,
+                        return_values: request.return_values,
+                    })
                     .await?;
             }
             SyncWriteRequest::DeleteItem(request) => {
@@ -66,14 +78,15 @@ impl SyncMutationResolver for DatabaseManager {
                         match (write.put_request, write.delete_request) {
                             (Some(put), None) => {
                                 resolver
-                                    .resolve_put(
-                                        table_name.clone(),
-                                        put.item,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                    )
+                                    .resolve_put(ResolvePutInput {
+                                        table_name: table_name.clone(),
+                                        item: put.item,
+                                        indexers: put.indexers,
+                                        condition_expression: None,
+                                        expression_attribute_names: None,
+                                        expression_attribute_values: None,
+                                        return_values: None,
+                                    })
                                     .await?;
                             }
                             (None, Some(delete)) => {
@@ -131,6 +144,7 @@ struct OverlayItem {
 #[derive(Clone)]
 pub(super) struct SyncItemState {
     pub(super) item: Option<HashMap<String, AttributeValue>>,
+    pub(super) indexers: Vec<String>,
     pub(super) item_stream_version: ItemStreamVersion,
 }
 
@@ -198,15 +212,16 @@ impl<'a> SyncWriteResolver<'a> {
         Ok(())
     }
 
-    pub(super) async fn resolve_put(
-        &mut self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<storage_types::AllOld>,
-    ) -> StorageResult<()> {
+    pub(super) async fn resolve_put(&mut self, input: ResolvePutInput) -> StorageResult<()> {
+        let ResolvePutInput {
+            table_name,
+            item,
+            indexers,
+            condition_expression,
+            expression_attribute_names,
+            expression_attribute_values,
+            return_values,
+        } = input;
         validate_expression_attribute_usage(
             expression_attribute_names.as_ref(),
             expression_attribute_values.as_ref(),
@@ -214,16 +229,27 @@ impl<'a> SyncWriteResolver<'a> {
         )?;
         let table_info = self
             .db
-            .storage_provider()
-            .get_table_info(&table_name)
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, {
+                let table_name = table_name.clone();
+                move |provider| async move {
+                    let database_call = metrics_facade::begin_database_call("get_table_info");
+                    let result = provider.get_table_info(&table_name).await;
+                    drop(database_call);
+                    result
+                }
+            })
             .await?;
         let mut payload = PutItemPayload::from(item);
         refresh_existing_updated_at_on_put_payload(&mut payload)?;
         let item = payload.into_attribute_map()?;
-        let key = self
-            .db
-            .storage_provider()
-            .get_key_attributes(&item, &table_info.key_schema)?;
+        let indexers =
+            IndexerDeclaration::try_new(indexers.unwrap_or_default(), table_info.max_indexers)?;
+        IndexedWireItem::validate_logical_item(&item, &indexers)?;
+        let key = StorageProvider::get_key_attributes(
+            self.db.storage.as_ref(),
+            &item,
+            &table_info.key_schema,
+        )?;
         let key_json = stable_key_json(&key)?;
         let old_state = self.current_item(&table_name, &key, &key_json).await?;
         let old_item = old_state.item.as_ref();
@@ -244,6 +270,7 @@ impl<'a> SyncWriteResolver<'a> {
             &key_json,
             SyncItemState {
                 item: Some(item),
+                indexers: indexers.names().to_vec(),
                 item_stream_version: target_item_stream_version,
             },
         );
@@ -261,7 +288,9 @@ impl<'a> SyncWriteResolver<'a> {
                 table_name,
                 key_json,
                 item_json,
+                indexers: indexers.into_names(),
                 old_item_json: old_item.map(stable_attribute_json).transpose()?,
+                old_indexers: old_state.item.as_ref().map(|_| old_state.indexers.clone()),
                 target_item_stream_version,
                 response,
             }));
@@ -300,6 +329,7 @@ impl<'a> SyncWriteResolver<'a> {
             &key_json,
             SyncItemState {
                 item: None,
+                indexers: Vec::new(),
                 item_stream_version: target_item_stream_version,
             },
         );
@@ -309,6 +339,7 @@ impl<'a> SyncWriteResolver<'a> {
                 table_name,
                 key_json,
                 old_item_json: old_item.map(stable_attribute_json).transpose()?,
+                old_indexers: old_state.item.as_ref().map(|_| old_state.indexers.clone()),
                 target_item_stream_version,
                 response: SyncMutationResponse::default(),
             }));
@@ -322,6 +353,7 @@ impl<'a> SyncWriteResolver<'a> {
         let storage_types::UpdateItemRequest {
             table_name,
             key,
+            indexers,
             update_expression,
             condition_expression,
             expression_attribute_names,
@@ -366,12 +398,26 @@ impl<'a> SyncWriteResolver<'a> {
         let updated_item = apply_bound_update_operations(item_to_update, &operations)?;
         let table_info = self
             .db
-            .storage_provider()
-            .get_table_info(&table_name)
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, {
+                let table_name = table_name.clone();
+                move |provider| async move {
+                    let database_call = metrics_facade::begin_database_call("get_table_info");
+                    let result = provider.get_table_info(&table_name).await;
+                    drop(database_call);
+                    result
+                }
+            })
             .await?;
-        self.db
-            .storage_provider()
-            .get_key_attributes(&updated_item, &table_info.key_schema)?;
+        StorageProvider::get_key_attributes(
+            self.db.storage.as_ref(),
+            &updated_item,
+            &table_info.key_schema,
+        )?;
+        let updated_indexers = IndexerDeclaration::try_new(
+            indexers.unwrap_or_else(|| old_state.indexers.clone()),
+            table_info.max_indexers,
+        )?;
+        IndexedWireItem::validate_logical_item(&updated_item, &updated_indexers)?;
         let response = match return_values.as_ref() {
             None | Some(storage_types::ReturnValuesOldNewUpdated::None) => {
                 SyncMutationResponse::default()
@@ -391,6 +437,7 @@ impl<'a> SyncWriteResolver<'a> {
             &key_json,
             SyncItemState {
                 item: Some(updated_item.clone()),
+                indexers: updated_indexers.names().to_vec(),
                 item_stream_version: target_item_stream_version,
             },
         );
@@ -400,7 +447,9 @@ impl<'a> SyncWriteResolver<'a> {
                 table_name,
                 key_json,
                 item_json: stable_attribute_json(&updated_item)?,
+                indexers: updated_indexers.into_names(),
                 old_item_json: old_item.map(stable_attribute_json).transpose()?,
+                old_indexers: old_state.item.as_ref().map(|_| old_state.indexers.clone()),
                 target_item_stream_version,
                 response,
             }));
@@ -418,11 +467,14 @@ impl<'a> SyncWriteResolver<'a> {
         }
         let proof = self
             .db
-            .storage_provider()
-            .get_item_with_durable_proof(DurablePointReadRequest {
-                table_name: table_name.clone(),
-                key: key.clone(),
-                consistent_read: true,
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+                provider
+                    .get_item_with_durable_proof(DurablePointReadRequest {
+                        table_name: table_name.clone(),
+                        key: key.clone(),
+                        consistent_read: true,
+                    })
+                    .await
             })
             .await?;
         sync_item_state_from_proof(proof)
@@ -493,8 +545,13 @@ fn decimal_digits(mut value: usize) -> usize {
 
 fn sync_item_state_from_proof(proof: DurablePointReadProof) -> StorageResult<SyncItemState> {
     match proof {
-        DurablePointReadProof::Present { item, revision } => Ok(SyncItemState {
+        DurablePointReadProof::Present {
+            item,
+            indexers,
+            revision,
+        } => Ok(SyncItemState {
             item: Some(item.into_attribute_map()?),
+            indexers,
             item_stream_version: ItemStreamVersion::try_from(revision.as_bytes()).map_err(
                 |error| {
                     StorageError::validation(format!("durable item revision is invalid: {error}"))
@@ -503,6 +560,7 @@ fn sync_item_state_from_proof(proof: DurablePointReadProof) -> StorageResult<Syn
         }),
         DurablePointReadProof::Absent { proof } => Ok(SyncItemState {
             item: None,
+            indexers: Vec::new(),
             item_stream_version: ItemStreamVersion::try_from(proof.as_bytes()).map_err(
                 |error| {
                     StorageError::validation(format!("durable absence proof is invalid: {error}"))

@@ -397,6 +397,7 @@ async fn measure_table_duration_update(
     provider
         .update_table(UpdateTableRequest {
             table_name: table.clone(),
+            max_indexers: None,
             attribute_definitions: None,
             billing_mode: None,
             provisioned_throughput: None,

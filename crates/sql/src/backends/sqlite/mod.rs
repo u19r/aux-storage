@@ -19,8 +19,6 @@ mod logical_backfill_tests;
 pub(crate) mod ops_item;
 pub(crate) mod ops_table;
 pub(crate) mod process_gsi_updates;
-#[cfg(test)]
-mod process_gsi_updates_alloc_tests;
 pub(crate) mod provider_read;
 pub(crate) mod provider_table_lifecycle;
 pub(crate) mod pubsub_provider;
@@ -61,6 +59,8 @@ mod pubsub_provider_tests;
 mod read_path_alloc_tests;
 #[cfg(test)]
 mod read_path_projection_tests;
+#[cfg(test)]
+mod read_sequence_compiler_tests;
 #[cfg(test)]
 mod sql_statements_tests;
 #[cfg(test)]

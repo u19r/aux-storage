@@ -17,6 +17,8 @@ async fn given_missing_delete_tombstone_when_system_record_is_built_then_keys_ar
     let key_image = HashMap::from([("pk".to_string(), AttributeValue::S("absent".to_string()))]);
     let pointer_id = StreamItemId::from([1; 12]);
     let pointer = StreamPointer {
+        indexers: Vec::new(),
+        old_indexers: None,
         stream_name: StreamName::new(b"missing-delete/stream-item/absent"),
         table_name: TableName::new("missing-delete"),
         item_stream_version: ItemStreamVersion::new(1),
@@ -35,7 +37,7 @@ async fn given_missing_delete_tombstone_when_system_record_is_built_then_keys_ar
     }];
 
     let record = system_stream_record(
-        database.stream_provider().as_ref(),
+        database.initialization_stream_provider().as_ref(),
         pointer,
         &images,
         &key_schema,

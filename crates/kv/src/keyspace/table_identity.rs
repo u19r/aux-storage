@@ -32,6 +32,10 @@ pub struct TableIdentity {
     pub(crate) table_id: TableStorageId,
     pub(crate) table_name: TableName,
     pub(crate) indexes: Vec<IndexIdentity>,
+    /// The resolved tenant namespace is part of every FoundationDB Tuple key.
+    /// It is persisted with table metadata so key construction cannot silently
+    /// drift when a provider is reconfigured.
+    pub(crate) tenant_keyspace: Vec<u8>,
     pub(crate) deleted: bool,
 }
 
@@ -45,6 +49,7 @@ impl TableIdentity {
             table_id,
             table_name,
             indexes,
+            tenant_keyspace: Vec::new(),
             deleted: false,
         }
     }
@@ -74,6 +79,17 @@ impl TableIdentity {
             .collect();
 
         Self::new(table_id, table_name.clone(), indexes)
+    }
+
+    pub(crate) fn user_indexes_for_table_with_tenant(
+        table_id: TableStorageId,
+        table_name: &TableName,
+        indexes: Option<&[GlobalSecondaryIndex]>,
+        tenant_keyspace: Vec<u8>,
+    ) -> Self {
+        let mut identity = Self::user_indexes_for_table(table_id, table_name, indexes);
+        identity.tenant_keyspace = tenant_keyspace;
+        identity
     }
 
     #[cfg(test)]

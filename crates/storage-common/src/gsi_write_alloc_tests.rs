@@ -276,6 +276,7 @@ fn legacy_action_shape(actions: &[LegacyGsiWriteAction<'_>]) -> usize {
 
 fn allocation_table_info() -> StoredTableInfo {
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: TableName::new("clone-audit-table"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::now(),

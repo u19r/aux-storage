@@ -25,13 +25,13 @@ impl FoundationDbKvStore {
         transform: AtomicTableWriteTransform,
         immediate_gsi_consistency: bool,
     ) -> StorageResult<Vec<u8>> {
-        let prefix = self.config.subspace_prefix.clone();
-        let prefixed_read_key = Self::prefix_bytes(prefix.as_ref(), &read_key);
+        let prefix = self.physical_prefix();
+        let prefixed_read_key = Self::prefix_bytes(prefix, &read_key);
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         loop {
             attempt = attempt.saturating_add(1);
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
             trx.set_option(options::TransactionOption::ReadYourWritesDisable)
                 .map_err(|error| map_fdb_error("disable atomic RMW read-your-writes", error))?;
             let current = trx
@@ -49,7 +49,7 @@ impl FoundationDbKvStore {
                     &trx,
                     &operations,
                     &stream_ids,
-                    prefix.as_ref(),
+                    prefix,
                     immediate_gsi_consistency,
                 )
                 .await
@@ -74,8 +74,6 @@ impl FoundationDbKvStore {
                 },
                 Err(FdbTableWriteExecutionError::Storage(error)) => return Err(error),
                 Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
-                    let candidate_keys =
-                        Self::collect_transact_write_table_keys(prefix.as_ref(), &operations);
                     trx = self
                         .retry_transaction_after_fdb_error(
                             trx,
@@ -83,7 +81,7 @@ impl FoundationDbKvStore {
                             scope,
                             attempt,
                             error,
-                            &candidate_keys,
+                            operations.len(),
                         )
                         .await?;
                 }
@@ -99,7 +97,7 @@ impl FoundationDbKvStore {
             return Ok(TransactWriteOutput::new(Vec::new()));
         }
 
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         let mut set_count = 0u64;
@@ -119,12 +117,11 @@ impl FoundationDbKvStore {
                 } => {
                     set_count = set_count.saturating_add(1);
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
-                    write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                    let key_bytes = prefix.len().saturating_add(key.len()) as u64;
+                    write_key_bytes = write_key_bytes.saturating_add(key_bytes);
                     if condition.is_some() {
                         get_count = get_count.saturating_add(1);
-                        read_key_bytes = read_key_bytes
-                            .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        read_key_bytes = read_key_bytes.saturating_add(key_bytes);
                         read_modify_writes = read_modify_writes.saturating_add(1);
                     } else {
                         blind_writes = blind_writes.saturating_add(1);
@@ -138,12 +135,11 @@ impl FoundationDbKvStore {
                     set_count = set_count.saturating_add(1);
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
                     let key = template.rocks_key();
-                    write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), &key).len() as u64);
+                    let key_bytes = prefix.len().saturating_add(key.len()) as u64;
+                    write_key_bytes = write_key_bytes.saturating_add(key_bytes);
                     if condition.is_some() {
                         get_count = get_count.saturating_add(1);
-                        read_key_bytes = read_key_bytes
-                            .saturating_add(Self::prefix_bytes(prefix.as_ref(), &key).len() as u64);
+                        read_key_bytes = read_key_bytes.saturating_add(key_bytes);
                         read_modify_writes = read_modify_writes.saturating_add(1);
                     } else {
                         blind_writes = blind_writes.saturating_add(1);
@@ -151,12 +147,11 @@ impl FoundationDbKvStore {
                 }
                 TransactWriteOperation::Delete { key, condition } => {
                     clear_count = clear_count.saturating_add(1);
-                    write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                    let key_bytes = prefix.len().saturating_add(key.len()) as u64;
+                    write_key_bytes = write_key_bytes.saturating_add(key_bytes);
                     if condition.is_some() {
                         get_count = get_count.saturating_add(1);
-                        read_key_bytes = read_key_bytes
-                            .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        read_key_bytes = read_key_bytes.saturating_add(key_bytes);
                         read_modify_writes = read_modify_writes.saturating_add(1);
                     } else {
                         blind_writes = blind_writes.saturating_add(1);
@@ -166,17 +161,17 @@ impl FoundationDbKvStore {
                 | TransactWriteOperation::CheckValue { key, .. } => {
                     get_count = get_count.saturating_add(1);
                     read_key_bytes = read_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        .saturating_add(prefix.len().saturating_add(key.len()) as u64);
                 }
                 TransactWriteOperation::Update { key, condition, .. } => {
                     set_count = set_count.saturating_add(1);
                     get_count = get_count.saturating_add(1);
-                    let prefixed_key = Self::prefix_bytes(prefix.as_ref(), key);
-                    write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);
-                    read_key_bytes = read_key_bytes.saturating_add(prefixed_key.len() as u64);
+                    let key_bytes = prefix.len().saturating_add(key.len()) as u64;
+                    write_key_bytes = write_key_bytes.saturating_add(key_bytes);
+                    read_key_bytes = read_key_bytes.saturating_add(key_bytes);
                     if condition.is_some() {
                         get_count = get_count.saturating_add(1);
-                        read_key_bytes = read_key_bytes.saturating_add(prefixed_key.len() as u64);
+                        read_key_bytes = read_key_bytes.saturating_add(key_bytes);
                     }
                     read_modify_writes = read_modify_writes.saturating_add(1);
                 }
@@ -186,11 +181,11 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
             let execute_started = Instant::now();
             match self
-                .execute_transact_write_tx(&trx, &operations, prefix.as_ref())
+                .execute_transact_write_tx(&trx, &operations, prefix)
                 .await
             {
                 Ok((result, bindings, ordered_log_writes)) => {
@@ -257,17 +252,13 @@ impl FoundationDbKvStore {
                             );
                             match retry_result {
                                 Ok(mut new_trx) => {
-                                    let candidate_keys = Self::collect_transact_write_keys(
-                                        prefix.as_ref(),
-                                        &operations,
-                                    );
                                     self.log_conflict_details(
                                         &new_trx,
                                         "transact_write",
                                         attempt,
                                         retryable,
                                         error_code,
-                                        &candidate_keys,
+                                        operations.len(),
                                     )
                                     .await;
                                     new_trx.reset();
@@ -293,7 +284,7 @@ impl FoundationDbKvStore {
             return Ok(());
         }
 
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         let mut set_count = 0u64;
@@ -310,19 +301,19 @@ impl FoundationDbKvStore {
                     set_count = set_count.saturating_add(1);
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
                     write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        .saturating_add(prefix.len().saturating_add(key.len()) as u64);
                 }
                 DirectWriteOperation::PutTemplate { template, value } => {
                     set_count = set_count.saturating_add(1);
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
                     let key = template.rocks_key();
                     write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), &key).len() as u64);
+                        .saturating_add(prefix.len().saturating_add(key.len()) as u64);
                 }
                 DirectWriteOperation::Delete { key } => {
                     clear_count = clear_count.saturating_add(1);
                     write_key_bytes = write_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        .saturating_add(prefix.len().saturating_add(key.len()) as u64);
                 }
                 DirectWriteOperation::DeleteRange {
                     start,
@@ -331,18 +322,18 @@ impl FoundationDbKvStore {
                     clear_count = clear_count.saturating_add(1);
                     range_clear_count = range_clear_count.saturating_add(1);
                     write_key_bytes = write_key_bytes.saturating_add(
-                        Self::prefix_bytes(prefix.as_ref(), start)
+                        prefix
                             .len()
-                            .saturating_add(
-                                Self::prefix_bytes(prefix.as_ref(), exclusive_end).len(),
-                            ) as u64,
+                            .saturating_mul(2)
+                            .saturating_add(start.len())
+                            .saturating_add(exclusive_end.len()) as u64,
                     );
                 }
                 DirectWriteOperation::CheckValue { key, .. } => {
                     check_count = check_count.saturating_add(1);
                     has_check = true;
                     read_key_bytes = read_key_bytes
-                        .saturating_add(Self::prefix_bytes(prefix.as_ref(), key).len() as u64);
+                        .saturating_add(prefix.len().saturating_add(key.len()) as u64);
                 }
             }
         }
@@ -350,11 +341,11 @@ impl FoundationDbKvStore {
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
             let execute_started = Instant::now();
             let ordered_log_writes = match self
-                .execute_transact_write_unchecked_tx(&trx, &operations, prefix.as_ref())
+                .execute_transact_write_unchecked_tx(&trx, &operations, prefix)
                 .await
             {
                 Ok(ordered_log_writes) => ordered_log_writes,
@@ -362,8 +353,6 @@ impl FoundationDbKvStore {
                     return Err(storage_err);
                 }
                 Err(FdbTableWriteExecutionError::Fdb { scope, error }) => {
-                    let candidate_keys =
-                        Self::collect_unchecked_write_keys(prefix.as_ref(), &operations);
                     trx = self
                         .retry_transaction_after_fdb_error(
                             trx,
@@ -371,7 +360,7 @@ impl FoundationDbKvStore {
                             scope,
                             attempt,
                             error,
-                            &candidate_keys,
+                            Self::direct_write_candidate_key_count(&operations),
                         )
                         .await?;
                     continue;
@@ -418,15 +407,13 @@ impl FoundationDbKvStore {
                     );
                     match retry_result {
                         Ok(diagnostic_trx) => {
-                            let candidate_keys =
-                                Self::collect_unchecked_write_keys(prefix.as_ref(), &operations);
                             self.log_conflict_details(
                                 &diagnostic_trx,
                                 "transact_write_unchecked",
                                 attempt,
                                 retryable,
                                 error_code,
-                                &candidate_keys,
+                                Self::direct_write_candidate_key_count(&operations),
                             )
                             .await;
                             trx = self.create_transaction()?;

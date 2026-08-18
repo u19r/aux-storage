@@ -48,6 +48,7 @@ fn create_table_request(table_name: &str) -> CreateTableRequest {
 fn update_table_request(table_name: &TableName) -> UpdateTableRequest {
     UpdateTableRequest {
         table_name: table_name.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -426,6 +427,7 @@ async fn sqlite_update_item_writes_item_stream_duration_state() -> StorageResult
             table_name: table_name.clone(),
             key: key("a"),
             update_expression: Some("SET value = :value".to_string()),
+            indexers: None,
             attribute_updates: None,
             condition_expression: None,
             expression_attribute_names: None,
@@ -542,6 +544,7 @@ async fn sqlite_batch_write_put_applies_item_stream_duration_state() -> StorageR
                     vec![WriteRequest {
                         put_request: Some(PutRequest {
                             item: item("batch"),
+                            indexers: None,
                             aux_item_stream_ttl_hours: Some(StreamRetentionDuration::FiniteHours(
                                 120,
                             )),
@@ -580,6 +583,7 @@ async fn sqlite_transaction_rollback_removes_item_stream_duration_state() -> Sto
                     put: Some(TransactPutRequest {
                         table_name: table_name.clone(),
                         item: item("new"),
+                        indexers: None,
                         condition_expression: None,
                         expression_attribute_names: None,
                         expression_attribute_values: None,

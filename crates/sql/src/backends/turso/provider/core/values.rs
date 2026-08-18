@@ -94,6 +94,7 @@ pub(crate) fn plan_turso_gsi_sql_statements(
     table_info: &StoredTableInfo,
     old_item: Option<&HashMap<String, AttributeValue>>,
     new_item: Option<&HashMap<String, AttributeValue>>,
+    new_indexers: &[String],
 ) -> StorageResult<WriteMaintenancePlan<TursoValue>> {
     let options = GsiSqlPlanOptions::new(
         gsi_table_name,
@@ -109,7 +110,7 @@ pub(crate) fn plan_turso_gsi_sql_statements(
         PlaceholderNumbering::PerStatement,
         GsiAttributesBlobStyle::FullProjectedItem,
     );
-    plan_gsi_sql_statements(table_info, old_item, new_item, &options)
+    plan_gsi_sql_statements(table_info, old_item, new_item, new_indexers, &options)
 }
 
 #[cfg(test)]

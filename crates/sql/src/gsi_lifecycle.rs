@@ -29,6 +29,35 @@ pub(crate) fn encode_gsi_json(
     }
 }
 
+pub(crate) fn gsi_projected_attribute_names(
+    table: &StoredTableInfo,
+    index: &GlobalSecondaryIndex,
+) -> Option<Vec<String>> {
+    use storage_types::ProjectionType;
+
+    match index.projection.projection_type.as_ref() {
+        None | Some(ProjectionType::All) => None,
+        Some(ProjectionType::KeysOnly) | Some(ProjectionType::Include) => {
+            let mut names = Vec::new();
+            for key in table.key_schema.iter().chain(index.key_schema.iter()) {
+                if !names.iter().any(|name| name == &key.attribute_name) {
+                    names.push(key.attribute_name.clone());
+                }
+            }
+            if index.projection.projection_type == Some(ProjectionType::Include)
+                && let Some(attributes) = &index.projection.non_key_attributes
+            {
+                for attribute in attributes {
+                    if !names.iter().any(|name| name == attribute) {
+                        names.push(attribute.clone());
+                    }
+                }
+            }
+            Some(names)
+        }
+    }
+}
+
 /// Apply GSI projection filtering rules. Returns a new item map containing only
 /// attributes that should appear in the GSI row.
 #[cfg(test)]
@@ -297,6 +326,7 @@ pub async fn apply_gsi_create(
         &table_info.attribute_definitions,
         &table_info.key_schema,
         &new_gsis,
+        table_info.max_indexers,
         SqliteTableRowidMode::WithoutRowid,
     );
     for gsi_sql in gsi_sqls {

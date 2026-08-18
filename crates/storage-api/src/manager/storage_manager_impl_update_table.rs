@@ -14,6 +14,14 @@ impl StorageApiManagerImpl {
         &self,
         request: UpdateTableRequest,
     ) -> Result<Response, HttpApiError> {
+        if let Some(requested) = request.max_indexers {
+            let current = self.db().get_table_info(&request.table_name).await?;
+            if requested < current.max_indexers {
+                return Err(HttpApiError::from(storage_types::StorageError::validation(
+                    "MaxIndexers:cannot_decrease",
+                )));
+            }
+        }
         if let Some(response) = self
             .propose_sync_write_if_configured(|| SyncWriteRequest::UpdateTable(request.clone()))
             .await?

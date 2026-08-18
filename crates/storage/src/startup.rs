@@ -19,8 +19,8 @@ use crate::{
     DatabaseManager, DatabaseManagerRuntimeOptions, InMemoryPointReadCache,
     InMemoryPointReadCacheConfig, InMemoryQueryProofCache, InMemoryQueryProofCacheConfig,
     PointReadCache, PointReadCacheEvictionPolicy, QueryProofCache, QueryProofCacheEvictionPolicy,
-    cache_coordinator::StorageAuthoritativeCacheOptions, noop_point_read_cache,
-    noop_query_proof_cache,
+    admission::AdmissionConfig, cache_coordinator::StorageAuthoritativeCacheOptions,
+    noop_point_read_cache, noop_query_proof_cache,
 };
 
 const DEFAULT_DEPENDENCY_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -446,6 +446,8 @@ pub async fn database_manager_from_features(
     let query_proof_cache = query_proof_cache_from_features(features);
     runtime_options.authoritative_cache_options =
         authoritative_cache_options_from_features(features);
+    runtime_options.admission_config = AdmissionConfig::from_config(&features.storage_admission)
+        .map_err(|error| StorageError::validation(error.to_string()))?;
     DatabaseManager::new_with_connection_registry_and_runtime_options_and_caches(
         registry,
         runtime_options,

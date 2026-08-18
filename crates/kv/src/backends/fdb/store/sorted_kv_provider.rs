@@ -4,14 +4,24 @@ use storage_types::{SerializesToKey, StorageResult};
 use crate::{
     backends::fdb::store::FoundationDbKvStore,
     sorted_kv_store::{
-        AtomicTableWriteTransform, BatchItem, DirectWriteOperation, OldNewItems, RangeResult,
-        SortedKvReadContext, SortedKvStore, TransactWriteOperation, TransactWriteOutput,
-        TransactWriteTableOperation,
+        AtomicTableWriteTransform, BatchItem, DirectWriteOperation, ItemValueCodec, OldNewItems,
+        RangeResult, SortedKvReadContext, SortedKvStore, TransactWriteOperation,
+        TransactWriteOutput, TransactWriteTableOperation, TransactionPriority,
     },
 };
 
 #[async_trait::async_trait]
 impl SortedKvStore for FoundationDbKvStore {
+    fn item_value_codec(&self) -> ItemValueCodec {
+        ItemValueCodec::FoundationDbTuple
+    }
+
+    fn with_transaction_priority(&self, priority: TransactionPriority) -> Self {
+        let mut clone = self.clone();
+        clone.transaction_priority = priority;
+        clone
+    }
+
     async fn atomic_read_modify_write_table(
         &self,
         read_key: Vec<u8>,
@@ -47,6 +57,20 @@ impl SortedKvStore for FoundationDbKvStore {
     ) -> StorageResult<Vec<OldNewItems>> {
         self.transact_write_table_operation(operations, immediate_gsi_consistency)
             .await
+    }
+
+    async fn transact_write_table_with_direct_writes(
+        &self,
+        table_operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
+        self.transact_write_table_with_direct_writes_operation(
+            table_operations,
+            direct_operations,
+            immediate_gsi_consistency,
+        )
+        .await
     }
 
     async fn batch_write(&self, items: Vec<BatchItem>) -> StorageResult<()> {

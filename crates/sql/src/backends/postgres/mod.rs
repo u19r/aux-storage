@@ -44,6 +44,8 @@ mod precision_tests;
 
 #[cfg(all(test, feature = "postgres-backend", feature = "postgres-tests"))]
 mod lifecycle_tests;
+#[cfg(all(test, feature = "postgres-backend", feature = "postgres-tests"))]
+mod read_sequence_compiled_tests;
 
 pub use provider::PostgresStorageProvider;
 pub(super) use provider::{

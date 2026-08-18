@@ -33,18 +33,38 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             .transact_write_table_operations(request.transact_items, &mut plan)
             .await?;
 
-        self.kv_store
-            .transact_write_table(operations, self.immediate_gsi_consistency)
-            .await?;
-
         let response = TransactWriteItemsResponse {
             consumed_capacity: None,
             item_collection_metrics: None,
         };
+        let idempotency_writes =
+            self.idempotency_writes(client_request_token.as_deref(), &response)?;
+        match self
+            .kv_store
+            .transact_write_table_with_direct_writes(
+                operations,
+                idempotency_writes,
+                self.immediate_gsi_consistency,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error)
+                if matches!(error.to_enum(), StorageEnum::ConditionalCheckFailed)
+                    && client_request_token.is_some() =>
+            {
+                if let Some(response) = self
+                    .load_cached_transact_write_response(client_request_token.as_deref())
+                    .await?
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
         record_write(plan.total_items_updated, plan.total_bytes_written);
         plan.billed_tally.emit("transact_write_items");
-        self.cache_transact_write_response(client_request_token.as_deref(), &response)
-            .await?;
         Ok(response)
     }
 
@@ -119,6 +139,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             table_identity: table_metadata.identity.clone(),
             table_info,
             item: std::mem::take(&mut request.item),
+            indexers: request.indexers.take(),
             item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
             condition: cached_transact_condition_binding(
                 &mut caches.condition_binding_cache,
@@ -181,6 +202,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
+            indexers,
             return_values_on_condition_check_failure,
             aux_item_stream_ttl_hours,
             ..
@@ -206,6 +228,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             table_info,
             key,
             operations,
+            indexers,
             item_stream_ttl_hours: aux_item_stream_ttl_hours,
             condition,
             return_values_on_condition_check_failure,
@@ -271,13 +294,13 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         Ok(None)
     }
 
-    async fn cache_transact_write_response(
+    fn idempotency_writes(
         &self,
         token: Option<&str>,
         response: &TransactWriteItemsResponse,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<DirectWriteOperation>> {
         let Some(token) = token else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let current_time = TimestampMillis::now();
         let timestamped_response = TimestampedIdempotencyResponse {
@@ -286,13 +309,17 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             expires_at: current_time + IDEMPOTENCY_TOKEN_TTL_MS,
         };
         let response_bytes = storage_types::storage_serde::to_bytes(&timestamped_response)?;
-        self.kv_store
-            .put(
-                &compact::idempotency_token_key(token),
-                &response_bytes,
-                None,
-            )
-            .await
+        let key = compact::idempotency_token_key(token);
+        Ok(vec![
+            DirectWriteOperation::CheckValue {
+                key: key.clone(),
+                expected_value: None,
+            },
+            DirectWriteOperation::Put {
+                key,
+                value: response_bytes,
+            },
+        ])
     }
 
     async fn cached_transact_table_identity(

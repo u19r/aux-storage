@@ -5,6 +5,8 @@ use storage_types::{ItemStreamVersion, TableName};
 
 use crate::metadata::SyncReadSet;
 
+pub const SYNC_PROTOCOL_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncMutationId(String);
 
@@ -96,7 +98,9 @@ pub struct SyncPutMutation {
     pub table_name: TableName,
     pub key_json: String,
     pub item_json: String,
+    pub indexers: Vec<String>,
     pub old_item_json: Option<String>,
+    pub old_indexers: Option<Vec<String>>,
     pub target_item_stream_version: ItemStreamVersion,
     pub response: SyncMutationResponse,
 }
@@ -107,6 +111,7 @@ pub struct SyncDeleteMutation {
     pub table_name: TableName,
     pub key_json: String,
     pub old_item_json: Option<String>,
+    pub old_indexers: Option<Vec<String>>,
     pub target_item_stream_version: ItemStreamVersion,
     pub response: SyncMutationResponse,
 }
@@ -141,18 +146,33 @@ pub struct SyncUpdateTimeToLiveMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedSyncMutationBatch {
+    pub protocol_version: u16,
     pub mutations: Vec<ResolvedSyncMutation>,
 }
 
 impl ResolvedSyncMutationBatch {
     #[must_use]
     pub fn new(mutations: Vec<ResolvedSyncMutation>) -> Self {
-        Self { mutations }
+        Self {
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            mutations,
+        }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.mutations.is_empty()
+    }
+
+    pub fn validate_protocol(&self) -> Result<(), SyncMutationError> {
+        if self.protocol_version == SYNC_PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(SyncMutationError::IncompatibleProtocolVersion {
+                expected: SYNC_PROTOCOL_VERSION,
+                actual: self.protocol_version,
+            })
+        }
     }
 }
 
@@ -210,6 +230,7 @@ pub struct SyncMutationResponse {
 pub enum SyncMutationError {
     EmptyMutationId,
     EmptyProposalId,
+    IncompatibleProtocolVersion { expected: u16, actual: u16 },
 }
 
 impl Display for SyncMutationError {
@@ -217,6 +238,10 @@ impl Display for SyncMutationError {
         match self {
             Self::EmptyMutationId => formatter.write_str("sync mutation id must not be empty"),
             Self::EmptyProposalId => formatter.write_str("sync proposal id must not be empty"),
+            Self::IncompatibleProtocolVersion { expected, actual } => write!(
+                formatter,
+                "sync protocol version {actual} is incompatible with required version {expected}"
+            ),
         }
     }
 }

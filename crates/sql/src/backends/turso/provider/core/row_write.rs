@@ -62,13 +62,23 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         key_attributes: &KeyAttributes,
         full_item: &HashMap<String, AttributeValue>,
+        payload_item: &HashMap<String, AttributeValue>,
+        indexers: Option<&[String]>,
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
     {
         let table_name_safe = table_info.table_name.sanitized_name();
-        let mut columns = Vec::with_capacity(table_info.key_schema.len() + 1);
-        let mut values = Vec::with_capacity(table_info.key_schema.len() + 1);
+        let indexed = crate::indexed_item::SqlIndexedItem::extract(
+            full_item,
+            payload_item,
+            indexers,
+            table_info.max_indexers,
+        )?;
+        let mut columns = Vec::with_capacity(
+            table_info.key_schema.len() + 1 + table_info.max_indexers.as_usize(),
+        );
+        let mut values = Vec::with_capacity(columns.capacity());
 
         for key in &table_info.key_schema {
             let value = key_attributes
@@ -79,7 +89,8 @@ impl TursoStorageProvider {
         }
 
         columns.push("attributes_blob".to_string());
-        values.push(TursoValue::Text(serde_json::to_string(full_item)?));
+        values.push(TursoValue::Text(indexed.residual_json().to_owned()));
+        append_indexer_values(&mut columns, &mut values, &indexed, table_info.max_indexers);
 
         let placeholders = (1..=columns.len())
             .map(|idx| format!("?{idx}"))
@@ -115,13 +126,23 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         key_attributes: &KeyAttributes,
         full_item: &HashMap<String, AttributeValue>,
+        payload_item: &HashMap<String, AttributeValue>,
+        indexers: Option<&[String]>,
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
     {
         let table_name_safe = table_info.table_name.sanitized_name();
-        let mut columns = Vec::with_capacity(table_info.key_schema.len() + 1);
-        let mut values = Vec::with_capacity(table_info.key_schema.len() + 1);
+        let indexed = crate::indexed_item::SqlIndexedItem::extract(
+            full_item,
+            payload_item,
+            indexers,
+            table_info.max_indexers,
+        )?;
+        let mut columns = Vec::with_capacity(
+            table_info.key_schema.len() + 1 + table_info.max_indexers.as_usize(),
+        );
+        let mut values = Vec::with_capacity(columns.capacity());
 
         for key in &table_info.key_schema {
             let value = key_attributes
@@ -132,7 +153,8 @@ impl TursoStorageProvider {
         }
 
         columns.push("attributes_blob".to_string());
-        values.push(TursoValue::Text(serde_json::to_string(full_item)?));
+        values.push(TursoValue::Text(indexed.residual_json().to_owned()));
+        append_indexer_values(&mut columns, &mut values, &indexed, table_info.max_indexers);
 
         let placeholders = (1..=columns.len())
             .map(|idx| format!("?{idx}"))
@@ -277,13 +299,14 @@ impl TursoStorageProvider {
         table_info: &StoredTableInfo,
         old_item: Option<&HashMap<String, AttributeValue>>,
         new_item: Option<&HashMap<String, AttributeValue>>,
+        new_indexers: &[String],
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
     {
         #[cfg(test)]
         let plan_started = Instant::now();
-        let plan = plan_turso_gsi_sql_statements(table_info, old_item, new_item)?;
+        let plan = plan_turso_gsi_sql_statements(table_info, old_item, new_item, new_indexers)?;
 
         #[cfg(test)]
         {
@@ -351,5 +374,23 @@ impl TursoStorageProvider {
         })?;
 
         Ok(Some(parsed))
+    }
+}
+
+fn append_indexer_values(
+    columns: &mut Vec<String>,
+    values: &mut Vec<TursoValue>,
+    indexed: &crate::indexed_item::SqlIndexedItem,
+    capacity: storage_types::MaxIndexers,
+) {
+    for ordinal in 0..capacity.as_usize() {
+        columns.push(crate::utils::indexer_column_name(ordinal));
+        values.push(
+            indexed
+                .slots()
+                .get(ordinal)
+                .and_then(Option::as_ref)
+                .map_or(TursoValue::Null, |value| TursoValue::Text(value.clone())),
+        );
     }
 }

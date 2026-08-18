@@ -21,8 +21,10 @@ use super::{
     },
 };
 use crate::{
-    error_handler::map_sqlite_error, stream_writer::write_stream_entries,
-    transaction_manager::with_transaction, utils::SqliteConn,
+    error_handler::map_sqlite_error,
+    stream_writer::{SqliteWriteStreamEntriesInput, write_stream_entries},
+    transaction_manager::with_transaction,
+    utils::SqliteConn,
 };
 
 pub(super) async fn import_logical_records(
@@ -38,16 +40,20 @@ pub(super) async fn import_logical_records(
                     table_name,
                     key_json: _,
                     item_json,
+                    indexers,
                     item_stream_version,
                 } => {
                     let table_name = TableName::new(&table_name);
                     let item = serde_json::from_str::<HashMap<String, AttributeValue>>(&item_json)?;
                     SQLiteStorageProvider::import_present_item_with_context(
                         &table_name,
-                        item,
-                        OldItemSource::ReadLocal,
-                        item_stream_version,
-                        immediate_gsi_consistency,
+                        ImportPresentItemInput {
+                            item,
+                            indexers: &indexers,
+                            old_item_source: OldItemSource::ReadLocal,
+                            item_stream_version,
+                            immediate_gsi_consistency,
+                        },
                         &mut context,
                         sqlite,
                     )?;
@@ -152,8 +158,22 @@ impl SyncImportContext {
 
 pub(super) enum OldItemSource<'a> {
     ReadLocal,
-    Resolved(Option<&'a str>),
+    Resolved {
+        item_json: Option<&'a str>,
+        indexers: Option<&'a [String]>,
+    },
 }
+
+pub(super) struct ImportPresentItemInput<'a> {
+    pub(super) item: HashMap<String, AttributeValue>,
+    pub(super) indexers: &'a [String],
+    pub(super) old_item_source: OldItemSource<'a>,
+    pub(super) item_stream_version: ItemStreamVersion,
+    pub(super) immediate_gsi_consistency: bool,
+}
+
+type OptionalLogicalItemWithIndexers =
+    (Option<HashMap<String, AttributeValue>>, Option<Vec<String>>);
 
 impl OldItemSource<'_> {
     fn load(
@@ -161,11 +181,26 @@ impl OldItemSource<'_> {
         table_name: &TableName,
         key: &KeyAttributes,
         sqlite: &SqliteConn<'_>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
+    ) -> StorageResult<OptionalLogicalItemWithIndexers> {
         match self {
-            Self::ReadLocal => SQLiteStorageProvider::do_get_item(table_name, key, sqlite),
-            Self::Resolved(Some(old_item_json)) => Ok(Some(serde_json::from_str(old_item_json)?)),
-            Self::Resolved(None) => Ok(None),
+            Self::ReadLocal => SQLiteStorageProvider::do_get_item_with_indexers(
+                table_name, key, sqlite,
+            )
+            .map(|old| {
+                old.map_or((None, None), |(item, indexers)| {
+                    (Some(item), Some(indexers))
+                })
+            }),
+            Self::Resolved {
+                item_json: Some(old_item_json),
+                indexers,
+            } => Ok((
+                Some(serde_json::from_str(old_item_json)?),
+                indexers.map(<[_]>::to_vec),
+            )),
+            Self::Resolved {
+                item_json: None, ..
+            } => Ok((None, None)),
         }
     }
 }
@@ -173,16 +208,21 @@ impl OldItemSource<'_> {
 impl SQLiteStorageProvider {
     pub(super) fn import_present_item_with_context(
         table_name: &TableName,
-        item: HashMap<String, AttributeValue>,
-        old_item_source: OldItemSource<'_>,
-        item_stream_version: ItemStreamVersion,
-        immediate_gsi_consistency: bool,
+        input: ImportPresentItemInput<'_>,
         context: &mut SyncImportContext,
         sqlite: &SqliteConn<'_>,
     ) -> StorageResult<()> {
+        let ImportPresentItemInput {
+            item,
+            indexers,
+            old_item_source,
+            item_stream_version,
+            immediate_gsi_consistency,
+        } = input;
         let table_info = context.table_info(table_name, sqlite)?;
         let split = split_item_into_key_and_attributes_sync(item, &table_info)?;
-        let old_item = old_item_source.load(table_name, &split.key_attributes, sqlite)?;
+        let (old_item, old_indexers) =
+            old_item_source.load(table_name, &split.key_attributes, sqlite)?;
         let current_version =
             Self::current_item_stream_version(table_name, &split.key_attributes, sqlite)?;
         let decision = plan_logical_import_apply(LogicalImportApplyCase::new(
@@ -194,8 +234,21 @@ impl SQLiteStorageProvider {
             return Ok(());
         }
 
-        let attributes_blob = serde_json::to_string(&split.non_key_attributes)?;
-        Self::upsert_imported_item(table_name, &split.key_attributes, &attributes_blob, sqlite)?;
+        let payload =
+            crate::utils::main_table_payload(&split.key_attributes, &split.non_key_attributes);
+        let indexed = crate::indexed_item::SqlIndexedItem::extract(
+            &split.all_attributes,
+            payload.as_ref(),
+            Some(indexers),
+            table_info.max_indexers,
+        )?;
+        crate::backends::sqlite::put_item_impl::execute_put_item(
+            sqlite,
+            table_name.sanitized_name().as_ref(),
+            &split.key_attributes,
+            &indexed,
+            table_info.max_indexers,
+        )?;
         Self::do_set_item_revision(
             table_name,
             &split.key_attributes,
@@ -206,10 +259,14 @@ impl SQLiteStorageProvider {
             sqlite,
             &table_info,
             &split.all_attributes,
-            old_item.as_ref(),
-            false,
-            item_stream_version,
-            None,
+            SqliteWriteStreamEntriesInput {
+                old_item: old_item.as_ref(),
+                indexers,
+                old_indexers: old_indexers.as_deref(),
+                is_deleted: false,
+                item_stream_version,
+                replication: None,
+            },
         )?;
         if immediate_gsi_consistency {
             Self::apply_immediate_gsi_updates(
@@ -217,6 +274,7 @@ impl SQLiteStorageProvider {
                 &table_info,
                 old_item.as_ref(),
                 Some(&split.all_attributes),
+                indexers,
                 item_stream_version,
             )?;
         }
@@ -240,7 +298,7 @@ impl SQLiteStorageProvider {
         let table_name = TableName::new(&tombstone.table_name);
         let key = serde_json::from_str::<KeyAttributes>(&tombstone.key_json)?;
         let table_info = context.table_info(&table_name, sqlite)?;
-        let existing_item = old_item_source.load(&table_name, &key, sqlite)?;
+        let (existing_item, existing_indexers) = old_item_source.load(&table_name, &key, sqlite)?;
         let current_version = Self::current_item_stream_version(&table_name, &key, sqlite)?;
         let decision = plan_logical_import_apply(LogicalImportApplyCase::new(
             current_version,
@@ -258,10 +316,14 @@ impl SQLiteStorageProvider {
             sqlite,
             &table_info,
             &key_item,
-            existing_item.as_ref(),
-            true,
-            tombstone.item_stream_version,
-            None,
+            SqliteWriteStreamEntriesInput {
+                old_item: existing_item.as_ref(),
+                indexers: &[],
+                old_indexers: existing_indexers.as_deref(),
+                is_deleted: true,
+                item_stream_version: tombstone.item_stream_version,
+                replication: None,
+            },
         )?;
         if immediate_gsi_consistency {
             Self::apply_immediate_gsi_updates(
@@ -269,6 +331,7 @@ impl SQLiteStorageProvider {
                 &table_info,
                 existing_item.as_ref(),
                 None,
+                &[],
                 tombstone.item_stream_version,
             )?;
         }
@@ -293,39 +356,6 @@ impl SQLiteStorageProvider {
         } else {
             Ok(Some(ItemStreamVersion::try_from(revision)?))
         }
-    }
-
-    fn upsert_imported_item(
-        table_name: &TableName,
-        key: &KeyAttributes,
-        attributes_blob: &str,
-        sqlite: &SqliteConn<'_>,
-    ) -> StorageResult<()> {
-        let mut columns = Vec::with_capacity(key.len() + 1);
-        let mut values = Vec::with_capacity(key.len() + 1);
-        for (attr_name, attr_value) in key.iter() {
-            columns.push(attr_name.to_string());
-            values.push(attr_value.inner_string().map_err(|err| {
-                StorageError::validation(format!("key attribute must be scalar: {err}"))
-            })?);
-        }
-        columns.push("attributes_blob".to_string());
-        values.push(attributes_blob.to_string());
-
-        let placeholders = (1..=values.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT OR REPLACE INTO \"table_{}\" ({}) VALUES ({})",
-            table_name.sanitized_name(),
-            columns.join(", "),
-            placeholders
-        );
-        sqlite
-            .execute(&sql, rusqlite::params_from_iter(values.iter()))
-            .map_err(map_sqlite_error)?;
-        Ok(())
     }
 
     fn delete_imported_item(
@@ -388,6 +418,10 @@ impl SQLiteStorageProvider {
         let created_at = payload_i64(&payload, "created_at")?;
         let attribute_definitions = payload_string(&payload, "attribute_definitions")?;
         let key_schema = payload_string(&payload, "key_schema")?;
+        let max_indexers = payload_i64(&payload, "max_indexers")?;
+        storage_types::MaxIndexers::try_new(u8::try_from(max_indexers).map_err(|_| {
+            StorageError::validation("table metadata max_indexers is outside the supported range")
+        })?)?;
         let global_secondary_indexes =
             payload_optional_string(&payload, "global_secondary_indexes")?;
         let table_size_bytes = payload_i64(&payload, "table_size_bytes")?;
@@ -409,11 +443,11 @@ impl SQLiteStorageProvider {
             .execute(
                 r"INSERT INTO tables (
                     id, table_name, table_status, created_at, attribute_definitions, key_schema,
-                    global_secondary_indexes, table_size_bytes, item_count, stream_specification,
+                    max_indexers, global_secondary_indexes, table_size_bytes, item_count, stream_specification,
                     deletion_protection_enabled, table_stream_duration_hours,
                     default_item_stream_duration_hours
                   )
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                   ON CONFLICT(table_name)
                   DO UPDATE SET
                     id = excluded.id,
@@ -421,6 +455,7 @@ impl SQLiteStorageProvider {
                     created_at = excluded.created_at,
                     attribute_definitions = excluded.attribute_definitions,
                     key_schema = excluded.key_schema,
+                    max_indexers = excluded.max_indexers,
                     global_secondary_indexes = excluded.global_secondary_indexes,
                     table_size_bytes = excluded.table_size_bytes,
                     item_count = excluded.item_count,
@@ -435,6 +470,7 @@ impl SQLiteStorageProvider {
                     created_at,
                     attribute_definitions.as_str(),
                     key_schema.as_str(),
+                    max_indexers,
                     global_secondary_indexes.as_deref(),
                     table_size_bytes,
                     item_count,

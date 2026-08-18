@@ -72,6 +72,7 @@ async fn single_node_sync_update_preserves_old_and_new_stream_images() {
         table_name: table_name.clone(),
         key: HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]).into(),
         update_expression: "SET #value = :value".to_string(),
+        indexers: None,
         condition_expression: Some("#value = :old".to_string()),
         expression_attribute_names: Some(HashMap::from([(
             "#value".to_string(),
@@ -206,6 +207,7 @@ async fn single_node_sync_replays_persisted_log_after_restart_once() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "replayed"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -221,7 +223,7 @@ async fn single_node_sync_replays_persisted_log_after_restart_once() {
         .await
         .expect("resolve replay proposal");
     let metadata = commit_metadata(1);
-    db.storage_provider()
+    db.maintenance_provider()
         .persist_resolved_sync_log_entry(&metadata, &proposal.batch)
         .await
         .expect("persist unapplied sync log entry");
@@ -301,7 +303,7 @@ async fn sync_lifecycle_create_table_resolves_and_applies_after_commit() {
         ResolvedSyncMutation::CreateTable(_)
     ));
     assert!(
-        !db.storage_provider()
+        !db.maintenance_provider()
             .table_exists(&table_name)
             .await
             .expect("table exists check"),
@@ -315,7 +317,7 @@ async fn sync_lifecycle_create_table_resolves_and_applies_after_commit() {
 
     assert_eq!(responses.len(), 1);
     assert!(
-        db.storage_provider()
+        db.maintenance_provider()
             .table_exists(&table_name)
             .await
             .expect("table exists check")
@@ -372,10 +374,7 @@ async fn sync_lifecycle_update_ttl_replay_treats_matching_in_progress_state_as_i
 
 #[cfg(feature = "rocksdb")]
 async fn create_rocksdb_single_node_sync_db(label: &str) -> DatabaseManager {
-    let path = std::env::temp_dir().join(format!(
-        "aux-storage-{label}-{}",
-        storage_types::TimestampMillis::now().timestamp_millis()
-    ));
+    let path = crate::storage_test_support::unique_path(&format!("aux-storage-{label}"));
     DatabaseManager::new_with_config_and_runtime_options(
         StorageConfig {
             backend_type: StorageBackend::RocksDB,

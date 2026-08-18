@@ -2,8 +2,15 @@ use serde::{Deserialize, Serialize};
 use storage_types::{ItemStreamVersion, StorageError};
 use thiserror::Error;
 
+pub const LOGICAL_BACKFILL_PROTOCOL_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LogicalBackfillError {
+    #[error(
+        "logical backfill protocol version {actual} is incompatible with required version \
+         {expected}"
+    )]
+    IncompatibleProtocolVersion { expected: u16, actual: u16 },
     #[error("logical backfill identifier cannot be empty")]
     EmptyId,
     #[error("logical backfill checksum cannot be empty")]
@@ -152,6 +159,7 @@ pub enum LogicalBackfillDomain {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogicalBackfillManifest {
+    pub protocol_version: u16,
     pub id: LogicalBackfillId,
     pub caller: LogicalBackfillCaller,
     pub activation_gate: LogicalBackfillActivationGate,
@@ -175,6 +183,7 @@ impl LogicalBackfillManifest {
         domains: Vec<LogicalBackfillDomain>,
     ) -> Self {
         Self {
+            protocol_version: LOGICAL_BACKFILL_PROTOCOL_VERSION,
             id,
             caller: policy.caller(),
             activation_gate: policy.activation_gate(),
@@ -208,6 +217,12 @@ pub fn validate_logical_chunk_for_manifest(
     manifest: &LogicalBackfillManifest,
     chunk: &LogicalBackfillChunk,
 ) -> Result<(), LogicalBackfillError> {
+    if manifest.protocol_version != LOGICAL_BACKFILL_PROTOCOL_VERSION {
+        return Err(LogicalBackfillError::IncompatibleProtocolVersion {
+            expected: LOGICAL_BACKFILL_PROTOCOL_VERSION,
+            actual: manifest.protocol_version,
+        });
+    }
     if !manifest.domains.contains(&chunk.summary.domain) {
         return Err(LogicalBackfillError::DomainNotInManifest {
             domain: chunk.summary.domain,
@@ -235,6 +250,7 @@ pub enum LogicalBackfillRecord {
         table_name: String,
         key_json: String,
         item_json: String,
+        indexers: Vec<String>,
         item_stream_version: ItemStreamVersion,
     },
     Tombstone(LogicalBackfillTombstone),

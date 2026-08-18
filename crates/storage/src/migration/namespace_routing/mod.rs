@@ -11,7 +11,7 @@ pub use access::{
     is_retryable_pause_error, is_shared_table_enabled_namespace_route,
     reject_direct_shared_table_access,
 };
-pub use cutover_watcher::CutoverWatcher;
+pub(crate) use cutover_watcher::CutoverWatcher;
 pub(crate) use model::NamespaceRouteRecord;
 pub use model::{
     CutoverEvent, CutoverEventStatus, NamespaceRoute, NamespaceSourceTable,
@@ -22,5 +22,4 @@ pub(super) use model::{
     NamespaceRouteMigrationModeSerde, NamespaceRouteRecordSerde,
 };
 pub use request_rewriter::NamespaceRequestRewriter;
-pub use resolver::NamespaceRouteResolver;
-pub(crate) use resolver::parse_namespace_route_record;
+pub(crate) use resolver::{NamespaceRouteResolver, parse_namespace_route_record};

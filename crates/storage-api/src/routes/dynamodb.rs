@@ -93,6 +93,7 @@ macro_rules! execute_json_operation {
         (status = 403, description = "Wrong machine credential type or service binding", body = ErrorResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 503, description = "Admission overloaded", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     params(

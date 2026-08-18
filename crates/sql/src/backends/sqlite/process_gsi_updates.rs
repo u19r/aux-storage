@@ -10,7 +10,6 @@ use std::{
 
 use async_trait::async_trait;
 use bg_jobs::BackgroundJob;
-use serde::ser::SerializeMap as _;
 use storage_backfill::{GsiCatchupApplyCase, GsiCatchupOutcome, plan_gsi_catchup_apply};
 use storage_common::{
     GsiKeyPart, GsiWriteAction, observe_gsi_lag, plan_gsi_write_actions, ttl::is_ttl_index,
@@ -28,7 +27,7 @@ use stream_provider::{
 
 use crate::{
     GsiPhysicalName, SQLiteStorageProvider, constants, error_handler::map_sqlite_error,
-    transaction_manager::with_transaction, utils::call_sqlite,
+    indexed_item::SqlIndexedItem, transaction_manager::with_transaction, utils::call_sqlite,
 };
 
 static GSI_UPDATE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +57,13 @@ impl PointerBatch {
             had_more_pages: result.has_more,
         })
     }
+}
+
+struct GsiBatchRecord {
+    table_info: Arc<GsiUpdateTableInfo>,
+    item_stream_version: ItemStreamVersion,
+    indexers: Vec<String>,
+    stream_items: Vec<StreamItem>,
 }
 
 struct GsiUpdateRun {
@@ -183,6 +189,7 @@ impl SQLiteStorageProvider {
         table_info: &StoredTableInfo,
         old_item: Option<&HashMap<String, AttributeValue>>,
         new_item: Option<&HashMap<String, AttributeValue>>,
+        indexers: &[String],
         item_version: ItemStreamVersion,
     ) -> StorageResult<()> {
         let item_version = item_version_i64(item_version)?;
@@ -197,7 +204,6 @@ impl SQLiteStorageProvider {
                     let Some(gsi) = table_info.gsi_by_name(&index.index_name) else {
                         continue;
                     };
-                    ensure_gsi_metadata_columns(txn, &gsi.gsi_table_name)?;
                     apply_gsi_delete(
                         txn,
                         gsi,
@@ -215,15 +221,22 @@ impl SQLiteStorageProvider {
                     let Some(gsi) = table_info.gsi_by_name(&index.index_name) else {
                         continue;
                     };
-                    ensure_gsi_metadata_columns(txn, &gsi.gsi_table_name)?;
-                    let attributes_blob = build_attributes_blob(&projected_item, gsi, &table_info)?;
+                    let Some(new_item) = new_item else {
+                        return Err(StorageError::internal("GSI put action requires a new item"));
+                    };
+                    let indexed = SqlIndexedItem::extract(
+                        new_item,
+                        &projected_item,
+                        Some(indexers),
+                        table_info.source.max_indexers,
+                    )?;
                     apply_gsi_put(
                         txn,
                         gsi,
                         &table_info,
                         &key_part_refs(&gsi_key),
                         &key_part_refs(&table_key),
-                        attributes_blob,
+                        &indexed,
                         item_version,
                     )?;
                 }
@@ -284,12 +297,6 @@ impl SQLiteStorageProvider {
             };
             self.ensure_captured_gsi_stream_tail_available(captured_stream_tail.as_deref())
                 .await?;
-            let update_gsi_table_name = Arc::clone(&update_gsi.gsi_table_name);
-            call_sqlite(&self.connection, move |conn| {
-                ensure_gsi_metadata_columns(conn, &update_gsi_table_name)
-            })
-            .await?;
-
             loop {
                 let (wire_items, next_lek) =
                     <SQLiteStorageProvider as storage_provider::StorageProvider>::scan_table(
@@ -325,15 +332,30 @@ impl SQLiteStorageProvider {
                             &main_key_attributes,
                             &crate::utils::SqliteConn::Connection(sqlite),
                         )?;
-                        let attributes_blob =
-                            build_attributes_blob(&item, &update_gsi, &update_table_info)?;
+                        let stored = SQLiteStorageProvider::do_get_item_with_indexers(
+                            &scan_table_name,
+                            &main_key_attributes,
+                            &crate::utils::SqliteConn::Connection(sqlite),
+                        )?;
+                        let indexers = stored
+                            .as_ref()
+                            .map(|(_, indexers)| indexers.as_slice())
+                            .unwrap_or_default();
+                        let projected_item =
+                            project_gsi_item(&item, &update_gsi, &update_table_info);
+                        let indexed = SqlIndexedItem::extract(
+                            &item,
+                            &projected_item,
+                            Some(indexers),
+                            update_table_info.source.max_indexers,
+                        )?;
                         apply_gsi_put(
                             sqlite,
                             &update_gsi,
                             &update_table_info,
                             &gsi_key,
                             &main_key,
-                            attributes_blob,
+                            &indexed,
                             item_version,
                         )?;
                     }
@@ -395,7 +417,6 @@ impl SQLiteStorageProvider {
             GsiPhysicalName::compose(&table_name.sanitized_name(), &index_name.sanitized_name())
                 .to_string();
         call_sqlite(&self.connection, move |conn| {
-            ensure_gsi_metadata_columns(conn, &gsi_table_name)?;
             conn.execute(
                 &format!("DELETE FROM \"{gsi_table_name}\" WHERE __aux_tombstone = 1"),
                 [],
@@ -510,7 +531,7 @@ impl SQLiteStorageProvider {
         &self,
         records: Vec<(StreamPointer, Vec<StreamItem>)>,
         table_infos: &mut HashMap<TableName, Arc<GsiUpdateTableInfo>>,
-    ) -> Vec<(Arc<GsiUpdateTableInfo>, ItemStreamVersion, Vec<StreamItem>)> {
+    ) -> Vec<GsiBatchRecord> {
         let mut batch_records = Vec::new();
         for (stream_pointer, stream_items) in records {
             let item_stream_version = stream_pointer.item_stream_version;
@@ -523,26 +544,37 @@ impl SQLiteStorageProvider {
             if table_info.gsis.is_empty() {
                 continue;
             }
-            batch_records.push((table_info, item_stream_version, stream_items));
+            batch_records.push(GsiBatchRecord {
+                table_info,
+                item_stream_version,
+                indexers: stream_pointer.indexers,
+                stream_items,
+            });
         }
         batch_records
     }
 
     async fn apply_gsi_batch_records(
         &self,
-        batch_records: Vec<(Arc<GsiUpdateTableInfo>, ItemStreamVersion, Vec<StreamItem>)>,
+        batch_records: Vec<GsiBatchRecord>,
     ) -> StorageResult<GsiApplyStats> {
         call_sqlite(&self.connection, move |txn| {
             let mut stats = GsiApplyStats::default();
-            for (table_info, item_stream_version, stream_items) in batch_records {
+            for record in batch_records {
+                let GsiBatchRecord {
+                    table_info,
+                    item_stream_version,
+                    indexers,
+                    stream_items,
+                } = record;
                 for gsi in &table_info.gsis {
-                    ensure_gsi_metadata_columns(txn, &gsi.gsi_table_name)?;
                     let gsi_stats = apply_stream_items_to_gsi(
                         txn,
                         &stream_items,
                         item_stream_version,
                         &table_info,
                         gsi,
+                        &indexers,
                     )?;
                     stats.add(gsi_stats);
                 }
@@ -672,8 +704,12 @@ impl From<StoredTableInfo> for GsiUpdateTableInfo {
                     .map(|key| key.attribute_name)
                     .collect();
                 let projection_plan = ProjectionPlan::from(&gsi.projection);
-                let insert_sql =
-                    build_gsi_insert_sql(&gsi_table_name, &key_names, &table_key_columns);
+                let insert_sql = build_gsi_insert_sql(
+                    &gsi_table_name,
+                    &key_names,
+                    &table_key_columns,
+                    source.max_indexers,
+                );
                 let delete_sql =
                     build_gsi_delete_sql(&gsi_table_name, &key_names, &table_key_columns);
                 let metadata_sql =
@@ -737,11 +773,16 @@ fn build_gsi_insert_sql(
     gsi_table_name: &str,
     gsi_key_names: &[String],
     table_key_columns: &[String],
+    capacity: storage_types::MaxIndexers,
 ) -> String {
-    let mut columns = Vec::with_capacity(gsi_key_names.len() + table_key_columns.len() + 3);
+    let mut columns =
+        Vec::with_capacity(gsi_key_names.len() + table_key_columns.len() + capacity.as_usize() + 3);
     columns.extend(gsi_key_names.iter().cloned());
     columns.extend(table_key_columns.iter().cloned());
     columns.push("attributes_blob".to_string());
+    for ordinal in 0..capacity.as_usize() {
+        columns.push(crate::utils::indexer_column_name(ordinal));
+    }
     columns.push("__aux_tombstone".to_string());
     columns.push("__aux_item_version".to_string());
 
@@ -750,47 +791,24 @@ fn build_gsi_insert_sql(
         .collect::<Vec<_>>()
         .join(", ");
     let columns_str = columns.join(", ");
+    let indexer_updates = (0..capacity.as_usize())
+        .map(|ordinal| {
+            let column = crate::utils::indexer_column_name(ordinal);
+            format!("{column} = excluded.{column}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let indexer_updates = if indexer_updates.is_empty() {
+        String::new()
+    } else {
+        format!(", {indexer_updates}")
+    };
     format!(
         "INSERT INTO \"{gsi_table_name}\" ({columns_str}) VALUES ({placeholders}) ON CONFLICT DO \
-         UPDATE SET attributes_blob = excluded.attributes_blob, __aux_tombstone = \
-         excluded.__aux_tombstone, __aux_item_version = excluded.__aux_item_version WHERE \
+         UPDATE SET attributes_blob = excluded.attributes_blob{indexer_updates}, __aux_tombstone \
+         = excluded.__aux_tombstone, __aux_item_version = excluded.__aux_item_version WHERE \
          excluded.__aux_item_version >= __aux_item_version"
     )
-}
-
-fn ensure_gsi_metadata_columns(
-    conn: &rusqlite::Connection,
-    gsi_table_name: &str,
-) -> StorageResult<()> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info(\"{gsi_table_name}\")"))
-        .map_err(map_sqlite_error)?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(map_sqlite_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_sqlite_error)?;
-    if !columns.iter().any(|column| column == "__aux_tombstone") {
-        conn.execute(
-            &format!(
-                "ALTER TABLE \"{gsi_table_name}\" ADD COLUMN __aux_tombstone INTEGER NOT NULL \
-                 DEFAULT 0"
-            ),
-            [],
-        )
-        .map_err(map_sqlite_error)?;
-    }
-    if !columns.iter().any(|column| column == "__aux_item_version") {
-        conn.execute(
-            &format!(
-                "ALTER TABLE \"{gsi_table_name}\" ADD COLUMN __aux_item_version INTEGER NOT NULL \
-                 DEFAULT 0"
-            ),
-            [],
-        )
-        .map_err(map_sqlite_error)?;
-    }
-    Ok(())
 }
 
 fn build_gsi_delete_sql(
@@ -917,6 +935,7 @@ fn apply_stream_items_to_gsi(
     item_stream_version: ItemStreamVersion,
     table_info: &GsiUpdateTableInfo,
     gsi: &GsiUpdateIndex,
+    indexers: &[String],
 ) -> Result<GsiApplyStats, StorageError> {
     let mut stats = GsiApplyStats::default();
     let Some(first) = stream_items.first() else {
@@ -985,14 +1004,20 @@ fn apply_stream_items_to_gsi(
     let Some(new_gsi_key) = new_gsi_key else {
         return Ok(stats);
     };
-    let attributes_blob = build_attributes_blob(&new_item, gsi, table_info)?;
+    let projected_item = project_gsi_item(&new_item, gsi, table_info);
+    let indexed = SqlIndexedItem::extract(
+        &new_item,
+        &projected_item,
+        Some(indexers),
+        table_info.source.max_indexers,
+    )?;
     apply_gsi_put(
         txn,
         gsi,
         table_info,
         &new_gsi_key,
         &main_table_key,
-        attributes_blob,
+        &indexed,
         item_version,
     )?;
     stats.puts += 1;
@@ -1024,7 +1049,7 @@ fn apply_gsi_put(
     table_info: &GsiUpdateTableInfo,
     gsi_key: &[(&str, &AttributeValue)],
     main_table_key: &[(&str, &AttributeValue)],
-    attributes_blob: Cow<'static, str>,
+    indexed: &SqlIndexedItem,
     item_version: i64,
 ) -> Result<(), StorageError> {
     if gsi_key.len() != gsi.key_names.len() || main_table_key.len() != table_info.key_names.len() {
@@ -1045,16 +1070,30 @@ fn apply_gsi_put(
         return Ok(());
     }
 
-    let item_version = item_version.to_string();
-    let mut all_values = Vec::with_capacity(key_values.len() + 3);
-    all_values.extend(key_values);
-    all_values.push(attributes_blob);
-    all_values.push(Cow::Borrowed("0"));
-    all_values.push(Cow::Owned(item_version));
+    let mut all_values =
+        Vec::with_capacity(key_values.len() + table_info.source.max_indexers.as_usize() + 3);
+    all_values.extend(
+        key_values
+            .into_iter()
+            .map(|value| rusqlite::types::Value::Text(value.into_owned())),
+    );
+    all_values.push(rusqlite::types::Value::Text(
+        indexed.residual_json().to_owned(),
+    ));
+    for ordinal in 0..table_info.source.max_indexers.as_usize() {
+        all_values.push(
+            match indexed.slots().get(ordinal).and_then(Option::as_ref) {
+                Some(value) => rusqlite::types::Value::Text(value.clone()),
+                None => rusqlite::types::Value::Null,
+            },
+        );
+    }
+    all_values.push(rusqlite::types::Value::Integer(0));
+    all_values.push(rusqlite::types::Value::Integer(item_version));
 
     txn.execute(
         &gsi.insert_sql,
-        rusqlite::params_from_iter(all_values.iter().map(std::convert::AsRef::as_ref)),
+        rusqlite::params_from_iter(all_values.iter()),
     )
     .map_err(map_sqlite_error)
     .context("execute GSI put operation")?;
@@ -1091,16 +1130,24 @@ fn apply_gsi_tombstone(
         return Ok(());
     }
 
-    let item_version = item_version.to_string();
-    let mut all_values = Vec::with_capacity(key_values.len() + 3);
-    all_values.extend(key_values);
-    all_values.push(Cow::Borrowed("{}"));
-    all_values.push(Cow::Borrowed("1"));
-    all_values.push(Cow::Owned(item_version));
+    let mut all_values =
+        Vec::with_capacity(key_values.len() + table_info.source.max_indexers.as_usize() + 3);
+    all_values.extend(
+        key_values
+            .into_iter()
+            .map(|value| rusqlite::types::Value::Text(value.into_owned())),
+    );
+    all_values.push(rusqlite::types::Value::Text("{}".to_string()));
+    all_values.extend(std::iter::repeat_n(
+        rusqlite::types::Value::Null,
+        table_info.source.max_indexers.as_usize(),
+    ));
+    all_values.push(rusqlite::types::Value::Integer(1));
+    all_values.push(rusqlite::types::Value::Integer(item_version));
 
     txn.execute(
         &gsi.insert_sql,
-        rusqlite::params_from_iter(all_values.iter().map(std::convert::AsRef::as_ref)),
+        rusqlite::params_from_iter(all_values.iter()),
     )
     .map_err(map_sqlite_error)
     .context("execute GSI tombstone operation")?;
@@ -1216,58 +1263,38 @@ pub(crate) fn push_key_values(
     Ok(())
 }
 
-pub(crate) fn build_attributes_blob(
+fn project_gsi_item(
     item: &HashMap<String, AttributeValue>,
     gsi: &GsiUpdateIndex,
     table_info: &GsiUpdateTableInfo,
-) -> Result<Cow<'static, str>, StorageError> {
-    if matches!(gsi.projection_plan, ProjectionPlan::KeysOnly) {
-        return Ok(Cow::Borrowed("{}"));
+) -> HashMap<String, AttributeValue> {
+    if matches!(gsi.projection_plan, ProjectionPlan::All) {
+        return item.clone();
     }
-
-    let mut non_key_attributes: Vec<(&str, &AttributeValue)> = Vec::new();
-
+    let mut projected = HashMap::with_capacity(
+        gsi.key_names.len()
+            + table_info.key_names.len()
+            + match &gsi.projection_plan {
+                ProjectionPlan::Include(attributes) => attributes.len(),
+                ProjectionPlan::All | ProjectionPlan::KeysOnly => 0,
+            },
+    );
+    for name in gsi.key_names.iter().chain(&table_info.key_names) {
+        if let Some(value) = item.get(name) {
+            projected.insert(name.clone(), value.clone());
+        }
+    }
     match &gsi.projection_plan {
-        ProjectionPlan::KeysOnly => {}
+        ProjectionPlan::All | ProjectionPlan::KeysOnly => {}
         ProjectionPlan::Include(attrs) => {
             for attr in attrs {
-                if let Some(value) = item.get(attr)
-                    && !is_key_attribute(attr.as_str(), &gsi.key_names, &table_info.key_names)
-                {
-                    non_key_attributes.push((attr.as_str(), value));
+                if let Some(value) = item.get(attr) {
+                    projected.insert(attr.clone(), value.clone());
                 }
             }
         }
-        ProjectionPlan::All => {
-            for (key, value) in item {
-                if is_key_attribute(key.as_str(), &gsi.key_names, &table_info.key_names) {
-                    continue;
-                }
-                non_key_attributes.push((key.as_str(), value));
-            }
-        }
     }
-
-    if non_key_attributes.is_empty() {
-        return Ok(Cow::Borrowed("{}"));
-    }
-
-    let blob = serde_json::to_string(&AttributePairs(&non_key_attributes))
-        .map_err(|err| StorageError::internal(&format!("serialize attributes failed: {err}")))?;
-    Ok(Cow::Owned(blob))
-}
-
-struct AttributePairs<'a>(&'a [(&'a str, &'a AttributeValue)]);
-
-impl serde::Serialize for AttributePairs<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, value) in self.0 {
-            map.serialize_entry(name, value)?;
-        }
-        map.end()
-    }
+    projected
 }
 
 fn extract_key_attributes<'a>(
@@ -1281,10 +1308,6 @@ fn extract_key_attributes<'a>(
         }
     }
     key_attributes
-}
-
-pub(crate) fn is_key_attribute(key: &str, gsi_key: &[String], main_table_key: &[String]) -> bool {
-    gsi_key.iter().any(|name| name == key) || main_table_key.iter().any(|name| name == key)
 }
 
 pub struct GsiBackfillJob {

@@ -9,7 +9,6 @@ impl StorageApiManagerImpl {
         request: ListChangeIndexMarkersRequest,
     ) -> Result<Response, HttpApiError> {
         self.db()
-            .storage_provider()
             .list_change_index_markers(request)
             .await
             .map(|markers| {

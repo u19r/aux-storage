@@ -54,9 +54,20 @@ type TxFuture<'a, T> = Pin<Box<dyn Future<Output = StorageResult<T>> + Send + 'a
 #[derive(Clone, Copy)]
 pub(crate) struct TursoWriteStreamEntriesInput<'a> {
     pub old_item: Option<&'a HashMap<String, AttributeValue>>,
+    pub indexers: &'a [String],
+    pub old_indexers: Option<&'a [String]>,
     pub is_deleted: bool,
     pub item_stream_version: storage_types::ItemStreamVersion,
     pub replication: Option<&'a ReplicationEventMetadata>,
+}
+
+pub(crate) struct TursoOverwriteItemInput<'a> {
+    pub(crate) item: &'a HashMap<String, AttributeValue>,
+    pub(crate) old_item: Option<&'a HashMap<String, AttributeValue>>,
+    pub(crate) indexers: &'a [String],
+    pub(crate) old_indexers: Option<&'a [String]>,
+    pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 pub(crate) struct TursoDeleteItemInput<'a> {
@@ -65,6 +76,15 @@ pub(crate) struct TursoDeleteItemInput<'a> {
     pub(crate) condition: Option<&'a Condition>,
     pub(crate) return_old_on_condition_failure: bool,
     pub(crate) replication: Option<&'a ReplicationEventMetadata>,
+    pub(crate) old_indexers: Option<&'a [String]>,
+    pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
+pub(crate) struct TursoPutItemTxnInput<'a> {
+    pub(crate) item: &'a HashMap<String, AttributeValue>,
+    pub(crate) indexers: Option<&'a [String]>,
+    pub(crate) condition: Option<&'a Condition>,
+    pub(crate) return_old_on_condition_failure: bool,
     pub(crate) item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
@@ -208,8 +228,8 @@ mod values;
 pub(crate) use row_decode::row_view_to_item_map_main;
 pub(crate) use row_decode::{
     attribute_scalar_to_turso_value, build_key_where_clause, gsi_table_name, row_optional_text,
-    row_required_text, row_to_item_map_main, row_to_table_info, row_view_to_gsi_wire_item,
-    row_view_to_main_wire_item,
+    row_required_text, row_to_decoded_item_main, row_to_item_map_main, row_to_table_info,
+    row_view_to_decoded_item_main, row_view_to_gsi_wire_item, row_view_to_main_wire_item,
 };
 pub(crate) use values::{
     canonical_revision_key, classify_execute_sql, is_conflict_storage_error,

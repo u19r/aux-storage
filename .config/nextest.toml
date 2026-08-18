@@ -4,11 +4,19 @@ max-threads = 1
 [test-groups.exclusive-profile]
 max-threads = 1
 
+[test-groups.kv-rocksdb-queue-regression]
+max-threads = 1
+
 [profile.default]
 
 [[profile.default.overrides]]
 filter = 'package(kv) & test(storage_ops::provider_tests)'
 test-group = 'kv-gsi'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'package(kv) & test(backends::rocksdb::queue_provider_regression_tests)'
+test-group = 'kv-rocksdb-queue-regression'
 threads-required = "num-cpus"
 
 [[profile.default.overrides]]

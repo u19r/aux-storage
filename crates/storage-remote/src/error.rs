@@ -149,6 +149,9 @@ pub fn classify_error_response(
             false,
         ),
         Some("InternalServerError") => (StorageError::internal(&message), true),
+        Some("ServiceUnavailable" | "ServiceUnavailableException") => {
+            (StorageError::service_unavailable(1), true)
+        }
         Some("SerializationException") => (
             StorageError::Base(StorageEnum::AwsSerialization(message)),
             false,

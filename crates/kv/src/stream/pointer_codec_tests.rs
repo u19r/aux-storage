@@ -31,6 +31,8 @@ fn compact_pointer_round_trips_embedded_items_without_table_or_stream_names() {
             },
         ],
         None,
+        Vec::new(),
+        None,
     );
 
     let encoded = encode_compact_pointer(&pointer).expect("encode compact pointer");
@@ -66,20 +68,20 @@ fn compact_pointer_reconstructs_public_pointer_at_provider_boundary() {
         b"item-scope".to_vec(),
         ItemStreamVersion::new(99),
         None,
+        Vec::new(),
+        None,
     );
 
-    let stream_pointer = pointer
-        .stream_pointer(&table, storage_types::StreamItemId::random())
-        .expect("public pointer");
+    let stored_pointer = pointer.into_stored_pointer(&table).expect("public pointer");
 
-    assert_eq!(stream_pointer.table_name, table.table_name);
+    assert_eq!(stored_pointer.table_name(), &table.table_name);
     assert_eq!(
-        stream_pointer.item_stream_version,
+        stored_pointer.target_item_stream_version(),
         ItemStreamVersion::new(99)
     );
     assert_eq!(
-        stream_pointer.stream_name,
-        item_stream_name(&table.table_name, b"item-scope")
+        stored_pointer.stream_name(),
+        &item_stream_name(&table.table_name, b"item-scope")
     );
 }
 

@@ -68,6 +68,7 @@ fn sample_table_info() -> StoredTableInfo {
         table_name: TableName::new("alloc_wire_item"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(0),
+        max_indexers: crate::MaxIndexers::ZERO,
         attribute_definitions: vec![
             AttributeDefinition {
                 attribute_name: "pk".to_string(),

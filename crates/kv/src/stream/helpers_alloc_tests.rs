@@ -91,7 +91,15 @@ fn measure_stream_envelope_wire_insert_baseline() -> alloc_counter::AllocationRe
     let wire_items = sample_wire_items();
     let encoded = wire_items
         .iter()
-        .map(|item| encode_wire_item_storage_bytes(item).expect("encode wire storage bytes"))
+        .map(|item| {
+            encode_wire_item_storage_bytes(
+                crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+                item,
+                None,
+                storage_types::MaxIndexers::ZERO,
+            )
+            .expect("encode wire storage bytes")
+        })
         .collect::<Vec<_>>();
 
     let guard = AllocationGuard::start(
@@ -109,6 +117,8 @@ fn measure_stream_envelope_wire_insert_baseline() -> alloc_counter::AllocationRe
                 table_identity: &table_identity,
                 table_name: &table_name,
                 item_key: &key,
+                indexers: &[],
+                old_indexers: None,
             },
             item_bytes.as_slice(),
             None,
@@ -126,7 +136,15 @@ fn measure_stream_envelope_wire_update_embedded() -> alloc_counter::AllocationRe
     let wire_items = sample_wire_items();
     let encoded = wire_items
         .iter()
-        .map(|item| encode_wire_item_storage_bytes(item).expect("encode wire storage bytes"))
+        .map(|item| {
+            encode_wire_item_storage_bytes(
+                crate::sorted_kv_store::ItemValueCodec::RocksDbEnvelope,
+                item,
+                None,
+                storage_types::MaxIndexers::ZERO,
+            )
+            .expect("encode wire storage bytes")
+        })
         .collect::<Vec<_>>();
 
     let guard = AllocationGuard::start(
@@ -144,6 +162,8 @@ fn measure_stream_envelope_wire_update_embedded() -> alloc_counter::AllocationRe
                 table_identity: &table_identity,
                 table_name: &table_name,
                 item_key: &key,
+                indexers: &[],
+                old_indexers: None,
             },
             item_bytes.as_slice(),
             Some(item_bytes.as_slice()),

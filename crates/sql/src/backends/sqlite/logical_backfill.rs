@@ -72,8 +72,8 @@ impl SQLiteStorageProvider {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
-                         key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification, deletion_protection_enabled, \
+                         key_schema, max_indexers, global_secondary_indexes, table_size_bytes, \
+                         item_count, stream_specification, deletion_protection_enabled, \
                          table_stream_duration_hours, default_item_stream_duration_hours FROM \
                          tables WHERE table_name = ?1 ORDER BY table_name LIMIT ?2",
                     )
@@ -88,8 +88,8 @@ impl SQLiteStorageProvider {
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, table_name, table_status, created_at, attribute_definitions, \
-                         key_schema, global_secondary_indexes, table_size_bytes, item_count, \
-                         stream_specification, deletion_protection_enabled, \
+                         key_schema, max_indexers, global_secondary_indexes, table_size_bytes, \
+                         item_count, stream_specification, deletion_protection_enabled, \
                          table_stream_duration_hours, default_item_stream_duration_hours FROM \
                          tables ORDER BY table_name LIMIT ?1",
                     )
@@ -143,6 +143,7 @@ impl SQLiteStorageProvider {
                     StorageError::validation(format!("logical export key encoding failed: {error}"))
                 })?,
                 item_json: serde_json::to_string(&item)?,
+                indexers: versioned.indexers,
                 item_stream_version: versioned.item_stream_version,
             });
         }
@@ -410,13 +411,14 @@ fn table_metadata_record_from_row(
     let created_at: i64 = row.get(3)?;
     let attribute_definitions: String = row.get(4)?;
     let key_schema: String = row.get(5)?;
-    let global_secondary_indexes: Option<String> = row.get(6)?;
-    let table_size_bytes: i64 = row.get(7)?;
-    let item_count: i64 = row.get(8)?;
-    let stream_specification: Option<String> = row.get(9)?;
-    let deletion_protection_enabled: bool = row.get(10)?;
-    let table_stream_duration_hours: i64 = row.get(11)?;
-    let default_item_stream_duration_hours: i64 = row.get(12)?;
+    let max_indexers: i64 = row.get(6)?;
+    let global_secondary_indexes: Option<String> = row.get(7)?;
+    let table_size_bytes: i64 = row.get(8)?;
+    let item_count: i64 = row.get(9)?;
+    let stream_specification: Option<String> = row.get(10)?;
+    let deletion_protection_enabled: bool = row.get(11)?;
+    let table_stream_duration_hours: i64 = row.get(12)?;
+    let default_item_stream_duration_hours: i64 = row.get(13)?;
     let payload_json = serde_json::json!({
         "id": id,
         "table_name": table_name,
@@ -424,6 +426,7 @@ fn table_metadata_record_from_row(
         "created_at": created_at,
         "attribute_definitions": attribute_definitions,
         "key_schema": key_schema,
+        "max_indexers": max_indexers,
         "global_secondary_indexes": global_secondary_indexes,
         "table_size_bytes": table_size_bytes,
         "item_count": item_count,

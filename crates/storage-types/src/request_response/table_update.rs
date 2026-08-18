@@ -5,14 +5,19 @@ use utoipa::ToSchema;
 
 use crate::{
     AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndex, IndexName,
-    KeyAttributes, OnDemandThroughput, ProvisionedThroughput, ReplicaUpdate, SseSpecification,
-    StreamRetentionDuration, StreamSpecification, TableClass, TableDescription, TableName,
+    KeyAttributes, MaxIndexers, OnDemandThroughput, ProvisionedThroughput, ReplicaUpdate,
+    SseSpecification, StreamRetentionDuration, StreamSpecification, TableClass, TableDescription,
+    TableName,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct UpdateTableRequest {
     pub table_name: TableName,
+
+    /// Aux-storage extension: increase the ordered item indexer capacity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_indexers: Option<MaxIndexers>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]

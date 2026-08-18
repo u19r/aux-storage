@@ -22,6 +22,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                         table_identity: table_metadata.identity.clone(),
                         table_info,
                         item: new_image,
+                        indexers: None,
                         item_stream_ttl_hours: None,
                         condition: None,
                         return_values_on_condition_check_failure: None,

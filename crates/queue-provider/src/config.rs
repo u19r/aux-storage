@@ -1,4 +1,4 @@
-use storage_types::{StorageError, StorageResult};
+use storage_types::{FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS, StorageError, StorageResult};
 
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
@@ -45,13 +45,25 @@ fn default_postgres_max_pool_size() -> usize {
         .max(20)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FoundationDbSettings {
     pub cluster_file: Option<String>,
     pub tenant_name: Option<String>,
     pub subspace_prefix: Option<String>,
     pub cache_read_version_ms: u16,
     pub report_conflicting_keys: bool,
+}
+
+impl Default for FoundationDbSettings {
+    fn default() -> Self {
+        Self {
+            cluster_file: None,
+            tenant_name: None,
+            subspace_prefix: None,
+            cache_read_version_ms: FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS,
+            report_conflicting_keys: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

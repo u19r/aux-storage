@@ -33,6 +33,7 @@ cargo_metadata = { workspace = true, optional = true }
 chrono = { workspace = true }
 jsonschema = { workspace = true }
 schemars = { workspace = true }
+storage-types = { path = "../storage-types" }
 toml = { workspace = true }
 
 [dev-dependencies]

@@ -12,7 +12,10 @@ use storage_types::{
 };
 use stream::{StoredStreamPointer, StreamDataType, StreamError, StreamItem, StreamPage};
 
-use crate::{DatabaseManager, DeleteItemInput, PutItemInput, ScanTableInput, Tables};
+use crate::{
+    DatabaseManager, DeleteItemInput, PutItemInput, ScanTableInput, Tables,
+    database_manager::ROUTED_DEFAULT_CONNECTION_ID,
+};
 
 const PAYLOAD_ATTR: &str = "payload";
 const PK_ATTR: &str = "pk";
@@ -504,10 +507,13 @@ impl DatabaseManager {
 
     pub async fn latest_system_stream_cursor(&self) -> StorageResult<Option<StreamItemId>> {
         let page = self
-            .database_trait_provider()
-            .read_backward(StreamName::system_table_stream(), None, 1)
-            .await
-            .map_err(StreamError::into_storage_enum)?;
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, |provider| async move {
+                provider
+                    .read_backward(StreamName::system_table_stream(), None, 1)
+                    .await
+                    .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
+            })
+            .await?;
         Ok(page.items.into_iter().next().map(|item| item.id))
     }
 
@@ -683,10 +689,19 @@ impl DatabaseManager {
                 last_evaluated_key,
                 ..
             } = self
-                .database_trait_provider()
-                .read_forward(system_stream_name.clone(), cursor, 1_000)
-                .await
-                .map_err(StreamError::into_storage_enum)?;
+                .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, {
+                    let page_cursor = cursor;
+                    let system_stream_name = system_stream_name.clone();
+                    move |provider| async move {
+                        provider
+                            .read_forward(system_stream_name, page_cursor, 1_000)
+                            .await
+                            .map_err(|error| {
+                                StorageError::from(StreamError::into_storage_enum(error))
+                            })
+                    }
+                })
+                .await?;
             if items.is_empty() {
                 break true;
             }
@@ -772,6 +787,7 @@ fn put_item_input_from_request(request: PutItemRequest) -> PutItemInput {
     PutItemInput {
         table_name: request.table_name,
         item: request.item.into(),
+        indexers: request.indexers,
         condition_expression: request.condition_expression,
         expression_attribute_names: request.expression_attribute_names,
         expression_attribute_values: request.expression_attribute_values,
@@ -799,15 +815,17 @@ impl DatabaseManager {
             return Ok(None);
         }
 
-        let stored_pointer = storage_types::storage_serde::from_bytes::<StoredStreamPointer>(
-            pointer_item.data.as_slice(),
-        )
-        .map_err(|error| {
-            StorageError::internal(&format!(
-                "decode outbound multi-region system stream pointer '{}': {error}",
-                pointer_item.id
-            ))
-        })?;
+        let stored_pointer = self
+            .run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, {
+                let pointer_item = pointer_item.clone();
+                move |provider| async move {
+                    provider
+                        .decode_stored_stream_pointer(&pointer_item)
+                        .await
+                        .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
+                }
+            })
+            .await?;
         let table_name = stored_pointer.table_name().clone();
         if !include_tables.contains(&table_name) || exclude_tables.contains(&table_name) {
             return Ok(None);
@@ -839,6 +857,11 @@ impl DatabaseManager {
             mutation: ReplicationMutation {
                 table_name,
                 key: stream_record.keys.into(),
+                new_indexers: stream_record
+                    .new_image
+                    .as_ref()
+                    .map(|_| stored_pointer.indexers().to_vec()),
+                old_indexers: stored_pointer.old_indexers().map(<[_]>::to_vec),
                 new_image: stream_record.new_image,
                 old_image: stream_record.old_image,
                 metadata: replication,
@@ -868,19 +891,27 @@ impl DatabaseManager {
                 item_stream_version,
                 ..
             } => {
+                let stream_name = (*stream_name).clone();
                 let exclusive_start_version =
                     item_stream_version.checked_increment().ok_or_else(|| {
                         StorageError::internal("outbound replication item stream version overflow")
                     })?;
-                self.database_trait_provider()
-                    .read_item_stream_backward_from_version(
-                        stream_name.clone(),
-                        exclusive_start_version,
-                        2,
-                    )
-                    .await
-                    .map_err(StreamError::into_storage_enum)?
-                    .items
+                self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, {
+                    move |provider| async move {
+                        provider
+                            .read_item_stream_backward_from_version(
+                                stream_name,
+                                exclusive_start_version,
+                                2,
+                            )
+                            .await
+                            .map_err(|error| {
+                                StorageError::from(StreamError::into_storage_enum(error))
+                            })
+                    }
+                })
+                .await?
+                .items
             }
         };
 

@@ -676,7 +676,10 @@ pub fn plan_runtime_query_execution<Item>(
             let remaining_limit =
                 requested_limit.map(|limit| limit.saturating_sub(items.len() as u32));
             if remaining_limit == Some(0) {
-                RuntimePreparedQueryExecution::PrefixOnly { items }
+                RuntimePreparedQueryExecution::PrefixOnly {
+                    items,
+                    last_evaluated_key: resume_token,
+                }
             } else {
                 RuntimePreparedQueryExecution::PrefixWithDbSuffix {
                     prefix_items: items,

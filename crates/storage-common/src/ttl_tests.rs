@@ -19,6 +19,7 @@ fn make_config() -> TtlConfigRecord {
 fn make_table_info() -> StoredTableInfo {
     let table = TableName::new("TokenTable");
     StoredTableInfo {
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_name: table,
         table_status: TableStatus::Active,
         created_at: TimestampMillis::now(),

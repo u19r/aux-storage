@@ -11,8 +11,7 @@ use tracing::warn;
 use crate::{
     SQLiteStorageProvider,
     backends::sqlite::{
-        delete_item_impl::DeleteItemInput,
-        put_item_impl::{PutItemInput, PutWireItemInput},
+        delete_item_impl::DeleteItemInput, put_item_impl::PutItemInput,
         update_item_impl::UpdateItemInput,
     },
     provider_core::transaction::{
@@ -42,7 +41,8 @@ impl SQLiteStorageProvider {
         immediate_gsi_consistency: bool,
     ) -> StorageResult<()> {
         let table_info = Self::do_get_table_info(&put_request.table_name, sqlite)?;
-        let item = put_request.item.to_attribute_map()?;
+        let item = put_request.item.item().to_attribute_map()?;
+        let indexers = put_request.item.indexer_names();
         validate_transact_put_item_key(&table_info, &item)?;
         let old_item = if put_request.condition_expression.is_some() {
             let key = storage_provider::split_item_into_key_and_attributes_sync(
@@ -86,14 +86,14 @@ impl SQLiteStorageProvider {
             ));
         }
 
-        Self::do_put_wire_item(
+        Self::do_put_item(
             sqlite,
-            PutWireItemInput {
+            PutItemInput {
                 table_name: &put_request.table_name,
-                item: &put_request.item,
+                item: &item,
                 condition: &None,
+                indexers: indexers.as_deref(),
                 immediate_gsi_consistency,
-                should_return_old: false,
                 return_old_on_condition_failure:
                     storage_types::return_values_on_condition_check_failure_all_old(
                         put_request
@@ -163,6 +163,7 @@ impl SQLiteStorageProvider {
                 table_name: &put_request.table_name,
                 item: &put_request.item,
                 condition: &None,
+                indexers: put_request.indexers.as_deref(),
                 immediate_gsi_consistency,
                 return_old_on_condition_failure:
                     storage_types::return_values_on_condition_check_failure_all_old(
@@ -203,6 +204,7 @@ impl SQLiteStorageProvider {
                 condition: &condition,
                 table_name: &update_request.table_name,
                 key: &update_request.key,
+                indexers: update_request.indexers.as_deref(),
                 immediate_gsi_consistency,
                 return_old_on_condition_failure:
                     storage_types::return_values_on_condition_check_failure_all_old(
@@ -302,6 +304,7 @@ impl SQLiteStorageProvider {
                             .as_ref(),
                     ),
                 replication: None,
+                old_indexers: None,
                 item_stream_ttl_hours: delete_request.aux_item_stream_ttl_hours,
             },
         )

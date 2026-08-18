@@ -1,4 +1,53 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+#[cfg(test)]
+static METRICS_TEST_LOCK: RwLock<()> = RwLock::new(());
+
+#[cfg(test)]
+thread_local! {
+    static METRICS_TEST_GUARD_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct FoundationDbMetricsTestGuard {
+    _guard: RwLockWriteGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn foundationdb_operation_metrics_test_guard() -> FoundationDbMetricsTestGuard {
+    let guard = METRICS_TEST_LOCK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    METRICS_TEST_GUARD_HELD.with(|held| held.set(true));
+    FoundationDbMetricsTestGuard { _guard: guard }
+}
+
+#[cfg(test)]
+impl Drop for FoundationDbMetricsTestGuard {
+    fn drop(&mut self) {
+        METRICS_TEST_GUARD_HELD.with(|held| held.set(false));
+    }
+}
+
+fn with_metrics_test_lock<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    {
+        if METRICS_TEST_GUARD_HELD.with(Cell::get) {
+            return operation();
+        }
+        let _guard: RwLockReadGuard<'static, ()> = METRICS_TEST_LOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operation()
+    }
+
+    #[cfg(not(test))]
+    operation()
+}
 
 const FOUNDATIONDB_OPERATIONS_TOTAL: &str = "foundationdb_operations_total";
 const FOUNDATIONDB_OPERATION_BYTES_TOTAL: &str = "foundationdb_operation_bytes_total";
@@ -7,7 +56,7 @@ const FOUNDATIONDB_OPERATION_LATENCY_MICROS_TOTAL: &str =
 const FOUNDATIONDB_OPERATION_LATENCY_COUNT_TOTAL: &str =
     "foundationdb_operation_latency_count_total";
 
-static OPERATION_COUNTERS: [OperationCounters; 13] = [
+static OPERATION_COUNTERS: [OperationCounters; 14] = [
     OperationCounters::new("range"),
     OperationCounters::new("queue_send"),
     OperationCounters::new("queue_prewarm"),
@@ -21,6 +70,7 @@ static OPERATION_COUNTERS: [OperationCounters; 13] = [
     OperationCounters::new("put"),
     OperationCounters::new("delete"),
     OperationCounters::new("read_context"),
+    OperationCounters::new("transaction"),
 ];
 
 static BYTE_COUNTERS: [ByteCounters; 13] = [
@@ -78,6 +128,7 @@ struct OperationCounters {
     retry: AtomicU64,
     clear: AtomicU64,
     range_clear: AtomicU64,
+    priority_batch: AtomicU64,
 }
 
 impl OperationCounters {
@@ -105,6 +156,7 @@ impl OperationCounters {
             retry: AtomicU64::new(0),
             clear: AtomicU64::new(0),
             range_clear: AtomicU64::new(0),
+            priority_batch: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +183,7 @@ impl OperationCounters {
             "retry" => Some(&self.retry),
             "clear" => Some(&self.clear),
             "range_clear" => Some(&self.range_clear),
+            "priority_batch" => Some(&self.priority_batch),
             _ => None,
         }
     }
@@ -158,6 +211,7 @@ impl OperationCounters {
             ("retry", &self.retry),
             ("clear", &self.clear),
             ("range_clear", &self.range_clear),
+            ("priority_batch", &self.priority_batch),
         ] {
             visit(operation, counter);
         }
@@ -271,85 +325,92 @@ impl LatencyStageCounters {
 }
 
 pub fn foundationdb_operation_metrics_snapshot() -> String {
-    let mut lines = String::new();
-    lines.push_str("# TYPE foundationdb_operations_total counter\n");
-    lines.push_str("# TYPE foundationdb_operation_bytes_total counter\n");
-    lines.push_str("# TYPE foundationdb_operation_latency_micros_total counter\n");
-    lines.push_str("# TYPE foundationdb_operation_latency_count_total counter\n");
+    with_metrics_test_lock(|| {
+        let mut lines = String::new();
+        lines.push_str("# TYPE foundationdb_operations_total counter\n");
+        lines.push_str("# TYPE foundationdb_operation_bytes_total counter\n");
+        lines.push_str("# TYPE foundationdb_operation_latency_micros_total counter\n");
+        lines.push_str("# TYPE foundationdb_operation_latency_count_total counter\n");
 
-    for counters in &OPERATION_COUNTERS {
-        counters.visit(|operation, counter| {
-            append_metric_line(
-                &mut lines,
-                FOUNDATIONDB_OPERATIONS_TOTAL,
-                counters.path,
-                "operation",
-                operation,
-                counter,
-            );
-        });
-    }
+        for counters in &OPERATION_COUNTERS {
+            counters.visit(|operation, counter| {
+                append_metric_line(
+                    &mut lines,
+                    FOUNDATIONDB_OPERATIONS_TOTAL,
+                    counters.path,
+                    "operation",
+                    operation,
+                    counter,
+                );
+            });
+        }
 
-    for counters in &BYTE_COUNTERS {
-        counters.visit(|direction, counter| {
-            append_metric_line(
-                &mut lines,
-                FOUNDATIONDB_OPERATION_BYTES_TOTAL,
-                counters.path,
-                "direction",
-                direction,
-                counter,
-            );
-        });
-    }
+        for counters in &BYTE_COUNTERS {
+            counters.visit(|direction, counter| {
+                append_metric_line(
+                    &mut lines,
+                    FOUNDATIONDB_OPERATION_BYTES_TOTAL,
+                    counters.path,
+                    "direction",
+                    direction,
+                    counter,
+                );
+            });
+        }
 
-    for counters in &LATENCY_COUNTERS {
-        counters.visit(|stage| {
-            append_metric_line(
-                &mut lines,
-                FOUNDATIONDB_OPERATION_LATENCY_MICROS_TOTAL,
-                counters.path,
-                "stage",
-                stage.stage,
-                &stage.micros,
-            );
-            append_metric_line(
-                &mut lines,
-                FOUNDATIONDB_OPERATION_LATENCY_COUNT_TOTAL,
-                counters.path,
-                "stage",
-                stage.stage,
-                &stage.count,
-            );
-        });
-    }
+        for counters in &LATENCY_COUNTERS {
+            counters.visit(|stage| {
+                append_metric_line(
+                    &mut lines,
+                    FOUNDATIONDB_OPERATION_LATENCY_MICROS_TOTAL,
+                    counters.path,
+                    "stage",
+                    stage.stage,
+                    &stage.micros,
+                );
+                append_metric_line(
+                    &mut lines,
+                    FOUNDATIONDB_OPERATION_LATENCY_COUNT_TOTAL,
+                    counters.path,
+                    "stage",
+                    stage.stage,
+                    &stage.count,
+                );
+            });
+        }
 
-    lines
+        lines
+    })
 }
 
 pub fn foundationdb_operation_metrics_reset() {
-    for counters in &OPERATION_COUNTERS {
-        counters.visit(|_, counter| counter.store(0, Ordering::Relaxed));
-    }
-    for counters in &BYTE_COUNTERS {
-        counters.visit(|_, counter| counter.store(0, Ordering::Relaxed));
-    }
-    for counters in &LATENCY_COUNTERS {
-        counters.visit(|stage| {
-            stage.micros.store(0, Ordering::Relaxed);
-            stage.count.store(0, Ordering::Relaxed);
-        });
-    }
+    with_metrics_test_lock(|| {
+        for counters in &OPERATION_COUNTERS {
+            counters.visit(|_, counter| counter.store(0, Ordering::Relaxed));
+        }
+        for counters in &BYTE_COUNTERS {
+            counters.visit(|_, counter| counter.store(0, Ordering::Relaxed));
+        }
+        for counters in &LATENCY_COUNTERS {
+            counters.visit(|stage| {
+                stage.micros.store(0, Ordering::Relaxed);
+                stage.count.store(0, Ordering::Relaxed);
+            });
+        }
+    });
 }
 
 pub(super) fn record_fdb_operation(path: &'static str, operation: &'static str, count: u64) {
     if count == 0 {
         return;
     }
-    if let Some(counter) = operation_counters(path).and_then(|counters| counters.counter(operation))
-    {
-        counter.fetch_add(count, Ordering::Relaxed);
-    }
+    with_metrics_test_lock(|| {
+        if let Some(counter) =
+            operation_counters(path).and_then(|counters| counters.counter(operation))
+        {
+            counter.fetch_add(count, Ordering::Relaxed);
+        }
+    });
 }
 
 pub(super) fn record_fdb_transaction_start(path: &'static str) {
@@ -388,9 +449,12 @@ pub(super) fn record_fdb_operation_bytes(path: &'static str, direction: &'static
     if bytes == 0 {
         return;
     }
-    if let Some(counter) = byte_counters(path).and_then(|counters| counters.counter(direction)) {
-        counter.fetch_add(bytes, Ordering::Relaxed);
-    }
+    with_metrics_test_lock(|| {
+        if let Some(counter) = byte_counters(path).and_then(|counters| counters.counter(direction))
+        {
+            counter.fetch_add(bytes, Ordering::Relaxed);
+        }
+    });
 }
 
 pub(super) fn record_fdb_operation_latency(
@@ -398,14 +462,17 @@ pub(super) fn record_fdb_operation_latency(
     stage: &'static str,
     elapsed: std::time::Duration,
 ) {
-    let Some(counters) = latency_counters(path).and_then(|counters| counters.stage(stage)) else {
-        return;
-    };
-    counters.micros.fetch_add(
-        elapsed.as_micros().try_into().unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
-    counters.count.fetch_add(1, Ordering::Relaxed);
+    with_metrics_test_lock(|| {
+        let Some(counters) = latency_counters(path).and_then(|counters| counters.stage(stage))
+        else {
+            return;
+        };
+        counters.micros.fetch_add(
+            elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        counters.count.fetch_add(1, Ordering::Relaxed);
+    });
 }
 
 pub(super) fn record_fdb_conflict_artifacts(
@@ -437,6 +504,7 @@ fn operation_counters(path: &str) -> Option<&'static OperationCounters> {
         "put" => Some(&OPERATION_COUNTERS[10]),
         "delete" => Some(&OPERATION_COUNTERS[11]),
         "read_context" => Some(&OPERATION_COUNTERS[12]),
+        "transaction" => Some(&OPERATION_COUNTERS[13]),
         _ => None,
     }
 }

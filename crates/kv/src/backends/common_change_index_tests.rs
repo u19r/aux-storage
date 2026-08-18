@@ -25,6 +25,7 @@ fn given_transaction_put_with_stream_when_planned_then_change_index_marker_is_at
             attribute_name: "pk".to_string(),
             key_type: KeyType::Hash,
         }],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from(0),
         stream_specification: Some(StreamSpecification {
@@ -48,6 +49,7 @@ fn given_transaction_put_with_stream_when_planned_then_change_index_marker_is_at
         table_identity,
         table_info,
         item,
+        indexers: None,
         item_stream_ttl_hours: None,
         condition: None::<Condition>,
         return_values_on_condition_check_failure: None,

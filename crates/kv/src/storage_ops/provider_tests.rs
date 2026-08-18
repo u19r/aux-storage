@@ -50,8 +50,8 @@ use crate::{
     },
     sorted_kv::{SortedKvDbStorageProvider, decode_table_storage_id},
     sorted_kv_store::{
-        BatchItem, OldNewItems, RangeResult, SortedKvStore, TransactWriteOperation,
-        TransactWriteOutput, TransactWriteTableOperation,
+        BatchItem, DirectWriteOperation, OldNewItems, RangeResult, SortedKvStore,
+        TransactWriteOperation, TransactWriteOutput, TransactWriteTableOperation,
     },
     stream::pointer_codec::decode_compact_pointer,
     ttl,
@@ -515,6 +515,21 @@ impl<S: SortedKvStore> SortedKvStore for FaultyStore<S> {
             .await
     }
 
+    async fn transact_write_table_with_direct_writes(
+        &self,
+        table_operations: Vec<TransactWriteTableOperation>,
+        direct_operations: Vec<DirectWriteOperation>,
+        immediate_gsi_consistency: bool,
+    ) -> StorageResult<Vec<OldNewItems>> {
+        self.inner
+            .transact_write_table_with_direct_writes(
+                table_operations,
+                direct_operations,
+                immediate_gsi_consistency,
+            )
+            .await
+    }
+
     async fn batch_write(&self, items: Vec<BatchItem>) -> StorageResult<()> {
         if self.should_fail() {
             return Err(StorageError::internal("injected batch failure"));
@@ -702,6 +717,8 @@ async fn kv_read_sequence_context_reuses_one_snapshot_for_get_batch_get_and_quer
     }
     #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
     let _guard = foundationdb_live_test_guard().await;
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    let _metrics_guard = crate::backends::fdb::foundationdb_operation_metrics_test_guard();
 
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
@@ -881,6 +898,8 @@ async fn transactional_read_context_multi_get_is_one_snapshot() {
     }
     #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
     let _guard = foundationdb_live_test_guard().await;
+    #[cfg(all(feature = "foundationdb-backend", not(feature = "rocksdb-backend")))]
+    let _metrics_guard = crate::backends::fdb::foundationdb_operation_metrics_test_guard();
 
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
@@ -934,6 +953,7 @@ async fn transactional_read_context_multi_get_is_one_snapshot() {
                                 AttributeValue::S("after".to_string()),
                             ),
                         ]),
+                        indexers: None,
                         condition_expression: None,
                         expression_attribute_names: None,
                         expression_attribute_values: None,
@@ -1467,6 +1487,7 @@ async fn foundationdb_gsi_tombstones_use_hidden_prefix_and_do_not_consume_query_
     use uuid::Uuid;
 
     let _guard = foundationdb_live_test_guard().await;
+    let _metrics_guard = crate::backends::fdb::foundationdb_operation_metrics_test_guard();
     if !foundationdb_live_port_available().await {
         eprintln!("Skipping FoundationDB GSI tombstone test: 127.0.0.1:4689 is unavailable");
         return;
@@ -1757,6 +1778,7 @@ async fn update_table_creates_gsi_and_backfills_kv() {
     // Add GSI via UpdateTable
     let req = storage_types::UpdateTableRequest {
         table_name: table_name.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -1819,6 +1841,68 @@ async fn update_table_creates_gsi_and_backfills_kv() {
 }
 
 #[tokio::test]
+async fn concurrent_gsi_updates_preserve_each_index() {
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table_name = TableName::new("ConcurrentGsiUpdates");
+    create_test_table(&provider, &table_name, false).await;
+
+    let request = |index_name: &str| storage_types::UpdateTableRequest {
+        table_name: table_name.clone(),
+        max_indexers: None,
+        attribute_definitions: None,
+        billing_mode: None,
+        provisioned_throughput: None,
+        on_demand_throughput: None,
+        deletion_protection_enabled: None,
+        aux_stream_duration_hours: None,
+        aux_default_item_stream_duration_hours: None,
+        global_secondary_index_updates: Some(vec![storage_types::GlobalSecondaryIndexUpdate {
+            create: Some(storage_types::CreateGlobalSecondaryIndex {
+                index_name: IndexName::new(index_name),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "gsi_pk".to_string(),
+                    key_type: KeyType::Hash,
+                }],
+                projection: Projection {
+                    projection_type: Some(ProjectionType::All),
+                    non_key_attributes: None,
+                },
+                provisioned_throughput: None,
+            }),
+            delete: None,
+            update: None,
+        }]),
+        replica_updates: None,
+        sse_specification: None,
+        stream_specification: None,
+        table_class: None,
+    };
+
+    let (first, second) = tokio::join!(
+        provider.update_table(request("GsiOne")),
+        provider.update_table(request("GsiTwo")),
+    );
+    first.expect("first concurrent GSI update");
+    second.expect("second concurrent GSI update");
+
+    let table_info = provider.get_table_info(&table_name).await.unwrap();
+    let indexes = table_info
+        .global_secondary_indexes
+        .expect("both concurrent GSI updates persist their metadata");
+    assert!(
+        indexes
+            .iter()
+            .any(|index| index.index_name == IndexName::new("GsiOne"))
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|index| index.index_name == IndexName::new("GsiTwo"))
+    );
+}
+
+#[tokio::test]
 async fn seed_10k_helper() {
     let provider = create_test_provider();
     provider.initialize_storage().await.unwrap();
@@ -1856,6 +1940,7 @@ async fn kv_backfill_crash_resume() {
     // Start UpdateTable to add GSI; this will begin backfill and persist progress
     let req = storage_types::UpdateTableRequest {
         table_name: TableName::new(&table.clone()),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -2020,6 +2105,7 @@ async fn foundationdb_transactional_put_gsi_is_visible_after_update_job() {
                             ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
                             ("gsi_sk".to_string(), AttributeValue::N("1".to_string())),
                         ]),
+                        indexers: None,
                         condition_expression: Some("attribute_not_exists(pk)".to_string()),
                         expression_attribute_names: None,
                         expression_attribute_values: None,
@@ -2212,6 +2298,7 @@ async fn kv_immediate_gsi_consistency_batch_write_updates_indexes_inline() {
                                     ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
                                     ("gsi_sk".to_string(), AttributeValue::N("1".to_string())),
                                 ]),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
@@ -2224,6 +2311,7 @@ async fn kv_immediate_gsi_consistency_batch_write_updates_indexes_inline() {
                                     ("gsi_pk".to_string(), AttributeValue::S("grp".to_string())),
                                     ("gsi_sk".to_string(), AttributeValue::N("2".to_string())),
                                 ]),
+                                indexers: None,
                                 aux_item_stream_ttl_hours: None,
                             }),
                             delete_request: None,
@@ -2272,6 +2360,7 @@ async fn kv_backfill_concurrent_writes() {
     // Kick off GSI creation
     let req = storage_types::UpdateTableRequest {
         table_name: table.clone(),
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -6408,6 +6497,7 @@ async fn idempotency_token_ttl_support() {
             put: Some(TransactPutRequest {
                 table_name: TableName::new(&table_name),
                 item,
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -6459,6 +6549,54 @@ async fn idempotency_token_ttl_support() {
     // Fixed: TTL is now implemented - tokens are stored with expiration
     // timestamps The TTL is set to 24 hours, so in production this token
     // would expire after that time
+}
+
+#[tokio::test]
+async fn concurrent_idempotent_transactions_commit_one_data_write() {
+    use storage_types::{TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest};
+
+    let provider = create_test_provider();
+    provider.initialize_storage().await.unwrap();
+    let table_name = TableName::new("IdempotencyAtomicTransaction");
+    create_test_table(&provider, &table_name, false).await;
+
+    let request = |sort_key: &str| TransactWriteItemsRequest {
+        transact_items: vec![TransactWriteItem {
+            put: Some(TransactPutRequest {
+                table_name: table_name.clone(),
+                item: HashMap::from([
+                    ("pk".to_string(), AttributeValue::S("item".to_string())),
+                    ("sk".to_string(), AttributeValue::S(sort_key.to_string())),
+                ]),
+                indexers: None,
+                condition_expression: None,
+                expression_attribute_names: None,
+                expression_attribute_values: None,
+                return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
+            }),
+            ..Default::default()
+        }],
+        client_request_token: Some("same-token-concurrently".to_string()),
+        ..Default::default()
+    };
+
+    let (first, second) = tokio::join!(
+        provider.transact_write_items(request("first")),
+        provider.transact_write_items(request("second")),
+    );
+    first.expect("first idempotent transaction");
+    second.expect("second idempotent transaction replays the committed result");
+
+    let (items, _) = provider
+        .scan_table(&create_scan_request(&table_name, None, None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "one idempotency token commits one data write"
+    );
 }
 
 #[tokio::test]
@@ -6638,6 +6776,7 @@ async fn put_item_encode_updates_stream_and_ttl_side_effects() {
             PutItemEncodeRequest {
                 table_name: table.clone(),
                 item: wire_item,
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -6712,11 +6851,11 @@ async fn stream_entries_created_with_gsi_without_stream_spec() {
         .unwrap()
         .unwrap();
     let pointer = stored_pointer
-        .stream_pointer(&table_metadata.identity, page.items[0].id)
+        .into_stored_pointer(&table_metadata.identity)
         .unwrap();
     assert_eq!(
-        pointer.stream_name,
-        StreamName::table_item_stream(&table_name, &item_key).expect("item stream")
+        pointer.stream_name(),
+        &StreamName::table_item_stream(&table_name, &item_key).expect("item stream")
     );
 }
 
@@ -6800,7 +6939,9 @@ async fn apply_replication_mutation_put_preserves_replication_metadata() {
             ])
             .into(),
             new_image: Some(new_image.clone()),
+            new_indexers: Some(Vec::new()),
             old_image: None,
+            old_indexers: None,
             metadata: metadata.clone(),
         })
         .await
@@ -6851,7 +6992,9 @@ async fn apply_replication_mutation_delete_writes_tombstone_for_missing_item() {
             table_name: table_name.clone(),
             key: key.clone().into(),
             new_image: None,
+            new_indexers: None,
             old_image: None,
+            old_indexers: None,
             metadata: metadata.clone(),
         })
         .await
@@ -7007,6 +7150,7 @@ async fn batch_stream_entries_created() {
             WriteRequest {
                 put_request: Some(PutRequest {
                     item: item1,
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -7014,6 +7158,7 @@ async fn batch_stream_entries_created() {
             WriteRequest {
                 put_request: Some(PutRequest {
                     item: item2,
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -7130,7 +7275,7 @@ async fn encoded_batch_write_with_immediate_gsi_preserves_table_stream_entries()
                     table_name.clone(),
                     vec![EncodeWriteRequest {
                         put_request: Some(EncodePutRequest {
-                            item: wire_item,
+                            item: storage_types::WireEntity::unindexed(wire_item),
                             aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
@@ -7169,6 +7314,7 @@ async fn batch_write_item_missing_table_returns_not_found_with_streams() {
             vec![WriteRequest {
                 put_request: Some(PutRequest {
                     item,
+                    indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
@@ -7261,6 +7407,7 @@ fn update_table_duration_request(
 ) -> UpdateTableRequest {
     UpdateTableRequest {
         table_name,
+        max_indexers: None,
         attribute_definitions: None,
         billing_mode: None,
         provisioned_throughput: None,
@@ -9137,6 +9284,7 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
                                 AttributeValue::S("after-put".to_string()),
                             ),
                         ]),
+                        indexers: None,
                         condition_expression: None,
                         expression_attribute_names: None,
                         expression_attribute_values: None,
@@ -9157,6 +9305,7 @@ async fn transact_write_items_emits_billed_item_breakdown_metrics() {
                         ])
                         .into(),
                         update_expression: "SET #data = :data".to_string(),
+                        indexers: None,
                         condition_expression: None,
                         expression_attribute_names: Some(HashMap::from([(
                             "#data".to_string(),

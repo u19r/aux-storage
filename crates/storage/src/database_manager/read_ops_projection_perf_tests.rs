@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -187,6 +188,25 @@ fn measure_single_item_projection_runtime(project: SingleItemProjectionFn) -> Du
 
 #[test]
 fn storage_api_projection_allocation_profile_tests() {
+    const ISOLATED_ENV: &str = "AUX_STORAGE_PROJECTION_BATCH_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe()
+                .expect("projection allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg("database_manager::read_ops_projection_perf_tests::storage_api_projection_allocation_profile_tests")
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated projection allocation test child should start");
+        assert!(
+            status.success(),
+            "isolated projection allocation test failed"
+        );
+        return;
+    }
+
     let baseline = measure_projection_allocations(baseline_storage_api_projection);
     let optimized = measure_projection_allocations(storage_api_projection);
     alloc_counter::emit_report(&baseline);
@@ -197,6 +217,27 @@ fn storage_api_projection_allocation_profile_tests() {
 
 #[test]
 fn storage_api_single_item_projection_allocation_profile_tests() {
+    const ISOLATED_ENV: &str = "AUX_STORAGE_PROJECTION_ALLOCATION_ISOLATED";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let status = Command::new(
+            std::env::current_exe()
+                .expect("projection allocation test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(
+            "database_manager::read_ops_projection_perf_tests::storage_api_single_item_projection_allocation_profile_tests",
+        )
+        .arg("--nocapture")
+        .env(ISOLATED_ENV, "1")
+        .status()
+        .expect("isolated projection allocation test child should start");
+        assert!(
+            status.success(),
+            "isolated projection allocation test failed"
+        );
+        return;
+    }
+
     let baseline = measure_single_item_projection_allocations(baseline_single_item_projection);
     let optimized = measure_single_item_projection_allocations(storage_api_project_item);
     alloc_counter::emit_report(&baseline);

@@ -1,4 +1,10 @@
-use crate::{keyspace::compact::KeyRange, storage_ops::provider_impl::*};
+use storage_types::MaxIndexers;
+
+use crate::{
+    keyspace::compact::KeyRange,
+    sorted_kv_store::ItemValueCodec,
+    storage_ops::{project_gsi_item, provider_impl::*},
+};
 
 pub(super) struct SortedKvReadSequenceReadContext<
     S: crate::partition_family::PartitionFamilyKvStore + 'static,
@@ -11,38 +17,54 @@ pub(super) struct SortedKvReadSequenceReadContext<
 impl<S> StorageProviderReadContext for SortedKvReadSequenceReadContext<S>
 where S: crate::partition_family::PartitionFamilyKvStore + 'static
 {
+    fn take_retryable_read_failure(&self) -> bool {
+        self.read_context.take_retryable_read_failure()
+    }
+
     async fn get_item(
         &self,
         table_name: TableName,
         key: KeyAttributes,
         consistent_read: bool,
     ) -> StorageResult<Option<WireItem>> {
-        self.provider
+        let database_call = metrics_facade::begin_database_call("read_sequence.get_item");
+        let result = self
+            .provider
             .get_item_with_kv_read_context(
                 self.read_context.as_ref(),
                 table_name,
                 key,
                 consistent_read,
             )
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 
     async fn batch_get_item(
         &self,
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse> {
-        self.provider
+        let database_call = metrics_facade::begin_database_call("read_sequence.batch_get_item");
+        let result = self
+            .provider
             .batch_get_item_with_kv_read_context(self.read_context.as_ref(), request)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 
     async fn query_table(
         &self,
         request: &QueryTableRequest,
     ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        self.provider
+        let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
+        let result = self
+            .provider
             .query_table_with_kv_read_context(self.read_context.as_ref(), request)
-            .await
+            .await;
+        drop(database_call);
+        result
     }
 }
 
@@ -143,7 +165,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
             )
             .await?;
         let has_more_items = prefix_result.has_more;
-        let (result_items, bytes_read) = decode_scan_items(prefix_result.values)?;
+        let (mut result_items, bytes_read) = decode_scan_items(
+            prefix_result.values,
+            self.kv_store.item_value_codec(),
+            table_info.max_indexers,
+        )?;
+        project_index_wire_items(&mut result_items, table_info, request.index_name.as_ref())?;
 
         record_read(result_items.len(), bytes_read);
         record_read_cost(
@@ -185,9 +212,91 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         let raw = self.kv_store.get(&item_key, consistent_read).await?;
         let wire_item = raw
             .as_deref()
-            .map(decode_wire_item_from_storage_bytes)
+            .map(|bytes| {
+                decode_wire_item_from_storage_bytes(
+                    self.kv_store.item_value_codec(),
+                    bytes,
+                    table_info.max_indexers,
+                )
+            })
             .transpose()?;
         wire_item.map(WireItem::into_attribute_map).transpose()
+    }
+
+    pub(crate) async fn get_wire_item_with_indexers(
+        &self,
+        table_name: &TableName,
+        key: &KeyAttributes,
+        consistent_read: bool,
+    ) -> StorageResult<Option<(WireItem, Vec<String>)>> {
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let metadata = self
+            .get_table_identity_from_name(table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(table_name))?;
+        let item_key =
+            ItemKey::from_key_schema(table_name.clone(), &metadata.table_info.key_schema, key)?;
+        let item_key = table_keys::item_key(&metadata.identity, &item_key)?;
+        self.kv_store
+            .get(&item_key, consistent_read)
+            .await?
+            .as_deref()
+            .map(|bytes| {
+                decode_wire_item_with_indexers_from_storage_bytes(
+                    self.kv_store.item_value_codec(),
+                    bytes,
+                    metadata.table_info.max_indexers,
+                )
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn scan_base_items_with_indexers(
+        &self,
+        request: &ScanTableRequest,
+    ) -> StorageResult<(Vec<(WireItem, Vec<String>)>, Option<String>)> {
+        if request.index_name.is_some() {
+            return Err(StorageError::validation(
+                "versioned item scans require the base table",
+            ));
+        }
+        let metadata = self
+            .get_table_identity_from_name(&request.table_name)
+            .await?
+            .ok_or_else(|| StorageError::table_not_found(&request.table_name))?;
+        let data_range = scan_data_range(&metadata.identity, request)?;
+        let page_token = scan_page_token(&metadata.identity, &metadata.table_info, request)?;
+        let page = self
+            .kv_store
+            .get_range_values(
+                &data_range.start,
+                &data_range.end,
+                request.limit,
+                page_token,
+                request.consistent_read,
+            )
+            .await?;
+        let mut items = Vec::with_capacity(page.values.len());
+        for value in page.values {
+            items.push(decode_wire_item_with_indexers_from_storage_bytes(
+                self.kv_store.item_value_codec(),
+                &value,
+                metadata.table_info.max_indexers,
+            )?);
+        }
+        let logical = items
+            .iter()
+            .map(|(item, _)| item.clone())
+            .collect::<Vec<_>>();
+        let next = scan_last_evaluated_key(
+            page.has_more,
+            &logical,
+            &metadata.table_info,
+            &request.index_name,
+        )?;
+        Ok((items, next))
     }
 
     async fn batch_get_item_with_kv_read_context(
@@ -227,8 +336,11 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         };
 
         record_read(1, data.len());
-        let json = storage_types::storage_serde::decompress_owned_bytes(data)?;
-        let item = WireItem::dynamo_json(json);
+        let item = decode_wire_item_from_storage_bytes(
+            self.kv_store.item_value_codec(),
+            &data,
+            table_info.max_indexers,
+        )?;
         record_read_cost("get_item", "get", 1, item.payload_len() as u64);
         Ok(Some(item))
     }
@@ -245,7 +357,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 continue;
             }
 
-            let Some(raw_results) = self
+            let Some((raw_results, capacity)) = self
                 .load_batch_get_raw_items(&reader, table_name, keys_and_attributes)
                 .await?
             else {
@@ -253,7 +365,12 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
                 continue;
             };
 
-            result.record_table_items(table_name, raw_results)?;
+            result.record_table_items(
+                table_name,
+                raw_results,
+                self.kv_store.item_value_codec(),
+                capacity,
+            )?;
         }
 
         Ok(result.into_response())
@@ -264,7 +381,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         reader: &KvReadSource<'_, S>,
         table_name: &TableName,
         keys_and_attributes: &KeysAndAttributes,
-    ) -> StorageResult<Option<Vec<Option<Vec<u8>>>>> {
+    ) -> StorageResult<Option<(Vec<Option<Vec<u8>>>, MaxIndexers)>> {
         let table_metadata = self
             .get_table_identity_from_name(table_name)
             .await?
@@ -279,7 +396,7 @@ impl<S: crate::partition_family::PartitionFamilyKvStore + 'static> SortedKvDbSto
         record_provider_stage("batch_get_item", "fdb_wait", fdb_wait_started.elapsed());
 
         match result {
-            Ok(results) => Ok(Some(results)),
+            Ok(results) => Ok(Some((results, table_info.max_indexers))),
             Err(error)
                 if matches!(error.to_enum(), StorageEnum::TableNotFound { .. })
                     || matches!(error.to_enum(), StorageEnum::KeyValidation { .. }) =>
@@ -361,14 +478,15 @@ impl BatchGetAccumulator {
         &mut self,
         table_name: &TableName,
         raw_results: Vec<Option<Vec<u8>>>,
+        codec: ItemValueCodec,
+        capacity: MaxIndexers,
     ) -> StorageResult<()> {
         let decode_started = Instant::now();
         let mut retrieved_items = Vec::with_capacity(raw_results.len());
 
         for raw in raw_results.into_iter().flatten() {
             self.total_bytes_read += raw.len();
-            let json = storage_types::storage_serde::decompress_bytes(&raw)?;
-            let item = WireItem::dynamo_json(json);
+            let item = decode_wire_item_from_storage_bytes(codec, &raw, capacity)?;
             self.billed_bytes_read += item.payload_len();
             retrieved_items.push(item);
         }
@@ -440,7 +558,7 @@ fn scan_data_range(
         });
     }
 
-    Ok(table_keys::primary_item_prefix(table_identity.table_id))
+    Ok(table_keys::primary_item_prefix(table_identity))
 }
 
 fn scan_page_token(
@@ -461,15 +579,43 @@ fn scan_page_token(
         .map(|key| key.map(RawKey))
 }
 
-fn decode_scan_items(values: Vec<Vec<u8>>) -> StorageResult<(Vec<WireItem>, usize)> {
+fn decode_scan_items(
+    values: Vec<Vec<u8>>,
+    codec: ItemValueCodec,
+    capacity: MaxIndexers,
+) -> StorageResult<(Vec<WireItem>, usize)> {
     let mut result_items = Vec::new();
     let mut bytes_read = 0_usize;
     for data in values {
         bytes_read += data.len();
-        let json = storage_types::storage_serde::decompress_bytes(&data)?;
-        result_items.push(WireItem::dynamo_json(json));
+        result_items.push(decode_wire_item_from_storage_bytes(codec, &data, capacity)?);
     }
     Ok((result_items, bytes_read))
+}
+
+fn project_index_wire_items(
+    items: &mut [WireItem],
+    table_info: &StoredTableInfo,
+    index_name: Option<&IndexName>,
+) -> StorageResult<()> {
+    let Some(index_name) = index_name else {
+        return Ok(());
+    };
+    let index = table_info
+        .global_secondary_indexes
+        .as_ref()
+        .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+        .ok_or_else(|| StorageError::internal("validated scan index is missing from metadata"))?;
+    for item in items {
+        let logical = item.to_attribute_map()?;
+        *item = WireItem::from_attribute_map(&project_gsi_item(
+            logical,
+            &index.projection,
+            &table_info.key_schema,
+            &index.key_schema,
+        ))?;
+    }
+    Ok(())
 }
 
 fn scan_last_evaluated_key(

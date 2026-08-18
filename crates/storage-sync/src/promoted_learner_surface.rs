@@ -6,6 +6,7 @@ pub struct SyncPromotedLearnerSurfaceGate {
     pub learner_promoted: bool,
     pub table_metadata_imported: bool,
     pub item_records_imported: bool,
+    pub indexer_metadata_imported: bool,
     pub durable_revisions_imported: bool,
     pub stream_records_imported: bool,
     pub ttl_records_imported: bool,
@@ -34,6 +35,7 @@ pub enum SyncPromotedLearnerSurfaceBlockReason {
     LearnerNotPromoted,
     TableMetadataMissing,
     ItemRecordsMissing,
+    IndexerMetadataMissing,
     DurableRevisionsMissing,
     StreamRecordsMissing,
     TtlRecordsMissing,
@@ -72,6 +74,11 @@ pub const fn plan_promoted_learner_storage_surface(
     if !gate.item_records_imported {
         return SyncPromotedLearnerSurfaceDecision::Block(
             SyncPromotedLearnerSurfaceBlockReason::ItemRecordsMissing,
+        );
+    }
+    if !gate.indexer_metadata_imported {
+        return SyncPromotedLearnerSurfaceDecision::Block(
+            SyncPromotedLearnerSurfaceBlockReason::IndexerMetadataMissing,
         );
     }
     if !gate.durable_revisions_imported {

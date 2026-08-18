@@ -92,6 +92,8 @@ pub struct StreamPointer {
     pub table_name: TableName,
     pub item_stream_version: ItemStreamVersion,
     pub stream_item_id: StreamItemId,
+    pub indexers: Vec<String>,
+    pub old_indexers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +109,8 @@ pub enum StoredStreamPointer {
         stream_name: StreamName,
         table_name: TableName,
         item_stream_version: ItemStreamVersion,
+        indexers: Vec<String>,
+        old_indexers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replication: Option<ReplicationEventMetadata>,
     },
@@ -115,6 +119,8 @@ pub enum StoredStreamPointer {
         table_name: TableName,
         item_stream_version: ItemStreamVersion,
         items: Vec<EmbeddedStreamItem>,
+        indexers: Vec<String>,
+        old_indexers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replication: Option<ReplicationEventMetadata>,
     },
@@ -131,6 +137,8 @@ impl StoredStreamPointer {
             stream_name,
             table_name,
             item_stream_version,
+            indexers: Vec::new(),
+            old_indexers: None,
             replication: None,
         }
     }
@@ -147,6 +155,8 @@ impl StoredStreamPointer {
             table_name,
             item_stream_version,
             items,
+            indexers: Vec::new(),
+            old_indexers: None,
             replication: None,
         }
     }
@@ -169,6 +179,34 @@ impl StoredStreamPointer {
     }
 
     #[must_use]
+    pub fn with_indexers(mut self, indexers: Vec<String>) -> Self {
+        match &mut self {
+            Self::Pointer {
+                indexers: stored, ..
+            }
+            | Self::Embedded {
+                indexers: stored, ..
+            } => *stored = indexers,
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_old_indexers(mut self, old_indexers: Option<Vec<String>>) -> Self {
+        match &mut self {
+            Self::Pointer {
+                old_indexers: stored,
+                ..
+            }
+            | Self::Embedded {
+                old_indexers: stored,
+                ..
+            } => *stored = old_indexers,
+        }
+        self
+    }
+
+    #[must_use]
     pub fn stream_name(&self) -> &StreamName {
         match self {
             StoredStreamPointer::Pointer { stream_name, .. } => stream_name,
@@ -181,6 +219,22 @@ impl StoredStreamPointer {
         match self {
             StoredStreamPointer::Pointer { table_name, .. } => table_name,
             StoredStreamPointer::Embedded { table_name, .. } => table_name,
+        }
+    }
+
+    #[must_use]
+    pub fn indexers(&self) -> &[String] {
+        match self {
+            Self::Pointer { indexers, .. } | Self::Embedded { indexers, .. } => indexers,
+        }
+    }
+
+    #[must_use]
+    pub fn old_indexers(&self) -> Option<&[String]> {
+        match self {
+            Self::Pointer { old_indexers, .. } | Self::Embedded { old_indexers, .. } => {
+                old_indexers.as_deref()
+            }
         }
     }
 
@@ -208,25 +262,43 @@ impl StoredStreamPointer {
 
     #[must_use]
     pub fn into_stream_pointer(self, pointer_stream_item_id: StreamItemId) -> StreamPointer {
-        let (stream_name, table_name, item_stream_version) = match self {
+        let (stream_name, table_name, item_stream_version, indexers, old_indexers) = match self {
             StoredStreamPointer::Pointer {
                 stream_name,
                 table_name,
                 item_stream_version,
+                indexers,
+                old_indexers,
                 ..
-            } => (stream_name, table_name, item_stream_version),
+            } => (
+                stream_name,
+                table_name,
+                item_stream_version,
+                indexers,
+                old_indexers,
+            ),
             StoredStreamPointer::Embedded {
                 stream_name,
                 table_name,
                 item_stream_version,
+                indexers,
+                old_indexers,
                 ..
-            } => (stream_name, table_name, item_stream_version),
+            } => (
+                stream_name,
+                table_name,
+                item_stream_version,
+                indexers,
+                old_indexers,
+            ),
         };
         StreamPointer {
             stream_name,
             table_name,
             item_stream_version,
             stream_item_id: pointer_stream_item_id,
+            indexers,
+            old_indexers,
         }
     }
 

@@ -191,6 +191,7 @@ async fn create_table_issues_remote_call() {
         .mock_async(|when, then| {
             when.method(POST)
                 .header("x-amz-target", "DynamoDB_20120810.CreateTable")
+                .body_excludes("MaxIndexers")
                 .path("/");
             then.status(200).json_body(serde_json::json!({
                 "TableDescription": {

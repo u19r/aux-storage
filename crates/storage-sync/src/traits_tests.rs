@@ -14,7 +14,9 @@ async fn sync_apply_adapter_is_typed_only_for_resolved_mutations() {
         table_name: TableName::new("orders"),
         key_json: r#"{"pk":{"S":"order#1"}}"#.to_string(),
         item_json: r#"{"pk":{"S":"order#1"},"status":{"S":"open"}}"#.to_string(),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(1),
         response: SyncMutationResponse::default(),
     });

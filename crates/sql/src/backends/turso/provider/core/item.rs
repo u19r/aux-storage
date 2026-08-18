@@ -107,29 +107,71 @@ impl TursoStorageProvider {
             .transpose()
     }
 
+    pub(crate) async fn get_item_map_with_indexers_by_key<C>(
+        &self,
+        conn: &C,
+        table_info: &StoredTableInfo,
+        key: &KeyAttributes,
+    ) -> StorageResult<Option<(HashMap<String, AttributeValue>, Vec<String>)>>
+    where
+        C: TursoSqlConnection + ?Sized,
+    {
+        if key.is_empty() {
+            return Ok(None);
+        }
+
+        let table_name_safe = table_info.table_name.sanitized_name();
+        let (where_clause, params) = build_key_where_clause(key, &table_info.key_schema)?;
+        let sql = sql_statements::select_main_row(&table_name_safe, &where_clause);
+        let rows = self.query_rows(conn, &sql, params).await?;
+
+        rows.into_iter()
+            .next()
+            .map(|row| {
+                let decoded = row_to_decoded_item_main(&row, table_info)?;
+                decoded
+                    .item
+                    .into_attribute_map()
+                    .map(|item| (item, decoded.indexers))
+            })
+            .transpose()
+    }
+
     pub(crate) async fn put_item_txn<C>(
         &self,
         conn: &C,
         table_info: &StoredTableInfo,
-        item: &HashMap<String, AttributeValue>,
-        condition: Option<&Condition>,
-        return_old_on_condition_failure: bool,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: TursoPutItemTxnInput<'_>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>
     where
         C: TursoSqlConnection + ?Sized,
     {
+        let TursoPutItemTxnInput {
+            item,
+            indexers,
+            condition,
+            return_old_on_condition_failure,
+            item_stream_ttl_hours: aux_item_stream_ttl_hours,
+        } = input;
         let mut item = item.clone();
         normalize_attribute_map_numbers_for_write(&mut item);
         let SplitDynamoItem {
             key_attributes,
+            non_key_attributes,
             all_attributes,
-            ..
         } = split_item_into_key_and_attributes_sync(item, table_info)?;
+        let payload = crate::utils::main_table_payload(&key_attributes, &non_key_attributes);
 
         if is_key_absence_condition(condition, table_info) && !return_old_on_condition_failure {
-            self.insert_main_row(conn, table_info, &key_attributes, &all_attributes)
-                .await?;
+            self.insert_main_row(
+                conn,
+                table_info,
+                &key_attributes,
+                &all_attributes,
+                payload.as_ref(),
+                indexers,
+            )
+            .await?;
             let item_stream_version = storage_types::ItemStreamVersion::try_from(
                 self.bump_item_revision(conn, &table_info.table_name, &key_attributes)
                     .await?,
@@ -140,6 +182,8 @@ impl TursoStorageProvider {
                 &all_attributes,
                 TursoWriteStreamEntriesInput {
                     old_item: None,
+                    indexers: indexers.unwrap_or_default(),
+                    old_indexers: None,
                     is_deleted: false,
                     item_stream_version,
                     replication: None,
@@ -154,15 +198,25 @@ impl TursoStorageProvider {
             )
             .await?;
             if self.immediate_gsi_consistency {
-                self.apply_gsi_rows_for_item_change(conn, table_info, None, Some(&all_attributes))
-                    .await?;
+                self.apply_gsi_rows_for_item_change(
+                    conn,
+                    table_info,
+                    None,
+                    Some(&all_attributes),
+                    indexers.unwrap_or_default(),
+                )
+                .await?;
             }
             return Ok(None);
         }
 
-        let old_item = self
-            .get_item_map_by_key(conn, table_info, &key_attributes)
-            .await?;
+        let (old_item, old_indexers) = self
+            .get_item_map_with_indexers_by_key(conn, table_info, &key_attributes)
+            .await?
+            .map_or_else(
+                || (None, Vec::new()),
+                |(item, indexers)| (Some(item), indexers),
+            );
 
         if let Some(condition) = condition
             && !evaluate_condition(condition_item_ref(old_item.as_ref()), condition)
@@ -173,8 +227,15 @@ impl TursoStorageProvider {
             ));
         }
 
-        self.upsert_main_row(conn, table_info, &key_attributes, &all_attributes)
-            .await?;
+        self.upsert_main_row(
+            conn,
+            table_info,
+            &key_attributes,
+            &all_attributes,
+            payload.as_ref(),
+            indexers,
+        )
+        .await?;
         let item_stream_version = storage_types::ItemStreamVersion::try_from(
             self.bump_item_revision(conn, &table_info.table_name, &key_attributes)
                 .await?,
@@ -185,6 +246,8 @@ impl TursoStorageProvider {
             &all_attributes,
             TursoWriteStreamEntriesInput {
                 old_item: old_item.as_ref(),
+                indexers: indexers.unwrap_or_default(),
+                old_indexers: old_item.as_ref().map(|_| old_indexers.as_slice()),
                 is_deleted: false,
                 item_stream_version,
                 replication: None,
@@ -204,6 +267,7 @@ impl TursoStorageProvider {
                 table_info,
                 old_item.as_ref(),
                 Some(&all_attributes),
+                indexers.unwrap_or_default(),
             )
             .await?;
         }
@@ -215,46 +279,37 @@ impl TursoStorageProvider {
         &self,
         conn: &C,
         table_info: &StoredTableInfo,
-        item: &HashMap<String, AttributeValue>,
-        old_item: Option<&HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+        input: TursoOverwriteItemInput<'_>,
     ) -> StorageResult<()>
     where
         C: TursoSqlConnection + ?Sized,
     {
-        self.overwrite_item_txn_with_replication(
-            conn,
-            table_info,
+        let TursoOverwriteItemInput {
             item,
             old_item,
-            None,
-            aux_item_stream_ttl_hours,
-        )
-        .await
-    }
-
-    pub(crate) async fn overwrite_item_txn_with_replication<C>(
-        &self,
-        conn: &C,
-        table_info: &StoredTableInfo,
-        item: &HashMap<String, AttributeValue>,
-        old_item: Option<&HashMap<String, AttributeValue>>,
-        replication: Option<&ReplicationEventMetadata>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<()>
-    where
-        C: TursoSqlConnection + ?Sized,
-    {
+            indexers,
+            old_indexers,
+            replication,
+            item_stream_ttl_hours,
+        } = input;
         let mut item = item.clone();
         normalize_attribute_map_numbers_for_write(&mut item);
         let SplitDynamoItem {
             key_attributes,
+            non_key_attributes,
             all_attributes,
-            ..
         } = split_item_into_key_and_attributes_sync(item, table_info)?;
+        let payload = crate::utils::main_table_payload(&key_attributes, &non_key_attributes);
 
-        self.upsert_main_row(conn, table_info, &key_attributes, &all_attributes)
-            .await?;
+        self.upsert_main_row(
+            conn,
+            table_info,
+            &key_attributes,
+            &all_attributes,
+            payload.as_ref(),
+            Some(indexers),
+        )
+        .await?;
         let item_stream_version = storage_types::ItemStreamVersion::try_from(
             self.bump_item_revision(conn, &table_info.table_name, &key_attributes)
                 .await?,
@@ -265,22 +320,25 @@ impl TursoStorageProvider {
             &all_attributes,
             TursoWriteStreamEntriesInput {
                 old_item,
+                indexers,
+                old_indexers,
                 is_deleted: false,
                 item_stream_version,
                 replication,
             },
         )
         .await?;
-        self.apply_item_stream_duration(
-            conn,
-            table_info,
-            &key_attributes,
-            aux_item_stream_ttl_hours,
-        )
-        .await?;
+        self.apply_item_stream_duration(conn, table_info, &key_attributes, item_stream_ttl_hours)
+            .await?;
         if self.immediate_gsi_consistency {
-            self.apply_gsi_rows_for_item_change(conn, table_info, old_item, Some(&all_attributes))
-                .await?;
+            self.apply_gsi_rows_for_item_change(
+                conn,
+                table_info,
+                old_item,
+                Some(&all_attributes),
+                indexers,
+            )
+            .await?;
         }
 
         Ok(())
@@ -300,9 +358,16 @@ impl TursoStorageProvider {
             condition,
             return_old_on_condition_failure,
             replication,
+            old_indexers: declared_old_indexers,
             item_stream_ttl_hours,
         } = input;
-        let old_item = self.get_item_map_by_key(conn, table_info, key).await?;
+        let (old_item, old_indexers) = self
+            .get_item_map_with_indexers_by_key(conn, table_info, key)
+            .await?
+            .map_or_else(
+                || (None, Vec::new()),
+                |(item, indexers)| (Some(item), indexers),
+            );
         if old_item.is_none() {
             return Ok(None);
         }
@@ -330,6 +395,8 @@ impl TursoStorageProvider {
             &key.to_attribute_map(),
             TursoWriteStreamEntriesInput {
                 old_item: old_item.as_ref(),
+                indexers: &[],
+                old_indexers: declared_old_indexers.or(Some(&old_indexers)),
                 is_deleted: true,
                 item_stream_version,
                 replication,
@@ -340,7 +407,7 @@ impl TursoStorageProvider {
             .await?;
 
         if self.immediate_gsi_consistency {
-            self.apply_gsi_rows_for_item_change(conn, table_info, old_item.as_ref(), None)
+            self.apply_gsi_rows_for_item_change(conn, table_info, old_item.as_ref(), None, &[])
                 .await?;
         }
 
@@ -359,6 +426,8 @@ impl TursoStorageProvider {
     {
         let TursoWriteStreamEntriesInput {
             old_item,
+            indexers,
+            old_indexers,
             is_deleted,
             item_stream_version,
             replication,
@@ -440,6 +509,9 @@ impl TursoStorageProvider {
                 item_stream_version,
             )
         };
+        let stored_pointer = stored_pointer
+            .with_indexers(indexers.to_vec())
+            .with_old_indexers(old_indexers.map(<[_]>::to_vec));
         let stored_pointer = if let Some(replication) = replication.cloned() {
             stored_pointer.with_replication_metadata(replication)
         } else {

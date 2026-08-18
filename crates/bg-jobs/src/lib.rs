@@ -46,6 +46,8 @@ pub mod startup;
 mod worker;
 
 #[cfg(test)]
+mod job_lock_tests;
+#[cfg(test)]
 mod job_manager_lock_tests;
 #[cfg(test)]
 mod job_manager_tests;
@@ -62,7 +64,7 @@ pub use immediate::{
     ImmediateJobProcessResult, ImmediateJobQueueError,
 };
 pub use jitter::jittered;
-pub use job_lock::{JobLockAttempt, JobLockResult, JobLockStore};
+pub use job_lock::{GatedJobLockStore, JobLockAttempt, JobLockResult, JobLockStore, JobStartGate};
 pub use job_manager::{BackgroundJob, JobConfig, JobHandle, JobManager};
 pub use job_name::{
     BackgroundJobGroup, BackgroundJobName, BackgroundJobNameParseError, DatabaseJobKind,

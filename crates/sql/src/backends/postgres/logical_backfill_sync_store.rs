@@ -129,58 +129,28 @@ pub(super) async fn upsert_main_row<C>(
     table_info: &storage_types::StoredTableInfo,
     key_attributes: &KeyAttributes,
     full_item: &HashMap<String, AttributeValue>,
+    payload_item: &HashMap<String, AttributeValue>,
+    indexers: &[String],
 ) -> StorageResult<()>
 where
     C: deadpool_postgres::GenericClient + Sync,
 {
-    let key_bindings = PostgresStorageProvider::key_column_bindings_for_schema(
+    let prepared = PostgresStorageProvider::prepare_main_row_write(
         table_info,
-        &table_info.key_schema,
         key_attributes,
-        None,
+        full_item,
+        payload_item,
+        Some(indexers),
     )?;
-    let attributes_blob = serde_json::to_string(full_item)
-        .map_err(|err| PostgresStorageProvider::map_postgres_error("serialize sync item", err))?;
-    let key_columns = key_bindings
-        .iter()
-        .map(|binding| binding.column.clone())
-        .collect::<Vec<_>>();
-    let columns_sql = key_columns
-        .iter()
-        .cloned()
-        .chain(std::iter::once("attributes_blob".to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut value_placeholders = key_bindings
-        .iter()
-        .enumerate()
-        .map(|(idx, binding)| {
-            PostgresStorageProvider::postgres_placeholder_for_type(idx + 1, &binding.attribute_type)
-        })
-        .collect::<Vec<_>>();
-    value_placeholders.push(format!("${}", key_bindings.len() + 1));
-    let values_placeholders = value_placeholders.join(", ");
-    let conflict_target = key_columns.join(", ");
-    let assignments = key_columns
-        .iter()
-        .cloned()
-        .chain(std::iter::once("attributes_blob".to_string()))
-        .map(|column| format!("{column} = EXCLUDED.{column}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let sql = sql_statements::upsert_main_row(
         &physical_names::physical_table_name(&table_info.table_name),
-        &columns_sql,
-        &values_placeholders,
-        &conflict_target,
-        &assignments,
+        &prepared.columns_sql,
+        &prepared.values_sql,
+        &prepared.conflict_target,
+        &prepared.assignments,
     );
-    let mut bind_values = key_bindings
-        .iter()
-        .map(|binding| binding.value.clone())
-        .collect::<Vec<_>>();
-    bind_values.push(attributes_blob);
-    let params = bind_values
+    let params = prepared
+        .bind_values
         .iter()
         .map(|value| value as &(dyn ToSql + Sync))
         .collect::<Vec<_>>();

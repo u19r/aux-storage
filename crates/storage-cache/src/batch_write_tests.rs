@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use storage_types::{
     AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest, DeleteRequest,
-    EncodePutRequest, EncodeWriteRequest, PutRequest, TableName, WireItem, WriteRequest,
+    EncodePutRequest, EncodeWriteRequest, PutRequest, TableName, WireEntity, WireItem,
+    WriteRequest,
 };
 
 use crate::batch_write::{
@@ -33,6 +34,7 @@ fn routed_batch_write_request_builder_tracks_physical_to_logical_tables() {
         vec![WriteRequest {
             put_request: Some(PutRequest {
                 item: item("1"),
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -67,7 +69,9 @@ fn routed_batch_write_encode_request_builder_tracks_physical_to_logical_tables()
         "conn-a".to_string(),
         vec![EncodeWriteRequest {
             put_request: Some(EncodePutRequest {
-                item: WireItem::from_attribute_map(&item("1")).expect("wire item"),
+                item: WireEntity::unindexed(
+                    WireItem::from_attribute_map(&item("1")).expect("wire item"),
+                ),
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -181,6 +185,7 @@ fn routed_batch_write_request_builder_keeps_primary_and_migration_dispatch_separ
         vec![WriteRequest {
             put_request: Some(PutRequest {
                 item: item("1"),
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
@@ -196,6 +201,7 @@ fn routed_batch_write_request_builder_keeps_primary_and_migration_dispatch_separ
         vec![WriteRequest {
             put_request: Some(PutRequest {
                 item: item("2"),
+                indexers: None,
                 aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,

@@ -17,6 +17,7 @@ fn sample_table_info() -> StoredTableInfo {
         table_name: TableName::new("jobs"),
         table_status: TableStatus::Active,
         created_at: TimestampMillis::from_timestamp(0),
+        max_indexers: crate::MaxIndexers::ZERO,
         attribute_definitions: vec![
             AttributeDefinition {
                 attribute_name: "pk".to_string(),
@@ -227,6 +228,48 @@ fn last_evaluated_key_projection_uses_local_split_keys_tests() {
     assert_eq!(
         decoded_key.hash_key(),
         &AttributeValue::S("STATE#ready".to_string())
+    );
+}
+
+#[test]
+fn last_evaluated_key_supports_gsi_and_table_reusing_range_attribute_tests() {
+    let mut table_info = sample_table_info();
+    table_info
+        .global_secondary_indexes
+        .as_mut()
+        .expect("sample GSI")
+        .first_mut()
+        .expect("sample GSI")
+        .key_schema[1]
+        .attribute_name = "sk".to_string();
+    let wire_item = WireItem::from_attribute_map(&HashMap::from([
+        (
+            "gsi_pk".to_string(),
+            AttributeValue::S("STATE#ready".to_string()),
+        ),
+        ("pk".to_string(), AttributeValue::S("JOB#1".to_string())),
+        ("sk".to_string(), AttributeValue::S("LOCK".to_string())),
+    ]))
+    .expect("wire item");
+
+    let token = wire_item
+        .last_evaluated_key(&table_info, &Some(IndexName::new("gsi1")))
+        .expect("create GSI last evaluated key")
+        .expect("GSI last evaluated key should include all key parts");
+    let decoded = crate::ItemKey::item_key_from_next_page_token(
+        &token,
+        &table_info,
+        &Some(IndexName::new("gsi1")),
+    )
+    .expect("decode GSI token")
+    .expect("decoded GSI key");
+    assert_eq!(
+        decoded.hash_key(),
+        &AttributeValue::S("STATE#ready".to_string())
+    );
+    assert_eq!(
+        decoded.range_key(),
+        Some(&AttributeValue::S("LOCK".to_string()))
     );
 }
 

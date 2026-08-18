@@ -6,7 +6,9 @@ mod protocol;
 static OPT_LOOP_ALLOCATOR: opt_loop_probe::ProbeAllocator = opt_loop_probe::ProbeAllocator::new();
 
 #[cfg(test)]
-pub(crate) use app::{Args, QueueStorageArg, queue_config_from_args, queue_url};
+pub(crate) use app::{
+    Args, QueueStorageArg, queue_config_from_args, queue_config_overrides, queue_url,
+};
 #[cfg(test)]
 pub(crate) use protocol::add_common_headers;
 

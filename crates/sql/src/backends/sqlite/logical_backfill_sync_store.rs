@@ -2,7 +2,7 @@ use storage_types::{AttributeValue, StorageError, StorageResult};
 
 use super::{
     SQLiteStorageProvider,
-    logical_backfill_import::{OldItemSource, SyncImportContext},
+    logical_backfill_import::{ImportPresentItemInput, OldItemSource, SyncImportContext},
 };
 use crate::{
     error_handler::map_sqlite_error,
@@ -35,10 +35,16 @@ pub(crate) async fn apply_resolved_sync_mutations(
                     >(&mutation.item_json)?;
                     SQLiteStorageProvider::import_present_item_with_context(
                         &mutation.table_name,
-                        item,
-                        OldItemSource::Resolved(mutation.old_item_json.as_deref()),
-                        mutation.target_item_stream_version,
-                        immediate_gsi_consistency,
+                        ImportPresentItemInput {
+                            item,
+                            indexers: &mutation.indexers,
+                            old_item_source: OldItemSource::Resolved {
+                                item_json: mutation.old_item_json.as_deref(),
+                                indexers: mutation.old_indexers.as_deref(),
+                            },
+                            item_stream_version: mutation.target_item_stream_version,
+                            immediate_gsi_consistency,
+                        },
                         &mut context,
                         sqlite,
                     )?;
@@ -57,7 +63,10 @@ pub(crate) async fn apply_resolved_sync_mutations(
                             key_json: mutation.key_json,
                             item_stream_version: mutation.target_item_stream_version,
                         },
-                        OldItemSource::Resolved(mutation.old_item_json.as_deref()),
+                        OldItemSource::Resolved {
+                            item_json: mutation.old_item_json.as_deref(),
+                            indexers: mutation.old_indexers.as_deref(),
+                        },
                         immediate_gsi_consistency,
                         &mut context,
                         sqlite,

@@ -87,12 +87,22 @@ impl QueueVisibilityWorkload {
         "FdbChaosQueueVisibility".to_string()
     }
 
-    fn queue_url(&self) -> String {
-        self.queue_name()
+    async fn queue_url(&self, manager: &QueueManager) -> Result<String, String> {
+        manager
+            .get_queue_url(GetQueueUrlRequest {
+                queue_name: self.queue_name(),
+            })
+            .await
+            .map(|response| response.queue_url)
+            .map_err(|err| err.to_string())
     }
 
     fn message_body(&self, sequence: u64) -> String {
         format!("queue-visibility-message-{sequence}")
+    }
+
+    fn messages_per_round(&self) -> u64 {
+        4
     }
 
     fn is_active_client(&self) -> bool {
@@ -187,27 +197,40 @@ impl RustWorkload for QueueVisibilityWorkload {
                 return;
             }
         };
-        for sequence in 0..self.operation_count {
-            self.trace_operation("start", "send_message");
-            if let Err(err) = manager
-                .send_message(SendMessageRequest {
-                    queue_url: self.queue_url(),
-                    message_body: self.message_body(sequence),
-                    delay_seconds: Some(0),
-                    message_attributes: None,
-                })
-                .await
-            {
-                self.trace_error("send_message", err.to_string());
+        let queue_url = match self.queue_url(&manager).await {
+            Ok(queue_url) => queue_url,
+            Err(err) => {
+                self.trace_error("resolve_queue_url", err);
                 return;
             }
-            self.send_count += 1;
+        };
+        for sequence in 0..self.operation_count {
+            for offset in 0..self.messages_per_round() {
+                self.trace_operation("start", "send_message");
+                if let Err(err) = manager
+                    .send_message(SendMessageRequest {
+                        queue_url: queue_url.clone(),
+                        message_body: self.message_body(
+                            sequence
+                                .saturating_mul(self.messages_per_round())
+                                .saturating_add(offset),
+                        ),
+                        delay_seconds: Some(0),
+                        message_attributes: None,
+                    })
+                    .await
+                {
+                    self.trace_error("send_message", err.to_string());
+                    return;
+                }
+                self.send_count += 1;
+            }
 
             self.trace_operation("start", "receive_message");
-            let first = match manager
+            let mut received = match manager
                 .receive_message(ReceiveMessageRequest {
-                    queue_url: self.queue_url(),
-                    max_number_of_messages: Some(1),
+                    queue_url: queue_url.clone(),
+                    max_number_of_messages: Some(self.messages_per_round() as u32),
                     visibility_timeout: Some(30),
                     wait_time_seconds: Some(0),
                     attribute_names: None,
@@ -221,19 +244,36 @@ impl RustWorkload for QueueVisibilityWorkload {
                     return;
                 }
             };
-            let Some(first) = first.into_iter().next() else {
+            if received.len() < 2 {
                 self.trace_error(
                     "receive_message",
-                    "expected one seeded queue message, got none".to_string(),
+                    format!(
+                        "expected multiple seeded queue messages, got {}",
+                        received.len()
+                    ),
                 );
                 return;
-            };
+            }
+            let first = received.remove(0);
             self.receive_count += 1;
+            for extra in received {
+                if let Err(err) = manager
+                    .delete_message(DeleteMessageRequest {
+                        queue_url: queue_url.clone(),
+                        receipt_handle: ReceiptHandle::from(extra.receipt_handle.as_str()),
+                    })
+                    .await
+                {
+                    self.trace_error("delete_extra_receipt", err.to_string());
+                    return;
+                }
+                self.delete_count += 1;
+            }
 
             self.trace_operation("start", "change_message_visibility_zero");
             if let Err(err) = manager
                 .change_message_visibility(ChangeMessageVisibilityRequest {
-                    queue_url: self.queue_url(),
+                    queue_url: queue_url.clone(),
                     receipt_handle: ReceiptHandle::from(first.receipt_handle.as_str()),
                     visibility_timeout: 0,
                 })
@@ -246,7 +286,7 @@ impl RustWorkload for QueueVisibilityWorkload {
             self.trace_operation("start", "receive_redelivery");
             let redelivery = match manager
                 .receive_message(ReceiveMessageRequest {
-                    queue_url: self.queue_url(),
+                    queue_url: queue_url.clone(),
                     max_number_of_messages: Some(1),
                     visibility_timeout: Some(30),
                     wait_time_seconds: Some(QUEUE_REDELIVERY_WAIT_SECONDS),
@@ -288,7 +328,7 @@ impl RustWorkload for QueueVisibilityWorkload {
             self.trace_operation("start", "delete_stale_receipt");
             match manager
                 .delete_message(DeleteMessageRequest {
-                    queue_url: self.queue_url(),
+                    queue_url: queue_url.clone(),
                     receipt_handle: ReceiptHandle::from(first.receipt_handle.as_str()),
                 })
                 .await
@@ -308,7 +348,7 @@ impl RustWorkload for QueueVisibilityWorkload {
             self.trace_operation("start", "delete_current_receipt");
             if let Err(err) = manager
                 .delete_message(DeleteMessageRequest {
-                    queue_url: self.queue_url(),
+                    queue_url: queue_url.clone(),
                     receipt_handle: ReceiptHandle::from(redelivery.receipt_handle.as_str()),
                 })
                 .await
@@ -333,10 +373,17 @@ impl RustWorkload for QueueVisibilityWorkload {
                 return;
             }
         };
+        let queue_url = match self.queue_url(&manager).await {
+            Ok(queue_url) => queue_url,
+            Err(err) => {
+                self.trace_error("resolve_queue_url", err);
+                return;
+            }
+        };
         self.trace_operation("check", "receive_empty_check");
         match manager
             .receive_message(ReceiveMessageRequest {
-                queue_url: self.queue_url(),
+                queue_url,
                 max_number_of_messages: Some(10),
                 visibility_timeout: Some(0),
                 wait_time_seconds: Some(0),

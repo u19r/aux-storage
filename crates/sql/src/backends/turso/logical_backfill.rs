@@ -123,6 +123,7 @@ async fn export_item_records(
                 StorageError::validation(format!("logical export key encoding failed: {error}"))
             })?,
             item_json: serde_json::to_string(&item)?,
+            indexers: versioned.indexers,
             item_stream_version: versioned.item_stream_version,
         });
     }
@@ -189,14 +190,16 @@ async fn import_logical_records(
                     LogicalBackfillRecord::PresentItem {
                         table_name,
                         item_json,
+                        indexers,
                         item_stream_version,
-                        ..
+                        key_json: _,
                     } => {
                         import_present_item(
                             &this,
                             conn,
                             &table_name,
                             &item_json,
+                            &indexers,
                             item_stream_version,
                         )
                         .await?;
@@ -252,6 +255,7 @@ async fn import_present_item<C>(
     conn: &C,
     table_name: &str,
     item_json: &str,
+    indexers: &[String],
     item_stream_version: ItemStreamVersion,
 ) -> StorageResult<()>
 where
@@ -261,9 +265,13 @@ where
     let table_info = provider.load_table_info_cached(&table_name).await?;
     let item = serde_json::from_str::<HashMap<String, AttributeValue>>(item_json)?;
     let split = split_item_into_key_and_attributes_sync(item, &table_info)?;
-    let old_item = provider
-        .get_item_map_by_key(conn, &table_info, &split.key_attributes)
-        .await?;
+    let (old_item, old_indexers) = provider
+        .get_item_map_with_indexers_by_key(conn, &table_info, &split.key_attributes)
+        .await?
+        .map_or_else(
+            || (None, Vec::new()),
+            |(item, indexers)| (Some(item), indexers),
+        );
     let current_version =
         current_item_stream_version(provider, conn, &table_name, &split.key_attributes).await?;
     let decision = plan_logical_import_apply(LogicalImportApplyCase::new(
@@ -281,6 +289,8 @@ where
             &table_info,
             &split.key_attributes,
             &split.all_attributes,
+            &split.non_key_attributes,
+            Some(indexers),
         )
         .await?;
     set_item_revision(
@@ -298,6 +308,8 @@ where
             &split.all_attributes,
             TursoWriteStreamEntriesInput {
                 old_item: old_item.as_ref(),
+                indexers,
+                old_indexers: old_item.as_ref().map(|_| old_indexers.as_slice()),
                 is_deleted: false,
                 item_stream_version,
                 replication: None,
@@ -311,6 +323,7 @@ where
                 &table_info,
                 old_item.as_ref(),
                 Some(&split.all_attributes),
+                indexers,
             )
             .await?;
     }
@@ -328,9 +341,13 @@ where
     let table_name = TableName::new(&tombstone.table_name);
     let table_info = provider.load_table_info_cached(&table_name).await?;
     let key = serde_json::from_str::<KeyAttributes>(&tombstone.key_json)?;
-    let old_item = provider
-        .get_item_map_by_key(conn, &table_info, &key)
-        .await?;
+    let (old_item, old_indexers) = provider
+        .get_item_map_with_indexers_by_key(conn, &table_info, &key)
+        .await?
+        .map_or_else(
+            || (None, Vec::new()),
+            |(item, indexers)| (Some(item), indexers),
+        );
     let current_version = current_item_stream_version(provider, conn, &table_name, &key).await?;
     let decision = plan_logical_import_apply(LogicalImportApplyCase::new(
         current_version,
@@ -357,6 +374,8 @@ where
             &key.to_attribute_map(),
             TursoWriteStreamEntriesInput {
                 old_item: old_item.as_ref(),
+                indexers: &[],
+                old_indexers: old_item.as_ref().map(|_| old_indexers.as_slice()),
                 is_deleted: true,
                 item_stream_version: tombstone.item_stream_version,
                 replication: None,
@@ -365,7 +384,7 @@ where
         .await?;
     if provider.immediate_gsi_consistency {
         provider
-            .apply_gsi_rows_for_item_change(conn, &table_info, old_item.as_ref(), None)
+            .apply_gsi_rows_for_item_change(conn, &table_info, old_item.as_ref(), None, &[])
             .await?;
     }
     Ok(())

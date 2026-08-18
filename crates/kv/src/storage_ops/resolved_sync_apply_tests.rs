@@ -80,7 +80,9 @@ async fn rocksdb_resolved_sync_apply_is_crash_idempotent_and_preserves_side_effe
         table_name: table.clone(),
         key_json: serde_json::to_string(&key("user#1", "order#1")).expect("key json"),
         item_json: serde_json::to_string(&item).expect("item json"),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(42),
         response: SyncMutationResponse {
             response_json: Some("{\"ok\":true}".to_string()),
@@ -232,7 +234,9 @@ async fn shared_kv_resolved_sync_apply_preserves_side_effects() {
             table_name: table.clone(),
             key_json: serde_json::to_string(&key("user#1", "order#1")).expect("key json"),
             item_json: serde_json::to_string(&put_item).expect("item json"),
+            indexers: Vec::new(),
             old_item_json: None,
+            old_indexers: None,
             target_item_stream_version: ItemStreamVersion::new(43),
             response: SyncMutationResponse {
                 response_json: Some("{\"ok\":true}".to_string()),
@@ -243,6 +247,7 @@ async fn shared_kv_resolved_sync_apply_preserves_side_effects() {
             table_name: table.clone(),
             key_json: serde_json::to_string(&key("user#2", "order#2")).expect("key json"),
             old_item_json: Some(serde_json::to_string(&deleted_item).expect("old item json")),
+            old_indexers: None,
             target_item_stream_version: ItemStreamVersion::new(44),
             response: SyncMutationResponse {
                 response_json: Some("{\"deleted\":true}".to_string()),
@@ -554,7 +559,9 @@ fn sync_apply_allocation_batches(table_name: &TableName) -> Vec<ResolvedSyncMuta
                         table_name: table_name.clone(),
                         key_json: serde_json::to_string(&key(&pk, &sk)).expect("key json"),
                         item_json: serde_json::to_string(&item).expect("item json"),
+                        indexers: Vec::new(),
                         old_item_json: None,
+                        old_indexers: None,
                         target_item_stream_version: ItemStreamVersion::new(
                             absolute_index as u64 + 1,
                         ),

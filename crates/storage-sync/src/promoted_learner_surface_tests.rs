@@ -29,6 +29,15 @@ fn promoted_learner_surface_blocks_rejected_backend_pair() {
 fn promoted_learner_surface_requires_domains_needed_by_storage_operations() {
     assert_eq!(
         plan_promoted_learner_storage_surface(SyncPromotedLearnerSurfaceGate {
+            indexer_metadata_imported: false,
+            ..complete_gate()
+        }),
+        SyncPromotedLearnerSurfaceDecision::Block(
+            SyncPromotedLearnerSurfaceBlockReason::IndexerMetadataMissing
+        )
+    );
+    assert_eq!(
+        plan_promoted_learner_storage_surface(SyncPromotedLearnerSurfaceGate {
             gsi_records_imported: false,
             ..complete_gate()
         }),
@@ -93,6 +102,7 @@ fn complete_gate() -> SyncPromotedLearnerSurfaceGate {
         learner_promoted: true,
         table_metadata_imported: true,
         item_records_imported: true,
+        indexer_metadata_imported: true,
         durable_revisions_imported: true,
         stream_records_imported: true,
         ttl_records_imported: true,

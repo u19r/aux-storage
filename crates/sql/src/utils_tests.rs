@@ -6,8 +6,7 @@ use storage_types::{
 };
 
 use crate::utils::{
-    SqliteTableRowidMode, build_gsi_creation_sqls, build_table_creation_sql,
-    main_table_attributes_blob,
+    SqliteTableRowidMode, build_gsi_creation_sqls, build_table_creation_sql, main_table_payload,
 };
 
 fn attribute_definitions() -> Vec<AttributeDefinition> {
@@ -67,7 +66,9 @@ fn main_table_attributes_blob_includes_number_keys_to_preserve_exact_wire_values
         AttributeValue::S("number-key".to_string()),
     )]);
 
-    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let blob =
+        serde_json::to_string(main_table_payload(&key_attributes, &non_key_attributes).as_ref())
+            .expect("blob");
     let attributes: HashMap<String, AttributeValue> =
         serde_json::from_str(&blob).expect("attribute map");
 
@@ -90,7 +91,9 @@ fn main_table_attributes_blob_expands_scientific_number_keys() {
     key_attributes.insert("sk", AttributeValue::N("1".to_string()));
     let non_key_attributes = HashMap::new();
 
-    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let blob =
+        serde_json::to_string(main_table_payload(&key_attributes, &non_key_attributes).as_ref())
+            .expect("blob");
     let attributes: HashMap<String, AttributeValue> =
         serde_json::from_str(&blob).expect("attribute map");
 
@@ -109,7 +112,9 @@ fn main_table_attributes_blob_keeps_string_key_rows_compact() {
         AttributeValue::S("string-key".to_string()),
     )]);
 
-    let blob = main_table_attributes_blob(&key_attributes, &non_key_attributes).expect("blob");
+    let blob =
+        serde_json::to_string(main_table_payload(&key_attributes, &non_key_attributes).as_ref())
+            .expect("blob");
     let attributes: HashMap<String, AttributeValue> =
         serde_json::from_str(&blob).expect("attribute map");
 
@@ -128,6 +133,7 @@ fn build_table_creation_sql_adds_without_rowid_when_requested() {
         &attribute_definitions(),
         &table_key_schema(),
         Some(&gsis),
+        storage_types::MaxIndexers::ZERO,
         SqliteTableRowidMode::WithoutRowid,
     );
 
@@ -142,6 +148,7 @@ fn build_table_creation_sql_omits_without_rowid_when_requested() {
         &attribute_definitions(),
         &table_key_schema(),
         Some(&gsis),
+        storage_types::MaxIndexers::ZERO,
         SqliteTableRowidMode::WithRowid,
     );
 
@@ -156,6 +163,7 @@ fn build_gsi_creation_sqls_add_without_rowid_when_requested() {
         &attribute_definitions(),
         &table_key_schema(),
         &global_secondary_indexes(),
+        storage_types::MaxIndexers::ZERO,
         SqliteTableRowidMode::WithoutRowid,
     );
 
@@ -173,6 +181,7 @@ fn build_gsi_creation_sqls_uses_actual_hash_only_table_key_shape() {
             key_type: KeyType::Hash,
         }],
         &global_secondary_indexes(),
+        storage_types::MaxIndexers::ZERO,
         SqliteTableRowidMode::WithoutRowid,
     );
 

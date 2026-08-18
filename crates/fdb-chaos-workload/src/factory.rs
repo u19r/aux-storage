@@ -6,6 +6,7 @@ use crate::{
     partition_family::PartitionFamilyWorkload,
     pubsub_delivery::PubsubDeliveryWorkload,
     queue_visibility::QueueVisibilityWorkload,
+    read_sequence_dag::ReadSequenceDagWorkload,
     table_atomicity::TableAtomicityWorkload,
 };
 
@@ -14,21 +15,14 @@ struct AuxStorageFdbChaosFactory;
 impl RustWorkloadFactory for AuxStorageFdbChaosFactory {
     fn create(name: String, context: WorkloadContext) -> WrappedWorkload {
         match name.as_str() {
-            WORKLOAD_KV_SMOKE => WrappedWorkload::new(KvSmokeWorkload::new(name, context)),
-            WORKLOAD_NOOP => WrappedWorkload::new(NoopWorkload::new(name, context)),
-            WORKLOAD_PARTITION_FAMILY => {
-                WrappedWorkload::new(PartitionFamilyWorkload::new(name, context))
-            }
-            WORKLOAD_PUBSUB_DELIVERY => {
-                WrappedWorkload::new(PubsubDeliveryWorkload::new(name, context))
-            }
-            WORKLOAD_QUEUE_VISIBILITY => {
-                WrappedWorkload::new(QueueVisibilityWorkload::new(name, context))
-            }
-            WORKLOAD_TABLE_ATOMICITY => {
-                WrappedWorkload::new(TableAtomicityWorkload::new(name, context))
-            }
-            _ => WrappedWorkload::new(InvalidWorkload::new(name, context)),
+            WORKLOAD_KV_SMOKE => KvSmokeWorkload::new(name, context).wrap(),
+            WORKLOAD_NOOP => NoopWorkload::new(name, context).wrap(),
+            WORKLOAD_PARTITION_FAMILY => PartitionFamilyWorkload::new(name, context).wrap(),
+            WORKLOAD_PUBSUB_DELIVERY => PubsubDeliveryWorkload::new(name, context).wrap(),
+            WORKLOAD_QUEUE_VISIBILITY => QueueVisibilityWorkload::new(name, context).wrap(),
+            WORKLOAD_READ_SEQUENCE_DAG => ReadSequenceDagWorkload::new(name, context).wrap(),
+            WORKLOAD_TABLE_ATOMICITY => TableAtomicityWorkload::new(name, context).wrap(),
+            _ => InvalidWorkload::new(name, context).wrap(),
         }
     }
 }

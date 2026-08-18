@@ -20,7 +20,13 @@ impl TableAtomicityWorkload {
                 return;
             }
         };
-        let manager = DatabaseManager::new_with_mocks(Arc::clone(&provider));
+        let manager = match DatabaseManager::new_with_mocks(Arc::clone(&provider)) {
+            Ok(manager) => manager,
+            Err(error) => {
+                self.trace_invariant_error("check", storage_error_detail(&error));
+                return;
+            }
+        };
         for key_index in 0..self.key_count {
             let key = self.owned_key(key_index);
             let expected = self.model.get(&key).map(str::to_string);

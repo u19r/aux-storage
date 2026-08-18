@@ -4,7 +4,7 @@ use storage_sync::{
 };
 use storage_types::StorageResult;
 
-use crate::DatabaseManager;
+use crate::database_manager::{DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID};
 
 #[async_trait]
 impl SyncApply for DatabaseManager {
@@ -14,10 +14,7 @@ impl SyncApply for DatabaseManager {
         batch: ResolvedSyncMutationBatch,
     ) -> StorageResult<Vec<SyncMutationResponse>> {
         if batch.mutations.iter().all(is_item_sync_mutation) {
-            return self
-                .storage_provider()
-                .apply_resolved_sync_mutations(metadata, batch)
-                .await;
+            return self.apply_sync_batch(metadata, batch).await;
         }
 
         let mut responses = Vec::with_capacity(batch.mutations.len());
@@ -30,14 +27,11 @@ impl SyncApply for DatabaseManager {
                 lifecycle => {
                     if !item_mutations.is_empty() {
                         responses.extend(
-                            self.storage_provider()
-                                .apply_resolved_sync_mutations(
-                                    metadata.clone(),
-                                    ResolvedSyncMutationBatch::new(std::mem::take(
-                                        &mut item_mutations,
-                                    )),
-                                )
-                                .await?,
+                            self.apply_sync_batch(
+                                metadata.clone(),
+                                ResolvedSyncMutationBatch::new(std::mem::take(&mut item_mutations)),
+                            )
+                            .await?,
                         );
                     }
                     responses.push(self.apply_lifecycle_sync_mutation(lifecycle).await?);
@@ -46,15 +40,26 @@ impl SyncApply for DatabaseManager {
         }
         if !item_mutations.is_empty() {
             responses.extend(
-                self.storage_provider()
-                    .apply_resolved_sync_mutations(
-                        metadata,
-                        ResolvedSyncMutationBatch::new(item_mutations),
-                    )
+                self.apply_sync_batch(metadata, ResolvedSyncMutationBatch::new(item_mutations))
                     .await?,
             );
         }
         Ok(responses)
+    }
+}
+
+impl DatabaseManager {
+    async fn apply_sync_batch(
+        &self,
+        metadata: storage_sync::SyncCommitMetadata,
+        batch: ResolvedSyncMutationBatch,
+    ) -> StorageResult<Vec<SyncMutationResponse>> {
+        self.run_control_admitted(ROUTED_DEFAULT_CONNECTION_ID, move |provider| async move {
+            provider
+                .apply_resolved_sync_mutations(metadata, batch)
+                .await
+        })
+        .await
     }
 }
 

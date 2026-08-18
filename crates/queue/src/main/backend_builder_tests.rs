@@ -76,6 +76,19 @@ fn queue_foundationdb_builder_preserves_optional_cluster_settings() {
 }
 
 #[test]
+fn queue_foundationdb_builder_uses_the_shared_cache_default() {
+    let config = foundationdb_queue_provider_config(&FoundationdbBackendConfig::default());
+
+    assert_eq!(
+        config
+            .foundationdb
+            .expect("foundationdb settings")
+            .cache_read_version_ms,
+        50
+    );
+}
+
+#[test]
 fn queue_remote_builder_preserves_endpoint_credentials_and_timeouts() {
     let config = remote_queue_provider_config(&RemoteBackendConfig {
         endpoint_urls: vec!["https://queue.example.test".to_string()],

@@ -103,6 +103,7 @@ fn realistic_table_info() -> StoredTableInfo {
                 key_type: KeyType::Range,
             },
         ],
+        max_indexers: storage_types::MaxIndexers::ZERO,
         global_secondary_indexes: None,
         table_size_bytes: 0,
         item_count: 0,

@@ -17,13 +17,21 @@ use storage_types::{
 
 use crate::{
     AtomicItemReadModifyWriteRequest, AttributeValue, ChangeIndexMarker,
-    ListChangeIndexMarkersRequest, StreamTrimDueMarker, StreamTrimState,
+    ListChangeIndexMarkersRequest, ReadSequenceExecution, ReadSequenceExecutionBudget,
+    StreamTrimDueMarker, StreamTrimState,
 };
 
 /// Provider-owned read context for operations that must share one backend
 /// snapshot/read version.
 #[async_trait]
 pub trait StorageProviderReadContext: Send + Sync {
+    /// Return and clear a backend signal that the current read-only attempt
+    /// must be discarded and rebuilt from a fresh snapshot.  Providers which
+    /// cannot classify retryable read failures keep the default `false`.
+    fn take_retryable_read_failure(&self) -> bool {
+        false
+    }
+
     async fn get_item(
         &self,
         table_name: TableName,
@@ -45,6 +53,69 @@ pub trait StorageProviderReadContext: Send + Sync {
 /// Trait for storage backends that can store `DynamoDB` table metadata
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
+    /// Whether this provider can lower an eligible ReadSequence query→get
+    /// edge to its native mapped-range primitive.  Callers can use this
+    /// capability to avoid a speculative whole-plan attempt on providers
+    /// which will necessarily fall back to serial reads.
+    fn supports_read_sequence_mapped_range(&self) -> bool {
+        false
+    }
+
+    /// Return and clear provider-pressure signals observed since the previous
+    /// admitted-operation boundary.
+    /// Providers which retry internally use this hook to tell the common
+    /// admission controller that capacity was consumed even when the final
+    /// operation succeeded.
+    fn take_admission_pressure_signal(&self) -> bool {
+        false
+    }
+
+    /// Attempt a backend whole-plan lowering. Unsupported shapes must return
+    /// `Unsupported` so callers can execute the same validated plan through
+    /// the ordinary DAG scheduler.
+    async fn execute_read_sequence_plan(
+        &self,
+        _plan: &storage_types::ReadSequencePlan,
+        _consistency: ReadSequenceConsistency,
+        _continuation: Option<&str>,
+    ) -> StorageResult<ReadSequenceExecution> {
+        Ok(ReadSequenceExecution::unsupported())
+    }
+
+    /// Attempt an optimized execution with an explicit item frontier.  The
+    /// default keeps providers which only implement the unbounded envelope on
+    /// the ordinary DAG path; a provider must opt into bounded execution so a
+    /// continuation cannot silently publish an over-budget page.
+    async fn execute_read_sequence_plan_with_budget(
+        &self,
+        plan: &storage_types::ReadSequencePlan,
+        consistency: ReadSequenceConsistency,
+        continuation: Option<&str>,
+        budget: ReadSequenceExecutionBudget,
+    ) -> StorageResult<ReadSequenceExecution> {
+        if budget.is_unbounded() {
+            self.execute_read_sequence_plan(plan, consistency, continuation)
+                .await
+        } else {
+            Ok(ReadSequenceExecution::Unsupported(
+                crate::ReadSequenceUnsupportedReason::ParameterLimit,
+            ))
+        }
+    }
+
+    /// Backend-internal helper for a lowering that combines independent
+    /// Get/BatchGet roots into one statement.  The ordinary whole-plan entry
+    /// point remains the only API callers need; providers which do not have a
+    /// multi-root lowering inherit the normal unsupported result.
+    async fn execute_read_sequence_independent_roots(
+        &self,
+        _plan: &storage_types::ReadSequencePlan,
+    ) -> StorageResult<ReadSequenceExecution> {
+        Ok(ReadSequenceExecution::Unsupported(
+            crate::ReadSequenceUnsupportedReason::OperationShape,
+        ))
+    }
+
     fn supports_guarded_writes(&self) -> bool {
         false
     }
@@ -73,6 +144,16 @@ pub trait StorageProvider: Send + Sync {
 
     /// Initialize the storage backend
     async fn initialize_storage(&self) -> StorageResult<()>;
+
+    /// Publish that service-level initialization has completed.
+    ///
+    /// Providers may use this lifecycle hook to release background work that
+    /// was registered during backend initialization but must not run until the
+    /// manager has created its system tables.  The default is a no-op so
+    /// providers without deferred startup work remain unchanged.
+    async fn complete_initialization(&self) -> StorageResult<()> {
+        Ok(())
+    }
 
     /// Check if a table exists
     async fn table_exists(&self, table_name: &TableName) -> StorageResult<bool>;
@@ -263,6 +344,7 @@ pub trait StorageProvider: Send + Sync {
                     .put_item_request(PutItemRequest {
                         table_name: request.table_name,
                         item: request.item.into_attribute_map()?,
+                        indexers: request.indexers,
                         condition_expression: request.condition_expression,
                         expression_attribute_names: request.expression_attribute_names,
                         expression_attribute_values: request.expression_attribute_values,

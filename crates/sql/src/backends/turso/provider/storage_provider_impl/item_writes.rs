@@ -1,4 +1,6 @@
-use crate::backends::turso::provider::storage_provider_impl::*;
+use crate::backends::turso::provider::{
+    TursoOverwriteItemInput, TursoPutItemTxnInput, storage_provider_impl::*,
+};
 
 impl TursoStorageProvider {
     pub(crate) async fn put_item_request_operation(
@@ -12,6 +14,7 @@ impl TursoStorageProvider {
         let PutItemRequest {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -35,15 +38,19 @@ impl TursoStorageProvider {
                 let this = this.clone();
                 let table_info = table_info.clone();
                 let item = item.clone();
+                let indexers = indexers.clone();
                 let condition = condition.clone();
                 Box::pin(async move {
                     this.put_item_txn(
                         conn,
                         &table_info,
-                        &item,
-                        condition.as_ref(),
-                        return_old_on_condition_failure,
-                        aux_item_stream_ttl_hours,
+                        TursoPutItemTxnInput {
+                            item: &item,
+                            indexers: indexers.as_deref(),
+                            condition: condition.as_ref(),
+                            return_old_on_condition_failure,
+                            item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                        },
                     )
                     .await
                 })
@@ -103,6 +110,7 @@ impl TursoStorageProvider {
                         condition: condition.as_ref(),
                         return_old_on_condition_failure,
                         replication: None,
+                        old_indexers: None,
                         item_stream_ttl_hours: aux_item_stream_ttl_hours,
                     },
                 )
@@ -125,6 +133,7 @@ impl TursoStorageProvider {
             expression_attribute_names,
             expression_attribute_values,
             return_values,
+            indexers,
         } = request;
         let table_info = self.get_table_info(&table_name).await?;
         let key_attributes =
@@ -146,6 +155,7 @@ impl TursoStorageProvider {
                 let guard = guard.clone();
                 let key_attributes = key_attributes.clone();
                 let condition = condition.clone();
+                let indexers = indexers.clone();
                 Box::pin(async move {
                     this.validate_durable_guard(
                         conn,
@@ -154,8 +164,18 @@ impl TursoStorageProvider {
                         &guard,
                     )
                     .await?;
-                    this.put_item_txn(conn, &table_info, &item, condition.as_ref(), false, None)
-                        .await
+                    this.put_item_txn(
+                        conn,
+                        &table_info,
+                        TursoPutItemTxnInput {
+                            item: &item,
+                            indexers: Some(&indexers),
+                            condition: condition.as_ref(),
+                            return_old_on_condition_failure: false,
+                            item_stream_ttl_hours: None,
+                        },
+                    )
+                    .await
                 })
             })
             .await?;
@@ -211,6 +231,7 @@ impl TursoStorageProvider {
                         condition: condition.as_ref(),
                         return_old_on_condition_failure: false,
                         replication: None,
+                        old_indexers: None,
                         item_stream_ttl_hours: None,
                     },
                 )
@@ -226,6 +247,8 @@ impl TursoStorageProvider {
     ) -> StorageResult<()> {
         let table_info = self.get_table_info(&mutation.table_name).await?;
         let metadata = mutation.metadata.clone();
+        let new_indexers = mutation.new_indexers.clone();
+        let old_indexers = mutation.old_indexers.clone();
         let this = self.clone();
         if let Some(new_image) = mutation.new_image {
             self.with_transaction(true, |conn| {
@@ -233,19 +256,31 @@ impl TursoStorageProvider {
                 let table_info = table_info.clone();
                 let new_image = new_image.clone();
                 let metadata = metadata.clone();
+                let new_indexers = new_indexers.clone();
+                let old_indexers = old_indexers.clone();
                 Box::pin(async move {
                     let split =
                         split_item_into_key_and_attributes_sync(new_image.clone(), &table_info)?;
-                    let old_item = this
-                        .get_item_map_by_key(conn, &table_info, &split.key_attributes)
-                        .await?;
-                    this.overwrite_item_txn_with_replication(
+                    let (old_item, stored_indexers) = this
+                        .get_item_map_with_indexers_by_key(conn, &table_info, &split.key_attributes)
+                        .await?
+                        .map_or_else(
+                            || (None, Vec::new()),
+                            |(item, indexers)| (Some(item), indexers),
+                        );
+                    this.overwrite_item_txn(
                         conn,
                         &table_info,
-                        &new_image,
-                        old_item.as_ref(),
-                        Some(&metadata),
-                        None,
+                        TursoOverwriteItemInput {
+                            item: &new_image,
+                            old_item: old_item.as_ref(),
+                            indexers: new_indexers.as_deref().unwrap_or_default(),
+                            old_indexers: old_indexers
+                                .as_deref()
+                                .or_else(|| old_item.as_ref().map(|_| stored_indexers.as_slice())),
+                            replication: Some(&metadata),
+                            item_stream_ttl_hours: None,
+                        },
                     )
                     .await
                 })
@@ -259,6 +294,7 @@ impl TursoStorageProvider {
             let table_info = table_info.clone();
             let key = mutation.key.clone();
             let metadata = metadata.clone();
+            let old_indexers = old_indexers.clone();
             Box::pin(async move {
                 this.delete_item_txn_with_replication(
                     conn,
@@ -268,6 +304,7 @@ impl TursoStorageProvider {
                         condition: None,
                         return_old_on_condition_failure: false,
                         replication: Some(&metadata),
+                        old_indexers: old_indexers.as_deref(),
                         item_stream_ttl_hours: None,
                     },
                 )
@@ -287,6 +324,7 @@ impl TursoStorageProvider {
         let UpdateItemRequest {
             table_name,
             key,
+            indexers,
             update_expression,
             condition_expression,
             expression_attribute_names,
@@ -312,6 +350,7 @@ impl TursoStorageProvider {
                 let condition_expression = condition_expression.clone();
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
+                let requested_indexers = indexers.clone();
                 Box::pin(async move {
                     let (operations, condition) = before_update_item_optional(
                         update_expression.as_deref(),
@@ -327,7 +366,13 @@ impl TursoStorageProvider {
                     } else {
                         Vec::new()
                     };
-                    let existing_item = this.get_item_map_by_key(conn, &table_info, &key).await?;
+                    let (existing_item, stored_indexers) = this
+                        .get_item_map_with_indexers_by_key(conn, &table_info, &key)
+                        .await?
+                        .map_or_else(
+                            || (None, Vec::new()),
+                            |(item, indexers)| (Some(item), indexers),
+                        );
                     let (item_to_update, updated_item) = plan_update_from_existing_item(
                         existing_item,
                         &key,
@@ -335,13 +380,21 @@ impl TursoStorageProvider {
                         condition.as_ref(),
                         return_old_on_condition_failure,
                     )?;
+                    let effective_indexers = requested_indexers
+                        .as_deref()
+                        .unwrap_or(stored_indexers.as_slice());
 
                     this.overwrite_item_txn(
                         conn,
                         &table_info,
-                        &updated_item,
-                        Some(&item_to_update),
-                        aux_item_stream_ttl_hours,
+                        TursoOverwriteItemInput {
+                            item: &updated_item,
+                            old_item: Some(&item_to_update),
+                            indexers: effective_indexers,
+                            old_indexers: Some(&stored_indexers),
+                            replication: None,
+                            item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                        },
                     )
                     .await?;
 
@@ -371,6 +424,7 @@ impl TursoStorageProvider {
         let UpdateItemRequest {
             table_name,
             key,
+            indexers,
             update_expression,
             condition_expression,
             expression_attribute_names,
@@ -392,6 +446,7 @@ impl TursoStorageProvider {
                 let condition_expression = condition_expression.clone();
                 let expression_attribute_names = expression_attribute_names.clone();
                 let expression_attribute_values = expression_attribute_values.clone();
+                let requested_indexers = indexers.clone();
                 Box::pin(async move {
                     let (operations, condition) = before_update_item_optional(
                         update_expression.as_deref(),
@@ -409,7 +464,13 @@ impl TursoStorageProvider {
                     };
                     this.validate_durable_guard(conn, &table_info.table_name, &key, &guard)
                         .await?;
-                    let existing_item = this.get_item_map_by_key(conn, &table_info, &key).await?;
+                    let (existing_item, stored_indexers) = this
+                        .get_item_map_with_indexers_by_key(conn, &table_info, &key)
+                        .await?
+                        .map_or_else(
+                            || (None, Vec::new()),
+                            |(item, indexers)| (Some(item), indexers),
+                        );
                     let (item_to_update, updated_item) = plan_update_from_existing_item(
                         existing_item,
                         &key,
@@ -417,13 +478,21 @@ impl TursoStorageProvider {
                         condition.as_ref(),
                         false,
                     )?;
+                    let effective_indexers = requested_indexers
+                        .as_deref()
+                        .unwrap_or(stored_indexers.as_slice());
 
                     this.overwrite_item_txn(
                         conn,
                         &table_info,
-                        &updated_item,
-                        Some(&item_to_update),
-                        aux_item_stream_ttl_hours,
+                        TursoOverwriteItemInput {
+                            item: &updated_item,
+                            old_item: Some(&item_to_update),
+                            indexers: effective_indexers,
+                            old_indexers: Some(&stored_indexers),
+                            replication: None,
+                            item_stream_ttl_hours: aux_item_stream_ttl_hours,
+                        },
                     )
                     .await?;
 

@@ -37,15 +37,16 @@ fn creates_parent_directory_for_file_backed_sqlite() {
 
 #[test]
 fn force_file_backed_database_overrides_test_memory_detection() {
+    let database_path = "run-artifacts/sql-data/sqlite-benchmark.db";
     let settings = SqliteSettings {
         force_file_backed_database: true,
         ..SqliteSettings::default()
     };
-    let use_memory_db = "/tmp/sqlite-benchmark.db" == ":memory:"
+    let use_memory_db = database_path == ":memory:"
         || (!settings.force_file_backed_database
             && (cfg!(test)
                 || std::env::var("RUST_TEST_THREADS").is_ok()
-                || "/tmp/sqlite-benchmark.db".contains("test")));
+                || database_path.contains("test")));
 
     assert!(
         !use_memory_db,

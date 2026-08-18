@@ -32,6 +32,7 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
     created_at INTEGER NOT NULL,
     attribute_definitions TEXT NOT NULL,
     key_schema TEXT NOT NULL,
+    max_indexers INTEGER NOT NULL,
     global_secondary_indexes TEXT,
     table_size_bytes INTEGER DEFAULT 0,
     item_count INTEGER DEFAULT 0,
@@ -49,6 +50,7 @@ pub(crate) fn create_tables_table(dialect: &dyn SqlDialect) -> SqlStatement {
         created_at BIGINT NOT NULL,
         attribute_definitions TEXT NOT NULL,
         key_schema TEXT NOT NULL,
+        max_indexers BIGINT NOT NULL,
         global_secondary_indexes TEXT,
         table_size_bytes BIGINT DEFAULT 0,
         item_count BIGINT DEFAULT 0,
@@ -190,14 +192,14 @@ pub(crate) fn get_table_info(
         match dialect.kind() {
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
-       attribute_definitions, key_schema, global_secondary_indexes,
+       attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
        table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables WHERE table_name = ?1"
             }
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
-        attribute_definitions, key_schema, global_secondary_indexes,
+        attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
         table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
         table_stream_duration_hours, default_item_stream_duration_hours
      FROM tables WHERE table_name = $1"
@@ -215,6 +217,7 @@ pub(crate) fn insert_table(
     created_at: i64,
     attribute_definitions: impl Into<String>,
     key_schema: impl Into<String>,
+    max_indexers: u8,
     global_secondary_indexes: Option<String>,
     stream_specification: Option<String>,
     deletion_protection_enabled: bool,
@@ -225,18 +228,18 @@ pub(crate) fn insert_table(
         SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
             r"INSERT INTO tables (
     id, table_name, table_status, created_at,
-    attribute_definitions, key_schema, global_secondary_indexes,
+    attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
     table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
     table_stream_duration_hours, default_item_stream_duration_hours
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         }
         SqlDialectKind::Postgres => {
             "INSERT INTO tables (
         id, table_name, table_status, created_at,
-        attribute_definitions, key_schema, global_secondary_indexes,
+        attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
         table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
         table_stream_duration_hours, default_item_stream_duration_hours
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9, $10, $11)"
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, $9, $10, $11, $12)"
         }
     };
     let mut params = vec![
@@ -246,6 +249,7 @@ pub(crate) fn insert_table(
         SqlParam::integer(created_at),
         SqlParam::text(attribute_definitions),
         SqlParam::text(key_schema),
+        SqlParam::integer(i64::from(max_indexers)),
     ];
     match global_secondary_indexes {
         Some(value) => params.push(SqlParam::text(value)),
@@ -286,7 +290,7 @@ pub(crate) fn list_all_tables(dialect: &dyn SqlDialect, limit: u32) -> SqlStatem
         match dialect.kind() {
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
-       attribute_definitions, key_schema, global_secondary_indexes,
+       attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
        table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables
@@ -295,7 +299,7 @@ LIMIT ?1"
             }
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
-        attribute_definitions, key_schema, global_secondary_indexes,
+        attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
         table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
         table_stream_duration_hours, default_item_stream_duration_hours
     FROM tables
@@ -316,7 +320,7 @@ pub(crate) fn list_tables_after(
         match dialect.kind() {
             SqlDialectKind::Sqlite | SqlDialectKind::Turso => {
                 r"SELECT id, table_name, table_status, created_at,
-       attribute_definitions, key_schema, global_secondary_indexes,
+       attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
        table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
        table_stream_duration_hours, default_item_stream_duration_hours
 FROM tables
@@ -326,7 +330,7 @@ LIMIT ?2"
             }
             SqlDialectKind::Postgres => {
                 "SELECT id, table_name, table_status, created_at,
-        attribute_definitions, key_schema, global_secondary_indexes,
+        attribute_definitions, key_schema, max_indexers, global_secondary_indexes,
         table_size_bytes, item_count, stream_specification, deletion_protection_enabled,
         table_stream_duration_hours, default_item_stream_duration_hours
     FROM tables

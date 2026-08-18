@@ -44,6 +44,7 @@ pub(super) async fn import_table_metadata_record(
     .with_global_secondary_indexes(gsis)
     .with_stream_specification(table_info.stream_specification);
     let request = CreateTableRequest {
+        max_indexers: table_info.max_indexers,
         deletion_protection_enabled: Some(table_info.deletion_protection_enabled),
         ..request
     };

@@ -210,6 +210,19 @@ fn materialize_test_file(
         "artifactRoot".to_string(),
         toml::Value::String(artifact_dir.display().to_string()),
     );
+    if args.workload == "read_sequence_dag" {
+        workload.insert(
+            "readSequenceSeed".to_string(),
+            toml::Value::Integer(
+                i64::try_from(args.seed)
+                    .map_err(|_| "simulation seed exceeds TOML integer range".to_string())?,
+            ),
+        );
+        workload.insert(
+            "readSequenceBuggify".to_string(),
+            toml::Value::String(args.buggify.clone()),
+        );
+    }
     apply_profile_overrides(args, workload);
     let rendered = toml::to_string_pretty(&value)
         .map_err(|err| format!("failed to render simulation TOML: {err}"))?;
@@ -251,3 +264,6 @@ fn map_command_error(command: &str, err: io::Error) -> String {
         format!("failed to run {command}: {err}")
     }
 }
+
+#[cfg(test)]
+mod simulation_tests;

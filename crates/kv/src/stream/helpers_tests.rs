@@ -2,6 +2,7 @@ use storage_types::{AttributeValue, ItemKey, StreamItemId, TableName};
 use stream_provider::StreamDataType;
 
 use crate::{
+    key_template::VersionstampedWriteConflictPolicy,
     keyspace::{compact::TableStorageId, table_identity::TableIdentity},
     stream::{
         helpers::{StreamEntryContext, create_item_update_stream_entries_wire_encoded},
@@ -71,6 +72,8 @@ fn wire_encoded_stream_entries_use_pointer_envelope_for_insert_tests() {
             table_identity: &table_identity,
             table_name: &table_name,
             item_key: &item_key,
+            indexers: &[],
+            old_indexers: None,
         },
         item_bytes,
         None,
@@ -119,6 +122,8 @@ fn wire_encoded_stream_entries_keep_item_rows_on_target_version_tests() {
             table_identity: &table_identity,
             table_name: &table_name,
             item_key: &item_key,
+            indexers: &[],
+            old_indexers: None,
         },
         item_bytes,
         None,
@@ -134,6 +139,13 @@ fn wire_encoded_stream_entries_keep_item_rows_on_target_version_tests() {
         .iter()
         .filter(|(template, _)| template.foundationdb_key().is_some())
         .count();
+    let conflict_free_versionstamped_entries = entries
+        .iter()
+        .filter(|(template, _)| {
+            template.versionstamped_write_conflict_policy()
+                == VersionstampedWriteConflictPolicy::OmitWriteConflictForUniqueKey
+        })
+        .count();
     let literal_target_entries = entries
         .iter()
         .filter(|(template, _)| {
@@ -145,6 +157,7 @@ fn wire_encoded_stream_entries_keep_item_rows_on_target_version_tests() {
         .count();
 
     assert_eq!(versionstamped_entries, 3);
+    assert_eq!(conflict_free_versionstamped_entries, 3);
     assert_eq!(literal_target_entries, 2);
 }
 
@@ -162,6 +175,8 @@ fn wire_encoded_stream_entries_embed_old_and_new_images_for_updates_tests() {
             table_identity: &table_identity,
             table_name: &table_name,
             item_key: &item_key,
+            indexers: &[],
+            old_indexers: None,
         },
         new_item,
         Some(old_item),

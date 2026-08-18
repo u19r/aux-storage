@@ -4,14 +4,6 @@
 
 It can run as standalone services or be embedded by another Rust workspace. The supported local and service backends are SQLite, Turso, Postgres, RocksDB, and FoundationDB.
 
-## What Lives Here
-
-- `crates/storage*`: DynamoDB-compatible storage types, providers, API service, cache, and backfill tooling.
-- `crates/queue*`: SQS-compatible queue provider and service code.
-- `crates/stream*`: SNS-compatible pub/sub and stream primitives used by queue and storage workflows.
-- `crates/sql` and `crates/kv`: shared SQL and key-value backend adapters.
-- `quint/`: protocol and model checks for storage behavior.
-
 ## Quick Start
 
 Build the workspace:
@@ -57,6 +49,15 @@ Common top-level flags are:
 `--overrides` accepts comma-separated JSON-path assignments and can be repeated.
 Values are parsed as JSON when possible and otherwise treated as strings.
 Escape commas and equals inside string values with a backslash.
+
+Foreground provider admission is configured under
+`features.storage_admission`. It is enabled by default and can be changed in
+JSON, with `AUX_STORAGE_ADMISSION_*` environment variables, or with
+`--storage-admission-*` flags. The precedence is file, environment, flags,
+then explicit `--overrides`; `AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS`
+remains a supported throughput shorthand. The controller is per connection,
+bounded by the configured queue and concurrency limits, and reports retryable
+overload as HTTP 503 with `Retry-After`.
 
 ```bash
 cargo run -p storage-api --bin storage-api -- \
@@ -132,6 +133,14 @@ service tokens. Prometheus metrics are served from `/metrics` by default; set
 `Authorization: Bearer <token>`. Do not print effective config in production
 logs unless the output is redacted.
 
+## Networking Security Boundary
+
+Aux-storage treats configured replication peers and HTTP/SNS subscription endpoints as trusted
+customer-controlled network destinations. It permits HTTP and private addresses; it does not
+enforce TLS, public-address filtering, or network segmentation. Deploy these paths in a private
+AWS VPC, VPN, or equivalent private network, and use security groups, routing, and customer
+network policy to restrict access. Network transport security is outside aux-storage's scope.
+
 ## Backend Support
 
 The workspace is structured around backend features:
@@ -147,10 +156,10 @@ Backend support varies by crate. Check each crate's `Cargo.toml` before enabling
 
 ## ReadSequence Extension
 
-`ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded N+1 read workflows.
-It runs ordered `Get`, `BatchGet`, and `Query` steps, binds selected parent attributes into child
-steps, and returns a nested response with deterministic joins. It is available through the
-`DynamoDB_20120810.ReadSequence` target.
+`ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded graph-shaped read
+workflows. It validates a directed acyclic graph of `Get`, `BatchGet`, and `Query` nodes, binds
+typed `FromInput` values, executes independent nodes in bounded waves, and returns flat node and
+invocation results through the `DynamoDB_20120810.ReadSequence` target.
 
 Supported consistency is capability-gated by backend. Eventual reads are the default. Strong reads
 are allowed for base-table operations and reject GSI reads. Transactional snapshots are currently
@@ -162,12 +171,15 @@ for independent point reads and `TransactGetItems` for small transactional point
 `ReadSequence` when later reads depend on attributes returned by earlier reads and the whole workflow
 must stay bounded by fanout, total-read, and response-size limits.
 
-Embedded Rust consumers can use `DatabaseManager::read_sequence_executor` for the same dependent
-read boundary without an HTTP hop or JSON request/response conversion. Its wire-native `get_item`
-and `query_table` methods require mutable access to the executor, reuse one provider context, reject
-cross-connection sequences, and enforce hard operation, item, and response-byte caps. The executor's
-stats distinguish started operations from completed operations so cancellation and provider failures
-remain observable.
+The backend lowering mode is configured outside the request under
+`features.read_sequence`:
+
+- `on` (the default) uses a supported whole-plan lowering and falls back to the ordinary DAG;
+- `shadow` samples an optimized result but returns the ordinary DAG response;
+- `off` is the rollback setting and runs the ordinary DAG only.
+
+Set `shadow_sample_percent` from 0 through 100 to bound shadow work. Changing this setting never
+restores the removed ordered executor or accepts the superseded request/token contract.
 
 Example target and request shape:
 
@@ -178,31 +190,37 @@ x-amz-target: DynamoDB_20120810.ReadSequence
 ```json
 {
   "ReadConsistency": "EVENTUAL",
-  "Sequence": [
+  "Nodes": [
     {
       "Name": "user",
-      "Get": {
-        "TableName": "Users",
-        "Key": { "pk": { "S": "user#1" } }
+      "Operation": {
+        "Get": {
+          "TableName": "Users",
+          "Key": { "pk": { "S": "user#1" } }
+        }
       },
-      "Select": {
-        "org_id": "$.org_id"
-      }
+      "Inputs": {},
+      "After": []
     },
     {
       "Name": "org",
-      "ForEach": {
-        "From": "user.Item.org_id",
-        "As": "org_id",
-        "OnMissing": "ERROR",
+      "Operation": {
         "Get": {
           "TableName": "Organizations",
-          "Key": { "pk": { "S": "${org_id}" } }
-        },
-        "Join": { "To": "user", "As": "org", "Type": "REQUIRED_ONE" }
-      }
+          "Key": { "pk": { "FromInput": "org_id" } }
+        }
+      },
+      "Inputs": {
+        "org_id": {
+          "From": { "Node": "user", "Select": "$.Get.Item.org_id" },
+          "Cardinality": "ONE",
+          "OnMissing": "ERROR"
+        }
+      },
+      "After": []
     }
-  ]
+  ],
+  "Outputs": ["user", "org"]
 }
 ```
 
@@ -210,44 +228,6 @@ Operators should treat `NextSequenceToken` as an opaque continuation token. Stal
 tokens fail validation. Remote `BatchGetItem` partial responses with `UnprocessedKeys` are surfaced
 as retryable throttling errors instead of incomplete joined data. Transactional requests on backends
 without a provider-owned snapshot context fail before any sequence step executes.
-
-## Sync Replication
-
-Sync replication is the low-latency quorum-replicated storage mode for `storage-api`. The first
-production milestone is intentionally narrow: SQLite-to-SQLite sync replication only. Mixed-backend
-promotion and other homogeneous backend pairs require the evidence listed in the support matrix
-before production use.
-
-Public sync replication docs:
-
-- [support matrix and release warnings](docs/sync-replication-support.md)
-- [operator runbooks](docs/sync-replication-operations.md)
-- [production readiness checklist](docs/production-readiness-checklist.md)
-- [performance budgets](docs/sync-replication-performance.md)
-- [throughput investigation](docs/sync-replication-throughput.md)
-- [contributor guide](docs/sync-replication-contributors.md)
-- [testing guide](docs/sync-replication-testing.md)
-- [architecture diagrams](docs/sync-replication-architecture.md)
-- [observability guide](docs/sync-replication-observability.md)
-- [closeout audit](docs/sync-replication-closeout-audit.md)
-- [release candidate evidence packet](docs/sync-replication-release-candidate.md)
-
-### Sync Node Join
-
-Existing sync voters do not need a process restart to admit a new node. A new node joins by starting
-with `features.storage_sync_replication.join_as_learner=true`, a fresh `node_id`, an internal
-`advertise_url`, persistent storage and sync Raft `data_dir`, the sync internal credential, and at
-least one bootstrap peer in `features.storage_sync_replication.peers`. On startup, the learner calls
-the bootstrap peer's token-protected `POST /storage/_internal/sync/raft/learners` endpoint. The
-leader adds it as a non-voting learner, replicates/catches it up, and the node is promoted only
-after the promotion safety gates pass.
-
-The current implementation is not gossip-based discovery: existing nodes do not notice arbitrary
-processes automatically, and sync runtime config is assembled at startup. To add capacity or replace
-a node, start the new process in learner mode and use the
-[learner replacement runbook](docs/sync-replication-operations.md#learner-replacement). Direct
-`storage::DatabaseManager` library calls bypass Raft; embedded services must host the `storage-api`
-routes and internal sync routes for sync replication.
 
 ## DynamoDB Stream Retention Extensions
 

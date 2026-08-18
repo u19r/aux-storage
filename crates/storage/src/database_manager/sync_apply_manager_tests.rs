@@ -23,6 +23,7 @@ async fn sync_apply_imports_resolved_put_and_delete() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "open"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -103,6 +104,7 @@ async fn sync_apply_ignores_duplicate_and_stale_resolved_versions() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "first"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -131,6 +133,7 @@ async fn sync_apply_ignores_duplicate_and_stale_resolved_versions() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "second"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -155,7 +158,9 @@ async fn sync_apply_ignores_duplicate_and_stale_resolved_versions() {
             table_name: table_name.clone(),
             key_json: r#"{"pk":{"S":"item#1"}}"#.to_string(),
             item_json: serde_json::to_string(&item("item#1", "stale")).unwrap(),
+            indexers: Vec::new(),
             old_item_json: None,
+            old_indexers: None,
             target_item_stream_version: storage_types::ItemStreamVersion::new(1),
             response: storage_sync::SyncMutationResponse::default(),
         })]),
@@ -188,6 +193,7 @@ async fn sync_apply_rolls_back_all_mutations_when_batch_fails() {
             SyncWriteRequest::PutItem(PutItemRequest {
                 table_name: table_name.clone(),
                 item: item("item#1", "valid"),
+                indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -208,7 +214,9 @@ async fn sync_apply_rolls_back_all_mutations_when_batch_fails() {
         table_name: TableName::new("missing_table"),
         key_json: r#"{"pk":{"S":"item#2"}}"#.to_string(),
         item_json: serde_json::to_string(&item("item#2", "invalid")).unwrap(),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: storage_types::ItemStreamVersion::new(1),
         response: storage_sync::SyncMutationResponse::default(),
     }));

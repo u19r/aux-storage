@@ -104,6 +104,14 @@ mod stored_table_info_tests;
 pub use stored_table_info::*;
 mod item_key;
 pub use item_key::{IndexKey, IndexKeyPrefix, ItemKey, ItemKeyError, TableKey};
+mod indexed_wire_item;
+#[cfg(test)]
+mod indexed_wire_item_tests;
+pub use indexed_wire_item::{
+    DecodedIndexedWireItem, INDEXED_VALUE_FORMAT_VERSION, INDEXED_VALUE_LZ4_CODEC,
+    INDEXED_VALUE_LZ4_HEADER, INDEXED_VALUE_RAW_CODEC, INDEXED_VALUE_RAW_HEADER,
+    INDEXER_TUPLE_OFFSET, IndexedWireItem, IndexerDeclaration, indexer_tuple_index,
+};
 mod index_name;
 #[cfg(test)]
 mod index_name_tests;
@@ -113,7 +121,7 @@ mod item_stream_version_tests;
 #[cfg(test)]
 mod quint_item_versioned_stream_tests;
 #[cfg(test)]
-mod quint_read_sequence_tests;
+mod quint_read_sequence_planner_tests;
 pub use item_stream_version::ItemStreamVersion;
 pub mod storage_serde;
 #[cfg(test)]
@@ -121,6 +129,10 @@ mod storage_serde_tests;
 pub use index_name::IndexName;
 mod table_name;
 pub use table_name::TableName;
+mod max_indexers;
+#[cfg(test)]
+mod max_indexers_tests;
+pub use max_indexers::{MAX_INDEXERS_CAPACITY, MaxIndexers};
 #[cfg(test)]
 mod stream_item_id_perf_tests;
 #[cfg(test)]
@@ -143,6 +155,9 @@ mod item_key_tests;
 mod key_validation;
 pub mod numeric;
 pub mod single_table_entity;
+#[cfg(test)]
+mod single_table_entity_tests;
+pub use single_table_entity::{EntityIndexer, SingleTableEntity, WireEntity};
 mod storage_entity_type;
 #[cfg(test)]
 mod storage_entity_type_tests;
@@ -166,6 +181,7 @@ mod ttl;
 pub use ttl::*;
 mod cacheable;
 pub use cacheable::Cacheable;
+pub mod canonical_json;
 mod validated_entity;
 pub use validated_entity::{NoopValidatedEntity, StoredEntity, ValidatedEntity};
 #[cfg(test)]
@@ -185,26 +201,39 @@ mod projection_expression_tests;
 mod request_expression_validation;
 #[cfg(test)]
 mod request_expression_validation_perf_tests;
-pub use projection_expression::{project_wire_items, validate_gsi_projection_expression};
+pub use projection_expression::{
+    AttributeProjection, project_attribute_map, project_attribute_map_ref, project_wire_items,
+    validate_gsi_projection, validate_gsi_required_attributes,
+};
 mod request_response;
 pub use request_response::*;
 mod read_sequence;
 mod read_sequence_error;
+mod read_sequence_graph;
+#[cfg(test)]
+mod read_sequence_graph_tests;
 mod read_sequence_planner;
 mod read_sequence_response;
 mod read_sequence_selector;
 #[cfg(test)]
-mod read_sequence_tests;
+mod read_sequence_selector_tests;
 pub use read_sequence::*;
 pub use read_sequence_error::ReadSequenceValidationError;
+pub use read_sequence_graph::{
+    ReadSequenceFromInput, ReadSequenceGraphPlan, ReadSequenceInputCardinality,
+    ReadSequenceMappedKeySource, ReadSequenceNode, ReadSequenceNodeId, ReadSequenceNodeInput,
+    ReadSequenceNodeOperation, ReadSequenceStringTemplateError, ReadSequenceStringTemplatePart,
+    ReadSequenceStringTemplateParts, read_sequence_input_literal, read_sequence_input_literal_name,
+    read_sequence_input_marker, read_sequence_input_marker_name,
+    read_sequence_operation_contains_literal_escape, read_sequence_string_template,
+    read_sequence_string_template_name,
+};
 pub use read_sequence_planner::{
-    ReadSequenceChildPlan, ReadSequencePlan, ReadSequencePlannedOperation,
-    ReadSequencePlannerInput, plan_read_sequence, plan_read_sequence_with_capabilities,
+    ReadSequencePlan, plan_read_sequence, plan_read_sequence_with_capabilities,
 };
 pub use read_sequence_response::*;
 pub use read_sequence_selector::{
-    ParsedReadSequenceSelector, ReadSequenceAttributeValueType, ReadSequenceSelectedContext,
-    ReadSequenceSelectorSegment, bind_read_sequence_attribute_value,
+    ParsedReadSequenceSelector, ReadSequenceAttributeValueType, ReadSequenceSelectorSegment,
 };
 mod multi_region;
 pub use multi_region::*;

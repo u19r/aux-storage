@@ -6,10 +6,10 @@ use crate::constants::FOUNDATIONDB_STARTUP_REACHABILITY_TIMEOUT_SECS;
 fn file_backed_sqlite_paths_use_storage_backed_job_locks_even_in_tests() {
     assert!(!use_in_memory_job_lock_for_path("main.db"));
     assert!(!use_in_memory_job_lock_for_path(
-        "/tmp/aux-storage-test/main.db"
+        "run-artifacts/storage-data/main.db"
     ));
     assert!(!use_in_memory_job_lock_for_path(
-        "sqlite:/tmp/aux-storage-test/main.db"
+        "sqlite:run-artifacts/storage-data/main.db"
     ));
 }
 

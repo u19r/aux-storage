@@ -26,7 +26,7 @@ impl FoundationDbKvStore {
     pub(crate) async fn split_partitioned_ordered_log_family_tx(
         &self,
         trx: &Transaction,
-        prefix: Option<&Vec<u8>>,
+        prefix: &[u8],
         family_component: &str,
         partition_id: u16,
         now_ms: i64,
@@ -119,12 +119,11 @@ impl FoundationDbKvStore {
         let mut versioned_key = marker_template.foundationdb_key().ok_or_else(|| {
             StorageError::internal("ordered-log split marker template must be versionstamped")
         })?;
-        if let Some(prefix_bytes) = prefix {
-            let mut composed = prefix_bytes.clone();
-            composed.extend_from_slice(&versioned_key);
-            adjust_versionstamp_offset(&mut composed, prefix_bytes.len());
-            versioned_key = composed;
-        }
+        let mut composed = Vec::with_capacity(prefix.len() + versioned_key.len());
+        composed.extend_from_slice(prefix);
+        composed.extend_from_slice(&versioned_key);
+        adjust_versionstamp_offset(&mut composed, prefix.len());
+        versioned_key = composed;
         trx.atomic_op(
             &versioned_key,
             &marker_bytes,
@@ -137,7 +136,7 @@ impl FoundationDbKvStore {
     pub(crate) async fn rewrite_partitioned_pointer_template(
         &self,
         trx: &Transaction,
-        subspace_prefix: Option<&Vec<u8>>,
+        subspace_prefix: &[u8],
         template: &crate::key_template::KeyTemplate,
         value: &[u8],
         ordered_log_family_cache: &mut OrderedLogFamilyCache,

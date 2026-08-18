@@ -6,7 +6,7 @@ use storage_types::{AttributeValue, KeyAttributes, StorageError, StorageResult, 
 use super::provider_impl::kv_mutation_to_direct_with_literal_templates;
 use crate::{
     SortedKvDbStorageProvider,
-    backends::common::plan_table_write,
+    backends::common::plan_table_write_with_codec,
     helpers::increment_bytes,
     partition_family::PartitionFamilyKvStore,
     sorted_kv_store::{DirectWriteOperation, RawKey, SortedKvStore, TransactWriteTableOperation},
@@ -43,12 +43,18 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                 let item =
                     serde_json::from_str::<HashMap<String, AttributeValue>>(&mutation.item_json)?;
                 let key_attributes = provider.get_key_attributes(&item, &table_info.key_schema)?;
-                let current = old_item_bytes(mutation.old_item_json.as_deref())?;
-                let plan = plan_table_write(
+                let current = old_item_bytes(
+                    mutation.old_item_json.as_deref(),
+                    mutation.old_indexers.as_deref(),
+                    provider.kv_store.item_value_codec(),
+                    table_info.max_indexers,
+                )?;
+                let plan = plan_table_write_with_codec(
                     &[TransactWriteTableOperation::Put {
                         table_identity: table_metadata.identity.clone(),
                         table_info,
                         item,
+                        indexers: Some(mutation.indexers),
                         item_stream_ttl_hours: None,
                         condition: None,
                         return_values_on_condition_check_failure: None,
@@ -60,6 +66,7 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                         mutation.target_item_stream_version,
                     ))],
                     provider.immediate_gsi_consistency,
+                    provider.kv_store.item_value_codec(),
                 )?;
                 operations.extend(
                     plan.mutations
@@ -92,8 +99,13 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                 let key =
                     serde_json::from_str::<HashMap<String, AttributeValue>>(&mutation.key_json)?;
                 let key_attributes = KeyAttributes::from(key);
-                let current = old_item_bytes(mutation.old_item_json.as_deref())?;
-                let plan = plan_table_write(
+                let current = old_item_bytes(
+                    mutation.old_item_json.as_deref(),
+                    mutation.old_indexers.as_deref(),
+                    provider.kv_store.item_value_codec(),
+                    table_info.max_indexers,
+                )?;
+                let plan = plan_table_write_with_codec(
                     &[TransactWriteTableOperation::Delete {
                         table_identity: table_metadata.identity.clone(),
                         table_info,
@@ -110,6 +122,7 @@ pub(super) async fn apply_resolved_sync_mutations<S: PartitionFamilyKvStore + 's
                         mutation.target_item_stream_version,
                     ))],
                     provider.immediate_gsi_consistency,
+                    provider.kv_store.item_value_codec(),
                 )?;
                 operations.extend(
                     plan.mutations
@@ -231,12 +244,20 @@ pub(super) async fn resolved_sync_log_entries_after<S: SortedKvStore>(
         .collect()
 }
 
-fn old_item_bytes(old_item_json: Option<&str>) -> StorageResult<Option<Vec<u8>>> {
+fn old_item_bytes(
+    old_item_json: Option<&str>,
+    old_indexers: Option<&[String]>,
+    codec: crate::sorted_kv_store::ItemValueCodec,
+    capacity: storage_types::MaxIndexers,
+) -> StorageResult<Option<Vec<u8>>> {
     old_item_json
         .map(|json| {
             serde_json::from_str::<HashMap<String, AttributeValue>>(json)
                 .map_err(StorageError::from)
-                .and_then(|item| storage_types::storage_serde::to_bytes(&item))
+                .and_then(|item| storage_types::WireItem::from_attribute_map(&item))
+                .and_then(|item| {
+                    super::encode_wire_item_storage_bytes(codec, &item, old_indexers, capacity)
+                })
         })
         .transpose()
 }

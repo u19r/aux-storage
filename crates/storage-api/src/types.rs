@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use storage::DatabaseManager;
 use storage_backfill::{LogicalBackfillChunk, LogicalBackfillManifest, LogicalBackfillResult};
 use storage_sync::{SyncNodeId, SyncTypeConfig};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::{
     batch_get_wire_response::BatchGetWireResponse,
@@ -39,6 +40,9 @@ pub struct AppState {
     sync_learner_join_handler: Option<Arc<dyn SyncLearnerJoinHandler>>,
     sync_internal_token: Option<Arc<str>>,
     replication_service_tokens: Vec<Arc<str>>,
+    pub(crate) admission_test_holds: Arc<Mutex<Vec<storage::admission::AdmissionPermit>>>,
+    pub(crate) admission_test_release: Arc<Notify>,
+    pub(crate) ingress_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -59,6 +63,7 @@ impl AppState {
         db_manager: Arc<DatabaseManager>,
         storage_manager: Arc<dyn StorageApiManager>,
     ) -> Self {
+        let ingress_limit = db_manager.fixed_ingress_limit();
         Self {
             db_manager,
             storage_manager,
@@ -75,6 +80,9 @@ impl AppState {
             sync_learner_join_handler: None,
             sync_internal_token: None,
             replication_service_tokens: Vec::new(),
+            admission_test_holds: Arc::new(Mutex::new(Vec::new())),
+            admission_test_release: Arc::new(Notify::new()),
+            ingress_semaphore: Arc::new(Semaphore::new(ingress_limit)),
         }
     }
 

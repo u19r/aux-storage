@@ -11,8 +11,7 @@ use storage_types::{
 use crate::{
     SQLiteStorageProvider,
     backends::sqlite::{
-        delete_item_impl::DeleteItemInput,
-        put_item_impl::{PutItemInput, PutWireItemInput},
+        delete_item_impl::DeleteItemInput, put_item_impl::PutItemInput,
         update_item_impl::UpdateItemInput,
     },
     storage_provider::parse_optional_condition,
@@ -32,6 +31,7 @@ impl SQLiteStorageProvider {
         let PutItemRequest {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -52,6 +52,7 @@ impl SQLiteStorageProvider {
                     table_name: &table_name,
                     item: &item,
                     condition: &condition,
+                    indexers: indexers.as_deref(),
                     immediate_gsi_consistency,
                     return_old_on_condition_failure,
                     replication: None,
@@ -77,6 +78,7 @@ impl SQLiteStorageProvider {
         let PutItemEncodeRequest {
             table_name,
             item,
+            indexers,
             condition_expression,
             expression_attribute_names,
             expression_attribute_values,
@@ -90,16 +92,17 @@ impl SQLiteStorageProvider {
             &expression_attribute_values,
         )?;
         let should_return_old = matches!(return_values, Some(AllOld::AllOld));
+        let item = item.into_attribute_map()?;
         let immediate_gsi_consistency = self.immediate_gsi_consistency;
         let old_value = with_transaction(&self.connection, move |sqlite| {
-            crate::SQLiteStorageProvider::do_put_wire_item(
+            crate::SQLiteStorageProvider::do_put_item(
                 sqlite,
-                PutWireItemInput {
+                PutItemInput {
                     table_name: &table_name,
                     item: &item,
                     condition: &condition,
+                    indexers: indexers.as_deref(),
                     immediate_gsi_consistency,
-                    should_return_old,
                     return_old_on_condition_failure,
                     replication: None,
                     item_stream_ttl_hours: aux_item_stream_ttl_hours,
@@ -158,6 +161,7 @@ impl SQLiteStorageProvider {
                     immediate_gsi_consistency,
                     return_old_on_condition_failure,
                     replication: None,
+                    old_indexers: None,
                     item_stream_ttl_hours: aux_item_stream_ttl_hours,
                 },
             )
@@ -172,6 +176,7 @@ impl SQLiteStorageProvider {
         let UpdateItemRequest {
             table_name,
             key,
+            indexers,
             update_expression,
             condition_expression,
             expression_attribute_names,
@@ -212,6 +217,7 @@ impl SQLiteStorageProvider {
                         condition: &condition,
                         table_name: &table_name,
                         key: &key,
+                        indexers: indexers.as_deref(),
                         immediate_gsi_consistency,
                         return_old_on_condition_failure,
                         item_stream_ttl_hours: aux_item_stream_ttl_hours,

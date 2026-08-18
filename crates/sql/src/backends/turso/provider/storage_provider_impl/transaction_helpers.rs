@@ -1,4 +1,4 @@
-use crate::backends::turso::provider::storage_provider_impl::*;
+use crate::backends::turso::provider::{TursoPutItemTxnInput, storage_provider_impl::*};
 
 impl TursoStorageProvider {
     pub(crate) async fn preflight_transact_item_key(
@@ -25,6 +25,7 @@ impl TursoStorageProvider {
                 PreparedBatchOperation::Put {
                     table_info,
                     full_item,
+                    indexers,
                     aux_item_stream_ttl_hours,
                     ..
                 } => {
@@ -32,10 +33,13 @@ impl TursoStorageProvider {
                         .put_item_txn(
                             conn,
                             table_info,
-                            full_item,
-                            None,
-                            false,
-                            *aux_item_stream_ttl_hours,
+                            TursoPutItemTxnInput {
+                                item: full_item,
+                                indexers: indexers.as_deref(),
+                                condition: None,
+                                return_old_on_condition_failure: false,
+                                item_stream_ttl_hours: *aux_item_stream_ttl_hours,
+                            },
                         )
                         .await?;
                 }
@@ -54,6 +58,7 @@ impl TursoStorageProvider {
                                 condition: None,
                                 return_old_on_condition_failure: false,
                                 replication: None,
+                                old_indexers: None,
                                 item_stream_ttl_hours: *aux_item_stream_ttl_hours,
                             },
                         )

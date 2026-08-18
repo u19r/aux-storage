@@ -36,14 +36,14 @@ impl FoundationDbKvStore {
             return Ok(());
         }
 
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         let mut trx = self.create_transaction()?;
         let mut attempt = 0u32;
         record_fdb_transaction_start("queue_send");
 
         loop {
             attempt += 1;
-            Self::configure_transaction(&trx, None, true)?;
+            self.configure_transaction(&trx, None, true)?;
 
             let mut write_bytes = 0u64;
             let mut write_key_bytes = 0u64;
@@ -53,7 +53,7 @@ impl FoundationDbKvStore {
             for message in &messages {
                 let mut set_value = |key: &[u8], value: &[u8]| -> StorageResult<()> {
                     write_bytes = write_bytes.saturating_add(value.len() as u64);
-                    let prefixed_key = Self::prefix_bytes(prefix.as_ref(), key);
+                    let prefixed_key = Self::prefix_bytes(prefix, key);
                     write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);
                     trx.set_option(options::TransactionOption::NextWriteNoWriteConflictRange)
                         .map_err(|err| map_fdb_error("disable queue send write conflict", err))?;
@@ -93,7 +93,7 @@ impl FoundationDbKvStore {
             }
             for (key, value) in ready_hints.into_iter().chain(wake_writes) {
                 write_bytes = write_bytes.saturating_add(value.len() as u64);
-                let prefixed_key = Self::prefix_bytes(prefix.as_ref(), key);
+                let prefixed_key = Self::prefix_bytes(prefix, key);
                 write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);
                 trx.set_option(options::TransactionOption::NextWriteNoWriteConflictRange)
                     .map_err(|err| map_fdb_error("disable queue send write conflict", err))?;
@@ -114,26 +114,13 @@ impl FoundationDbKvStore {
                     let retryable = commit_err.is_retryable();
                     match commit_err.on_error().await {
                         Ok(mut new_trx) => {
-                            let candidate_keys = messages
-                                .iter()
-                                .flat_map(|message| {
-                                    [
-                                        &message.state_key,
-                                        &message.payload_key,
-                                        &message.ready_key,
-                                        &message.ready_hint_key,
-                                        &message.wake_key,
-                                    ]
-                                })
-                                .map(|key| Self::prefix_bytes(prefix.as_ref(), key))
-                                .collect::<Vec<_>>();
                             self.log_conflict_details(
                                 &new_trx,
                                 "write_partitioned_queue_messages",
                                 attempt,
                                 retryable,
                                 error_code,
-                                &candidate_keys,
+                                messages.len().saturating_mul(5),
                             )
                             .await;
                             new_trx.reset();
@@ -157,10 +144,10 @@ impl FoundationDbKvStore {
             return Ok(());
         }
 
-        let prefix = self.config.subspace_prefix.clone();
+        let prefix = self.physical_prefix();
         for chunk in partitions.chunks(64) {
             let trx = self.create_transaction()?;
-            Self::configure_transaction(&trx, Some("queue.prewarm_partitioned_queue"), true)?;
+            self.configure_transaction(&trx, Some("queue.prewarm_partitioned_queue"), true)?;
             record_fdb_transaction_start("queue_prewarm");
             let mut write_bytes = 0u64;
             let mut write_key_bytes = 0u64;
@@ -171,7 +158,7 @@ impl FoundationDbKvStore {
                     partition.partition_id,
                 );
                 write_bytes = write_bytes.saturating_add(marker_value.len() as u64);
-                let prefixed_key = Self::prefix_bytes(prefix.as_ref(), &partition.marker_key);
+                let prefixed_key = Self::prefix_bytes(prefix, &partition.marker_key);
                 write_key_bytes = write_key_bytes.saturating_add(prefixed_key.len() as u64);
                 trx.set_option(options::TransactionOption::NextWriteNoWriteConflictRange)
                     .map_err(|err| map_fdb_error("disable queue prewarm write conflict", err))?;

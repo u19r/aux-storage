@@ -160,10 +160,10 @@ pub use multi_region_interop::{
     plan_sync_multi_region_interop,
 };
 pub use mutation::{
-    ResolvedSyncMutation, ResolvedSyncMutationBatch, SyncCreateTableMutation, SyncDeleteMutation,
-    SyncDeleteTableMutation, SyncMutationId, SyncMutationResponse, SyncProposalBatch,
-    SyncProposalId, SyncProposalResponse, SyncPutMutation, SyncUpdateTableMutation,
-    SyncUpdateTimeToLiveMutation,
+    ResolvedSyncMutation, ResolvedSyncMutationBatch, SYNC_PROTOCOL_VERSION,
+    SyncCreateTableMutation, SyncDeleteMutation, SyncDeleteTableMutation, SyncMutationId,
+    SyncMutationResponse, SyncProposalBatch, SyncProposalId, SyncProposalResponse, SyncPutMutation,
+    SyncUpdateTableMutation, SyncUpdateTimeToLiveMutation,
 };
 pub use non_sql_resolved_apply::{
     SyncNonSqlBackend, SyncNonSqlResolvedApplyBlockReason, SyncNonSqlResolvedApplyDecision,

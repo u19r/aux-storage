@@ -87,6 +87,7 @@ fn records_expose_item_stream_version_for_compare_and_set() {
         table_name: "users".to_string(),
         key_json: r#"{"pk":{"S":"u#1"}}"#.to_string(),
         item_json: r#"{"pk":{"S":"u#1"},"name":{"S":"A"}}"#.to_string(),
+        indexers: Vec::new(),
         item_stream_version: ItemStreamVersion::new(7),
     };
     let tombstone = LogicalBackfillRecord::Tombstone(LogicalBackfillTombstone {
@@ -105,6 +106,35 @@ fn records_expose_item_stream_version_for_compare_and_set() {
     );
     assert_eq!(present.domain(), LogicalBackfillDomain::ItemRecords);
     assert_eq!(tombstone.domain(), LogicalBackfillDomain::Tombstones);
+}
+
+#[test]
+fn given_present_item_without_indexers_when_deserialized_then_record_is_rejected() {
+    let encoded = serde_json::json!({
+        "type": "present_item",
+        "table_name": "users",
+        "key_json": r#"{"pk":{"S":"u#1"}}"#,
+        "item_json": r#"{"pk":{"S":"u#1"}}"#,
+        "item_stream_version": 7
+    });
+
+    assert!(serde_json::from_value::<LogicalBackfillRecord>(encoded).is_err());
+}
+
+#[test]
+fn given_present_item_with_indexers_when_serialized_then_order_round_trips() {
+    let record = LogicalBackfillRecord::PresentItem {
+        table_name: "users".to_string(),
+        key_json: r#"{"pk":{"S":"u#1"}}"#.to_string(),
+        item_json: r#"{"pk":{"S":"u#1"},"customer_id":{"S":"c#1"}}"#.to_string(),
+        indexers: vec!["customer_id".to_string(), "region_id".to_string()],
+        item_stream_version: ItemStreamVersion::new(7),
+    };
+    let decoded: LogicalBackfillRecord =
+        serde_json::from_value(serde_json::to_value(&record).expect("serialize logical record"))
+            .expect("deserialize logical record");
+
+    assert_eq!(decoded, record);
 }
 
 #[test]

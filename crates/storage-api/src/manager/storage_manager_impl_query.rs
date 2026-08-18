@@ -4,11 +4,12 @@ use http_error::HttpApiError;
 use storage::{QueryIndexInput, QueryTableInput};
 use storage_provider::StorageProviderReadContext;
 use storage_types::{
-    AttributeValue, IndexName, KeySchemaElement, QueryRequest, QueryResponse, StorageEnum,
-    StorageError, StoredTableInfo, TableName, WireItem, context::WrappedError,
+    AttributeProjection, AttributeValue, IndexName, KeySchemaElement, QueryRequest, QueryResponse,
+    StorageEnum, StorageError, StoredTableInfo, TableName, WireItem, context::WrappedError,
     subset_expression_attribute_names_for_expression,
     subset_expression_attribute_values_for_expression, validate_expression_attribute_usage,
-    validate_gsi_projection_expression, validate_key_attribute_value_for_schema,
+    validate_gsi_projection, validate_gsi_required_attributes,
+    validate_key_attribute_value_for_schema,
 };
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
         StorageApiManagerImpl,
         storage_manager_impl_consumed_capacity::calculate_consumed_capacity_from_inputs,
         storage_manager_impl_expression::{
-            apply_filter_expression_refs, apply_projection_expression_refs,
+            apply_filter_condition_refs, apply_projection_expression_refs, parse_filter_expression,
         },
         storage_manager_impl_read_pagination::{
             page_token_to_key_attributes, paginate_items_by_response_bytes,
@@ -39,7 +40,15 @@ impl StorageApiManagerImpl {
         &self,
         request: QueryRequest,
     ) -> Result<Response, HttpApiError> {
-        self.query_internal_with_context(request, QueryReadContext::Manager)
+        self.query_internal_with_context(request, QueryReadContext::Manager, false)
+            .await
+    }
+
+    pub(super) async fn query_internal_for_read_sequence(
+        &self,
+        request: QueryRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.query_internal_with_context(request, QueryReadContext::Manager, true)
             .await
     }
 
@@ -48,7 +57,7 @@ impl StorageApiManagerImpl {
         request: QueryRequest,
         read_context: &dyn StorageProviderReadContext,
     ) -> Result<Response, HttpApiError> {
-        self.query_internal_with_context(request, QueryReadContext::Provider(read_context))
+        self.query_internal_with_context(request, QueryReadContext::Provider(read_context), true)
             .await
     }
 
@@ -56,6 +65,7 @@ impl StorageApiManagerImpl {
         &self,
         request: QueryRequest,
         read_context: QueryReadContext<'_>,
+        require_projected_filter: bool,
     ) -> Result<Response, HttpApiError> {
         let mut query_expressions = vec![request.key_condition_expression.as_str()];
         if let Some(filter_expr) = request.filter_expression.as_deref() {
@@ -79,14 +89,31 @@ impl StorageApiManagerImpl {
             &request.key_condition_expression,
             request.expression_attribute_values.as_ref(),
         );
+        let filter_condition = request
+            .filter_expression
+            .as_deref()
+            .map(|expression| {
+                parse_filter_expression(
+                    expression,
+                    request.expression_attribute_names.as_ref(),
+                    request.expression_attribute_values.as_ref(),
+                )
+            })
+            .transpose()?;
 
         let table_info = self.db().get_table_info(&request.table_name).await?;
-        validate_gsi_projection_expression(
+        validate_gsi_projection(
             &table_info,
             request.index_name.as_ref(),
             request.projection_expression.as_deref(),
+            request.attributes_to_get.as_deref(),
             request.expression_attribute_names.as_ref(),
         )?;
+        if require_projected_filter && let Some(condition) = filter_condition.as_ref() {
+            let mut required = Vec::new();
+            condition.visit_attribute_paths(&mut |path| required.push(top_level_attribute(path)));
+            validate_gsi_required_attributes(&table_info, request.index_name.as_ref(), required)?;
+        }
         validate_query_key_condition_values(&request, &table_info)?;
         let exclusive_start_key = resolve_exclusive_start_key(
             request.exclusive_start_key.as_ref(),
@@ -114,13 +141,8 @@ impl StorageApiManagerImpl {
         // Apply filtering if FilterExpression is provided
         #[expect(clippy::cast_possible_truncation)]
         let (filtered_items, count, scanned_count) =
-            if let Some(filter_expr) = &request.filter_expression {
-                let filtered = apply_filter_expression_refs(
-                    &items,
-                    filter_expr,
-                    request.expression_attribute_names.as_ref(),
-                    request.expression_attribute_values.as_ref(),
-                )?;
+            if let Some(condition) = filter_condition.as_ref() {
+                let filtered = apply_filter_condition_refs(&items, condition);
                 let filtered_len = filtered.len() as u32;
                 (filtered, filtered_len, items.len() as u32)
             } else {
@@ -139,6 +161,12 @@ impl StorageApiManagerImpl {
                         projection_expr,
                         request.expression_attribute_names.as_ref(),
                     )
+                } else if let Some(attributes) = &request.attributes_to_get {
+                    let projection = AttributeProjection::from_attributes(attributes);
+                    filtered_items
+                        .iter()
+                        .map(|item| projection.project(item).into_hashmap())
+                        .collect()
                 } else {
                     let mut out = Vec::with_capacity(filtered_items.len());
                     for item in &filtered_items {
@@ -570,9 +598,14 @@ fn resolve_expression_attribute_name<'a>(
     identifier
 }
 
+fn top_level_attribute(path: &str) -> &str {
+    path.split(['.', '[']).next().unwrap_or(path)
+}
+
 fn query_wire_fast_path_enabled(request: &QueryRequest) -> bool {
     request.filter_expression.is_none()
         && request.projection_expression.is_none()
+        && request.attributes_to_get.is_none()
         && request.select.as_deref() != Some("COUNT")
 }
 

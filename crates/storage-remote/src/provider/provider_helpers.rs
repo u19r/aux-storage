@@ -1,4 +1,7 @@
-use std::{sync::atomic::AtomicUsize, time::Duration};
+use std::{
+    sync::{Mutex, atomic::AtomicUsize},
+    time::{Duration, Instant},
+};
 
 use aws_sigv4_signing::SigningError;
 use http::Uri;
@@ -13,7 +16,9 @@ use storage_types::{
 };
 
 use crate::{
-    constants::{BASE_BACKOFF_MS, MAX_JITTER_MS},
+    constants::{
+        BASE_BACKOFF_MS, MAX_BACKOFF_MS, RETRY_TOKEN_CAPACITY, RETRY_TOKEN_REFILL_PER_SECOND,
+    },
     provider::{AttemptError, EndpointState},
 };
 
@@ -74,6 +79,7 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
         created_at: TimestampMillis::from(table.created_at),
         attribute_definitions: table.attribute_definitions,
         key_schema: table.key_schema,
+        max_indexers: table.max_indexers,
         global_secondary_indexes: table.global_secondary_indexes.map(|indexes| {
             indexes
                 .into_iter()
@@ -144,20 +150,108 @@ pub(crate) fn record_latency(operation: &str, endpoint: &str, outcome: &str, ela
     .record(latency_ms);
 }
 
-pub(crate) fn compute_backoff(attempt: usize) -> Duration {
+pub(crate) fn retry_backoff_cap(attempt: usize) -> Duration {
     if attempt == 0 {
         return Duration::ZERO;
     }
     let capped_attempt = attempt.saturating_sub(1).min(8);
-    let base = BASE_BACKOFF_MS.saturating_mul(1_u64 << capped_attempt);
-    let jitter_cap = base.min(MAX_JITTER_MS);
-    let jitter = if jitter_cap == 0 {
-        0
-    } else {
-        let mut prng = rng();
-        prng.random_range(0..=jitter_cap)
-    };
-    Duration::from_millis(base + jitter)
+    Duration::from_millis(
+        BASE_BACKOFF_MS
+            .saturating_mul(1_u64 << capped_attempt)
+            .min(MAX_BACKOFF_MS),
+    )
+}
+
+pub(crate) fn full_jitter_delay(attempt: usize, sample: u64) -> Duration {
+    let cap = retry_backoff_cap(attempt).as_millis() as u64;
+    if cap == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(sample % cap.saturating_add(1))
+}
+
+pub(crate) fn compute_backoff(attempt: usize) -> Duration {
+    let cap = retry_backoff_cap(attempt).as_millis() as u64;
+    if cap == 0 {
+        return Duration::ZERO;
+    }
+    let mut prng = rng();
+    full_jitter_delay(attempt, prng.random_range(0..=cap))
+}
+
+#[derive(Debug)]
+struct RetryTokenState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl RetryTokenState {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: RETRY_TOKEN_CAPACITY as f64,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        if elapsed <= 0.0 {
+            return;
+        }
+        self.tokens = (self.tokens + elapsed * RETRY_TOKEN_REFILL_PER_SECOND as f64)
+            .min(RETRY_TOKEN_CAPACITY as f64);
+        self.last_refill = now;
+    }
+
+    fn try_take(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+
+    fn refund(&mut self, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens + 1.0).min(RETRY_TOKEN_CAPACITY as f64);
+    }
+}
+
+/// Per-provider retry budget. The mutex is held only for the arithmetic update;
+/// no network or timer operation is performed while it is locked.
+pub(crate) struct RetryTokenBucket {
+    state: Mutex<RetryTokenState>,
+}
+
+impl RetryTokenBucket {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(RetryTokenState::new(Instant::now())),
+        }
+    }
+
+    pub(crate) fn try_take(&self) -> bool {
+        self.try_take_at(Instant::now())
+    }
+
+    pub(crate) fn try_take_at(&self, now: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.try_take(now)
+    }
+
+    pub(crate) fn refund_one(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.refund(Instant::now());
+    }
 }
 
 pub(super) fn attempt_internal(message: &str) -> AttemptError {
@@ -208,6 +302,7 @@ pub(super) fn error_label(error: &StorageError) -> &'static str {
         StorageEnum::Throttled { .. } => "throttled",
         StorageEnum::LimitExceeded { .. } => "limit_exceeded",
         StorageEnum::RequestLimitExceeded => "request_limit_exceeded",
+        StorageEnum::ServiceUnavailable { .. } => "service_unavailable",
         StorageEnum::Authentication { .. } => "authentication",
         StorageEnum::MissingAuthenticationToken => "missing_authentication_token",
         StorageEnum::AccessDenied { .. } => "access_denied",

@@ -148,6 +148,7 @@ impl ReadPerfFixture {
             .expect("create table");
         for index in 0..ITEM_COUNT {
             db.put_item(storage::PutItemInput {
+                indexers: None,
                 table_name: table_name.clone(),
                 item: realistic_item(index).into(),
                 condition_expression: None,

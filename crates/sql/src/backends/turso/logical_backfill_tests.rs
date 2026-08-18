@@ -16,14 +16,122 @@ use storage_sync::{
 use storage_types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableRequest, DurablePointReadProof,
     DurablePointReadRequest, ItemStreamVersion, KeyAttributeType, KeyAttributes, KeySchemaElement,
-    KeyType, TableName, TimestampMillis,
+    KeyType, ReplicationEventMetadata, ReplicationHybridLogicalClock, ReplicationMutation,
+    ReplicationWriteSource, StreamItemId, StreamName, StreamSpecification, StreamViewType,
+    TableName, TimestampMillis,
 };
-use stream_provider::StreamProvider;
+use stream_provider::{StoredStreamPointer, StreamProvider};
 
 use super::TursoStorageProvider;
 
 const SYNC_APPLY_ALLOC_BATCHES: usize = 8;
 const SYNC_APPLY_ALLOC_BATCH_SIZE: usize = 8;
+
+#[tokio::test]
+async fn given_replication_put_when_streamed_then_indexer_declaration_is_preserved() {
+    let provider = initialized_provider().await;
+    let table_name = TableName::new("turso_replication_indexers");
+    let mut create = basic_create_table_request(&table_name).with_stream_specification(Some(
+        StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewAndOldImages),
+        },
+    ));
+    create.max_indexers = storage_types::MaxIndexers::try_new(1).expect("valid capacity");
+    provider.create_table(&create).await.expect("create table");
+
+    let metadata = ReplicationEventMetadata {
+        origin_region: "eu-west-1".to_string(),
+        origin_sequence: StreamItemId::from([1_u8; 12]),
+        origin_hlc: ReplicationHybridLogicalClock {
+            physical_ms: TimestampMillis::from_timestamp(1_700_000_000_000),
+            logical: 1,
+        },
+        origin_commit_ts: TimestampMillis::from_timestamp(1_700_000_000_000),
+        table_replica_epoch: 1,
+        write_source: ReplicationWriteSource::Replicated,
+    };
+    provider
+        .apply_replication_mutation(ReplicationMutation {
+            table_name: table_name.clone(),
+            key: HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))])
+                .into(),
+            new_image: Some(HashMap::from([
+                ("pk".to_string(), AttributeValue::S("item#1".to_string())),
+                ("status".to_string(), AttributeValue::S("open".to_string())),
+            ])),
+            new_indexers: Some(vec!["status".to_string()]),
+            old_image: None,
+            old_indexers: None,
+            metadata,
+        })
+        .await
+        .expect("apply mutation");
+
+    let page = provider
+        .read_forward(StreamName::table_stream(&table_name), None, 1)
+        .await
+        .expect("read stream");
+    let pointer: StoredStreamPointer =
+        storage_types::storage_serde::from_bytes(&page.items[0].data).expect("decode pointer");
+    assert_eq!(pointer.indexers(), ["status"]);
+}
+
+#[tokio::test]
+async fn given_indexed_item_when_logically_copied_then_declaration_and_missing_slot_survive() {
+    let source = initialized_provider().await;
+    let destination = initialized_provider().await;
+    let table_name = TableName::new("turso_logical_indexers");
+    let mut create = basic_create_table_request(&table_name);
+    create.max_indexers = storage_types::MaxIndexers::try_new(2).expect("valid capacity");
+    source
+        .create_table(&create)
+        .await
+        .expect("create source table");
+    destination
+        .create_table(&create)
+        .await
+        .expect("create destination table");
+
+    let mut put =
+        storage_types::PutItemRequest::new(table_name.clone(), item_map("item#1", "open"));
+    put.indexers = Some(vec!["status".to_string(), "missing".to_string()]);
+    source
+        .put_item_request(put)
+        .await
+        .expect("put indexed item");
+    let page = source
+        .export_logical_page(export_request(
+            LogicalBackfillDomain::ItemRecords,
+            Some(&table_name),
+        ))
+        .await
+        .expect("export item");
+    import_records(
+        &destination,
+        &logical_manifest(vec![LogicalBackfillDomain::ItemRecords]),
+        LogicalBackfillDomain::ItemRecords,
+        page.records,
+    )
+    .await;
+
+    let DurablePointReadProof::Present { item, indexers, .. } = destination
+        .get_item_with_durable_proof(DurablePointReadRequest {
+            table_name,
+            key: KeyAttributes::from(key_map("item#1")),
+            consistent_read: true,
+        })
+        .await
+        .expect("read imported item")
+    else {
+        panic!("imported item should exist");
+    };
+    assert_eq!(indexers, ["status", "missing"]);
+    assert_eq!(
+        item.into_attribute_map().expect("decode item"),
+        item_map("item#1", "open")
+    );
+}
 
 #[tokio::test]
 async fn turso_logical_empty_domains_export_without_unsupported_errors() {
@@ -66,10 +174,9 @@ async fn turso_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
         .expect("initialize turso streams");
 
     let table_name = TableName::new("sync_turso_items");
-    provider
-        .create_table(&basic_create_table_request(&table_name))
-        .await
-        .expect("create table");
+    let mut create = basic_create_table_request(&table_name);
+    create.max_indexers = storage_types::MaxIndexers::try_new(1).expect("valid capacity");
+    provider.create_table(&create).await.expect("create table");
 
     let key_json = r#"{"pk":{"S":"item#1"}}"#.to_string();
     let item_json = r#"{"pk":{"S":"item#1"},"status":{"S":"open"}}"#.to_string();
@@ -78,7 +185,9 @@ async fn turso_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
         table_name: table_name.clone(),
         key_json: key_json.clone(),
         item_json,
+        indexers: vec!["status".to_string()],
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(7),
         response: SyncMutationResponse {
             response_json: Some(r#"{"ok":true}"#.to_string()),
@@ -90,6 +199,7 @@ async fn turso_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
         table_name: table_name.clone(),
         key_json: delete_key_json.clone(),
         old_item_json: Some(r#"{"pk":{"S":"item#2"},"status":{"S":"closed"}}"#.to_string()),
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(8),
         response: SyncMutationResponse {
             response_json: Some(r#"{"deleted":true}"#.to_string()),
@@ -153,13 +263,17 @@ async fn turso_resolved_sync_apply_is_idempotent_and_sets_target_revision() {
         })
         .await
         .expect("durable proof");
-    let DurablePointReadProof::Present { revision, .. } = proof else {
+    let DurablePointReadProof::Present {
+        revision, indexers, ..
+    } = proof
+    else {
         panic!("sync-applied item should be present");
     };
     assert_eq!(
         revision.as_bytes(),
         &ItemStreamVersion::new(7).to_be_bytes()
     );
+    assert_eq!(indexers, ["status"]);
     let delete_key = serde_json::from_str::<HashMap<String, AttributeValue>>(&delete_key_json)
         .expect("decode delete key");
     let delete_proof = provider
@@ -268,6 +382,7 @@ async fn turso_logical_item_export_import_preserves_target_revision() {
         table_name: table_name.as_ref().to_string(),
         key_json: r#"{"pk":{"S":"item#1"}}"#.to_string(),
         item_json: r#"{"pk":{"S":"item#1"},"status":{"S":"stale"}}"#.to_string(),
+        indexers: Vec::new(),
         item_stream_version: ItemStreamVersion::new(6),
     };
     import_records(
@@ -432,7 +547,9 @@ async fn apply_sync_put(
         table_name: table_name.clone(),
         key_json: serde_json::to_string(&key_map(pk)).expect("encode key"),
         item_json: serde_json::to_string(&item_map(pk, status)).expect("encode item"),
+        indexers: Vec::new(),
         old_item_json: None,
+        old_indexers: None,
         target_item_stream_version: ItemStreamVersion::new(version),
         response: SyncMutationResponse {
             response_json: Some(r#"{"ok":true}"#.to_string()),
@@ -472,7 +589,9 @@ fn sync_apply_allocation_batches(table_name: &TableName) -> Vec<ResolvedSyncMuta
                             "open",
                         ))
                         .expect("encode item"),
+                        indexers: Vec::new(),
                         old_item_json: None,
+                        old_indexers: None,
                         target_item_stream_version: ItemStreamVersion::new(
                             absolute_index as u64 + 1,
                         ),
