@@ -1,3 +1,5 @@
+use fdb_chaos_model::PublishAuditPhase;
+
 use crate::{common::*, imports::*, pubsub_delivery::*};
 
 impl RustWorkload for PubsubDeliveryWorkload {
@@ -82,13 +84,6 @@ impl RustWorkload for PubsubDeliveryWorkload {
             );
             return;
         }
-        let manager = match self.manager(db.clone()).await {
-            Ok(manager) => manager,
-            Err(err) => {
-                self.trace_error("start", err);
-                return;
-            }
-        };
         let provider = match self.provider(db.clone()).await {
             Ok(provider) => provider,
             Err(err) => {
@@ -97,53 +92,86 @@ impl RustWorkload for PubsubDeliveryWorkload {
             }
         };
 
-        self.trace_operation("start", "publish");
-        let publish = match manager
-            .publish(PublishRequest {
-                topic_arn: topic_arn.clone(),
-                message: self.message_body(0),
-                subject: None,
-                message_attributes: HashMap::new(),
-            })
-            .await
-        {
-            Ok(publish) => publish,
-            Err(err) => {
-                self.trace_error("publish", err.to_string());
+        let message_id = match self.publish_for_delivery_audit(&provider, &topic_arn).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                self.trace_error("publish", error);
                 return;
             }
         };
-        self.publish_count += 1;
-        let mut delivery_record_ids = subscription_arns
-            .iter()
-            .map(|subscription_arn| {
-                DeliveryRecordId(format!("{}:{}", subscription_arn, publish.message_id))
-            })
-            .collect::<Vec<_>>();
-        delivery_record_ids.sort_by(|left, right| left.0.cmp(&right.0));
-
-        self.trace_operation("start", "claim_delivery");
-        let now = TimestampMillis::now();
-        let claim = match provider
-            .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                owner: "fdb-chaos-pubsub-worker".to_string(),
-                now,
-                lease_expires_at: now + 30,
-                limit: 10,
-            })
+        self.message_id = Some(message_id);
+        if let Err(error) = self
+            .audit_publish_effects(db.clone(), PublishAuditPhase::Accepted)
             .await
         {
-            Ok(claim) => claim,
+            self.trace_error("publish_acceptance_audit", error);
+            return;
+        }
+
+        if let Err(error) = self
+            .materialize_for_delivery_audit(&provider, db.clone())
+            .await
+        {
+            let audit = self
+                .audit_publish_effects(db.clone(), PublishAuditPhase::Materialized)
+                .await;
+            self.trace_error(
+                "materialize_publish_intents",
+                format!(
+                    "{error}; durable audit: {:?}",
+                    audit.as_ref().map(|records| records.len())
+                ),
+            );
+            return;
+        }
+        let materialized = match self
+            .audit_publish_effects(db.clone(), PublishAuditPhase::Materialized)
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                self.trace_error("publish_materialization_audit", error);
+                return;
+            }
+        };
+        let delivery_record_ids = materialized
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        self.delivery_record_ids = delivery_record_ids.clone();
+
+        self.trace_operation("start", "claim_delivery");
+        let mut now = TimestampMillis::now();
+        let Some(limit) = DeliveryClaimLimit::try_from(10usize).ok() else {
+            return;
+        };
+        let claim = match self
+            .claim_delivery_for_audit(
+                &provider,
+                "claim_delivery",
+                ClaimDeliveryRecordsRequest {
+                    owner: "fdb-chaos-pubsub-worker".to_string(),
+                    now,
+                    lease_expires_at: now + 30,
+                    limit,
+                },
+            )
+            .await
+        {
+            Ok((claim, next_now)) => {
+                now = next_now;
+                claim
+            }
             Err(err) => {
                 self.trace_error("claim_delivery", err.to_string());
                 return;
             }
         };
-        if claim.records.len() != 2 {
+        if claim.records.len() != delivery_record_ids.len() {
             self.trace_error(
                 "claim_delivery",
                 format!(
-                    "expected two delivery records, found {}",
+                    "expected all materialized delivery records, found {}",
                     claim.records.len()
                 ),
             );
@@ -168,16 +196,26 @@ impl RustWorkload for PubsubDeliveryWorkload {
         self.claim_count += records.len() as u64;
 
         self.trace_operation("start", "claim_duplicate");
-        let duplicate = match provider
-            .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                owner: "fdb-chaos-pubsub-worker-duplicate".to_string(),
-                now: now + 1,
-                lease_expires_at: now + 31,
-                limit: 10,
-            })
+        let Some(limit) = DeliveryClaimLimit::try_from(10usize).ok() else {
+            return;
+        };
+        let duplicate = match self
+            .claim_delivery_for_audit(
+                &provider,
+                "claim_duplicate",
+                ClaimDeliveryRecordsRequest {
+                    owner: "fdb-chaos-pubsub-worker-duplicate".to_string(),
+                    now: now + 1,
+                    lease_expires_at: now + 31,
+                    limit,
+                },
+            )
             .await
         {
-            Ok(claim) => claim,
+            Ok((claim, next_now)) => {
+                now = next_now;
+                claim
+            }
             Err(err) => {
                 self.trace_error("claim_duplicate", err.to_string());
                 return;
@@ -195,45 +233,70 @@ impl RustWorkload for PubsubDeliveryWorkload {
         }
         self.duplicate_claim_reject_count += 1;
 
-        self.trace_operation("start", "mark_delivered");
-        let mut delivered_record = records.remove(0);
-        delivered_record.status = DeliveryStatus::Delivered;
-        delivered_record.updated_at = now + 2;
-        delivered_record.lease_owner = None;
-        delivered_record.lease_expires_at = None;
-        if let Err(err) = provider.update_delivery_record(delivered_record).await {
-            self.trace_error("mark_delivered", err.to_string());
-            return;
+        let mut retry_record_ids = Vec::new();
+        for record in records {
+            let delivered = self.expected_delivery_status(&record.subscription_arn)
+                == DeliveryStatus::Delivered;
+            let Some(owner) = record.lease_owner else {
+                self.trace_error(
+                    "update_delivery",
+                    "claimed delivery has no lease owner".into(),
+                );
+                return;
+            };
+            if !delivered {
+                retry_record_ids.push(record.id.clone());
+            }
+            let update = DeliveryRecordUpdate {
+                record_id: record.id,
+                expected_claim_generation: record.claim_generation,
+                expected_lease_owner: owner,
+                status: if delivered {
+                    DeliveryStatus::Delivered
+                } else {
+                    DeliveryStatus::RetryScheduled
+                },
+                attempts: record.attempts.saturating_add(1),
+                next_attempt_at: if delivered { None } else { Some(now + 10) },
+                last_error: if delivered {
+                    None
+                } else {
+                    Some("fdb-chaos synthetic retry".into())
+                },
+                updated_at: now + 3,
+            };
+            if let Err(error) = provider.update_delivery_record(update).await {
+                self.trace_error("update_delivery", error.to_string());
+                return;
+            }
+            if delivered {
+                self.delivered_count += 1;
+            } else {
+                self.retry_reschedule_count += 1;
+            }
         }
-        self.delivered_count += 1;
-
-        self.trace_operation("start", "schedule_retry");
-        let mut retry_record = records.remove(0);
-        retry_record.status = DeliveryStatus::RetryScheduled;
-        retry_record.attempts += 1;
-        retry_record.next_attempt_at = Some(now + 10);
-        retry_record.updated_at = now + 3;
-        retry_record.lease_owner = None;
-        retry_record.lease_expires_at = None;
-        retry_record.last_error = Some("fdb-chaos synthetic retry".to_string());
-        let retry_record_id = retry_record.id.clone();
-        if let Err(err) = provider.update_delivery_record(retry_record).await {
-            self.trace_error("schedule_retry", err.to_string());
-            return;
-        }
-        self.retry_reschedule_count += 1;
 
         self.trace_operation("start", "claim_terminal_and_retry_not_due");
-        let not_due = match provider
-            .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                owner: "fdb-chaos-pubsub-worker-terminal".to_string(),
-                now: now + 4,
-                lease_expires_at: now + 34,
-                limit: 10,
-            })
+        let Some(limit) = DeliveryClaimLimit::try_from(10usize).ok() else {
+            return;
+        };
+        let not_due = match self
+            .claim_delivery_for_audit(
+                &provider,
+                "claim_terminal_and_retry_not_due",
+                ClaimDeliveryRecordsRequest {
+                    owner: "fdb-chaos-pubsub-worker-terminal".to_string(),
+                    now: now + 4,
+                    lease_expires_at: now + 34,
+                    limit,
+                },
+            )
             .await
         {
-            Ok(claim) => claim,
+            Ok((claim, next_now)) => {
+                now = next_now;
+                claim
+            }
             Err(err) => {
                 self.trace_error("claim_terminal_and_retry_not_due", err.to_string());
                 return;
@@ -252,57 +315,86 @@ impl RustWorkload for PubsubDeliveryWorkload {
         self.terminal_duplicate_reject_count += 1;
 
         self.trace_operation("start", "claim_retry_due");
-        let retry_claim = match provider
-            .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                owner: "fdb-chaos-pubsub-worker-retry".to_string(),
-                now: now + 11,
-                lease_expires_at: now + 41,
-                limit: 10,
-            })
+        let Some(limit) = DeliveryClaimLimit::try_from(10usize).ok() else {
+            return;
+        };
+        let retry_claim = match self
+            .claim_delivery_for_audit(
+                &provider,
+                "claim_retry_due",
+                ClaimDeliveryRecordsRequest {
+                    owner: "fdb-chaos-pubsub-worker-retry".to_string(),
+                    now: now + 11,
+                    lease_expires_at: now + 41,
+                    limit,
+                },
+            )
             .await
         {
-            Ok(claim) => claim,
+            Ok((claim, next_now)) => {
+                now = next_now;
+                claim
+            }
             Err(err) => {
                 self.trace_error("claim_retry_due", err.to_string());
                 return;
             }
         };
-        if retry_claim.records.len() != 1 || retry_claim.records[0].id != retry_record_id {
+        let mut retry_ids = retry_claim
+            .records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        retry_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        if retry_ids != retry_record_ids {
             self.trace_error(
                 "claim_retry_due",
-                format!(
-                    "expected retry delivery {}, found {:?}",
-                    retry_record_id.0, retry_claim.records
-                ),
+                "retry claim differs from scheduled record set".into(),
             );
             return;
         }
-        self.retry_claim_count += 1;
-
+        self.retry_claim_count += retry_claim.records.len() as u64;
         self.trace_operation("start", "mark_failed");
-        let mut failed_record = retry_claim.records[0].clone();
-        failed_record.status = DeliveryStatus::Failed;
-        failed_record.updated_at = now + 12;
-        failed_record.lease_owner = None;
-        failed_record.lease_expires_at = None;
-        failed_record.last_error = Some("fdb-chaos synthetic failure".to_string());
-        if let Err(err) = provider.update_delivery_record(failed_record).await {
-            self.trace_error("mark_failed", err.to_string());
-            return;
+        for record in retry_claim.records {
+            let Some(owner) = record.lease_owner else {
+                self.trace_error("mark_failed", "claimed delivery has no lease owner".into());
+                return;
+            };
+            let update = DeliveryRecordUpdate {
+                record_id: record.id,
+                expected_claim_generation: record.claim_generation,
+                expected_lease_owner: owner,
+                status: DeliveryStatus::Failed,
+                attempts: record.attempts.saturating_add(1),
+                next_attempt_at: None,
+                last_error: Some("fdb-chaos synthetic failure".into()),
+                updated_at: now + 12,
+            };
+            if let Err(error) = provider.update_delivery_record(update).await {
+                self.trace_error("mark_failed", error.to_string());
+                return;
+            }
+            self.failed_count += 1;
         }
-        self.failed_count += 1;
 
         self.trace_operation("start", "claim_terminal_failed");
-        let failed_terminal = match provider
-            .claim_delivery_records(ClaimDeliveryRecordsRequest {
-                owner: "fdb-chaos-pubsub-worker-failed-terminal".to_string(),
-                now: now + 13,
-                lease_expires_at: now + 43,
-                limit: 10,
-            })
+        let Some(limit) = DeliveryClaimLimit::try_from(10usize).ok() else {
+            return;
+        };
+        let failed_terminal = match self
+            .claim_delivery_for_audit(
+                &provider,
+                "claim_terminal_failed",
+                ClaimDeliveryRecordsRequest {
+                    owner: "fdb-chaos-pubsub-worker-failed-terminal".to_string(),
+                    now: now + 13,
+                    lease_expires_at: now + 43,
+                    limit,
+                },
+            )
             .await
         {
-            Ok(claim) => claim,
+            Ok((claim, _next_now)) => claim,
             Err(err) => {
                 self.trace_error("claim_terminal_failed", err.to_string());
                 return;
@@ -322,7 +414,6 @@ impl RustWorkload for PubsubDeliveryWorkload {
 
         self.topic_arn = Some(topic_arn);
         self.subscription_arns = subscription_arns;
-        self.message_id = Some(publish.message_id);
         self.delivery_record_ids = delivery_record_ids;
     }
 
@@ -332,88 +423,62 @@ impl RustWorkload for PubsubDeliveryWorkload {
         if self.client_id != 0 {
             return;
         }
-        let delivery_record_ids = self.delivery_record_ids.clone();
-        if delivery_record_ids.len() != 2 {
+        if self.message_id.is_none() || self.delivery_record_ids.len() < 2 {
             self.trace_error(
                 "check",
-                format!(
-                    "expected two delivery record ids, found {}",
-                    delivery_record_ids.len()
-                ),
+                "acknowledged delivery coverage was not initialized".into(),
             );
             return;
         }
         let provider = match self.provider(db.clone()).await {
             Ok(provider) => provider,
-            Err(err) => {
-                self.trace_error("check", err);
+            Err(error) => {
+                self.trace_error("check", error);
                 return;
             }
         };
-
-        self.trace_operation("check", "delivery_record_terminal");
-        for (record_id, expected_status) in [
-            (&delivery_record_ids[0], DeliveryStatus::Delivered),
-            (&delivery_record_ids[1], DeliveryStatus::Failed),
-        ] {
-            match provider.get_delivery_record(record_id).await {
-                Ok(Some(record)) if record.status == expected_status => {
-                    self.orphan_check_count += 1;
-                }
-                Ok(Some(record)) => {
-                    self.trace_error(
-                        "delivery_record_terminal",
-                        format!(
-                            "expected terminal record {} status {:?}, found {:?}",
-                            record_id.0, expected_status, record.status
-                        ),
-                    );
-                    return;
-                }
-                Ok(None) => {
-                    self.trace_error(
-                        "delivery_record_terminal",
-                        format!("delivery record {} is missing", record_id.0),
-                    );
-                    return;
-                }
-                Err(err) => {
-                    self.trace_error("delivery_record_terminal", err.to_string());
-                    return;
-                }
-            }
-        }
-
-        self.trace_operation("check", "direct_delivery_record_scan");
-        let direct_records = match self.direct_delivery_records(db).await {
+        let records = match self
+            .audit_publish_effects(db, PublishAuditPhase::Terminal)
+            .await
+        {
             Ok(records) => records,
-            Err(err) => {
-                self.trace_error("direct_delivery_record_scan", err);
+            Err(error) => {
+                self.trace_error("publish_terminal_audit", error);
                 return;
             }
         };
-        self.direct_scan_count += direct_records.len() as u64;
-        for (record_id, expected_status) in [
-            (&delivery_record_ids[0], DeliveryStatus::Delivered),
-            (&delivery_record_ids[1], DeliveryStatus::Failed),
-        ] {
-            match direct_records.iter().find(|record| record.id == *record_id) {
-                Some(record) if record.status == expected_status => {}
-                Some(record) => {
+        self.direct_scan_count += records.len() as u64;
+        let direct_ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        if direct_ids != self.delivery_record_ids {
+            self.trace_error(
+                "check",
+                "terminal delivery set differs from materialized set".into(),
+            );
+            return;
+        }
+        for direct in records {
+            let expected = self.expected_delivery_status(&direct.subscription_arn);
+            if direct.status != expected {
+                self.trace_error(
+                    "check",
+                    "direct delivery has incorrect terminal outcome".into(),
+                );
+                return;
+            }
+            match provider.get_delivery_record(&direct.id).await {
+                Ok(Some(record)) if record == direct => self.orphan_check_count += 1,
+                Ok(_) => {
                     self.trace_error(
-                        "direct_delivery_record_scan",
-                        format!(
-                            "direct scan expected record {} status {:?}, found {:?}",
-                            record_id.0, expected_status, record.status
-                        ),
+                        "check",
+                        "provider delivery differs from durable audit".into(),
                     );
                     return;
                 }
-                None => {
-                    self.trace_error(
-                        "direct_delivery_record_scan",
-                        format!("direct scan did not find delivery record {}", record_id.0),
-                    );
+                Err(error) => {
+                    self.trace_error("check", error.to_string());
                     return;
                 }
             }
@@ -428,6 +493,18 @@ impl RustWorkload for PubsubDeliveryWorkload {
             metric_val_u64(
                 "aux_storage_pubsub_delivery_publish_count",
                 self.publish_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_publish_count",
+                self.unknown_publish_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_materialization_count",
+                self.unknown_materialization_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_claim_count",
+                self.unknown_claim_count,
             ),
             metric_val_u64("aux_storage_pubsub_delivery_claim_count", self.claim_count),
             metric_val_u64(

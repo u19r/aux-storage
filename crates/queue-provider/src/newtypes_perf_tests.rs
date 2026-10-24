@@ -2,10 +2,11 @@ use std::{str::FromStr, time::Instant};
 
 use alloc_counter::AllocationGuard;
 
-use crate::{MessageId, constants::MESSAGE_ID_VERSIONSTAMP_LEN};
-
-const ITERATIONS: usize = 200_000;
-const MESSAGE_ID_HEX: &str = "018f1f612a6f7ac3b9b67f65";
+use crate::{
+    MessageId,
+    constants::MESSAGE_ID_VERSIONSTAMP_LEN,
+    constants_tests::{NEWTYPES_PERF_ITERATIONS, NEWTYPES_PERF_MESSAGE_ID_HEX},
+};
 
 fn parse_message_id_legacy(value: &str) -> Result<MessageId, hex::FromHexError> {
     let decoded = hex::decode(value)?;
@@ -24,15 +25,15 @@ fn measure_runtime(
     let started = Instant::now();
     let mut checksum = 0u8;
 
-    for _ in 0..ITERATIONS {
-        let id = parse(MESSAGE_ID_HEX).expect("parse message id");
+    for _ in 0..NEWTYPES_PERF_ITERATIONS {
+        let id = parse(NEWTYPES_PERF_MESSAGE_ID_HEX).expect("parse message id");
         checksum ^= id.as_bytes()[11];
     }
 
     let elapsed = started.elapsed();
-    let ns_per_iter = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+    let ns_per_iter = elapsed.as_nanos() as f64 / NEWTYPES_PERF_ITERATIONS as f64;
     println!(
-        "{label} iterations={ITERATIONS} checksum={checksum} elapsed_ms={:.3} \
+        "{label} iterations={NEWTYPES_PERF_ITERATIONS} checksum={checksum} elapsed_ms={:.3} \
          ns_per_iter={ns_per_iter:.2}",
         elapsed.as_secs_f64() * 1_000.0,
     );
@@ -52,8 +53,8 @@ fn measure_allocations(
     );
 
     let mut checksum = 0u8;
-    for _ in 0..ITERATIONS {
-        let id = parse(MESSAGE_ID_HEX).expect("parse message id");
+    for _ in 0..NEWTYPES_PERF_ITERATIONS {
+        let id = parse(NEWTYPES_PERF_MESSAGE_ID_HEX).expect("parse message id");
         checksum ^= id.as_bytes()[11];
     }
     std::hint::black_box(checksum);
@@ -70,8 +71,8 @@ fn message_id_parse_avoids_temporary_decode_allocation_tests() {
         MessageId::from_str(value)
     });
 
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert_eq!(optimized.allocation_count, 0);
     assert!(optimized.allocation_count < legacy.allocation_count);

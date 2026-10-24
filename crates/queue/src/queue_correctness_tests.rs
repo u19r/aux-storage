@@ -1,33 +1,25 @@
-#[cfg(feature = "foundationdb")]
-use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-#[cfg(feature = "foundationdb")]
-use queue_provider::FoundationDbSettings;
-#[cfg(feature = "postgres")]
-use queue_provider::PostgresSettings;
 use queue_provider::{
-    CreateQueueRequest, DeleteMessageRequest, QueueBackend, QueueConfig, ReceiveMessageRequest,
-    SendMessageRequest,
+    CreateQueueRequest, DeleteMessageRequest, QueueError, QueueValidationKind,
+    ReceiveMessageRequest, SendMessageRequest,
 };
 
-use crate::{QueueManager, create_queue_provider};
-
-const SOAK_MESSAGE_COUNT: usize = 240;
-const SOAK_WORKER_COUNT: usize = 12;
-const RECEIVE_BATCH_SIZE: u32 = 10;
-
-struct BackendCase {
-    name: &'static str,
-    config: QueueConfig,
-}
+use crate::{
+    QueueManager,
+    constants_tests::{RECEIVE_BATCH_SIZE, SOAK_MESSAGE_COUNT, SOAK_WORKER_COUNT},
+    queue_test_support_tests::{
+        BackendCase, required_manager_for_case, select_native_backend_name,
+        selected_distributed_backend_case, selected_native_backend_case, unique_suffix,
+    },
+};
 
 #[derive(Debug, Default)]
 struct SoakReport {
@@ -37,171 +29,6 @@ struct SoakReport {
     dropped_messages: usize,
     delayed_messages: usize,
     over_five_attempt_receives: usize,
-}
-
-fn unique_suffix(label: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{label}-{nanos}-{}", std::process::id())
-}
-
-#[cfg(feature = "rocksdb")]
-fn local_rocksdb_path(label: &str) -> std::path::PathBuf {
-    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = crate_dir
-        .parent()
-        .and_then(|path| path.parent())
-        .expect("workspace root");
-    workspace_root
-        .join("target")
-        .join("queue-test-data")
-        .join(unique_suffix(label))
-}
-
-fn empty_config(backend_type: QueueBackend) -> QueueConfig {
-    QueueConfig {
-        backend_type,
-        connection_string: None,
-        file_path: None,
-        postgres: None,
-        foundationdb: None,
-        remote: None,
-    }
-}
-
-fn sqlite_case(_label: &str) -> BackendCase {
-    let mut config = empty_config(QueueBackend::SQLite);
-    config.connection_string = Some(":memory:".to_string());
-    BackendCase {
-        name: "sqlite",
-        config,
-    }
-}
-
-#[cfg(feature = "turso")]
-fn turso_case(_label: &str) -> BackendCase {
-    let mut config = empty_config(QueueBackend::Turso);
-    config.connection_string = Some(":memory:".to_string());
-    BackendCase {
-        name: "turso",
-        config,
-    }
-}
-
-#[cfg(feature = "rocksdb")]
-fn rocksdb_case(label: &str) -> BackendCase {
-    let mut config = empty_config(QueueBackend::RocksDB);
-    config.connection_string = Some(local_rocksdb_path(label).to_string_lossy().to_string());
-    BackendCase {
-        name: "rocksdb",
-        config,
-    }
-}
-
-#[cfg(feature = "postgres")]
-fn postgres_case(_label: &str) -> Option<BackendCase> {
-    let dsn = std::env::var("AUX_QUEUE_POSTGRES_DSN")
-        .or_else(|_| std::env::var("POSTGRES_DSN"))
-        .unwrap_or_else(|_| {
-            let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
-            format!("postgres://{user}@localhost:5432/postgres")
-        });
-    if dsn.trim().is_empty() {
-        return None;
-    }
-    let mut config = empty_config(QueueBackend::Postgres);
-    config.connection_string = Some(dsn.clone());
-    config.postgres = Some(PostgresSettings {
-        dsn,
-        max_pool_size: 16,
-        background_max_pool_size: 4,
-        tls: false,
-    });
-    Some(BackendCase {
-        name: "postgres",
-        config,
-    })
-}
-
-#[cfg(feature = "foundationdb")]
-fn local_fdb_cluster_file_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("FDB_CLUSTER_FILE") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    [
-        "/usr/local/etc/foundationdb/fdb.cluster",
-        "/opt/homebrew/etc/foundationdb/fdb.cluster",
-        "/etc/foundationdb/fdb.cluster",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|path| path.is_file())
-}
-
-#[cfg(feature = "foundationdb")]
-fn foundationdb_case(label: &str) -> Option<BackendCase> {
-    let cluster_file = local_fdb_cluster_file_path()?;
-    let mut config = empty_config(QueueBackend::FoundationDb);
-    config.foundationdb = Some(FoundationDbSettings {
-        cluster_file: Some(cluster_file.to_string_lossy().to_string()),
-        subspace_prefix: Some(format!("tests/queue-correctness/{}/", unique_suffix(label))),
-        ..FoundationDbSettings::default()
-    });
-    Some(BackendCase {
-        name: "foundationdb",
-        config,
-    })
-}
-
-fn available_single_node_backend_cases(label: &str) -> Vec<BackendCase> {
-    #[allow(unused_mut)]
-    let mut cases = vec![sqlite_case(label)];
-    cases
-}
-
-fn available_multi_node_backend_cases(_label: &str) -> Vec<BackendCase> {
-    #[allow(unused_mut)]
-    let mut cases = Vec::new();
-    #[cfg(feature = "foundationdb")]
-    if let Some(case) = foundationdb_case(_label) {
-        cases.push(case);
-    }
-    #[cfg(feature = "postgres")]
-    if let Some(case) = postgres_case(_label) {
-        cases.push(case);
-    }
-    cases
-}
-
-async fn manager_for_case(case: &BackendCase) -> Option<Arc<QueueManager>> {
-    let storage = match create_queue_provider(case.config.clone()).await {
-        Ok(storage) => storage,
-        Err(error) if case.name == "foundationdb" || case.name == "postgres" => {
-            eprintln!("skipping {} queue correctness case: {error}", case.name);
-            return None;
-        }
-        Err(error) => panic!("create {} queue provider: {error:?}", case.name),
-    };
-    if let Err(error) = storage.initialize().await {
-        if case.name == "foundationdb" || case.name == "postgres" {
-            eprintln!("skipping {} queue correctness case: {error}", case.name);
-            return None;
-        }
-        panic!("initialize {} queue provider: {error:?}", case.name);
-    }
-    Some(Arc::new(QueueManager::new(Arc::from(storage))))
-}
-
-async fn required_manager_for_case(case: &BackendCase) -> Arc<QueueManager> {
-    manager_for_case(case)
-        .await
-        .unwrap_or_else(|| panic!("{} provider should be available", case.name))
 }
 
 async fn create_queue(manager: &QueueManager, queue_name: &str) -> String {
@@ -263,16 +90,15 @@ async fn receive_one_within_attempts(
     messages
 }
 
-async fn run_twelve_worker_no_drop_duplicate(case: &BackendCase) {
-    let manager = required_manager_for_case(case).await;
+async fn run_twelve_worker_no_drop_duplicate(case: &BackendCase, manager: &Arc<QueueManager>) {
     let queue_url = create_queue(
-        &manager,
+        manager,
         &format!("{}-twelve-workers", unique_suffix(case.name)),
     )
     .await;
 
     for index in 0..120 {
-        send_message(&manager, &queue_url, format!("message-{index}")).await;
+        send_message(manager, &queue_url, format!("message-{index}")).await;
     }
 
     let mut unique_ids = HashSet::new();
@@ -280,7 +106,7 @@ async fn run_twelve_worker_no_drop_duplicate(case: &BackendCase) {
     for _ in 0..4 {
         let mut workers = Vec::new();
         for _ in 0..12 {
-            let manager = Arc::clone(&manager);
+            let manager = Arc::clone(manager);
             let queue_url = queue_url.clone();
             workers.push(tokio::spawn(async move {
                 receive_messages(&manager, &queue_url, RECEIVE_BATCH_SIZE).await
@@ -309,16 +135,15 @@ async fn run_twelve_worker_no_drop_duplicate(case: &BackendCase) {
     assert_eq!(total_received, 120, "{} received count mismatch", case.name);
 }
 
-async fn run_known_visible_found_quickly(case: &BackendCase) {
-    let manager = required_manager_for_case(case).await;
+async fn run_known_visible_found_quickly(case: &BackendCase, manager: &Arc<QueueManager>) {
     let queue_url = create_queue(
-        &manager,
+        manager,
         &format!("{}-bounded-discovery", unique_suffix(case.name)),
     )
     .await;
-    let sent_id = send_message(&manager, &queue_url, "known-visible".to_string()).await;
+    let sent_id = send_message(manager, &queue_url, "known-visible".to_string()).await;
 
-    let messages = receive_one_within_attempts(&manager, &queue_url, 4).await;
+    let messages = receive_one_within_attempts(manager, &queue_url, 4).await;
     assert_eq!(
         messages.len(),
         1,
@@ -328,19 +153,18 @@ async fn run_known_visible_found_quickly(case: &BackendCase) {
     assert_eq!(messages[0].message_id, sent_id);
 }
 
-async fn run_send_to_receive_under_500ms(case: &BackendCase) {
-    let manager = required_manager_for_case(case).await;
+async fn run_send_to_receive_under_500ms(case: &BackendCase, manager: &Arc<QueueManager>) {
     let queue_url = create_queue(
-        &manager,
+        manager,
         &format!("{}-send-to-receive", unique_suffix(case.name)),
     )
     .await;
-    send_message(&manager, &queue_url, "latency".to_string()).await;
+    send_message(manager, &queue_url, "latency".to_string()).await;
 
     let started_at = Instant::now();
     let mut messages = Vec::new();
     while started_at.elapsed() < Duration::from_millis(500) {
-        messages = receive_messages(&manager, &queue_url, 1).await;
+        messages = receive_messages(manager, &queue_url, 1).await;
         if !messages.is_empty() {
             break;
         }
@@ -355,16 +179,18 @@ async fn run_send_to_receive_under_500ms(case: &BackendCase) {
     );
 }
 
-async fn run_stale_receipt_does_not_delete_current_claim(case: &BackendCase) {
-    let manager = required_manager_for_case(case).await;
+async fn run_stale_receipt_does_not_delete_current_claim(
+    case: &BackendCase,
+    manager: &Arc<QueueManager>,
+) {
     let queue_url = create_queue(
-        &manager,
+        manager,
         &format!("{}-stale-receipt", unique_suffix(case.name)),
     )
     .await;
-    let sent_id = send_message(&manager, &queue_url, "stale-receipt".to_string()).await;
+    let sent_id = send_message(manager, &queue_url, "stale-receipt".to_string()).await;
 
-    let first = receive_one_within_attempts(&manager, &queue_url, 4).await;
+    let first = receive_one_within_attempts(manager, &queue_url, 4).await;
     assert_eq!(first.len(), 1);
     manager
         .change_message_visibility(queue_provider::ChangeMessageVisibilityRequest {
@@ -375,7 +201,7 @@ async fn run_stale_receipt_does_not_delete_current_claim(case: &BackendCase) {
         .await
         .expect("make first claim visible");
 
-    let second = receive_one_within_attempts(&manager, &queue_url, 16).await;
+    let second = receive_one_within_attempts(manager, &queue_url, 16).await;
     assert_eq!(
         second.len(),
         1,
@@ -390,11 +216,27 @@ async fn run_stale_receipt_does_not_delete_current_claim(case: &BackendCase) {
             receipt_handle: first[0].receipt_handle.as_str().into(),
         })
         .await;
-    assert!(
-        stale_delete.is_err(),
-        "{} stale receipt handle should not delete current claim",
-        case.name
-    );
+    // AWS permits an old, otherwise valid receipt handle to return success when
+    // it no longer identifies the current claim; the operation must not remove
+    // that claim. Providers that reject stale handles use this typed validation
+    // error instead.
+    if let Err(error) = stale_delete {
+        assert!(
+            matches!(
+                error,
+                QueueError::Validation {
+                    kind: QueueValidationKind::MessageNotFoundOrAlreadyProcessed
+                        | QueueValidationKind::MessageNotFound,
+                    ..
+                } | QueueError::ResourceNotFound {
+                    resource_type: "receipt_handle",
+                    ..
+                }
+            ),
+            "{} stale receipt returned unrelated error: {error:?}",
+            case.name
+        );
+    }
 
     manager
         .change_message_visibility(queue_provider::ChangeMessageVisibilityRequest {
@@ -404,7 +246,7 @@ async fn run_stale_receipt_does_not_delete_current_claim(case: &BackendCase) {
         })
         .await
         .expect("make second claim visible");
-    let still_present = receive_one_within_attempts(&manager, &queue_url, 4).await;
+    let still_present = receive_one_within_attempts(manager, &queue_url, 4).await;
     assert_eq!(still_present.len(), 1);
     assert_eq!(still_present[0].message_id, sent_id);
 }
@@ -531,96 +373,79 @@ async fn run_soak(case: &BackendCase) -> SoakReport {
 }
 
 #[tokio::test]
-async fn sqs_delivery_invariants_run_across_available_backends() {
-    for case in available_single_node_backend_cases("delivery") {
-        run_twelve_worker_no_drop_duplicate(&case).await;
-        run_known_visible_found_quickly(&case).await;
-        run_send_to_receive_under_500ms(&case).await;
-    }
+async fn selected_single_node_backend_runs_sqs_delivery_invariants() {
+    let case = selected_native_backend_case("delivery");
+    let manager = required_manager_for_case(&case).await;
+    run_twelve_worker_no_drop_duplicate(&case, &manager).await;
+    run_known_visible_found_quickly(&case, &manager).await;
+    run_send_to_receive_under_500ms(&case, &manager).await;
 }
 
 #[tokio::test]
-async fn stale_receipts_preserve_messages_across_single_node_backends() {
-    for case in available_single_node_backend_cases("failure-injection") {
-        run_stale_receipt_does_not_delete_current_claim(&case).await;
-    }
+async fn selected_single_node_backend_preserves_messages_from_stale_receipts() {
+    let case = selected_native_backend_case("failure-injection");
+    let manager = required_manager_for_case(&case).await;
+    run_stale_receipt_does_not_delete_current_claim(&case, &manager).await;
 }
 
-#[cfg(feature = "turso")]
+#[cfg(any(feature = "foundationdb", feature = "postgres"))]
 #[tokio::test]
-#[ignore = "turso single-node queue correctness currently trips a turso_core arithmetic panic"]
-async fn turso_single_node_sqs_delivery_invariants() {
-    let case = turso_case("turso-delivery");
-    run_twelve_worker_no_drop_duplicate(&case).await;
-    run_known_visible_found_quickly(&case).await;
-    run_send_to_receive_under_500ms(&case).await;
+#[ignore = "requires a configured external database service"]
+async fn selected_multi_node_delivery_invariants() {
+    let case = selected_distributed_backend_case("multi-node-delivery");
+    let manager = required_manager_for_case(&case).await;
+    run_twelve_worker_no_drop_duplicate(&case, &manager).await;
+    run_known_visible_found_quickly(&case, &manager).await;
+    run_send_to_receive_under_500ms(&case, &manager).await;
 }
 
-#[cfg(feature = "rocksdb")]
+#[cfg(any(feature = "foundationdb", feature = "postgres"))]
 #[tokio::test]
-#[ignore = "RocksDB service-level queue harness can conflict with same-process RocksDB locks; \
-            provider-level RocksDB correctness runs by default"]
-async fn rocksdb_single_node_sqs_delivery_invariants() {
-    let case = rocksdb_case("rocksdb-delivery");
-    run_twelve_worker_no_drop_duplicate(&case).await;
-    run_known_visible_found_quickly(&case).await;
-    run_send_to_receive_under_500ms(&case).await;
-    run_stale_receipt_does_not_delete_current_claim(&case).await;
-}
-
-#[tokio::test]
-#[ignore = "multi-node queue correctness requires FoundationDB or Postgres services"]
-async fn multi_node_delivery_invariants_run_across_available_backends() {
-    for case in available_multi_node_backend_cases("multi-node-delivery") {
-        if manager_for_case(&case).await.is_none() {
-            continue;
-        }
-        run_twelve_worker_no_drop_duplicate(&case).await;
-        run_known_visible_found_quickly(&case).await;
-        run_send_to_receive_under_500ms(&case).await;
-    }
-}
-
-#[tokio::test]
-#[ignore = "multi-node queue correctness requires FoundationDB or Postgres services"]
-async fn stale_receipts_and_node_rejoin_preserve_messages_across_multi_node_backends() {
-    for case in available_multi_node_backend_cases("multi-node-failure-injection") {
-        if manager_for_case(&case).await.is_none() {
-            continue;
-        }
-        run_stale_receipt_does_not_delete_current_claim(&case).await;
-        run_node_leave_join_preserves_messages(&case).await;
-    }
+#[ignore = "requires a configured external database service"]
+async fn selected_multi_node_stale_receipts_and_node_rejoin_preserve_messages() {
+    let case = selected_distributed_backend_case("multi-node-failure-injection");
+    let manager = required_manager_for_case(&case).await;
+    run_stale_receipt_does_not_delete_current_claim(&case, &manager).await;
+    drop(manager);
+    run_node_leave_join_preserves_messages(&case).await;
 }
 
 #[tokio::test]
 #[ignore = "12-worker multi-node soak requires FoundationDB or Postgres services"]
 async fn twelve_worker_multi_node_soak_records_delivery_failures() {
-    for case in available_multi_node_backend_cases("multi-node-soak") {
-        if manager_for_case(&case).await.is_none() {
-            continue;
-        }
-        let report = run_soak(&case).await;
-        assert_eq!(
-            report.duplicate_receives, 0,
-            "{} duplicate receives in soak report: {:?}",
-            case.name, report
-        );
-        assert_eq!(
-            report.dropped_messages, 0,
-            "{} dropped messages in soak report: {:?}",
-            case.name, report
-        );
-        assert_eq!(
-            report.delayed_messages, 0,
-            "{} delayed messages in soak report: {:?}",
-            case.name, report
-        );
-        let over_five_attempt_receives = report.over_five_attempt_receives;
-        eprintln!(
-            "{} queue soak report: {:?}; over_five_attempt_receives={}",
-            case.name, report, over_five_attempt_receives
-        );
-        assert_eq!(report.received, report.sent);
-    }
+    let case = selected_distributed_backend_case("multi-node-soak");
+    let report = run_soak(&case).await;
+    assert_eq!(
+        report.duplicate_receives, 0,
+        "{} duplicate receives in soak report: {:?}",
+        case.name, report
+    );
+    assert_eq!(
+        report.dropped_messages, 0,
+        "{} dropped messages in soak report: {:?}",
+        case.name, report
+    );
+    assert_eq!(
+        report.delayed_messages, 0,
+        "{} delayed messages in soak report: {:?}",
+        case.name, report
+    );
+    let over_five_attempt_receives = report.over_five_attempt_receives;
+    eprintln!(
+        "{} queue soak report: {:?}; over_five_attempt_receives={}",
+        case.name, report, over_five_attempt_receives
+    );
+    assert_eq!(report.received, report.sent);
+}
+
+#[test]
+fn given_backend_inventory_when_selecting_acceptance_case_then_selection_is_exact_and_nonempty() {
+    assert_eq!(
+        select_native_backend_name(Some(" postgres "), &["sqlite", "postgres"]),
+        Ok("postgres")
+    );
+    assert!(select_native_backend_name(Some("foundationdb"), &["sqlite", "postgres"]).is_err());
+    assert_eq!(select_native_backend_name(None, &["turso"]), Ok("turso"));
+    assert!(select_native_backend_name(None, &[]).is_err());
+    assert!(select_native_backend_name(None, &["turso", "rocksdb"]).is_err());
 }

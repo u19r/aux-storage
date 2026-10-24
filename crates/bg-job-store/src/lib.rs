@@ -3,12 +3,17 @@
 //! This crate is not a supported downstream API.
 #![doc(hidden)]
 
+#[doc(hidden)]
+pub mod backend;
+mod config;
 mod constants;
-mod job_lock_store;
+mod error;
+mod provider_job_store;
 
-pub use crate::job_lock_store::*;
+pub use crate::{
+    backend::ScheduledJobStoreSource, config::ScheduledJobStoreConfig,
+    error::ScheduledJobStoreError, provider_job_store::ScheduledJobStore,
+};
 
 #[cfg(test)]
-mod job_lock_store_request_tests;
-#[cfg(test)]
-mod job_lock_store_tests;
+mod provider_job_store_tests;

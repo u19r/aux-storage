@@ -1,8 +1,6 @@
-#[cfg(target_os = "linux")]
-use std::fs;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
+mod constants;
+
+use std::collections::HashMap;
 
 #[cfg(feature = "turso")]
 use storage_provider::TursoSettings;
@@ -13,19 +11,10 @@ use storage_provider::{
 };
 use storage_types::{StorageError, StorageResult};
 use tokio::{net::TcpStream, time::timeout};
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::{
-    DatabaseManager, DatabaseManagerRuntimeOptions, InMemoryPointReadCache,
-    InMemoryPointReadCacheConfig, InMemoryQueryProofCache, InMemoryQueryProofCacheConfig,
-    PointReadCache, PointReadCacheEvictionPolicy, QueryProofCache, QueryProofCacheEvictionPolicy,
-    admission::AdmissionConfig, cache_coordinator::StorageAuthoritativeCacheOptions,
-    noop_point_read_cache, noop_query_proof_cache,
-};
-
-const DEFAULT_DEPENDENCY_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const MEBIBYTE: u64 = 1024 * 1024;
-const DEFAULT_POINT_READ_CACHE_MB_PER_CORE: u64 = 100;
+use self::constants::DEFAULT_DEPENDENCY_CONNECT_TIMEOUT;
+use crate::{DatabaseManager, DatabaseManagerRuntimeOptions, admission::AdmissionConfig};
 
 #[cfg(feature = "turso")]
 fn turso_backend_configured(backends: &config::Backends) -> bool {
@@ -145,6 +134,7 @@ pub fn try_storage_connection_config_from_backends(
             turso: None,
             rocksdb: None,
             foundationdb: Some(storage_provider::FoundationDbSettings {
+                transaction_byte_limit: fdb.transaction_byte_limit,
                 cluster_file: fdb.cluster_file.clone(),
                 tenant_name: fdb.tenant_name.clone(),
                 subspace_prefix: fdb.subspace_prefix.clone(),
@@ -250,223 +240,16 @@ pub fn storage_connection_registry_from_features(
     })
 }
 
-#[must_use]
-pub fn point_read_cache_from_features(features: &config::Features) -> Arc<dyn PointReadCache> {
-    let cache_config = &features.storage_point_read_cache;
-    if !cache_config.enabled {
-        return noop_point_read_cache();
-    }
-    let max_bytes = resolve_point_read_cache_max_bytes(cache_config);
-
-    Arc::new(InMemoryPointReadCache::new(InMemoryPointReadCacheConfig {
-        capacity: cache_config.capacity,
-        max_bytes,
-        ttl: Duration::from_secs(cache_config.ttl_seconds),
-        eviction_policy: match cache_config.eviction_policy {
-            config::StoragePointReadCacheEvictionPolicy::Lru => PointReadCacheEvictionPolicy::Lru,
-            config::StoragePointReadCacheEvictionPolicy::TwoQueue => {
-                PointReadCacheEvictionPolicy::TwoQueue
-            }
-        },
-    }))
-}
-
-fn resolve_point_read_cache_max_bytes(cache_config: &config::StoragePointReadCacheConfig) -> usize {
-    if let Some(max_bytes) = cache_config.max_bytes {
-        return max_bytes.max(1);
-    }
-    let available_cores = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
-    let effective_memory_limit_bytes = detect_effective_memory_limit_bytes();
-    resolve_point_read_cache_max_bytes_for(
-        cache_config,
-        available_cores,
-        effective_memory_limit_bytes,
-    )
-}
-
-pub(crate) fn resolve_point_read_cache_max_bytes_for(
-    cache_config: &config::StoragePointReadCacheConfig,
-    available_cores: NonZeroUsize,
-    effective_memory_limit_bytes: Option<u64>,
-) -> usize {
-    let target_bytes = match cache_config.memory_budget.mode {
-        config::StoragePointReadCacheMemoryBudgetMode::AutoPerCore { megabytes_per_core } => {
-            auto_point_read_cache_max_bytes(available_cores, megabytes_per_core)
-        }
-        config::StoragePointReadCacheMemoryBudgetMode::FixedBytes { bytes } => bytes.max(1),
-        config::StoragePointReadCacheMemoryBudgetMode::PercentOfAvailableMemory { percent } => {
-            let Some(limit_bytes) = effective_memory_limit_bytes else {
-                warn!(
-                    percent,
-                    "unable to determine effective memory limit for storage point-read cache, \
-                     falling back to per-core budget"
-                );
-                return clamp_u64_to_usize(auto_point_read_cache_max_bytes(
-                    available_cores,
-                    DEFAULT_POINT_READ_CACHE_MB_PER_CORE,
-                ));
-            };
-            percent_of_limit_bytes(limit_bytes, percent)
-        }
-    };
-    clamp_u64_to_usize(target_bytes)
-}
-
-fn auto_point_read_cache_max_bytes(available_cores: NonZeroUsize, megabytes_per_core: u64) -> u64 {
-    (available_cores.get() as u64)
-        .saturating_mul(megabytes_per_core.max(1))
-        .saturating_mul(MEBIBYTE)
-}
-
-fn percent_of_limit_bytes(limit_bytes: u64, percent: u8) -> u64 {
-    limit_bytes
-        .saturating_mul(percent as u64)
-        .checked_div(100)
-        .unwrap_or(0)
-        .max(1)
-}
-
-fn clamp_u64_to_usize(value: u64) -> usize {
-    value.min(usize::MAX as u64) as usize
-}
-
-fn detect_effective_memory_limit_bytes() -> Option<u64> {
-    let physical = detect_physical_memory_bytes();
-    let cgroup = detect_cgroup_memory_limit_bytes();
-    match (physical, cgroup) {
-        (Some(physical), Some(cgroup)) => Some(physical.min(cgroup)),
-        (Some(physical), None) => Some(physical),
-        (None, Some(cgroup)) => Some(cgroup),
-        (None, None) => None,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_physical_memory_bytes() -> Option<u64> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    parse_linux_meminfo_total_bytes(&meminfo)
-}
-
-#[cfg(target_os = "macos")]
-fn detect_physical_memory_bytes() -> Option<u64> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8(output.stdout).ok()?;
-    raw.trim().parse::<u64>().ok()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn detect_physical_memory_bytes() -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
-    const CANDIDATE_PATHS: [&str; 3] = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-        "/sys/fs/cgroup/memory.limit_in_bytes",
-    ];
-
-    for path in CANDIDATE_PATHS {
-        let Some(limit) = read_memory_limit_from_file(Path::new(path)) else {
-            continue;
-        };
-        return Some(limit);
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_memory_limit_from_file(path: &std::path::Path) -> Option<u64> {
-    let raw = fs::read_to_string(path).ok()?;
-    parse_cgroup_memory_limit_bytes(&raw)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_cgroup_memory_limit_bytes(raw: &str) -> Option<u64> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "max" {
-        return None;
-    }
-    let parsed = trimmed.parse::<u64>().ok()?;
-    if parsed == 0 || parsed >= (1_u64 << 60) {
-        return None;
-    }
-    Some(parsed)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_meminfo_total_bytes(meminfo: &str) -> Option<u64> {
-    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
-    let kib = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u64>().ok())?;
-    Some(kib.saturating_mul(1024))
-}
-
-#[must_use]
-pub fn query_proof_cache_from_features(features: &config::Features) -> Arc<dyn QueryProofCache> {
-    let cache_config = &features.storage_query_proof_cache;
-    if !cache_config.enabled {
-        return noop_query_proof_cache();
-    }
-
-    Arc::new(InMemoryQueryProofCache::new(
-        InMemoryQueryProofCacheConfig {
-            max_query_spaces: cache_config.max_query_spaces,
-            max_manifest_entries: cache_config.max_manifest_entries,
-            max_coverage_ranges: cache_config.max_coverage_ranges,
-            eviction_policy: match cache_config.eviction_policy {
-                config::StorageQueryProofCacheEvictionPolicy::PartitionLru => {
-                    QueryProofCacheEvictionPolicy::PartitionLru
-                }
-            },
-        },
-    ))
-}
-
 pub async fn database_manager_from_features(
     features: &config::Features,
     mut runtime_options: DatabaseManagerRuntimeOptions,
 ) -> StorageResult<DatabaseManager> {
     let registry = storage_connection_registry_from_features(features)?;
-    let point_read_cache = point_read_cache_from_features(features);
-    let query_proof_cache = query_proof_cache_from_features(features);
-    runtime_options.authoritative_cache_options =
-        authoritative_cache_options_from_features(features);
+    runtime_options.load_regional_connections(&features.regional_connections)?;
     runtime_options.admission_config = AdmissionConfig::from_config(&features.storage_admission)
         .map_err(|error| StorageError::validation(error.to_string()))?;
-    DatabaseManager::new_with_connection_registry_and_runtime_options_and_caches(
-        registry,
-        runtime_options,
-        point_read_cache,
-        query_proof_cache,
-    )
-    .await
-}
-
-#[must_use]
-pub fn authoritative_cache_options_from_features(
-    features: &config::Features,
-) -> StorageAuthoritativeCacheOptions {
-    let cache = &features.storage_point_read_cache;
-    StorageAuthoritativeCacheOptions {
-        authoritative_strong_point_reads: cache.authoritative_strong_point_reads,
-        authoritative_write_preimages: cache.authoritative_write_preimages,
-        strong_read_through_warming: cache.strong_read_through_warming,
-    }
+    DatabaseManager::new_with_connection_registry_and_runtime_options(registry, runtime_options)
+        .await
 }
 
 pub fn storage_config_for_configured_process(

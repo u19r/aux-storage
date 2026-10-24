@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::StreamItemId;
-
-const ITEM_STREAM_VERSION_LEN: usize = 8;
+use crate::{StreamItemId, constants::ITEM_STREAM_VERSION_LEN};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema,

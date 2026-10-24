@@ -85,6 +85,25 @@ fn normalize_attribute_map_numbers_for_write_walks_nested_values() {
 }
 
 #[test]
+fn normalized_attribute_map_for_write_borrows_plain_numbers_and_owns_expanded_numbers() {
+    use std::borrow::Cow;
+
+    let plain = HashMap::from([("pk".to_owned(), AttributeValue::N("12.3".to_owned()))]);
+    assert!(matches!(
+        crate::normalized_attribute_map_for_write(&plain),
+        Cow::Borrowed(_)
+    ));
+
+    let scientific = HashMap::from([("pk".to_owned(), AttributeValue::N("1E2".to_owned()))]);
+    let normalized = crate::normalized_attribute_map_for_write(&scientific);
+    assert!(matches!(normalized, Cow::Owned(_)));
+    assert_eq!(
+        normalized.get("pk"),
+        Some(&AttributeValue::N("100".to_owned()))
+    );
+}
+
+#[test]
 fn validate_key_attributes_rejects_invalid_dynamodb_numbers() {
     let schema = vec![KeySchemaElement {
         attribute_name: "pk".to_string(),
@@ -134,7 +153,7 @@ fn validate_item_key_attributes_rejects_invalid_dynamodb_numbers() {
 }
 
 fn assert_validation_message(err: &crate::StorageError, expected: &str) {
-    let StorageEnum::Validation { message } = err.to_enum() else {
+    let StorageEnum::Validation { message, .. } = err.to_enum() else {
         panic!("expected validation error, got {err:?}");
     };
     assert_eq!(message, expected);

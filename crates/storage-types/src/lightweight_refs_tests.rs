@@ -1,6 +1,7 @@
 use crate::{
-    AttributeValue, DEFAULT_PK_NAME, DEFAULT_SK_NAME, ExprNameRef, ExprValueRef, expr_names_to_map,
-    expr_values_to_map,
+    AttributeValue, ExprNameRef, ExprValueRef,
+    constants::{DEFAULT_PK_NAME, DEFAULT_SK_NAME},
+    expr_names_to_map, expr_values_to_map,
     lightweight_refs::{AttributeValueRef, KeyRef, ScalarValueRef},
 };
 

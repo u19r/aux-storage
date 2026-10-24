@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 edition = "2024"
 license.workspace = true
 name = "storage"
@@ -9,60 +10,109 @@ doctest = false
 
 [features]
 default = ["sqlite"]
-sqlite = ["dep:sql", "sql/sqlite-backend", "storage-types/sqlite", "stream/sqlite"]
-turso = [
-    "dep:sql",
-    "sql/sqlite-backend",
-    "sql/turso-backend",
-    "storage-types/turso",
-    "stream/turso",
+sqlite = [
+    "dep:sql-backend",
+    "sql-backend/sqlite",
+    "storage-types/sqlite",
+    "stream/sqlite",
 ]
+turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso", "stream/turso"]
 postgres = [
-    "dep:sql",
-    "sql/postgres-backend",
+    "dep:sql-backend",
+    "sql-backend/postgres",
     "storage-types/postgres",
     "stream/postgres",
 ]
-rocksdb = ["dep:kv", "kv/rocksdb-backend", "storage-types/rocksdb", "stream/rocksdb"]
-foundationdb = ["dep:kv", "kv/foundationdb-backend", "stream/foundationdb"]
+rocksdb = [
+    "dep:kv-backend",
+    "kv-backend/rocksdb",
+    "storage-types/rocksdb",
+    "stream/rocksdb",
+]
+foundationdb = ["dep:kv-backend", "kv-backend/foundationdb", "stream/foundationdb"]
 remote = ["dep:storage-remote"]
+regional = [
+    "storage-types/regional",
+    "dep:replication-types",
+    "dep:regional-replication",
+    "dep:infrastructure-provider",
+]
 opt-loop-profiling = ["dep:opt-loop-probe"]
-cache-write-planner = []
+test-support = [
+    "dep:anyhow",
+    "dep:replication-provider",
+    "dep:reqwest",
+    "dep:tempfile",
+    "dep:tokio-postgres",
+    "dep:tracing-subscriber",
+    "dep:bytes",
+    "dep:uuid",
+    "scheduled-bg-jobs/test-support",
+    "kv-backend?/test-support",
+]
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bg-job-store = { path = "../bg-job-store" }
-bg-jobs = { path = "../bg-jobs" }
+bg-jobs-tokio = { workspace = true }
+bytes = { workspace = true, optional = true }
 config = { path = "../config" }
 futures = { workspace = true }
-kv = { path = "../kv", optional = true, default-features = false }
+hex = { workspace = true }
+infrastructure-provider = { workspace = true, optional = true }
+kv-backend = { path = "../kv-backend", optional = true, default-features = false }
 lru-ttl-cache = { workspace = true }
+md5 = { workspace = true }
 metrics = { workspace = true }
 metrics-facade = { workspace = true }
 opt-loop-probe = { workspace = true, optional = true }
 pubsub-provider = { path = "../pubsub-provider" }
 queue-provider = { path = "../queue-provider" }
-serde = { workspace = true }
+regional-replication = { path = "../regional-replication", optional = true }
+replication-provider = { workspace = true, optional = true }
+replication-types = { path = "../replication-types", optional = true }
+reqwest = { workspace = true, optional = true }
+scheduled-bg-jobs = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
-sql = { path = "../sql", optional = true, default-features = false }
+sha2 = { workspace = true }
+sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-backfill = { path = "../storage-backfill" }
-storage-cache = { path = "../storage-cache" }
 storage-common = { path = "../storage-common" }
 storage-condition = { path = "../storage-condition" }
 storage-derive = { path = "../storage-derive" }
-storage-provider = { path = "../storage-provider" }
+storage-provider = { path = "../storage-provider", features = ["runtime-integration"] }
 storage-remote = { path = "../storage-remote", optional = true }
-storage-sync = { path = "../storage-sync" }
 storage-types = { path = "../storage-types" }
 stream = { path = "../stream", default-features = false }
+stream-provider = { path = "../stream-provider" }
+tempfile = { workspace = true, optional = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true, optional = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 typed-builder = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
+bg-jobs-tokio = { workspace = true, features = ["test-support"] }
+bytes = { workspace = true }
+cpu-time = { workspace = true }
+infrastructure-provider = { workspace = true }
 quint-connect = { workspace = true }
+replication-provider = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+scheduled-bg-jobs = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing-subscriber = { workspace = true }
+turso = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

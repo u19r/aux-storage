@@ -154,6 +154,10 @@ fn default_rocksdb_path() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct FoundationdbBackendConfig {
+    /// Enforced on every native attempt; absent preserves database defaults.
+    #[serde(default)]
+    #[schemars(default)]
+    pub transaction_byte_limit: Option<std::num::NonZeroUsize>,
     #[serde(default)]
     #[schemars(default)]
     pub cluster_file: Option<String>,
@@ -177,6 +181,7 @@ pub struct FoundationdbBackendConfig {
 impl Default for FoundationdbBackendConfig {
     fn default() -> Self {
         Self {
+            transaction_byte_limit: None,
             cluster_file: None,
             tenant_name: None,
             subspace_prefix: None,

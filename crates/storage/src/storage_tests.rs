@@ -284,7 +284,10 @@ fn put_item_request_serialization() {
         AttributeValue::S("test data".to_string()),
     );
 
-    let request = PutItemRequest::new(TableName::new("TestTable"), item);
+    let request = PutItemRequest::new(
+        TableName::new("TestTable"),
+        storage_types::WireItem::try_from(&(item)).unwrap(),
+    );
 
     let json = serde_json::to_value(&request).unwrap();
     let expected = json!({
@@ -299,7 +302,10 @@ fn put_item_request_serialization() {
 
     let deserialized: PutItemRequest = serde_json::from_value(json).unwrap();
     assert_eq!(deserialized.table_name, request.table_name);
-    assert_eq!(deserialized.item, request.item);
+    assert_eq!(
+        deserialized.item.to_attribute_map().expect("decode item"),
+        request.item.to_attribute_map().expect("decode item")
+    );
 }
 
 #[test]

@@ -1,23 +1,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use serde_json::{Value, json};
 
-use crate::{
-    error::ConfigError, model::RootConfig, schema,
-    sync_replication::validate_storage_sync_replication,
-};
-
-const MAX_INTERPOLATION_DEPTH: usize = 16;
+use crate::{constants::MAX_INTERPOLATION_DEPTH, error::ConfigError, model::RootConfig, schema};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: RootConfig,
     pub effective_json: Value,
 }
+
+static SCHEMA_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 
 impl Config {
     pub fn schema_json() -> Result<String, ConfigError> {
@@ -97,12 +94,12 @@ fn load_impl(
 }
 
 fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
-    validate_backend_details(&root.features.backends, "features.backends")?;
-    if root.features.read_sequence.shadow_sample_percent > 100 {
+    if root.jobs.gsi_backfill_interval_ms == 0 {
         return Err(ConfigError::validation(
-            "features.read_sequence.shadow_sample_percent must be between 0 and 100",
+            "jobs.gsi_backfill_interval_ms must be greater than 0",
         ));
     }
+    validate_backend_details(&root.features.backends, "features.backends")?;
     if let Some(registry) = &root.features.storage_connections {
         if registry.default_connection.trim().is_empty() {
             return Err(ConfigError::validation(
@@ -132,32 +129,7 @@ fn validate_root(root: &RootConfig) -> Result<(), ConfigError> {
     }
     validate_queue_config(root)?;
     validate_pubsub_config(root)?;
-    validate_storage_sync_replication(&root.features.storage_sync_replication)?;
     validate_storage_admission_config(&root.features.storage_admission)?;
-    if root.features.storage_point_read_cache.capacity == 0 {
-        return Err(ConfigError::validation(
-            "features.storage_point_read_cache.capacity must be greater than 0",
-        ));
-    }
-    if root
-        .features
-        .metrics
-        .prometheus
-        .bearer_token
-        .as_deref()
-        .is_some_and(|token| token.trim().is_empty())
-    {
-        return Err(ConfigError::validation(
-            "features.metrics.prometheus.bearer_token must not be empty when set",
-        ));
-    }
-    if let Some(max_bytes) = root.features.storage_point_read_cache.max_bytes
-        && max_bytes == 0
-    {
-        return Err(ConfigError::validation(
-            "features.storage_point_read_cache.max_bytes must be greater than 0 when set",
-        ));
-    }
     Ok(())
 }
 
@@ -296,9 +268,17 @@ fn validate_backend_details(backends: &crate::Backends, path: &str) -> Result<()
 }
 
 fn validate_against_schema(value: &Value) -> Result<(), ConfigError> {
-    let schema_value: Value = serde_json::from_str(&schema::schema_json()?)?;
-    let validator = jsonschema::validator_for(&schema_value)
-        .map_err(|error| ConfigError::schema(error.to_string()))?;
+    let validator = if let Some(validator) = SCHEMA_VALIDATOR.get() {
+        validator
+    } else {
+        let schema_value = schema::schema_value()?;
+        let validator = jsonschema::validator_for(&schema_value)
+            .map_err(|error| ConfigError::schema(error.to_string()))?;
+        let _ = SCHEMA_VALIDATOR.set(validator);
+        SCHEMA_VALIDATOR.get().ok_or_else(|| {
+            ConfigError::schema("schema validator is missing after initialization".to_string())
+        })?
+    };
     let errors: Vec<String> = validator
         .iter_errors(value)
         .map(|error| error.to_string())

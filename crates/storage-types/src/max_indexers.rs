@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{StorageError, StorageResult};
-
-pub const MAX_INDEXERS_CAPACITY: u8 = 32;
+use crate::{StorageError, StorageResult, constants::MAX_INDEXERS_CAPACITY};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, ToSchema)]
 #[serde(transparent)]
@@ -17,6 +15,16 @@ impl MaxIndexers {
             return Err(StorageError::validation("MaxIndexers:too_many"));
         }
         Ok(Self(value))
+    }
+
+    pub fn requested_increase(self, requested: Option<Self>) -> StorageResult<Option<Self>> {
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        if requested < self {
+            return Err(StorageError::validation("MaxIndexers:cannot_decrease"));
+        }
+        Ok((requested > self).then_some(requested))
     }
 
     #[must_use]

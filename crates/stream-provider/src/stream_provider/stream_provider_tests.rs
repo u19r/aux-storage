@@ -35,14 +35,32 @@ impl InMemoryStreamProvider {
     ) -> Self {
         Self {
             pointer_streams,
-            item_streams,
+            item_streams: item_streams
+                .into_iter()
+                .map(|(stream_name, items)| {
+                    (
+                        storage_types::ItemHistoryAddress {
+                            history_id: 1u32.into(),
+                            stream_name,
+                        }
+                        .physical_stream_name(),
+                        items,
+                    )
+                })
+                .collect(),
             failed_item_streams: HashSet::new(),
             read_backward_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn with_failed_item_stream(mut self, stream_name: StreamName) -> Self {
-        self.failed_item_streams.insert(stream_name);
+        self.failed_item_streams.insert(
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name,
+            }
+            .physical_stream_name(),
+        );
         self
     }
 
@@ -190,18 +208,6 @@ impl StreamProvider for InMemoryStreamProvider {
     ) -> StreamResult<Option<StreamCursor>> {
         unimplemented!("get_cursor not needed for pointer stream tests")
     }
-
-    async fn start_cleanup_task(&self, _parallelism: usize) -> StreamResult<()> {
-        Ok(())
-    }
-
-    async fn stop_cleanup_task(&self) -> StreamResult<()> {
-        Ok(())
-    }
-
-    async fn cleanup_expired_items(&self) -> StreamResult<u64> {
-        Ok(0)
-    }
 }
 
 fn stream_item_id(value: u8) -> StreamItemId {
@@ -259,9 +265,15 @@ fn pointer_stream_reads_item_stream_images() {
         ];
 
         let stored_pointer = StoredStreamPointer::pointer(
-            item_stream.clone(),
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: item_stream.clone(),
+            },
             table_name.clone(),
-            item_stream_version(2),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(2),
+            },
         );
         let pointer_stream_item = build_stream_item(
             pointer_id,
@@ -303,9 +315,15 @@ fn given_pointer_target_failure_when_page_is_resolved_then_read_fails() {
         let pointer_stream = StreamName::new(b"pointer-stream");
         let item_stream = StreamName::new(b"failed-item-stream");
         let stored_pointer = StoredStreamPointer::pointer(
-            item_stream.clone(),
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: item_stream.clone(),
+            },
             TableName::new("failed_table"),
-            item_stream_version(1),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(1),
+            },
         );
         let pointer_item = build_stream_item(
             stream_item_id(1),
@@ -347,9 +365,15 @@ fn embedded_pointer_stream_skips_item_stream_reads() {
 
         let pointer_id = stream_item_id(2);
         let embedded = StoredStreamPointer::embedded(
-            item_stream.clone(),
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: item_stream.clone(),
+            },
             table_name.clone(),
-            item_stream_version(2),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(2),
+            },
             vec![
                 EmbeddedStreamItem {
                     data: storage_types::storage_serde::to_bytes(&new_item).expect("new bytes"),
@@ -395,6 +419,81 @@ fn embedded_pointer_stream_skips_item_stream_reads() {
 }
 
 #[test]
+fn mixed_embedded_and_pointer_stream_preserves_input_order() {
+    futures::executor::block_on(async {
+        let pointer_stream = StreamName::new(b"mixed-pointer-stream");
+        let embedded_stream = StreamName::new(b"embedded-item-stream");
+        let fetched_stream = StreamName::new(b"fetched-item-stream");
+        let embedded_table = TableName::new("embedded_table");
+        let fetched_table = TableName::new("fetched_table");
+        let embedded_item =
+            HashMap::from([("pk".to_owned(), AttributeValue::S("embedded".to_owned()))]);
+        let fetched_item =
+            HashMap::from([("pk".to_owned(), AttributeValue::S("fetched".to_owned()))]);
+        let embedded = StoredStreamPointer::embedded(
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: embedded_stream.clone(),
+            },
+            embedded_table.clone(),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(1),
+            },
+            vec![EmbeddedStreamItem {
+                data: storage_types::storage_serde::to_bytes(&embedded_item)
+                    .expect("embedded bytes"),
+                data_type: StreamDataType::DynamoDbJson,
+            }],
+        );
+        let pointer = StoredStreamPointer::pointer(
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: fetched_stream.clone(),
+            },
+            fetched_table.clone(),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(1),
+            },
+        );
+        let pointer_items = vec![
+            build_stream_item(
+                stream_item_id(1),
+                None,
+                storage_types::storage_serde::to_bytes(&embedded).expect("embedded pointer bytes"),
+                StreamDataType::StreamPointer,
+            ),
+            build_stream_item(
+                stream_item_id(2),
+                None,
+                storage_types::storage_serde::to_bytes(&pointer).expect("pointer bytes"),
+                StreamDataType::StreamPointer,
+            ),
+        ];
+        let fetched_items = vec![build_stream_item(
+            stream_item_id(1),
+            Some(fetched_stream.clone()),
+            storage_types::storage_serde::to_bytes(&fetched_item).expect("fetched bytes"),
+            StreamDataType::DynamoDbJson,
+        )];
+        let provider = InMemoryStreamProvider::new(
+            HashMap::from([(pointer_stream.clone(), pointer_items)]),
+            HashMap::from([(fetched_stream, fetched_items)]),
+        );
+
+        let result = provider
+            .get_items_from_pointer_stream(pointer_stream, None, Some(10))
+            .await
+            .expect("mixed pointer stream read");
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].0.table_name, embedded_table);
+        assert_eq!(result.records[1].0.table_name, fetched_table);
+        assert_eq!(provider.read_backward_calls(), 1);
+    });
+}
+
+#[test]
 fn embedded_pointer_stream_record_sequence_uses_pointer_stream_item_id() {
     futures::executor::block_on(async {
         let pointer_stream = StreamName::new(b"pointer-stream");
@@ -406,9 +505,15 @@ fn embedded_pointer_stream_record_sequence_uses_pointer_stream_item_id() {
 
         let pointer_id = stream_item_id(9);
         let embedded = StoredStreamPointer::embedded(
-            item_stream,
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: item_stream,
+            },
             table_name,
-            item_stream_version(2),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(2),
+            },
             vec![
                 EmbeddedStreamItem {
                     data: storage_types::storage_serde::to_bytes(&new_item).expect("new bytes"),
@@ -472,18 +577,30 @@ fn pointer_stream_record_sequences_follow_stream_order_across_items() {
         )]);
 
         let first_pointer = StoredStreamPointer::embedded(
-            first_item_stream,
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: first_item_stream,
+            },
             table_name.clone(),
-            item_stream_version(3),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(3),
+            },
             vec![EmbeddedStreamItem {
                 data: storage_types::storage_serde::to_bytes(&first_image).expect("first bytes"),
                 data_type: StreamDataType::DynamoDbJson,
             }],
         );
         let second_pointer = StoredStreamPointer::embedded(
-            second_item_stream,
+            storage_types::ItemHistoryAddress {
+                history_id: 1u32.into(),
+                stream_name: second_item_stream,
+            },
             table_name,
-            item_stream_version(1),
+            storage_types::ItemWriteVersions {
+                item_revision: storage_types::ItemRevision::initial(),
+                item_stream_version: item_stream_version(1),
+            },
             vec![EmbeddedStreamItem {
                 data: storage_types::storage_serde::to_bytes(&second_image).expect("second bytes"),
                 data_type: StreamDataType::DynamoDbJson,
@@ -550,9 +667,15 @@ fn pointer_stream_omits_last_evaluated_key_on_terminal_page() {
             stream_item_id(1),
             None,
             storage_types::storage_serde::to_bytes(&StoredStreamPointer::embedded(
-                item_stream.clone(),
+                storage_types::ItemHistoryAddress {
+                    history_id: 1u32.into(),
+                    stream_name: item_stream.clone(),
+                },
                 table_name.clone(),
-                item_stream_version(1),
+                storage_types::ItemWriteVersions {
+                    item_revision: storage_types::ItemRevision::initial(),
+                    item_stream_version: item_stream_version(1),
+                },
                 vec![EmbeddedStreamItem {
                     data: b"first".to_vec(),
                     data_type: StreamDataType::Binary,
@@ -565,9 +688,15 @@ fn pointer_stream_omits_last_evaluated_key_on_terminal_page() {
             stream_item_id(2),
             None,
             storage_types::storage_serde::to_bytes(&StoredStreamPointer::embedded(
-                item_stream,
+                storage_types::ItemHistoryAddress {
+                    history_id: 1u32.into(),
+                    stream_name: item_stream,
+                },
                 table_name,
-                item_stream_version(2),
+                storage_types::ItemWriteVersions {
+                    item_revision: storage_types::ItemRevision::initial(),
+                    item_stream_version: item_stream_version(2),
+                },
                 vec![EmbeddedStreamItem {
                     data: b"second".to_vec(),
                     data_type: StreamDataType::Binary,
@@ -609,9 +738,15 @@ fn pointer_stream_reports_last_scanned_key_when_terminal_page_decodes_no_records
             pointer_id,
             None,
             storage_types::storage_serde::to_bytes(&StoredStreamPointer::embedded(
-                item_stream,
+                storage_types::ItemHistoryAddress {
+                    history_id: 1u32.into(),
+                    stream_name: item_stream,
+                },
                 table_name,
-                item_stream_version(1),
+                storage_types::ItemWriteVersions {
+                    item_revision: storage_types::ItemRevision::initial(),
+                    item_stream_version: item_stream_version(1),
+                },
                 vec![EmbeddedStreamItem {
                     data: Vec::new(),
                     data_type: StreamDataType::DeleteMarker,
@@ -645,53 +780,6 @@ fn pointer_stream_reports_last_scanned_key_when_terminal_page_decodes_no_records
             Some(pointer_id),
             "durable pollers need a checkpoint cursor even when a terminal page only contains \
              skipped pointers"
-        );
-    });
-}
-
-#[test]
-fn pointer_stream_reports_last_scanned_key_when_pointer_target_image_is_missing() {
-    futures::executor::block_on(async {
-        let pointer_stream = StreamName::new(b"pointer-stream");
-        let item_stream = StreamName::new(b"missing-item-stream");
-        let table_name = TableName::new("missing_image_page_table");
-        let pointer_id = stream_item_id(4);
-
-        let pointer_stream_item = build_stream_item(
-            pointer_id,
-            None,
-            storage_types::storage_serde::to_bytes(&StoredStreamPointer::pointer(
-                item_stream,
-                table_name,
-                item_stream_version(1),
-            ))
-            .expect("pointer bytes"),
-            StreamDataType::StreamPointer,
-        );
-
-        let provider = InMemoryStreamProvider::new(
-            HashMap::from([(pointer_stream.clone(), vec![pointer_stream_item])]),
-            HashMap::new(),
-        );
-
-        let (records, last_pointer) = provider
-            .get_stream_records_from_pointer_stream(
-                pointer_stream,
-                &[KeySchemaElement {
-                    attribute_name: "pk".to_string(),
-                    key_type: KeyType::Hash,
-                }],
-                None,
-                Some(10),
-            )
-            .await
-            .expect("stream records");
-
-        assert!(records.is_empty());
-        assert_eq!(
-            last_pointer,
-            Some(pointer_id),
-            "missing pointer target images must not permanently strand a source-polling checkpoint"
         );
     });
 }

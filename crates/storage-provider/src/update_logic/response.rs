@@ -3,7 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use storage_types::{AttributeValue, ReturnValuesOldNewUpdated, StorageResult, UpdateItemResponse};
+use storage_types::{
+    AttributeMap, AttributeValue, ReturnValuesOldNewUpdated, StorageResult, UpdateItemRequest,
+    UpdateItemResponse,
+};
 
 use crate::update_logic::{
     logic::{BoundUpdateOperation, UpdateOperation},
@@ -12,6 +15,23 @@ use crate::update_logic::{
 
 pub trait UpdateFieldName {
     fn field_name(&self) -> &str;
+}
+
+/// Bind the updated-field names used by `ReturnValues=UPDATED_*` responses.
+///
+/// This runs the canonical update-expression parser so every provider shapes
+/// the response from the same bound paths and reports the same parse errors.
+pub fn update_item_response_fields(request: &UpdateItemRequest) -> StorageResult<Vec<Arc<str>>> {
+    let (operations, _) = super::logic::before_update_item_optional(
+        request.update_expression.as_deref(),
+        None,
+        request.expression_attribute_names.as_ref(),
+        request.expression_attribute_values.as_ref(),
+    )?;
+    Ok(operations
+        .iter()
+        .map(|operation| operation.field_name_arc())
+        .collect())
 }
 
 impl UpdateFieldName for UpdateOperation {
@@ -51,10 +71,10 @@ pub fn update_item_response<T: UpdateFieldName>(
             ReturnValuesOldNewUpdated::AllOld => old_item,
             ReturnValuesOldNewUpdated::AllNew => new_item,
             ReturnValuesOldNewUpdated::UpdatedOld => {
-                old_item.and_then(|item| non_empty_updated_attributes(operations, &item))
+                old_item.and_then(|item| non_empty_updated_attributes_owned(operations, item))
             }
             ReturnValuesOldNewUpdated::UpdatedNew => {
-                new_item.and_then(|item| non_empty_updated_attributes(operations, &item))
+                new_item.and_then(|item| non_empty_updated_attributes_owned(operations, item))
             }
         },
     };
@@ -62,6 +82,47 @@ pub fn update_item_response<T: UpdateFieldName>(
     Ok(UpdateItemResponse {
         attributes: attributes.map(Into::into),
     })
+}
+
+/// Shape the new-path response without materializing a HashMap for flat paths.
+pub fn update_item_response_attributes<T: UpdateFieldName>(
+    operations: &[T],
+    old_item: Option<AttributeMap>,
+    new_item: Option<AttributeMap>,
+    return_values: Option<&ReturnValuesOldNewUpdated>,
+) -> StorageResult<UpdateItemResponse> {
+    let attributes = match return_values {
+        None | Some(ReturnValuesOldNewUpdated::None) => None,
+        Some(ReturnValuesOldNewUpdated::AllOld) => old_item,
+        Some(ReturnValuesOldNewUpdated::AllNew) => new_item,
+        Some(ReturnValuesOldNewUpdated::UpdatedOld) => {
+            old_item.and_then(|item| updated_attribute_map(operations, item))
+        }
+        Some(ReturnValuesOldNewUpdated::UpdatedNew) => {
+            new_item.and_then(|item| updated_attribute_map(operations, item))
+        }
+    };
+    Ok(UpdateItemResponse { attributes })
+}
+
+fn updated_attribute_map<T: UpdateFieldName>(
+    operations: &[T],
+    mut item: AttributeMap,
+) -> Option<AttributeMap> {
+    if operations
+        .iter()
+        .all(|op| is_top_level_response_path(op.field_name()))
+    {
+        let mut attributes = AttributeMap::with_capacity(operations.len());
+        for operation in operations {
+            if let Some(value) = item.remove(operation.field_name()) {
+                attributes.insert(operation.field_name(), value);
+            }
+        }
+        return (!attributes.is_empty()).then_some(attributes);
+    }
+    let attributes = updated_attributes_for_response(operations, &item.into_hashmap());
+    (!attributes.is_empty()).then(|| attributes.into())
 }
 
 #[must_use]
@@ -92,10 +153,47 @@ fn non_empty_updated_attributes<T: UpdateFieldName>(
     (!attributes.is_empty()).then_some(attributes)
 }
 
+fn non_empty_updated_attributes_owned<T: UpdateFieldName>(
+    operations: &[T],
+    mut item: HashMap<String, AttributeValue>,
+) -> Option<HashMap<String, AttributeValue>> {
+    if !operations
+        .iter()
+        .all(|operation| is_top_level_response_path(operation.field_name()))
+    {
+        return non_empty_updated_attributes(operations, &item);
+    }
+
+    let mut attributes = HashMap::with_capacity(operations.len());
+    for operation in operations {
+        if let Some(value) = item.remove(operation.field_name()) {
+            attributes.insert(operation.field_name().to_string(), value);
+        }
+    }
+    (!attributes.is_empty()).then_some(attributes)
+}
+
 pub fn updated_attributes_for_response<T: UpdateFieldName>(
     operations: &[T],
     item: &HashMap<String, AttributeValue>,
 ) -> HashMap<String, AttributeValue> {
+    // The common form is a flat SET/ADD/REMOVE response.  Avoid building a
+    // temporary projection tree when no operation addresses a document path;
+    // nested paths still use the merge logic below because a root operation
+    // and a child operation must retain their order-dependent shape.
+    if operations
+        .iter()
+        .all(|operation| is_top_level_response_path(operation.field_name()))
+    {
+        let mut attributes = HashMap::with_capacity(operations.len());
+        for operation in operations {
+            if let Some(value) = item.get(operation.field_name()) {
+                attributes.insert(operation.field_name().to_string(), value.clone());
+            }
+        }
+        return attributes;
+    }
+
     let mut projection = UpdatedAttributeProjection::default();
     for op in operations {
         let field_name = op.field_name();
@@ -104,6 +202,14 @@ pub fn updated_attributes_for_response<T: UpdateFieldName>(
         }
     }
     projection.into_attributes()
+}
+
+fn is_top_level_response_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'.' | b'['))
 }
 
 #[derive(Default)]
@@ -119,10 +225,10 @@ impl UpdatedAttributeProjection {
         let Some((ResponsePathSegment::Name(root), rest)) = path.split_first() else {
             return;
         };
-        let projected_value = projected_value_from_path(rest, value);
-        merge_projected_value(
+        insert_projected_path(
             self.roots.entry((*root).to_string()).or_default(),
-            projected_value,
+            rest,
+            value,
         );
     }
 
@@ -162,50 +268,33 @@ impl ProjectedAttributeValue {
     }
 }
 
-fn projected_value_from_path(
+fn insert_projected_path(
+    target: &mut ProjectedAttributeValue,
     path: &[ResponsePathSegment<'_>],
     value: AttributeValue,
-) -> ProjectedAttributeValue {
+) {
     let Some((segment, rest)) = path.split_first() else {
-        return ProjectedAttributeValue::Leaf(value);
+        *target = ProjectedAttributeValue::Leaf(value);
+        return;
     };
     match segment {
         ResponsePathSegment::Name(name) => {
-            let mut map = HashMap::with_capacity(1);
-            map.insert((*name).to_string(), projected_value_from_path(rest, value));
-            ProjectedAttributeValue::Map(map)
+            if !matches!(target, ProjectedAttributeValue::Map(_)) {
+                *target = ProjectedAttributeValue::Map(HashMap::new());
+            }
+            let ProjectedAttributeValue::Map(map) = target else {
+                unreachable!();
+            };
+            insert_projected_path(map.entry((*name).to_string()).or_default(), rest, value);
         }
         ResponsePathSegment::Index(index) => {
-            let mut list = BTreeMap::new();
-            list.insert(*index, projected_value_from_path(rest, value));
-            ProjectedAttributeValue::List(list)
-        }
-    }
-}
-
-fn merge_projected_value(target: &mut ProjectedAttributeValue, incoming: ProjectedAttributeValue) {
-    match (target, incoming) {
-        (target @ ProjectedAttributeValue::Empty, incoming) => {
-            *target = incoming;
-        }
-        (target @ ProjectedAttributeValue::Leaf(_), incoming) => {
-            *target = incoming;
-        }
-        (ProjectedAttributeValue::Map(target_map), ProjectedAttributeValue::Map(incoming_map)) => {
-            for (name, incoming_value) in incoming_map {
-                merge_projected_value(target_map.entry(name).or_default(), incoming_value);
+            if !matches!(target, ProjectedAttributeValue::List(_)) {
+                *target = ProjectedAttributeValue::List(BTreeMap::new());
             }
-        }
-        (
-            ProjectedAttributeValue::List(target_list),
-            ProjectedAttributeValue::List(incoming_list),
-        ) => {
-            for (index, incoming_value) in incoming_list {
-                merge_projected_value(target_list.entry(index).or_default(), incoming_value);
-            }
-        }
-        (target, incoming) => {
-            *target = incoming;
+            let ProjectedAttributeValue::List(list) = target else {
+                unreachable!();
+            };
+            insert_projected_path(list.entry(*index).or_default(), rest, value);
         }
     }
 }

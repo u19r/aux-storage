@@ -19,10 +19,13 @@ categories = ["asynchronous", "database"]
 bundled = ["rusqlite/bundled"]
 
 [dependencies]
-crossbeam-channel = "0.5"
-rusqlite = { version = "0.40.1", features = ["bundled", "uuid"] }
-tokio = { version = "1.52.3", features = ["sync"] }
+crossbeam-channel = "0.5.17"
+rusqlite = { version = "0.41.0", features = ["bundled", "uuid"] }
+tokio = { version = "1.54.1", features = ["sync"] }
+# Local aux-storage diagnostic patch (phase 7 §2.3): ordinary enqueue event,
+# same in every build. Uses the existing workspace tracing version.
+tracing = "0.1.44"
 
 [dev-dependencies]
-rusqlite = { version = "0.40.1", features = ["bundled", "uuid"] }
-tokio = { version = "1.52.3", features = ["full"] }
+rusqlite = { version = "0.41.0", features = ["bundled", "uuid"] }
+tokio = { version = "1.54.1", features = ["full"] }

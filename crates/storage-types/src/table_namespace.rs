@@ -2,19 +2,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{StorageError, StorageResult, WireAttributeDecode};
-
-/// Reserved namespace for system-owned storage metadata.
-pub const SYSTEM_TABLE_NAMESPACE: &str = "system";
-const TABLE_NAMESPACE_TYPE_NAME: &str = "Table Namespace";
-const TABLE_NAMESPACE_PREFIX: &str = "ns_";
-const CROCKFORD_114_BITS: usize = 114;
-const CROCKFORD_114_LENGTH: usize = CROCKFORD_114_BITS.div_ceil(5);
-const CROCKFORD_ALPHABET_BYTES: [u8; 32] = *b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const CROCKFORD_ALPHABET: [char; 32] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J',
-    'K', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'X', 'Y', 'Z',
-];
+use crate::{
+    StorageError, StorageResult, WireAttributeDecode,
+    constants::{
+        CROCKFORD_114_BITS, CROCKFORD_114_LENGTH, CROCKFORD_ALPHABET, CROCKFORD_ALPHABET_BYTES,
+        SYSTEM_TABLE_NAMESPACE, TABLE_NAMESPACE_HASH_OFFSET_BASIS, TABLE_NAMESPACE_HASH_PRIME,
+        TABLE_NAMESPACE_PREFIX, TABLE_NAMESPACE_TYPE_NAME,
+    },
+};
 
 /// Stable namespace identifier used by storage routing and shared-table
 /// placement.
@@ -24,17 +19,17 @@ pub struct TableNamespace(String);
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum TableNamespaceParseError {
     #[error("Invalid {type_name} format (expected `{expected_prefix}` prefix and Crockford32 key)")]
-    InvalidFormat {
+    Format {
         type_name: &'static str,
         expected_prefix: &'static str,
     },
     #[error("Invalid {type_name} length (expected {expected} characters)")]
-    InvalidLength {
+    Length {
         type_name: &'static str,
         expected: usize,
     },
     #[error("Invalid {type_name} characters (expected Crockford32 key)")]
-    InvalidCharacters { type_name: &'static str },
+    Characters { type_name: &'static str },
 }
 
 impl TableNamespace {
@@ -46,8 +41,10 @@ impl TableNamespace {
     #[must_use]
     pub fn new() -> Self {
         let raw = Uuid::now_v7().as_u128() >> (u128::BITS as usize - CROCKFORD_114_BITS);
-        let suffix = encode_crockford_u128(raw, CROCKFORD_114_LENGTH);
-        Self(format!("{}{suffix}", Self::PREFIX))
+        let mut namespace = String::with_capacity(Self::LENGTH);
+        namespace.push_str(Self::PREFIX);
+        append_crockford_u128(&mut namespace, raw, CROCKFORD_114_LENGTH);
+        Self(namespace)
     }
 
     #[must_use]
@@ -58,11 +55,14 @@ impl TableNamespace {
     #[must_use]
     pub fn from_seed(seed: impl AsRef<str>) -> Self {
         let mask = (1u128 << CROCKFORD_114_BITS) - 1;
-        let suffix = encode_crockford_u128(
+        let mut namespace = String::with_capacity(Self::LENGTH);
+        namespace.push_str(Self::PREFIX);
+        append_crockford_u128(
+            &mut namespace,
             stable_seed_u128("table-namespace", seed.as_ref()) & mask,
             Self::KEY_LENGTH,
         );
-        Self(format!("{}{suffix}", Self::PREFIX))
+        Self(namespace)
     }
 
     pub fn parse_str(input: &str) -> Result<Self, TableNamespaceParseError> {
@@ -210,32 +210,42 @@ fn parse_table_namespace(
         input
     };
 
-    let normalized = normalize_crockford_storage(raw, key_length)?;
-    Ok(format!("{prefix}{normalized}"))
+    normalize_crockford_storage(raw, prefix, key_length)
 }
 
 fn normalize_crockford_storage(
     candidate: &str,
+    prefix: &str,
     expected_len: usize,
 ) -> Result<String, TableNamespaceParseError> {
     if candidate.len() != expected_len {
-        return Err(TableNamespaceParseError::InvalidLength {
+        return Err(TableNamespaceParseError::Length {
             type_name: TABLE_NAMESPACE_TYPE_NAME,
             expected: expected_len,
         });
     }
-    let upper = candidate.to_ascii_uppercase();
-    if !upper.chars().all(|c| normalize_crockford_char(c).is_some()) {
-        return Err(TableNamespaceParseError::InvalidCharacters {
+    let mut normalized = String::with_capacity(prefix.len() + expected_len);
+    normalized.push_str(prefix);
+    for character in candidate.chars() {
+        let upper = character.to_ascii_uppercase();
+        if normalize_crockford_char(upper).is_none() {
+            return Err(TableNamespaceParseError::Characters {
+                type_name: TABLE_NAMESPACE_TYPE_NAME,
+            });
+        }
+        normalized.push(upper);
+    }
+    let Some(suffix) = normalized.get(prefix.len()..) else {
+        return Err(TableNamespaceParseError::Characters {
+            type_name: TABLE_NAMESPACE_TYPE_NAME,
+        });
+    };
+    if expected_len == CROCKFORD_114_LENGTH && !is_crockford_114_storage_key(suffix) {
+        return Err(TableNamespaceParseError::Characters {
             type_name: TABLE_NAMESPACE_TYPE_NAME,
         });
     }
-    if expected_len == CROCKFORD_114_LENGTH && !is_crockford_114_storage_key(&upper) {
-        return Err(TableNamespaceParseError::InvalidCharacters {
-            type_name: TABLE_NAMESPACE_TYPE_NAME,
-        });
-    }
-    Ok(upper)
+    Ok(normalized)
 }
 
 fn is_crockford_114_storage_key(candidate: &str) -> bool {
@@ -267,31 +277,49 @@ fn crockford_value_of(c: char) -> Option<u8> {
         .and_then(|index| u8::try_from(index).ok())
 }
 
-fn encode_crockford_u128(mut value: u128, length: usize) -> String {
-    let mut output = vec![0u8; length];
-    for slot in output.iter_mut().rev() {
+fn append_crockford_u128(output: &mut String, mut value: u128, length: usize) {
+    let mut encoded = [0u8; 26];
+    assert!(
+        length <= encoded.len(),
+        "Crockford output length is too large"
+    );
+    for slot in encoded[..length].iter_mut().rev() {
         let index = (value & 0x1F) as usize;
         *slot = CROCKFORD_ALPHABET_BYTES[index];
         value >>= 5;
     }
-    output.into_iter().map(char::from).collect()
+    output.extend(encoded[..length].iter().map(|byte| *byte as char));
+}
+
+fn stable_seed_bytes<const N: usize>(offset_basis: u64, prime: u64, parts: [&[u8]; N]) -> u64 {
+    let mut hash = offset_basis;
+    for part in parts {
+        for byte in part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(prime);
+        }
+    }
+    hash
 }
 
 fn stable_seed_u64(seed: &str) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = OFFSET_BASIS;
+    let mut hash = TABLE_NAMESPACE_HASH_OFFSET_BASIS;
     for byte in seed.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
+        hash = hash.wrapping_mul(TABLE_NAMESPACE_HASH_PRIME);
     }
     hash
 }
 
 fn stable_seed_u128(namespace: &str, seed: &str) -> u128 {
     let upper = stable_seed_u64(seed);
-    let lower = stable_seed_u64(&format!("{namespace}:{seed}"));
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
+    let lower = stable_seed_bytes(
+        OFFSET_BASIS,
+        PRIME,
+        [namespace.as_bytes(), b":" as &[u8], seed.as_bytes()],
+    );
 
     (u128::from(upper) << 64) | u128::from(lower)
 }

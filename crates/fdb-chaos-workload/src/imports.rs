@@ -6,32 +6,20 @@ pub(crate) use std::{
 };
 
 pub(crate) use fdb_chaos_model::{
-    Anomaly, AnomalyKind, AnomalyReport, BackgroundLeaseEvent, GsiEntry, GsiIndexModel,
-    HistoryEvent, OperationHistory, OperationKind, OperationOutcome, PossibleTableModel,
-    SharedKeyAudit, SharedKeyRead, TableModel, TrimProviderSnapshot, TrimScopeExpectation,
-    TrimScopeKind, TrimScopeReport, TrimStateModel, classify_operation_error,
+    Anomaly, AnomalyKind, AnomalyReport, GsiEntry, GsiIndexModel, HistoryEvent, OperationHistory,
+    OperationKind, OperationOutcome, PossibleTableModel, SharedKeyAudit, SharedKeyRead, TableModel,
+    TrimProviderSnapshot, TrimScopeExpectation, TrimScopeKind, TrimScopeReport, TrimStateModel,
+    classify_operation_error,
 };
 pub(crate) use foundationdb_simulation::{
     Metric, Metrics, RustWorkload, RustWorkloadFactory, Severity, SimDatabase, WorkloadContext,
     WrappedWorkload, details, register_factory,
 };
-pub(crate) use kv::{
-    FoundationDbConfig, FoundationDbKvStore, SortedKvDbStorageProvider,
-    constants::PARTITION_LOAD_SAMPLE_WINDOW_SECONDS,
-    keyspace::compact::{self, PubsubRecordKind},
-    partition_family::{
-        DEFAULT_ORDERED_LOG_PARTITION_COUNT, PartitionFamilyKind, PartitionInfo,
-        PartitionLoadSample, PartitionLoadSampleRecord, PartitionState, find_partition_for_hash,
-        initial_partition_infos, ordered_log_family_component, ordered_log_hash,
-        parse_partition_info, partition_info_prefix, partition_load_sample_bytes,
-        partition_load_sample_key, partition_sample_window_start_ms, routing_key_bucket_bit,
-    },
-    sorted_kv_store::{BatchItem, SortedKvStore},
-};
 pub(crate) use pubsub::{
-    ClaimDeliveryRecordsRequest, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
-    DeliveryStatus, PublishRequest, PubsubManager, PubsubMessageId, PubsubProvider as _,
-    SubscribeRequest, SubscriptionArn, SubscriptionProtocol, TopicArn, TopicName,
+    ClaimDeliveryRecordsRequest, ClaimDeliveryRecordsResponse, CreateTopicRequest,
+    DeliveryClaimLimit, DeliveryRecord, DeliveryRecordId, DeliveryRecordUpdate, DeliveryStatus,
+    PublishRequest, PubsubMessageId, PubsubProvider as _, SubscribeRequest, SubscriptionArn,
+    SubscriptionProtocol, TopicArn, TopicName,
 };
 pub(crate) use queue::{
     ChangeMessageVisibilityRequest, CreateQueueRequest, DeleteMessageRequest, GetQueueUrlRequest,
@@ -40,20 +28,17 @@ pub(crate) use queue::{
 pub(crate) use storage::{
     DatabaseManager, DeleteItemInput, PutItemInput, QueryIndexInput, UpdateItemInput,
 };
-pub(crate) use storage_common::STREAM_TRIM_JOB;
 pub(crate) use storage_provider::{
-    ReadSequenceExecution, ReadSequenceFlatResult, StorageProvider as _, StreamDurationTrimBackend,
+    StreamDurationTrimConfig, StreamDurationTrimWorker, StreamRetentionRepository,
 };
 pub(crate) use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, BillingMode,
-    CreateGlobalSecondaryIndex, CreateTableRequest, GetItemRequest, IndexName, ItemKey,
-    KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, Projection,
-    ProjectionType, QueryRequest, QueryTableRequest, ReadSequenceConsistency,
-    ReadSequenceFromInput, ReadSequenceInputCardinality, ReadSequenceNode, ReadSequenceNodeId,
-    ReadSequenceNodeInput, ReadSequenceNodeOperation, ReadSequenceOnMissing, ReadSequenceRequest,
-    ReadSequenceSelector, StorageEnum, StorageError, StreamName, StreamRetentionDuration,
-    StreamSpecification, StreamViewType, TableName, TimestampMillis, TransactPutRequest,
-    TransactWriteItem, TransactWriteItemsRequest, UserStreamName, WireItem,
+    CreateGlobalSecondaryIndex, CreateTableRequest, GetItemRequest, IndexName, KeyAttributeType,
+    KeyAttributes, KeySchemaElement, KeyType, KeysAndAttributes, Projection, ProjectionType,
+    QueryRequest, QueryTableRequest, ReadSequenceFromInput, ReadSequenceInputCardinality,
+    ReadSequenceNode, ReadSequenceNodeId, ReadSequenceNodeInput, ReadSequenceNodeOperation,
+    ReadSequenceOnMissing, ReadSequenceRequest, ReadSequenceSelector, StorageEnum, StorageError,
+    StreamName, StreamRetentionDuration, StreamSpecification, StreamViewType, TableName,
+    TimestampMillis, TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem,
     context::WrappedError as _, plan_read_sequence, read_sequence_input_marker,
 };
-pub(crate) use stream_provider::{StreamPartitioningMode, StreamProvider as _};

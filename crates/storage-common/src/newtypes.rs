@@ -12,9 +12,7 @@ macro_rules! simple_newtype {
     };
 }
 
-simple_newtype!(PageToken, String);
 simple_newtype!(IdempotencyToken, String);
-simple_newtype!(BackfillCursor, String);
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,

@@ -134,8 +134,8 @@ fn round_trip_pagination_token() {
 
 #[test]
 fn key_consistency_across_methods() {
-    // This test verifies that different methods that should produce the same key
-    // actually do produce identical keys
+    // This test verifies that different methods that should produce the same
+    // key actually do produce identical keys
     let hash_key = AttributeValue::S("consistent_key".to_string());
     let range_key = AttributeValue::S("range_value".to_string());
     let item_key = ItemKey::table_key(

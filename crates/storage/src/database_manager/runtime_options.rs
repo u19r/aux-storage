@@ -3,16 +3,14 @@ use std::sync::Arc;
 use metrics_facade::MetricsFacade;
 use storage_common::DatabaseJobIntervals;
 
-#[cfg(all(test, feature = "cache-write-planner"))]
-use super::DatabaseManagerTestPauseHandle;
-use crate::{admission::AdmissionConfig, cache_coordinator::StorageAuthoritativeCacheOptions};
+use crate::admission::AdmissionConfig;
 
 #[derive(Debug, Clone)]
 pub struct DatabaseManagerRuntimeOptions {
     pub enable_database_jobs: bool,
-    pub enable_background_refresh: bool,
-    pub enable_background_watchers: bool,
-    pub enable_single_node_sync_mode: bool,
+    /// Native scheduled-job operation budget for capabilities on the
+    /// initialized local store.
+    pub scheduled_job_store_config: bg_job_store::ScheduledJobStoreConfig,
     /// Enables legacy aux single-table conveniences on generic raw write
     /// operations.
     ///
@@ -20,32 +18,29 @@ pub struct DatabaseManagerRuntimeOptions {
     /// require this flag. Keep this option for older callers that intentionally
     /// want raw DynamoDB-compatible writes to receive single-table metadata.
     pub enable_single_table_mode: bool,
-    pub run_gsi_maintenance_after_write: Option<bool>,
     pub database_job_intervals: DatabaseJobIntervals,
-    pub authoritative_cache_options: StorageAuthoritativeCacheOptions,
     pub metrics_facade: Option<Arc<dyn MetricsFacade>>,
-    /// Per-connection foreground admission settings.  Provider call sites can
-    /// migrate incrementally through `DatabaseManager::acquire_admission`.
+    /// Per-connection foreground admission settings. Manager dispatch retains
+    /// each permit through provider settlement, including response
+    /// cancellation.
     pub admission_config: AdmissionConfig,
-    #[cfg(all(test, feature = "cache-write-planner"))]
-    pub(crate) pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
+    /// Startup-only operator inputs keyed by storage connection ID.
+    #[cfg(feature = "regional")]
+    pub regional_connections:
+        std::collections::HashMap<String, regional_replication::runtime::RegionalStartup>,
 }
 
 impl Default for DatabaseManagerRuntimeOptions {
     fn default() -> Self {
         Self {
             enable_database_jobs: true,
-            enable_background_refresh: true,
-            enable_background_watchers: true,
-            enable_single_node_sync_mode: false,
+            scheduled_job_store_config: Default::default(),
             enable_single_table_mode: false,
-            run_gsi_maintenance_after_write: None,
             database_job_intervals: DatabaseJobIntervals::default(),
-            authoritative_cache_options: StorageAuthoritativeCacheOptions::default(),
             metrics_facade: None,
             admission_config: AdmissionConfig::default(),
-            #[cfg(all(test, feature = "cache-write-planner"))]
-            pause_after_storage_write: None,
+            #[cfg(feature = "regional")]
+            regional_connections: Default::default(),
         }
     }
 }
@@ -65,6 +60,19 @@ pub struct DatabaseManagerRuntimeOptionsBuilder {
 }
 
 impl DatabaseManagerRuntimeOptionsBuilder {
+    #[cfg(feature = "regional")]
+    #[must_use]
+    pub fn regional_connection(
+        mut self,
+        connection_id: String,
+        startup: regional_replication::runtime::RegionalStartup,
+    ) -> Self {
+        self.options
+            .regional_connections
+            .insert(connection_id, startup);
+        self
+    }
+
     #[must_use]
     pub fn enable_database_jobs(mut self, enable_database_jobs: bool) -> Self {
         self.options.enable_database_jobs = enable_database_jobs;
@@ -72,20 +80,11 @@ impl DatabaseManagerRuntimeOptionsBuilder {
     }
 
     #[must_use]
-    pub fn enable_background_refresh(mut self, enable_background_refresh: bool) -> Self {
-        self.options.enable_background_refresh = enable_background_refresh;
-        self
-    }
-
-    #[must_use]
-    pub fn enable_background_watchers(mut self, enable_background_watchers: bool) -> Self {
-        self.options.enable_background_watchers = enable_background_watchers;
-        self
-    }
-
-    #[must_use]
-    pub fn enable_single_node_sync_mode(mut self, enable_single_node_sync_mode: bool) -> Self {
-        self.options.enable_single_node_sync_mode = enable_single_node_sync_mode;
+    pub fn scheduled_job_store_config(
+        mut self,
+        config: bg_job_store::ScheduledJobStoreConfig,
+    ) -> Self {
+        self.options.scheduled_job_store_config = config;
         self
     }
 
@@ -100,26 +99,8 @@ impl DatabaseManagerRuntimeOptionsBuilder {
     }
 
     #[must_use]
-    pub fn run_gsi_maintenance_after_write(
-        mut self,
-        run_gsi_maintenance_after_write: Option<bool>,
-    ) -> Self {
-        self.options.run_gsi_maintenance_after_write = run_gsi_maintenance_after_write;
-        self
-    }
-
-    #[must_use]
     pub fn database_job_intervals(mut self, database_job_intervals: DatabaseJobIntervals) -> Self {
         self.options.database_job_intervals = database_job_intervals;
-        self
-    }
-
-    #[must_use]
-    pub fn authoritative_cache_options(
-        mut self,
-        authoritative_cache_options: StorageAuthoritativeCacheOptions,
-    ) -> Self {
-        self.options.authoritative_cache_options = authoritative_cache_options;
         self
     }
 
@@ -135,18 +116,23 @@ impl DatabaseManagerRuntimeOptionsBuilder {
         self
     }
 
-    #[cfg(all(test, feature = "cache-write-planner"))]
-    #[must_use]
-    pub(crate) fn pause_after_storage_write(
-        mut self,
-        pause_after_storage_write: Option<DatabaseManagerTestPauseHandle>,
-    ) -> Self {
-        self.options.pause_after_storage_write = pause_after_storage_write;
-        self
-    }
-
     #[must_use]
     pub fn build(self) -> DatabaseManagerRuntimeOptions {
         self.options
+    }
+}
+
+#[cfg(not(feature = "regional"))]
+impl DatabaseManagerRuntimeOptions {
+    pub(crate) fn load_regional_connections(
+        &mut self,
+        files: &std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> storage_types::StorageResult<()> {
+        if !files.is_empty() {
+            return Err(storage_types::StorageError::validation(
+                "regional configuration requires regional support in this binary",
+            ));
+        }
+        Ok(())
     }
 }

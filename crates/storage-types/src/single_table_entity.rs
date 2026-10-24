@@ -4,6 +4,11 @@ use std::{borrow::Cow, collections::HashMap};
 
 use serde::Serialize;
 
+pub use crate::constants::{
+    CREATED_AT_ALIAS_ATTR, CREATED_AT_ATTR, ENTITY_TYPE_ATTR, EXPIRES_AT_ALIAS_ATTR,
+    EXPIRES_AT_ATTR, LEGACY_ENTITY_TYPE_ATTR, UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
+};
+
 /// Keys returned are logical (no tenant id prefix because each tenant has its
 /// own physical table). Implementations should keep pk stable (category token)
 /// and derive sk & optional GSIs at call time.
@@ -48,6 +53,58 @@ pub trait SingleTableEntity {
     #[must_use]
     fn table_key_map(&self) -> HashMap<String, crate::AttributeValue> {
         self.entity_key().into_map()
+    }
+
+    /// Bind a decoded entity to its addressed row before its identity selects
+    /// a destination. Split physical keys and residual keys must agree; the
+    /// canonical wire reader retains the existing entity-type alias format.
+    fn validate_stored_identity(&self, source: &crate::WireItem) -> crate::StorageResult<()> {
+        let key = crate::KeyAttributes::from_iter([
+            ("pk".into(), crate::AttributeValue::S(self.pk())),
+            ("sk".into(), crate::AttributeValue::S(self.sk())),
+        ]);
+        let entity_types = source.select_attribute_values(&[
+            ENTITY_TYPE_ATTR,
+            crate::constants::LEGACY_ENTITY_TYPE_ATTR,
+        ])?;
+        if !source.has_verified_keys(&key)?
+            || !matches!(entity_types.as_slice(),
+                [Some(crate::AttributeValue::S(value)), None]
+                | [None, Some(crate::AttributeValue::S(value))]
+                    if value == Self::STORAGE_ENTITY_TYPE)
+        {
+            return Err(crate::StorageError::internal(
+                "stored entity identity mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify the independent physical source address before entity identity
+    /// selects a destination. A range image alone cannot prove its table/key.
+    fn validate_addressed_identity(
+        &self,
+        table: &crate::TableName,
+        address: &crate::ItemKey,
+    ) -> crate::StorageResult<()> {
+        let key = match address {
+            crate::ItemKey::Table(key) => key,
+            crate::ItemKey::Index(key) => &key.table_key,
+            crate::ItemKey::IndexPrefix(_) => {
+                return Err(crate::StorageError::internal(
+                    "entity source lacks a table key",
+                ));
+            }
+        };
+        if &key.table_name != table
+            || key.hash_key != crate::AttributeValue::S(self.pk())
+            || key.range_key != Some(crate::AttributeValue::S(self.sk()))
+        {
+            return Err(crate::StorageError::internal(
+                "addressed entity identity mismatch",
+            ));
+        }
+        Ok(())
     }
 
     /// Optional GSI1 pair (pk, sk)
@@ -223,38 +280,25 @@ impl WireEntity {
 
 use crate::{AttributeValue, TryIntoWireItem, WireItem};
 
-pub const ENTITY_TYPE_ATTR: &str = "et";
-pub const LEGACY_ENTITY_TYPE_ATTR: &str = "entity_type";
-pub const CREATED_AT_ATTR: &str = "created_at";
-pub const UPDATED_AT_ATTR: &str = "updated_at";
-pub const EXPIRES_AT_ATTR: &str = "expires_at";
-pub const CREATED_AT_ALIAS_ATTR: &str = "c_at";
-pub const UPDATED_AT_ALIAS_ATTR: &str = "u_at";
-pub const EXPIRES_AT_ALIAS_ATTR: &str = "e_at";
-
 /// Build a write-ready entity envelope using the derived write encoder path.
 ///
 /// This path avoids materializing a `HashMap<String, AttributeValue>` for the
 /// payload itself and instead stitches key metadata directly into the encoded
-/// Dynamo wire JSON object.
+/// Dynamo wire JSON object. Generated keys precede the payload and replace
+/// duplicate payload names; TTL and indexers precede ordinary metadata.
 pub fn to_wire_entity<T: SingleTableEntity + TryIntoWireItem>(
     entity: &T,
 ) -> Result<WireEntity, crate::ConversionError> {
-    let payload_data = match entity
+    let payload = entity
         .try_into_wire_item()
-        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?
-    {
-        WireItem::DynamoJson { data } => data,
-        other @ WireItem::LocalSplit { .. } => {
-            let map = other
-                .into_attribute_map()
-                .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
-            serde_json::to_vec(&map)
-                .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?
-        }
-    };
-    let metadata_data = encode_single_table_metadata(entity)?;
-    let bytes = merge_dynamo_object_bytes(payload_data.as_slice(), metadata_data.as_slice())?;
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
+    let payload_data = payload
+        .dynamo_json_bytes()
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
+    let metadata_data = serde_json::to_vec(&SingleTableMetadata(entity))
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
+    let bytes = crate::wire_item::attributes::merge_attribute_bytes(&payload_data, &metadata_data)
+        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
     Ok(WireEntity::new::<T>(WireItem::dynamo_json(bytes)))
 }
 
@@ -269,7 +313,7 @@ pub fn to_wire_entity<T: SingleTableEntity + TryIntoWireItem>(
 pub fn to_wire_item_fast<T: SingleTableEntity + TryIntoWireItem>(
     entity: &T,
 ) -> Result<WireItem, crate::ConversionError> {
-    Ok(to_wire_entity(entity)?.into_write_parts().0)
+    Ok(to_wire_entity(entity)?.item)
 }
 
 /// Encode a manually serialized single-table entity as a logical wire item.
@@ -281,8 +325,8 @@ pub fn to_wire_item_fast<T: SingleTableEntity + TryIntoWireItem>(
 pub fn to_wire_item<T: SingleTableEntity + Serialize>(
     entity: &T,
 ) -> Result<WireItem, crate::ConversionError> {
-    let attributes = to_item_map(entity)?;
-    WireItem::from_attribute_map(&attributes)
+    let attributes = to_attribute_map(entity)?;
+    WireItem::try_from(&attributes)
         .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
 }
 
@@ -296,6 +340,14 @@ pub fn to_wire_item<T: SingleTableEntity + Serialize>(
 pub fn to_item_map<T: SingleTableEntity + Serialize>(
     entity: &T,
 ) -> Result<HashMap<String, AttributeValue>, crate::ConversionError> {
+    Ok(to_attribute_map(entity)?.into_hashmap())
+}
+
+/// Encode a manually serialized entity without allocating an intermediate
+/// HashMap.
+pub fn to_attribute_map<T: SingleTableEntity + Serialize>(
+    entity: &T,
+) -> Result<crate::AttributeMap, crate::ConversionError> {
     let value = serde_json::to_value(entity)
         .map_err(|err| crate::ConversionError::Serialization(err.to_string()))?;
     let serde_json::Value::Object(fields) = value else {
@@ -308,121 +360,84 @@ pub fn to_item_map<T: SingleTableEntity + Serialize>(
         .map(|(name, value)| {
             crate::attribute_value_from_json_value(value).map(|value| (name, value))
         })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+        .collect::<Result<crate::AttributeMap, _>>()?;
     normalize_timestamp_aliases(&mut attributes);
-    attributes.extend(entity_metadata(entity));
+    for (name, value) in entity_metadata(entity) {
+        attributes.insert(name, AttributeValue::S(value.into_owned()));
+    }
+    attributes.order_single_table_attributes(T::INDEXERS);
     Ok(attributes)
 }
 
-fn normalize_timestamp_aliases(attributes: &mut HashMap<String, AttributeValue>) {
+fn normalize_timestamp_aliases(attributes: &mut crate::AttributeMap) {
     for (long_name, alias) in [
         (CREATED_AT_ATTR, CREATED_AT_ALIAS_ATTR),
         (UPDATED_AT_ATTR, UPDATED_AT_ALIAS_ATTR),
         (EXPIRES_AT_ATTR, EXPIRES_AT_ALIAS_ATTR),
     ] {
-        if let Some(value) = attributes.remove(long_name) {
-            attributes.entry(alias.to_string()).or_insert(value);
+        if let Some(value) = attributes.remove(long_name)
+            && !attributes.contains_key(alias)
+        {
+            attributes.insert(alias, value);
         }
     }
 }
 
-fn encode_single_table_metadata<T: SingleTableEntity>(
+struct SingleTableMetadata<'a, T>(&'a T);
+
+#[derive(Serialize)]
+struct MetadataString<'a> {
+    #[serde(rename = "S")]
+    value: &'a str,
+}
+
+impl<T: SingleTableEntity> Serialize for SingleTableMetadata<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(None)?;
+        for (name, value) in entity_metadata(self.0) {
+            map.serialize_entry(name, &MetadataString { value: &value })?;
+        }
+        map.end()
+    }
+}
+
+fn entity_metadata<T: SingleTableEntity>(
     entity: &T,
-) -> Result<Vec<u8>, crate::ConversionError> {
-    serde_json::to_vec(&entity_metadata(entity))
-        .map_err(|err| crate::ConversionError::Serialization(err.to_string()))
-}
-
-fn entity_metadata<T: SingleTableEntity>(entity: &T) -> HashMap<String, AttributeValue> {
-    let mut metadata = HashMap::with_capacity(13);
-    metadata.insert(
-        "pk".to_string(),
-        AttributeValue::S(entity.pk_cow().into_owned()),
-    );
-    metadata.insert(
-        "sk".to_string(),
-        AttributeValue::S(entity.sk_cow().into_owned()),
-    );
-    metadata.insert(
-        ENTITY_TYPE_ATTR.to_string(),
-        AttributeValue::S(T::ENTITY_TYPE.to_string()),
-    );
-    if let Some((gpk, gsk)) = entity.gsi1() {
-        metadata.insert("gsi1pk".to_string(), AttributeValue::S(gpk));
-        metadata.insert("gsi1sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi2() {
-        metadata.insert("gsi2pk".to_string(), AttributeValue::S(gpk));
-        metadata.insert("gsi2sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi3() {
-        metadata.insert("gsi3pk".to_string(), AttributeValue::S(gpk));
-        metadata.insert("gsi3sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi4() {
-        metadata.insert("gsi4pk".to_string(), AttributeValue::S(gpk));
-        metadata.insert("gsi4sk".to_string(), AttributeValue::S(gsk));
-    }
-    if let Some((gpk, gsk)) = entity.gsi5() {
-        metadata.insert("gsi5pk".to_string(), AttributeValue::S(gpk));
-        metadata.insert("gsi5sk".to_string(), AttributeValue::S(gsk));
-    }
-    metadata
-}
-
-fn merge_dynamo_object_bytes(
-    payload_data: &[u8],
-    metadata_data: &[u8],
-) -> Result<Vec<u8>, crate::ConversionError> {
-    let payload_trimmed = trim_ascii_whitespace(payload_data);
-    let metadata_trimmed = trim_ascii_whitespace(metadata_data);
-    if !is_json_object(payload_trimmed) || !is_json_object(metadata_trimmed) {
-        return Err(crate::ConversionError::Serialization(
-            "wire item encode expected JSON objects".to_string(),
-        ));
-    }
-    if payload_trimmed == b"{}" {
-        return Ok(metadata_trimmed.to_vec());
-    }
-    if metadata_trimmed == b"{}" {
-        return Ok(payload_trimmed.to_vec());
-    }
-
-    let mut out = Vec::with_capacity(payload_trimmed.len() + metadata_trimmed.len() - 1);
-    out.extend_from_slice(&payload_trimmed[..payload_trimmed.len() - 1]);
-    out.push(b',');
-    out.extend_from_slice(&metadata_trimmed[1..]);
-    Ok(out)
-}
-
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    let mut end = bytes.len();
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &bytes[start..end]
-}
-
-fn is_json_object(bytes: &[u8]) -> bool {
-    bytes.len() >= 2 && bytes[0] == b'{' && bytes[bytes.len() - 1] == b'}'
+) -> impl Iterator<Item = (&'static str, Cow<'_, str>)> {
+    let primary = [
+        ("pk", entity.pk_cow()),
+        ("sk", entity.sk_cow()),
+        (ENTITY_TYPE_ATTR, Cow::Borrowed(T::ENTITY_TYPE)),
+    ];
+    let secondary = [
+        ("gsi1pk", "gsi1sk", entity.gsi1()),
+        ("gsi2pk", "gsi2sk", entity.gsi2()),
+        ("gsi3pk", "gsi3sk", entity.gsi3()),
+        ("gsi4pk", "gsi4sk", entity.gsi4()),
+        ("gsi5pk", "gsi5sk", entity.gsi5()),
+    ];
+    primary
+        .into_iter()
+        .chain(secondary.into_iter().flat_map(|(pk, sk, pair)| {
+            pair.into_iter().flat_map(move |(partition, sort)| {
+                [(pk, Cow::Owned(partition)), (sk, Cow::Owned(sort))]
+            })
+        }))
 }
 
 #[must_use]
-pub fn matches_entity_type<T: SingleTableEntity>(map: &HashMap<String, AttributeValue>) -> bool {
+pub fn matches_entity_type<T: SingleTableEntity>(map: &impl crate::AttributeValueLookup) -> bool {
     entity_type_from_item(map).is_some_and(|entity_type| entity_type == T::STORAGE_ENTITY_TYPE)
 }
 
 #[must_use]
 pub fn storage_entity_type_from_item(
-    map: &HashMap<String, AttributeValue>,
+    map: &impl crate::AttributeValueLookup,
 ) -> Option<crate::StorageEntityType> {
     match map
-        .get(ENTITY_TYPE_ATTR)
-        .or_else(|| map.get(LEGACY_ENTITY_TYPE_ATTR))
+        .get_attribute_value(ENTITY_TYPE_ATTR)
+        .or_else(|| map.get_attribute_value(LEGACY_ENTITY_TYPE_ATTR))
     {
         Some(AttributeValue::S(value)) => crate::StorageEntityType::parse_db(value),
         _ => None,
@@ -430,10 +445,10 @@ pub fn storage_entity_type_from_item(
 }
 
 #[must_use]
-pub fn entity_type_from_item(map: &HashMap<String, AttributeValue>) -> Option<&str> {
+pub fn entity_type_from_item(map: &impl crate::AttributeValueLookup) -> Option<&str> {
     match map
-        .get(ENTITY_TYPE_ATTR)
-        .or_else(|| map.get(LEGACY_ENTITY_TYPE_ATTR))
+        .get_attribute_value(ENTITY_TYPE_ATTR)
+        .or_else(|| map.get_attribute_value(LEGACY_ENTITY_TYPE_ATTR))
     {
         Some(AttributeValue::S(value)) => Some(value.as_str()),
         _ => None,

@@ -1,30 +1,25 @@
-#[cfg(feature = "rocksdb")]
-use kv::RocksDbKvStore;
-#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
-use kv::SortedKvDbStorageProvider;
-#[cfg(feature = "foundationdb")]
-use kv::{FoundationDbConfig, FoundationDbKvStore};
-#[cfg(feature = "postgres")]
-use sql::PostgresStorageProvider;
-#[cfg(feature = "sqlite")]
-use sql::SQLiteStorageProvider;
-#[cfg(feature = "turso")]
-use sql::TursoStorageProvider;
-use storage_provider::{StorageBackend, StorageConfig};
-use stream_provider::{StreamError, StreamProvider, StreamResult};
+//! Construct one initialized family store for the standalone stream service.
 
-/// Factory function to create stream providers
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+use kv_backend::KvStore;
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+use sql_backend::SqlStore;
+use storage_provider::{StorageBackend, StorageConfig};
+use stream_provider::{StreamError, StreamOperations, StreamResult};
+
+/// Select the configured driver, initialize its physical format, and publish
+/// it.
 pub async fn create_stream_provider(
     config: StorageConfig,
-) -> StreamResult<Box<dyn StreamProvider>> {
+) -> StreamResult<Box<dyn StreamOperations>> {
     match config.backend_type {
         #[cfg(feature = "sqlite")]
         StorageBackend::SQLite => {
-            let db_path = config
+            let path = config
                 .connection_string
-                .unwrap_or_else(|| "main.db".to_string());
-            let provider = SQLiteStorageProvider::new(&db_path).await?;
-            Ok(Box::new(provider))
+                .unwrap_or_else(|| "main.db".to_owned());
+            let driver = sql_backend::sqlite::SqliteBackend::initialize(path).await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
         }
         #[cfg(not(feature = "sqlite"))]
         StorageBackend::SQLite => Err(StreamError::internal(
@@ -32,11 +27,11 @@ pub async fn create_stream_provider(
         )),
         #[cfg(feature = "turso")]
         StorageBackend::Turso => {
-            let db_path = config
+            let path = config
                 .connection_string
-                .unwrap_or_else(|| "main.turso.db".to_string());
-            let provider = TursoStorageProvider::new(&db_path).await?;
-            Ok(Box::new(provider))
+                .unwrap_or_else(|| "main.turso.db".to_owned());
+            let driver = sql_backend::turso::TursoBackend::initialize(&path).await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
         }
         #[cfg(not(feature = "turso"))]
         StorageBackend::Turso => Err(StreamError::internal(
@@ -46,38 +41,28 @@ pub async fn create_stream_provider(
         StorageBackend::Postgres => {
             let dsn = config
                 .connection_string
-                .clone()
                 .ok_or_else(|| StreamError::internal("postgres stream backend missing dsn"))?;
-            let (pool_size, background_pool_size, tls_enabled) =
-                config.postgres.as_ref().map_or((16, 4, true), |cfg| {
-                    (cfg.max_pool_size, cfg.background_max_pool_size, cfg.tls)
-                });
-            let provider = PostgresStorageProvider::new_with_tls(
-                &dsn,
-                pool_size,
-                background_pool_size,
-                tls_enabled,
-            )
-            .await?;
-            Ok(Box::new(provider))
+            let (pool_size, tls) = config.postgres.as_ref().map_or((16, true), |settings| {
+                (settings.max_pool_size, settings.tls)
+            });
+            let driver =
+                sql_backend::postgres::PostgresBackend::initialize(&dsn, pool_size, tls).await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
         }
         #[cfg(not(feature = "postgres"))]
         StorageBackend::Postgres => Err(StreamError::internal(
             "postgres stream backend is not enabled in this build",
         )),
-
         #[cfg(feature = "rocksdb")]
         StorageBackend::RocksDB => {
-            let db_path = config.connection_string.unwrap_or_else(|| {
+            let path = config.connection_string.unwrap_or_else(|| {
                 std::env::temp_dir()
                     .join("rocksdb")
                     .to_string_lossy()
-                    .to_string()
+                    .into_owned()
             });
-            let rocks_db = RocksDbKvStore::new(db_path.into())?;
-            let provider = SortedKvDbStorageProvider::new(rocks_db);
-
-            Ok(Box::new(provider))
+            let driver = kv_backend::rocksdb::RocksDbBackend::initialize(path.into())?;
+            Ok(Box::new(KvStore::initialize_format(driver).await?))
         }
         #[cfg(not(feature = "rocksdb"))]
         StorageBackend::RocksDB => Err(StreamError::internal(
@@ -85,8 +70,21 @@ pub async fn create_stream_provider(
         )),
         #[cfg(feature = "foundationdb")]
         StorageBackend::FoundationDb => {
-            let provider = build_foundationdb_provider(&config)?;
-            Ok(Box::new(provider))
+            let settings = config.foundationdb.unwrap_or_default();
+            let prefix = settings.subspace_prefix.as_deref().map(str::as_bytes);
+            let tenant = settings.tenant_name.as_deref().map(str::as_bytes);
+            let driver = kv_backend::foundationdb::FoundationDbBackend::initialize(
+                kv_backend::foundationdb::FoundationDbOptions {
+                    cluster_file: settings.cluster_file.as_deref(),
+                    subspace_prefix: prefix,
+                    tenant_name: tenant,
+                    cache_read_version_ms: settings.cache_read_version_ms,
+                    transaction_byte_limit: settings.transaction_byte_limit,
+                    report_conflicting_keys: false,
+                },
+            )
+            .await?;
+            Ok(Box::new(KvStore::initialize_format(driver).await?))
         }
         #[cfg(not(feature = "foundationdb"))]
         StorageBackend::FoundationDb => Err(StreamError::internal(
@@ -96,24 +94,4 @@ pub async fn create_stream_provider(
             "remote stream backend is not implemented",
         )),
     }
-}
-
-#[cfg(feature = "foundationdb")]
-fn build_foundationdb_provider(
-    config: &StorageConfig,
-) -> StreamResult<SortedKvDbStorageProvider<FoundationDbKvStore>> {
-    let settings = config.foundationdb.clone().unwrap_or_default();
-    let mut fdb_config = FoundationDbConfig::default();
-    if let Some(cluster_file_path) = settings.cluster_file {
-        fdb_config.cluster_file_path = Some(cluster_file_path);
-    }
-    if let Some(prefix) = settings.subspace_prefix {
-        fdb_config.subspace_prefix = Some(prefix.into_bytes());
-    }
-    if let Some(tenant) = settings.tenant_name {
-        fdb_config.tenant_name = Some(tenant.into_bytes());
-    }
-    fdb_config.cache_read_version_ms = settings.cache_read_version_ms;
-    let store = FoundationDbKvStore::connect(fdb_config)?;
-    Ok(SortedKvDbStorageProvider::new(store))
 }

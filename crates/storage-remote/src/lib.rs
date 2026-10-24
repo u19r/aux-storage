@@ -9,6 +9,16 @@ mod provider;
 
 #[cfg(test)]
 mod error_tests;
+#[cfg(test)]
+mod remote_body_allocation_tests;
+#[cfg(test)]
+mod remote_conformance_corrections_tests;
+#[cfg(test)]
+mod remote_provider_tests;
+#[cfg(test)]
+mod scheduled_job_store_tests;
 
-pub use constants::{MAX_ENDPOINT_RETRIES, MAX_REMOTE_RETRIES};
-pub use provider::RemoteStorageProvider;
+pub use provider::{
+    RemoteStorageProvider, build_scheduled_job_store, connect_scheduled_job_store,
+    validate_scheduled_job_http_endpoints,
+};

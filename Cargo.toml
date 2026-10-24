@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-rust-version = "1.96.0"
+rust-version = "1.99.1"
 edition = "2024"
 repository = "https://github.com/u19r/aux-storage"
 readme = "README.md"
@@ -13,17 +13,18 @@ categories = []
 license = "BUSL-1.1"
 
 [workspace.dependencies]
+cpu-time = "1.0.0"
 ############################################
 # rust-random
-rand = "0.10.2"
+rand = "0.10.3"
 
 ############################################
 # tokio-rs
 axum = "0.8.9"
-deadpool-postgres = "0.14.1"
-rustls = "0.23.43"
-rustls-native-certs = "0.8.4"
-tokio = { version = "1.53.1", features = ["full", "tracing"] }
+deadpool-postgres = "0.14.2"
+rustls = "0.23.46"
+rustls-native-certs = "0.8.5"
+tokio = { version = "1.54.1", features = ["full", "tracing"] }
 tokio-postgres = "0.7.18"
 tokio-postgres-rustls = "0.14.0"
 tracing = "0.1.44"
@@ -37,36 +38,40 @@ futures-util = "0.3.34"
 ############################################
 # hyperium
 bytes = "1.12.1"
+concurrent-queue = "2.5.0"
 http = "1.5.0"
 httpdate = "1.0.3"
-tower-http = { version = "0.7.0", features = ["catch-panic", "cors"] }
+tower-http = { version = "0.7.1", features = ["catch-panic", "cors"] }
 
 ############################################
 # serde-rs
-md5 = "0.8"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+md5 = "0.8.1"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = "0.11.1"
 url = "2.5.8"
 
 ############################################
 # awslabs
-aws-config = "1.10.1"
-aws-credential-types = "1.3.0"
-aws-sdk-dynamodb = "1.120.0"
-aws-sdk-sns = "1.107.0"
-aws-sdk-sqs = "1.105.0"
-aws-sigv4 = "1.5.1"
-aws-smithy-runtime-api = "1.14.0"
-aws-smithy-types = "1.6.2"
+aws-config = "1.13.0"
+aws-credential-types = "1.3.1"
+aws-sdk-dynamodb = { version = "1.134.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sns = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1.117.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sigv4 = "1.6.3"
+aws-smithy-runtime-api = "1.19.1"
+aws-smithy-types = "1.9.0"
 
 ############################################
 # dtolnay
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-inventory = "0.3.24"
+inventory = "0.3.25"
+proc-macro2 = "1.0.107"
 quote = "1.0.47"
-syn = { version = "3.0.3", features = ["full"] }
-thiserror = "2.0.20"
+self_cell = "1.3.0"
+syn = { version = "3.0.9", features = ["full"] }
+thiserror = "2.0.21"
 
 ############################################
 # marshallpierce
@@ -83,77 +88,76 @@ cucumber = "0.23.0"
 
 ############################################
 # seanmonstar
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
 
 ############################################
 # rust-rocksdb
-rocksdb = { version = "0.24", features = ["multi-threaded-cf"] }
+rocksdb = { version = "0.25.0", features = ["multi-threaded-cf"] }
 
 ############################################
 # clap-rs
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 ############################################
 # uuid-rs
-uuid = { version = "1.24.1", features = ["serde", "v4", "v5", "v7"] }
+uuid = { version = "1.29.0", features = ["serde", "v4", "v5", "v7"] }
 
 ############################################
 # idanarye
-typed-builder = "0.23.2"
-
-############################################
-# jeromefroe
-hashring = "0.3.6"
-
-############################################
-# datafuselabs
-openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
-
-############################################
-# Stebalien
 tempfile = "3.27.0"
+typed-builder = "0.23.2"
 
 ############################################
 # Other / standalone
 base32 = "0.5.1"
 cargo_metadata = "0.23.1"
-#0.10.0 with fix for rust 1.91
-foundationdb = { version = "0.11.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "6030bbba92809e6fad73b54161f723f294ce839b" }
-foundationdb-simulation = { version = "0.3.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "6030bbba92809e6fad73b54161f723f294ce839b" }
-hostname = "0.4"
-httpmock = "0.8.3"
-ipnet = "2.12.0"
-jsonschema = { version = "0.46.10", default-features = false, features = ["resolve-file"] }
-lz4_flex = "0.13.1"
+# Keep the native client, tuple codec, and simulation API on one upstream revision.
+foundationdb = { version = "0.11.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
+foundationdb-simulation = { version = "0.3.0", features = ["embedded-fdb-include", "fdb-7_4"], git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
+foundationdb-tuple = { version = "0.11.0", git = "https://github.com/foundationdb-rs/foundationdb-rs.git", rev = "9c91ad4fc84836a51f6544ea7c60c784f4d9b6f3" }
+hostname = "0.4.2"
+httpmock = "0.9.0"
+ipnet = "2.12.2"
+jsonschema = { version = "0.60.1", default-features = false, features = ["resolve-file"] }
+lz4_flex = "0.14.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 notify = "8.2.0"
-proptest = "1.11.0"
-quint-connect = "0.1.2"
-rust_decimal = "1.42.1"
-schemars = "1.2.2"
-smallvec = { version = "1.15.2", features = ["serde"] }
-toml = "1.1.4"
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
-turso = { version = "0.6.1", default-features = false }
-utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
-xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+proptest = "1.12.0"
+quint-connect = "=0.1.2"
+rust_decimal = "1.43.0"
+schemars = "1.2.3"
+smallvec = { version = "1.16.4", features = ["serde"] }
+toml = "1.1.8"
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+turso = { version = "0.8.3", default-features = false }
+utoipa = { version = "6.0.0", features = ["axum_extras", "chrono", "uuid"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 ############################################
-# Public aux-common shared crates.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "d3080d30961e4ed773d52caef8c05eadcc2c9eee" }
+# Shared crates pinned to a published aux-common revision.
+alloc-counter = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+http-request = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+
+# Scheduled jobs use the shared aux-common contract; storage owns provider adapters.
+bg-jobs-tokio = { package = "bg-jobs-tokio", version = "0.2.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+scheduled-bg-jobs = { package = "bg-jobs", version = "0.2.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", version = "0.1.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
 
 ############################################
 # Local path dependencies
+infrastructure-provider = { path = "crates/infrastructure-provider" }
+replication-provider = { path = "crates/replication-provider" }
+replication-types = { path = "crates/replication-types" }
+storage-types = { path = "crates/storage-types" }
 tokio-rusqlite = { path = "vended/tokio-rusqlite" }
 
-rusqlite = { version = "0.40.2", features = ["bundled", "uuid"] }
+rusqlite = { version = "0.41.0", features = ["backup", "bundled", "hooks", "uuid"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -178,6 +182,12 @@ debug = 0
 lto = false
 codegen-units = 256
 incremental = false
+
+[profile.test.package.turso_core]
+opt-level = 1
+
+[profile.test.package.turso_parser]
+opt-level = 1
 
 [profile.release]
 opt-level = "z"
@@ -209,3 +219,11 @@ strip = "none"
 debug = 0
 incremental = false
 codegen-units = 256
+
+# Turso's recursive SQL parser and translator exhaust ordinary thread stacks
+# without optimization, including bounded infrastructure reads during enable.
+[profile.dev.package.turso_core]
+opt-level = 1
+
+[profile.dev.package.turso_parser]
+opt-level = 1

@@ -44,6 +44,12 @@ impl From<&[u8]> for StreamKey {
     }
 }
 
+impl From<Vec<u8>> for StreamKey {
+    fn from(value: Vec<u8>) -> Self {
+        StreamKey(value)
+    }
+}
+
 impl std::fmt::Debug for StreamKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "StreamKey({})", String::from_utf8_lossy(&self.0))

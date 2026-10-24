@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::profile_integer_overrides;
+use crate::profiles::profile_integer_overrides;
 
 #[test]
 fn local_soak_profiles_materialize_larger_queue_work() {

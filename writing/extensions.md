@@ -20,13 +20,13 @@ It is intended for systems that want the DynamoDB data model and API shape, but 
 Immediate consistency GSIs are enabled at the aux-storage service level:
 
 ```bash
-storage-api --storage foundationdb --immediate-consistency-gsis
+storage-api --storage foundationdb --overrides 'features.backends.foundationdb.immediate_gsi_consistency=true'
 ```
 
 From a source checkout, the same launch shape is:
 
 ```bash
-cargo run -p storage-api --bin storage-api -- --storage foundationdb --immediate-consistency-gsis
+cargo run -p storage-api --bin storage-api -- --storage foundationdb --overrides 'features.backends.foundationdb.immediate_gsi_consistency=true'
 ```
 
 Use the equivalent deployment setting if your environment wraps `storage-api`
@@ -680,14 +680,6 @@ Mapped ranges use serializable reads with FoundationDB read-your-writes support
 enabled. The 7.4.5 client rejects mapped ranges in snapshot mode or when
 read-your-writes is disabled. ReadSequence does not expose those invalid
 transaction modes.
-
-On the measured composite-key fixture, one public ReadSequence request replaced
-an average 5.50 standard DynamoDB Query/Get/BatchGet HTTP calls. Native mapped
-execution achieved 670.3 requests/s at 4.23 ms p95; client composition achieved
-313.7 requests/s at 21.18 ms p95, with zero errors in both runs. These figures
-describe the local 100-item benchmark, not a production latency guarantee. See
-the [ordered indexer benchmark](../docs/benchmarks/indexers-20260810.md) for the
-fixture, commands, provider counters, and interpretation.
 
 For a GSI parent, aux-storage reads only the stored GSI projection and never
 follows the entry to the base item. A child without `ProjectionExpression`

@@ -1,5 +1,24 @@
 use crate::{common::*, imports::*, table_atomicity::*};
 
+pub(crate) fn recorded_workload_error_detail(
+    error_count: u64,
+    anomalies: &[Anomaly],
+    unknown_count: usize,
+) -> Option<String> {
+    let operation_failure_count = anomalies
+        .iter()
+        .filter(|anomaly| anomaly.kind == AnomalyKind::OperationFailed)
+        .count();
+    if error_count == 0 && operation_failure_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "recorded workload errors before check: error_count={} operation_failed_anomalies={} \
+         unknown_count={}",
+        error_count, operation_failure_count, unknown_count,
+    ))
+}
+
 impl TableAtomicityWorkload {
     pub(crate) async fn check_phase(&mut self, db: SimDatabase) {
         self.trace_phase("check");
@@ -13,25 +32,38 @@ impl TableAtomicityWorkload {
             self.trace_invariant_error("write_artifacts", err);
             return;
         }
-        let provider = match self.provider(db).await {
+        if let Some(error) = recorded_workload_error_detail(
+            self.error_count,
+            &self.anomalies,
+            self.history.unknown_count(),
+        ) {
+            self.trace_invariant_error("check", error);
+            return;
+        }
+        let provider = match self.provider(db.clone()).await {
             Ok(provider) => provider,
             Err(err) => {
                 self.trace_invariant_error("check", err);
                 return;
             }
         };
-        let manager = match DatabaseManager::new_with_mocks(Arc::clone(&provider)) {
+        let manager = match self.manager_from_store(Arc::clone(&provider)).await {
             Ok(manager) => manager,
             Err(error) => {
-                self.trace_invariant_error("check", storage_error_detail(&error));
+                self.trace_invariant_error("check", error);
                 return;
             }
         };
+        self.trace_check_progress("table_snapshot", "start", 0);
         for key_index in 0..self.key_count {
             let key = self.owned_key(key_index);
             let expected = self.model.get(&key).map(str::to_string);
+            self.trace_check_progress("table_item_read", "start", key_index);
             let actual_item = match manager
-                .get_item_map(self.table_name(), self.key_attributes(&key))
+                .get_item_decode::<_, storage_types::AttributeMap>(
+                    self.table_name(),
+                    self.key_attributes(&key),
+                )
                 .await
             {
                 Ok(actual) => actual,
@@ -47,6 +79,7 @@ impl TableAtomicityWorkload {
                     return;
                 }
             };
+            self.trace_check_progress("table_item_read", "finish", key_index);
             let actual = match self.payload_from_item(&key, actual_item) {
                 Ok(actual) => actual,
                 Err(err) => {
@@ -85,6 +118,7 @@ impl TableAtomicityWorkload {
                 return;
             }
         }
+        self.trace_check_progress("table_snapshot", "finish", self.key_count);
         if let Err(err) = self.check_gsi_exactness(&manager).await {
             self.trace_invariant_error("check_gsi", err);
             return;
@@ -121,7 +155,7 @@ impl TableAtomicityWorkload {
             return;
         }
         if self.client_id == 0
-            && let Err(err) = self.check_direct_stream_pointers(&provider).await
+            && let Err(err) = self.check_direct_stream_pointers(db, &provider).await
         {
             self.trace_invariant_error("check_direct_stream_pointers", err);
             return;
@@ -132,9 +166,13 @@ impl TableAtomicityWorkload {
             }
             let side_effect_key =
                 self.transact_side_effect_key(&event.key, event.client_id, event.sequence);
+            self.trace_check_progress("transaction_side_effect_read", "start", event.sequence);
             let expected = event.value.clone();
             let actual_item = match manager
-                .get_item_map(self.table_name(), self.key_attributes(&side_effect_key))
+                .get_item_decode::<_, storage_types::AttributeMap>(
+                    self.table_name(),
+                    self.key_attributes(&side_effect_key),
+                )
                 .await
             {
                 Ok(actual) => actual,
@@ -150,6 +188,7 @@ impl TableAtomicityWorkload {
                     return;
                 }
             };
+            self.trace_check_progress("transaction_side_effect_read", "finish", event.sequence);
             let actual = match self.payload_from_item(&side_effect_key, actual_item) {
                 Ok(actual) => actual,
                 Err(err) => {
@@ -215,8 +254,12 @@ impl TableAtomicityWorkload {
             let mut reads = Vec::new();
             for key_index in 0..self.shared_key_count {
                 let key = self.shared_key(key_index);
+                self.trace_check_progress("shared_key_read", "start", key_index);
                 let actual_item = match manager
-                    .get_item_map(self.table_name(), self.key_attributes(&key))
+                    .get_item_decode::<_, storage_types::AttributeMap>(
+                        self.table_name(),
+                        self.key_attributes(&key),
+                    )
                     .await
                 {
                     Ok(actual) => actual,
@@ -232,6 +275,7 @@ impl TableAtomicityWorkload {
                         return;
                     }
                 };
+                self.trace_check_progress("shared_key_read", "finish", key_index);
                 let actual = match self.payload_from_item(&key, actual_item) {
                     Ok(actual) => actual,
                     Err(err) => {

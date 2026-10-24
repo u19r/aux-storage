@@ -4,10 +4,59 @@ use alloc_counter::AllocationGuard;
 
 use crate::{
     AttributeValue, KeyAttributes, KeySchemaElement, KeyType,
-    validate_key_attribute_value_for_schema, validate_key_attributes_for_schema,
+    constants_tests::DYNAMODB_LIMITS_PERF_ITERATIONS, validate_key_attribute_value_for_schema,
+    validate_key_attributes_for_schema,
 };
 
-const ITERATIONS: usize = 30_000;
+fn transaction_request_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "TransactItems": (0..10)
+            .map(|index| serde_json::json!({
+                "Put": {
+                    "TableName": "jobs",
+                    "Item": {
+                        "pk": { "S": format!("tenant#{index}") },
+                        "payload": { "S": "x".repeat(1_150) }
+                    }
+                }
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn legacy_validate_transaction_request_size(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<(), String> {
+    let size = serde_json::to_vec(value)
+        .map_err(|err| format!("Invalid request format: {err}"))?
+        .len();
+    if size > crate::constants::MAX_TRANSACTION_REQUEST_BYTES {
+        return Err(format!(
+            "{field} cannot exceed {} bytes",
+            crate::constants::MAX_TRANSACTION_REQUEST_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn measure_transaction_request_size(
+    label: &'static str,
+    value: &serde_json::Value,
+    validate: fn(&serde_json::Value, &str) -> Result<(), String>,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "transaction_request_size_allocation_profile",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..DYNAMODB_LIMITS_PERF_ITERATIONS {
+        validate(value, "TransactWriteItems request").expect("request is within limit");
+    }
+    guard.finish()
+}
 
 fn schemas() -> [KeySchemaElement; 3] {
     [
@@ -48,7 +97,7 @@ fn measure_direct_validation_allocations() -> alloc_counter::AllocationReport<'s
         Some("direct"),
     );
 
-    for _ in 0..ITERATIONS {
+    for _ in 0..DYNAMODB_LIMITS_PERF_ITERATIONS {
         for (schema, (_, value)) in schemas.iter().zip(values.iter()) {
             validate_key_attribute_value_for_schema(schema, value).expect("valid key value");
         }
@@ -68,7 +117,7 @@ fn measure_legacy_validation_allocations() -> alloc_counter::AllocationReport<'s
         Some("legacy"),
     );
 
-    for _ in 0..ITERATIONS {
+    for _ in 0..DYNAMODB_LIMITS_PERF_ITERATIONS {
         for (schema, (name, value)) in schemas.iter().zip(values.iter()) {
             let mut key_attributes = KeyAttributes::with_capacity(1);
             key_attributes.insert(name.clone(), value.clone());
@@ -86,7 +135,7 @@ fn measure_runtime(
     let schemas = schemas();
     let values = key_values();
     let started = Instant::now();
-    for _ in 0..ITERATIONS {
+    for _ in 0..DYNAMODB_LIMITS_PERF_ITERATIONS {
         validate(&schemas, &values);
     }
     started.elapsed()
@@ -96,8 +145,8 @@ fn measure_runtime(
 fn direct_key_attribute_value_validation_allocation_profile_tests() {
     let legacy = measure_legacy_validation_allocations();
     let direct = measure_direct_validation_allocations();
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&direct);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&direct);
     assert!(direct.allocation_count < legacy.allocation_count);
     assert!(direct.allocated_bytes < legacy.allocated_bytes);
 }
@@ -120,16 +169,16 @@ fn direct_key_attribute_value_validation_runtime_perf_probe() {
     });
 
     println!(
-        "legacy_key_attribute_validation iterations={ITERATIONS} elapsed_ms={:.3} \
-         ns_per_iter={:.2}",
+        "legacy_key_attribute_validation iterations={DYNAMODB_LIMITS_PERF_ITERATIONS} \
+         elapsed_ms={:.3} ns_per_iter={:.2}",
         legacy.as_secs_f64() * 1_000.0,
-        legacy.as_nanos() as f64 / ITERATIONS as f64
+        legacy.as_nanos() as f64 / DYNAMODB_LIMITS_PERF_ITERATIONS as f64
     );
     println!(
-        "direct_key_attribute_validation iterations={ITERATIONS} elapsed_ms={:.3} \
-         ns_per_iter={:.2}",
+        "direct_key_attribute_validation iterations={DYNAMODB_LIMITS_PERF_ITERATIONS} \
+         elapsed_ms={:.3} ns_per_iter={:.2}",
         direct.as_secs_f64() * 1_000.0,
-        direct.as_nanos() as f64 / ITERATIONS as f64
+        direct.as_nanos() as f64 / DYNAMODB_LIMITS_PERF_ITERATIONS as f64
     );
     assert!(direct.as_nanos() > 0);
 }
@@ -146,4 +195,31 @@ fn realistic_key_values_cover_string_number_and_binary_tests() {
     for (schema, (_, value)) in schemas.iter().zip(values.iter()) {
         validate_key_attribute_value_for_schema(schema, value).expect("valid key value");
     }
+}
+
+#[test]
+fn transaction_request_size_writer_preserves_result_and_avoids_buffer_allocation() {
+    let value = transaction_request_fixture();
+    assert_eq!(
+        crate::dynamodb_limits::validate_transaction_request_size(
+            &value,
+            "TransactWriteItems request",
+        ),
+        legacy_validate_transaction_request_size(&value, "TransactWriteItems request")
+    );
+
+    let legacy = measure_transaction_request_size(
+        "legacy_to_vec",
+        &value,
+        legacy_validate_transaction_request_size,
+    );
+    let candidate = measure_transaction_request_size(
+        "counting_writer",
+        &value,
+        crate::dynamodb_limits::validate_transaction_request_size,
+    );
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&candidate);
+    assert!(candidate.allocation_count < legacy.allocation_count);
+    assert!(candidate.allocated_bytes < legacy.allocated_bytes);
 }

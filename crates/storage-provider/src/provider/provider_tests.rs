@@ -13,7 +13,7 @@ fn transact_write_request_preserves_client_request_token() {
                 item: {
                     let mut item = HashMap::new();
                     item.insert("id".to_string(), AttributeValue::S("test".to_string()));
-                    item
+                    storage_types::WireItem::try_from(&item).unwrap()
                 },
                 indexers: None,
                 condition_expression: None,
@@ -38,7 +38,7 @@ fn transact_write_item_can_represent_invalid_multiple_operations_for_validation_
         transact_items: vec![TransactWriteItem {
             put: Some(TransactPutRequest {
                 table_name: TableName::new("test_table"),
-                item: HashMap::new(),
+                item: storage_types::WireItem::dynamo_json(b"{}".to_vec()),
                 indexers: None,
                 condition_expression: None,
                 expression_attribute_names: None,

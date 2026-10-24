@@ -5,12 +5,44 @@ use storage::DatabaseManager;
 use storage_types::{AttributeValue, TableName, UpdateItemRequest, UpdateItemResponse};
 
 use crate::{
-    routes::routes_test_support::{
-        create_test_db, default_conformance_backends, handle_create_table, handle_get_item,
+    routes::routes_tests::{
+        create_sqlite_test_db, default_conformance_backends, handle_create_table, handle_get_item,
         handle_put_item, handle_update_item,
     },
     types::Response,
 };
+
+#[tokio::test]
+async fn given_missing_table_and_invalid_key_when_update_runs_then_table_error_wins() {
+    let error = handle_update_item(
+        create_sqlite_test_db().await,
+        json!({"TableName": "MissingUpdateTable", "Key": {"other": {"S": "x"}}})
+            .try_into()
+            .unwrap(),
+    )
+    .await
+    .expect_err("missing table must fail first");
+    assert_eq!(error.status_code, 400);
+    assert!(error.message.contains("MissingUpdateTable"), "{error:?}");
+}
+
+#[tokio::test]
+async fn given_invalid_key_and_indexers_when_update_runs_then_key_error_wins() {
+    let db = create_sqlite_test_db().await;
+    create_hash_table(db.clone(), "UpdateErrorOrder").await;
+    let error = handle_update_item(
+        db,
+        json!({"TableName": "UpdateErrorOrder", "Key": {"other": {"S": "x"}}, "Indexers": ["duplicate", "duplicate"]})
+            .try_into()
+            .unwrap(),
+    )
+    .await
+    .expect_err("invalid key must fail first");
+    assert_eq!(
+        error.message,
+        "The provided key element does not match the schema"
+    );
+}
 
 #[test]
 fn update_item_request_serialization() {
@@ -27,7 +59,7 @@ fn update_item_request_serialization() {
         .table_name(TableName::new("test-table"))
         .key(key)
         .update_expression("SET attr = :val")
-        .expression_attribute_values(Some(expression_values))
+        .expression_attribute_values(Some(expression_values.into()))
         .return_values(Some(storage_types::ReturnValuesOldNewUpdated::AllNew))
         .build();
 
@@ -225,6 +257,9 @@ async fn update_item_without_update_expression_is_noop_upsert_across_conformance
         assert_eq!(
             existing_item
                 .item
+                .map(storage_types::AttributeMap::try_from)
+                .transpose()
+                .expect("decode existing item")
                 .and_then(|item| item.get("payload").cloned()),
             Some(AttributeValue::S("keep".to_string())),
             "{} existing item should be unchanged",
@@ -256,73 +291,75 @@ async fn update_item_without_update_expression_is_noop_upsert_across_conformance
 
 #[tokio::test]
 async fn update_item_accepts_aux_item_stream_ttl_without_storing_attribute() {
-    let db = create_test_db().await;
-    create_hash_table(db.clone(), "RouteUpdateItemDuration").await;
-    handle_put_item(
-        db.clone(),
-        json!({
-            "TableName": "RouteUpdateItemDuration",
-            "Item": {
-                "pk": {"S": "item1"},
-                "value": {"S": "old"}
-            }
-        })
-        .try_into()
-        .expect("valid put item request"),
-    )
-    .await
-    .expect("seed item");
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_hash_table(db.clone(), "RouteUpdateItemDuration").await;
+        handle_put_item(
+            db.clone(),
+            json!({
+                "TableName": "RouteUpdateItemDuration",
+                "Item": {
+                    "pk": {"S": "item1"},
+                    "value": {"S": "old"}
+                }
+            })
+            .try_into()
+            .expect("valid put item request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} seed item: {err:?}", backend.name));
 
-    handle_update_item(
-        db.clone(),
-        json!({
-            "TableName": "RouteUpdateItemDuration",
-            "Key": {"pk": {"S": "item1"}},
-            "UpdateExpression": "SET #value = :value",
-            "ExpressionAttributeNames": {
-                "#value": "value"
-            },
-            "ExpressionAttributeValues": {
-                ":value": {"S": "updated"}
-            },
-            "AuxItemStreamTtlHours": 144
-        })
-        .try_into()
-        .expect("valid update item request"),
-    )
-    .await
-    .expect("update item with custom item stream ttl");
-
-    let item = expect_get_item_response(
-        handle_get_item(
-            db,
+        handle_update_item(
+            db.clone(),
             json!({
                 "TableName": "RouteUpdateItemDuration",
                 "Key": {"pk": {"S": "item1"}},
-                "ConsistentRead": true
+                "UpdateExpression": "SET #value = :value",
+                "ExpressionAttributeNames": {
+                    "#value": "value"
+                },
+                "ExpressionAttributeValues": {
+                    ":value": {"S": "updated"}
+                },
+                "AuxItemStreamTtlHours": 144
             })
             .try_into()
-            .expect("valid get item request"),
+            .expect("valid update item request"),
         )
         .await
-        .expect("get item"),
-    )
-    .item
-    .expect("item");
-    assert_eq!(
-        item.get("value"),
-        Some(&AttributeValue::S("updated".to_string()))
-    );
-    assert!(
-        !item.contains_key("AuxItemStreamTtlHours"),
-        "aux item stream ttl is request metadata, not item data"
-    );
+        .unwrap_or_else(|err| panic!("{} update item with custom ttl: {err:?}", backend.name));
+
+        let item = expect_get_item_response(
+            handle_get_item(
+                db,
+                json!({
+                    "TableName": "RouteUpdateItemDuration",
+                    "Key": {"pk": {"S": "item1"}},
+                    "ConsistentRead": true
+                })
+                .try_into()
+                .expect("valid get item request"),
+            )
+            .await
+            .expect("get item"),
+        )
+        .item
+        .expect("item");
+        let item = storage_types::AttributeMap::try_from(item).expect("decode item");
+        assert_eq!(
+            item.get("value"),
+            Some(&AttributeValue::S("updated".to_string()))
+        );
+        assert!(
+            !item.contains_key("AuxItemStreamTtlHours"),
+            "aux item stream ttl is request metadata, not item data"
+        );
+    }
 }
 
 fn expect_get_item_response(response: Response) -> storage_types::GetItemResponse {
     match response {
         Response::GetItem(response) => response,
-        Response::GetWire(response) => response.into_get_item_response().unwrap(),
         other => panic!("Expected GetItem response, got: {other:?}"),
     }
 }
@@ -436,60 +473,65 @@ async fn update_item_condition_failure_returns_all_old_item_when_requested() {
 
 #[tokio::test]
 async fn competing_conditional_updates_return_the_atomic_winner_as_all_old() {
-    let db = create_test_db().await;
-    create_hash_table(db.clone(), "UpdateConditionalAtomicPreimage").await;
-    handle_put_item(
-        db.clone(),
-        json!({
-            "TableName": "UpdateConditionalAtomicPreimage",
-            "Item": {"pk": {"S": "p"}, "status": {"S": "open"}}
-        })
-        .try_into()
-        .expect("put item request"),
-    )
-    .await
-    .expect("seed item");
-
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-    let mut tasks = tokio::task::JoinSet::new();
-    for next in ["closed-a", "closed-b"] {
-        let db = db.clone();
-        let barrier = barrier.clone();
-        tasks.spawn(async move {
-            let request = json!({
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        create_hash_table(db.clone(), "UpdateConditionalAtomicPreimage").await;
+        handle_put_item(
+            db.clone(),
+            json!({
                 "TableName": "UpdateConditionalAtomicPreimage",
-                "Key": {"pk": {"S": "p"}},
-                "UpdateExpression": "SET #status = :next",
-                "ConditionExpression": "#status = :expected",
-                "ExpressionAttributeNames": {"#status": "status"},
-                "ExpressionAttributeValues": {
-                    ":next": {"S": next},
-                    ":expected": {"S": "open"}
-                },
-                "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                "Item": {"pk": {"S": "p"}, "status": {"S": "open"}}
             })
             .try_into()
-            .expect("update request");
-            barrier.wait().await;
-            (next, handle_update_item(db, request).await)
-        });
-    }
+            .expect("put item request"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{} seed item: {err:?}", backend.name));
 
-    let mut winner = None;
-    let mut loser_item = None;
-    while let Some(result) = tasks.join_next().await {
-        let (next, result) = result.expect("update task");
-        match result {
-            Ok(_) => winner = Some(next),
-            Err(error) => loser_item = error.item,
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = tokio::task::JoinSet::new();
+        for next in ["closed-a", "closed-b"] {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                let request = json!({
+                    "TableName": "UpdateConditionalAtomicPreimage",
+                    "Key": {"pk": {"S": "p"}},
+                    "UpdateExpression": "SET #status = :next",
+                    "ConditionExpression": "#status = :expected",
+                    "ExpressionAttributeNames": {"#status": "status"},
+                    "ExpressionAttributeValues": {
+                        ":next": {"S": next},
+                        ":expected": {"S": "open"}
+                    },
+                    "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+                })
+                .try_into()
+                .expect("update request");
+                barrier.wait().await;
+                (next, handle_update_item(db, request).await)
+            });
         }
+
+        let mut winner = None;
+        let mut loser_item = None;
+        while let Some(result) = tasks.join_next().await {
+            let (next, result) = result.expect("update task");
+            match result {
+                Ok(_) => winner = Some(next),
+                Err(error) => loser_item = error.item,
+            }
+        }
+        let winner = winner.unwrap_or_else(|| panic!("{} one update wins", backend.name));
+        let loser_item = loser_item
+            .unwrap_or_else(|| panic!("{} one update loses with an atomic preimage", backend.name));
+        assert_eq!(
+            loser_item.get("status"),
+            Some(&AttributeValue::S(winner.to_string())),
+            "{}",
+            backend.name
+        );
     }
-    let winner = winner.expect("one update wins");
-    let loser_item = loser_item.expect("one update loses with an atomic preimage");
-    assert_eq!(
-        loser_item.get("status"),
-        Some(&AttributeValue::S(winner.to_string()))
-    );
 }
 
 #[tokio::test]

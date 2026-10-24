@@ -3,15 +3,21 @@ use std::ops::{Add, Deref};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ItemKey, StreamItemId, StreamKey, TableName, item_key::ItemKeyError};
+use crate::{
+    ItemKey, StreamItemId, StreamKey, TableName,
+    constants::{STREAM_ITEM_HASH_PREFIX, STREAM_ITEM_KEY_MAX_BYTES},
+    item_key::ItemKeyError,
+};
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamName(pub(crate) Vec<u8>);
 
-pub(crate) const STREAM_ITEM_KEY_MAX_BYTES: usize = 1024;
-const STREAM_ITEM_HASH_PREFIX: &[u8] = b"hash/";
-
 impl StreamName {
+    // Legacy SQL/KV providers still parse these logical addresses. Shorten
+    // them when those providers are deleted at the single-owner cutover.
+    pub const TABLE_STREAM_SUFFIX: &'static [u8] = b"/stream-table";
+    pub const ITEM_STREAM_SEGMENT: &'static [u8] = b"/stream-item/";
+
     #[must_use]
     pub fn new(name: &[u8]) -> Self {
         Self(name.to_vec())
@@ -19,14 +25,27 @@ impl StreamName {
 
     #[must_use]
     pub fn system_table_stream() -> Self {
+        // This address changes with the table/item markers at cutover.
         Self(b"system-streams/tables".to_vec())
     }
 
     #[must_use]
     pub fn table_stream(table_name: &TableName) -> Self {
         let mut name = table_name.sanitized_name().as_bytes().to_vec();
-        name.extend(b"/stream-table");
+        name.extend_from_slice(Self::TABLE_STREAM_SUFFIX);
         Self(name)
+    }
+
+    /// The logical item address has one table-name segment before the item
+    /// marker.
+    pub fn item_table_name(&self) -> Option<TableName> {
+        let separator = self.0.iter().position(|byte| *byte == b'/')?;
+        if !self.0[separator..].starts_with(Self::ITEM_STREAM_SEGMENT) {
+            return None;
+        }
+        std::str::from_utf8(&self.0[..separator])
+            .ok()
+            .map(TableName::new)
     }
 
     pub fn table_item_stream(
@@ -34,7 +53,7 @@ impl StreamName {
         item_key: &ItemKey,
     ) -> Result<Self, ItemKeyError> {
         let mut name = table_name.sanitized_name().as_bytes().to_vec();
-        name.extend(b"/stream-item/");
+        name.extend_from_slice(Self::ITEM_STREAM_SEGMENT);
         let key_part = item_key.hash_range_key_part()?;
         if key_part.len() > STREAM_ITEM_KEY_MAX_BYTES {
             let digest = Uuid::new_v5(&Uuid::NAMESPACE_OID, &key_part)
@@ -113,10 +132,11 @@ impl Add<&StreamItemId> for &StreamName {
     type Output = StreamKey;
 
     fn add(self, rhs: &StreamItemId) -> Self::Output {
-        let mut v = self.0.clone();
+        let mut v = Vec::with_capacity(self.0.len() + 1 + rhs.as_bytes().len());
+        v.extend_from_slice(&self.0);
         v.extend(b"/");
         v.extend(rhs.as_bytes());
-        v.as_slice().into()
+        v.into()
     }
 }
 

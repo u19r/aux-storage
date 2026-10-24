@@ -1,12 +1,13 @@
 use alloc_counter::AllocationGuard;
 
 use crate::{
-    AttributeMap, AttributeValue, KeyAttributes, NonCoveringLookupAttachment,
-    NonCoveringLookupCandidate, NonCoveringLookupError, NonCoveringLookupJoinMode,
-    merge_non_covering_lookup_items, plan_non_covering_lookup,
+    AttributeMap, AttributeValue, KeyAttributes,
+    constants_tests::NON_COVERING_LOOKUP_ALLOCATION_PROFILE_ITERATIONS,
+    non_covering_lookup_model_tests::{
+        NonCoveringLookupAttachment, NonCoveringLookupCandidate, NonCoveringLookupError,
+        NonCoveringLookupJoinMode, merge_non_covering_lookup_items, plan_non_covering_lookup,
+    },
 };
-
-const ALLOCATION_PROFILE_ITERATIONS: usize = 256;
 
 #[test]
 fn given_duplicate_child_keys_when_planning_then_backend_fetch_is_deduped() {
@@ -142,7 +143,7 @@ fn given_mismatched_fetch_results_when_merging_then_error_names_expected_count()
 fn non_covering_lookup_key_mapping_allocation_baseline_tests() {
     let report = measure_key_mapping_allocations();
 
-    alloc_counter::emit_report(&report);
+    let _ = alloc_counter::emit_report(&report);
     assert!(report.allocation_count > 0);
     assert!(report.allocated_bytes > 0);
 }
@@ -151,7 +152,7 @@ fn non_covering_lookup_key_mapping_allocation_baseline_tests() {
 fn non_covering_lookup_merge_allocation_baseline_tests() {
     let report = measure_merge_allocations();
 
-    alloc_counter::emit_report(&report);
+    let _ = alloc_counter::emit_report(&report);
     assert!(report.allocation_count > 0);
     assert!(report.allocated_bytes > 0);
 }
@@ -168,7 +169,7 @@ fn measure_key_mapping_allocations() -> alloc_counter::AllocationReport<'static>
         Some("key_mapping"),
     );
 
-    for _ in 0..ALLOCATION_PROFILE_ITERATIONS {
+    for _ in 0..NON_COVERING_LOOKUP_ALLOCATION_PROFILE_ITERATIONS {
         let plan = plan_non_covering_lookup(candidates.clone(), 64).expect("lookup plan");
         std::hint::black_box(plan);
     }
@@ -188,7 +189,7 @@ fn measure_merge_allocations() -> alloc_counter::AllocationReport<'static> {
         Some("merge"),
     );
 
-    for _ in 0..ALLOCATION_PROFILE_ITERATIONS {
+    for _ in 0..NON_COVERING_LOOKUP_ALLOCATION_PROFILE_ITERATIONS {
         let attachments = merge_non_covering_lookup_items(
             &plan,
             fetched.clone(),

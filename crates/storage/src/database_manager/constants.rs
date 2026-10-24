@@ -27,3 +27,27 @@ pub(crate) const CAPPED_ENTITY_COUNTER_DELETE_CONDITION: &str =
     "attribute_exists(#value) AND #value > :zero";
 pub(crate) const CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION: &str =
     "ADD #value :delta SET #et = :entity_type";
+
+pub(crate) const STORAGE_OPERATIONS: &[&str] = &[
+    "batch_get_item",
+    "create_table",
+    "delete_item",
+    "delete_table",
+    "get_item",
+    "get_table_info",
+    "guarded_delete_item",
+    "guarded_put_item",
+    "guarded_update_item",
+    "list_tables",
+    "put_item",
+    "query_table",
+    "read_sequence",
+    "scan_table",
+    "table_exists",
+    "transact_get_items",
+    "update_item",
+    "update_table",
+];
+
+/// Dynamo-compatible key count per strongly decoded batch request.
+pub(super) const DECODE_BATCH_GET_KEYS: usize = 100;

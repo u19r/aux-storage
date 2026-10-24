@@ -25,12 +25,7 @@ pub enum StorageBackend {
     Remote,
 }
 
-impl StorageBackend {
-    #[must_use]
-    pub const fn supports_multi_region_replication_control_plane(&self) -> bool {
-        !matches!(self, Self::Remote)
-    }
-}
+impl StorageBackend {}
 
 #[derive(Debug, Clone, Default)]
 pub struct SqliteSettings {
@@ -77,6 +72,7 @@ pub struct RocksdbSettings {
 
 #[derive(Debug, Clone)]
 pub struct FoundationDbSettings {
+    pub transaction_byte_limit: Option<std::num::NonZeroUsize>,
     pub cluster_file: Option<String>,
     pub tenant_name: Option<String>,
     pub subspace_prefix: Option<String>,
@@ -87,6 +83,7 @@ pub struct FoundationDbSettings {
 impl Default for FoundationDbSettings {
     fn default() -> Self {
         Self {
+            transaction_byte_limit: None,
             cluster_file: None,
             tenant_name: None,
             subspace_prefix: None,

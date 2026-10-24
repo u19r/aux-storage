@@ -1,31 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use storage_provider::{StorageBackend, StorageConfig};
 use storage_types::UserStreamName;
 use stream_provider::{
     CursorPosition, StreamPartitioningMode, SubscriptionDestination, SubscriptionMessage,
     SubscriptionMessageSender, SubscriptionSendFuture, SubscriptionSendOutcome,
 };
 
-use crate::{StreamManager, create_stream_provider};
-
-async fn create_test_manager() -> StreamManager {
-    let config = StorageConfig {
-        backend_type: StorageBackend::SQLite,
-        connection_string: Some(":memory:".to_string()),
-        file_path: None,
-        sqlite: None,
-        turso: None,
-        postgres: None,
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
-    };
-
-    let provider = create_stream_provider(config).await.unwrap();
-    provider.initialize_stream().await.unwrap();
-    StreamManager::new(provider.into())
-}
+use crate::stream_test_support_tests::{create_test_manager, create_test_manager_with_sender};
 
 #[derive(Default)]
 struct RecordingSubscriptionSender {
@@ -72,22 +53,8 @@ async fn stream_manager_create_and_get() {
 
 #[tokio::test]
 async fn stream_manager_accepts_custom_subscription_message_sender() {
-    let config = StorageConfig {
-        backend_type: StorageBackend::SQLite,
-        connection_string: Some(":memory:".to_string()),
-        file_path: None,
-        sqlite: None,
-        turso: None,
-        postgres: None,
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
-    };
-    let provider = create_stream_provider(config).await.unwrap();
-    provider.initialize_stream().await.unwrap();
     let sender = Arc::new(RecordingSubscriptionSender::default());
-    let manager =
-        StreamManager::new_with_subscription_message_sender(provider.into(), sender.clone());
+    let manager = create_test_manager_with_sender(Some(sender.clone())).await;
 
     assert!(manager.has_subscription_message_sender());
 
@@ -167,7 +134,15 @@ async fn stream_manager_partitioned_api_is_backward_compatible() {
         .await
         .unwrap()
         .unwrap();
+    #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
     assert_eq!(stream.partitioning_mode, StreamPartitioningMode::Single);
+    #[cfg(all(
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "postgres"),
+        any(feature = "rocksdb", feature = "foundationdb")
+    ))]
+    assert_eq!(stream.partitioning_mode, StreamPartitioningMode::KeyOrdered);
 
     let item_id = manager
         .append_item_with_partition_key("partitioned-stream", b"payload", Some("customer-1"))
@@ -262,48 +237,6 @@ async fn stream_manager_cursor_operations() {
 }
 
 #[tokio::test]
-async fn stream_manager_cleanup_task() {
-    let manager = create_test_manager().await;
-
-    // Start cleanup with default parallelism
-    let result = manager.start_cleanup_task(None).await;
-    assert!(result.is_ok());
-
-    // Start cleanup with custom parallelism (clamped)
-    let result = manager.start_cleanup_task(Some(0)).await;
-    assert!(result.is_ok());
-
-    let result = manager.start_cleanup_task(Some(100)).await;
-    assert!(result.is_ok());
-
-    // Stop cleanup
-    let result = manager.stop_cleanup_task().await;
-    assert!(result.is_ok());
-
-    // Manual cleanup
-    let result = manager.cleanup_expired_items().await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn stream_manager_stats() {
-    let manager = create_test_manager().await;
-
-    manager
-        .create_stream("test-stream", Some(3600))
-        .await
-        .unwrap();
-
-    let stats = manager.get_stream_stats("test-stream").await.unwrap();
-    assert_eq!(stats.stream_name, "test-stream");
-    assert_eq!(stats.ttl_seconds, Some(3600u32.into()));
-
-    // Non-existent stream
-    let result = manager.get_stream_stats("missing-stream").await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
 async fn stream_manager_delete() {
     let manager = create_test_manager().await;
 
@@ -394,10 +327,9 @@ async fn stream_manager_full_workflow() {
     assert_eq!(cursor_page.items[0].id, id1);
     assert_eq!(cursor_page.items[1].id, id2);
 
-    // Get stream stats
-    let stats = manager.get_stream_stats("events").await.unwrap();
-    assert_eq!(stats.stream_name, "events");
-    assert_eq!(stats.ttl_seconds, Some(3600.into()));
+    let stream = manager.get_stream("events").await.unwrap().unwrap();
+    assert_eq!(stream.name.as_str(), "events");
+    assert_eq!(stream.ttl_seconds, Some(3600.into()));
 }
 
 #[tokio::test]
@@ -592,6 +524,40 @@ async fn stream_manager_cursor_name_validation() {
                 .unwrap_err()
                 .to_string()
                 .contains("can only contain alphanumeric")
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_private_stream_and_cursor_when_items_are_consumed_then_traces_omit_identifiers_and_payload()
+ {
+    use storage_observability_test_support::observation::observe;
+    let manager = create_test_manager().await;
+    let stream = "private-stream-log-marker";
+    let cursor = "private-cursor-log-marker";
+    let body = "private-stream-body-marker";
+    let observed = observe(async {
+        manager.create_stream(stream, None).await.unwrap();
+        let item = manager.append_item(stream, body.as_bytes()).await.unwrap();
+        manager
+            .create_cursor(stream, cursor, CursorPosition::Head)
+            .await
+            .unwrap();
+        let page = manager
+            .read_from_cursor(stream, cursor, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        item
+    })
+    .await;
+    assert!(!observed.spans.is_empty());
+    let traces = format!("{:?}{:?}", observed.events, observed.spans);
+    let item_id = observed.result.to_string();
+    for private in [stream, cursor, body, item_id.as_str()] {
+        assert!(
+            !traces.contains(private),
+            "private stream data entered tracing"
         );
     }
 }

@@ -1,60 +1,80 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 use utoipa::ToSchema;
 
-use crate::{AttributeMap, AttributeValue, ExclusiveStartKey, IndexName, KeyAttributes, TableName};
+use crate::{
+    AttributeMap, AttributeValue, ExclusiveStartKey, IndexName, KeyAttributes,
+    ReturnConsumedCapacity, TableName, VecMap, WireItem,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
 #[serde(rename_all = "PascalCase")]
 pub struct ScanRequest {
     pub table_name: TableName,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub index_name: Option<IndexName>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub attributes_to_get: Option<Vec<String>>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub projection_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub filter_expression: Option<String>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub scan_filter: Option<HashMap<String, Condition>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[builder(default)]
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[builder(default)]
+    pub expression_attribute_values: Option<AttributeMap>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub limit: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub exclusive_start_key: Option<ExclusiveStartKey>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    #[builder(default)]
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub total_segments: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub segment: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub consistent_read: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub select: Option<String>,
 }
 
@@ -80,30 +100,18 @@ impl ScanRequest {
             select: None,
         }
     }
-
-    #[must_use]
-    pub fn with_index_name(mut self, index_name: Option<IndexName>) -> Self {
-        self.index_name = index_name;
-        self
-    }
-
-    #[must_use]
-    pub fn with_limit(mut self, limit: Option<u32>) -> Self {
-        self.limit = limit;
-        self
-    }
-
-    #[must_use]
-    pub fn with_exclusive_start_key(mut self, exclusive_start_key: Option<String>) -> Self {
-        self.exclusive_start_key = exclusive_start_key.map(ExclusiveStartKey::from);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScanResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<AttributeMap>>,
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::wire_item::dynamo_json::optional_items"
+    )]
+    #[schema(value_type = Option<Vec<AttributeMap>>)]
+    pub items: Option<Vec<WireItem>>,
 
     #[serde(rename = "Count")]
     pub count: u32,
@@ -130,7 +138,8 @@ pub struct ConsumedCapacity {
         rename = "GlobalSecondaryIndexes",
         skip_serializing_if = "Option::is_none"
     )]
-    pub global_secondary_indexes: Option<HashMap<String, ConsumedCapacityMetrics>>,
+    #[schema(value_type = Option<HashMap<String, ConsumedCapacityMetrics>>)]
+    pub global_secondary_indexes: Option<VecMap<String, ConsumedCapacityMetrics>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -188,56 +197,71 @@ pub enum AttributeAction {
     Add,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields, rename_all = "PascalCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[serde(rename_all = "PascalCase")]
 pub struct QueryRequest {
     pub table_name: TableName,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub index_name: Option<IndexName>,
 
     #[serde(default)]
     pub key_condition_expression: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub attributes_to_get: Option<Vec<String>>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub filter_expression: Option<String>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub query_filter: Option<HashMap<String, Condition>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub projection_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[builder(default)]
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[builder(default)]
+    pub expression_attribute_values: Option<AttributeMap>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub limit: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub exclusive_start_key: Option<ExclusiveStartKey>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    #[builder(default)]
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub consistent_read: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub scan_index_forward: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub select: Option<String>,
 }
 
@@ -263,54 +287,18 @@ impl QueryRequest {
             select: None,
         }
     }
-
-    #[must_use]
-    pub fn with_index_name(mut self, index_name: Option<IndexName>) -> Self {
-        self.index_name = index_name;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_names(
-        mut self,
-        expression_attribute_names: Option<HashMap<String, String>>,
-    ) -> Self {
-        self.expression_attribute_names = expression_attribute_names;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_values(
-        mut self,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> Self {
-        self.expression_attribute_values = expression_attribute_values;
-        self
-    }
-
-    #[must_use]
-    pub fn with_limit(mut self, limit: Option<u32>) -> Self {
-        self.limit = limit;
-        self
-    }
-
-    #[must_use]
-    pub fn with_exclusive_start_key(mut self, exclusive_start_key: Option<String>) -> Self {
-        self.exclusive_start_key = exclusive_start_key.map(ExclusiveStartKey::from);
-        self
-    }
-
-    #[must_use]
-    pub fn with_scan_index_forward(mut self, scan_index_forward: Option<bool>) -> Self {
-        self.scan_index_forward = scan_index_forward;
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryResponse {
-    #[serde(rename = "Items", skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<AttributeMap>>,
+    #[serde(
+        rename = "Items",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::wire_item::dynamo_json::optional_items"
+    )]
+    #[schema(value_type = Option<Vec<AttributeMap>>)]
+    pub items: Option<Vec<WireItem>>,
 
     #[serde(rename = "Count")]
     pub count: u32,

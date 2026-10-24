@@ -406,7 +406,7 @@ pub struct Message {
     pub message_attributes: Option<HashMap<String, MessageAttributeValue>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessageAttributeValue {
     #[serde(rename = "StringValue", skip_serializing_if = "Option::is_none")]
@@ -428,6 +428,9 @@ pub struct MessageAttributeValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QueueMessage {
+    /// Durable deliveries, incremented atomically with each visibility lease.
+    #[serde(default)]
+    pub receive_count: u32,
     pub message_id: MessageId,
     pub queue_url: String,
     pub body: String,
@@ -435,6 +438,29 @@ pub struct QueueMessage {
     pub receipt_handle: Option<ReceiptHandle>,
     pub created_at: TimestampMillis,
     pub visibility_timestamp: Option<TimestampMillis>,
+}
+
+/// Build the provider message for one validated send, sharing the batch
+/// timestamp. An omitted delay stays distinct from an explicit zero so the
+/// queue's default delay can be applied inside the native send attempt.
+#[must_use]
+pub fn queue_message_for_send(
+    request: SendMessageRequest,
+    created_at: TimestampMillis,
+) -> QueueMessage {
+    let visibility_timestamp = request
+        .delay_seconds
+        .map(|seconds| created_at + storage_types::DurationSeconds::from(seconds));
+    QueueMessage {
+        receive_count: 0,
+        message_id: MessageId::default(),
+        queue_url: request.queue_url,
+        body: request.message_body,
+        message_attributes: request.message_attributes,
+        receipt_handle: None,
+        created_at,
+        visibility_timestamp,
+    }
 }
 
 pub struct Visible;
@@ -453,7 +479,8 @@ pub type DeletedQueueMessage = QueueMessageState<Deleted>;
 impl VisibleQueueMessage {
     #[must_use]
     pub fn new(message: QueueMessage) -> Self {
-        // Messages can reappear after a visibility timeout with a prior receipt handle.
+        // Messages can reappear after a visibility timeout with a prior receipt
+        // handle.
         Self {
             inner: message,
             _state: PhantomData,
@@ -488,8 +515,9 @@ impl InvisibleQueueMessage {
 
     #[must_use]
     pub fn into_message_response(self) -> Option<MessageResponse> {
-        let receipt_handle = self.inner.receipt_handle.clone()?;
-        Some(MessageResponse::from_message(self.inner, &receipt_handle))
+        let mut message = self.inner;
+        let receipt_handle = message.receipt_handle.take()?;
+        Some(MessageResponse::from_message(message, receipt_handle))
     }
 
     #[must_use]
@@ -529,19 +557,25 @@ pub struct MessageResponse {
 
 impl MessageResponse {
     #[must_use]
-    pub fn from_message(msg: QueueMessage, receipt_handle: &ReceiptHandle) -> Self {
+    pub fn from_message(msg: QueueMessage, receipt_handle: ReceiptHandle) -> Self {
         let md5_of_body = format!("{:x}", md5::compute(msg.body.as_bytes()));
         let md5_of_message_attributes = msg
             .message_attributes
             .as_ref()
             .and_then(md5_of_message_attributes);
-        let attributes = Some(HashMap::from([(
-            "SentTimestamp".to_string(),
-            msg.created_at.timestamp_millis().to_string(),
-        )]));
+        let attributes = Some(HashMap::from([
+            (
+                "SentTimestamp".to_string(),
+                msg.created_at.timestamp_millis().to_string(),
+            ),
+            (
+                "ApproximateReceiveCount".to_string(),
+                msg.receive_count.to_string(),
+            ),
+        ]));
         Self {
             message_id: msg.message_id.to_string(),
-            receipt_handle: receipt_handle.to_string(),
+            receipt_handle: receipt_handle.0,
             md5_of_body,
             md5_of_message_attributes,
             body: msg.body,
@@ -555,37 +589,36 @@ impl MessageResponse {
 pub fn md5_of_message_attributes(
     attributes: &HashMap<String, MessageAttributeValue>,
 ) -> Option<String> {
-    let mut encoded = Vec::new();
-    let mut names: Vec<_> = attributes.keys().collect();
-    names.sort();
+    let mut entries: Vec<_> = attributes.iter().collect();
+    entries.sort_unstable_by_key(|(left, _)| *left);
+    let mut context = md5::Context::new();
 
-    for name in names {
-        let value = attributes.get(name)?;
-        encode_queue_attribute_string(&mut encoded, name);
-        encode_queue_attribute_string(&mut encoded, &value.data_type);
+    for (name, value) in entries {
+        encode_queue_attribute_string(&mut context, name);
+        encode_queue_attribute_string(&mut context, &value.data_type);
         if value.data_type.starts_with("Binary") {
-            encoded.push(2);
+            context.consume([2]);
             let binary_value = value.binary_value.as_ref()?;
             let decoded = STANDARD.decode(binary_value).ok()?;
-            encode_queue_attribute_binary(&mut encoded, &decoded);
+            encode_queue_attribute_binary(&mut context, &decoded);
         } else {
-            encoded.push(1);
+            context.consume([1]);
             let string_value = value.string_value.as_ref()?;
-            encode_queue_attribute_string(&mut encoded, string_value);
+            encode_queue_attribute_string(&mut context, string_value);
         }
     }
 
-    Some(format!("{:x}", md5::compute(encoded)))
+    Some(format!("{:x}", context.finalize()))
 }
 
-fn encode_queue_attribute_string(output: &mut Vec<u8>, value: &str) {
+fn encode_queue_attribute_string(output: &mut md5::Context, value: &str) {
     encode_queue_attribute_binary(output, value.as_bytes());
 }
 
-fn encode_queue_attribute_binary(output: &mut Vec<u8>, value: &[u8]) {
+fn encode_queue_attribute_binary(output: &mut md5::Context, value: &[u8]) {
     let length = value.len().min(u32::MAX as usize) as u32;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(value);
+    output.consume(length.to_be_bytes());
+    output.consume(value);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

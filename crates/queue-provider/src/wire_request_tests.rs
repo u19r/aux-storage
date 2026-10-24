@@ -7,27 +7,35 @@ use std::{
 use alloc_counter::AllocationGuard;
 
 use crate::{
-    DeleteMessageRequest, IntoValidatedQueueRequest, QueueAction, QueueRequest,
-    QueueRequestValidation, QueueResult, ReceiveMessageRequest, SendMessageRequest,
-    ValidatedQueueRequest, decode_json_request,
+    DeleteMessageRequest, IntoValidatedQueueRequest, QueueAction, QueueRequest, QueueResult,
+    ReceiveMessageRequest, SendMessageRequest,
+    constants_tests::{WIRE_REQUEST_ITERATIONS, WIRE_REQUEST_SEND_JSON},
+    decode_json_request,
+    request_validation::QueueRequestValidation,
+    wire_request::ValidatedQueueRequest,
 };
 
-const ITERATIONS: usize = 1_000;
-const SEND_JSON: &[u8] =
-    br#"{"QueueUrl":"https://queue.example/jobs","MessageBody":"hello","DelaySeconds":1}"#;
-
 fn legacy_json_send() -> SendMessageRequest {
-    let value = serde_json::from_slice(SEND_JSON).expect("JSON value");
+    let value = serde_json::from_slice(WIRE_REQUEST_SEND_JSON).expect("JSON value");
     SendMessageRequest::from_json(value).expect("legacy send request")
 }
 
 fn typed_json_send() -> SendMessageRequest {
     let QueueRequest::SendMessage(request) =
-        decode_json_request(QueueAction::SendMessage, SEND_JSON).expect("typed send request")
+        decode_json_request(QueueAction::SendMessage, WIRE_REQUEST_SEND_JSON)
+            .expect("typed send request")
     else {
         panic!("expected send request");
     };
     request.into_inner()
+}
+
+fn legacy_json_send_with_attributes() -> SendMessageRequest {
+    let value = serde_json::from_slice(
+        br#"{"QueueUrl":"https://queue.example/jobs","MessageBody":"hello","MessageAttributes":{"Trace":{"DataType":"String","StringValue":"abc"},"Tenant":{"DataType":"String","StringValue":"aux"}}}"#,
+    )
+    .expect("JSON value");
+    SendMessageRequest::from_json(value).expect("legacy send request with attributes")
 }
 
 fn measure(
@@ -42,7 +50,7 @@ fn measure(
         Some(label),
     );
     let mut bytes = 0usize;
-    for _ in 0..ITERATIONS {
+    for _ in 0..WIRE_REQUEST_ITERATIONS {
         bytes = bytes.saturating_add(decode().message_body.len());
     }
     black_box(bytes);
@@ -54,10 +62,20 @@ fn typed_json_wire_decode_reduces_small_request_allocations() {
     let legacy_json = measure("queue_json_value_then_request", legacy_json_send);
     let typed_json = measure("queue_json_direct_typed", typed_json_send);
 
-    alloc_counter::emit_report(&legacy_json);
-    alloc_counter::emit_report(&typed_json);
+    let _ = alloc_counter::emit_report(&legacy_json);
+    let _ = alloc_counter::emit_report(&typed_json);
     assert!(typed_json.allocation_count < legacy_json.allocation_count);
     assert!(typed_json.allocated_bytes < legacy_json.allocated_bytes);
+}
+
+#[test]
+fn legacy_json_attribute_decode_allocation_profile() {
+    let report = measure(
+        "legacy_json_attribute_decode_owned_fields",
+        legacy_json_send_with_attributes,
+    );
+    let _ = alloc_counter::emit_report(&report);
+    assert!(report.allocation_count > 0);
 }
 
 #[test]

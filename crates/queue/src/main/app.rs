@@ -17,7 +17,7 @@ use http_error::HttpApiError;
 use metrics_exporter_prometheus::PrometheusHandle;
 use queue::{
     FoundationDbSettings, PostgresSettings, QueueBackend, QueueConfig as ProviderQueueConfig,
-    QueueManager, QueueProvider, RemoteCredentialStrategy, RemoteQueueSettings,
+    QueueManager, QueueOperations, RemoteCredentialStrategy, RemoteQueueSettings,
     RemoteSigv4Settings, RemoteStaticCredentials, create_queue_provider,
 };
 use serde::Serialize;
@@ -127,8 +127,7 @@ pub(crate) async fn run_with_runtime_threads(
         &config.root.features.backends,
     )?)
     .await?;
-    storage.initialize().await?;
-    let storage: Arc<dyn QueueProvider> = Arc::from(storage);
+    let storage: Arc<dyn QueueOperations> = Arc::from(storage);
     let manager = Arc::new(QueueManager::new(storage.clone()));
     let app_state = Arc::new(AppState {
         manager,
@@ -161,7 +160,9 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-fn load_queue_config_from_args(args: &Args) -> Result<Arc<config::Config>, std::io::Error> {
+pub(super) fn load_queue_config_from_args(
+    args: &Args,
+) -> Result<Arc<config::Config>, std::io::Error> {
     let mut overrides = queue_config_overrides(args);
     overrides.extend(parse_override_args(args.overrides.as_slice())?);
     load_optional_with_overrides(args.config.as_deref(), overrides.as_slice())
@@ -278,23 +279,7 @@ fn parse_override_args(args: &[String]) -> Result<Vec<(String, String)>, std::io
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) fn queue_config_from_args(args: &Args) -> Result<ProviderQueueConfig, std::io::Error> {
-    if args
-        .storage
-        .as_ref()
-        .is_some_and(|storage| matches!(storage, QueueStorageArg::Postgres))
-        && args.postgres_dsn.as_deref().is_none_or(str::is_empty)
-    {
-        return Err(std::io::Error::other(
-            "--postgres-dsn is required when --storage postgres",
-        ));
-    }
-    let config = load_queue_config_from_args(args)?;
-    provider_queue_config_from_backends(&config.root.features.backends)
-}
-
-fn provider_queue_config_from_backends(
+pub(super) fn provider_queue_config_from_backends(
     backends: &config::Backends,
 ) -> Result<ProviderQueueConfig, std::io::Error> {
     Ok(if let Some(sqlite) = &backends.sqlite {
@@ -368,6 +353,7 @@ pub(crate) fn foundationdb_queue_provider_config(
 ) -> ProviderQueueConfig {
     let mut config = base_queue_provider_config(QueueBackend::FoundationDb);
     config.foundationdb = Some(FoundationDbSettings {
+        transaction_byte_limit: foundationdb.transaction_byte_limit,
         cluster_file: foundationdb.cluster_file.clone(),
         tenant_name: foundationdb.tenant_name.clone(),
         subspace_prefix: foundationdb.subspace_prefix.clone(),
@@ -452,13 +438,6 @@ async fn health() -> impl IntoResponse {
 
 async fn metrics(State(app_state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = app_state.metrics_handle.render();
-    #[cfg(feature = "foundationdb")]
-    let body = {
-        let mut body = body;
-        body.push_str(&kv::backends::fdb::foundationdb_operation_metrics_snapshot());
-        body.push_str(&kv::queue::metrics::queue_operation_metrics_snapshot());
-        body
-    };
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
@@ -531,6 +510,16 @@ async fn queue_endpoint(
             handle_manager(&request_id, protocol, action, request, |req| async move {
                 app_state.manager.purge_queue(req).await
             })
+            .await
+        }
+        QueueRequest::PublishMessage(request) => {
+            handle_manager(
+                &request_id,
+                protocol,
+                action,
+                request,
+                |request| async move { app_state.manager.publish_message(request).await },
+            )
             .await
         }
         QueueRequest::SendMessage(request) => {

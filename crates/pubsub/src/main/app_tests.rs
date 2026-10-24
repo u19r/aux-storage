@@ -4,11 +4,15 @@ use config::{
 };
 use pubsub_provider::{SubscribeRequest, SubscriptionProtocol};
 
+#[cfg(feature = "rocksdb")]
+use super::app::rocksdb_pubsub_db_path;
+#[cfg(feature = "turso")]
+use super::app::turso_pubsub_db_path;
 use super::app::{
     Args, PubsubStorageArg, create_pubsub_runtime_providers, ensure_no_remote_pubsub_backend,
     initialize_pubsub_runtime, parse_override_args, pubsub_backend_override_path, pubsub_bind_addr,
-    pubsub_config_overrides, pubsub_db_path_override_path, rocksdb_pubsub_db_path,
-    selected_pubsub_backend, sqlite_pubsub_db_path, turso_pubsub_db_path,
+    pubsub_config_overrides, pubsub_db_path_override_path, selected_pubsub_backend,
+    sqlite_pubsub_db_path,
 };
 
 fn base_args(storage: Option<PubsubStorageArg>) -> Args {
@@ -29,17 +33,7 @@ fn base_args(storage: Option<PubsubStorageArg>) -> Args {
 
 #[tokio::test]
 async fn given_standalone_runtime_when_subscribing_queue_then_protocol_is_available() {
-    let backends = Backends {
-        sqlite: Some(SqliteBackendConfig {
-            db_path: ":memory:".to_string(),
-            immediate_gsi_consistency: false,
-        }),
-        turso: None,
-        postgres: None,
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
-    };
+    let backends = standalone_fixture_backends();
     let providers = create_pubsub_runtime_providers(&backends)
         .await
         .expect("standalone providers should initialize");
@@ -63,6 +57,117 @@ async fn given_standalone_runtime_when_subscribing_queue_then_protocol_is_availa
         .expect("queue protocol should be available");
 
     assert!(!subscription.subscription_arn.is_empty());
+}
+
+#[cfg(all(feature = "turso", not(feature = "sqlite")))]
+fn standalone_fixture_backends() -> Backends {
+    Backends {
+        sqlite: None,
+        turso: Some(TursoBackendConfig {
+            db_path: ":memory:".to_string(),
+            ..TursoBackendConfig::default()
+        }),
+        postgres: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    }
+}
+
+#[cfg(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+))]
+fn standalone_fixture_backends() -> Backends {
+    let dsn = std::env::var("TEST_POSTGRES_DSN")
+        .expect("TEST_POSTGRES_DSN is required for PostgreSQL pubsub fixture");
+    Backends {
+        sqlite: None,
+        turso: None,
+        postgres: Some(PostgresBackendConfig {
+            dsn,
+            max_pool_size: 4,
+            background_max_pool_size: 4,
+            tls: false,
+            immediate_gsi_consistency: false,
+        }),
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    }
+}
+
+#[cfg(not(any(
+    all(feature = "turso", not(feature = "sqlite")),
+    all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    )
+)))]
+fn standalone_fixture_backends() -> Backends {
+    Backends {
+        sqlite: Some(SqliteBackendConfig {
+            db_path: ":memory:".to_string(),
+            immediate_gsi_consistency: false,
+        }),
+        turso: None,
+        postgres: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    }
+}
+
+#[test]
+fn standalone_fixture_selects_the_only_compiled_sql_backend() {
+    let backends = standalone_fixture_backends();
+    let turso_only = cfg!(all(feature = "turso", not(feature = "sqlite")));
+    let postgres_only = cfg!(all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    ));
+    assert_eq!(backends.turso.is_some(), turso_only);
+    assert_eq!(backends.sqlite.is_some(), !(turso_only || postgres_only));
+    assert_eq!(backends.postgres.is_some(), postgres_only);
+}
+
+#[cfg(feature = "rocksdb")]
+#[tokio::test]
+async fn given_rocksdb_runtime_when_creating_topic_then_topic_is_persisted() {
+    let directory = std::env::temp_dir().join(format!("pubsub-rocksdb-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("temporary RocksDB directory");
+    let backends = Backends {
+        sqlite: None,
+        turso: None,
+        postgres: None,
+        rocksdb: Some(RocksdbBackendConfig {
+            db_path: directory.display().to_string(),
+            immediate_gsi_consistency: false,
+        }),
+        foundationdb: None,
+        remote: None,
+    };
+    let providers = create_pubsub_runtime_providers(&backends)
+        .await
+        .expect("RocksDB providers should initialize");
+    let manager = initialize_pubsub_runtime(providers)
+        .await
+        .expect("RocksDB manager should initialize");
+
+    manager
+        .create_topic("rocksdb-topic")
+        .await
+        .expect("RocksDB topic creation should succeed");
+    std::fs::remove_dir_all(directory).expect("remove temporary RocksDB directory");
 }
 
 #[test]
@@ -210,14 +315,7 @@ fn selected_pubsub_backend_prefers_explicit_non_default_backends() {
     ));
 
     backends.rocksdb = None;
-    backends.foundationdb = Some(FoundationdbBackendConfig {
-        cluster_file: None,
-        tenant_name: None,
-        subspace_prefix: None,
-        cache_read_version_ms: 0,
-        immediate_gsi_consistency: false,
-        report_conflicting_keys: false,
-    });
+    backends.foundationdb = Some(FoundationdbBackendConfig::default());
     assert!(matches!(
         selected_pubsub_backend(&backends),
         PubsubStorageArg::FoundationDb
@@ -253,7 +351,9 @@ fn pubsub_backend_build_helpers_resolve_backend_paths_without_opening_providers(
     };
 
     assert_eq!(sqlite_pubsub_db_path(&backends), "pubsub.sqlite");
+    #[cfg(feature = "turso")]
     assert_eq!(turso_pubsub_db_path(&backends), "pubsub.turso");
+    #[cfg(feature = "rocksdb")]
     assert_eq!(rocksdb_pubsub_db_path(&backends), "pubsub.rocks");
 }
 
@@ -269,7 +369,9 @@ fn pubsub_backend_build_helpers_fall_back_to_default_paths() {
     };
 
     assert_eq!(sqlite_pubsub_db_path(&backends), "storage.sqlite3");
+    #[cfg(feature = "turso")]
     assert_eq!(turso_pubsub_db_path(&backends), "storage.turso.db");
+    #[cfg(feature = "rocksdb")]
     assert_eq!(rocksdb_pubsub_db_path(&backends), "storage.rocksdb");
 }
 

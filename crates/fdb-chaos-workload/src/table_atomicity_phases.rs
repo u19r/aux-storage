@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*, table_atomicity::*};
+use crate::{common::*, constants::*, imports::*, table_atomicity::*};
 
 impl TableAtomicityWorkload {
     pub(crate) async fn setup_phase(&mut self, db: SimDatabase) {
@@ -30,10 +30,21 @@ impl TableAtomicityWorkload {
             }
             return;
         }
-        let manager = match self.manager(db).await {
+        let store = match self.provider(db).await {
+            Ok(store) => store,
+            Err(error) => {
+                self.trace_invariant_error("start", error);
+                return;
+            }
+        };
+        if let Err(error) = self.capture_table_binding(&store).await {
+            self.trace_invariant_error("start", error);
+            return;
+        }
+        let manager = match self.manager_from_store(store).await {
             Ok(manager) => manager,
-            Err(err) => {
-                self.trace_invariant_error("start", err);
+            Err(error) => {
+                self.trace_invariant_error("start", error);
                 return;
             }
         };
@@ -143,12 +154,12 @@ impl TableAtomicityWorkload {
                     let result = manager
                         .update_item(UpdateItemInput {
                             table_name: self.table_name(),
-                            key: self.key_attributes(&key).into(),
+                            key: self.key_attributes(&key),
                             update_expression,
                             indexers: None,
                             condition_expression: None,
                             expression_attribute_names: None,
-                            expression_attribute_values: Some(expression_attribute_values),
+                            expression_attribute_values: Some(expression_attribute_values.into()),
                             return_values: None,
                             return_old_on_condition_failure: false,
                             aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
@@ -207,7 +218,10 @@ impl TableAtomicityWorkload {
                 4 => {
                     let started_at_sim_us = self.sim_time_us();
                     let result = manager
-                        .get_item_map(self.table_name(), self.key_attributes(&key))
+                        .get_item_decode::<_, storage_types::AttributeMap>(
+                            self.table_name(),
+                            self.key_attributes(&key),
+                        )
                         .await;
                     match result {
                         Ok(item) => {
@@ -289,7 +303,8 @@ impl TableAtomicityWorkload {
                                 TransactWriteItem {
                                     put: Some(TransactPutRequest {
                                         table_name: self.table_name(),
-                                        item: self.item(&key, &value),
+                                        item: WireItem::try_from(self.item(&key, &value))
+                                            .expect("valid workload item"),
                                         indexers: None,
                                         condition_expression: None,
                                         expression_attribute_names: None,
@@ -305,7 +320,8 @@ impl TableAtomicityWorkload {
                                 TransactWriteItem {
                                     put: Some(TransactPutRequest {
                                         table_name: self.table_name(),
-                                        item: self.item(&second_key, &value),
+                                        item: WireItem::try_from(self.item(&second_key, &value))
+                                            .expect("valid workload item"),
                                         indexers: None,
                                         condition_expression: None,
                                         expression_attribute_names: None,

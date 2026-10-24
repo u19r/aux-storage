@@ -6,51 +6,19 @@ use metrics::{Counter, Histogram};
 
 use crate::{
     constants::{
+        DYNAMODB_BODY_READ_STAGE as BODY_READ_STAGE, DYNAMODB_ERROR_STATUS as ERROR_STATUS,
+        DYNAMODB_JSON_DECODE_STAGE as JSON_DECODE_STAGE, DYNAMODB_MANAGER_STAGE as MANAGER_STAGE,
+        DYNAMODB_OPERATIONS, DYNAMODB_REQUEST_CONVERT_STAGE as REQUEST_CONVERT_STAGE,
+        DYNAMODB_RESPONSE_ENCODE_STAGE as RESPONSE_ENCODE_STAGE, DYNAMODB_STAGES,
+        DYNAMODB_STATUS_UNKNOWN_OPERATION as UNKNOWN_OPERATION, DYNAMODB_STATUSES,
+        DYNAMODB_SUCCESS_STATUS as SUCCESS_STATUS,
         STORAGE_API_DYNAMODB_REQUEST_LATENCY_MICROS_TOTAL_METRIC,
         STORAGE_API_DYNAMODB_REQUEST_LATENCY_MS_METRIC, STORAGE_API_DYNAMODB_REQUESTS_TOTAL_METRIC,
         STORAGE_API_DYNAMODB_STAGE_LATENCY_MS_METRIC, STORAGE_API_DYNAMODB_STAGE_TOTAL_METRIC,
     },
-    routes::dynamodb::{
-        BODY_READ_STAGE, DynamoError, ERROR_STATUS, JSON_DECODE_STAGE, MANAGER_STAGE,
-        REQUEST_CONVERT_STAGE, RESPONSE_ENCODE_STAGE, SUCCESS_STATUS, response_to_http,
-    },
+    routes::dynamodb::{DynamoError, response_to_http},
     types::Response as ApiResponse,
 };
-
-const UNKNOWN_OPERATION: &str = "unknown";
-
-const DYNAMODB_OPERATIONS: &[&str] = &[
-    "batch_get_item",
-    "batch_write_item",
-    "create_table",
-    "delete_item",
-    "delete_table",
-    "describe_table",
-    "describe_time_to_live",
-    "get_item",
-    "get_stream_records",
-    "list_tables",
-    "put_item",
-    "query",
-    "scan",
-    "transact_get_items",
-    "transact_write_items",
-    "update_continuous_backups",
-    "update_item",
-    "update_table",
-    "update_time_to_live",
-    UNKNOWN_OPERATION,
-];
-
-const DYNAMODB_STATUSES: &[&str] = &[SUCCESS_STATUS, ERROR_STATUS];
-
-const DYNAMODB_STAGES: &[&str] = &[
-    BODY_READ_STAGE,
-    JSON_DECODE_STAGE,
-    REQUEST_CONVERT_STAGE,
-    MANAGER_STAGE,
-    RESPONSE_ENCODE_STAGE,
-];
 
 struct RequestMetricHandles {
     requests_total: Counter,
@@ -190,7 +158,9 @@ pub(super) fn dynamodb_operation_label(target: &str) -> &'static str {
         "DynamoDB_20120810.DescribeTable" => "describe_table",
         "DynamoDB_20120810.DescribeTimeToLive" => "describe_time_to_live",
         "DynamoDB_20120810.GetItem" => "get_item",
+        "DynamoDB_20120810.GetCanonicalHistory" => "get_canonical_history",
         "DynamoDB_20120810.GetStreamRecords" => "get_stream_records",
+        "DynamoDB_20120810.QuerySourcePage" => "query_source_page",
         "DynamoDB_20120810.ListChangeIndexMarkers" => "list_change_index_markers",
         "DynamoDBStreams_20120810.DescribeStream" => "describe_stream",
         "DynamoDBStreams_20120810.GetRecords" => "get_records",

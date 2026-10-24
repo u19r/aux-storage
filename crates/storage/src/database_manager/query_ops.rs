@@ -1,297 +1,117 @@
-use std::collections::HashMap;
-
-use storage_cache::RuntimePreparedQueryExecution;
+use storage_provider::{RangeReadItem, RangeReadPage};
 use storage_types::{
-    AttributeValue, ItemKey, KeyAttributes, KeySchemaElement, QueryTableRequest, StorageError,
-    StorageResult, TableNamespace, TryFromWireItem, WireItem,
-    subset_expression_attribute_names_for_expression, validate_gsi_projection,
+    QueryTableRequest, StorageResult, StoredEntity, TryFromWireItem, WireItem,
+    single_table_entity::SingleTableEntity,
 };
 
 use crate::{
     QueryIndexInput, QueryTableInput,
-    database_manager::{
-        DatabaseManager, ROUTED_DEFAULT_CONNECTION_ID, decode_wire_items_to_decoded,
-        decode_wire_items_to_maps, normalize_wire_items_for_shared_table, record_storage_operation,
-    },
-    namespace_routing::NamespaceStorageMode,
+    database_manager::{DatabaseManager, record_storage_operation},
 };
 
 impl DatabaseManager {
     pub async fn query_table_map(
         &self,
         input: QueryTableInput,
-    ) -> StorageResult<(Vec<HashMap<String, AttributeValue>>, Option<String>)> {
-        let (items, lek) = self.query_table_request(input.into()).await?;
-        Ok((decode_wire_items_to_maps(items)?, lek))
+    ) -> StorageResult<RangeReadPage<storage_types::AttributeMap>> {
+        self.query_table_request(input.into())
+            .await?
+            .try_map(|item| item.to_attribute_map())
     }
 
     pub async fn query_table(
         &self,
         input: QueryTableInput,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+    ) -> StorageResult<RangeReadPage<WireItem>> {
         self.query_table_request(input.into()).await
     }
 
     pub async fn query_table_decode<T>(
         &self,
         input: QueryTableInput,
-    ) -> StorageResult<(Vec<T>, Option<String>)>
+    ) -> StorageResult<RangeReadPage<T>>
     where
         T: TryFromWireItem,
     {
-        let (items, lek) = self.query_table(input).await?;
-        Ok((decode_wire_items_to_decoded(items)?, lek))
+        self.query_table(input)
+            .await?
+            .try_map(T::try_from_wire_item)
+    }
+
+    /// Admit complete entities only when their persisted identity agrees with
+    /// the independently observed physical table/key.
+    pub async fn query_table_stored_entity<T>(
+        &self,
+        input: QueryTableInput,
+    ) -> StorageResult<RangeReadPage<T>>
+    where
+        T: StoredEntity + SingleTableEntity,
+    {
+        let request: QueryTableRequest = input.into();
+        let table = request.table_name.clone();
+        self.query_source_page(request).await?.try_map(|source| {
+            let entity = T::try_from_stored_item(&source.item)?;
+            entity.validate_stored_identity(&source.item)?;
+            entity.validate_addressed_identity(&table, &source.key)?;
+            Ok(entity)
+        })
     }
 
     pub async fn query_index_map(
         &self,
         input: QueryIndexInput,
-    ) -> StorageResult<(Vec<HashMap<String, AttributeValue>>, Option<String>)> {
-        let (items, lek) = self.query_table_request(input.into()).await?;
-        Ok((decode_wire_items_to_maps(items)?, lek))
+    ) -> StorageResult<RangeReadPage<storage_types::AttributeMap>> {
+        self.query_table_request(input.into())
+            .await?
+            .try_map(|item| item.to_attribute_map())
     }
 
     pub async fn query_index(
         &self,
         input: QueryIndexInput,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+    ) -> StorageResult<RangeReadPage<WireItem>> {
         self.query_table_request(input.into()).await
     }
 
     pub async fn query_index_decode<T>(
         &self,
         input: QueryIndexInput,
-    ) -> StorageResult<(Vec<T>, Option<String>)>
+    ) -> StorageResult<RangeReadPage<T>>
     where
         T: TryFromWireItem,
     {
-        let (items, lek) = self.query_index(input).await?;
-        Ok((decode_wire_items_to_decoded(items)?, lek))
+        self.query_index(input)
+            .await?
+            .try_map(T::try_from_wire_item)
+    }
+
+    /// Returns physical addresses independently of the persisted images.
+    pub async fn query_source_page(
+        &self,
+        request: QueryTableRequest,
+    ) -> StorageResult<RangeReadPage<RangeReadItem>> {
+        self.run_dynamo_admitted(
+            "default",
+            crate::admission::AdmissionClass::RangeRead,
+            |dynamo| async move {
+                record_storage_operation("query_source_page", dynamo.query_source_page(request))
+                    .await
+            },
+        )
+        .await
     }
 
     async fn query_table_request(
         &self,
         request: QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        let logical_request = request.clone();
-        let cache_query_runtime = self.cache_query_runtime();
-        match cache_query_runtime
-            .prepare_query_execution(&logical_request)
-            .await?
-        {
-            RuntimePreparedQueryExecution::WholePage {
-                items,
-                last_evaluated_key,
-                ..
-            } => return Ok((items, last_evaluated_key)),
-            RuntimePreparedQueryExecution::PrefixWithDbSuffix {
-                prefix_items,
-                resume_token,
-                remaining_limit,
-            } => {
-                let mut suffix_request = logical_request.clone();
-                suffix_request.exclusive_start_key = Some(resume_token);
-                suffix_request.limit = remaining_limit;
-                let (mut suffix_items, suffix_lek) =
-                    self.execute_query_table_db_only(suffix_request).await?;
-                let mut merged_items = prefix_items;
-                merged_items.append(&mut suffix_items);
-                cache_query_runtime.record_partial_hit();
-                return Ok((merged_items, suffix_lek));
-            }
-            RuntimePreparedQueryExecution::PrefixOnly {
-                items,
-                last_evaluated_key,
-            } => return Ok((items, Some(last_evaluated_key))),
-            RuntimePreparedQueryExecution::None => {}
-        }
-        cache_query_runtime.record_miss_if_eventual(request.consistent_read);
-        self.execute_query_table_db_only(logical_request).await
-    }
-
-    async fn execute_query_table_db_only(
-        &self,
-        mut request: QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
-        request.validate_for_dynamodb()?;
-        let logical_request = request.clone();
-        let mut connection_id = ROUTED_DEFAULT_CONNECTION_ID.to_string();
-        let mut normalize_namespace: Option<TableNamespace> = None;
-        let mut project_after_namespace_normalization = false;
-
-        if let Some(route) = self
-            .resolve_namespace_route_for_table(&request.table_name)
-            .await?
-        {
-            if route.storage_mode == NamespaceStorageMode::SharedTable {
-                self.request_rewriter
-                    .rewrite_query_for_shared_table(&route.namespace, &mut request)?;
-                self.rewrite_query_start_key_for_shared_table(&route.namespace, &mut request)
-                    .await?;
-                normalize_namespace = Some(route.namespace.clone());
-                if request.projection_expression.is_some() {
-                    project_after_namespace_normalization = true;
-                    request.projection_expression = None;
-                    request.expression_attribute_names =
-                        subset_expression_attribute_names_for_expression(
-                            &request.key_condition_expression,
-                            request.expression_attribute_names.as_ref(),
-                        );
-                }
-            }
-            request.table_name = route.read_target.table_name.clone();
-            connection_id = route.read_target.connection_id.clone();
-        }
-
-        if let Some(index_name) = request.index_name.as_ref() {
-            let table_info = self.get_table_info_arc(&logical_request.table_name).await?;
-            let has_index = table_info
-                .global_secondary_indexes
-                .as_ref()
-                .is_some_and(|indexes| indexes.iter().any(|index| index.index_name == *index_name));
-            if !has_index {
-                return Err(StorageError::validation(format!(
-                    "One or more parameter values were invalid: The table does not have the \
-                     specified index: {index_name}"
-                )));
-            }
-            validate_gsi_projection(
-                &table_info,
-                Some(index_name),
-                request.projection_expression.as_deref(),
-                None,
-                request.expression_attribute_names.as_ref(),
-            )?;
-        }
-
-        let (mut items, mut lek) = self
-            .run_admitted(
-                &connection_id,
-                crate::admission::AdmissionClass::RangeRead,
-                |provider| async move {
-                    record_storage_operation("query_table", provider.query_table(&request)).await
-                },
-            )
-            .await?;
-        if let Some(namespace) = normalize_namespace.as_ref() {
-            normalize_wire_items_for_shared_table(&self.request_rewriter, namespace, &mut items)?;
-            lek = self
-                .normalize_query_start_key_from_shared_table(namespace, &logical_request, lek)
-                .await?;
-        }
-        if project_after_namespace_normalization {
-            items = logical_request.project_wire_items(items)?;
-        }
-        self.cache_query_runtime()
-            .observe_db_query_result(&logical_request, &items, lek.is_some())
-            .await?;
-        Ok((items, lek))
-    }
-
-    pub(super) async fn rewrite_query_start_key_for_shared_table(
-        &self,
-        namespace: &TableNamespace,
-        request: &mut QueryTableRequest,
-    ) -> StorageResult<()> {
-        let Some(token) = request.exclusive_start_key.as_deref() else {
-            return Ok(());
-        };
-        if request.index_name.is_some() {
-            return Ok(());
-        }
-
-        let table_info = self.get_table_info_arc(&request.table_name).await?;
-        let Some(item_key) = ItemKey::item_key_from_next_page_token(token, &table_info, &None)
-            .map_err(|err| {
-                StorageError::validation(format!("invalid shared-table query start key: {err}"))
-            })?
-        else {
-            request.exclusive_start_key = None;
-            return Ok(());
-        };
-        let mut key = KeyAttributes::from(item_key_to_attribute_map(
-            &table_info.key_schema,
-            &item_key,
-        )?);
-        self.request_rewriter
-            .rewrite_key_for_shared_table(namespace, &mut key)?;
-        let rewritten_item_key =
-            ItemKey::from_key_schema(request.table_name.clone(), &table_info.key_schema, &key)
-                .map_err(|err| {
-                    StorageError::internal(&format!(
-                        "rewrite shared-table query start key from logical key: {err}"
-                    ))
-                })?;
-        request.exclusive_start_key =
-            Some(rewritten_item_key.next_page_token().map_err(|err| {
-                StorageError::internal(&format!(
-                    "encode rewritten shared-table query start key: {err}"
-                ))
-            })?);
-        Ok(())
-    }
-
-    pub(super) async fn normalize_query_start_key_from_shared_table(
-        &self,
-        namespace: &TableNamespace,
-        request: &QueryTableRequest,
-        token: Option<String>,
-    ) -> StorageResult<Option<String>> {
-        let Some(token) = token else {
-            return Ok(None);
-        };
-        if request.index_name.is_some() {
-            return Ok(Some(token));
-        }
-
-        let table_info = self.get_table_info_arc(&request.table_name).await?;
-        let Some(item_key) = ItemKey::item_key_from_next_page_token(&token, &table_info, &None)
-            .map_err(|err| {
-                StorageError::validation(format!("invalid shared-table query next token: {err}"))
-            })?
-        else {
-            return Ok(None);
-        };
-        let mut key = KeyAttributes::from(item_key_to_attribute_map(
-            &table_info.key_schema,
-            &item_key,
-        )?);
-        self.request_rewriter
-            .normalize_key_from_shared_table(namespace, &mut key)?;
-        let normalized_item_key =
-            ItemKey::from_key_schema(request.table_name.clone(), &table_info.key_schema, &key)
-                .map_err(|err| {
-                    StorageError::internal(&format!(
-                        "normalize shared-table query next token to logical key: {err}"
-                    ))
-                })?;
-        Ok(Some(normalized_item_key.next_page_token().map_err(
-            |err| {
-                StorageError::internal(&format!(
-                    "encode normalized shared-table query next token: {err}"
-                ))
+    ) -> StorageResult<RangeReadPage<WireItem>> {
+        self.run_dynamo_admitted(
+            "default",
+            crate::admission::AdmissionClass::RangeRead,
+            |dynamo| async move {
+                record_storage_operation("query_table", dynamo.query_page(request)).await
             },
-        )?))
+        )
+        .await
     }
-}
-
-pub(crate) fn item_key_to_attribute_map(
-    key_schema: &[KeySchemaElement],
-    item_key: &ItemKey,
-) -> StorageResult<HashMap<String, AttributeValue>> {
-    let mut key = HashMap::new();
-    for element in key_schema {
-        match element.key_type {
-            storage_types::KeyType::Hash => {
-                key.insert(element.attribute_name.clone(), item_key.hash_key().clone());
-            }
-            storage_types::KeyType::Range => {
-                let Some(range_key) = item_key.range_key().cloned() else {
-                    return Err(StorageError::invalid_or_missing_key());
-                };
-                key.insert(element.attribute_name.clone(), range_key);
-            }
-        }
-    }
-    Ok(key)
 }

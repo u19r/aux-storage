@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 use storage_types::{
     AttributeMap, ReadSequenceNodeId, ReadSequenceNodeOperation, ReadSequencePlan,
@@ -67,7 +69,7 @@ pub fn decode_read_sequence_sql_rows(
 pub fn materialize_read_sequence_sql_mapped(
     plan: &ReadSequencePlan,
     ir: &ReadSequenceSqlIr,
-    rows: Vec<ReadSequenceSqlDecodedRow>,
+    mut rows: Vec<ReadSequenceSqlDecodedRow>,
 ) -> Result<Vec<ReadSequenceFlatRow>, ReadSequenceSqlCompileError> {
     let child = ir
         .nodes
@@ -79,73 +81,142 @@ pub fn materialize_read_sequence_sql_mapped(
         .mapped_source
         .as_ref()
         .ok_or(ReadSequenceSqlCompileError::UnsupportedShape)?;
-    let parent_items = rows
-        .iter()
-        .filter(|row| row.node == source.parent)
-        .collect::<Vec<_>>();
-    let mut children = rows
-        .iter()
-        .filter(|row| row.node == child.node)
-        .collect::<Vec<_>>();
-    children.sort_by_key(|row| row.invocation_ordinal);
-    for (index, child_row) in children.iter().enumerate() {
+    let mut parent_indices = Vec::new();
+    let mut child_indices = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.node == source.parent {
+            parent_indices.push(index);
+        } else if row.node == child.node {
+            child_indices.push(index);
+        }
+    }
+    child_indices.sort_unstable_by_key(|index| rows[*index].invocation_ordinal);
+    let child_invocation_limit = if source.iterates {
+        parent_indices.len()
+    } else {
+        usize::from(!parent_indices.is_empty())
+    };
+    for (index, child_index) in child_indices.iter().enumerate() {
+        let child_row = &rows[*child_index];
         let invocation = usize::try_from(child_row.invocation_ordinal)
             .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
         if child_row.item_ordinal != 0
-            || invocation >= parent_items.len()
-            || children
+            || invocation >= child_invocation_limit
+            || child_indices
                 .get(index.wrapping_sub(1))
-                .is_some_and(|previous| previous.invocation_ordinal == child_row.invocation_ordinal)
+                .is_some_and(|previous| {
+                    rows[*previous].invocation_ordinal == child_row.invocation_ordinal
+                })
         {
             return Err(ReadSequenceSqlCompileError::MalformedResult);
         }
     }
-    let mut output = Vec::with_capacity(parent_items.len() + 1);
-    let count = u32::try_from(parent_items.len())
-        .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
-    output.push(ReadSequenceFlatRow {
-        node: source.parent,
-        invocation_ordinal: 0,
-        input_refs: Default::default(),
-        result: ReadSequenceFlatResult::Query {
-            items: parent_items.iter().map(|row| row.item.clone()).collect(),
-            count,
-            scanned_count: count,
-            last_evaluated_key: None,
-        },
-    });
     let mapped_parents = if source.iterates {
-        parent_items.as_slice()
+        parent_indices.as_slice()
     } else {
-        parent_items
+        parent_indices
             .first()
             .map(std::slice::from_ref)
             .ok_or(ReadSequenceSqlCompileError::MappingMiss)?
     };
-    for (ordinal, parent) in mapped_parents.iter().copied().enumerate() {
+    let mapped_attribute = source
+        .keys
+        .iter()
+        .find_map(|key| match &key.source {
+            crate::provider::read_sequence_sql::ReadSequenceSqlMappedKeySource::Indexer => {
+                Some(key.target_attribute_name.as_str())
+            }
+            crate::provider::read_sequence_sql::ReadSequenceSqlMappedKeySource::Constant(_) => None,
+        })
+        .ok_or(ReadSequenceSqlCompileError::MappingMiss)?;
+    let mut pending_children = Vec::with_capacity(mapped_parents.len());
+    let mut children_by_key = HashMap::with_capacity(child_indices.len());
+    for child_index in &child_indices {
+        let child = &rows[*child_index];
+        let Some(storage_types::AttributeValue::S(mapped_value)) = child.item.get(mapped_attribute)
+        else {
+            return Err(ReadSequenceSqlCompileError::MappingMiss);
+        };
+        match children_by_key.entry(mapped_value.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(*child_index);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if rows[*entry.get()].item != child.item {
+                    return Err(ReadSequenceSqlCompileError::MappingMiss);
+                }
+            }
+        }
+    }
+    let mut emitted_keys = HashSet::with_capacity(mapped_parents.len());
+    for (parent_ordinal, parent_index) in mapped_parents.iter().enumerate() {
+        let parent = &rows[*parent_index];
         if parent.indexers.get(usize::from(source.indexer)) != Some(&source.attribute_name) {
             return Err(ReadSequenceSqlCompileError::MappingMiss);
         }
-        let ordinal =
-            u32::try_from(ordinal).map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
-        let item = children
-            .iter()
-            .find(|row| row.invocation_ordinal == ordinal)
-            .map(|row| row.item.clone());
-        verify_mapped_child_key(parent, item.as_ref(), source)?;
+        if parent.mapped_indexer_value.is_none() {
+            if source.iterates {
+                continue;
+            }
+            return Err(ReadSequenceSqlCompileError::MappingMiss);
+        }
+        let parent_ordinal = u32::try_from(parent_ordinal)
+            .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
+        let mapped_value = parent
+            .mapped_indexer_value
+            .as_deref()
+            .ok_or(ReadSequenceSqlCompileError::MappingMiss)?;
+        let child_index = children_by_key.get(mapped_value).copied();
+        let item = child_index.map(|index| &rows[index].item);
+        verify_mapped_child_key(parent, item, source)?;
+        if !emitted_keys.insert(mapped_value) {
+            // Keep the first parent ordinal as the canonical child reference.
+            continue;
+        }
+        let invocation_ordinal = u32::try_from(pending_children.len())
+            .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
         let input_refs = [(
             source.input_name.clone(),
             storage_types::ReadSequenceInputReference {
                 node: plan.nodes[source.parent.index()].name.clone(),
                 invocation_ordinal: 0,
-                item_ordinal: Some(ordinal),
+                item_ordinal: Some(parent_ordinal),
             },
         )]
         .into_iter()
         .collect();
+        pending_children.push((invocation_ordinal, input_refs, child_index));
+    }
+    if children_by_key
+        .keys()
+        .any(|mapped_value| !emitted_keys.contains(mapped_value))
+    {
+        return Err(ReadSequenceSqlCompileError::MappingMiss);
+    }
+    drop(emitted_keys);
+    drop(children_by_key);
+    let count = u32::try_from(parent_indices.len())
+        .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
+    let mut output = Vec::with_capacity(parent_indices.len() + 1);
+    output.push(ReadSequenceFlatRow {
+        node: source.parent,
+        invocation_ordinal: 0,
+        input_refs: Default::default(),
+        result: ReadSequenceFlatResult::Query {
+            items: parent_indices
+                .into_iter()
+                .map(|index| std::mem::take(&mut rows[index].item))
+                .collect(),
+            count,
+            scanned_count: count,
+            last_evaluated_key: None,
+        },
+    });
+    for (invocation_ordinal, input_refs, child_index) in pending_children {
+        let item = child_index.map(|index| std::mem::take(&mut rows[index].item));
         output.push(ReadSequenceFlatRow {
             node: child.node,
-            invocation_ordinal: ordinal,
+            invocation_ordinal,
             input_refs,
             result: ReadSequenceFlatResult::Get { item },
         });
@@ -198,15 +269,10 @@ fn decode_sql_row(
     };
     validate_sql_row(&row, node_id, metadata, previous)?;
     let (mut item, indexers, mapped_indexer_value) = decode_sql_item(&mut row, metadata, ir)?;
-    append_sql_key_values(&mut item, &row, metadata)?;
+    let key_values = std::mem::take(&mut row.key_values);
+    append_sql_key_values(&mut item, key_values, metadata)?;
     if let Some(projected_attributes) = &metadata.metadata.projected_attributes {
-        let mut projected = AttributeMap::with_capacity(projected_attributes.len());
-        for name in projected_attributes {
-            if let Some(value) = item.get(name) {
-                projected.insert(name.clone(), value.clone());
-            }
-        }
-        item = projected;
+        item.retain(|name, _| projected_attributes.iter().any(|wanted| wanted == name));
     }
     if matches!(node.operation, ReadSequenceNodeOperation::Get(_)) && row.item_ordinal != 0 {
         return Err(ReadSequenceSqlCompileError::MalformedResult);
@@ -263,19 +329,35 @@ fn decode_sql_item(
     if row.indexer_values.len() != metadata.metadata.max_indexers.as_usize() {
         return Err(ReadSequenceSqlCompileError::MalformedResult);
     }
+    // New row shape (§3.2/§5.2): `item_bytes` is the full-item DynamoJSON,
+    // moved here without parsing beyond the single map decode the flat-row
+    // contract requires. GSI rows carry their own projected bytes, so no
+    // GSI→base join or residual/marker reconstruction happens on this path.
     let residual = row
         .item_json
         .take()
         .ok_or(ReadSequenceSqlCompileError::MalformedResult)?;
-    let storage_types::DecodedIndexedWireItem {
-        item,
-        declaration,
-        slots,
-    } = storage_types::IndexedWireItem::decode_padded_parts(
-        residual,
-        std::mem::take(&mut row.indexer_values),
-    )
-    .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
+    let item: AttributeMap = serde_json::from_slice(&residual)
+        .map_err(|_| ReadSequenceSqlCompileError::MalformedResult)?;
+    let slots = std::mem::take(&mut row.indexer_values);
+    // The new schema persists slot values only, not the per-row indexer
+    // declaration names the old residual markers carried. The names needed
+    // for the mapped Query→Get check come from the IR instead: every mapped
+    // source names its parent attribute plus ordinal, which is exactly what
+    // the materializer compares. Unknown ordinals keep an empty placeholder
+    // (attribute names are never empty, so no false match is possible).
+    let mut indexers = vec![String::new(); slots.len()];
+    for node in &ir.nodes {
+        let Some(source) = node.metadata.mapped_source.as_ref() else {
+            continue;
+        };
+        if source.parent != metadata.node {
+            continue;
+        }
+        if let Some(name) = indexers.get_mut(usize::from(source.indexer)) {
+            *name = source.attribute_name.clone();
+        }
+    }
     let mapped_indexer_value = ir
         .nodes
         .iter()
@@ -284,31 +366,22 @@ fn decode_sql_item(
         .and_then(|source| slots.get(usize::from(source.indexer)))
         .cloned()
         .flatten();
-    Ok((
-        AttributeMap::from(item),
-        declaration.into_names(),
-        mapped_indexer_value,
-    ))
+    Ok((item, indexers, mapped_indexer_value))
 }
 
-fn append_sql_key_values(
+pub(super) fn append_sql_key_values(
     item: &mut AttributeMap,
-    row: &ReadSequenceSqlEnvelopeRow,
+    key_values: Vec<storage_types::AttributeValue>,
     metadata: &crate::provider::read_sequence_sql::ReadSequenceSqlIrNode,
 ) -> Result<(), ReadSequenceSqlCompileError> {
-    for (attribute_name, value) in metadata
-        .metadata
-        .key_attribute_names
-        .iter()
-        .zip(row.key_values.iter())
-    {
+    for (attribute_name, value) in metadata.metadata.key_attribute_names.iter().zip(key_values) {
         if item
             .get(attribute_name)
-            .is_some_and(|stored| stored != value)
+            .is_some_and(|stored| stored != &value)
         {
             return Err(ReadSequenceSqlCompileError::MalformedResult);
         }
-        item.insert(attribute_name.clone(), value.clone());
+        item.insert(attribute_name.clone(), value);
     }
     Ok(())
 }

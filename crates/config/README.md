@@ -30,7 +30,7 @@ Config documents may reference it with `$schema`:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/u19r/aux-storage/refs/heads/main/crates/config/config.schema.json?token=GHSAT0AAAAAADK4QYGE6FCAG4LATCSLN4UI2QGCFVA",
+  "$schema": "https://raw.githubusercontent.com/u19r/aux-storage/refs/heads/main/crates/config/config.schema.json",
   "features": {
     "backends": {
       "sqlite": { "db_path": "./data/storage.sqlite" }
@@ -81,12 +81,9 @@ resolved from the config file directory.
 Object keys are intentionally not interpolated. Missing environment variables
 and unreadable files are hard errors.
 
-Sensitive fields include database DSNs, remote credentials, and replication
-service tokens. `features.metrics.enabled` defaults to `true` and controls the
-storage-api `/metrics` endpoint. Set
-`features.metrics.prometheus.bearer_token` to require an
-`Authorization: Bearer <token>` header. Avoid logging effective config unless it
-is redacted.
+Sensitive fields include database DSNs and remote credentials.
+`features.metrics.enabled` defaults to `true` and controls the storage-api
+`/metrics` endpoint. Avoid logging effective config unless it is redacted.
 
 ## Extension Rules
 

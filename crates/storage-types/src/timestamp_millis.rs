@@ -1,6 +1,6 @@
 use std::ops::{Add, Deref, Sub};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -118,10 +118,44 @@ impl Deref for TimestampMillis {
 
 impl std::fmt::Display for TimestampMillis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let datetime = DateTime::from_timestamp_millis(self.0);
-        let rfc3339 = datetime.unwrap_or(Utc::now()).to_rfc3339();
-        write!(f, "{rfc3339}")
+        write_rfc3339_utc(
+            DateTime::from_timestamp_millis(self.0).unwrap_or_else(Utc::now),
+            f,
+        )
     }
+}
+
+pub(crate) fn write_rfc3339_utc(
+    datetime: DateTime<Utc>,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    let year = datetime.year();
+    if (0..=9999).contains(&year) {
+        write!(formatter, "{year:04}")?;
+    } else {
+        write!(formatter, "{year:+05}")?;
+    }
+    write!(
+        formatter,
+        "-{:02}-{:02}T{:02}:{:02}:{:02}",
+        datetime.month(),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second()
+    )?;
+    let nanos = datetime.nanosecond();
+    if nanos != 0 {
+        let (fraction, width) = if nanos.is_multiple_of(1_000_000) {
+            (nanos / 1_000_000, 3)
+        } else if nanos.is_multiple_of(1_000) {
+            (nanos / 1_000, 6)
+        } else {
+            (nanos, 9)
+        };
+        write!(formatter, ".{fraction:0width$}")?;
+    }
+    formatter.write_str("+00:00")
 }
 
 impl From<&chrono::DateTime<Utc>> for TimestampMillis {

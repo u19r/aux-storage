@@ -1,9 +1,11 @@
 use storage_types::UserStreamName;
-use stream_provider::{CursorName, StreamError, StreamResult, StreamValidationKind};
+use stream_provider::{
+    CursorName, MAX_STREAM_ITEM_DATA_BYTES, StreamError, StreamResult, StreamValidationKind,
+};
 
 use crate::constants::{
-    CURSOR_NAME_ALLOWED_MIDDLE_CHARS, MAX_CURSOR_NAME_LEN, MAX_STREAM_ITEM_DATA_BYTES,
-    MAX_STREAM_NAME_LEN, MAX_STREAM_TTL_SECONDS, STREAM_NAME_ALLOWED_MIDDLE_CHARS,
+    CURSOR_NAME_ALLOWED_MIDDLE_CHARS, MAX_CURSOR_NAME_LEN, MAX_STREAM_NAME_LEN,
+    MAX_STREAM_TTL_SECONDS, STREAM_NAME_ALLOWED_MIDDLE_CHARS,
 };
 
 pub(crate) trait UserStreamNameValidation {
@@ -62,10 +64,8 @@ pub fn validate_name_format(
     field_name: &str,
     allowed_middle_chars: &[char],
 ) -> StreamResult<()> {
-    let chars: Vec<char> = value.chars().collect();
-
-    for (i, ch) in chars.iter().enumerate() {
-        if i == 0 || i == chars.len() - 1 {
+    for (i, ch) in value.char_indices() {
+        if i == 0 || i + ch.len_utf8() == value.len() {
             // First and last characters must be alphanumeric
             if !ch.is_alphanumeric() {
                 return Err(StreamError::validation_with_detail(
@@ -75,7 +75,7 @@ pub fn validate_name_format(
             }
         } else {
             // Middle characters can be alphanumeric or in the allowed list
-            if !ch.is_alphanumeric() && !allowed_middle_chars.contains(ch) {
+            if !ch.is_alphanumeric() && !allowed_middle_chars.contains(&ch) {
                 let allowed_chars_str = allowed_middle_chars
                     .iter()
                     .map(std::string::ToString::to_string)

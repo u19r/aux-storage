@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Write as _};
 
+use alloc_counter::AllocationGuard;
 use chrono::Duration as ChronoDuration;
 use serde::Deserialize;
 
@@ -79,4 +80,65 @@ fn timestamp_seconds_converts_to_millis_with_saturation() {
     let millis = TimestampMillis::from(too_large);
 
     assert_eq!(millis.timestamp_millis(), i64::MAX);
+}
+
+fn write_legacy_display(value: TimestampSeconds, output: &mut String) {
+    let datetime = chrono::DateTime::from_timestamp(value.as_seconds(), 0);
+    let rfc3339 = datetime.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+    write!(output, "{rfc3339}").expect("String accepts all writes");
+}
+
+fn write_candidate_display(value: TimestampSeconds, output: &mut String) {
+    write!(output, "{value}").expect("String accepts all writes");
+}
+
+fn measure_display_allocations(
+    label: &'static str,
+    write_display: fn(TimestampSeconds, &mut String),
+) -> alloc_counter::AllocationReport<'static> {
+    let value = TimestampSeconds::from_timestamp(1_700_000_000);
+    let mut output = String::with_capacity(32);
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "timestamp_seconds_display_allocation_profile",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..256 {
+        output.clear();
+        write_display(value, &mut output);
+        std::hint::black_box(&output);
+    }
+    guard.finish()
+}
+
+#[test]
+fn timestamp_seconds_display_preserves_rfc3339_bytes() {
+    let value = TimestampSeconds::from_timestamp(1_700_000_000);
+    let mut legacy = String::new();
+    write_legacy_display(value, &mut legacy);
+    assert_eq!(value.to_string(), legacy);
+    assert_eq!(legacy, "2023-11-14T22:13:20+00:00");
+
+    for value in [
+        TimestampSeconds::from_timestamp(-1),
+        TimestampSeconds::from_timestamp(0),
+        TimestampSeconds::from_timestamp(253_402_300_800),
+    ] {
+        let expected = chrono::DateTime::from_timestamp(value.as_seconds(), 0)
+            .expect("timestamp in chrono range")
+            .to_rfc3339();
+        assert_eq!(value.to_string(), expected);
+    }
+}
+
+#[test]
+fn timestamp_seconds_display_avoids_valid_timestamp_allocations() {
+    let legacy = measure_display_allocations("legacy_to_rfc3339", write_legacy_display);
+    let candidate = measure_display_allocations("direct_formatter", write_candidate_display);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&candidate);
+    assert!(candidate.allocation_count < legacy.allocation_count);
+    assert!(candidate.allocated_bytes < legacy.allocated_bytes);
 }

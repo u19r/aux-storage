@@ -1,4 +1,4 @@
-use crate::TableName;
+use crate::{IndexName, TableName};
 
 #[test]
 fn sanitized_name_allows_alphanumeric() {
@@ -82,4 +82,26 @@ fn sanitized_name_all_valid_characters() {
 fn sanitized_name_empty_after_filtering() {
     let name = TableName::new("';/@#$%");
     assert_eq!(name.sanitized_name(), "");
+}
+
+#[test]
+fn given_table_name_when_physical_names_are_built_then_prefixes_match_sql_backends() {
+    let table = TableName::new("orders");
+    let index = IndexName::new("by-status");
+
+    assert_eq!(table.physical_table_name(), "table_orders");
+    assert_eq!(
+        table.physical_gsi_table_name(&index),
+        "gsi_orders_by-status"
+    );
+    assert_eq!(table.physical_ttl_index_table_name(), "ttl_index_orders");
+}
+
+#[test]
+fn given_unsafe_table_name_when_physical_names_are_built_then_parts_are_sanitized() {
+    let table = TableName::new("ord';ers");
+    let index = IndexName::new("by\"status");
+
+    assert_eq!(table.physical_table_name(), "table_orders");
+    assert_eq!(table.physical_gsi_table_name(&index), "gsi_orders_bystatus");
 }

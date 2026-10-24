@@ -5,12 +5,11 @@
 //! construction.
 
 mod immediate_jobs;
+mod immediate_queue_worker;
 mod manager;
 mod operation_metrics;
-pub mod provider {
-    pub use queue_provider::*;
-}
 pub use immediate_jobs::*;
+pub use immediate_queue_worker::wait_for_immediate_job_receive_retry;
 pub use manager::*;
 pub use queue_provider::*;
 
@@ -19,8 +18,18 @@ mod immediate_jobs_tests;
 #[cfg(test)]
 mod queue_correctness_tests;
 #[cfg(test)]
+mod queue_test_support_tests;
+#[cfg(test)]
 mod queue_tests;
 
 mod constants;
+#[cfg(test)]
+mod constants_tests;
 mod factory;
 pub use factory::create_queue_provider;
+
+#[cfg(test)]
+mod immediate_queue_worker_tests;
+
+#[cfg(test)]
+mod queue_publication_tests;

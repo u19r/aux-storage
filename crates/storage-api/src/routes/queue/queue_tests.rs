@@ -75,11 +75,8 @@ fn given_provider_pressure_errors_when_classifying_queue_responses_then_retries_
         ("com.amazonaws.dynamodb.v20120810#RequestTimeout", 504),
         ("ThrottlingException", 429),
         ("com.amazonaws.dynamodb.v20120810#ThrottlingException", 429),
-        ("ServiceUnavailableException", 503),
-        (
-            "com.amazonaws.dynamodb.v20120810#ServiceUnavailableException",
-            503,
-        ),
+        ("ServiceUnavailable", 503),
+        ("com.amazonaws.dynamodb.v20120810#ServiceUnavailable", 503),
     ] {
         let error = HttpApiError::aws_query_error(error_type, "provider pressure", status_code);
         assert!(

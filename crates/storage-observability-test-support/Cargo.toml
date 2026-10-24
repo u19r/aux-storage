@@ -1,0 +1,21 @@
+[package]
+rust-version.workspace = true
+publish = false
+edition = "2024"
+license.workspace = true
+name = "storage-observability-test-support"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+metrics-facade = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

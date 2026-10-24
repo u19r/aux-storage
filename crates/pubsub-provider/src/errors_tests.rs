@@ -2,7 +2,9 @@ use http_error::HttpApiError;
 
 use crate::{
     PubsubError, PubsubValidationKind,
-    errors::{SNS_INTERNAL_ERROR_TYPE, SNS_INVALID_PARAMETER_ERROR_TYPE, SNS_NOT_FOUND_ERROR_TYPE},
+    constants::{
+        SNS_INTERNAL_ERROR_TYPE, SNS_INVALID_PARAMETER_ERROR_TYPE, SNS_NOT_FOUND_ERROR_TYPE,
+    },
 };
 
 #[test]
@@ -97,4 +99,20 @@ fn pubsub_error_maps_topic_not_found_to_shared_http_error() {
     assert_eq!(http_error.error_type, "NotFound");
     assert_eq!(http_error.message, "Topic does not exist");
     assert_eq!(http_error.status_code, 400);
+}
+
+#[test]
+fn given_unknown_commit_when_pubsub_maps_storage_error_then_outcome_and_http_shape_survive() {
+    let error = PubsubError::from(storage_types::StorageError::sync_submission_ambiguous(
+        None,
+        "native commit outcome unavailable",
+    ));
+    assert!(matches!(&error, PubsubError::Storage(source)
+        if matches!(source.as_ref(), storage_types::StorageEnum::SyncSubmissionAmbiguous { .. })));
+    assert_eq!(error.aws_query_error_type(), SNS_INTERNAL_ERROR_TYPE);
+    assert_eq!(error.aws_query_status_code(), 500);
+    assert_eq!(error.aws_query_message(), "Internal server error: storage");
+    let http_error = HttpApiError::from(error);
+    assert_eq!(http_error.status_code, 500);
+    assert_eq!(http_error.message, "Internal server error: storage");
 }

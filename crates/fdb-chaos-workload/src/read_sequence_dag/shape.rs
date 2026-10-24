@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
 
+use storage_types::PutItemRequest;
+
 use crate::{
     common::*,
     imports::*,
-    read_sequence_dag::{
-        FdbChaosProvider, NormalizedResult, ReadSequenceDagWorkload, constants::MAPPED_INDEX_NAME,
-    },
+    read_sequence_dag::{NormalizedResult, ReadSequenceDagWorkload, constants::MAPPED_INDEX_NAME},
 };
 
 impl ReadSequenceDagWorkload {
     pub(super) fn create_mapped_table(&self, table_name: TableName) -> CreateTableRequest {
-        CreateTableRequest::new(
+        let mut request = CreateTableRequest::new(
             table_name,
             vec![
                 AttributeDefinition {
@@ -27,8 +27,8 @@ impl ReadSequenceDagWorkload {
                 key_type: KeyType::Hash,
             }],
             BillingMode::PayPerRequest,
-        )
-        .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+        );
+        request.global_secondary_indexes = Some(vec![CreateGlobalSecondaryIndex {
             index_name: IndexName::new(MAPPED_INDEX_NAME),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi_pk".to_string(),
@@ -39,16 +39,17 @@ impl ReadSequenceDagWorkload {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
-        }]))
+        }]);
+        request
     }
 
     pub(super) async fn seed_mapped_table(
         &self,
-        provider: &Arc<FdbChaosProvider>,
+        provider: &Arc<dyn storage_provider::DynamoOperations>,
         table_name: &TableName,
     ) -> Result<(), String> {
         provider
-            .create_table(&self.create_mapped_table(table_name.clone()))
+            .create_table(self.create_mapped_table(table_name.clone()))
             .await
             .map_err(|error| storage_error_detail(&error))?;
         self.seed_rows(provider, table_name, ["a", "b", "c"], "open")
@@ -58,7 +59,7 @@ impl ReadSequenceDagWorkload {
 
     async fn seed_rows<'a, I>(
         &self,
-        provider: &Arc<FdbChaosProvider>,
+        provider: &Arc<dyn storage_provider::DynamoOperations>,
         table_name: &TableName,
         keys: I,
         status: &str,
@@ -76,7 +77,10 @@ impl ReadSequenceDagWorkload {
                 ),
             ]);
             provider
-                .put_item(table_name.clone(), item, None, None, None, None)
+                .put_item(PutItemRequest::new(
+                    table_name.clone(),
+                    WireItem::try_from(&item).map_err(|error| storage_error_detail(&error))?,
+                ))
                 .await
                 .map_err(|error| storage_error_detail(&error))?;
         }
@@ -85,10 +89,10 @@ impl ReadSequenceDagWorkload {
 
     async fn seed_overflow_rows(
         &self,
-        provider: &Arc<FdbChaosProvider>,
+        provider: &Arc<dyn storage_provider::DynamoOperations>,
         table_name: &TableName,
     ) -> Result<(), String> {
-        // The mapped provider caps the physical page at 100 parent rows.
+        // Force a public continuation beyond a 100-row query page.
         for index in 0..101 {
             let pk = format!("overflow-{index:03}");
             let item = HashMap::from([
@@ -103,7 +107,10 @@ impl ReadSequenceDagWorkload {
                 ),
             ]);
             provider
-                .put_item(table_name.clone(), item, None, None, None, None)
+                .put_item(PutItemRequest::new(
+                    table_name.clone(),
+                    WireItem::try_from(&item).map_err(|error| storage_error_detail(&error))?,
+                ))
                 .await
                 .map_err(|error| storage_error_detail(&error))?;
         }
@@ -157,49 +164,29 @@ impl ReadSequenceDagWorkload {
             ("independent".to_string(), vec![vec![item("a")]]),
         ])
     }
-
-    pub(super) fn normalize_mapped_response(
-        request: &ReadSequenceRequest,
-        rows: &[storage_provider::ReadSequenceFlatRow],
-    ) -> NormalizedResult {
-        let mut grouped = BTreeMap::new();
-        for row in rows {
-            let name = request.nodes[row.node.index()].name.clone();
-            let items = normalize_row_items(&row.result);
-            grouped
-                .entry(name)
-                .or_insert_with(Vec::new)
-                .push((row.invocation_ordinal, items));
-        }
-        grouped
-            .into_iter()
-            .map(|(name, mut invocations)| {
-                invocations.sort_by_key(|(ordinal, _)| *ordinal);
-                (
-                    name,
-                    invocations.into_iter().map(|(_, items)| items).collect(),
-                )
-            })
-            .collect()
-    }
 }
 
 fn query_node(table_name: &TableName, index_name: &IndexName, status: &str) -> ReadSequenceNode {
-    let mut query = QueryRequest::new(table_name.clone(), "gsi_pk = :gsi_pk".to_string())
-        .with_index_name(Some(index_name.clone()));
-    query.expression_attribute_values = Some(HashMap::from([(
-        ":gsi_pk".to_string(),
-        AttributeValue::S(status.to_string()),
-    )]));
-    ReadSequenceNode::new("query", ReadSequenceNodeOperation::Query(query))
+    let mut query = QueryRequest::builder()
+        .table_name(table_name.clone())
+        .key_condition_expression("gsi_pk = :gsi_pk".to_string())
+        .index_name(Some(index_name.clone()))
+        .build();
+    query.limit = Some(100);
+    query.expression_attribute_values = Some(
+        HashMap::from([(":gsi_pk".to_string(), AttributeValue::S(status.to_string()))]).into(),
+    );
+    ReadSequenceNode::new("query", ReadSequenceNodeOperation::Query(Box::new(query)))
 }
 
 fn child_node(table_name: &TableName) -> ReadSequenceNode {
     ReadSequenceNode::builder()
         .name("child")
-        .operation(ReadSequenceNodeOperation::Get(GetItemRequest::new(
-            table_name.clone(),
-            HashMap::from([("pk".to_string(), read_sequence_input_marker("pk"))]),
+        .operation(ReadSequenceNodeOperation::Get(Box::new(
+            GetItemRequest::new(
+                table_name.clone(),
+                HashMap::from([("pk".to_string(), read_sequence_input_marker("pk"))]),
+            ),
         )))
         .inputs(
             [(
@@ -224,10 +211,10 @@ fn child_node(table_name: &TableName) -> ReadSequenceNode {
 fn independent_node(table_name: &TableName) -> ReadSequenceNode {
     ReadSequenceNode::new(
         "independent",
-        ReadSequenceNodeOperation::Get(GetItemRequest::new(
+        ReadSequenceNodeOperation::Get(Box::new(GetItemRequest::new(
             table_name.clone(),
             HashMap::from([("pk".to_string(), AttributeValue::S("a".to_string()))]),
-        )),
+        ))),
     )
 }
 
@@ -238,24 +225,5 @@ fn query_keys(status: &str) -> Vec<String> {
             .collect()
     } else {
         ["a", "b", "c"].into_iter().map(str::to_string).collect()
-    }
-}
-
-fn normalize_row_items(
-    result: &storage_provider::ReadSequenceFlatResult,
-) -> Vec<HashMap<String, AttributeValue>> {
-    match result {
-        ReadSequenceFlatResult::Get { item } => item
-            .clone()
-            .into_iter()
-            .map(|item| item.to_hashmap())
-            .collect(),
-        ReadSequenceFlatResult::Query { items, .. } => {
-            items.iter().map(|item| item.to_hashmap()).collect()
-        }
-        ReadSequenceFlatResult::BatchGet { responses } => responses
-            .values()
-            .flat_map(|items| items.iter().map(|item| item.to_hashmap()))
-            .collect(),
     }
 }

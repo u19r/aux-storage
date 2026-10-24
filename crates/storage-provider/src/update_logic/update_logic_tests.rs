@@ -1,23 +1,163 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use alloc_counter::AllocationGuard;
-use storage_types::{AttributeValue, ReturnValuesOldNewUpdated};
+use storage_types::{AttributeMap, AttributeValue, ReturnValuesOldNewUpdated};
 
-use crate::update_logic::{
-    BoundUpdateOperation, SetFunction, UpdateOperation, apply_update_operations,
-    before_update_item, parse_update_expression, resolve_attribute_value,
-    return_values_need_old_item, return_values_need_updated_fields,
-    split_operations_preserving_functions, update_item_response, updated_attributes_for_response,
-    value::BoundUpdateOperand,
+use super::logic::remove_set_members;
+use crate::{
+    constants_tests::{UPDATE_CLONE_AUDIT_ITERATIONS, UPDATE_EXPRESSION_AUDIT_ITERATIONS},
+    update_logic::{
+        BoundUpdateOperation, UpdateOperation, apply_bound_update_operations,
+        apply_update_operations, before_update_item, parse_update_expression,
+        return_values_need_old_item, return_values_need_updated_fields, update_item_response,
+        updated_attributes_for_response, value::BoundUpdateOperand,
+    },
 };
 
-const UPDATE_CLONE_AUDIT_ITERATIONS: usize = 512;
-const UPDATE_EXPRESSION_AUDIT_ITERATIONS: usize = 1024;
+#[test]
+fn given_set_delete_members_when_measuring_removal_then_one_pass_replaces_repeated_retains() {
+    let existing = (0..64)
+        .map(|index| format!("value-{index}"))
+        .collect::<Vec<_>>();
+    let deleted = (0..16)
+        .map(|index| format!("value-{}", index * 2))
+        .collect::<Vec<_>>();
+    let baseline_passes = measure_repeated_set_removal(&existing, &deleted);
+    let current_passes = measure_single_pass_set_removal(&existing, &deleted);
+
+    assert_eq!(baseline_passes, deleted.len());
+    assert_eq!(current_passes, 1);
+}
+
+#[test]
+fn updated_response_preserves_top_level_values_when_extracting_from_owned_item() {
+    let old_item = HashMap::from([
+        (
+            "payload".to_string(),
+            AttributeValue::M(HashMap::from([
+                ("nested".to_string(), AttributeValue::S("old".to_string())),
+                (
+                    "large".to_string(),
+                    AttributeValue::L(vec![
+                        AttributeValue::S("a".to_string()),
+                        AttributeValue::S("b".to_string()),
+                    ]),
+                ),
+            ])),
+        ),
+        (
+            "unchanged".to_string(),
+            AttributeValue::S("keep".to_string()),
+        ),
+    ]);
+    let operations = vec![UpdateOperation::Set {
+        field: Arc::from("payload"),
+        value: AttributeValue::S("new".to_string()),
+    }];
+
+    let response = update_item_response(
+        &operations,
+        Some(old_item),
+        None,
+        Some(&ReturnValuesOldNewUpdated::UpdatedOld),
+    )
+    .unwrap();
+
+    assert_eq!(
+        response.attributes.map(HashMap::from),
+        Some(HashMap::from([(
+            "payload".to_string(),
+            AttributeValue::M(HashMap::from([
+                ("nested".to_string(), AttributeValue::S("old".to_string())),
+                (
+                    "large".to_string(),
+                    AttributeValue::L(vec![
+                        AttributeValue::S("a".to_string()),
+                        AttributeValue::S("b".to_string()),
+                    ])
+                ),
+            ])),
+        )]))
+    );
+}
+
+#[test]
+fn updated_response_keeps_nested_projection_shape_for_owned_item() {
+    let old_item = HashMap::from([(
+        "payload".to_string(),
+        AttributeValue::M(HashMap::from([
+            ("first".to_string(), AttributeValue::S("a".to_string())),
+            ("second".to_string(), AttributeValue::S("b".to_string())),
+        ])),
+    )]);
+    let operations = vec![UpdateOperation::Set {
+        field: Arc::from("payload.first"),
+        value: AttributeValue::S("new".to_string()),
+    }];
+
+    let response = update_item_response(
+        &operations,
+        Some(old_item),
+        None,
+        Some(&ReturnValuesOldNewUpdated::UpdatedOld),
+    )
+    .unwrap();
+
+    assert_eq!(
+        response.attributes.map(HashMap::from),
+        Some(HashMap::from([(
+            "payload".to_string(),
+            AttributeValue::M(HashMap::from([(
+                "first".to_string(),
+                AttributeValue::S("a".to_string()),
+            )])),
+        )]))
+    );
+}
+
+#[test]
+fn updated_response_omits_missing_selected_owned_field() {
+    let old_item = HashMap::from([(
+        "other".to_string(),
+        AttributeValue::S("unchanged".to_string()),
+    )]);
+    let operations = vec![UpdateOperation::Set {
+        field: Arc::from("missing"),
+        value: AttributeValue::S("new".to_string()),
+    }];
+
+    let response = update_item_response(
+        &operations,
+        Some(old_item),
+        None,
+        Some(&ReturnValuesOldNewUpdated::UpdatedOld),
+    )
+    .unwrap();
+
+    assert!(response.attributes.is_none());
+}
+
+fn measure_repeated_set_removal(existing: &[String], deleted: &[String]) -> usize {
+    let mut values = existing.to_vec();
+    for item_to_delete in deleted {
+        values.retain(|item| item != item_to_delete);
+    }
+    std::hint::black_box(values);
+    deleted.len()
+}
+
+fn measure_single_pass_set_removal(existing: &[String], deleted: &[String]) -> usize {
+    let mut values = existing.to_vec();
+    remove_set_members(&mut values, deleted);
+    std::hint::black_box(values);
+    1
+}
 
 #[test]
 fn update_logic_allocation_profile_tests() {
     assert_return_values_do_not_need_old_when_applying_update_then_full_item_clone_is_skipped();
     assert_updated_old_response_when_applying_update_then_only_projected_old_fields_are_cloned();
+    assert_owned_updated_response_extraction_allocation_profile();
     assert_update_expression_binding_and_condition_cache_allocation_profile();
     assert_response_field_collection_allocation_profile();
     assert_arithmetic_bound_operand_construction_allocation_profile();
@@ -30,8 +170,8 @@ fn assert_return_values_do_not_need_old_when_applying_update_then_full_item_clon
     let baseline = measure_preserve_old_for_update_response(&item, &operations);
     let optimized = measure_preserve_old_only_if_needed(&item, &operations);
 
-    alloc_counter::emit_report(&baseline);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert!(
         optimized.allocation_count < baseline.allocation_count,
@@ -56,8 +196,8 @@ fn assert_updated_old_response_when_applying_update_then_only_projected_old_fiel
     let baseline = measure_updated_old_full_item_clone(&item, &operations);
     let optimized = measure_updated_old_projected_fields(&item, &operations);
 
-    alloc_counter::emit_report(&baseline);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert!(
         optimized.allocation_count < baseline.allocation_count,
@@ -73,6 +213,81 @@ fn assert_updated_old_response_when_applying_update_then_only_projected_old_fiel
     );
 }
 
+fn assert_owned_updated_response_extraction_allocation_profile() {
+    let item = clone_audit_item();
+    let operations = clone_audit_operations();
+    let baseline_items = (0..UPDATE_CLONE_AUDIT_ITERATIONS)
+        .map(|_| item.clone())
+        .collect::<Vec<_>>();
+    let optimized_items = (0..UPDATE_CLONE_AUDIT_ITERATIONS)
+        .map(|_| item.clone())
+        .collect::<Vec<_>>();
+
+    let baseline = measure_borrowed_updated_response_extraction(&baseline_items, &operations);
+    let optimized = measure_owned_updated_response_extraction(optimized_items, &operations);
+
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&optimized);
+
+    assert!(
+        optimized.allocation_count < baseline.allocation_count,
+        "expected consuming updated response extraction to allocate less often, baseline={} \
+         optimized={}",
+        baseline.allocation_count,
+        optimized.allocation_count
+    );
+    assert!(
+        optimized.allocated_bytes < baseline.allocated_bytes,
+        "expected consuming updated response extraction to allocate fewer bytes, baseline={} \
+         optimized={}",
+        baseline.allocated_bytes,
+        optimized.allocated_bytes
+    );
+}
+
+fn measure_borrowed_updated_response_extraction(
+    items: &[HashMap<String, AttributeValue>],
+    operations: &[UpdateOperation],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "updated_response_borrowed_extraction_baseline",
+        file!(),
+        line!(),
+        Some("borrowed_values"),
+    );
+    for item in items {
+        let attributes = updated_attributes_for_response(operations, item);
+        let attributes: AttributeMap = attributes.into();
+        std::hint::black_box(attributes);
+    }
+    guard.finish()
+}
+
+fn measure_owned_updated_response_extraction(
+    items: Vec<HashMap<String, AttributeValue>>,
+    operations: &[UpdateOperation],
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "updated_response_owned_extraction_optimized",
+        file!(),
+        line!(),
+        Some("moved_values"),
+    );
+    for old_item in items {
+        let response = update_item_response(
+            operations,
+            Some(old_item),
+            None,
+            Some(&ReturnValuesOldNewUpdated::UpdatedOld),
+        )
+        .unwrap();
+        std::hint::black_box(response.attributes);
+    }
+    guard.finish()
+}
+
 fn measure_preserve_old_for_update_response(
     item: &HashMap<String, AttributeValue>,
     operations: &[UpdateOperation],
@@ -86,8 +301,7 @@ fn measure_preserve_old_for_update_response(
     );
     for _ in 0..UPDATE_CLONE_AUDIT_ITERATIONS {
         let item_to_update = item.clone();
-        let updated = apply_update_operations(item_to_update.clone(), operations)
-            .expect("apply update operations");
+        let updated = apply_update_operations(item_to_update.clone().into(), operations).unwrap();
         std::hint::black_box((item_to_update.len(), updated.len()));
     }
     guard.finish()
@@ -108,8 +322,7 @@ fn measure_preserve_old_only_if_needed(
         let item_to_update = item.clone();
         let old_for_response = return_values_need_old_item(Some(&ReturnValuesOldNewUpdated::None))
             .then(|| item_to_update.clone());
-        let updated =
-            apply_update_operations(item_to_update, operations).expect("apply update operations");
+        let updated = apply_update_operations(item_to_update.into(), operations).unwrap();
         std::hint::black_box((old_for_response, updated.len()));
     }
     guard.finish()
@@ -129,15 +342,14 @@ fn measure_updated_old_full_item_clone(
     for _ in 0..UPDATE_CLONE_AUDIT_ITERATIONS {
         let item_to_update = item.clone();
         let old_for_response = Some(item_to_update.clone());
-        let updated =
-            apply_update_operations(item_to_update, operations).expect("apply update operations");
+        let updated = apply_update_operations(item_to_update.into(), operations).unwrap();
         let response = update_item_response(
             operations,
             old_for_response,
-            Some(updated),
+            Some(updated.into_hashmap()),
             Some(&ReturnValuesOldNewUpdated::UpdatedOld),
         )
-        .expect("build response");
+        .unwrap();
         std::hint::black_box(response.attributes);
     }
     guard.finish()
@@ -158,22 +370,21 @@ fn measure_updated_old_projected_fields(
         let item_to_update = item.clone();
         let attributes = updated_attributes_for_response(operations, &item_to_update);
         let old_for_response = (!attributes.is_empty()).then_some(attributes);
-        let updated =
-            apply_update_operations(item_to_update, operations).expect("apply update operations");
+        let updated = apply_update_operations(item_to_update.into(), operations).unwrap();
         std::hint::black_box((old_for_response, updated.len()));
     }
     guard.finish()
 }
 
 fn assert_update_expression_binding_and_condition_cache_allocation_profile() {
-    let names = HashMap::from([
+    let names = storage_types::VecMap::from_iter([
         ("#payload".to_string(), "payload_0".to_string()),
         ("#counter".to_string(), "counter".to_string()),
         ("#status".to_string(), "status".to_string()),
         ("#tags".to_string(), "tags".to_string()),
         ("#notes".to_string(), "notes".to_string()),
     ]);
-    let values = HashMap::from([
+    let values = storage_types::AttributeMap::from_iter([
         (
             ":payload".to_string(),
             AttributeValue::S("updated".to_string()),
@@ -206,7 +417,7 @@ fn assert_update_expression_binding_and_condition_cache_allocation_profile() {
         &names,
         &values,
     );
-    alloc_counter::emit_report(&report);
+    let _ = alloc_counter::emit_report(&report);
 
     assert!(report.allocation_count > 0);
 }
@@ -218,10 +429,10 @@ fn assert_response_field_collection_allocation_profile() {
     let legacy_updated = measure_legacy_response_field_string_collection(&operations, true);
     let optimized_updated = measure_optimized_response_field_collection(&operations, true);
 
-    alloc_counter::emit_report(&legacy_default);
-    alloc_counter::emit_report(&optimized_default);
-    alloc_counter::emit_report(&legacy_updated);
-    alloc_counter::emit_report(&optimized_updated);
+    let _ = alloc_counter::emit_report(&legacy_default);
+    let _ = alloc_counter::emit_report(&optimized_default);
+    let _ = alloc_counter::emit_report(&legacy_updated);
+    let _ = alloc_counter::emit_report(&optimized_updated);
 
     assert!(optimized_default.allocation_count < legacy_default.allocation_count);
     assert!(optimized_default.allocated_bytes < legacy_default.allocated_bytes);
@@ -233,8 +444,8 @@ fn assert_arithmetic_bound_operand_construction_allocation_profile() {
     let legacy = measure_legacy_arithmetic_bound_operand_construction();
     let optimized = measure_optimized_arithmetic_bound_operand_construction();
 
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert!(optimized.allocation_count < legacy.allocation_count);
     assert!(optimized.allocated_bytes <= legacy.allocated_bytes);
@@ -360,8 +571,8 @@ fn measure_optimized_response_field_collection(
 fn measure_update_expression_binding_and_condition_cache(
     update_expression: &str,
     condition_expression: Option<&str>,
-    names: &HashMap<String, String>,
-    values: &HashMap<String, AttributeValue>,
+    names: &storage_types::VecMap<String, String>,
+    values: &storage_types::AttributeMap,
 ) -> alloc_counter::AllocationReport<'static> {
     let _ = before_update_item(
         update_expression,
@@ -369,7 +580,7 @@ fn measure_update_expression_binding_and_condition_cache(
         Some(names),
         Some(values),
     )
-    .expect("warm expression caches");
+    .unwrap();
 
     let guard = AllocationGuard::start(
         module_path!(),
@@ -385,7 +596,7 @@ fn measure_update_expression_binding_and_condition_cache(
             Some(names),
             Some(values),
         )
-        .expect("bind update expression");
+        .unwrap();
         std::hint::black_box((operations.len(), condition.is_some()));
     }
     guard.finish()
@@ -419,7 +630,7 @@ fn clone_audit_operations() -> Vec<UpdateOperation> {
 
 #[test]
 fn parse_set_arithmetic_in_first_clause() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":zero".to_string(), AttributeValue::N("0".to_string()));
     values.insert(":inc".to_string(), AttributeValue::N("1".to_string()));
 
@@ -448,7 +659,7 @@ fn parse_set_arithmetic_in_first_clause() {
 
 #[test]
 fn parse_set_arithmetic_in_continuation_clause() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":zero".to_string(), AttributeValue::N("0".to_string()));
     values.insert(":inc".to_string(), AttributeValue::N("2".to_string()));
     values.insert(":name".to_string(), AttributeValue::S("jane".to_string()));
@@ -516,7 +727,7 @@ fn parse_unknown_operation() {
 
 #[test]
 fn parse_attribute_name_not_found() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#name".to_string(), "actual_name".to_string());
 
     let result = parse_update_expression("SET #missing = :val", Some(&names), None);
@@ -531,7 +742,7 @@ fn parse_attribute_name_not_found() {
 
 #[test]
 fn parse_attribute_value_not_found() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val".to_string(), AttributeValue::S("test".to_string()));
 
     let result = parse_update_expression("SET field = :missing", None, Some(&values));
@@ -584,7 +795,7 @@ fn parse_invalid_literal_value() {
 
 #[test]
 fn parse_multiple_set_operations() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val1".to_string(), AttributeValue::S("value1".to_string()));
     values.insert(":val2".to_string(), AttributeValue::N("42".to_string()));
 
@@ -610,10 +821,10 @@ fn parse_multiple_set_operations() {
 
 #[test]
 fn parse_set_with_attribute_names() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#f".to_string(), "field".to_string());
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":v".to_string(), AttributeValue::S("value".to_string()));
 
     let operations = parse_update_expression("SET #f = :v", Some(&names), Some(&values)).unwrap();
@@ -630,7 +841,7 @@ fn parse_set_with_attribute_names() {
 
 #[test]
 fn parse_set_without_spaces_around_equals() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val".to_string(), AttributeValue::S("value".to_string()));
 
     let operations = parse_update_expression("SET field=:val", None, Some(&values)).unwrap();
@@ -647,10 +858,10 @@ fn parse_set_without_spaces_around_equals() {
 
 #[test]
 fn parse_set_with_attribute_names_without_spaces_around_equals() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#f".to_string(), "field".to_string());
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":v".to_string(), AttributeValue::S("value".to_string()));
 
     let operations = parse_update_expression("SET #f=:v", Some(&names), Some(&values)).unwrap();
@@ -667,7 +878,7 @@ fn parse_set_with_attribute_names_without_spaces_around_equals() {
 
 #[test]
 fn parse_set_continuation_without_spaces_around_equals() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val1".to_string(), AttributeValue::S("value1".to_string()));
     values.insert(":val2".to_string(), AttributeValue::S("value2".to_string()));
 
@@ -695,7 +906,7 @@ fn parse_set_continuation_without_spaces_around_equals() {
 
 #[test]
 fn parse_multiple_add_operations() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":num".to_string(), AttributeValue::N("10".to_string()));
     values.insert(":str".to_string(), AttributeValue::S("item".to_string()));
 
@@ -729,7 +940,7 @@ fn apply_add_to_existing_number() {
         value: AttributeValue::N("25".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("score").unwrap(),
@@ -746,7 +957,7 @@ fn apply_add_to_nonexistent_number_initializes_to_zero() {
         value: AttributeValue::N("50".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("score").unwrap(),
@@ -755,14 +966,14 @@ fn apply_add_to_nonexistent_number_initializes_to_zero() {
 }
 
 #[test]
-fn update_refreshes_existing_timestamp_metadata_without_adding_it_to_plain_items() {
+fn given_update_when_plain_item_then_timestamp_metadata_is_not_injected_or_changed() {
     let item = HashMap::from([("payload".to_string(), AttributeValue::S("old".to_string()))]);
     let operations = vec![UpdateOperation::Set {
         field: Arc::from("payload"),
         value: AttributeValue::S("new".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert!(!updated.contains_key(storage_types::single_table_entity::UPDATED_AT_ATTR));
     assert!(!updated.contains_key(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR));
@@ -775,16 +986,58 @@ fn update_refreshes_existing_timestamp_metadata_without_adding_it_to_plain_items
         ),
     ]);
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
-        updated.get(storage_types::single_table_entity::UPDATED_AT_ATTR),
-        None
-    );
-    assert!(matches!(
         updated.get(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR),
-        Some(AttributeValue::N(value)) if value.parse::<i64>().is_ok_and(|value| value > 1)
-    ));
+        Some(&AttributeValue::N("1".to_string()))
+    );
+}
+
+#[test]
+fn given_existing_timestamp_when_unrelated_bound_update_applied_then_timestamp_is_unchanged() {
+    let item = HashMap::from([
+        ("payload".to_string(), AttributeValue::S("old".to_string())),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("100".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ATTR.to_string(),
+            AttributeValue::N("200".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("300".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ATTR.to_string(),
+            AttributeValue::N("400".to_string()),
+        ),
+    ]);
+    let operations = vec![BoundUpdateOperation::Set {
+        field: Arc::from("payload"),
+        value: Cow::Owned(AttributeValue::S("new".to_string())),
+    }];
+
+    let updated = apply_bound_update_operations(item.into(), &operations).unwrap();
+
+    assert_eq!(
+        updated.get(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR),
+        Some(&AttributeValue::N("100".to_string()))
+    );
+    assert_eq!(
+        updated.get(storage_types::single_table_entity::UPDATED_AT_ATTR),
+        Some(&AttributeValue::N("200".to_string()))
+    );
+    assert_eq!(
+        updated.get(storage_types::single_table_entity::CREATED_AT_ALIAS_ATTR),
+        Some(&AttributeValue::N("300".to_string()))
+    );
+    assert_eq!(
+        updated.get(storage_types::single_table_entity::CREATED_AT_ATTR),
+        Some(&AttributeValue::N("400".to_string()))
+    );
 }
 
 #[test]
@@ -801,7 +1054,7 @@ fn update_respects_explicit_updated_at_assignment() {
         value: AttributeValue::N("7".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR),
@@ -818,7 +1071,7 @@ fn apply_add_rejects_invalid_number() {
         value: AttributeValue::N("NaN".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -843,7 +1096,7 @@ fn apply_add_rejects_list_attribute() {
         value: AttributeValue::S("async".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -861,7 +1114,7 @@ fn apply_add_rejects_scalar_operand_for_missing_attribute() {
         value: AttributeValue::S("new_tag".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -883,7 +1136,7 @@ fn apply_add_to_string_set() {
         value: AttributeValue::SS(vec!["programming".to_string(), "rust".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("categories").unwrap() {
         AttributeValue::SS(set) => {
@@ -905,7 +1158,7 @@ fn apply_add_to_missing_string_set_initializes_to_operand() {
         value: AttributeValue::SS(vec!["tech".to_string(), "rust".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("categories").unwrap(),
@@ -926,7 +1179,7 @@ fn apply_add_to_number_set() {
         value: AttributeValue::NS(vec!["95".to_string(), "100".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("scores").unwrap() {
         AttributeValue::NS(set) => {
@@ -949,7 +1202,7 @@ fn apply_add_to_missing_number_set_initializes_to_operand() {
         value: AttributeValue::NS(vec!["95".to_string(), "100".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("scores").unwrap(),
@@ -975,7 +1228,7 @@ fn apply_add_to_binary_set() {
         ]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("data").unwrap() {
         AttributeValue::BS(set) => {
@@ -997,7 +1250,7 @@ fn apply_add_to_missing_binary_set_initializes_to_operand() {
         value: AttributeValue::BS(vec!["BwgJ".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("data").unwrap(),
@@ -1014,7 +1267,7 @@ fn apply_add_rejects_empty_set_operand() {
         value: AttributeValue::SS(vec![]),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -1055,7 +1308,7 @@ fn apply_remove_existing_field() {
         field: Arc::from("age"),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert!(updated.contains_key("name"));
     assert!(!updated.contains_key("age"));
@@ -1071,7 +1324,7 @@ fn apply_remove_nonexistent_field() {
         field: Arc::from("nonexistent"),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert!(updated.contains_key("name"));
     assert!(!updated.contains_key("nonexistent"));
@@ -1081,7 +1334,7 @@ fn apply_remove_nonexistent_field() {
 
 #[test]
 fn parse_delete_operation() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(
         ":val".to_string(),
         AttributeValue::SS(vec!["remove_me".to_string()]),
@@ -1119,7 +1372,7 @@ fn apply_delete_from_string_set() {
         ]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("tags").unwrap() {
         AttributeValue::SS(set) => {
@@ -1145,7 +1398,7 @@ fn apply_delete_removes_attribute_when_string_set_becomes_empty() {
         value: AttributeValue::SS(vec!["remove_me".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert!(!updated.contains_key("tags"));
 }
@@ -1163,7 +1416,7 @@ fn apply_delete_from_number_set() {
         value: AttributeValue::NS(vec!["90".to_string()]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("scores").unwrap() {
         AttributeValue::NS(set) => {
@@ -1195,7 +1448,7 @@ fn apply_delete_from_binary_set() {
         ]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("data").unwrap() {
         AttributeValue::BS(set) => {
@@ -1218,7 +1471,7 @@ fn apply_delete_on_non_set_type_fails() {
         value: AttributeValue::S("John".to_string()),
     }];
 
-    let result = apply_update_operations(item, &operations);
+    let result = apply_update_operations(item.into(), &operations);
     assert!(result.is_err());
     assert!(
         result
@@ -1258,7 +1511,7 @@ fn apply_mixed_operations() {
         },
     ];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
     assert_eq!(
         updated.get("name").unwrap(),
         &AttributeValue::S("Jane".to_string())
@@ -1282,12 +1535,12 @@ fn apply_mixed_operations() {
 
 #[test]
 fn parse_complex_expression_with_all_operations() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#n".to_string(), "name".to_string());
     names.insert("#s".to_string(), "score".to_string());
     names.insert("#t".to_string(), "tags".to_string());
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":name".to_string(), AttributeValue::S("Alice".to_string()));
     values.insert(":points".to_string(), AttributeValue::N("25".to_string()));
     values.insert(
@@ -1354,7 +1607,7 @@ fn parse_empty_expression() {
 
 #[test]
 fn parse_expression_with_whitespace() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val".to_string(), AttributeValue::S("test".to_string()));
 
     let operations =
@@ -1388,7 +1641,7 @@ fn apply_operations_on_empty_item() {
         },
     ];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(updated.len(), 2);
     assert_eq!(
@@ -1416,7 +1669,7 @@ fn apply_add_operations_only_on_empty_item() {
         },
     ];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(updated.len(), 2);
     assert_eq!(
@@ -1497,7 +1750,7 @@ fn apply_add_rejects_incompatible_existing_type() {
         value: AttributeValue::N("5".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -1510,7 +1763,7 @@ fn apply_add_rejects_incompatible_existing_type() {
 
 #[test]
 fn parse_if_not_exists_function() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(
         ":default".to_string(),
         AttributeValue::S("default_value".to_string()),
@@ -1540,7 +1793,7 @@ fn parse_if_not_exists_function() {
 
 #[test]
 fn parse_list_append_function() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(
         ":list1".to_string(),
         AttributeValue::L(vec![AttributeValue::S("a".to_string())]),
@@ -1592,7 +1845,7 @@ fn apply_if_not_exists_when_path_exists() {
         operand: AttributeValue::S("default".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     // Should copy the existing value to the target field
     assert_eq!(
@@ -1611,7 +1864,7 @@ fn apply_if_not_exists_when_path_does_not_exist() {
         operand: AttributeValue::S("default".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     // Should use the default operand
     assert_eq!(
@@ -1636,7 +1889,7 @@ fn apply_list_append_with_lists() {
         ]),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     match updated.get("result").unwrap() {
         AttributeValue::L(list) => {
@@ -1660,7 +1913,7 @@ fn apply_list_append_with_single_values() {
         operand2: AttributeValue::S("value".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
     assert!(
         error
             .to_string()
@@ -1676,7 +1929,7 @@ fn apply_list_append_reads_path_operands_and_allows_if_not_exists() {
         AttributeValue::L(vec![AttributeValue::S("a".to_string())]),
     );
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":empty".to_string(), AttributeValue::L(vec![]));
     values.insert(
         ":tail".to_string(),
@@ -1691,7 +1944,7 @@ fn apply_list_append_reads_path_operands_and_allows_if_not_exists() {
     )
     .unwrap();
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("result").unwrap(),
@@ -1718,12 +1971,12 @@ fn apply_set_and_remove_list_indexes_in_dynamodb_action_order() {
         ]),
     );
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":x".to_string(), AttributeValue::S("X".to_string()));
 
     let operations =
         parse_update_expression("REMOVE l[0] SET l[1] = :x", None, Some(&values)).unwrap();
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("l").unwrap(),
@@ -1746,11 +1999,11 @@ fn apply_set_list_index_past_end_appends_like_dynamodb() {
         ]),
     );
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":z".to_string(), AttributeValue::S("z".to_string()));
 
     let operations = parse_update_expression("SET l[99] = :z", None, Some(&values)).unwrap();
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("l").unwrap(),
@@ -1779,7 +2032,7 @@ fn apply_set_nested_path_rejects_absent_or_wrong_type_parents_like_dynamodb() {
         AttributeValue::L(vec![AttributeValue::S("a".to_string())]),
     );
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":x".to_string(), AttributeValue::S("x".to_string()));
 
     for update_expression in [
@@ -1789,7 +2042,7 @@ fn apply_set_nested_path_rejects_absent_or_wrong_type_parents_like_dynamodb() {
         "SET l[0].child = :x",
     ] {
         let operations = parse_update_expression(update_expression, None, Some(&values)).unwrap();
-        let error = apply_update_operations(item.clone(), &operations).unwrap_err();
+        let error = apply_update_operations(item.clone().into(), &operations).unwrap_err();
         assert_eq!(
             error.to_string(),
             "The document path provided in the update expression is invalid for update"
@@ -1807,16 +2060,14 @@ fn apply_remove_nested_path_rejects_absent_intermediate_parent_like_dynamodb() {
         )])),
     )]);
 
-    let missing_leaf =
-        parse_update_expression("REMOVE m.absent", None, None).expect("missing leaf parses");
+    let missing_leaf = parse_update_expression("REMOVE m.absent", None, None).unwrap();
     assert_eq!(
-        apply_update_operations(item.clone(), &missing_leaf).expect("missing leaf is a no-op"),
-        item
+        apply_update_operations(item.clone().into(), &missing_leaf).unwrap(),
+        AttributeMap::from(&item)
     );
 
-    let missing_parent = parse_update_expression("REMOVE m.absent.child", None, None)
-        .expect("missing parent parses");
-    let error = apply_update_operations(item, &missing_parent).unwrap_err();
+    let missing_parent = parse_update_expression("REMOVE m.absent.child", None, None).unwrap();
+    let error = apply_update_operations(item.into(), &missing_parent).unwrap_err();
     assert_eq!(
         error.to_string(),
         "The document path provided in the update expression is invalid for update"
@@ -1829,13 +2080,13 @@ fn apply_set_arithmetic_rejects_missing_or_wrong_type_operands_like_dynamodb() {
     item.insert("n".to_string(), AttributeValue::N("3".to_string()));
     item.insert("s".to_string(), AttributeValue::S("old".to_string()));
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":inc".to_string(), AttributeValue::N("2".to_string()));
     values.insert(":s".to_string(), AttributeValue::S("x".to_string()));
 
     for update_expression in ["SET n = absentx + :inc", "SET n = n + absentx"] {
         let operations = parse_update_expression(update_expression, None, Some(&values)).unwrap();
-        let error = apply_update_operations(item.clone(), &operations).unwrap_err();
+        let error = apply_update_operations(item.clone().into(), &operations).unwrap_err();
         assert_eq!(
             error.to_string(),
             "The provided expression refers to an attribute that does not exist in the item"
@@ -1844,7 +2095,7 @@ fn apply_set_arithmetic_rejects_missing_or_wrong_type_operands_like_dynamodb() {
 
     for update_expression in ["SET n = n + s", "SET n = n + :s"] {
         let operations = parse_update_expression(update_expression, None, Some(&values)).unwrap();
-        let error = apply_update_operations(item.clone(), &operations).unwrap_err();
+        let error = apply_update_operations(item.clone().into(), &operations).unwrap_err();
         assert_eq!(
             error.to_string(),
             "An operand in the update expression has an incorrect data type"
@@ -1857,12 +2108,12 @@ fn apply_add_runs_after_set_even_when_add_appears_first() {
     let mut item = HashMap::new();
     item.insert("n".to_string(), AttributeValue::N("3".to_string()));
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":inc".to_string(), AttributeValue::N("2".to_string()));
 
     let operations =
         parse_update_expression("ADD n :inc SET snapx = n", None, Some(&values)).unwrap();
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("n").unwrap(),
@@ -1879,7 +2130,7 @@ fn apply_set_arithmetic_supports_reverse_add_and_subtract() {
     let mut item = HashMap::new();
     item.insert("n".to_string(), AttributeValue::N("3".to_string()));
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":inc".to_string(), AttributeValue::N("2".to_string()));
     values.insert(":dec".to_string(), AttributeValue::N("1".to_string()));
 
@@ -1889,7 +2140,7 @@ fn apply_set_arithmetic_supports_reverse_add_and_subtract() {
         Some(&values),
     )
     .unwrap();
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("reverse").unwrap(),
@@ -1943,11 +2194,11 @@ fn apply_set_arithmetic_matches_dynamodb_decimal_number_semantics() {
         let mut item = HashMap::new();
         item.insert("n".to_string(), AttributeValue::N(initial.to_string()));
 
-        let mut values = HashMap::new();
+        let mut values = storage_types::AttributeMap::new();
         values.insert(":v".to_string(), AttributeValue::N(operand.to_string()));
 
         let operations = parse_update_expression(expression, None, Some(&values)).unwrap();
-        let updated = apply_update_operations(item, &operations).unwrap();
+        let updated = apply_update_operations(item.into(), &operations).unwrap();
 
         assert_eq!(
             updated.get("n").unwrap(),
@@ -1978,11 +2229,11 @@ fn apply_set_arithmetic_rejects_dynamodb_number_overflow_and_underflow() {
         let mut item = HashMap::new();
         item.insert("n".to_string(), AttributeValue::N(initial.to_string()));
 
-        let mut values = HashMap::new();
+        let mut values = storage_types::AttributeMap::new();
         values.insert(":v".to_string(), AttributeValue::N(operand.to_string()));
 
         let operations = parse_update_expression("SET n = n + :v", None, Some(&values)).unwrap();
-        let error = apply_update_operations(item, &operations).unwrap_err();
+        let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
         assert_eq!(error.to_string(), expected);
     }
@@ -1990,11 +2241,11 @@ fn apply_set_arithmetic_rejects_dynamodb_number_overflow_and_underflow() {
 
 #[test]
 fn parse_if_not_exists_with_attribute_names() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#p".to_string(), "path_field".to_string());
     names.insert("#t".to_string(), "target_field".to_string());
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":def".to_string(), AttributeValue::S("default".to_string()));
 
     let operations = parse_update_expression(
@@ -2045,7 +2296,7 @@ fn parse_invalid_list_append_wrong_arg_count() {
 
 #[test]
 fn parse_set_operation() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val".to_string(), AttributeValue::S("test".to_string()));
 
     let operations = parse_update_expression("SET field = :val", None, Some(&values)).unwrap();
@@ -2062,7 +2313,7 @@ fn parse_set_operation() {
 
 #[test]
 fn parse_add_operation() {
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":val".to_string(), AttributeValue::N("5".to_string()));
 
     let operations = parse_update_expression("ADD counter :val", None, Some(&values)).unwrap();
@@ -2106,7 +2357,7 @@ fn apply_set_operation() {
         },
     ];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("existing").unwrap(),
@@ -2128,7 +2379,7 @@ fn apply_add_operation_to_number() {
         value: AttributeValue::N("5".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("counter").unwrap(),
@@ -2145,7 +2396,7 @@ fn apply_add_operation_to_nonexistent_number() {
         value: AttributeValue::N("5".to_string()),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert_eq!(
         updated.get("counter").unwrap(),
@@ -2166,7 +2417,7 @@ fn apply_add_operation_to_list_fails() {
         value: AttributeValue::S("item2".to_string()),
     }];
 
-    let error = apply_update_operations(item, &operations).unwrap_err();
+    let error = apply_update_operations(item.into(), &operations).unwrap_err();
 
     assert!(
         error
@@ -2184,170 +2435,18 @@ fn apply_remove_operation() {
         field: Arc::from("field"),
     }];
 
-    let updated = apply_update_operations(item, &operations).unwrap();
+    let updated = apply_update_operations(item.into(), &operations).unwrap();
 
     assert!(!updated.contains_key("field"));
 }
 
 #[test]
-fn resolve_attribute_value_with_expression_attribute_values() {
-    let mut values = HashMap::new();
-    values.insert(
-        ":val1".to_string(),
-        AttributeValue::S("test_string".to_string()),
-    );
-    values.insert(":val2".to_string(), AttributeValue::N("42".to_string()));
-    values.insert(
-        ":val3".to_string(),
-        AttributeValue::L(vec![AttributeValue::S("item".to_string())]),
-    );
-    let result = resolve_attribute_value(":val1", None, Some(&values)).unwrap();
-    assert_eq!(result, Ok(AttributeValue::S("test_string".to_string())));
-    let result = resolve_attribute_value(":val2", None, Some(&values)).unwrap();
-    assert_eq!(result, Ok(AttributeValue::N("42".to_string())));
-    let result = resolve_attribute_value(":val3", None, Some(&values)).unwrap();
-    assert_eq!(
-        result,
-        Ok(AttributeValue::L(vec![AttributeValue::S(
-            "item".to_string()
-        )]))
-    );
-    let result = resolve_attribute_value(":nonexistent", None, Some(&values));
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("not found in ExpressionAttributeValues")
-    );
-}
-
-#[test]
-fn resolve_attribute_value_with_if_not_exists() {
-    let mut values = HashMap::new();
-    values.insert(
-        ":default".to_string(),
-        AttributeValue::S("default_value".to_string()),
-    );
-
-    let result =
-        resolve_attribute_value("if_not_exists(path, :default)", None, Some(&values)).unwrap();
-    match result {
-        Err(SetFunction::IfNotExists { path, operand }) => {
-            assert_eq!(path, "path");
-            assert_eq!(operand, AttributeValue::S("default_value".to_string()));
-        }
-        _ => panic!("Expected IfNotExists function"),
-    }
-}
-
-#[test]
-fn resolve_attribute_value_with_list_append() {
-    let mut values = HashMap::new();
-    values.insert(
-        ":list1".to_string(),
-        AttributeValue::L(vec![AttributeValue::S("a".to_string())]),
-    );
-    values.insert(
-        ":list2".to_string(),
-        AttributeValue::L(vec![AttributeValue::S("b".to_string())]),
-    );
-
-    let result =
-        resolve_attribute_value("list_append(:list1, :list2)", None, Some(&values)).unwrap();
-    match result {
-        Err(SetFunction::ListAppend { operand1, operand2 }) => {
-            assert_eq!(
-                operand1,
-                AttributeValue::L(vec![AttributeValue::S("a".to_string())])
-            );
-            assert_eq!(
-                operand2,
-                AttributeValue::L(vec![AttributeValue::S("b".to_string())])
-            );
-        }
-        _ => panic!("Expected ListAppend function"),
-    }
-}
-
-#[test]
-fn resolve_attribute_value_with_json_literal() {
-    let result = resolve_attribute_value("\"test\"", None, None).unwrap();
-    assert_eq!(result, Ok(AttributeValue::S("test".to_string())));
-    let result = resolve_attribute_value("42", None, None).unwrap();
-    assert_eq!(result, Ok(AttributeValue::N("42".to_string())));
-    let result = resolve_attribute_value("true", None, None).unwrap();
-    assert_eq!(result, Ok(AttributeValue::BOOL(true)));
-}
-
-#[test]
-fn resolve_attribute_value_errors() {
-    let result = resolve_attribute_value("if_not_exists(path)", None, None);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("if_not_exists requires exactly 2 arguments")
-    );
-    let result = resolve_attribute_value("list_append(list1)", None, None);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("list_append requires exactly 2 arguments")
-    );
-    let result = resolve_attribute_value("{\"invalid\": json}", None, None);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid value expression")
-    );
-}
-
-#[test]
-fn operation_splitter_preserves_function_arguments() {
-    let result = split_operations_preserving_functions("SET field1 = :val1, SET field2 = :val2");
-    assert_eq!(result, vec!["SET field1 = :val1", "SET field2 = :val2"]);
-    let result =
-        split_operations_preserving_functions("SET combined = list_append(:list1, :list2)");
-    assert_eq!(result, vec!["SET combined = list_append(:list1, :list2)"]);
-    let result = split_operations_preserving_functions("SET field = if_not_exists(path, :default)");
-    assert_eq!(result, vec!["SET field = if_not_exists(path, :default)"]);
-    let result = split_operations_preserving_functions(
-        "SET field1 = :val1, SET field2 = list_append(:list1, :list2), REMOVE field3",
-    );
-    assert_eq!(
-        result,
-        vec![
-            "SET field1 = :val1",
-            "SET field2 = list_append(:list1, :list2)",
-            "REMOVE field3"
-        ]
-    );
-    let result = split_operations_preserving_functions(
-        "SET result = list_append(if_not_exists(list, :empty), :items)",
-    );
-    assert_eq!(
-        result,
-        vec!["SET result = list_append(if_not_exists(list, :empty), :items)"]
-    );
-    let result = split_operations_preserving_functions("");
-    assert_eq!(result, Vec::<String>::new());
-    let result = split_operations_preserving_functions("SET field = :value");
-    assert_eq!(result, vec!["SET field = :value"]);
-}
-
-#[test]
 fn update_expression_sections_accept_case_and_whitespace_variants() {
-    let mut names = HashMap::new();
+    let mut names = storage_types::VecMap::default();
     names.insert("#result".to_string(), "result".to_string());
     names.insert("#old".to_string(), "old".to_string());
 
-    let mut values = HashMap::new();
+    let mut values = storage_types::AttributeMap::new();
     values.insert(":v".to_string(), AttributeValue::S("written".to_string()));
 
     let operations = parse_update_expression(
@@ -2355,9 +2454,156 @@ fn update_expression_sections_accept_case_and_whitespace_variants() {
         Some(&names),
         Some(&values),
     )
-    .expect("update expression should accept lowercase sections and newline/tab separators");
+    .unwrap();
 
     assert_eq!(operations.len(), 2);
     assert!(matches!(operations[0], UpdateOperation::Set { .. }));
     assert!(matches!(operations[1], UpdateOperation::Remove { .. }));
+}
+
+use super::value::{
+    DynamoDecimal, list_append_owned_values, list_append_values,
+    value_tests::add_with_aligned_scratch,
+};
+
+#[test]
+fn owned_list_append_moves_nested_values_instead_of_cloning_result_items() {
+    let left = nested_list(32, "left");
+    let right = nested_list(32, "right");
+
+    let baseline = measure_list_append_baseline(&left, &right);
+    let current = measure_list_append_current(&left, &right);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&current);
+    assert!(
+        current.allocation_count < baseline.allocation_count,
+        "expected owned list append to allocate less often, baseline={} current={}",
+        baseline.allocation_count,
+        current.allocation_count
+    );
+    assert!(
+        current.allocated_bytes < baseline.allocated_bytes,
+        "expected owned list append to allocate fewer bytes, baseline={} current={}",
+        baseline.allocated_bytes,
+        current.allocated_bytes
+    );
+
+    let expected = list_append_values(&left, &right).unwrap();
+    let actual = list_append_owned_values(left.clone(), right.clone()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+fn nested_list(count: usize, prefix: &str) -> AttributeValue {
+    AttributeValue::L(
+        (0..count)
+            .map(|index| {
+                AttributeValue::M(std::collections::HashMap::from([(
+                    "value".to_string(),
+                    AttributeValue::S(format!("{prefix}-{index}-{}", "x".repeat(64))),
+                )]))
+            })
+            .collect(),
+    )
+}
+
+fn measure_list_append_baseline(
+    left: &AttributeValue,
+    right: &AttributeValue,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "list_append_result_clone_baseline",
+        file!(),
+        line!(),
+        Some("borrowed_operands"),
+    );
+    for _ in 0..64 {
+        let left = left.clone();
+        let right = right.clone();
+        std::hint::black_box(list_append_values(&left, &right).unwrap());
+    }
+    guard.finish()
+}
+
+fn measure_list_append_current(
+    left: &AttributeValue,
+    right: &AttributeValue,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "list_append_owned_result_move_optimized",
+        file!(),
+        line!(),
+        Some("owned_operands"),
+    );
+    for _ in 0..64 {
+        let left = left.clone();
+        let right = right.clone();
+        std::hint::black_box(list_append_owned_values(left, right).unwrap());
+    }
+    guard.finish()
+}
+
+#[test]
+fn decimal_alignment_fixture_preserves_output_with_fewer_scratch_allocations() {
+    let lhs = DynamoDecimal::parse("12345678901234567890.123456").unwrap();
+    let rhs = DynamoDecimal::parse("9876543210.987654").unwrap();
+    let baseline = measure_decimal_add_baseline(&lhs, &rhs);
+    let current = measure_decimal_add_current(&lhs, &rhs);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&current);
+
+    assert!(
+        current.allocation_count < baseline.allocation_count,
+        "expected virtual decimal alignment to allocate less often, baseline={} current={}",
+        baseline.allocation_count,
+        current.allocation_count
+    );
+    assert!(
+        current.allocated_bytes < baseline.allocated_bytes,
+        "expected virtual decimal alignment to allocate fewer bytes, baseline={} current={}",
+        baseline.allocated_bytes,
+        current.allocated_bytes
+    );
+
+    let expected = add_with_aligned_scratch(&lhs, &rhs)
+        .unwrap()
+        .format()
+        .unwrap();
+    let actual = lhs.add(&rhs).unwrap().format().unwrap();
+    assert_eq!(actual, expected);
+}
+
+fn measure_decimal_add_baseline(
+    lhs: &DynamoDecimal,
+    rhs: &DynamoDecimal,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "decimal_add_aligned_scratch_baseline",
+        file!(),
+        line!(),
+        Some("aligned_digit_vectors"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(add_with_aligned_scratch(lhs, rhs).unwrap());
+    }
+    guard.finish()
+}
+
+fn measure_decimal_add_current(
+    lhs: &DynamoDecimal,
+    rhs: &DynamoDecimal,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "decimal_add_virtual_alignment_optimized",
+        file!(),
+        line!(),
+        Some("virtual_padding"),
+    );
+    for _ in 0..256 {
+        std::hint::black_box(lhs.add(rhs).unwrap());
+    }
+    guard.finish()
 }

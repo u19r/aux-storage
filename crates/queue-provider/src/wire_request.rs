@@ -4,8 +4,9 @@ use serde::de::DeserializeOwned;
 use crate::{
     ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
     DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
-    GetQueueUrlRequest, ListQueuesRequest, PurgeQueueRequest, QueueRequestValidation, QueueResult,
+    GetQueueUrlRequest, ListQueuesRequest, PublishMessageRequest, PurgeQueueRequest, QueueResult,
     ReceiveMessageRequest, SendMessageBatchRequest, SendMessageRequest, SetQueueAttributesRequest,
+    request_validation::QueueRequestValidation,
 };
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ pub enum QueueAction {
     SetQueueAttributes,
     PurgeQueue,
     SendMessage,
+    PublishMessage,
     SendMessageBatch,
     ReceiveMessage,
     DeleteMessage,
@@ -82,6 +84,7 @@ impl QueueAction {
             "SetQueueAttributes" => Some(Self::SetQueueAttributes),
             "PurgeQueue" => Some(Self::PurgeQueue),
             "SendMessage" => Some(Self::SendMessage),
+            "PublishMessage" => Some(Self::PublishMessage),
             "SendMessageBatch" => Some(Self::SendMessageBatch),
             "ReceiveMessage" => Some(Self::ReceiveMessage),
             "DeleteMessage" => Some(Self::DeleteMessage),
@@ -103,6 +106,7 @@ impl QueueAction {
             Self::SetQueueAttributes => "SetQueueAttributes",
             Self::PurgeQueue => "PurgeQueue",
             Self::SendMessage => "SendMessage",
+            Self::PublishMessage => "PublishMessage",
             Self::SendMessageBatch => "SendMessageBatch",
             Self::ReceiveMessage => "ReceiveMessage",
             Self::DeleteMessage => "DeleteMessage",
@@ -123,6 +127,7 @@ pub enum QueueRequest {
     SetQueueAttributes(ValidatedQueueRequest<SetQueueAttributesRequest>),
     PurgeQueue(ValidatedQueueRequest<PurgeQueueRequest>),
     SendMessage(ValidatedQueueRequest<SendMessageRequest>),
+    PublishMessage(ValidatedQueueRequest<PublishMessageRequest>),
     SendMessageBatch(ValidatedQueueRequest<SendMessageBatchRequest>),
     ReceiveMessage(ValidatedQueueRequest<ReceiveMessageRequest>),
     DeleteMessage(ValidatedQueueRequest<DeleteMessageRequest>),
@@ -143,6 +148,7 @@ impl QueueRequest {
             Self::SetQueueAttributes(_) => QueueAction::SetQueueAttributes,
             Self::PurgeQueue(_) => QueueAction::PurgeQueue,
             Self::SendMessage(_) => QueueAction::SendMessage,
+            Self::PublishMessage(_) => QueueAction::PublishMessage,
             Self::SendMessageBatch(_) => QueueAction::SendMessageBatch,
             Self::ReceiveMessage(_) => QueueAction::ReceiveMessage,
             Self::DeleteMessage(_) => QueueAction::DeleteMessage,
@@ -173,6 +179,7 @@ pub fn decode_json_request(action: QueueAction, body: &[u8]) -> Result<QueueRequ
         }
         QueueAction::PurgeQueue => decode!(PurgeQueueRequest, PurgeQueue),
         QueueAction::SendMessage => decode!(SendMessageRequest, SendMessage),
+        QueueAction::PublishMessage => decode!(PublishMessageRequest, PublishMessage),
         QueueAction::SendMessageBatch => decode!(SendMessageBatchRequest, SendMessageBatch),
         QueueAction::ReceiveMessage => decode!(ReceiveMessageRequest, ReceiveMessage),
         QueueAction::DeleteMessage => decode!(DeleteMessageRequest, DeleteMessage),
@@ -210,6 +217,7 @@ pub fn decode_value_request(
         QueueAction::SetQueueAttributes => decode!(SetQueueAttributesRequest, SetQueueAttributes),
         QueueAction::PurgeQueue => decode!(PurgeQueueRequest, PurgeQueue),
         QueueAction::SendMessage => decode!(SendMessageRequest, SendMessage),
+        QueueAction::PublishMessage => decode!(PublishMessageRequest, PublishMessage),
         QueueAction::SendMessageBatch => decode!(SendMessageBatchRequest, SendMessageBatch),
         QueueAction::ReceiveMessage => decode!(ReceiveMessageRequest, ReceiveMessage),
         QueueAction::DeleteMessage => decode!(DeleteMessageRequest, DeleteMessage),

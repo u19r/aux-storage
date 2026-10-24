@@ -2,9 +2,27 @@ use config::DEFAULT_STORAGE_SQLITE_DB_PATH;
 use queue::QueueBackend;
 
 use crate::{
-    Args, QueueStorageArg, add_common_headers, queue_config_from_args, queue_config_overrides,
-    queue_url,
+    app::{
+        Args, QueueStorageArg, load_queue_config_from_args, provider_queue_config_from_backends,
+        queue_config_overrides, queue_url,
+    },
+    protocol::add_common_headers,
 };
+
+fn queue_config_from_args(args: &Args) -> Result<queue_provider::QueueConfig, std::io::Error> {
+    if args
+        .storage
+        .as_ref()
+        .is_some_and(|storage| matches!(storage, QueueStorageArg::Postgres))
+        && args.postgres_dsn.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(std::io::Error::other(
+            "--postgres-dsn is required when --storage postgres",
+        ));
+    }
+    let config = load_queue_config_from_args(args)?;
+    provider_queue_config_from_backends(&config.root.features.backends)
+}
 
 fn base_args(storage: QueueStorageArg) -> Args {
     Args {

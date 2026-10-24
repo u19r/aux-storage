@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::constants::KEY_VALIDATION_MAX_SEGMENT_BYTES;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KeyValidationError {
     #[error("Key empty.")]
@@ -16,13 +18,11 @@ pub fn validate_key_segment(seg: &str) -> Result<(), KeyValidationError> {
     if seg.is_empty() {
         return Err(KeyValidationError::Empty);
     }
-    #[expect(
-        clippy::items_after_statements,
-        reason = "Constant defined close to usage for clarity; acceptable here."
-    )]
-    const MAX: usize = 512; // conservative upper bound
-    if seg.len() > MAX {
-        return Err(KeyValidationError::TooLong(seg.len(), MAX));
+    if seg.len() > KEY_VALIDATION_MAX_SEGMENT_BYTES {
+        return Err(KeyValidationError::TooLong(
+            seg.len(),
+            KEY_VALIDATION_MAX_SEGMENT_BYTES,
+        ));
     }
     if seg.contains('#') {
         return Err(KeyValidationError::ForbiddenChar);

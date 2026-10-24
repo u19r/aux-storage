@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use alloc_counter::AllocationGuard;
 use serde::{Deserialize, Serialize};
 
 use crate::{AttributeValue, from_hashmap, to_hashmap};
@@ -203,4 +204,145 @@ fn from_hashmap_decodes_numeric_timestamps_for_datetime_fields() {
             },
         }
     );
+}
+
+#[test]
+fn consuming_attribute_value_conversion_matches_borrowed_conversion() {
+    let mut nested = HashMap::new();
+    nested.insert("number".to_string(), AttributeValue::N("1150".to_string()));
+    nested.insert(
+        "fallback".to_string(),
+        AttributeValue::N("1e-130".to_string()),
+    );
+    nested.insert("binary".to_string(), AttributeValue::B("AQI=".to_string()));
+    let value = AttributeValue::M(nested);
+
+    let expected = value.to_json_value().expect("borrowed conversion");
+    let actual = value.into_json_value().expect("consuming conversion");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn consuming_attribute_value_conversion_preserves_null_error() {
+    let borrowed = AttributeValue::NULL(false).to_json_value();
+    let consuming = AttributeValue::NULL(false).into_json_value();
+
+    assert!(matches!(
+        borrowed,
+        Err(crate::ConversionError::UnsupportedType(message)) if message == "NULL(false)"
+    ));
+    assert!(matches!(
+        consuming,
+        Err(crate::ConversionError::UnsupportedType(message)) if message == "NULL(false)"
+    ));
+}
+
+fn canonical_map_fixture(width: usize) -> HashMap<String, AttributeValue> {
+    (0..width)
+        .map(|index| {
+            let name = match index {
+                0 => "field-雪".to_string(),
+                1 => "field-quote\n".to_string(),
+                _ => format!("field-{:03}", width.saturating_sub(index)),
+            };
+            let value = match index % 10 {
+                0 => AttributeValue::S(format!("text-{index}")),
+                1 => AttributeValue::N(if index == 1 {
+                    "1e-130".to_string()
+                } else if index == 11 {
+                    "not-a-number".to_string()
+                } else {
+                    (index * 17).to_string()
+                }),
+                2 => AttributeValue::B("AQID".to_string()),
+                3 => AttributeValue::SS(vec!["alpha".to_string(), "βeta".to_string()]),
+                4 => AttributeValue::NS(vec!["1".to_string(), "2.5".to_string()]),
+                5 => AttributeValue::BS(vec!["AQI=".to_string(), "AwQ=".to_string()]),
+                6 => AttributeValue::BOOL(index % 2 == 0),
+                7 => AttributeValue::NULL(true),
+                8 => AttributeValue::L(vec![
+                    AttributeValue::S("nested".to_string()),
+                    AttributeValue::N("1e-130".to_string()),
+                ]),
+                9 => AttributeValue::M(HashMap::from([
+                    ("zeta".to_string(), AttributeValue::S("last".to_string())),
+                    (
+                        "alpha".to_string(),
+                        AttributeValue::N("not-a-number".to_string()),
+                    ),
+                ])),
+                _ => unreachable!(),
+            };
+            (name, value)
+        })
+        .collect()
+}
+
+fn legacy_canonical_map_json(map: &HashMap<String, AttributeValue>) -> Result<String, String> {
+    let ordered = map
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&ordered).map_err(|error| error.to_string())
+}
+
+fn current_canonical_map_json(map: &HashMap<String, AttributeValue>) -> String {
+    crate::canonical_dynamo_map_json(map).expect("canonical map should serialize")
+}
+
+#[test]
+fn canonical_dynamo_map_borrowed_entries_preserve_bytes_for_supported_shapes() {
+    for width in [0, 1, 10, 100] {
+        let map = canonical_map_fixture(width);
+        let expected = legacy_canonical_map_json(&map);
+        let actual = crate::canonical_dynamo_map_json(&map).map_err(|error| error.to_string());
+        assert_eq!(actual, expected, "attribute width {width}");
+    }
+}
+
+fn measure_canonical_map_allocations(
+    label: &'static str,
+    map: &HashMap<String, AttributeValue>,
+    encode: fn(&HashMap<String, AttributeValue>) -> String,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "canonical_dynamo_map_allocation_profile",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..128 {
+        std::hint::black_box(encode(std::hint::black_box(map)));
+    }
+    guard.finish()
+}
+
+#[test]
+#[ignore = "manual paired allocation probe; run in an isolated process"]
+fn canonical_dynamo_map_borrowed_entries_allocation_profile() {
+    for width in [1, 10, 100] {
+        let map = canonical_map_fixture(width);
+        let legacy = measure_canonical_map_allocations("legacy_clone_btree", &map, |map| {
+            legacy_canonical_map_json(map).expect("legacy map should serialize")
+        });
+        let current = measure_canonical_map_allocations(
+            "borrowed_sorted_entries",
+            &map,
+            current_canonical_map_json,
+        );
+        let _ = alloc_counter::emit_report(&legacy);
+        let _ = alloc_counter::emit_report(&current);
+        println!(
+            "canonical_dynamo_map width={width} legacy_allocations={} current_allocations={} \
+             legacy_bytes={} current_bytes={}",
+            legacy.allocation_count / 128,
+            current.allocation_count / 128,
+            legacy.allocated_bytes / 128,
+            current.allocated_bytes / 128,
+        );
+        assert!(current.allocation_count < legacy.allocation_count);
+        assert!(current.allocated_bytes < legacy.allocated_bytes);
+    }
 }

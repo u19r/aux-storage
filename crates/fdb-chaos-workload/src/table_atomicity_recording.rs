@@ -1,6 +1,26 @@
 use crate::{imports::*, table_atomicity::*};
 
 impl TableAtomicityWorkload {
+    pub(crate) fn trace_check_progress(
+        &self,
+        stage: &'static str,
+        event: &'static str,
+        ordinal: u64,
+    ) {
+        self.context.trace(
+            Severity::Info,
+            "AuxStorageFdbChaosTableAtomicityCheckProgress",
+            details![
+                "Layer" => "aux-storage",
+                "Workload" => &self.name,
+                "Stage" => stage,
+                "Event" => event,
+                "Ordinal" => ordinal,
+                "ClientId" => self.client_id,
+            ],
+        );
+    }
+
     pub(crate) fn trace_phase(&self, phase: &'static str) {
         self.context.trace(
             Severity::Info,

@@ -4,24 +4,27 @@ use std::{
     sync::{Arc, OnceLock, RwLock},
 };
 
-use storage_condition::{Condition, parse_condition_expression};
+use storage_condition::{Condition, parse_condition_expression_typed};
 use storage_types::{
-    AttributeValue, StorageError, StorageResult, TimestampMillis,
+    AttributeMap, AttributeValue, StorageError, StorageResult,
     subset_expression_attribute_values_for_expression,
 };
 
 #[allow(unused_imports)]
 pub use crate::update_logic::value::{ArithmeticOperator, UpdateOperand};
-use crate::update_logic::{
-    path::{
-        get_attribute_value, remove_attribute_value, resolve_document_path, set_attribute_value,
-    },
-    value::{
-        BoundUpdateOperand, SetFunctionPlan, UpdateValuePlan, add_add_expression_numbers,
-        bind_borrowed_scalar_update_value_plan, bind_borrowed_update_value_plan,
-        bind_scalar_update_value_plan, bind_update_value_plan, evaluate_bound_set_arithmetic,
-        evaluate_bound_update_operand, evaluate_update_operand, list_append_values,
-        resolve_attribute_value_plan, validate_add_number,
+use crate::{
+    constants::UPDATE_SECTION_KEYWORDS,
+    update_logic::{
+        path::{
+            get_attribute_value, remove_attribute_value, resolve_document_path, set_attribute_value,
+        },
+        value::{
+            BoundUpdateOperand, SetFunctionPlan, UpdateValuePlan, add_add_expression_with_rhs,
+            bind_borrowed_scalar_update_value_plan, bind_borrowed_update_value_plan,
+            bind_scalar_update_value_plan, bind_update_value_plan, evaluate_bound_set_arithmetic,
+            evaluate_bound_update_operand, evaluate_update_operand, list_append_values,
+            parse_add_number, resolve_attribute_value_plan, validate_add_number,
+        },
     },
 };
 
@@ -143,16 +146,6 @@ impl BoundUpdateOperation<'_> {
     }
 }
 
-/// Split update expression by commas, but preserve commas inside function calls
-#[must_use]
-pub fn split_operations_preserving_functions(expression: &str) -> Vec<String> {
-    let normalized = normalize_update_section_keywords(expression);
-    split_operation_parts_preserving_functions(&normalized)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
 fn split_operation_parts_preserving_functions(expression: &str) -> Vec<&str> {
     let mut parts = Vec::with_capacity(4);
     let mut current_start = 0;
@@ -212,8 +205,8 @@ fn split_operation_parts_preserving_functions(expression: &str) -> Vec<&str> {
 /// Parse an update expression into individual operations
 pub fn parse_update_expression(
     update_expression: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
+    expression_attribute_values: Option<&storage_types::AttributeMap>,
 ) -> StorageResult<Vec<UpdateOperation>> {
     let plan = cached_update_expression_plan(update_expression, expression_attribute_names)?;
     bind_update_expression_plan(&plan, expression_attribute_values)
@@ -246,7 +239,7 @@ enum UpdateOperationPlan {
 
 fn cached_update_expression_plan(
     update_expression: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<Arc<Vec<UpdateOperationPlan>>> {
     static UPDATE_EXPRESSION_PLAN_CACHE: OnceLock<
         RwLock<HashMap<String, Vec<CachedUpdateExpressionPlan>>>,
@@ -282,7 +275,7 @@ fn cached_update_expression_plan(
 }
 
 fn attribute_names_match(
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
     cached_names: &[(String, String)],
 ) -> bool {
     let Some(names) = expression_attribute_names else {
@@ -296,7 +289,7 @@ fn attribute_names_match(
 
 fn parse_update_expression_plan(
     update_expression: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<Vec<UpdateOperationPlan>> {
     let normalized_expression = normalize_update_section_keywords(update_expression);
     let parts = split_operation_parts_preserving_functions(&normalized_expression);
@@ -381,14 +374,15 @@ fn parse_update_expression_plan(
         }
         // Check if this looks like a valid operation continuation or an unknown operation
         else {
-            // If it doesn't start with a known operation keyword, check if it could be a
-            // continuation
+            // If it doesn't start with a known operation keyword, check if it
+            // could be a continuation
             let could_be_continuation = (part.contains('=') && split_assignment(part).is_some()) || // SET-like
                                            (part.contains(' ') && !part.contains('=') && part.split_once(' ').is_some()) || // ADD-like
                                            (!part.contains(' ') && !part.contains('=')); // REMOVE-like
 
             if could_be_continuation && operations.is_empty() {
-                // If we have no previous operations, this is likely an unknown operation
+                // If we have no previous operations, this is likely an unknown
+                // operation
                 return Err(StorageError::validation(format!(
                     "Unknown update operation: {part}"
                 )));
@@ -456,7 +450,7 @@ fn parse_update_expression_plan(
 
 fn bind_update_expression_plan(
     plan: &[UpdateOperationPlan],
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<&storage_types::AttributeMap>,
 ) -> StorageResult<Vec<UpdateOperation>> {
     let mut operations = Vec::with_capacity(plan.len());
     for operation in plan {
@@ -482,19 +476,21 @@ fn bind_update_expression_plan(
                         }
                     }
                     UpdateOperand::ListAppend { operand1, operand2 } => {
-                        if let (UpdateOperand::Value(operand1), UpdateOperand::Value(operand2)) =
-                            (&*operand1, &*operand2)
-                        {
-                            UpdateOperation::SetListAppend {
-                                field: Arc::clone(field),
-                                operand1: operand1.clone(),
-                                operand2: operand2.clone(),
+                        match (*operand1, *operand2) {
+                            (UpdateOperand::Value(operand1), UpdateOperand::Value(operand2)) => {
+                                UpdateOperation::SetListAppend {
+                                    field: Arc::clone(field),
+                                    operand1,
+                                    operand2,
+                                }
                             }
-                        } else {
-                            UpdateOperation::SetExpression {
+                            (operand1, operand2) => UpdateOperation::SetExpression {
                                 field: Arc::clone(field),
-                                value: UpdateOperand::ListAppend { operand1, operand2 },
-                            }
+                                value: UpdateOperand::ListAppend {
+                                    operand1: Box::new(operand1),
+                                    operand2: Box::new(operand2),
+                                },
+                            },
                         }
                     }
                     value => UpdateOperation::SetExpression {
@@ -522,7 +518,7 @@ fn bind_update_expression_plan(
 
 fn bind_borrowed_update_expression_plan<'a>(
     plan: &[UpdateOperationPlan],
-    expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<&'a storage_types::AttributeMap>,
 ) -> StorageResult<Vec<BoundUpdateOperation<'a>>> {
     let mut operations = Vec::with_capacity(plan.len());
     for operation in plan {
@@ -594,21 +590,22 @@ fn bind_borrowed_update_expression_plan<'a>(
                         }
                     }
                     BoundUpdateOperand::ListAppend { operand1, operand2 } => {
-                        if let (
-                            BoundUpdateOperand::Value(operand1),
-                            BoundUpdateOperand::Value(operand2),
-                        ) = (&*operand1, &*operand2)
-                        {
-                            BoundUpdateOperation::SetListAppend {
+                        match (*operand1, *operand2) {
+                            (
+                                BoundUpdateOperand::Value(operand1),
+                                BoundUpdateOperand::Value(operand2),
+                            ) => BoundUpdateOperation::SetListAppend {
                                 field: Arc::clone(field),
-                                operand1: operand1.clone(),
-                                operand2: operand2.clone(),
-                            }
-                        } else {
-                            BoundUpdateOperation::SetExpression {
+                                operand1,
+                                operand2,
+                            },
+                            (operand1, operand2) => BoundUpdateOperation::SetExpression {
                                 field: Arc::clone(field),
-                                value: BoundUpdateOperand::ListAppend { operand1, operand2 },
-                            }
+                                value: BoundUpdateOperand::ListAppend {
+                                    operand1: Box::new(operand1),
+                                    operand2: Box::new(operand2),
+                                },
+                            },
                         }
                     }
                     value => BoundUpdateOperation::SetExpression {
@@ -638,7 +635,7 @@ fn push_set_operation_plan(
     operations: &mut Vec<UpdateOperationPlan>,
     field: &str,
     value_expr: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<()> {
     let field = Arc::from(resolve_attribute_name(field, expression_attribute_names)?);
     match resolve_attribute_value_plan(value_expr, expression_attribute_names)? {
@@ -747,13 +744,6 @@ fn update_section_keyword_at(expression: &str, index: usize) -> Option<(&'static
 }
 
 fn split_keyword(bytes: &[u8]) -> Option<(&'static str, usize)> {
-    const UPDATE_SECTION_KEYWORDS: [(&[u8], &str); 4] = [
-        (b" SET ", "SET "),
-        (b" REMOVE ", "REMOVE "),
-        (b" ADD ", "ADD "),
-        (b" DELETE ", "DELETE "),
-    ];
-
     for (pattern, keyword) in UPDATE_SECTION_KEYWORDS {
         if bytes.starts_with(pattern) {
             return Some((keyword, pattern.len()));
@@ -763,12 +753,12 @@ fn split_keyword(bytes: &[u8]) -> Option<(&'static str, usize)> {
 }
 
 fn sorted_attribute_names(
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> Vec<(String, String)> {
     let mut names = expression_attribute_names
         .into_iter()
-        .flat_map(HashMap::iter)
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .flat_map(|names| names.iter())
+        .map(|(key, value)| (key.to_string(), value.clone()))
         .collect::<Vec<_>>();
     names.sort();
     names
@@ -777,162 +767,16 @@ fn sorted_attribute_names(
 /// Resolve attribute name from expression attribute names
 fn resolve_attribute_name(
     name: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<String> {
     resolve_document_path(name, expression_attribute_names)
 }
 
-/// Represents a parsed function call in SET expressions
-#[derive(Debug, Clone, PartialEq)]
-pub enum SetFunction {
-    IfNotExists {
-        path: String,
-        operand: AttributeValue,
-    },
-    ListAppend {
-        operand1: AttributeValue,
-        operand2: AttributeValue,
-    },
-}
-
-/// Resolve attribute value from expression attribute values, handling function
-/// calls
-pub fn resolve_attribute_value(
-    value_expr: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
-) -> StorageResult<Result<AttributeValue, SetFunction>> {
-    // First, check if it's a reference to ExpressionAttributeValues
-    if value_expr.starts_with(':') {
-        if let Some(values) = expression_attribute_values {
-            if let Some(value) = values.get(value_expr) {
-                Ok(Ok(value.clone()))
-            } else {
-                Err(StorageError::validation(format!(
-                    "Attribute value {value_expr} not found in ExpressionAttributeValues"
-                )))
-            }
-        } else {
-            Err(StorageError::validation(format!(
-                "Attribute value {value_expr} requires ExpressionAttributeValues"
-            )))
-        }
-    } else if let Some(inner) = value_expr
-        .strip_prefix("if_not_exists(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let (path_part, operand_part) = inner
-            .split_once(',')
-            .map(|(a, b)| (a.trim(), b.trim()))
-            .ok_or_else(|| {
-                StorageError::validation(format!(
-                    "if_not_exists requires exactly 2 arguments: {value_expr}"
-                ))
-            })?;
-
-        let path = resolve_attribute_name(path_part, expression_attribute_names)?;
-        let Ok(operand) = resolve_attribute_value(
-            operand_part,
-            expression_attribute_names,
-            expression_attribute_values,
-        )?
-        else {
-            return Err(StorageError::validation(format!(
-                "if_not_exists operand cannot be a function call: {value_expr}"
-            )));
-        };
-
-        Ok(Err(SetFunction::IfNotExists { path, operand }))
-    } else if let Some(inner) = value_expr
-        .strip_prefix("list_append(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let (op1_part, op2_part) = inner
-            .split_once(',')
-            .map(|(a, b)| (a.trim(), b.trim()))
-            .ok_or_else(|| {
-                StorageError::validation(format!(
-                    "list_append requires exactly 2 arguments: {value_expr}"
-                ))
-            })?;
-
-        let Ok(operand1) = resolve_attribute_value(
-            op1_part,
-            expression_attribute_names,
-            expression_attribute_values,
-        )?
-        else {
-            return Err(StorageError::validation(format!(
-                "list_append operand1 cannot be a function call: {value_expr}"
-            )));
-        };
-
-        let Ok(operand2) = resolve_attribute_value(
-            op2_part,
-            expression_attribute_names,
-            expression_attribute_values,
-        )?
-        else {
-            return Err(StorageError::validation(format!(
-                "list_append operand2 cannot be a function call: {value_expr}"
-            )));
-        };
-
-        Ok(Err(SetFunction::ListAppend { operand1, operand2 }))
-    } else {
-        // Try to parse as JSON literal value
-        match serde_json::from_str::<serde_json::Value>(value_expr) {
-            Ok(json_value) => {
-                // Convert JSON value to AttributeValue
-                match json_value {
-                    serde_json::Value::String(s) => Ok(Ok(AttributeValue::S(s))),
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            Ok(Ok(AttributeValue::N(i.to_string())))
-                        } else if let Some(f) = n.as_f64() {
-                            Ok(Ok(AttributeValue::N(f.to_string())))
-                        } else {
-                            Err(StorageError::validation(format!("Invalid number: {n}")))
-                        }
-                    }
-                    serde_json::Value::Bool(b) => Ok(Ok(AttributeValue::BOOL(b))),
-                    _ => Err(StorageError::validation(format!(
-                        "Unsupported literal value: {value_expr}"
-                    ))),
-                }
-            }
-            Err(_) => {
-                // If JSON parsing fails, check if we have ExpressionAttributeValues
-                if let Some(values) = expression_attribute_values {
-                    if let Some(value) = values.get(value_expr) {
-                        Ok(Ok(value.clone()))
-                    } else {
-                        Err(StorageError::validation(format!(
-                            "Invalid value expression: {value_expr}"
-                        )))
-                    }
-                } else {
-                    Err(StorageError::validation(format!(
-                        "Invalid value expression: {value_expr}"
-                    )))
-                }
-            }
-        }
-    }
-}
-
 /// Apply update operations to an item
 pub fn apply_update_operations(
-    mut item: HashMap<String, AttributeValue>,
+    mut item: AttributeMap,
     operations: &[UpdateOperation],
-) -> StorageResult<HashMap<String, AttributeValue>> {
-    let timestamp_attr = existing_updated_at_attr(&item);
-    let touches_updated_at = if timestamp_attr.is_some() {
-        operations.iter().any(update_operation_touches_updated_at)
-    } else {
-        false
-    };
-
+) -> StorageResult<AttributeMap> {
     for operation in operations {
         match operation {
             UpdateOperation::Set { field, value } => {
@@ -979,25 +823,14 @@ pub fn apply_update_operations(
 
     for operation in operations {
         if let UpdateOperation::Delete { field, value } = operation {
-            let Some(existing_value) = item.get_mut(field.as_ref()) else {
+            let Some(mut existing_value) = item.remove(field.as_ref()) else {
                 continue;
             };
-            let remove_attribute = apply_delete_set_operation(existing_value, value, field)?;
-            if remove_attribute {
-                item.remove(field.as_ref());
+            let remove_attribute = apply_delete_set_operation(&mut existing_value, value, field)?;
+            if !remove_attribute {
+                item.insert(field.to_string(), existing_value);
             }
         }
-    }
-
-    if let Some(timestamp_attr) = timestamp_attr
-        && !touches_updated_at
-    {
-        item.remove(storage_types::single_table_entity::UPDATED_AT_ATTR);
-        item.remove(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR);
-        item.insert(
-            timestamp_attr.to_string(),
-            AttributeValue::N(TimestampMillis::now().timestamp_millis().to_string()),
-        );
     }
 
     Ok(item)
@@ -1005,20 +838,10 @@ pub fn apply_update_operations(
 
 /// Apply bound update operations that may borrow request attribute values.
 pub fn apply_bound_update_operations(
-    mut item: HashMap<String, AttributeValue>,
+    item: AttributeMap,
     operations: &[BoundUpdateOperation<'_>],
-) -> StorageResult<HashMap<String, AttributeValue>> {
-    let timestamp_attr = existing_updated_at_attr(&item);
-    let touches_updated_at = if timestamp_attr.is_some() {
-        {
-            operations
-                .iter()
-                .any(bound_update_operation_touches_updated_at)
-        }
-    } else {
-        false
-    };
-
+) -> StorageResult<AttributeMap> {
+    let mut item = item;
     for operation in operations {
         match operation {
             BoundUpdateOperation::Set { field, value } => {
@@ -1074,70 +897,32 @@ pub fn apply_bound_update_operations(
 
     for operation in operations {
         if let BoundUpdateOperation::Delete { field, value } = operation {
-            let Some(existing_value) = item.get_mut(field.as_ref()) else {
+            let Some(mut existing_value) = item.remove(field.as_ref()) else {
                 continue;
             };
             let remove_attribute =
-                apply_delete_set_operation(existing_value, value.as_ref(), field)?;
-            if remove_attribute {
-                item.remove(field.as_ref());
+                apply_delete_set_operation(&mut existing_value, value.as_ref(), field)?;
+            if !remove_attribute {
+                item.insert(field.to_string(), existing_value);
             }
         }
-    }
-
-    if let Some(timestamp_attr) = timestamp_attr
-        && !touches_updated_at
-    {
-        item.remove(storage_types::single_table_entity::UPDATED_AT_ATTR);
-        item.remove(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR);
-        item.insert(
-            timestamp_attr.to_string(),
-            AttributeValue::N(TimestampMillis::now().timestamp_millis().to_string()),
-        );
     }
 
     Ok(item)
 }
 
-fn existing_updated_at_attr(item: &HashMap<String, AttributeValue>) -> Option<&'static str> {
-    if item.contains_key(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR) {
-        return Some(storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR);
-    }
-    item.contains_key(storage_types::single_table_entity::UPDATED_AT_ATTR)
-        .then_some(storage_types::single_table_entity::UPDATED_AT_ATTR)
-}
-
-fn update_operation_touches_updated_at(operation: &UpdateOperation) -> bool {
-    match operation {
-        UpdateOperation::Set { field, .. }
-        | UpdateOperation::SetExpression { field, .. }
-        | UpdateOperation::SetIfNotExists { field, .. }
-        | UpdateOperation::SetListAppend { field, .. }
-        | UpdateOperation::Add { field, .. }
-        | UpdateOperation::Remove { field }
-        | UpdateOperation::Delete { field, .. } => field_touches_updated_at(field),
-    }
-}
-
-fn bound_update_operation_touches_updated_at(operation: &BoundUpdateOperation<'_>) -> bool {
-    field_touches_updated_at(operation.field_name())
-}
-
-fn field_touches_updated_at(field: &str) -> bool {
-    let root = field
-        .split_once(['.', '['])
-        .map_or(field, |(root, _)| root)
-        .trim();
-    root == storage_types::single_table_entity::UPDATED_AT_ATTR
-        || root == storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR
-}
-
 fn apply_add_operation(
-    item: &mut HashMap<String, AttributeValue>,
+    item: &mut AttributeMap,
     field: &str,
     value: &AttributeValue,
 ) -> StorageResult<()> {
-    validate_add_operand(field, value)?;
+    // Validate the operand before touching state so malformed numbers fail
+    // even when the target attribute is absent.
+    if let AttributeValue::N(number) = value {
+        parse_add_number(field, number)?;
+    } else {
+        validate_add_operand(field, value)?;
+    }
 
     let Some(existing_value) = get_attribute_value(item, field) else {
         if update_field_is_top_level(field) {
@@ -1150,7 +935,8 @@ fn apply_add_operation(
 
     match (&mut updated_value, value) {
         (AttributeValue::N(existing_num), AttributeValue::N(add_num)) => {
-            *existing_num = add_add_expression_numbers(field, existing_num, add_num)?;
+            let parsed = parse_add_number(field, add_num)?;
+            *existing_num = add_add_expression_with_rhs(field, existing_num, &parsed)?;
         }
         (AttributeValue::SS(existing_set), AttributeValue::SS(add_set)) => {
             append_unique_values(existing_set, add_set);
@@ -1232,10 +1018,12 @@ fn update_operand_type_error() -> StorageError {
     StorageError::validation("An operand in the update expression has an incorrect data type")
 }
 
-fn remove_set_members(existing_set: &mut Vec<String>, delete_set: &[String]) {
-    for item_to_delete in delete_set {
-        existing_set.retain(|item| item != item_to_delete);
-    }
+pub(super) fn remove_set_members(existing_set: &mut Vec<String>, delete_set: &[String]) {
+    existing_set.retain(|item| {
+        !delete_set
+            .iter()
+            .any(|item_to_delete| item == item_to_delete)
+    });
 }
 
 fn attribute_value_type_name(value: &AttributeValue) -> &'static str {
@@ -1257,8 +1045,8 @@ fn attribute_value_type_name(value: &AttributeValue) -> &'static str {
 pub fn before_update_item<'a>(
     update_expression: &str,
     condition_expression: Option<&str>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-    expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
+    expression_attribute_values: Option<&'a storage_types::AttributeMap>,
 ) -> StorageResult<(Vec<BoundUpdateOperation<'a>>, Option<Condition>)> {
     before_update_item_optional(
         Some(update_expression),
@@ -1271,8 +1059,8 @@ pub fn before_update_item<'a>(
 pub fn before_update_item_optional<'a>(
     update_expression: Option<&str>,
     condition_expression: Option<&str>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-    expression_attribute_values: Option<&'a HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
+    expression_attribute_values: Option<&'a storage_types::AttributeMap>,
 ) -> StorageResult<(Vec<BoundUpdateOperation<'a>>, Option<Condition>)> {
     let operations = if let Some(update_expression) = update_expression {
         let plan = cached_update_expression_plan(update_expression, expression_attribute_names)?;
@@ -1306,8 +1094,8 @@ struct CachedConditionExpression {
 
 fn cached_condition_expression(
     condition_expression: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
+    expression_attribute_values: Option<&storage_types::AttributeMap>,
 ) -> Result<Condition, String> {
     static CONDITION_EXPRESSION_CACHE: OnceLock<
         RwLock<HashMap<String, Vec<CachedConditionExpression>>>,
@@ -1327,7 +1115,7 @@ fn cached_condition_expression(
         return Ok((*cached.condition).clone());
     }
 
-    let condition = Arc::new(parse_condition_expression(
+    let condition = Arc::new(parse_condition_expression_typed(
         condition_expression,
         expression_attribute_names,
         expression_attribute_values,
@@ -1357,7 +1145,7 @@ fn cached_condition_expression(
 
 fn sorted_condition_attribute_values(
     condition_expression: &str,
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<&storage_types::AttributeMap>,
 ) -> Vec<(String, AttributeValue)> {
     let values = subset_expression_attribute_values_for_expression(
         condition_expression,
@@ -1367,14 +1155,14 @@ fn sorted_condition_attribute_values(
         .as_ref()
         .into_iter()
         .flat_map(|values| values.iter())
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| (key.to_string(), value.clone()))
         .collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
     values
 }
 
 fn condition_attribute_values_match(
-    expression_attribute_values: Option<&HashMap<String, AttributeValue>>,
+    expression_attribute_values: Option<&storage_types::AttributeMap>,
     cached_values: &[(String, AttributeValue)],
 ) -> bool {
     cached_values.iter().all(|(key, value)| {

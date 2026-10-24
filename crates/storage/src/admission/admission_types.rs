@@ -1,5 +1,7 @@
 use std::{fmt, time::Duration};
 
+use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
+
 /// The bounded workload classes used by the controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdmissionClass {
@@ -174,6 +176,21 @@ pub enum AdmissionOutcome {
 }
 
 impl AdmissionOutcome {
+    pub(super) fn from_storage_error(
+        error: Option<&StorageError>,
+        latency: Duration,
+        provider_pressure: bool,
+    ) -> Self {
+        match error {
+            None if provider_pressure => Self::SuccessAfterPressure(latency),
+            None => Self::Success(latency),
+            Some(error) if provider_pressure || is_admission_pressure(error) => {
+                Self::RetryablePressure(latency)
+            }
+            Some(_) => Self::Failure(latency),
+        }
+    }
+
     pub(super) const fn latency(self) -> Option<Duration> {
         match self {
             Self::Success(latency)
@@ -196,6 +213,29 @@ impl AdmissionOutcome {
 
     pub(super) const fn is_success(self) -> bool {
         matches!(self, Self::Success(_) | Self::SuccessAfterPressure(_))
+    }
+}
+
+pub(crate) fn is_admission_pressure(error: &StorageError) -> bool {
+    match error.to_enum() {
+        StorageEnum::ProvisionedThroughputExceeded { .. }
+        | StorageEnum::Throttled { .. }
+        | StorageEnum::LimitExceeded { .. }
+        | StorageEnum::RequestLimitExceeded
+        | StorageEnum::ServiceUnavailable { .. } => true,
+        StorageEnum::AwsService {
+            code: Some(code), ..
+        } => matches!(
+            code.as_str(),
+            "ServiceUnavailable"
+                | "ServiceUnavailableException"
+                | "RequestTimeout"
+                | "RequestTimeoutException"
+                | "ThrottlingException"
+                | "ProvisionedThroughputExceededException"
+                | "LimitExceededException"
+        ),
+        _ => false,
     }
 }
 

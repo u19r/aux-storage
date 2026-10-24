@@ -297,6 +297,66 @@ fn in_condition_matches_maps_structurally() {
 }
 
 #[test]
+fn given_duplicate_sets_when_comparing_membership_then_existing_asymmetric_semantics_are_preserved()
+{
+    let item = HashMap::from([
+        (
+            "strings".to_string(),
+            AttributeValue::SS(vec!["a".to_string(), "a".to_string()]),
+        ),
+        (
+            "numbers".to_string(),
+            AttributeValue::NS(vec!["1".to_string(), "1".to_string()]),
+        ),
+        (
+            "binaries".to_string(),
+            AttributeValue::BS(vec!["YQ==".to_string(), "YQ==".to_string()]),
+        ),
+    ]);
+
+    for (field, same, different) in [
+        (
+            "strings",
+            AttributeValue::SS(vec!["a".to_string(), "a".to_string()]),
+            AttributeValue::SS(vec!["a".to_string(), "b".to_string()]),
+        ),
+        (
+            "numbers",
+            AttributeValue::NS(vec!["1".to_string(), "1".to_string()]),
+            AttributeValue::NS(vec!["1".to_string(), "2".to_string()]),
+        ),
+        (
+            "binaries",
+            AttributeValue::BS(vec!["YQ==".to_string(), "YQ==".to_string()]),
+            AttributeValue::BS(vec!["YQ==".to_string(), "Yg==".to_string()]),
+        ),
+    ] {
+        assert!(evaluate_condition(
+            &item,
+            &Condition::Equal {
+                field: field.to_string(),
+                value: same,
+            }
+        ));
+        assert!(evaluate_condition(
+            &item,
+            &Condition::Equal {
+                field: field.to_string(),
+                value: different,
+            }
+        ));
+    }
+
+    assert!(!evaluate_condition(
+        &HashMap::new(),
+        &Condition::ValueEqual {
+            left: AttributeValue::SS(vec!["a".to_string(), "b".to_string()]),
+            right: AttributeValue::SS(vec!["a".to_string(), "a".to_string()]),
+        }
+    ));
+}
+
+#[test]
 fn literal_value_equality_condition() {
     let item = HashMap::new();
 
@@ -805,8 +865,8 @@ fn or_condition() {
 fn deeply_nested_and_or_conditions() {
     let item = create_test_item();
 
-    // Complex nested condition: (exists name AND age > 20) OR (not exists deleted
-    // AND active = true)
+    // Complex nested condition: (exists name AND age > 20) OR (not exists
+    // deleted AND active = true)
     let condition = Condition::Or {
         conditions: vec![
             Condition::And {
@@ -835,8 +895,8 @@ fn deeply_nested_and_or_conditions() {
     };
     assert!(evaluate_condition(&item, &condition));
 
-    // Deeply nested: ((name exists AND age > 30) OR (tags size = 2)) AND active =
-    // true
+    // Deeply nested: ((name exists AND age > 30) OR (tags size = 2)) AND active
+    // = true
     let condition = Condition::And {
         conditions: vec![
             Condition::Or {
@@ -866,7 +926,8 @@ fn deeply_nested_and_or_conditions() {
     };
     assert!(evaluate_condition(&item, &condition));
 
-    // Triple nested: (((name begins with "J" AND age between 20-30) OR tags size =
+    // Triple nested: (((name begins with "J" AND age between 20-30) OR tags
+    // size =
     // 3) AND active = true) OR deleted = null
     let condition = Condition::Or {
         conditions: vec![
@@ -1093,4 +1154,394 @@ fn repeated_root_detection_only_flags_duplicate_roots() {
     )
     .expect("parse single root condition");
     assert!(!condition_has_repeated_root_field(&single));
+}
+
+#[test]
+fn given_owned_nested_roots_when_evaluating_paths_then_map_and_cached_results_match() {
+    let item = create_test_item();
+    for path in [
+        "name",
+        "name.child",
+        "name[0]",
+        "absent",
+        "map_field.nested_name",
+        "map_field.absent",
+        "map_field[0]",
+        "list_field[0]",
+        "list_field[1]",
+        "list_field[2]",
+        "list_field[3]",
+        "list_field[-1]",
+        "list_field[",
+        "list_field[]",
+        "list_field[999999999999999999999999999999]",
+        "list_field[0]tail",
+        "list_field[0].child",
+        "list_field.child",
+        "map_field.",
+        "",
+    ] {
+        for condition in [
+            Condition::Exists {
+                field: path.to_string(),
+            },
+            Condition::NotExists {
+                field: path.to_string(),
+            },
+            Condition::Equal {
+                field: path.to_string(),
+                value: AttributeValue::S("item1".to_string()),
+            },
+            Condition::NotEqual {
+                field: path.to_string(),
+                value: AttributeValue::S("item1".to_string()),
+            },
+        ] {
+            let expected = evaluate_condition(&item, &condition);
+            let mut calls = Vec::new();
+            let actual = try_evaluate_condition_with_root(&condition, &mut |root| {
+                calls.push(root.to_string());
+                Ok::<_, ()>(item.get(root).cloned())
+            })
+            .expect("owned evaluation");
+            let cached = crate::try_evaluate_condition_with_cached_roots(&condition, &mut |root| {
+                Ok::<_, ()>(item.get(root).cloned())
+            })
+            .expect("cached evaluation");
+            assert_eq!(actual, expected, "{condition:?}");
+            assert_eq!(cached, expected, "{condition:?}");
+            assert_eq!(calls.len(), 1, "{condition:?}");
+        }
+    }
+}
+
+#[test]
+fn given_nested_unicode_values_when_consuming_paths_then_all_value_types_survive() {
+    for value in [
+        AttributeValue::S("葉".repeat(1024)),
+        AttributeValue::N("42.5".to_string()),
+        AttributeValue::B("YQ==".to_string()),
+        AttributeValue::BOOL(false),
+        AttributeValue::NULL(true),
+        AttributeValue::SS(vec!["a".to_string(), "b".to_string()]),
+        AttributeValue::NS(vec!["1".to_string(), "2".to_string()]),
+        AttributeValue::BS(vec!["YQ==".to_string(), "Yg==".to_string()]),
+        AttributeValue::L(vec![AttributeValue::BOOL(true)]),
+        AttributeValue::M(HashMap::from([(
+            "子".to_string(),
+            AttributeValue::BOOL(true),
+        )])),
+    ] {
+        let item = HashMap::from([(
+            "根".to_string(),
+            AttributeValue::M(HashMap::from([
+                (
+                    "枝".to_string(),
+                    AttributeValue::L(vec![AttributeValue::NULL(true), value.clone()]),
+                ),
+                (
+                    "残り".to_string(),
+                    AttributeValue::S("sibling".repeat(1024)),
+                ),
+            ])),
+        )]);
+        let condition = Condition::Equal {
+            field: "根.枝[1]".to_string(),
+            value,
+        };
+        let wire = storage_types::WireItem::try_from(&item).unwrap();
+        assert!(
+            try_evaluate_condition_with_root(&condition, &mut |root| wire.attribute_value(root))
+                .expect("evaluation")
+        );
+        assert!(evaluate_condition(&item, &condition));
+        let mut root = item.get("根").cloned();
+        let guard = alloc_counter::AllocationGuard::start(
+            module_path!(),
+            "owned_nested_value",
+            file!(),
+            line!(),
+            None,
+        );
+        let matched =
+            try_evaluate_condition_with_root(&condition, &mut |_| Ok::<_, ()>(root.take()))
+                .expect("evaluate owned value");
+        let report = guard.finish();
+        assert!(matched);
+        assert_eq!(
+            report.allocation_count, 0,
+            "owned path must move its selected values"
+        );
+    }
+}
+
+#[test]
+fn given_callback_failures_when_evaluating_boolean_conditions_then_order_and_errors_are_preserved()
+{
+    let exists = |field: &str| Condition::Exists {
+        field: field.to_string(),
+    };
+    let cases = [
+        (
+            Condition::And {
+                conditions: vec![exists("missing.child"), exists("error.child")],
+            },
+            Ok(false),
+            vec!["missing"],
+        ),
+        (
+            Condition::Or {
+                conditions: vec![exists("present.child"), exists("error.child")],
+            },
+            Ok(true),
+            vec!["present"],
+        ),
+        (
+            Condition::And {
+                conditions: vec![
+                    exists("present.child"),
+                    exists("error.child"),
+                    exists("later"),
+                ],
+            },
+            Err("root decode failed exactly"),
+            vec!["present", "error"],
+        ),
+        (
+            Condition::Or {
+                conditions: vec![
+                    exists("missing.child"),
+                    exists("error.child"),
+                    exists("later"),
+                ],
+            },
+            Err("root decode failed exactly"),
+            vec!["missing", "error"],
+        ),
+        (
+            exists("error[malformed"),
+            Err("root decode failed exactly"),
+            vec!["error"],
+        ),
+    ];
+    for (condition, expected, expected_calls) in cases {
+        let mut calls = Vec::new();
+        let actual = try_evaluate_condition_with_root(&condition, &mut |root| {
+            calls.push(root.to_string());
+            match root {
+                "missing" => Ok(None),
+                "present" => Ok(Some(AttributeValue::M(HashMap::from([(
+                    "child".to_string(),
+                    AttributeValue::BOOL(true),
+                )])))),
+                _ => Err("root decode failed exactly"),
+            }
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(calls, expected_calls);
+    }
+}
+
+#[test]
+#[ignore = "manual comparative allocation and elapsed measurement"]
+fn given_wire_roots_when_evaluating_nested_conditions_then_measure_complete_owner_path() {
+    const ITERATIONS: usize = 1000;
+    for (depth, width) in [(0, 2), (1, 2), (3, 2), (10, 2), (1, 64)] {
+        let (item, path) = create_owned_path_fixture(depth, width);
+        let ordered_item: std::collections::BTreeMap<_, _> = item.iter().collect();
+        let wire = storage_types::WireItem::dynamo_json(
+            serde_json::to_vec(&ordered_item).expect("wire item"),
+        );
+        let condition = Condition::Equal {
+            field: path,
+            value: AttributeValue::S("v".repeat(1024)),
+        };
+        assert!(evaluate_condition(&item, &condition));
+        for repetition in 0..3 {
+            let guard = alloc_counter::AllocationGuard::start(
+                module_path!(),
+                "owned_root_evaluation",
+                file!(),
+                line!(),
+                None,
+            );
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                assert!(std::hint::black_box(
+                    try_evaluate_condition_with_root(
+                        std::hint::black_box(&condition),
+                        &mut |root| std::hint::black_box(&wire).attribute_value(root),
+                    )
+                    .expect("evaluate")
+                ));
+            }
+            let elapsed = started.elapsed();
+            let report = guard.finish();
+            println!(
+                "owned-root depth={depth} width={width} repetition={repetition} \
+                 iterations={ITERATIONS} allocations={} bytes={} ns_per_op={:.2}",
+                report.allocation_count,
+                report.allocated_bytes,
+                elapsed.as_nanos() as f64 / ITERATIONS as f64
+            );
+        }
+    }
+}
+
+fn create_owned_path_fixture(
+    depth: usize,
+    width: usize,
+) -> (HashMap<String, AttributeValue>, String) {
+    let mut value = AttributeValue::S("v".repeat(1024));
+    for _ in 0..depth {
+        let mut values = vec![AttributeValue::S("residual".repeat(128)); width - 1];
+        values.push(value);
+        value = AttributeValue::M(HashMap::from([
+            ("child".to_string(), AttributeValue::L(values)),
+            ("sibling".to_string(), AttributeValue::S("s".repeat(1024))),
+        ]));
+    }
+    let mut item = HashMap::from([("payload".to_string(), value)]);
+    for ordinal in 0..9 {
+        item.insert(
+            format!("key{ordinal}{}", "k".repeat(96)),
+            AttributeValue::S("v".repeat(1024)),
+        );
+    }
+    (
+        item,
+        format!("payload{}", format!(".child[{}]", width - 1).repeat(depth)),
+    )
+}
+
+#[test]
+fn numeric_conditions_preserve_exact_order_and_equivalent_spellings() {
+    for (lower, upper) in [
+        ("9007199254740992", "9007199254740993"),
+        (
+            "12345678901234567890123456789012345677",
+            "12345678901234567890123456789012345678",
+        ),
+        ("-9007199254740993", "-9007199254740992"),
+        ("-1e-130", "0"),
+        ("0", "1e-130"),
+        ("1.09", "1.1"),
+    ] {
+        let item = HashMap::from([("n".to_string(), AttributeValue::N(upper.to_string()))]);
+        for condition in [
+            Condition::GreaterThan {
+                field: "n".to_string(),
+                value: lower.to_string(),
+            },
+            Condition::GreaterThanEqual {
+                field: "n".to_string(),
+                value: upper.to_string(),
+            },
+            Condition::NotEqual {
+                field: "n".to_string(),
+                value: AttributeValue::N(lower.to_string()),
+            },
+            Condition::Between {
+                field: "n".to_string(),
+                min: lower.to_string(),
+                max: upper.to_string(),
+            },
+        ] {
+            assert_numeric_condition_paths(&item, &condition, true);
+        }
+        for condition in [
+            Condition::LessThan {
+                field: "n".to_string(),
+                value: lower.to_string(),
+            },
+            Condition::LessThanEqual {
+                field: "n".to_string(),
+                value: lower.to_string(),
+            },
+            Condition::Equal {
+                field: "n".to_string(),
+                value: AttributeValue::N(lower.to_string()),
+            },
+            Condition::Between {
+                field: "n".to_string(),
+                min: lower.to_string(),
+                max: lower.to_string(),
+            },
+        ] {
+            assert_numeric_condition_paths(&item, &condition, false);
+        }
+    }
+    for (left, right) in [
+        ("1", "1.00"),
+        ("100", "1e2"),
+        ("-0", "0"),
+        ("-1.2", "-12e-1"),
+    ] {
+        let item = HashMap::from([("n".to_string(), AttributeValue::N(left.to_string()))]);
+        assert_numeric_condition_paths(
+            &item,
+            &Condition::Equal {
+                field: "n".to_string(),
+                value: AttributeValue::N(right.to_string()),
+            },
+            true,
+        );
+    }
+    for invalid in ["NaN", "Infinity", "", "1e126"] {
+        let item = HashMap::from([("n".to_string(), AttributeValue::N(invalid.to_string()))]);
+        assert!(!evaluate_condition(
+            &item,
+            &Condition::Equal {
+                field: "n".to_string(),
+                value: AttributeValue::N(invalid.to_string()),
+            }
+        ));
+    }
+}
+
+fn assert_numeric_condition_paths(
+    item: &HashMap<String, AttributeValue>,
+    condition: &Condition,
+    expected: bool,
+) {
+    let guard = alloc_counter::AllocationGuard::start(
+        module_path!(),
+        "exact_numeric_condition",
+        file!(),
+        line!(),
+        None,
+    );
+    let actual = evaluate_condition(item, condition);
+    let allocations = guard.finish();
+    assert_eq!(actual, expected, "{item:?} {condition:?}");
+    assert_eq!(
+        allocations.allocation_count, 0,
+        "exact scalar comparisons retain inline digits"
+    );
+    let wire = storage_types::WireItem::try_from(item).unwrap();
+    assert_eq!(
+        crate::evaluate_wire_condition(Some(&wire), condition).unwrap(),
+        expected
+    );
+    assert_eq!(
+        try_evaluate_condition_with_root(condition, &mut |field| Ok::<_, ()>(
+            item.get(field).cloned()
+        ))
+        .unwrap(),
+        expected
+    );
+    let indexed =
+        storage_types::IndexedWireItem::from_parts(serde_json::to_vec(item).unwrap(), vec![])
+            .unwrap();
+    assert_eq!(
+        crate::evaluate_indexed_wire_condition(Some(&indexed), condition).unwrap(),
+        expected
+    );
+    let repeated = Condition::And {
+        conditions: vec![condition.clone(), condition.clone()],
+    };
+    assert_eq!(
+        crate::evaluate_indexed_wire_condition(Some(&indexed), &repeated).unwrap(),
+        expected
+    );
 }

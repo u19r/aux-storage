@@ -19,43 +19,6 @@ use std::collections::HashMap;
 
 use storage_types::{AttributeValue, KeySchemaElement, Projection, ProjectionType};
 
-/// Apply a projection to an item. For KEYS_ONLY we only return the key
-/// attributes. For INCLUDE we return only the listed non-key attributes (does
-/// not *auto add* keys per current DynamoDB parity unless specified there). For
-/// ALL or None we clone the whole item.
-pub fn apply_projection(
-    item: &HashMap<String, AttributeValue>,
-    projection: Option<&Projection>,
-    key_schema: &[KeySchemaElement],
-) -> HashMap<String, AttributeValue> {
-    let Some(proj) = projection else {
-        return item.clone();
-    };
-    match proj.projection_type.clone().unwrap_or(ProjectionType::All) {
-        ProjectionType::All => item.clone(),
-        ProjectionType::KeysOnly => {
-            let mut out = HashMap::with_capacity(key_schema.len());
-            for k in key_schema {
-                if let Some(v) = item.get(&k.attribute_name) {
-                    out.insert(k.attribute_name.clone(), v.clone());
-                }
-            }
-            out
-        }
-        ProjectionType::Include => {
-            let mut out = HashMap::new();
-            if let Some(attrs) = &proj.non_key_attributes {
-                for a in attrs {
-                    if let Some(v) = item.get(a) {
-                        out.insert(a.clone(), v.clone());
-                    }
-                }
-            }
-            out
-        }
-    }
-}
-
 /// Apply a projection within the context of a GSI, ensuring BOTH the base table
 /// primary key attributes and the GSI key attributes are retained for KeysOnly
 /// / Include projections, matching DynamoDB semantics tested in kv provider.
@@ -65,37 +28,56 @@ pub fn apply_gsi_projection(
     table_key_schema: &[KeySchemaElement],
     gsi_key_schema: &[KeySchemaElement],
 ) -> HashMap<String, AttributeValue> {
-    let Some(proj) = projection else {
+    let Some(projection) = projection else {
         return item.clone();
     };
-    match proj.projection_type.clone().unwrap_or(ProjectionType::All) {
-        ProjectionType::All => item.clone(),
-        ProjectionType::KeysOnly => {
-            let mut out = HashMap::new();
-            for k in table_key_schema.iter().chain(gsi_key_schema.iter()) {
-                if let Some(v) = item.get(&k.attribute_name) {
-                    out.entry(k.attribute_name.clone())
-                        .or_insert_with(|| v.clone());
-                }
-            }
-            out
+    if projection
+        .projection_type
+        .as_ref()
+        .is_none_or(|kind| *kind == ProjectionType::All)
+    {
+        return item.clone();
+    }
+
+    gsi_projection_fields(Some(projection), table_key_schema, gsi_key_schema)
+        .into_iter()
+        .filter_map(|name| item.get(name).map(|value| (name.to_owned(), value.clone())))
+        .collect()
+}
+
+/// Select the logical fields retained by a GSI projection. Keys are emitted
+/// first, with table keys before index keys; INCLUDE attributes follow them.
+/// Duplicate names are kept once, which also handles table/index key overlap.
+pub fn gsi_projection_fields<'a>(
+    projection: Option<&'a Projection>,
+    table_key_schema: &'a [KeySchemaElement],
+    gsi_key_schema: &'a [KeySchemaElement],
+) -> Vec<&'a str> {
+    let mut fields = Vec::with_capacity(
+        table_key_schema.len()
+            + gsi_key_schema.len()
+            + projection
+                .and_then(|projection| projection.non_key_attributes.as_ref())
+                .map_or(0, Vec::len),
+    );
+    for key in table_key_schema.iter().chain(gsi_key_schema) {
+        push_unique(&mut fields, key.attribute_name.as_str());
+    }
+    if projection
+        .is_some_and(|projection| projection.projection_type == Some(ProjectionType::Include))
+    {
+        for name in projection
+            .and_then(|projection| projection.non_key_attributes.as_deref())
+            .unwrap_or_default()
+        {
+            push_unique(&mut fields, name);
         }
-        ProjectionType::Include => {
-            let mut out = HashMap::new();
-            if let Some(attrs) = &proj.non_key_attributes {
-                for a in attrs {
-                    if let Some(v) = item.get(a) {
-                        out.insert(a.clone(), v.clone());
-                    }
-                }
-            }
-            for k in table_key_schema.iter().chain(gsi_key_schema.iter()) {
-                if let Some(v) = item.get(&k.attribute_name) {
-                    out.entry(k.attribute_name.clone())
-                        .or_insert_with(|| v.clone());
-                }
-            }
-            out
-        }
+    }
+    fields
+}
+
+fn push_unique<'a>(fields: &mut Vec<&'a str>, name: &'a str) {
+    if !fields.contains(&name) {
+        fields.push(name);
     }
 }

@@ -1,6 +1,14 @@
 # aux-storage Configuration
 
-This repository contains the runtime configuration needed to run storage, queue, and stream services.
+This repository contains the runtime configuration needed to run storage, queue, and pubsub services.
+
+## Inbound access
+
+The service endpoints, including `/metrics`, do not enforce application-layer authentication.
+The default listener binds to `0.0.0.0:8080`, and metrics are enabled by default.
+Use private ingress, security groups, or an authenticating proxy to restrict inbound access.
+The Prometheus `bearer_token` option has been removed. Disable metrics with
+`features.metrics.enabled=false` when an ingress policy cannot protect that endpoint.
 
 ## Compile-Time Features
 
@@ -9,12 +17,11 @@ Backend features are selected per crate:
 | Feature             | Purpose                                                |
 | ------------------- | ------------------------------------------------------ |
 | `sqlite`            | Embedded SQLite backend.                               |
-| `turso`             | Turso/libSQL-compatible backend where supported.       |
+| `turso`             | Embedded Turso backend where supported.       |
 | `postgres`          | Postgres-backed service deployments.                   |
 | `rocksdb`           | Embedded RocksDB backend.                              |
 | `foundationdb`      | FoundationDB-backed distributed deployments.           |
 | `remote`            | Provider/client mode for a separately running service. |
-| `distributed-cache` | Distributed cache model where supported.               |
 
 Check the target crate's `Cargo.toml` for the exact feature names and transitive enables.
 
@@ -39,14 +46,12 @@ Common options and flags:
 | `--storage rocksdb`               | Use RocksDB.                                                                                      |
 | `--storage postgres`              | Use Postgres.                                                                                     |
 | `--storage foundationdb`          | Use FoundationDB when compiled with the feature.                                                  |
-| `--storage remote`                | Use a remote provider/client backend.                                                             |
 | `--db-path <path>`                | Local data path for embedded backends.                                                            |
 | `--postgres-dsn <dsn>`            | Postgres connection string.                                                                       |
 | `--postgres-max-pool-size <n>`    | Postgres pool size.                                                                               |
 | `--storage-admission-enabled <bool>` | Enable or disable foreground storage admission.                                                |
 | `--storage-admission-<parameter>` | Override a `features.storage_admission` sizing or queue parameter.                              |
 | `--enable-internal-helper-routes` | Enable test/helper routes                                                                         |
-| `--immediate-consistency-gsis`    | Enable immediate consistency for Global Secondary Indexes (GSIs) instead of eventual consistency. |
 
 ### Foreground storage admission
 
@@ -169,7 +174,7 @@ Historical and background-work interactions:
   They must fail closed when required stream history has been trimmed. Until
   those APIs exist, custom stream duration exposes the trim-state fields they
   need but does not add a user-facing historical read/export surface.
-- Sync replication, logical backfill, GSI backfill, and future export sessions
+- Cross-region table bootstrap, stream catch-up, GSI backfill, and future export sessions
   can protect stream boundaries. Custom duration trim must stop before those
   protected boundaries, even when the configured retention horizon is older.
 - TTL cleanup and custom stream trim are cooperative background jobs. They may
@@ -179,26 +184,12 @@ Historical and background-work interactions:
   soak profile for the chosen backend and size background capacity from measured
   rows-deleted per pass.
 
-## Sync Replication Configuration
+## Multi-region replication
 
-Sync replication is configured under `features.storage_sync_replication`. The
-first production-supported release target is SQLite-to-SQLite only; see
-`docs/sync-replication-support.md` before enabling it.
-
-Required when enabled:
-
-- `node_id`: stable non-zero node id.
-- `advertise_url`: internal peer URL reachable by other sync nodes.
-- `sync_internal_token`: internal peer credential supplied from secret
-  management.
-- `data_dir`: required when the storage backend does not provide the SQLite
-  Raft log path.
-
-Learner startup uses `join_as_learner=true`, at least one bootstrap peer in
-`peers`, and optionally `learner_join_peer_node_id` when the orchestrator knows
-which configured peer should receive the join request.
-
-Internal sync endpoints must not be exposed through public ingress.
+Multi-region replication uses independent regional backends and explicit peer configuration.
+The former `features.storage_sync_replication` configuration and SQLite Raft mode have been
+removed. See [Multi-region replication](writing/multi-region-replication.md) for the maintained
+configuration, acknowledgement semantics, and recovery behavior.
 
 ## Downstream Repositories
 

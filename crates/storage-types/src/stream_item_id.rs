@@ -1,18 +1,19 @@
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Visitor};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::ItemStreamVersion;
-
-const STREAM_ITEM_ID_LEN: usize = 12;
+use crate::{ItemStreamVersion, constants::STREAM_ITEM_ID_LEN};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ToSchema)]
 #[schema(value_type = String, example = "000000000000000000000000")]
 pub struct StreamItemId([u8; STREAM_ITEM_ID_LEN]);
 
 impl StreamItemId {
+    /// Inclusive upper bound of the opaque, unsigned item-ID address space.
+    pub const MAX: Self = Self([u8::MAX; STREAM_ITEM_ID_LEN]);
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; STREAM_ITEM_ID_LEN] {
         &self.0
@@ -49,6 +50,22 @@ impl StreamItemId {
         }
         Self(next)
     }
+
+    /// The exclusive lower bound for an inclusive ordered stream read.
+    /// The zero identity has no predecessor, so its read starts at the head.
+    #[must_use]
+    pub fn predecessor(&self) -> Option<Self> {
+        let mut previous = self.0;
+        for byte in previous.iter_mut().rev() {
+            if *byte == 0 {
+                *byte = u8::MAX;
+            } else {
+                *byte -= 1;
+                return Some(Self(previous));
+            }
+        }
+        None
+    }
 }
 
 impl TryFrom<&[u8]> for StreamItemId {
@@ -84,15 +101,29 @@ impl Default for StreamItemId {
 impl Serialize for StreamItemId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
-        serializer.serialize_str(&self.to_hex())
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+struct StreamItemIdVisitor;
+
+impl<'de> Visitor<'de> for StreamItemIdVisitor {
+    type Value = StreamItemId;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a lowercase hexadecimal stream item id")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where E: serde::de::Error {
+        StreamItemId::from_str(value).map_err(E::custom)
     }
 }
 
 impl<'de> Deserialize<'de> for StreamItemId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
-        let s = String::deserialize(deserializer)?;
-        StreamItemId::from_str(&s).map_err(serde::de::Error::custom)
+        deserializer.deserialize_str(StreamItemIdVisitor)
     }
 }
 
@@ -137,6 +168,6 @@ impl FromStr for StreamItemId {
 
 impl std::fmt::Display for StreamItemId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
+        f.write_str(&hex::encode(self.0))
     }
 }

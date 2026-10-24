@@ -4,62 +4,70 @@ use std::{
 };
 
 use crate::{
-    AttributeValue, CreateGlobalSecondaryIndex, IndexName, KeyAttributes, KeySchemaElement,
-    KeyType, LocalSecondaryIndex, Projection, ProjectionType, StorageError, dynamodb_binary,
+    AttributeValue, AttributeValueLookup, CreateGlobalSecondaryIndex, IndexName, KeyAttributes,
+    KeySchemaElement, KeyType, LocalSecondaryIndex, Projection, ProjectionType, StorageEnum,
+    StorageError, StorageValidationKind, TableKey,
+    constants::{
+        DYNAMODB_NUMBER_ZERO_PADDING, DYNAMODB_WRITE_NUMBER_BYTES, MAX_ATTRIBUTE_NAME_BYTES,
+        MAX_ATTRIBUTE_NESTING_DEPTH, MAX_INDEX_NAME_BYTES, MAX_PARTITION_KEY_BYTES,
+        MAX_PROJECTED_ATTRIBUTES, MAX_SORT_KEY_BYTES, MAX_TRANSACTION_REQUEST_BYTES,
+        MIN_INDEX_NAME_BYTES, SMALL_SET_DUPLICATE_SCAN_LIMIT,
+    },
+    context::WrappedError as _,
+    dynamodb_binary,
 };
 
-pub const MAX_ITEM_SIZE_BYTES: usize = 400 * 1024;
-pub const MAX_PARTITION_KEY_BYTES: usize = 2_048;
-pub const MAX_SORT_KEY_BYTES: usize = 1_024;
-pub const MAX_ATTRIBUTE_NAME_BYTES: usize = 65_535;
-pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 32;
-pub const MAX_PROJECTED_ATTRIBUTES: usize = 100;
-pub const MIN_INDEX_NAME_BYTES: usize = 3;
-pub const MAX_INDEX_NAME_BYTES: usize = 255;
-pub const MAX_EXPRESSION_BYTES: usize = 4 * 1024;
-pub const MAX_TRANSACTION_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_QUERY_SCAN_RESPONSE_BYTES: usize = 1024 * 1024;
-pub const MAX_LIST_TABLES_LIMIT: u32 = 100;
-
 pub fn validate_index_name(index_name: &IndexName, field: &str) -> Result<(), String> {
+    validate_index_name_lazy(index_name, || field.to_owned())
+}
+
+pub(crate) fn validate_index_name_lazy<F>(index_name: &IndexName, field: F) -> Result<(), String>
+where F: FnOnce() -> String {
     let name = index_name.as_ref();
     let len = name.len();
     if !(MIN_INDEX_NAME_BYTES..=MAX_INDEX_NAME_BYTES).contains(&len) {
-        return Err(format!("{field} must be between 3 and 255 characters"));
+        return Err(format!("{} must be between 3 and 255 characters", field()));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
-        return Err(format!("{field} contains invalid characters"));
+        return Err(format!("{} contains invalid characters", field()));
     }
     Ok(())
 }
 
-pub fn validate_attribute_name(name: &str, field: &str) -> Result<(), String> {
+pub(crate) fn validate_attribute_name(
+    name: &str,
+    field: impl FnOnce() -> String,
+) -> Result<(), String> {
     let len = name.len();
     if len == 0 {
-        return Err(format!("{field} cannot be empty"));
+        return Err(format!("{} cannot be empty", field()));
     }
     if len > MAX_ATTRIBUTE_NAME_BYTES {
         return Err(format!(
-            "{field} cannot exceed {MAX_ATTRIBUTE_NAME_BYTES} bytes"
+            "{} cannot exceed {MAX_ATTRIBUTE_NAME_BYTES} bytes",
+            field()
         ));
     }
     Ok(())
 }
 
-pub fn validate_item(item: &HashMap<String, AttributeValue>, field: &str) -> Result<(), String> {
-    let mut size = 0;
-    for (name, value) in item {
-        validate_attribute_name(name, &format!("{field} attribute name"))?;
-        validate_attribute_value(value, 0, field)?;
-        size += name.len() + attribute_value_size(value);
+#[derive(Default)]
+struct ByteCounter {
+    size: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.size += bytes.len();
+        Ok(bytes.len())
     }
-    if size > MAX_ITEM_SIZE_BYTES {
-        return Err("Item size has exceeded the maximum allowed size".to_string());
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn validate_attribute_value_for_write(
@@ -70,7 +78,19 @@ pub fn validate_attribute_value_for_write(
 }
 
 pub fn normalize_dynamodb_number_for_write(value: &str) -> Cow<'_, str> {
-    expand_scientific_number(value).map_or(Cow::Borrowed(value), Cow::Owned)
+    if !number_needs_write_normalization(value) {
+        return Cow::Borrowed(value);
+    }
+    if value.len() <= DYNAMODB_WRITE_NUMBER_BYTES
+        && let Some(expanded) = expand_scientific_number(value)
+    {
+        return Cow::Owned(expanded);
+    }
+    crate::canonical_dynamodb_number(value).map_or(Cow::Borrowed(value), Cow::Owned)
+}
+
+fn number_needs_write_normalization(value: &str) -> bool {
+    value.len() > DYNAMODB_WRITE_NUMBER_BYTES || value.contains(['e', 'E'])
 }
 
 pub fn normalize_attribute_map_numbers_for_write(
@@ -90,13 +110,28 @@ pub fn attribute_map_numbers_need_write_normalization(
         .any(attribute_value_numbers_need_write_normalization)
 }
 
+/// Borrow an attribute map whose numbers already use the write form, and
+/// normalize only when an owned copy is needed.
+pub fn normalized_attribute_map_for_write(
+    item: &HashMap<String, AttributeValue>,
+) -> Cow<'_, HashMap<String, AttributeValue>> {
+    if !attribute_map_numbers_need_write_normalization(item) {
+        return Cow::Borrowed(item);
+    }
+
+    let mut normalized = item.clone();
+    normalize_attribute_map_numbers_for_write(&mut normalized);
+    Cow::Owned(normalized)
+}
+
 pub fn validate_transaction_request_size(
     value: &serde_json::Value,
     field: &str,
 ) -> Result<(), String> {
-    let size = serde_json::to_vec(value)
-        .map_err(|err| format!("Invalid request format: {err}"))?
-        .len();
+    let mut writer = ByteCounter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|err| format!("Invalid request format: {err}"))?;
+    let size = writer.size;
     if size > MAX_TRANSACTION_REQUEST_BYTES {
         return Err(format!(
             "{field} cannot exceed {MAX_TRANSACTION_REQUEST_BYTES} bytes"
@@ -118,13 +153,42 @@ pub fn validate_key_attributes_for_schema(
     Ok(())
 }
 
+/// Point reads and Query report malformed numeric key operands without the
+/// write-request validation prefix.
+pub fn read_key_validation_error(error: StorageError) -> StorageError {
+    numeric_key_validation_error(error, ": ")
+}
+
+/// BatchWriteItem returns malformed numeric delete keys without the ordinary
+/// validation prefix or the point-read empty-number suffix.
+pub fn batch_write_key_validation_error(error: StorageError) -> StorageError {
+    numeric_key_validation_error(error, "")
+}
+
+fn numeric_key_validation_error(error: StorageError, empty_number_suffix: &str) -> StorageError {
+    let StorageEnum::Validation { message, .. } = error.to_enum() else {
+        return error;
+    };
+    match message.as_str() {
+        "The parameter cannot be converted to a numeric value" => {
+            StorageError::raw_validation(format!("{message}{empty_number_suffix}"))
+        }
+        "Attempting to store more than 38 significant digits in a Number"
+        | "Number underflow. Attempting to store a number with magnitude smaller than supported \
+         range"
+        | "Number overflow. Attempting to store a number with magnitude larger than supported \
+         range" => StorageError::raw_validation(message.clone()),
+        _ => error,
+    }
+}
+
 pub fn validate_item_key_attributes_for_schema(
     key_schema: &[KeySchemaElement],
-    item: &HashMap<String, AttributeValue>,
+    item: &impl AttributeValueLookup,
 ) -> Result<(), StorageError> {
     for element in key_schema {
         let value = item
-            .get(&element.attribute_name)
+            .get_attribute_value(&element.attribute_name)
             .ok_or_else(StorageError::invalid_or_missing_key)?;
         validate_key_attribute_value_for_schema(element, value)?;
     }
@@ -135,7 +199,15 @@ pub fn validate_key_attribute_value_for_schema(
     element: &KeySchemaElement,
     value: &AttributeValue,
 ) -> Result<(), StorageError> {
-    validate_key_value_size(element, value)
+    validate_key_value_size(&element.key_type, &element.attribute_name, value)
+}
+
+pub(crate) fn validate_table_key(key: &TableKey) -> Result<(), StorageError> {
+    validate_key_value_size(&KeyType::Hash, "partition key", &key.hash_key)?;
+    if let Some(range_key) = key.range_key.as_ref() {
+        validate_key_value_size(&KeyType::Range, "sort key", range_key)?;
+    }
+    Ok(())
 }
 
 pub fn validate_projected_attribute_limit(
@@ -161,36 +233,41 @@ pub fn validate_projected_attribute_limit(
     Ok(())
 }
 
-fn validate_key_value_size(
-    element: &KeySchemaElement,
+pub(crate) fn validate_key_value_size(
+    key_type: &KeyType,
+    attribute_name: &str,
     value: &AttributeValue,
 ) -> Result<(), StorageError> {
     if let AttributeValue::N(value) = value {
-        validate_number(value).map_err(StorageError::validation)?;
+        crate::dynamodb_number::validate_dynamodb_number(value)
+            .map_err(|error| StorageError::validation(error.validation_kind()))?;
     }
     let size = key_value_size(value).map_err(StorageError::validation)?;
     if size == 0 {
-        let value_type = match value {
-            AttributeValue::S(_) => "string",
-            AttributeValue::B(_) => "binary",
+        let (kind, value_type) = match value {
+            AttributeValue::S(_) => (StorageValidationKind::EmptyStringKey, "string"),
+            AttributeValue::B(_) => (StorageValidationKind::EmptyBinaryKey, "binary"),
             _ => {
                 return Err(StorageError::validation(
                     "Key attributes must be scalar string, number, or binary values",
                 ));
             }
         };
-        return Err(StorageError::validation(format!(
-            "One or more parameter values are not valid. The AttributeValue for a key attribute \
-             cannot contain an empty {value_type} value. Key: {}",
-            element.attribute_name
-        )));
+        return Err(StorageError::validation_detail(
+            kind,
+            format!(
+                "One or more parameter values are not valid. The AttributeValue for a key \
+                 attribute cannot contain an empty {value_type} value. Key: {}",
+                attribute_name
+            ),
+        ));
     }
-    let max = match element.key_type {
+    let max = match key_type {
         KeyType::Hash => MAX_PARTITION_KEY_BYTES,
         KeyType::Range => MAX_SORT_KEY_BYTES,
     };
     if size > max {
-        let message = match element.key_type {
+        let message = match key_type {
             KeyType::Hash => {
                 format!(
                     "One or more parameter values were invalid: Size of hashkey has exceeded the \
@@ -219,7 +296,7 @@ fn key_value_size(value: &AttributeValue) -> Result<usize, String> {
     }
 }
 
-fn validate_attribute_value(
+pub(crate) fn validate_attribute_value(
     value: &AttributeValue,
     depth: usize,
     field: &str,
@@ -233,6 +310,7 @@ fn validate_attribute_value(
         AttributeValue::SS(values) => validate_string_set(values)?,
         AttributeValue::N(value) => validate_number(value)?,
         AttributeValue::NS(values) => validate_number_set(values)?,
+        AttributeValue::B(value) => validate_binary(value)?,
         AttributeValue::BS(values) => validate_binary_set(values)?,
         AttributeValue::L(values) => {
             for value in values {
@@ -241,7 +319,7 @@ fn validate_attribute_value(
         }
         AttributeValue::M(values) => {
             for (name, value) in values {
-                validate_attribute_name(name, &format!("{field} nested attribute name"))?;
+                validate_attribute_name(name, || format!("{field} nested attribute name"))?;
                 validate_attribute_value(value, depth + 1, field)?;
             }
         }
@@ -257,10 +335,10 @@ fn validate_string_set(values: &[String]) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if contains_duplicate(values.iter().map(String::as_str)) {
+    if has_duplicate_members(values) {
         return Err(format!(
             "One or more parameter values were invalid: Input collection {} contains duplicates.",
-            quoted_collection(values)
+            format_quoted_collection(values, ", ")
         ));
     }
     Ok(())
@@ -275,8 +353,7 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
     }
     let mut seen = HashSet::with_capacity(values.len());
     for value in values {
-        validate_number(value)?;
-        let key = canonical_number_set_member(value);
+        let key = crate::canonical_dynamodb_number(value).map_err(number_validation_error)?;
         if !seen.insert(key) {
             return Err(
                 "One or more parameter values were invalid: Input collection contains duplicates."
@@ -287,22 +364,15 @@ fn validate_number_set(values: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_number(value: &str) -> Result<(), String> {
-    let parsed = parse_dynamodb_number(value)?;
-    if parsed.significant_digits > 38 {
-        return Err("Attempting to store more than 38 significant digits in a Number".to_string());
-    }
-    if !parsed.is_zero && parsed.adjusted_exponent < -130 {
-        return Err(
-            "Number underflow. Attempting to store a number with magnitude smaller than supported \
-             range"
-                .to_string(),
-        );
-    }
-    Ok(())
+pub(crate) fn validate_number(value: &str) -> Result<(), String> {
+    crate::dynamodb_number::validate_dynamodb_number(value).map_err(number_validation_error)
 }
 
-fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bool {
+fn number_validation_error(error: crate::dynamodb_number::DynamodbNumberError) -> String {
+    error.validation_kind().message().to_string()
+}
+
+pub(crate) fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bool {
     match value {
         AttributeValue::N(number) => match normalize_dynamodb_number_for_write(number) {
             Cow::Borrowed(_) => false,
@@ -321,9 +391,9 @@ fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bo
             }
             changed
         }
-        AttributeValue::L(values) => values
-            .iter_mut()
-            .any(normalize_attribute_value_numbers_for_write),
+        AttributeValue::L(values) => values.iter_mut().fold(false, |changed, value| {
+            normalize_attribute_value_numbers_for_write(value) | changed
+        }),
         AttributeValue::M(values) => normalize_attribute_map_numbers_for_write(values),
         _ => false,
     }
@@ -331,8 +401,10 @@ fn normalize_attribute_value_numbers_for_write(value: &mut AttributeValue) -> bo
 
 fn attribute_value_numbers_need_write_normalization(value: &AttributeValue) -> bool {
     match value {
-        AttributeValue::N(number) => number.contains(['e', 'E']),
-        AttributeValue::NS(values) => values.iter().any(|number| number.contains(['e', 'E'])),
+        AttributeValue::N(number) => number_needs_write_normalization(number),
+        AttributeValue::NS(values) => values
+            .iter()
+            .any(|number| number_needs_write_normalization(number)),
         AttributeValue::L(values) => values
             .iter()
             .any(attribute_value_numbers_need_write_normalization),
@@ -346,183 +418,58 @@ fn expand_scientific_number(value: &str) -> Option<String> {
     let exponent = exponent.parse::<i32>().ok()?;
     let negative = mantissa.starts_with('-');
     let mantissa = mantissa.trim_start_matches(['+', '-']);
-    let mut digits = String::new();
-    let mut fractional_digits = 0i32;
-    let mut after_decimal = false;
-    for character in mantissa.chars() {
-        match character {
-            '0'..='9' => {
-                digits.push(character);
-                if after_decimal {
-                    fractional_digits += 1;
-                }
-            }
-            '.' if !after_decimal => after_decimal = true,
-            _ => return None,
-        }
-    }
-    if digits.is_empty() {
+    let (integer, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digit_count = integer.len() + fractional.len();
+    if digit_count == 0
+        || !integer
+            .bytes()
+            .chain(fractional.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
+    let point = integer.len() as i64 + i64::from(exponent);
+    let prefix_zeroes = point.min(0).unsigned_abs() as usize;
+    let suffix_zeroes = (point - digit_count as i64).max(0) as usize;
+    let decimal_bytes = usize::from(point < digit_count as i64) + usize::from(point <= 0);
+    let sign = negative && !(digit_count == 1 && point == 1 && mantissa.contains('0'));
+    let output_bytes =
+        digit_count + prefix_zeroes + suffix_zeroes + decimal_bytes + usize::from(sign);
+    if output_bytes > DYNAMODB_WRITE_NUMBER_BYTES {
+        return None;
+    }
+    let mut output = String::with_capacity(output_bytes);
+    if sign {
+        output.push('-');
+    }
+    if point <= 0 {
+        output.push_str("0.");
+        append_zero_padding(&mut output, prefix_zeroes);
+    }
+    append_decimal_digits(&mut output, integer, fractional, point);
+    append_zero_padding(&mut output, suffix_zeroes);
+    Some(output)
+}
 
-    let decimal_position = digits.len() as i32 - fractional_digits + exponent;
-    let expanded = if decimal_position <= 0 {
-        format!(
-            "0.{}{}",
-            "0".repeat(decimal_position.unsigned_abs() as usize),
-            digits
-        )
-    } else if decimal_position as usize >= digits.len() {
-        format!(
-            "{}{}",
-            digits,
-            "0".repeat(decimal_position as usize - digits.len())
-        )
-    } else {
-        let split = decimal_position as usize;
-        let (integer, fractional) = digits.split_at(split);
-        format!("{integer}.{fractional}")
-    };
-
-    if negative && expanded != "0" {
-        Some(format!("-{expanded}"))
-    } else {
-        Some(expanded)
+fn append_decimal_digits(output: &mut String, integer: &str, fractional: &str, point: i64) {
+    for (index, byte) in integer.bytes().chain(fractional.bytes()).enumerate() {
+        if index > 0 && index as i64 == point {
+            output.push('.');
+        }
+        output.push(char::from(byte));
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ParsedDynamoNumber {
-    significant_digits: usize,
-    adjusted_exponent: i32,
-    is_zero: bool,
-}
-
-fn parse_dynamodb_number(value: &str) -> Result<ParsedDynamoNumber, String> {
-    if value.is_empty() {
-        return Err("The parameter cannot be converted to a numeric value".to_string());
+fn append_zero_padding(output: &mut String, zeroes: usize) {
+    for _ in 0..zeroes / DYNAMODB_NUMBER_ZERO_PADDING.len() {
+        output.push_str(DYNAMODB_NUMBER_ZERO_PADDING);
     }
-
-    let bytes = value.as_bytes();
-    let mut index = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
-    let mut integer_digits = 0usize;
-    let mut fractional_digits = 0usize;
-    let mut significant_digits = 0usize;
-    let mut first_significant_position = None;
-    let mut last_significant_position = None;
-    let mut saw_digit = false;
-
-    while let Some(byte) = bytes.get(index) {
-        match byte {
-            b'0'..=b'9' => {
-                saw_digit = true;
-                let digit = byte - b'0';
-                if digit != 0 || first_significant_position.is_some() {
-                    first_significant_position.get_or_insert(integer_digits);
-                    last_significant_position = Some(integer_digits);
-                    significant_digits += 1;
-                }
-                integer_digits += 1;
-                index += 1;
-            }
-            b'.' => {
-                index += 1;
-                break;
-            }
-            _ => break,
-        }
-    }
-
-    while let Some(byte) = bytes.get(index) {
-        match byte {
-            b'0'..=b'9' => {
-                saw_digit = true;
-                let digit = byte - b'0';
-                if digit != 0 || first_significant_position.is_some() {
-                    first_significant_position.get_or_insert(integer_digits);
-                    last_significant_position = Some(integer_digits);
-                    significant_digits += 1;
-                }
-                integer_digits += 1;
-                fractional_digits += 1;
-                index += 1;
-            }
-            _ => break,
-        }
-    }
-
-    if !saw_digit {
-        return Err("The parameter cannot be converted to a numeric value".to_string());
-    }
-
-    let mut exponent = 0i32;
-    if matches!(bytes.get(index), Some(b'e') | Some(b'E')) {
-        index += 1;
-        let exponent_sign = match bytes.get(index) {
-            Some(b'+') => {
-                index += 1;
-                1
-            }
-            Some(b'-') => {
-                index += 1;
-                -1
-            }
-            _ => 1,
-        };
-        let exponent_start = index;
-        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            index += 1;
-        }
-        if exponent_start == index {
-            return Err("The parameter cannot be converted to a numeric value".to_string());
-        }
-        exponent = value
-            .get(exponent_start..index)
-            .ok_or_else(|| "The parameter cannot be converted to a numeric value".to_string())?
-            .parse::<i32>()
-            .map_err(|_| "The parameter cannot be converted to a numeric value".to_string())?
-            * exponent_sign;
-    }
-
-    if index != bytes.len() {
-        return Err("The parameter cannot be converted to a numeric value".to_string());
-    }
-
-    let Some(last_significant_position) = last_significant_position else {
-        return Ok(ParsedDynamoNumber {
-            significant_digits: 1,
-            adjusted_exponent: 0,
-            is_zero: true,
-        });
-    };
-
-    significant_digits -= trailing_zero_count(value, last_significant_position);
-    let adjusted_exponent = last_significant_position as i32 - fractional_digits as i32 + exponent;
-    Ok(ParsedDynamoNumber {
-        significant_digits,
-        adjusted_exponent,
-        is_zero: false,
-    })
-}
-
-fn trailing_zero_count(value: &str, last_significant_position: usize) -> usize {
-    let mut position = 0usize;
-    let mut trailing_zeroes = 0usize;
-    for byte in value.bytes() {
-        match byte {
-            b'0' if position <= last_significant_position => {
-                trailing_zeroes += 1;
-                position += 1;
-            }
-            b'1'..=b'9' if position <= last_significant_position => {
-                trailing_zeroes = 0;
-                position += 1;
-            }
-            b'.' | b'+' | b'-' => {}
-            _ => break,
-        }
-    }
-    trailing_zeroes
+    // The ASCII padding and bounded remainder always form a valid string range.
+    output.extend(
+        DYNAMODB_NUMBER_ZERO_PADDING
+            .chars()
+            .take(zeroes % DYNAMODB_NUMBER_ZERO_PADDING.len()),
+    );
 }
 
 fn validate_binary_set(values: &[String]) -> Result<(), String> {
@@ -532,124 +479,50 @@ fn validate_binary_set(values: &[String]) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if contains_duplicate(values.iter().map(String::as_str)) {
+    if has_duplicate_members(values) {
         return Err(format!(
             "One or more parameter values were invalid: Input collection {}of type BS contains \
              duplicates.",
-            compact_quoted_collection(values)
+            format_quoted_collection(values, ",")
         ));
+    }
+    for value in values {
+        validate_binary(value)?;
     }
     Ok(())
 }
 
-fn contains_duplicate<'a>(values: impl Iterator<Item = &'a str>) -> bool {
-    let mut seen = HashSet::new();
-    values.into_iter().any(|value| !seen.insert(value))
-}
-
-fn quoted_collection(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| format!("\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-fn compact_quoted_collection(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|value| format!("\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn canonical_number_set_member(value: &str) -> String {
-    let (mantissa, exponent) = value
-        .split_once(['e', 'E'])
-        .map_or((value, 0), |(mantissa, exponent)| {
-            (mantissa, exponent.parse::<i32>().unwrap_or(0))
-        });
-    let mut chars = mantissa.chars();
-    let negative = matches!(chars.clone().next(), Some('-'));
-    if matches!(chars.clone().next(), Some('-' | '+')) {
-        let _ = chars.next();
-    }
-
-    let mut digits = Vec::new();
-    let mut fractional_digits = 0i32;
-    let mut after_decimal = false;
-    for ch in chars {
-        match ch {
-            '0'..='9' => {
-                digits.push(ch);
-                if after_decimal {
-                    fractional_digits += 1;
-                }
-            }
-            '.' if !after_decimal => after_decimal = true,
-            _ => {}
-        }
-    }
-
-    while matches!(digits.first(), Some('0')) {
-        digits.remove(0);
-    }
-    if digits.is_empty() {
-        return "0".to_string();
-    }
-
-    let mut scale = fractional_digits - exponent;
-    while scale < 0 {
-        digits.push('0');
-        scale += 1;
-    }
-    while scale > 0 && matches!(digits.last(), Some('0')) {
-        let _ = digits.pop();
-        scale -= 1;
-    }
-    if digits.is_empty() {
-        return "0".to_string();
-    }
-
-    format!(
-        "{}{}:{scale}",
-        if negative { "-" } else { "" },
-        digits.into_iter().collect::<String>()
-    )
-}
-
-fn attribute_value_size(value: &AttributeValue) -> usize {
-    match value {
-        AttributeValue::S(value) => value.len(),
-        AttributeValue::N(value) => dynamodb_number_size(value),
-        AttributeValue::B(value) => dynamodb_binary_size(value),
-        AttributeValue::SS(values) => values.iter().map(String::len).sum(),
-        AttributeValue::NS(values) => values.iter().map(|value| dynamodb_number_size(value)).sum(),
-        AttributeValue::BS(values) => values.iter().map(|value| dynamodb_binary_size(value)).sum(),
-        AttributeValue::BOOL(_) | AttributeValue::NULL(_) => 1,
-        AttributeValue::L(values) => {
-            3 + values.len() + values.iter().map(attribute_value_size).sum::<usize>()
-        }
-        AttributeValue::M(values) => {
-            3 + values.len()
-                + values
-                    .iter()
-                    .map(|(name, value)| name.len() + attribute_value_size(value))
-                    .sum::<usize>()
-        }
-    }
-}
-
-fn dynamodb_binary_size(value: &str) -> usize {
+fn validate_binary(value: &str) -> Result<(), String> {
     dynamodb_binary::decode_base64_string(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(value.len())
+        .map(|_| ())
+        .map_err(|err| format!("invalid base64 for DynamoDB binary field: {err}"))
+}
+
+fn has_duplicate_members(values: &[String]) -> bool {
+    let prefix = &values[..values.len().min(SMALL_SET_DUPLICATE_SCAN_LIMIT)];
+    let has_duplicate = prefix
+        .iter()
+        .enumerate()
+        .any(|(index, value)| prefix[..index].contains(value));
+    if has_duplicate || values.len() == prefix.len() {
+        return has_duplicate;
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    values.iter().any(|value| !seen.insert(value.as_str()))
+}
+
+fn format_quoted_collection(values: &[String], separator: &str) -> String {
+    let mut output = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push_str(separator);
+        }
+        output.push('"');
+        output.push_str(value);
+        output.push('"');
+    }
+    output.push(']');
+    output
 }
 
 pub(crate) fn dynamodb_number_size(value: &str) -> usize {

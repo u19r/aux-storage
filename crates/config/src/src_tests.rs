@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::{
     AppRole, Backends, ConfigError, DEFAULT_STORAGE_SQLITE_DB_PATH, RemoteCredentialsConfig,
     RemoteStaticCredentialsConfig, RootConfig, StorageApiLaunchConfig,
-    config_test_support::{temp_dir, write_config},
+    config_test_support_tests::{temp_dir, write_config},
     launch::collect_storage_admission_environment_overrides,
     load, load_optional_with_overrides,
 };
@@ -28,48 +28,10 @@ fn loads_storage_defaults() {
             .db_path,
         DEFAULT_STORAGE_SQLITE_DB_PATH
     );
-    assert_eq!(
-        loaded.root.features.read_sequence.mode,
-        crate::ReadSequenceExecutionMode::On
-    );
-    assert_eq!(loaded.root.features.read_sequence.shadow_sample_percent, 1);
 }
 
 #[test]
-fn read_sequence_rollout_modes_and_bounded_shadow_sampling_load() {
-    let file = write_config(json!({
-        "features": {
-            "read_sequence": {
-                "mode": "shadow",
-                "shadow_sample_percent": 37
-            }
-        }
-    }));
-
-    let loaded = load(file.path()).expect("load ReadSequence rollout config");
-
-    assert_eq!(
-        loaded.root.features.read_sequence.mode,
-        crate::ReadSequenceExecutionMode::Shadow
-    );
-    assert_eq!(loaded.root.features.read_sequence.shadow_sample_percent, 37);
-}
-
-#[test]
-fn read_sequence_rollout_rejects_unknown_mode_and_unbounded_sample() {
-    let unknown_mode = write_config(json!({
-        "features": {"read_sequence": {"mode": "experimental"}}
-    }));
-    assert!(load(unknown_mode.path()).is_err());
-
-    let unbounded_sample = write_config(json!({
-        "features": {"read_sequence": {"shadow_sample_percent": 101}}
-    }));
-    load(unbounded_sample.path()).expect_err("sample above 100 must fail");
-}
-
-#[test]
-fn foundationdb_cache_read_version_defaults_to_fifty_milliseconds() {
+fn foundationdb_cache_read_version_is_disabled_by_default() {
     let file = write_config(json!({
         "features": {
             "backends": {
@@ -89,7 +51,7 @@ fn foundationdb_cache_read_version_defaults_to_fifty_milliseconds() {
             .as_ref()
             .expect("FoundationDB backend")
             .cache_read_version_ms,
-        50
+        0
     );
 }
 
@@ -353,27 +315,6 @@ fn cli_overrides_apply() {
 }
 
 #[test]
-fn cli_overrides_parse_json_values_before_merging() {
-    let loaded = load_optional_with_overrides(
-        None,
-        &[
-            (
-                "features.storage_point_read_cache.enabled".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "features.storage_point_read_cache.capacity".to_string(),
-                "12".to_string(),
-            ),
-        ],
-    )
-    .expect("load override");
-
-    assert!(loaded.root.features.storage_point_read_cache.enabled);
-    assert_eq!(loaded.root.features.storage_point_read_cache.capacity, 12);
-}
-
-#[test]
 fn cli_overrides_reject_empty_path_segments() {
     let error = load_optional_with_overrides(
         None,
@@ -415,60 +356,6 @@ fn metrics_config_defaults_to_enabled() {
     let loaded = load_optional_with_overrides(None, &[]).expect("load defaults");
 
     assert!(loaded.root.features.metrics.enabled);
-    assert!(
-        loaded
-            .root
-            .features
-            .metrics
-            .prometheus
-            .bearer_token
-            .is_none()
-    );
-}
-
-#[test]
-fn metrics_config_accepts_prometheus_bearer_token() {
-    let file = write_config(json!({
-        "features": {
-            "metrics": {
-                "enabled": true,
-                "prometheus": {
-                    "bearer_token": "metrics-token"
-                }
-            }
-        }
-    }));
-
-    let loaded = load(file.path()).expect("load metrics config");
-
-    assert_eq!(
-        loaded
-            .root
-            .features
-            .metrics
-            .prometheus
-            .bearer_token
-            .as_deref(),
-        Some("metrics-token")
-    );
-}
-
-#[test]
-fn metrics_config_rejects_empty_prometheus_bearer_token() {
-    let file = write_config(json!({
-        "features": {
-            "metrics": {
-                "prometheus": {
-                    "bearer_token": ""
-                }
-            }
-        }
-    }));
-
-    let error = load(file.path()).expect_err("empty metrics token should fail");
-
-    assert!(matches!(error, ConfigError::Validation { message }
-        if message.contains("features.metrics.prometheus.bearer_token")));
 }
 
 #[test]
@@ -551,38 +438,6 @@ fn job_jitter_is_capped_at_one_hundred_percent() {
 }
 
 #[test]
-fn point_read_cache_capacity_must_leave_room_for_entries() {
-    let file = write_config(json!({
-        "features": {
-            "storage_point_read_cache": {
-                "capacity": 0
-            }
-        }
-    }));
-
-    let error = load(file.path()).expect_err("zero cache capacity should fail");
-
-    assert!(matches!(error, ConfigError::Validation { message }
-        if message.contains("features.storage_point_read_cache.capacity must be greater than 0")));
-}
-
-#[test]
-fn point_read_cache_byte_limit_must_be_positive_when_set() {
-    let file = write_config(json!({
-        "features": {
-            "storage_point_read_cache": {
-                "max_bytes": 0
-            }
-        }
-    }));
-
-    let error = load(file.path()).expect_err("zero cache byte limit should fail");
-
-    assert!(matches!(error, ConfigError::Validation { message }
-        if message.contains("features.storage_point_read_cache.max_bytes must be greater than 0")));
-}
-
-#[test]
 fn storage_connection_registry_must_name_an_existing_default_connection() {
     let file = write_config(json!({
         "features": {
@@ -659,35 +514,6 @@ fn storage_connection_registry_validates_each_connection_backend_selection() {
     let error = load(file.path()).expect_err("connection without backend should fail");
 
     assert!(matches!(error, ConfigError::Validation { .. }));
-}
-
-#[test]
-fn point_read_cache_budget_loads_fixed_bytes_inside_mode() {
-    let file = write_config(json!({
-        "features": {
-            "storage_point_read_cache": {
-                "memory_budget": {
-                    "mode": {
-                        "fixed_bytes": {
-                            "bytes": 4096
-                        }
-                    }
-                }
-            }
-        }
-    }));
-
-    let loaded = load(file.path()).expect("load fixed byte budget");
-
-    assert_eq!(
-        loaded
-            .root
-            .features
-            .storage_point_read_cache
-            .memory_budget
-            .mode,
-        crate::StoragePointReadCacheMemoryBudgetMode::FixedBytes { bytes: 4096 }
-    );
 }
 
 #[test]
@@ -1005,4 +831,15 @@ fn storage_admission_environment_rejects_zero_except_queue_capacity() {
     })
     .expect("zero queue capacity is valid");
     assert_eq!(overrides[0].1, "0");
+}
+
+#[test]
+fn given_retired_replication_config_when_loaded_then_rejected() {
+    for value in [
+        json!({"features": {"storage_sync_replication": {"enabled": false}}}),
+        json!({"jobs": {"storage_replication": {"enabled": false}}}),
+    ] {
+        let file = write_config(value);
+        assert!(load(file.path()).is_err());
+    }
 }

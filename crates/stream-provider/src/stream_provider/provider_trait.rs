@@ -1,21 +1,26 @@
 //! Stream provider for DynamoDB-compatible change streams.
-use std::collections::HashMap;
-
 use async_trait::async_trait;
-use futures::StreamExt;
 use storage_types::{
-    AttributeValue, DurationSeconds, ItemStreamVersion, KeySchemaElement, StreamItemId, StreamName,
-    StreamRecord, UserStreamName,
+    AttributeMap, DurationSeconds, ItemStreamVersion, KeyAttributes, KeySchemaElement,
+    StreamItemId, StreamName, StreamRecord, UserStreamName,
 };
 
+use super::pointer_read::{PointerReadPurpose, PointerStreamRead};
 use crate::{
     constants::STREAM_LIMITS,
     errors::{StreamError, StreamInternalKind, StreamResult, StreamValidationKind},
     newtypes::CursorName,
+    protected_cursor::{
+        BootstrapCursorName, ProtectedCursorAdvanceRequest, ProtectedCursorPage,
+        ProtectedCursorReadRequest,
+    },
+    system_stream::{
+        SystemStreamLineage, SystemStreamPage, SystemStreamPageRequest, SystemStreamSplitRequest,
+        SystemStreamSplitResult,
+    },
     types::{
         CursorPage, CursorPosition, PointerRecordsResult, StoredStreamPointer, Stream,
         StreamCursor, StreamDataType, StreamItem, StreamPage, StreamPartitioningMode,
-        StreamPointer,
     },
 };
 
@@ -70,6 +75,62 @@ pub trait StreamProvider: Send + Sync {
         limit: u32,
     ) -> StreamResult<StreamPage>;
 
+    /// Read one logical SystemStream page.  Providers that do not own a
+    /// logical scope/frontier inherit the fail-closed contract; the SQLite
+    /// reference provider implements the transaction and issued-token catalog
+    /// behind this boundary.
+    async fn get_system_stream_page(
+        &self,
+        _request: SystemStreamPageRequest,
+    ) -> StreamResult<SystemStreamPage> {
+        Err(StreamError::from(storage_types::StorageError::unsupported(
+            "SystemStream logical lineage is unavailable from this backend",
+        )))
+    }
+
+    /// Return the provider's logical lineage catalog.  This is primarily a
+    /// conformance/readiness seam; public records contain positions, never
+    /// physical provider identifiers.
+    async fn system_stream_lineage_catalog(
+        &self,
+        _source_scope: storage_types::SystemStreamScope,
+    ) -> StreamResult<Vec<SystemStreamLineage>> {
+        Err(StreamError::from(storage_types::StorageError::unsupported(
+            "SystemStream logical lineage is unavailable from this backend",
+        )))
+    }
+
+    /// Return the database-owned logical SystemStream scope. This is a
+    /// discovery seam for internal clients; records still validate the scope
+    /// supplied by each page request.
+    async fn system_stream_scope(&self) -> StreamResult<storage_types::SystemStreamScope> {
+        Err(StreamError::from(storage_types::StorageError::unsupported(
+            "SystemStream logical scope is unavailable from this backend",
+        )))
+    }
+
+    /// Atomically split one logical SystemStream lineage.
+    ///
+    /// A provider must compare the complete request with the durable
+    /// operation receipt before reading or writing split state. An exact
+    /// receipt is returned as `Replayed`; an unknown operation with any
+    /// partial child publication is rejected. A fresh operation must use one
+    /// native transaction that records the receipt before applying effects,
+    /// seals the exact active parent with a scope/generation/lineage write
+    /// fence, creates both child catalog rows and initialized sequences, and
+    /// publishes private routing/topology.
+    /// Existing checkpoints remain immutable and a sealed parent is never
+    /// appendable. The result may contain only logical identities and must be
+    /// returned after the transaction commits; page requests are unchanged.
+    async fn split_system_stream(
+        &self,
+        _request: SystemStreamSplitRequest,
+    ) -> StreamResult<SystemStreamSplitResult> {
+        Err(StreamError::from(storage_types::StorageError::unsupported(
+            "SystemStream logical split is unavailable from this backend",
+        )))
+    }
+
     /// Decode a provider-owned stream pointer into its logical representation.
     async fn decode_stored_stream_pointer(
         &self,
@@ -83,35 +144,42 @@ pub trait StreamProvider: Send + Sync {
         })
     }
 
-    async fn read_item_stream_backward_from_version(
-        &self,
-        stream_name: StreamName,
-        exclusive_start_version: ItemStreamVersion,
-        limit: u32,
-    ) -> StreamResult<StreamPage> {
-        self.read_backward(
-            stream_name,
-            Some(StreamItemId::from(exclusive_start_version)),
-            limit,
-        )
-        .await
-    }
-
     async fn read_item_stream_backward_from_pointer(
         &self,
-        stream_name: StreamName,
+        history: storage_types::ItemHistoryAddress,
         pointer_stream_item_id: StreamItemId,
         target_item_stream_version: ItemStreamVersion,
         limit: u32,
     ) -> StreamResult<StreamPage> {
-        let _ = pointer_stream_item_id;
-        let Some(next_version) = target_item_stream_version.checked_increment() else {
+        let page = self
+            .read_item_history(
+                history,
+                Some(StreamItemId::from(target_item_stream_version).increment()),
+                limit,
+            )
+            .await?;
+        if page.items.first().map(|item| item.id)
+            != Some(StreamItemId::from(target_item_stream_version))
+        {
             return Err(StreamError::internal_with_detail(
                 StreamInternalKind::ParseStreamPointer,
-                "item stream version overflow",
+                format_args!(
+                    "pointer {pointer_stream_item_id} targets missing item version \
+                     {target_item_stream_version}"
+                ),
             ));
-        };
-        self.read_item_stream_backward_from_version(stream_name, next_version, limit)
+        }
+        Ok(page)
+    }
+
+    /// Read physical history using the identity retained by a stored pointer.
+    async fn read_item_history(
+        &self,
+        history: storage_types::ItemHistoryAddress,
+        exclusive_start: Option<StreamItemId>,
+        limit: u32,
+    ) -> StreamResult<StreamPage> {
+        self.read_backward(history.physical_stream_name(), exclusive_start, limit)
             .await
     }
 
@@ -138,6 +206,74 @@ pub trait StreamProvider: Send + Sync {
         limit: u32,
     ) -> StreamResult<CursorPage>;
 
+    /// Read a bootstrap page under the provider-owned protected cursor.
+    ///
+    /// Implementations must authenticate the cursor identity, boundary, and
+    /// current position in one native/consistent operation. A default is not
+    /// provided because an unverified empty page must never authorize
+    /// activation.
+    async fn read_from_protected_cursor(
+        &self,
+        _request: ProtectedCursorReadRequest,
+    ) -> StreamResult<ProtectedCursorPage> {
+        Err(StreamError::continuity(
+            crate::StreamContinuityKind::Unsupported,
+            "provider has no protected cursor implementation",
+        ))
+    }
+
+    /// Atomically create or reconcile a typed bootstrap cursor and return its
+    /// authoritative retained position. Generic cursor operations must not be
+    /// used to acquire bootstrap retention authority.
+    async fn create_protected_cursor(
+        &self,
+        _stream_name: StreamName,
+        _cursor_name: BootstrapCursorName,
+        _position: CursorPosition,
+    ) -> StreamResult<StreamCursor> {
+        Err(StreamError::continuity(
+            crate::StreamContinuityKind::Unsupported,
+            "provider has no protected cursor creation implementation",
+        ))
+    }
+
+    /// Read a typed bootstrap cursor for restart reconciliation. Generic
+    /// cursor reads must not be used to recover protected retention state.
+    async fn get_protected_cursor(
+        &self,
+        _stream_name: StreamName,
+        _cursor_name: BootstrapCursorName,
+    ) -> StreamResult<Option<StreamCursor>> {
+        Err(StreamError::continuity(
+            crate::StreamContinuityKind::Unsupported,
+            "provider has no protected cursor reconciliation implementation",
+        ))
+    }
+
+    /// Atomically authenticate and monotonically advance a protected cursor.
+    async fn advance_protected_cursor(
+        &self,
+        _request: ProtectedCursorAdvanceRequest,
+    ) -> StreamResult<StreamItemId> {
+        Err(StreamError::continuity(
+            crate::StreamContinuityKind::Unsupported,
+            "provider has no protected cursor advance implementation",
+        ))
+    }
+
+    /// Delete a typed bootstrap cursor after its steady-state checkpoint is
+    /// durable. Generic deletion must not be able to remove protected state.
+    async fn delete_protected_cursor(
+        &self,
+        _stream_name: StreamName,
+        _cursor_name: BootstrapCursorName,
+    ) -> StreamResult<()> {
+        Err(StreamError::continuity(
+            crate::StreamContinuityKind::Unsupported,
+            "provider has no protected cursor deletion implementation",
+        ))
+    }
+
     /// Advance the cursor position to a specific item
     async fn advance_cursor(
         &self,
@@ -155,28 +291,17 @@ pub trait StreamProvider: Send + Sync {
 
     fn get_key_attributes(
         &self,
-        item: &HashMap<String, AttributeValue>,
+        item: &AttributeMap,
         key_schema: &[KeySchemaElement],
-    ) -> StreamResult<HashMap<String, AttributeValue>> {
-        let mut key_attributes = HashMap::new();
-
-        for (attr_name, attr_value) in item {
-            let key_attribute = key_schema.iter().any(|i| *attr_name == i.attribute_name);
-
-            if key_attribute {
-                key_attributes.insert(attr_name.clone(), attr_value.clone());
-            }
+    ) -> StreamResult<KeyAttributes> {
+        let mut keys = KeyAttributes::with_capacity(key_schema.len());
+        for schema_key in key_schema {
+            let value = item.get(&schema_key.attribute_name).ok_or_else(|| {
+                StreamError::internal(StreamInternalKind::InvalidOrMissingKeyAttribute)
+            })?;
+            keys.insert(schema_key.attribute_name.clone(), value.clone());
         }
-
-        for table_schema_key in key_schema {
-            if !key_attributes.contains_key(&table_schema_key.attribute_name) {
-                return Err(StreamError::internal(
-                    StreamInternalKind::InvalidOrMissingKeyAttribute,
-                ));
-            }
-        }
-
-        Ok(key_attributes)
+        Ok(keys)
     }
 
     async fn get_items_from_pointer_stream(
@@ -185,160 +310,43 @@ pub trait StreamProvider: Send + Sync {
         starting_item_id: Option<StreamItemId>,
         limit: Option<u32>,
     ) -> StreamResult<PointerRecordsResult> {
-        let item_pointers = self
-            .read_forward(
-                pointer_stream_name.clone(),
-                starting_item_id,
-                STREAM_LIMITS.clamp(limit),
-            )
-            .await?;
-
-        let mut tasks = Vec::new();
-        let mut task_order = Vec::new();
-
-        for pointer_item in item_pointers.items {
-            let pointer_stream_name_dbg: String = (&pointer_stream_name).into();
-            let stored_pointer = storage_types::storage_serde::from_bytes::<StoredStreamPointer>(
-                pointer_item.data.as_slice(),
-            )
-            .map_err(|e| {
-                tracing::error!(
-                    pointer_stream = %pointer_stream_name_dbg,
-                    pointer_id = %pointer_item.id,
-                    error = %e,
-                    "failed to parse stream pointer"
-                );
-                StreamError::internal_with_detail(
-                    StreamInternalKind::ParseStreamPointer,
-                    format_args!(
-                        "pointer {} in {}: {e}",
-                        pointer_item.id, pointer_stream_name_dbg
-                    ),
-                )
-            })?;
-            match stored_pointer {
-                StoredStreamPointer::Embedded {
-                    stream_name,
-                    table_name,
-                    item_stream_version,
-                    items,
-                    indexers,
-                    old_indexers,
-                    ..
-                } => {
-                    let pointer = StreamPointer {
-                        stream_name,
-                        table_name,
-                        item_stream_version,
-                        stream_item_id: pointer_item.id,
-                        indexers,
-                        old_indexers,
-                    };
-                    let embedded_items = items
-                        .into_iter()
-                        .map(|item| StreamItem {
-                            id: pointer_item.id,
-                            stream_name: None,
-                            data: item.data,
-                            data_type: item.data_type,
-                            created_at: pointer_item.created_at,
-                        })
-                        .collect::<Vec<_>>();
-                    task_order.push(TaskSlot::Ready((pointer, embedded_items)));
-                }
-                StoredStreamPointer::Pointer {
-                    stream_name,
-                    table_name,
-                    item_stream_version,
-                    indexers,
-                    old_indexers,
-                    ..
-                } => {
-                    let pointer = StreamPointer {
-                        stream_name,
-                        table_name,
-                        item_stream_version,
-                        stream_item_id: pointer_item.id,
-                        indexers,
-                        old_indexers,
-                    };
-                    let task = async move {
-                        let target_stream_dbg: String = (&pointer.stream_name).into();
-                        tracing::debug!(
-                            table = %pointer.table_name,
-                            pointer_stream = %pointer_stream_name_dbg,
-                            target_stream = %target_stream_dbg,
-                            pointer_id = %pointer.stream_item_id,
-                            target_version = %pointer.item_stream_version,
-                            "stream-provider: fetching item images for pointer"
-                        );
-                        let items = self
-                            .read_item_stream_backward_from_pointer(
-                                pointer.stream_name.clone(),
-                                pointer.stream_item_id,
-                                pointer.item_stream_version,
-                                2,
-                            )
-                            .await;
-
-                        match &items {
-                            Ok(page) => {
-                                let types: Vec<_> =
-                                    page.items.iter().map(|i| i.data_type).collect();
-                                tracing::debug!(
-                                    target_stream = %target_stream_dbg,
-                                    types = ?types,
-                                    len = page.items.len(),
-                                    "stream-provider: fetched item images"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    target_stream = %target_stream_dbg,
-                                    error = %e,
-                                    "stream-provider: error fetching item images"
-                                );
-                            }
-                        }
-
-                        (pointer, items)
-                    };
-                    let idx = tasks.len();
-                    tasks.push(task);
-                    task_order.push(TaskSlot::Pending(idx));
-                }
-            }
+        PointerStreamRead {
+            provider: self,
+            purpose: PointerReadPurpose::Direct,
         }
-        let mut results = futures::stream::iter(tasks)
-            .buffered(32)
+        .read(pointer_stream_name, starting_item_id, limit)
+        .await
+    }
+
+    /// Read a pointer stream for a durable background consumer.
+    ///
+    /// Historical pointers remain valid after newer images are published.
+    /// Referenced images use the same exact-target reader as direct reads.
+    /// Providers can override this method to omit deleted table incarnations
+    /// when their background consumer contract permits that omission.
+    async fn get_items_from_pointer_stream_for_background(
+        &self,
+        pointer_stream_name: StreamName,
+        starting_item_id: Option<StreamItemId>,
+        limit: Option<u32>,
+    ) -> StreamResult<PointerRecordsResult> {
+        PointerStreamRead {
+            provider: self,
+            purpose: PointerReadPurpose::Background,
+        }
+        .read(pointer_stream_name, starting_item_id, limit)
+        .await
+    }
+
+    /// Decode a background record. A provider may omit a deleted source when
+    /// its durable consumer contract allows that omission.
+    async fn decode_stored_stream_pointer_for_background(
+        &self,
+        pointer_item: &StreamItem,
+    ) -> StreamResult<Option<StoredStreamPointer>> {
+        self.decode_stored_stream_pointer(pointer_item)
+            .await
             .map(Some)
-            .collect::<Vec<_>>()
-            .await;
-
-        let last_scanned_key = item_pointers.last_evaluated_key;
-        let last_evaluated_key = item_pointers.has_more.then_some(last_scanned_key).flatten();
-
-        Ok(PointerRecordsResult {
-            last_evaluated_key,
-            last_scanned_key,
-            has_more: item_pointers.has_more,
-            records: task_order
-                .into_iter()
-                .map(|slot| match slot {
-                    TaskSlot::Ready(record) => Ok(record),
-                    TaskSlot::Pending(index) => {
-                        let (stream_pointer, stream_page_result) =
-                            results[index].take().ok_or_else(|| {
-                                StreamError::internal_with_detail(
-                                    StreamInternalKind::ParseStreamPointer,
-                                    "pointer resolution result was consumed twice",
-                                )
-                            })?;
-                        Ok((stream_pointer, stream_page_result?.items))
-                    }
-                })
-                .collect::<StreamResult<Vec<_>>>()?,
-        })
     }
 
     async fn get_stream_records_from_pointer_stream(
@@ -360,30 +368,14 @@ pub trait StreamProvider: Send + Sync {
         let mut image_items = Vec::new();
 
         for (pointer, item_data) in results {
-            let first_type = item_data.first().map(|i| i.data_type);
-            let second_type = item_data.get(1).map(|i| i.data_type);
-            tracing::debug!(
-                table = %pointer.table_name,
-                ptr_id = %pointer.stream_item_id,
-                first_type = ?first_type,
-                second_type = ?second_type,
-                count = item_data.len(),
-                "stream-provider: processing pointer images"
-            );
-
             let new_image = item_data.first();
             let old_image = item_data.get(1);
             let Some(new_image) = new_image else {
-                tracing::debug!(
-                    table = %pointer.table_name,
-                    ptr_id = %pointer.stream_item_id,
-                    "stream-provider: pointer target image is missing; skipping"
-                );
                 continue;
             };
 
-            let mut record_old_image: Option<HashMap<String, AttributeValue>> = None;
-            let mut record_new_image: Option<HashMap<String, AttributeValue>> = None;
+            let mut record_old_image: Option<AttributeMap> = None;
+            let mut record_new_image: Option<AttributeMap> = None;
 
             if !matches!(new_image.data_type, StreamDataType::DeleteMarker) {
                 record_new_image = Some(
@@ -403,44 +395,15 @@ pub trait StreamProvider: Send + Sync {
                 );
             }
 
-            if let Some(ref img) = record_new_image {
-                let new_keys: Vec<_> = img.keys().cloned().collect();
-                tracing::debug!(
-                    ptr_id = %pointer.stream_item_id,
-                    new_keys = ?new_keys,
-                    "stream-provider: decoded new image keys"
-                );
-            }
-            if let Some(ref img) = record_old_image {
-                let old_keys: Vec<_> = img.keys().cloned().collect();
-                tracing::debug!(
-                    ptr_id = %pointer.stream_item_id,
-                    old_keys = ?old_keys,
-                    "stream-provider: decoded old image keys"
-                );
-            }
-
             let item_for_key = match (&record_old_image, &record_new_image) {
                 (Some(_) | None, Some(new)) => new,
                 (Some(old), None) => old,
                 (None, None) => {
-                    tracing::debug!(
-                        ptr_id = %pointer.stream_item_id,
-                        "stream-provider: both images were DeleteMarker or missing; skipping"
-                    );
                     continue;
                 }
             };
 
             let keys = self.get_key_attributes(item_for_key, key_schema)?;
-            let key_names: Vec<_> = keys.keys().cloned().collect();
-            tracing::debug!(
-                ptr_id = %pointer.stream_item_id,
-                keys = ?key_names,
-                has_old = %record_old_image.is_some(),
-                has_new = %record_new_image.is_some(),
-                "stream-provider: built stream record"
-            );
 
             let stream_record = StreamRecord {
                 cursor: Some(pointer.stream_item_id.to_string()),
@@ -449,6 +412,7 @@ pub trait StreamProvider: Send + Sync {
                 sequence_number: pointer.stream_item_id.to_string(),
                 old_image: record_old_image,
                 new_image: record_new_image,
+                system_position: None,
             };
 
             image_items.push(stream_record);
@@ -459,18 +423,4 @@ pub trait StreamProvider: Send + Sync {
 
         Ok((image_items, checkpoint_pointer))
     }
-
-    /// Start the background TTL cleanup task
-    async fn start_cleanup_task(&self, parallelism: usize) -> StreamResult<()>;
-
-    /// Stop the background TTL cleanup task
-    async fn stop_cleanup_task(&self) -> StreamResult<()>;
-
-    /// Perform cleanup for streams with TTL (called by background task)
-    async fn cleanup_expired_items(&self) -> StreamResult<u64>;
-}
-
-enum TaskSlot {
-    Ready((StreamPointer, Vec<StreamItem>)),
-    Pending(usize),
 }

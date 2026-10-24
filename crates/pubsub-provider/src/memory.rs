@@ -7,67 +7,173 @@ use async_trait::async_trait;
 use storage_types::TimestampMillis;
 
 use crate::{
-    ClaimDeliveryRecordsRequest, ClaimDeliveryRecordsResponse, ConfirmSubscriptionRequest,
-    ConfirmSubscriptionResponse, CreateTopicRequest, DeliveryRecord, DeliveryRecordId,
-    GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse, GetTopicAttributesRequest,
-    GetTopicAttributesResponse, ListSubscriptionsRequest, ListSubscriptionsResponse,
-    ListTopicsRequest, ListTopicsResponse, PubsubError, PubsubInternalKind, PubsubProvider,
-    PubsubResult, PubsubValidationKind, SetSubscriptionAttributesRequest,
-    SetTopicAttributesRequest, SubscribeRequest, Subscription, SubscriptionArn,
-    SubscriptionConfirmation, Topic, TopicArn,
+    AcceptedPublication, ClaimDeliveryRecordsRequest, ClaimDeliveryRecordsResponse,
+    ClaimedPublishChunk, ConfirmSubscriptionRequest, ConfirmSubscriptionResponse, DeliveryRecord,
+    DeliveryRecordId, DeliveryRecordUpdate, GetTopicAttributesRequest, GetTopicAttributesResponse,
+    ListSubscriptionsRequest, ListSubscriptionsResponse, ListTopicsRequest, ListTopicsResponse,
+    PublishChunkClaimRequest, PublishChunkCommit, PublishIntent, PubsubAttributeRepository,
+    PubsubDeliveryRepository, PubsubError, PubsubInternalKind, PubsubPublicationRepository,
+    PubsubPublishAcceptanceRepository, PubsubResult, PubsubRuntimeRepository,
+    PubsubSubscriptionRepository, PubsubTopicRepository, PubsubValidationKind,
+    SetSubscriptionAttributesRequest, SetTopicAttributesRequest, Subscription,
+    SubscriptionAcceptanceInput, SubscriptionArn, SubscriptionConfirmation, Topic, TopicArn,
 };
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InMemoryPubsubProvider {
     state: Mutex<InMemoryPubsubState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct InMemoryPubsubState {
     topics: HashMap<TopicArn, Topic>,
     subscriptions: HashMap<SubscriptionArn, Subscription>,
     deliveries: HashMap<String, DeliveryRecord>,
+    snapshot_chunks: HashMap<(String, u32), Vec<Subscription>>,
+    publish_intents: HashMap<String, PublishIntent>,
 }
 
 #[async_trait]
-impl PubsubProvider for InMemoryPubsubProvider {
-    async fn initialize(&self) -> PubsubResult<()> {
-        Ok(())
-    }
-
-    async fn create_topic(&self, request: CreateTopicRequest) -> PubsubResult<Topic> {
+impl PubsubPublicationRepository for InMemoryPubsubProvider {
+    async fn persist_accepted_publication(
+        &self,
+        publication: AcceptedPublication,
+    ) -> PubsubResult<()> {
         let mut state = self.state()?;
-        if let Some(topic) = state
-            .topics
-            .values()
-            .find(|topic| topic.name == request.name)
-            .cloned()
+        let AcceptedPublication { snapshot, intent } = publication;
+        let generation = snapshot.root.generation.to_string();
+        if let Some(stored) = state
+            .publish_intents
+            .get(&intent.acceptance.message_id.to_string())
         {
-            return Ok(topic);
+            return if stored == &intent {
+                Ok(())
+            } else {
+                Err(PubsubError::storage(
+                    "publish message id already belongs to another intent",
+                ))
+            };
         }
-        let topic = Topic {
-            topic_arn: TopicArn::compose("aws", "us-east-1", "000000000000", &request.name),
-            name: request.name,
-            display_name: request.attributes.get("DisplayName").cloned(),
-            created_at: TimestampMillis::now(),
-        };
-        state.topics.insert(topic.topic_arn.clone(), topic.clone());
-        Ok(topic)
-    }
-
-    async fn delete_topic(&self, topic_arn: &TopicArn) -> PubsubResult<()> {
-        let mut state = self.state()?;
-        state.topics.remove(topic_arn);
+        for (index, subscriptions) in snapshot.chunks.iter().enumerate() {
+            let index =
+                u32::try_from(index).map_err(|error| PubsubError::storage(error.to_string()))?;
+            if state
+                .snapshot_chunks
+                .get(&(generation.clone(), index))
+                .is_some_and(|stored| stored != subscriptions)
+            {
+                return Err(PubsubError::storage(
+                    "publish snapshot generation already contains different subscriptions",
+                ));
+            }
+        }
+        for (index, subscriptions) in snapshot.chunks.into_iter().enumerate() {
+            let index =
+                u32::try_from(index).map_err(|error| PubsubError::storage(error.to_string()))?;
+            state
+                .snapshot_chunks
+                .insert((generation.clone(), index), subscriptions);
+        }
         state
-            .subscriptions
-            .retain(|_, subscription| &subscription.topic_arn != topic_arn);
+            .publish_intents
+            .insert(intent.acceptance.message_id.to_string(), intent);
         Ok(())
     }
 
-    async fn get_topic(&self, topic_arn: &TopicArn) -> PubsubResult<Option<Topic>> {
-        Ok(self.state()?.topics.get(topic_arn).cloned())
+    async fn claim_publish_chunks(
+        &self,
+        request: PublishChunkClaimRequest,
+    ) -> PubsubResult<Vec<ClaimedPublishChunk>> {
+        let mut state = self.state()?;
+        let mut keys = state.publish_intents.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let limit = usize::from(request.limit);
+        let mut claims = Vec::with_capacity(limit.min(keys.len()));
+        for key in keys.into_iter().take(limit) {
+            let Some(mut intent) = state.publish_intents.remove(&key) else {
+                continue;
+            };
+            if intent
+                .lease_expires_at
+                .is_some_and(|lease_expires_at| lease_expires_at > request.now)
+            {
+                state.publish_intents.insert(key, intent);
+                continue;
+            }
+            intent.lease_expires_at = Some(TimestampMillis::from_timestamp(
+                request
+                    .now
+                    .timestamp_millis()
+                    .saturating_add(crate::PUBLISH_INTENT_LEASE_MILLIS),
+            ));
+            let chunk_key = (intent.snapshot.generation.to_string(), intent.next_chunk);
+            let subscriptions = if intent.snapshot.chunk_count == 0 {
+                Vec::new()
+            } else {
+                state
+                    .snapshot_chunks
+                    .get(&chunk_key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PubsubError::storage("in-memory publish snapshot chunk is missing")
+                    })?
+            };
+            state.publish_intents.insert(key, intent.clone());
+            claims.push(ClaimedPublishChunk {
+                intent,
+                subscriptions,
+            });
+        }
+        Ok(claims)
     }
 
+    async fn commit_publish_chunk(&self, commit: PublishChunkCommit) -> PubsubResult<()> {
+        let mut state = self.state()?;
+        let intent_key = commit.claimed_intent.acceptance.message_id.to_string();
+        let Some(current) = state.publish_intents.get(&intent_key) else {
+            return Ok(());
+        };
+        if current.lease_expires_at != commit.claimed_intent.lease_expires_at
+            || current.next_chunk != commit.claimed_intent.next_chunk
+        {
+            return Err(PubsubError::storage(
+                "in-memory publish intent claim was lost",
+            ));
+        }
+        for record in commit.records {
+            state
+                .deliveries
+                .entry(record.id.0.clone())
+                .or_insert(record);
+        }
+        match commit.next_intent {
+            Some(intent) => {
+                state.publish_intents.insert(intent_key, intent);
+            }
+            None => {
+                state.publish_intents.remove(&intent_key);
+                let generation = commit.claimed_intent.snapshot.generation.to_string();
+                state
+                    .snapshot_chunks
+                    .retain(|(stored_generation, _), _| stored_generation != &generation);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PubsubRuntimeRepository for InMemoryPubsubProvider {
+    async fn initialize_pubsub(&self) -> PubsubResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PubsubPublishAcceptanceRepository for InMemoryPubsubProvider {}
+
+#[async_trait]
+impl PubsubAttributeRepository for InMemoryPubsubProvider {
     async fn get_topic_attributes(
         &self,
         request: GetTopicAttributesRequest,
@@ -92,6 +198,36 @@ impl PubsubProvider for InMemoryPubsubProvider {
             attributes: topic.attributes(confirmed, pending),
         })
     }
+}
+
+#[async_trait]
+impl PubsubTopicRepository for InMemoryPubsubProvider {
+    async fn create_topic(&self, topic: Topic) -> PubsubResult<Topic> {
+        let mut state = self.state()?;
+        if let Some(topic) = state
+            .topics
+            .values()
+            .find(|stored| stored.name == topic.name)
+            .cloned()
+        {
+            return Ok(topic);
+        }
+        state.topics.insert(topic.topic_arn.clone(), topic.clone());
+        Ok(topic)
+    }
+
+    async fn delete_topic(&self, topic_arn: &TopicArn) -> PubsubResult<()> {
+        let mut state = self.state()?;
+        state.topics.remove(topic_arn);
+        state
+            .subscriptions
+            .retain(|_, subscription| &subscription.topic_arn != topic_arn);
+        Ok(())
+    }
+
+    async fn get_topic(&self, topic_arn: &TopicArn) -> PubsubResult<Option<Topic>> {
+        Ok(self.state()?.topics.get(topic_arn).cloned())
+    }
 
     async fn set_topic_attributes(
         &self,
@@ -115,41 +251,45 @@ impl PubsubProvider for InMemoryPubsubProvider {
             next_token: None,
         })
     }
+}
 
-    async fn create_subscription(&self, request: SubscribeRequest) -> PubsubResult<Subscription> {
+#[async_trait]
+impl PubsubSubscriptionRepository for InMemoryPubsubProvider {
+    async fn create_subscription(
+        &self,
+        input: SubscriptionAcceptanceInput,
+    ) -> PubsubResult<Subscription> {
+        let (proposed, message_id) = input.into_parts();
         let mut state = self.state()?;
-        if !state.topics.contains_key(&request.topic_arn) {
-            return Err(PubsubError::topic_not_found(request.topic_arn.to_string()));
+        if !state.topics.contains_key(&proposed.topic_arn) {
+            return Err(PubsubError::topic_not_found(proposed.topic_arn.to_string()));
         }
-        if let Some(subscription) = state
+        let accepted_at = proposed.created_at;
+        let subscription = state
             .subscriptions
             .values()
-            .find(|subscription| {
-                subscription.topic_arn == request.topic_arn
-                    && subscription.protocol == request.protocol
-                    && subscription.endpoint == request.endpoint
+            .find(|stored| {
+                stored.topic_arn == proposed.topic_arn
+                    && stored.protocol == proposed.protocol
+                    && stored.endpoint == proposed.endpoint
             })
             .cloned()
-        {
-            return Ok(subscription);
-        }
-        let raw_message_delivery = request
-            .attributes
-            .get("RawMessageDelivery")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let subscription = Subscription {
-            subscription_arn: SubscriptionArn::compose(&request.topic_arn),
-            topic_arn: request.topic_arn,
-            protocol: request.protocol,
-            endpoint: request.endpoint,
-            raw_message_delivery,
-            confirmation: request.protocol.subscription_confirmation(),
-            extra_json: request.extra_json,
-            created_at: TimestampMillis::now(),
-        };
+            .unwrap_or(proposed);
+        let confirmation = DeliveryRecord::pending_confirmation_at(
+            &subscription,
+            message_id.as_ref(),
+            accepted_at,
+        )?;
         state
             .subscriptions
-            .insert(subscription.subscription_arn.clone(), subscription.clone());
+            .entry(subscription.subscription_arn.clone())
+            .or_insert_with(|| subscription.clone());
+        if let Some(record) = confirmation {
+            state
+                .deliveries
+                .entry(record.id.0.clone())
+                .or_insert(record);
+        }
         Ok(subscription)
     }
 
@@ -198,21 +338,6 @@ impl PubsubProvider for InMemoryPubsubProvider {
         Ok(subscription.clone())
     }
 
-    async fn get_subscription_attributes(
-        &self,
-        request: GetSubscriptionAttributesRequest,
-    ) -> PubsubResult<GetSubscriptionAttributesResponse> {
-        let state = self.state()?;
-        let Some(subscription) = state.subscriptions.get(&request.subscription_arn) else {
-            return Err(PubsubError::subscription_not_found(
-                request.subscription_arn.to_string(),
-            ));
-        };
-        Ok(GetSubscriptionAttributesResponse {
-            attributes: subscription.attributes(),
-        })
-    }
-
     async fn list_subscriptions(
         &self,
         request: ListSubscriptionsRequest,
@@ -239,9 +364,16 @@ impl PubsubProvider for InMemoryPubsubProvider {
             next_token: None,
         })
     }
+}
 
+#[async_trait]
+impl PubsubDeliveryRepository for InMemoryPubsubProvider {
     async fn put_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()> {
-        self.state()?.deliveries.insert(record.id.0.clone(), record);
+        record.validate_storage_range()?;
+        self.state()?
+            .deliveries
+            .entry(record.id.0.clone())
+            .or_insert(record);
         Ok(())
     }
 
@@ -254,20 +386,50 @@ impl PubsubProvider for InMemoryPubsubProvider {
             .deliveries
             .values_mut()
             .filter(|record| record.is_claimable(request.now))
-            .take(request.limit)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        records.truncate(usize::from(request.limit));
+        let generations = records
+            .iter()
             .map(|record| {
+                record
+                    .claim_generation
+                    .checked_add(1)
+                    .ok_or_else(|| PubsubError::storage("delivery claim generation overflow"))
+            })
+            .collect::<PubsubResult<Vec<_>>>()?;
+        let records = records
+            .into_iter()
+            .zip(generations)
+            .map(|(record, claim_generation)| {
+                record.claim_generation = claim_generation;
                 record.lease_owner = Some(request.owner.clone());
                 record.lease_expires_at = Some(request.lease_expires_at);
                 record.updated_at = request.now;
-                record.clone()
+                Ok(record.clone())
             })
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+            .collect::<PubsubResult<Vec<_>>>()?;
         Ok(ClaimDeliveryRecordsResponse { records })
     }
 
-    async fn update_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()> {
-        self.state()?.deliveries.insert(record.id.0.clone(), record);
+    async fn update_delivery_record(&self, update: DeliveryRecordUpdate) -> PubsubResult<()> {
+        let mut state = self.state()?;
+        let Some(record) = state.deliveries.get_mut(&update.record_id.0) else {
+            return Err(PubsubError::delivery_claim_lost(update.record_id.0));
+        };
+        if update.expected_claim_generation == 0
+            || record.claim_generation != update.expected_claim_generation
+            || record.lease_owner.as_deref() != Some(update.expected_lease_owner.as_str())
+        {
+            return Err(PubsubError::delivery_claim_lost(update.record_id.0));
+        }
+        record.status = update.status;
+        record.attempts = update.attempts;
+        record.next_attempt_at = update.next_attempt_at;
+        record.lease_owner = None;
+        record.lease_expires_at = None;
+        record.last_error = update.last_error;
+        record.updated_at = update.updated_at;
         Ok(())
     }
 

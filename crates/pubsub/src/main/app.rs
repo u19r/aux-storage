@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
@@ -11,30 +11,20 @@ use axum::{
 use clap::Parser;
 use config::load_optional_with_overrides;
 use http_error::HttpApiError;
-#[cfg(feature = "rocksdb")]
-use kv::RocksDbKvStore;
 #[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
-use kv::SortedKvDbStorageProvider;
-#[cfg(feature = "foundationdb")]
-use kv::{FoundationDbConfig, FoundationDbKvStore};
+use kv_backend::KvStore;
 use pubsub::{
     PubsubError, PubsubManager, PubsubProvider, decode_query_request, render_query_api_error,
     render_query_success,
 };
 use queue::QueueManager;
-use queue_provider::QueueProvider;
-#[cfg(feature = "postgres")]
-use sql::PostgresStorageProvider;
-#[cfg(feature = "sqlite")]
-use sql::SQLiteStorageProvider;
-#[cfg(feature = "turso")]
-use sql::TursoStorageProvider;
+use queue_provider::QueueOperations;
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+use sql_backend::SqlStore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const DELIVERY_IDLE_INTERVAL: Duration = Duration::from_secs(1);
-const DELIVERY_ERROR_INTERVAL: Duration = Duration::from_secs(5);
-const DELIVERY_BATCH_LIMIT: usize = 100;
+use crate::constants::{DELIVERY_BATCH_LIMIT, DELIVERY_ERROR_INTERVAL, DELIVERY_IDLE_INTERVAL};
 
 #[derive(Parser, Debug)]
 #[command(name = "pubsub")]
@@ -84,11 +74,11 @@ struct AppState {
 
 pub(crate) struct PubsubRuntimeProviders {
     pubsub: Arc<dyn PubsubProvider>,
-    queue: Arc<dyn QueueProvider>,
+    queue: Arc<dyn QueueOperations>,
 }
 
 fn shared_runtime_providers<P>(provider: P) -> PubsubRuntimeProviders
-where P: PubsubProvider + QueueProvider + 'static {
+where P: PubsubProvider + QueueOperations + 'static {
     let provider = Arc::new(provider);
     PubsubRuntimeProviders {
         pubsub: provider.clone(),
@@ -99,8 +89,6 @@ where P: PubsubProvider + QueueProvider + 'static {
 pub(crate) async fn initialize_pubsub_runtime(
     providers: PubsubRuntimeProviders,
 ) -> Result<PubsubManager, Box<dyn std::error::Error>> {
-    providers.pubsub.initialize().await?;
-    providers.queue.initialize().await?;
     let queue_manager = Arc::new(QueueManager::new(providers.queue));
     Ok(PubsubManager::builder()
         .provider(providers.pubsub)
@@ -128,26 +116,17 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = %bind_addr, "pubsub server listening");
-    let delivery_worker = spawn_delivery_worker(manager);
+    let delivery_worker = pubsub::PubsubDeliveryWorker::start(
+        manager,
+        DELIVERY_BATCH_LIMIT,
+        DELIVERY_IDLE_INTERVAL,
+        DELIVERY_ERROR_INTERVAL,
+    )?;
     let server_result = axum::serve(listener, app).await;
-    delivery_worker.abort();
+    let delivery_result = delivery_worker.shutdown().await;
     server_result?;
+    delivery_result?;
     Ok(())
-}
-
-fn spawn_delivery_worker(manager: Arc<PubsubManager>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            match manager.process_due_deliveries(DELIVERY_BATCH_LIMIT).await {
-                Ok(0) => tokio::time::sleep(DELIVERY_IDLE_INTERVAL).await,
-                Ok(_) => tokio::task::yield_now().await,
-                Err(error) => {
-                    tracing::warn!(error = %error, "pubsub delivery worker failed; retrying");
-                    tokio::time::sleep(DELIVERY_ERROR_INTERVAL).await;
-                }
-            }
-        }
-    })
 }
 
 fn init_tracing() {
@@ -211,13 +190,13 @@ pub(crate) async fn create_pubsub_runtime_providers(
         )
         .into()),
         #[cfg(feature = "rocksdb")]
-        PubsubStorageArg::RocksDb => create_rocksdb_pubsub_provider(backends),
+        PubsubStorageArg::RocksDb => create_rocksdb_pubsub_provider(backends).await,
         #[cfg(not(feature = "rocksdb"))]
         PubsubStorageArg::RocksDb => {
             Err(std::io::Error::other("rocksdb pubsub backend is not enabled in this build").into())
         }
         #[cfg(feature = "foundationdb")]
-        PubsubStorageArg::FoundationDb => create_foundationdb_pubsub_provider(backends),
+        PubsubStorageArg::FoundationDb => create_foundationdb_pubsub_provider(backends).await,
         #[cfg(not(feature = "foundationdb"))]
         PubsubStorageArg::FoundationDb => Err(std::io::Error::other(
             "foundationdb pubsub backend is not enabled in this build",
@@ -248,7 +227,7 @@ pub(crate) fn sqlite_pubsub_db_path(backends: &config::Backends) -> String {
         .unwrap_or_else(|| "storage.sqlite3".to_string())
 }
 
-#[cfg(any(test, feature = "turso"))]
+#[cfg(feature = "turso")]
 pub(crate) fn turso_pubsub_db_path(backends: &config::Backends) -> String {
     backends
         .turso
@@ -257,7 +236,7 @@ pub(crate) fn turso_pubsub_db_path(backends: &config::Backends) -> String {
         .unwrap_or_else(|| "storage.turso.db".to_string())
 }
 
-#[cfg(any(test, feature = "rocksdb"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn rocksdb_pubsub_db_path(backends: &config::Backends) -> String {
     backends
         .rocksdb
@@ -271,8 +250,9 @@ async fn create_sqlite_pubsub_provider(
     backends: &config::Backends,
 ) -> Result<PubsubRuntimeProviders, Box<dyn std::error::Error>> {
     let db_path = sqlite_pubsub_db_path(backends);
+    let driver = sql_backend::sqlite::SqliteBackend::initialize(&db_path).await?;
     Ok(shared_runtime_providers(
-        SQLiteStorageProvider::new(&db_path).await?,
+        SqlStore::initialize_schema(driver).await?,
     ))
 }
 
@@ -281,8 +261,9 @@ async fn create_turso_pubsub_provider(
     backends: &config::Backends,
 ) -> Result<PubsubRuntimeProviders, Box<dyn std::error::Error>> {
     let db_path = turso_pubsub_db_path(backends);
+    let driver = sql_backend::turso::TursoBackend::initialize(&db_path).await?;
     Ok(shared_runtime_providers(
-        TursoStorageProvider::new(&db_path).await?,
+        SqlStore::initialize_schema(driver).await?,
     ))
 }
 
@@ -293,55 +274,53 @@ async fn create_postgres_pubsub_provider(
     let postgres = backends.postgres.as_ref().ok_or_else(|| {
         std::io::Error::other("postgres pubsub backend requires postgres settings")
     })?;
-    let provider = PostgresStorageProvider::new_with_tls(
+    let driver = sql_backend::postgres::PostgresBackend::initialize(
         &postgres.dsn,
         postgres.max_pool_size,
-        postgres.background_max_pool_size,
         postgres.tls,
     )
     .await?;
-    Ok(shared_runtime_providers(provider))
+    Ok(shared_runtime_providers(
+        SqlStore::initialize_schema(driver).await?,
+    ))
 }
 
 #[cfg(feature = "rocksdb")]
-fn create_rocksdb_pubsub_provider(
+async fn create_rocksdb_pubsub_provider(
     backends: &config::Backends,
 ) -> Result<PubsubRuntimeProviders, Box<dyn std::error::Error>> {
     let db_path = rocksdb_pubsub_db_path(backends);
-    let store = RocksDbKvStore::new(db_path.into())?;
-    Ok(shared_runtime_providers(SortedKvDbStorageProvider::new(
-        store,
-    )))
+    let driver = kv_backend::rocksdb::RocksDbBackend::initialize(db_path.into())?;
+    Ok(shared_runtime_providers(
+        KvStore::initialize_format(driver).await?,
+    ))
 }
 
 #[cfg(feature = "foundationdb")]
-fn foundationdb_pubsub_config_from_backends(backends: &config::Backends) -> FoundationDbConfig {
-    let mut fdb_config = FoundationDbConfig::default();
-    let foundationdb = backends.foundationdb.as_ref();
-    if let Some(cluster_file_path) = foundationdb.and_then(|cfg| cfg.cluster_file.clone()) {
-        fdb_config.cluster_file_path = Some(cluster_file_path);
-    }
-    if let Some(prefix) = foundationdb.and_then(|cfg| cfg.subspace_prefix.clone()) {
-        fdb_config.subspace_prefix = Some(prefix.into_bytes());
-    }
-    if let Some(tenant) = foundationdb.and_then(|cfg| cfg.tenant_name.clone()) {
-        fdb_config.tenant_name = Some(tenant.into_bytes());
-    }
-    if let Some(foundationdb) = foundationdb {
-        fdb_config.cache_read_version_ms = foundationdb.cache_read_version_ms;
-        fdb_config.report_conflicting_keys = foundationdb.report_conflicting_keys;
-    }
-    fdb_config
-}
-
-#[cfg(feature = "foundationdb")]
-fn create_foundationdb_pubsub_provider(
+async fn create_foundationdb_pubsub_provider(
     backends: &config::Backends,
 ) -> Result<PubsubRuntimeProviders, Box<dyn std::error::Error>> {
-    let store = FoundationDbKvStore::connect(foundationdb_pubsub_config_from_backends(backends))?;
-    Ok(shared_runtime_providers(SortedKvDbStorageProvider::new(
-        store,
-    )))
+    let settings = backends.foundationdb.as_ref();
+    let prefix = settings
+        .and_then(|value| value.subspace_prefix.as_deref())
+        .map(str::as_bytes);
+    let tenant = settings
+        .and_then(|value| value.tenant_name.as_deref())
+        .map(str::as_bytes);
+    let driver = kv_backend::foundationdb::FoundationDbBackend::initialize(
+        kv_backend::foundationdb::FoundationDbOptions {
+            cluster_file: settings.and_then(|value| value.cluster_file.as_deref()),
+            subspace_prefix: prefix,
+            tenant_name: tenant,
+            cache_read_version_ms: settings.map_or(0, |value| value.cache_read_version_ms),
+            transaction_byte_limit: settings.and_then(|value| value.transaction_byte_limit),
+            report_conflicting_keys: settings.is_some_and(|value| value.report_conflicting_keys),
+        },
+    )
+    .await?;
+    Ok(shared_runtime_providers(
+        KvStore::initialize_format(driver).await?,
+    ))
 }
 
 fn load_pubsub_config_from_args(args: &Args) -> Result<Arc<config::Config>, std::io::Error> {

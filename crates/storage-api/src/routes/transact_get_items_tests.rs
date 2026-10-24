@@ -6,9 +6,9 @@ use storage_types::{
 };
 
 use crate::{
-    routes::routes_test_support::{
-        create_transactional_test_db, default_conformance_backends, handle_create_table,
-        handle_put_item, handle_transact_get_items,
+    routes::routes_tests::{
+        default_conformance_backends, handle_create_table, handle_put_item,
+        handle_transact_get_items,
     },
     types::Response,
 };
@@ -35,59 +35,203 @@ async fn setup_named_table(db: &DatabaseManager, table_name: &str) {
 
 #[tokio::test]
 async fn transact_get_items_returns_ordered_item_responses() {
-    let db = create_transactional_test_db().await;
-    setup_table(&db).await;
-    let put = json!({
-        "TableName": "TransactGetTable",
-        "Item": {
-            "pk": { "S": "item#1" },
-            "status": { "S": "active" }
-        }
-    });
+    for backend in default_conformance_backends() {
+        let db = backend.create_transactional_db().await;
+        setup_table(&db).await;
+        let put = json!({
+            "TableName": "TransactGetTable",
+            "Item": {
+                "pk": { "S": "item#1" },
+                "status": { "S": "active" }
+            }
+        });
+        handle_put_item(
+            db.clone(),
+            PutItemRequest::try_from(put).expect("valid put item"),
+        )
+        .await
+        .expect("put item");
+
+        let request = json!({
+            "TransactItems": [
+                {
+                    "Get": {
+                        "TableName": "TransactGetTable",
+                        "Key": { "pk": { "S": "item#1" } },
+                        "ProjectionExpression": "#s",
+                        "ExpressionAttributeNames": { "#s": "status" }
+                    }
+                },
+                {
+                    "Get": {
+                        "TableName": "TransactGetTable",
+                        "Key": { "pk": { "S": "missing" } }
+                    }
+                }
+            ]
+        });
+
+        let response = handle_transact_get_items(
+            db,
+            TransactGetItemsRequest::try_from(request).expect("valid transact get"),
+        )
+        .await
+        .expect("transact get succeeds");
+
+        let Response::TransactGetItems(response) = response else {
+            panic!("expected TransactGetItems response");
+        };
+        assert_eq!(response.responses.len(), 2, "{}", backend.name);
+        let first =
+            storage_types::AttributeMap::try_from(response.responses[0].item.clone().unwrap())
+                .unwrap();
+        assert_eq!(
+            first.get("status"),
+            Some(&AttributeValue::S("active".to_string())),
+            "{}",
+            backend.name
+        );
+        assert!(!first.contains_key("pk"), "{}", backend.name);
+        assert!(response.responses[1].item.is_none(), "{}", backend.name);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
+async fn transact_get_endpoint_repeated_response_report() {
+    use std::{hint::black_box, sync::Arc, time::Instant};
+
+    use alloc_counter::AllocationGuard;
+    use axum::{
+        body::{self, Bytes},
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
+
+    use crate::{routes::dynamodb::dynamodb_endpoint, types::AppState};
+
+    const ITERATIONS: usize = 10_000;
+    let db = super::routes_tests::create_sqlite_test_db().await;
+    setup_table(db.as_ref()).await;
     handle_put_item(
         db.clone(),
-        PutItemRequest::try_from(put).expect("valid put item"),
+        json!({"TableName":"TransactGetTable","Item":{
+            "pk":{"S":"item#1"},"status":{"S":"active"}
+        }})
+        .try_into()
+        .unwrap(),
     )
     .await
-    .expect("put item");
-
-    let request = json!({
-        "TransactItems": [
-            {
-                "Get": {
-                    "TableName": "TransactGetTable",
-                    "Key": { "pk": { "S": "item#1" } },
-                    "ProjectionExpression": "#s",
-                    "ExpressionAttributeNames": { "#s": "status" }
-                }
-            },
-            {
-                "Get": {
-                    "TableName": "TransactGetTable",
-                    "Key": { "pk": { "S": "missing" } }
-                }
-            }
-        ]
-    });
-
-    let response = handle_transact_get_items(
-        db,
-        TransactGetItemsRequest::try_from(request).expect("valid transact get"),
-    )
-    .await
-    .expect("transact get succeeds");
-
-    let Response::TransactGetItems(response) = response else {
-        panic!("expected TransactGetItems response");
-    };
-    assert_eq!(response.responses.len(), 2);
-    let first = response.responses[0].item.as_ref().expect("first item");
-    assert_eq!(
-        first.get("status"),
-        Some(&AttributeValue::S("active".to_string()))
+    .unwrap();
+    let app_state = Arc::new(AppState::new(db));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-target",
+        HeaderValue::from_static("DynamoDB_20120810.TransactGetItems"),
     );
-    assert!(!first.contains_key("pk"));
-    assert!(response.responses[1].item.is_none());
+    let request = Bytes::from_static(br#"{"TransactItems":[{"Get":{"TableName":"TransactGetTable","Key":{"pk":{"S":"item#1"}}}},{"Get":{"TableName":"TransactGetTable","Key":{"pk":{"S":"missing"}}}}]}"#);
+    for _ in 0..100 {
+        let response =
+            dynamodb_endpoint(State(app_state.clone()), headers.clone(), request.clone())
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "transact_get_endpoint_repeated_response_report",
+        file!(),
+        line!(),
+        Some("transact_get_endpoint"),
+    );
+    let started = Instant::now();
+    let mut total_bytes = 0;
+    for _ in 0..ITERATIONS {
+        let response = dynamodb_endpoint(
+            State(app_state.clone()),
+            headers.clone(),
+            black_box(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        total_bytes += body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .len();
+    }
+    let elapsed = started.elapsed();
+    let report = guard.finish();
+    alloc_counter::emit_report(&report).unwrap();
+    assert!(total_bytes > 0);
+    println!(
+        "transact_get_endpoint iterations={ITERATIONS} elapsed_ns={}",
+        elapsed.as_nanos()
+    );
+}
+
+#[test]
+#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
+fn transact_get_response_wire_clone_and_serde_report() {
+    use std::{hint::black_box, time::Instant};
+
+    use alloc_counter::AllocationGuard;
+    use serde::Serialize;
+    use storage_types::{ItemResponse, TransactGetItemsResponse, WireItem};
+
+    #[derive(Clone, Serialize)]
+    struct MapSlot {
+        #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
+        item: Option<storage_types::AttributeMap>,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct MapResponse {
+        #[serde(rename = "Responses")]
+        responses: Vec<MapSlot>,
+    }
+
+    const ITERATIONS: usize = 10_000;
+    const ITEM: &[u8] =
+        br#"{"pk":{"S":"item#1"},"status":{"S":"active"},"nested":{"M":{"child":{"S":"value"}}}}"#;
+    let map = MapResponse {
+        responses: vec![MapSlot {
+            item: Some(serde_json::from_slice(ITEM).unwrap()),
+        }],
+    };
+    let wire = TransactGetItemsResponse {
+        responses: vec![ItemResponse {
+            item: Some(WireItem::dynamo_json(ITEM.to_vec())),
+        }],
+        consumed_capacity: None,
+    };
+    for label in ["map_clone", "wire_clone", "map_serde", "wire_serde"] {
+        let guard = AllocationGuard::start(
+            module_path!(),
+            "transact_get_response_wire_clone_and_serde_report",
+            file!(),
+            line!(),
+            Some(label),
+        );
+        let started = Instant::now();
+        let mut total = 0;
+        for _ in 0..ITERATIONS {
+            total += match label {
+                "map_clone" => black_box(map.clone()).responses.len(),
+                "wire_clone" => black_box(wire.clone()).responses.len(),
+                "map_serde" => serde_json::to_vec(black_box(&map)).unwrap().len(),
+                _ => serde_json::to_vec(black_box(&wire)).unwrap().len(),
+            };
+        }
+        let elapsed = started.elapsed();
+        let report = guard.finish();
+        alloc_counter::emit_report(&report).unwrap();
+        assert!(total > 0);
+        println!(
+            "transact_get_response label={label} iterations={ITERATIONS} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
 }
 
 #[tokio::test]

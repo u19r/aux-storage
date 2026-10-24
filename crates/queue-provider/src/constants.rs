@@ -1,5 +1,14 @@
-/// Queue message IDs use the first 12 bytes of a UUIDv7-compatible
-/// versionstamp so they sort by creation time while staying compact in storage.
+use std::{num::NonZeroU32, time::Duration};
+
+use storage_types::WriteRetryPolicy;
+
+pub(crate) const CATALOG_PAGE_ITEMS: NonZeroU32 = NonZeroU32::MIN.saturating_add(100 - 1);
+pub(crate) const QUEUE_WRITE_RETRY: WriteRetryPolicy =
+    WriteRetryPolicy::new(5, Duration::from_millis(2));
+
+/// Compact message keys use twelve bytes. Ordinary sends use a UUIDv7 prefix;
+/// stable publications can use deterministic keys. Visibility time orders due
+/// work.
 pub const MESSAGE_ID_VERSIONSTAMP_LEN: usize = 12;
 
 pub const MAX_DELAY_SECONDS: u32 = 900;
@@ -8,6 +17,13 @@ pub const MAX_MAXIMUM_MESSAGE_SIZE_BYTES: u32 = 1_048_576;
 pub const MIN_MESSAGE_RETENTION_SECONDS: u32 = 60;
 pub const MAX_MESSAGE_RETENTION_SECONDS: u32 = 1_209_600;
 pub const MAX_RECEIVE_MESSAGES: u32 = 10;
+/// SQS receive default: one message when `MaxNumberOfMessages` is omitted.
+pub const DEFAULT_RECEIVE_MAX_MESSAGES: u32 = 1;
+/// SQS default visibility timeout (seconds) when `VisibilityTimeout` is
+/// omitted.
+pub const DEFAULT_RECEIVE_VISIBILITY_TIMEOUT_SECS: u32 = 30;
+/// SQS default wait time (seconds) when `WaitTimeSeconds` is omitted.
+pub const DEFAULT_RECEIVE_WAIT_TIME_SECONDS: u32 = 0;
 pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 pub const MAX_WAIT_TIME_SECONDS: u32 = 20;
 pub const MAX_VISIBILITY_TIMEOUT_SECONDS: u32 = 43_200;

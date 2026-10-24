@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*};
+use crate::{common::*, constants::*, imports::*};
 
 pub(crate) struct PubsubDeliveryWorkload {
     pub(crate) name: String,
@@ -12,7 +12,14 @@ pub(crate) struct PubsubDeliveryWorkload {
     pub(crate) start_count: u64,
     pub(crate) check_count: u64,
     pub(crate) publish_count: u64,
+    pub(crate) unknown_publish_count: u64,
+    pub(crate) unknown_materialization_count: u64,
+    pub(crate) publish_audit_count: u64,
+    pub(crate) publish_attempts: Vec<fdb_chaos_model::PublishAttempt>,
+    pub(crate) observed_publish_acceptances: BTreeSet<String>,
     pub(crate) claim_count: u64,
+    pub(crate) unknown_claim_count: u64,
+    pub(crate) claim_audit_count: u64,
     pub(crate) duplicate_claim_reject_count: u64,
     pub(crate) delivered_count: u64,
     pub(crate) failed_count: u64,
@@ -52,7 +59,14 @@ impl PubsubDeliveryWorkload {
             start_count: 0,
             check_count: 0,
             publish_count: 0,
+            unknown_publish_count: 0,
+            unknown_materialization_count: 0,
+            publish_audit_count: 0,
+            publish_attempts: Vec::new(),
+            observed_publish_acceptances: BTreeSet::new(),
             claim_count: 0,
+            unknown_claim_count: 0,
+            claim_audit_count: 0,
             duplicate_claim_reject_count: 0,
             delivered_count: 0,
             failed_count: 0,
@@ -70,33 +84,23 @@ impl PubsubDeliveryWorkload {
         }
     }
 
-    pub(crate) fn store(&self, db: SimDatabase) -> Result<FoundationDbKvStore, String> {
-        FoundationDbKvStore::from_database(
-            FoundationDbConfig {
-                cluster_file_path: None,
-                tenant_name: None,
-                subspace_prefix: Some(b"aux-storage/fdb-chaos/pubsub-delivery/".to_vec()),
-                cache_read_version_ms: 0,
-                immediate_gsi_consistency: false,
-                report_conflicting_keys: false,
-            },
+    pub(crate) fn driver(&self, db: SimDatabase) -> kv_backend::foundationdb::FoundationDbBackend {
+        kv_backend::foundationdb::FoundationDbBackend::from_simulation(
             db,
+            Some(b"aux-storage/fdb-chaos/pubsub-delivery/"),
+            None,
         )
-        .map_err(|err| storage_error_detail(&err))
     }
 
-    pub(crate) async fn provider(&self, db: SimDatabase) -> Result<Arc<FdbChaosProvider>, String> {
-        let provider = Arc::new(
-            SortedKvDbStorageProvider::new(self.store(db)?).with_database_jobs_enabled(false),
-        );
-        pubsub::PubsubProvider::initialize(provider.as_ref())
+    pub(crate) async fn provider(
+        &self,
+        db: SimDatabase,
+    ) -> Result<Arc<kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>>, String>
+    {
+        let store = kv_backend::KvStore::initialize_format(self.driver(db))
             .await
-            .map_err(|err| err.to_string())?;
-        Ok(provider)
-    }
-
-    pub(crate) async fn manager(&self, db: SimDatabase) -> Result<PubsubManager, String> {
-        Ok(PubsubManager::new(self.provider(db).await?))
+            .map_err(|error| storage_error_detail(&error))?;
+        Ok(Arc::new(store))
     }
 
     pub(crate) fn is_active_client(&self) -> bool {
@@ -113,29 +117,6 @@ impl PubsubDeliveryWorkload {
 
     pub(crate) fn message_body(&self, sequence: u64) -> String {
         format!("pubsub-delivery-message-{sequence}")
-    }
-
-    pub(crate) async fn direct_delivery_records(
-        &self,
-        db: SimDatabase,
-    ) -> Result<Vec<DeliveryRecord>, String> {
-        let store = self.store(db)?;
-        let delivery_prefix = compact::pubsub_kind_prefix(PubsubRecordKind::Delivery).start;
-        let scan = store
-            .direct_audit_scan_prefix(&delivery_prefix, 1024)
-            .await
-            .map_err(|err| storage_error_detail(&err))?;
-        let mut records = Vec::new();
-        for (key, value) in scan.items {
-            if !is_direct_delivery_record_key(&key) {
-                continue;
-            }
-            let record: DeliveryRecord = storage_types::storage_serde::from_bytes(&value)
-                .map_err(|err| format!("decode pubsub delivery record key={key:?}: {err:?}"))?;
-            records.push(record);
-        }
-        records.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        Ok(records)
     }
 
     pub(crate) fn trace_phase(&self, phase: &'static str) {
@@ -185,8 +166,4 @@ impl PubsubDeliveryWorkload {
             ],
         );
     }
-}
-
-pub(crate) fn is_direct_delivery_record_key(key: &[u8]) -> bool {
-    key.len() == 8 && key[2..8].iter().any(|byte| *byte != 0)
 }

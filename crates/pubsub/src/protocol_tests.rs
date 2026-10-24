@@ -1,14 +1,12 @@
+use http_error::HttpApiError;
 use pubsub_provider::{
     PubsubError, PubsubMessageId, PubsubValidationKind, SubscriptionProtocol, TopicArn,
 };
 use serde::Deserialize;
 
-use crate::{
-    PubsubAction,
-    protocol::{
-        PubsubSuccess, SubscriptionView, decode_query_request, render_query_error,
-        render_query_success,
-    },
+use crate::protocol::{
+    PubsubAction, PubsubSuccess, SubscriptionView, decode_query_request, render_query_api_error,
+    render_query_success,
 };
 
 #[test]
@@ -258,10 +256,8 @@ fn render_query_errors_match_normalized_aws_fixtures() {
 
 #[test]
 fn render_query_error_includes_complete_aws_error_response_shape() {
-    let xml = render_query_error(
-        &PubsubError::validation(PubsubValidationKind::InvalidTopicName),
-        "request-id",
-    );
+    let error = PubsubError::validation(PubsubValidationKind::InvalidTopicName);
+    let xml = render_query_api_error(&HttpApiError::from(&error), "request-id");
 
     assert!(xml.starts_with("<ErrorResponse xmlns=\"https://sns.amazonaws.com/doc/2010-03-31/\">"));
     assert!(xml.contains("<Error><Type>Sender</Type><Code>InvalidParameter</Code>"));
@@ -281,7 +277,7 @@ fn assert_query_error(fixtures: &QueryErrorFixtures, name: &str, error: PubsubEr
     let expected = fixtures.cases.get(name).unwrap_or_else(|| {
         panic!("missing query error fixture case {name}");
     });
-    let xml = render_query_error(&error, "request-id");
+    let xml = render_query_api_error(&HttpApiError::from(&error), "request-id");
     assert_eq!(extract_xml_value(&xml, "Code"), expected.code);
     assert_eq!(extract_xml_value(&xml, "Message"), expected.message);
 }

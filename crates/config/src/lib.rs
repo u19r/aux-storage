@@ -1,13 +1,10 @@
 #![doc(hidden)]
 
-#[cfg(test)]
-mod config_test_support;
-#[cfg(test)]
-pub mod src_tests;
-#[cfg(test)]
-mod sync_replication_tests;
-
 mod compile_time;
+#[cfg(test)]
+mod config_test_support_tests;
+#[cfg(test)]
+mod src_tests;
 
 pub mod runtime;
 pub mod startup;
@@ -16,7 +13,6 @@ pub mod startup;
 mod startup_tests;
 
 mod backends;
-mod cache;
 mod constants;
 mod error;
 pub(crate) mod launch;
@@ -24,36 +20,24 @@ mod loader;
 mod messaging;
 mod model;
 mod schema;
-mod sync_replication;
 
 pub use backends::{
     Backends, FoundationdbBackendConfig, PostgresBackendConfig, RemoteBackendConfig,
-    RemoteCredentialsConfig, RemoteCredentialsConfigError, RemoteDefaultStorageMode,
-    RemoteStaticCredentialsConfig, RemoteTimeoutOverrides, RocksdbBackendConfig,
-    SqliteBackendConfig, StorageConnectionsConfig, TursoBackendConfig,
-};
-pub use cache::{
-    CacheTtlOverridesConfig, DistributedCacheConfig, StoragePointReadCacheConfig,
-    StoragePointReadCacheEvictionPolicy, StoragePointReadCacheMemoryBudgetConfig,
-    StoragePointReadCacheMemoryBudgetMode, StorageQueryProofCacheConfig,
-    StorageQueryProofCacheEvictionPolicy,
+    RemoteCredentialsConfig, RemoteDefaultStorageMode, RemoteStaticCredentialsConfig,
+    RemoteTimeoutOverrides, RocksdbBackendConfig, SqliteBackendConfig, StorageConnectionsConfig,
+    TursoBackendConfig,
 };
 pub use compile_time::{CompileTimeManifest, CrateFeature, ManifestCrate};
 pub use constants::{
     DEFAULT_STORAGE_ROCKS_DB_PATH, DEFAULT_STORAGE_SQLITE_DB_PATH, DEFAULT_STORAGE_TURSO_DB_PATH,
 };
 pub use error::ConfigError;
-pub use launch::{
-    LaunchInputs, StorageApiLaunchConfig, StorageApiLaunchEffectiveConfig, StorageBackendArg,
-};
+pub use launch::{StorageApiLaunchConfig, StorageApiLaunchEffectiveConfig};
 pub use loader::{Config, load, load_optional_with_overrides, load_with_overrides};
-pub use messaging::{PubsubConfig, QueueConfig};
+pub use messaging::QueueConfig;
 pub use model::{
-    AppRole, Cors, Features, HttpConfig, HttpRoutesConfig, Jobs, MetricsConfig,
-    PrometheusMetricsConfig, ReadSequenceConfig, ReadSequenceExecutionMode, RootConfig,
-    RuntimeEnvironment, RuntimeFeatures, SlowOperationLogThresholds, StorageAdmissionConfig,
-    StorageReplicationConfig, StorageReplicationPeerConfig, Tracing, TracingTrace,
+    AppRole, Cors, Features, HttpConfig, Jobs, MetricsConfig, RootConfig, RuntimeEnvironment,
+    RuntimeFeatures, SlowOperationLogThresholds, StorageAdmissionConfig, Tracing, TracingTrace,
 };
-pub use sync_replication::{StorageSyncReplicationConfig, StorageSyncReplicationPeerConfig};
 
 pub type RemoteStaticCredentials = RemoteStaticCredentialsConfig;

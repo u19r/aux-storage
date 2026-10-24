@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 edition = "2024"
 license.workspace = true
@@ -17,8 +18,10 @@ crate-type = ["cdylib"]
 fdb-chaos-model = { path = "../fdb-chaos-model" }
 foundationdb = { workspace = true }
 foundationdb-simulation = { workspace = true }
-kv = { path = "../kv", default-features = false, features = ["foundationdb-backend"] }
+futures = { workspace = true }
+kv-backend = { path = "../kv-backend", default-features = false, features = ["simulation"] }
 pubsub = { path = "../pubsub", default-features = false, features = ["foundationdb"] }
+pubsub-provider = { path = "../pubsub-provider" }
 queue = { path = "../queue", default-features = false, features = ["foundationdb"] }
 serde_json = { workspace = true }
 storage = { path = "../storage", default-features = false, features = ["foundationdb"] }

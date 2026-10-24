@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
 
-pub const MAX_STREAM_RETENTION_HOURS: u16 = 24 * 365 * 7;
+use crate::{TimestampMillis, constants::MAX_STREAM_RETENTION_HOURS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
 pub enum StreamRetentionDuration {
@@ -49,6 +49,14 @@ impl StreamRetentionDuration {
             (Self::FiniteHours(table_hours), Self::FiniteHours(item_hours)) => {
                 Self::FiniteHours(table_hours.max(item_hours))
             }
+        }
+    }
+
+    #[must_use]
+    pub fn cutoff_at(self, reference: TimestampMillis) -> Option<TimestampMillis> {
+        match self {
+            Self::Forever => None,
+            Self::FiniteHours(hours) => Some(reference - (i64::from(hours) * 60 * 60 * 1000)),
         }
     }
 }

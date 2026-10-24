@@ -7,9 +7,7 @@ use axum::{
 };
 use http_error::ErrorResponse;
 use serde::de::{IgnoredAny, MapAccess, Visitor};
-use storage_types::{AttributeValue, StorageError, WireItem, WireItemKeyAttributes};
-
-pub(crate) type AttributeMap = std::collections::HashMap<String, AttributeValue>;
+use storage_types::{AttributeMap, AttributeValue, StorageError, WireItem, WireItemKeyAttributes};
 
 pub(crate) fn json_response_bytes(bytes: Vec<u8>) -> AxumResponse {
     (
@@ -54,41 +52,6 @@ pub(crate) fn write_field_name(
     out.write_all(b":").map_err(serde_json::Error::io)
 }
 
-pub(crate) fn write_wire_item_array(
-    out: &mut Vec<u8>,
-    items: Vec<WireItem>,
-) -> serde_json::Result<()> {
-    out.push(b'[');
-    for (idx, item) in items.into_iter().enumerate() {
-        if idx > 0 {
-            out.push(b',');
-        }
-        write_wire_item(out, item)?;
-    }
-    out.push(b']');
-    Ok(())
-}
-
-pub(crate) fn wire_item_array_json_capacity(items: &[WireItem]) -> usize {
-    let separators = items.len().saturating_sub(1);
-    2 + separators + items.iter().map(WireItem::payload_len).sum::<usize>()
-}
-
-pub(crate) fn wire_item_json_len_upper_bound(item: &WireItem) -> serde_json::Result<usize> {
-    match item {
-        WireItem::DynamoJson { data } => Ok(data.len()),
-        WireItem::LocalSplit {
-            primary_key,
-            secondary_key,
-            non_key_attributes_blob,
-        } => local_split_wire_item_json_len_upper_bound(
-            primary_key,
-            secondary_key.as_ref(),
-            non_key_attributes_blob.as_deref(),
-        ),
-    }
-}
-
 pub(crate) fn write_wire_item(out: &mut Vec<u8>, item: WireItem) -> serde_json::Result<()> {
     write_wire_item_ref(out, &item)
 }
@@ -130,40 +93,13 @@ fn write_local_split_wire_item(
         );
     }
 
-    let map: AttributeMap = WireItem::LocalSplit {
+    let map = AttributeMap::try_from(WireItem::LocalSplit {
         primary_key: primary_key.clone(),
         secondary_key: secondary_key.cloned(),
         non_key_attributes_blob: non_key_attributes_blob.map(Vec::from),
-    }
-    .into_attribute_map()
+    })
     .map_err(storage_error_to_json_error)?;
     serde_json::to_writer(out, &map)
-}
-
-fn local_split_wire_item_json_len_upper_bound(
-    primary_key: &WireItemKeyAttributes,
-    secondary_key: Option<&WireItemKeyAttributes>,
-    non_key_attributes_blob: Option<&[u8]>,
-) -> serde_json::Result<usize> {
-    let Some(blob) = non_key_attributes_blob else {
-        return composed_local_split_json_len(primary_key, secondary_key, None);
-    };
-    let trimmed = trim_ascii_whitespace(blob);
-    if trimmed.is_empty() || trimmed == b"{}" {
-        return composed_local_split_json_len(primary_key, secondary_key, None);
-    }
-    if trimmed.starts_with(b"{") && trimmed.ends_with(b"}") {
-        return composed_local_split_json_len(primary_key, secondary_key, Some(trimmed));
-    }
-
-    let map: AttributeMap = WireItem::LocalSplit {
-        primary_key: primary_key.clone(),
-        secondary_key: secondary_key.cloned(),
-        non_key_attributes_blob: non_key_attributes_blob.map(Vec::from),
-    }
-    .into_attribute_map()
-    .map_err(storage_error_to_json_error)?;
-    Ok(serde_json::to_vec(&map)?.len())
 }
 
 fn can_compose_local_split(
@@ -189,61 +125,6 @@ fn can_compose_local_split(
     }
 
     object_keys_are_disjoint_from_local_split_keys(trimmed, primary_key, secondary_key)
-}
-
-fn composed_local_split_json_len(
-    primary_key: &WireItemKeyAttributes,
-    secondary_key: Option<&WireItemKeyAttributes>,
-    non_key_attributes_blob: Option<&[u8]>,
-) -> serde_json::Result<usize> {
-    let mut len = 2;
-    let mut first = true;
-    add_key_attributes_json_len(&mut len, &mut first, primary_key)?;
-    if let Some(secondary_key) = secondary_key {
-        add_key_attributes_json_len(&mut len, &mut first, secondary_key)?;
-    }
-    if let Some(blob) = non_key_attributes_blob {
-        let trimmed = trim_ascii_whitespace(blob);
-        if trimmed.len() > 2 {
-            let body = trim_ascii_whitespace(&trimmed[1..trimmed.len() - 1]);
-            if !body.is_empty() {
-                len += usize::from(!first) + body.len();
-            }
-        }
-    }
-    Ok(len)
-}
-
-fn add_key_attributes_json_len(
-    len: &mut usize,
-    first: &mut bool,
-    key_attributes: &WireItemKeyAttributes,
-) -> serde_json::Result<()> {
-    add_key_attribute_json_len(
-        len,
-        first,
-        key_attributes.hash_key_name.as_ref(),
-        &key_attributes.hash_key,
-    )?;
-    if let (Some(name), Some(value)) = (
-        key_attributes.sort_key_name.as_ref(),
-        key_attributes.sort_key.as_ref(),
-    ) {
-        add_key_attribute_json_len(len, first, name.as_ref(), value)?;
-    }
-    Ok(())
-}
-
-fn add_key_attribute_json_len(
-    len: &mut usize,
-    first: &mut bool,
-    name: &str,
-    value: &AttributeValue,
-) -> serde_json::Result<()> {
-    *len += usize::from(!*first);
-    *first = false;
-    *len += serde_json::to_vec(name)?.len() + 1 + serde_json::to_vec(value)?.len();
-    Ok(())
 }
 
 fn write_composed_local_split(

@@ -1,0 +1,47 @@
+[package]
+name = "regional-replication"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
+
+[dependencies]
+async-trait.workspace = true
+flate2 = "1.1.10"
+futures.workspace = true
+infrastructure-provider.workspace = true
+metrics-facade.workspace = true
+queue-provider = { path = "../queue-provider" }
+replication-provider.workspace = true
+replication-types.workspace = true
+scheduled-bg-jobs.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { workspace = true, features = ["regional"] }
+stream-provider = { path = "../stream-provider" }
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+alloc-counter.workspace = true
+bg-job-store = { path = "../bg-job-store" }
+bg-jobs-tokio = { workspace = true, features = ["test-support"] }
+replication-contract-tests = { path = "../replication-contract-tests", features = ["native-sqlite"] }
+reqwest.workspace = true
+rustix = { version = "1.1.5", features = ["time"] }
+sql-backend = { path = "../sql-backend", features = ["sqlite"] }
+
+[lints]
+workspace = true

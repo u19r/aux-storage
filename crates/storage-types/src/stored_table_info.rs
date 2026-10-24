@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    IndexName, KeyAttributeType, KeySchemaElement, MaxIndexers, StreamRetentionDuration, TableName,
-    TimestampMillis,
+    IndexName, KeyAttributeType, KeyAttributes, KeySchemaElement, MaxIndexers, StorageError,
+    StorageResult, StreamRetentionDuration, TableName, TimestampMillis, WireItem,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -27,6 +27,47 @@ pub struct StoredTableInfo {
     pub deletion_protection_enabled: bool,
 }
 
+impl StoredTableInfo {
+    /// Extracts the complete primary key from a wire item in one bounded
+    /// decode.
+    pub fn table_key_from_wire(&self, item: &WireItem) -> StorageResult<KeyAttributes> {
+        let fields = self
+            .key_schema
+            .iter()
+            .map(|element| element.attribute_name.as_str())
+            .collect::<smallvec::SmallVec<[&str; 2]>>();
+        let values = item.select_attribute_values(&fields)?;
+        let mut key = KeyAttributes::with_capacity(self.key_schema.len());
+        for (element, value) in self.key_schema.iter().zip(values) {
+            key.insert(
+                element.attribute_name.clone(),
+                value.ok_or_else(|| {
+                    StorageError::internal("wire item is missing a table key attribute")
+                })?,
+            );
+        }
+        Ok(key)
+    }
+
+    /// Whether a table mutation must be retained in the stream for a public
+    /// stream or deferred secondary-index projection.
+    #[must_use]
+    pub fn requires_stream_entry(&self, immediate_gsi_consistency: bool) -> bool {
+        let stream_enabled = self
+            .stream_specification
+            .as_ref()
+            .is_some_and(|specification| specification.stream_enabled);
+        let has_deferred_index = !immediate_gsi_consistency
+            && self
+                .global_secondary_indexes
+                .as_ref()
+                .is_some_and(|indexes| {
+                    indexes.iter().any(|index| !index.index_name.is_ttl_index())
+                });
+        stream_enabled || has_deferred_index
+    }
+}
+
 fn default_table_stream_duration() -> StreamRetentionDuration {
     StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
 }
@@ -35,7 +76,7 @@ fn default_item_stream_duration() -> StreamRetentionDuration {
     StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct AttributeDefinition {
     #[serde(rename = "AttributeName")]
     pub attribute_name: String,
@@ -65,26 +106,7 @@ pub struct StreamSpecification {
     pub stream_view_type: Option<StreamViewType>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
-pub enum GsiBackfillStatus {
-    Backfilling,
-    Done,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GsiBackfillRecord {
-    pub table_name: String,
-    pub index_name: String,
-    pub status: GsiBackfillStatus,
-    pub scan_lek: Option<String>,
-    pub captured_stream_tail: Option<String>,
-    #[schema(value_type = i64, example = 1_700_000_000_000i64)]
-    pub created_at: TimestampMillis,
-    #[schema(value_type = i64, example = 1_700_000_001_234i64)]
-    pub updated_at: TimestampMillis,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct Projection {
     #[serde(rename = "ProjectionType", skip_serializing_if = "Option::is_none")]
     pub projection_type: Option<ProjectionType>,
@@ -93,7 +115,7 @@ pub struct Projection {
     pub non_key_attributes: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProjectionType {
     KeysOnly,

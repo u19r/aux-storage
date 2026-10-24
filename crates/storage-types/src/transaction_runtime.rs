@@ -1,13 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write as _,
-};
+use std::{collections::HashSet, fmt::Write as _};
 
 use crate::{
-    AttributeValue, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, KeyAttributeType, KeyAttributes,
-    StorageEnum, StorageError, StorageResult, StoredTableInfo, TableName, TransactGetItem,
-    TransactWriteItem, context::WrappedError as _, normalize_dynamodb_number_for_write,
-    validate_item_key_attributes_for_schema, validate_key_attributes_for_schema,
+    AttributeValue, AttributeValueLookup, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
+    KeyAttributeType, KeyAttributes, StorageEnum, StorageError, StorageResult, StoredTableInfo,
+    TableName, TransactEncodeItem, TransactGetItem, TransactWriteItem, canonical_dynamodb_number,
+    context::WrappedError as _, validate_item_key_attributes_for_schema,
+    validate_key_attribute_value_for_schema, validate_key_attributes_for_schema,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -34,6 +32,20 @@ pub fn transaction_canceled_for_item_error_with_len(
     };
 
     transaction_canceled_for_reason_with_len(index, total_len, reason)
+}
+
+/// Schema-bound transaction keys distinguish request validation from member
+/// cancellation.
+pub fn transaction_write_binding_error_with_len(
+    index: usize,
+    total_len: usize,
+    error: StorageError,
+) -> StorageError {
+    if error.is_transact_write_key_error_top_level() {
+        error.into_raw_validation()
+    } else {
+        transaction_canceled_for_item_error_with_len(index, total_len, error)
+    }
 }
 
 pub fn transaction_canceled_for_reason(index: usize, reason: String) -> StorageError {
@@ -95,6 +107,7 @@ pub fn transaction_canceled_for_preflights(
     Some(StorageEnum::TransactionCanceled { reasons }.into())
 }
 
+// TODO: consolidate transaction-reason accessors on StorageError.
 pub fn transaction_cancellation_reason_at(error: &StorageError, index: usize) -> Option<String> {
     match error.to_enum() {
         StorageEnum::TransactionCanceled { reasons } => reasons
@@ -102,14 +115,15 @@ pub fn transaction_cancellation_reason_at(error: &StorageError, index: usize) ->
             .filter(|reason| reason.as_str() != "None")
             .cloned(),
         StorageEnum::ConditionalCheckFailed => Some("ConditionalCheckFailed".to_string()),
-        StorageEnum::Validation { message } => Some(format!("ValidationError\t{message}")),
+        StorageEnum::Validation { message, .. } => Some(format!("ValidationError\t{message}")),
         _ => None,
     }
 }
 
+// TODO: consolidate transaction-reason accessors on StorageError.
 pub fn transaction_validation_reason(error: &StorageError) -> Option<String> {
     match error.to_enum() {
-        StorageEnum::Validation { message } => Some(format!("ValidationError\t{message}")),
+        StorageEnum::Validation { message, .. } => Some(format!("ValidationError\t{message}")),
         _ => None,
     }
 }
@@ -151,13 +165,42 @@ pub fn transact_item_table_name(item: &TransactWriteItem) -> Option<&TableName> 
     }
 }
 
+/// Table name for one wire-encoded transact item, mirroring
+/// [`transact_item_table_name`]. Shared by KV and SQL encode-path context
+/// validation so neither backend re-spells the variant dispatch.
+#[must_use]
+pub fn transact_encode_item_table_name(item: &TransactEncodeItem) -> Option<&TableName> {
+    match item {
+        TransactEncodeItem { put: Some(put), .. } => Some(&put.table_name),
+        TransactEncodeItem {
+            delete: Some(delete),
+            ..
+        } => Some(&delete.table_name),
+        TransactEncodeItem {
+            update: Some(update),
+            ..
+        } => Some(&update.table_name),
+        TransactEncodeItem {
+            condition_check: Some(check),
+            ..
+        } => Some(&check.table_name),
+        _ => None,
+    }
+}
+
 pub fn preflight_transact_item_key_with_table_info(
     item: &TransactWriteItem,
     table_info: &StoredTableInfo,
 ) -> StorageResult<TransactionKeyPreflight> {
     match item {
         TransactWriteItem { put: Some(put), .. } => {
-            preflight_transact_put_item_key_with_table_info(table_info, &put.item)
+            let fields = table_info
+                .key_schema
+                .iter()
+                .map(|key| key.attribute_name.as_str())
+                .collect::<Vec<_>>();
+            let attributes = put.item.project_attributes(&fields)?;
+            preflight_transact_put_item_key_with_table_info(table_info, &attributes)
         }
         TransactWriteItem {
             delete: Some(delete),
@@ -177,7 +220,7 @@ pub fn preflight_transact_item_key_with_table_info(
 
 pub fn preflight_transact_put_item_key_with_table_info(
     table_info: &StoredTableInfo,
-    item: &HashMap<String, AttributeValue>,
+    item: &impl AttributeValueLookup,
 ) -> StorageResult<TransactionKeyPreflight> {
     preflight_transact_write_key_result(
         validate_transact_put_item_key(table_info, item)
@@ -199,8 +242,8 @@ fn preflight_transact_write_key_result(
     result: StorageResult<String>,
 ) -> StorageResult<TransactionKeyPreflight> {
     match result {
-        Err(error) if transact_write_key_error_is_top_level(&error) => {
-            Err(raw_validation_from_error(error))
+        Err(error) if error.is_transact_write_key_error_top_level() => {
+            Err(error.into_raw_validation())
         }
         result => transaction_key_preflight_from_key_result(result),
     }
@@ -214,41 +257,12 @@ pub fn preflight_transact_get_item_key_with_table_info(
         return transaction_key_preflight_from_key_result(Err(error));
     }
     if let Err(error) = validate_key_attributes_for_schema(&table_info.key_schema, &item.get.key) {
-        if transact_get_key_size_error_is_top_level(&error) {
+        if error.is_transact_get_key_error_top_level() {
             return Err(error);
         }
         return transaction_key_preflight_from_key_result(Err(error));
     }
     transaction_key_preflight_from_key_result(transact_key_fingerprint(table_info, &item.get.key))
-}
-
-fn transact_get_key_size_error_is_top_level(error: &StorageError) -> bool {
-    let StorageEnum::Validation { message } = error.to_enum() else {
-        return false;
-    };
-    message.contains("key attribute cannot contain an empty string value")
-        || message.contains("key attribute cannot contain an empty binary value")
-}
-
-fn transact_write_key_error_is_top_level(error: &StorageError) -> bool {
-    let StorageEnum::Validation { message } = error.to_enum() else {
-        return false;
-    };
-    message.contains("key attribute cannot contain an empty string value")
-        || message.contains("key attribute cannot contain an empty binary value")
-        || message.contains("The parameter cannot be converted to a numeric value")
-        || message.contains("Attempting to store more than 38 significant digits in a Number")
-        || message.contains(
-            "Number underflow. Attempting to store a number with magnitude smaller than supported \
-             range",
-        )
-}
-
-fn raw_validation_from_error(error: StorageError) -> StorageError {
-    let StorageEnum::Validation { message } = error.to_enum() else {
-        return error;
-    };
-    StorageError::raw_validation(message.clone())
 }
 
 pub fn validate_no_duplicate_transact_item_keys(
@@ -268,8 +282,8 @@ pub fn validate_no_duplicate_transact_item_keys(
     Ok(())
 }
 
-pub fn conditional_check_failed_reason(
-    old_item: Option<&HashMap<String, AttributeValue>>,
+pub fn conditional_check_failed_reason<T: serde::Serialize>(
+    old_item: Option<&T>,
 ) -> StorageResult<String> {
     if let Some(old_item) = old_item {
         return Ok(format!(
@@ -288,23 +302,25 @@ pub fn return_values_on_condition_check_failure_all_old(value: Option<&String>) 
 
 pub fn validate_transact_put_item_key(
     table_info: &StoredTableInfo,
-    item: &HashMap<String, AttributeValue>,
+    item: &impl AttributeValueLookup,
 ) -> StorageResult<()> {
     for key in &table_info.key_schema {
-        let value = item.get(&key.attribute_name).ok_or_else(|| {
-            StorageError::validation(format!(
-                "One or more parameter values were invalid: Missing the key {} in the item",
-                key.attribute_name
-            ))
-        })?;
+        let value = item
+            .get_attribute_value(&key.attribute_name)
+            .ok_or_else(|| {
+                StorageError::validation(format!(
+                    "One or more parameter values were invalid: Missing the key {} in the item",
+                    key.attribute_name
+                ))
+            })?;
         let expected = key_attribute_type(table_info, &key.attribute_name);
-        if !attribute_value_matches_key_type(value, &expected) {
+        if !value.matches_key_type(&expected) {
             return Err(StorageError::validation(format!(
                 "One or more parameter values were invalid: Type mismatch for key {} expected: {} \
                  actual: {}",
                 key.attribute_name,
                 key_type_name(&expected),
-                attribute_value_type_name(value)
+                value.variant_name()
             )));
         }
     }
@@ -314,17 +330,51 @@ pub fn validate_transact_put_item_key(
 
 pub fn transact_put_item_key_fingerprint(
     table_info: &StoredTableInfo,
-    item: &HashMap<String, AttributeValue>,
+    item: &impl AttributeValueLookup,
 ) -> StorageResult<String> {
-    transact_key_fingerprint_from_values(table_info, |name| item.get(name))
+    transact_key_fingerprint_from_values(table_info, |name| item.get_attribute_value(name))
 }
 
 pub fn validate_transact_key(
     table_info: &StoredTableInfo,
     key: &KeyAttributes,
 ) -> StorageResult<()> {
-    validate_transact_key_shape(table_info, key)?;
-    validate_key_attributes_for_schema(&table_info.key_schema, key)?;
+    validate_transact_key_with_unresolved_attributes(table_info, key, &[])
+}
+
+/// Validate the concrete components of a key before a provider-specific
+/// lowering.  `unresolved_attributes` is only for a typed planner lowering
+/// whose values come from a provider row (for example a mapped ReadSequence
+/// child); it is not a request-level escape hatch.
+///
+/// Every schema component must still be present.  Resolved components retain
+/// the canonical type and DynamoDB-domain validation from
+/// `validate_transact_key`; only explicitly planner-owned unresolved components
+/// are deferred until the lowering has resolved their provider value.
+pub fn validate_transact_key_with_unresolved_attributes(
+    table_info: &StoredTableInfo,
+    key: &KeyAttributes,
+    unresolved_attributes: &[&str],
+) -> StorageResult<()> {
+    if key.len() != table_info.key_schema.len() {
+        return Err(transact_key_schema_error());
+    }
+    for key_schema in &table_info.key_schema {
+        let Some(value) = key.get(&key_schema.attribute_name) else {
+            return Err(transact_key_schema_error());
+        };
+        if unresolved_attributes
+            .iter()
+            .any(|name| *name == key_schema.attribute_name)
+        {
+            continue;
+        }
+        let expected = key_attribute_type(table_info, &key_schema.attribute_name);
+        if !value.matches_key_type(&expected) {
+            return Err(transact_key_schema_error());
+        }
+        validate_key_attribute_value_for_schema(key_schema, value)?;
+    }
     Ok(())
 }
 
@@ -337,7 +387,7 @@ fn validate_transact_key_shape(
             return Err(transact_key_schema_error());
         };
         let expected = key_attribute_type(table_info, &key_schema.attribute_name);
-        if !attribute_value_matches_key_type(value, &expected) {
+        if !value.matches_key_type(&expected) {
             return Err(transact_key_schema_error());
         }
     }
@@ -366,20 +416,27 @@ fn transact_key_fingerprint_from_values<'a>(
             continue;
         };
         append_fingerprint_part(&mut fingerprint, "K", &key_schema.attribute_name);
-        append_attribute_value_fingerprint(&mut fingerprint, value);
+        append_attribute_value_fingerprint(&mut fingerprint, value)?;
     }
     Ok(fingerprint)
 }
 
-fn append_attribute_value_fingerprint(fingerprint: &mut String, value: &AttributeValue) {
+fn append_attribute_value_fingerprint(
+    fingerprint: &mut String,
+    value: &AttributeValue,
+) -> StorageResult<()> {
     match value {
         AttributeValue::S(value) => append_fingerprint_part(fingerprint, "S", value),
         AttributeValue::N(value) => {
-            append_fingerprint_part(fingerprint, "N", normalize_dynamodb_number_for_write(value));
+            let value = canonical_dynamodb_number(value).map_err(|error| {
+                StorageError::validation(format!("Invalid numeric key: {error}"))
+            })?;
+            append_fingerprint_part(fingerprint, "N", value);
         }
         AttributeValue::B(value) => append_fingerprint_part(fingerprint, "B", value),
         _ => {}
     }
+    Ok(())
 }
 
 fn append_fingerprint_part(fingerprint: &mut String, tag: &str, value: impl AsRef<str>) {
@@ -397,23 +454,13 @@ fn transact_key_schema_error() -> StorageError {
     StorageError::validation("The provided key element does not match the schema")
 }
 
+// TODO: move schema attribute-type lookup onto StoredTableInfo.
 fn key_attribute_type(table_info: &StoredTableInfo, name: &str) -> KeyAttributeType {
     table_info
         .attribute_definitions
         .iter()
         .find(|definition| definition.attribute_name == name)
-        .map_or(KeyAttributeType::S, |definition| {
-            definition.attribute_type.clone()
-        })
-}
-
-fn attribute_value_matches_key_type(value: &AttributeValue, expected: &KeyAttributeType) -> bool {
-    matches!(
-        (value, expected),
-        (AttributeValue::S(_), KeyAttributeType::S)
-            | (AttributeValue::N(_), KeyAttributeType::N)
-            | (AttributeValue::B(_), KeyAttributeType::B)
-    )
+        .map_or(KeyAttributeType::S, |definition| definition.attribute_type)
 }
 
 fn key_type_name(key_type: &KeyAttributeType) -> &'static str {
@@ -421,20 +468,5 @@ fn key_type_name(key_type: &KeyAttributeType) -> &'static str {
         KeyAttributeType::S => "S",
         KeyAttributeType::N => "N",
         KeyAttributeType::B => "B",
-    }
-}
-
-fn attribute_value_type_name(value: &AttributeValue) -> &'static str {
-    match value {
-        AttributeValue::S(_) => "S",
-        AttributeValue::N(_) => "N",
-        AttributeValue::B(_) => "B",
-        AttributeValue::SS(_) => "SS",
-        AttributeValue::NS(_) => "NS",
-        AttributeValue::BS(_) => "BS",
-        AttributeValue::BOOL(_) => "BOOL",
-        AttributeValue::NULL(_) => "NULL",
-        AttributeValue::L(_) => "L",
-        AttributeValue::M(_) => "M",
     }
 }

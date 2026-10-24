@@ -1,8 +1,74 @@
 use std::collections::HashMap;
 
-use storage_types::AttributeValue;
+use storage_types::{AttributeValue, KeySchemaElement, KeyType};
 
-use crate::{Condition, SizeComparison, evaluate_condition, parse_condition_expression};
+use crate::{
+    Condition, SizeComparison, evaluate_condition, parse_condition_expression,
+    validate_key_condition,
+};
+
+fn query_key_schema() -> Vec<KeySchemaElement> {
+    vec![
+        KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        },
+        KeySchemaElement {
+            attribute_name: "sk".to_string(),
+            key_type: KeyType::Range,
+        },
+    ]
+}
+
+#[test]
+fn key_condition_validation_accepts_partition_and_sort_key_shapes() {
+    let values = HashMap::from([
+        (":pk".to_string(), AttributeValue::S("acct".to_string())),
+        (":lo".to_string(), AttributeValue::S("a".to_string())),
+        (":hi".to_string(), AttributeValue::S("z".to_string())),
+    ]);
+    let schema = query_key_schema();
+
+    for expression in [
+        "pk = :pk",
+        ":pk = pk AND :lo <= sk",
+        "pk = :pk AND sk BETWEEN :lo AND :hi",
+        "pk = :pk AND begins_with(sk, :lo)",
+    ] {
+        let condition = parse_condition_expression(expression, None, Some(&values))
+            .unwrap_or_else(|error| panic!("{expression} should parse: {error}"));
+        validate_key_condition(&condition, &schema)
+            .unwrap_or_else(|error| panic!("{expression} should be a key condition: {error}"));
+    }
+}
+
+#[test]
+fn key_condition_validation_rejects_filter_only_operators_but_parser_keeps_filter_or() {
+    let values = HashMap::from([
+        (":pk".to_string(), AttributeValue::S("acct".to_string())),
+        (":sk".to_string(), AttributeValue::S("a".to_string())),
+    ]);
+    let schema = query_key_schema();
+
+    for expression in [
+        "pk = :pk AND sk <> :sk",
+        "pk = :pk OR sk = :sk",
+        "pk = :pk AND contains(sk, :sk)",
+        "pk = :pk AND begins_with(pk, :sk)",
+        "pk = :pk AND sk > :sk AND sk <= :sk",
+    ] {
+        let condition = parse_condition_expression(expression, None, Some(&values))
+            .unwrap_or_else(|error| panic!("{expression} should parse: {error}"));
+        assert!(
+            validate_key_condition(&condition, &schema).is_err(),
+            "{expression} must not be accepted as a key condition"
+        );
+    }
+
+    let filter = parse_condition_expression("pk = :pk OR sk = :sk", None, Some(&values))
+        .expect("the shared parser must retain OR for filter expressions");
+    assert!(matches!(filter, Condition::Or { .. }));
+}
 
 // Parser tests
 #[test]
@@ -107,6 +173,13 @@ fn parse_between_condition_rejects_reversed_literal_bounds() {
             "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater \
              than or equal to lower bound; lower bound operand: AttributeValue: {N:5}, upper \
              bound operand: AttributeValue: {N:4}",
+        ),
+        (
+            AttributeValue::N("9007199254740993".to_string()),
+            AttributeValue::N("9007199254740992".to_string()),
+            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater \
+             than or equal to lower bound; lower bound operand: AttributeValue: \
+             {N:9007199254740993}, upper bound operand: AttributeValue: {N:9007199254740992}",
         ),
         (
             AttributeValue::S("z".to_string()),
@@ -379,6 +452,48 @@ fn parse_parenthesized_comparison_operands() {
             value: AttributeValue::S("John".to_string()),
         }
     );
+}
+
+#[test]
+fn given_owned_literals_and_alias_paths_when_parsing_then_values_and_names_remain_reusable() {
+    let attribute_names = HashMap::from([
+        ("#root".to_string(), "根".to_string()),
+        ("#child".to_string(), "枝".to_string()),
+    ]);
+    let attribute_values = HashMap::from([
+        (":left".to_string(), AttributeValue::S("left".to_string())),
+        (":lower".to_string(), AttributeValue::N("2".to_string())),
+        (":upper".to_string(), AttributeValue::N("8".to_string())),
+        (":null".to_string(), AttributeValue::NULL(true)),
+    ]);
+
+    let condition = parse_condition_expression(
+        "#root.#child[2].leaf = \"葉\\q\\n\" AND (:left) < #root.#child[2].leaf AND \
+         #root.#child[2].leaf BETWEEN :lower AND :upper AND #root.#child[2].leaf = :null",
+        Some(&attribute_names),
+        Some(&attribute_values),
+    )
+    .expect("owned token and alias paths should parse");
+    assert!(matches!(condition, Condition::And { .. }));
+    assert_eq!(attribute_names["#root"], "根");
+    assert_eq!(
+        attribute_values[":left"],
+        AttributeValue::S("left".to_string())
+    );
+    assert_eq!(attribute_values[":null"], AttributeValue::NULL(true));
+}
+
+#[test]
+fn given_missing_and_null_placeholders_when_parsing_and_evaluating_then_semantics_hold() {
+    let values = HashMap::from([(":null".to_string(), AttributeValue::NULL(true))]);
+    let condition = parse_condition_expression(
+        "attribute_not_exists(missing) AND present = :null",
+        None,
+        Some(&values),
+    )
+    .expect("missing and null condition should parse");
+    let item = HashMap::from([("present".to_string(), AttributeValue::NULL(true))]);
+    assert!(evaluate_condition(&item, &condition));
 }
 
 #[test]

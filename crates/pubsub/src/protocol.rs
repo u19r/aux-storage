@@ -87,87 +87,90 @@ impl From<Subscription> for SubscriptionView {
 }
 
 pub fn decode_query_request(body: &[u8]) -> PubsubResult<PubsubAction> {
-    let fields = url::form_urlencoded::parse(body)
+    let mut fields = url::form_urlencoded::parse(body)
         .into_owned()
         .collect::<BTreeMap<String, String>>();
-    let action = required(&fields, "Action")?;
+    let action = required(&mut fields, "Action")?;
     match action.as_str() {
         "CreateTopic" => Ok(PubsubAction::CreateTopic {
-            name: TopicName::new(required(&fields, "Name")?)?,
-            attributes: decode_entry_map(&fields, "Attributes"),
+            name: TopicName::new(required(&mut fields, "Name")?)?,
+            attributes: decode_entry_map(fields, "Attributes"),
         }),
         "DeleteTopic" => Ok(PubsubAction::DeleteTopic {
-            topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
+            topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
         }),
         "GetTopicAttributes" => Ok(PubsubAction::GetTopicAttributes(
             GetTopicAttributesRequest {
-                topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
+                topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
             },
         )),
         "SetTopicAttributes" => Ok(PubsubAction::SetTopicAttributes(
             SetTopicAttributesRequest {
-                topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
-                attributes: decode_named_attribute(&fields)?,
+                topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
+                attributes: decode_named_attribute(&mut fields)?,
             },
         )),
         "ListTopics" => Ok(PubsubAction::ListTopics(ListTopicsRequest {
-            next_token: fields.get("NextToken").cloned(),
+            next_token: fields.remove("NextToken"),
         })),
         "Subscribe" => {
-            let protocol_text = required(&fields, "Protocol")?;
+            let protocol_text = required(&mut fields, "Protocol")?;
             let Some(protocol) = SubscriptionProtocol::parse(&protocol_text) else {
                 return Err(PubsubError::validation_with_detail(
                     PubsubValidationKind::UnsupportedProtocol,
                     protocol_text,
                 ));
             };
+            let topic_arn = TopicArn::new(required(&mut fields, "TopicArn")?)?;
+            let endpoint = required(&mut fields, "Endpoint")?;
+            let extra_json = fields
+                .remove("ExtraJson")
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
             Ok(PubsubAction::Subscribe(SubscribeRequest {
-                topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
+                topic_arn,
                 protocol,
-                endpoint: required(&fields, "Endpoint")?,
-                attributes: decode_entry_map(&fields, "Attributes"),
-                extra_json: fields
-                    .get("ExtraJson")
-                    .map(|raw| serde_json::from_str(raw))
-                    .transpose()?
-                    .unwrap_or(serde_json::Value::Null),
+                endpoint,
+                attributes: decode_entry_map(fields, "Attributes"),
+                extra_json,
             }))
         }
         "Unsubscribe" => Ok(PubsubAction::Unsubscribe {
-            subscription_arn: SubscriptionArn::new(required(&fields, "SubscriptionArn")?)?,
+            subscription_arn: SubscriptionArn::new(required(&mut fields, "SubscriptionArn")?)?,
         }),
         "ConfirmSubscription" => Ok(PubsubAction::ConfirmSubscription(
             ConfirmSubscriptionRequest {
-                topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
-                token: required(&fields, "Token")?,
+                topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
+                token: required(&mut fields, "Token")?,
             },
         )),
         "GetSubscriptionAttributes" => Ok(PubsubAction::GetSubscriptionAttributes(
             GetSubscriptionAttributesRequest {
-                subscription_arn: SubscriptionArn::new(required(&fields, "SubscriptionArn")?)?,
+                subscription_arn: SubscriptionArn::new(required(&mut fields, "SubscriptionArn")?)?,
             },
         )),
         "SetSubscriptionAttributes" => Ok(PubsubAction::SetSubscriptionAttributes(
             SetSubscriptionAttributesRequest {
-                subscription_arn: SubscriptionArn::new(required(&fields, "SubscriptionArn")?)?,
-                attributes: decode_named_attribute(&fields)?,
+                subscription_arn: SubscriptionArn::new(required(&mut fields, "SubscriptionArn")?)?,
+                attributes: decode_named_attribute(&mut fields)?,
             },
         )),
         "ListSubscriptions" => Ok(PubsubAction::ListSubscriptions(ListSubscriptionsRequest {
             topic_arn: None,
-            next_token: fields.get("NextToken").cloned(),
+            next_token: fields.remove("NextToken"),
         })),
         "ListSubscriptionsByTopic" => Ok(PubsubAction::ListSubscriptionsByTopic(
             ListSubscriptionsRequest {
-                topic_arn: Some(TopicArn::new(required(&fields, "TopicArn")?)?),
-                next_token: fields.get("NextToken").cloned(),
+                topic_arn: Some(TopicArn::new(required(&mut fields, "TopicArn")?)?),
+                next_token: fields.remove("NextToken"),
             },
         )),
         "Publish" => Ok(PubsubAction::Publish(PublishRequest {
-            topic_arn: TopicArn::new(required(&fields, "TopicArn")?)?,
-            message: required(&fields, "Message")?,
-            subject: fields.get("Subject").cloned(),
-            message_attributes: decode_message_attributes(&fields),
+            topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
+            message: required(&mut fields, "Message")?,
+            subject: fields.remove("Subject"),
+            message_attributes: decode_message_attributes(fields),
         })),
         _ => Err(PubsubError::validation_with_detail(
             PubsubValidationKind::UnsupportedAttribute,
@@ -250,10 +253,6 @@ pub fn render_query_success(success: &PubsubSuccess, request_id: &str) -> String
     }
 }
 
-pub fn render_query_error(error: &PubsubError, request_id: &str) -> String {
-    render_query_api_error(&HttpApiError::from(error), request_id)
-}
-
 pub fn render_query_api_error(error: &HttpApiError, request_id: &str) -> String {
     format!(
         "<ErrorResponse \
@@ -302,14 +301,14 @@ fn render_attributes(root: &str, attributes: &HashMap<String, String>) -> String
     format!("<{root}>{members}</{root}>")
 }
 
-fn required(fields: &BTreeMap<String, String>, name: &str) -> PubsubResult<String> {
-    fields.get(name).cloned().ok_or_else(|| {
+fn required(fields: &mut BTreeMap<String, String>, name: &str) -> PubsubResult<String> {
+    fields.remove(name).ok_or_else(|| {
         PubsubError::validation_with_detail(PubsubValidationKind::UnsupportedAttribute, name)
     })
 }
 
 fn decode_named_attribute(
-    fields: &BTreeMap<String, String>,
+    fields: &mut BTreeMap<String, String>,
 ) -> PubsubResult<HashMap<String, String>> {
     Ok(HashMap::from([(
         required(fields, "AttributeName")?,
@@ -317,7 +316,7 @@ fn decode_named_attribute(
     )]))
 }
 
-fn decode_entry_map(fields: &BTreeMap<String, String>, prefix: &str) -> HashMap<String, String> {
+fn decode_entry_map(fields: BTreeMap<String, String>, prefix: &str) -> HashMap<String, String> {
     let mut pairs: BTreeMap<usize, (Option<String>, Option<String>)> = BTreeMap::new();
     let key_prefix = format!("{prefix}.entry.");
     for (field, value) in fields {
@@ -332,8 +331,8 @@ fn decode_entry_map(fields: &BTreeMap<String, String>, prefix: &str) -> HashMap<
         };
         let pair = pairs.entry(index).or_default();
         match part {
-            "key" => pair.0 = Some(value.clone()),
-            "value" => pair.1 = Some(value.clone()),
+            "key" => pair.0 = Some(value),
+            "value" => pair.1 = Some(value),
             _ => {}
         }
     }
@@ -343,7 +342,7 @@ fn decode_entry_map(fields: &BTreeMap<String, String>, prefix: &str) -> HashMap<
         .collect()
 }
 
-fn decode_message_attributes(fields: &BTreeMap<String, String>) -> HashMap<String, String> {
+fn decode_message_attributes(fields: BTreeMap<String, String>) -> HashMap<String, String> {
     let mut names: BTreeMap<usize, String> = BTreeMap::new();
     let mut values: BTreeMap<usize, String> = BTreeMap::new();
     for (field, value) in fields {
@@ -358,10 +357,10 @@ fn decode_message_attributes(fields: &BTreeMap<String, String>) -> HashMap<Strin
         };
         match part {
             "Name" => {
-                names.insert(index, value.clone());
+                names.insert(index, value);
             }
             "Value.StringValue" => {
-                values.insert(index, value.clone());
+                values.insert(index, value);
             }
             _ => {}
         }

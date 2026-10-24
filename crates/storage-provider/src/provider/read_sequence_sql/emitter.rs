@@ -1,5 +1,13 @@
+use std::fmt::Write as _;
+
 use storage_types::{AttributeValue, ReadSequencePlan};
 
+// J1 home (plan §4.6): engine-agnostic IR with per-engine render arms. The
+// placeholder spellings below intentionally mirror
+// `sql::statements::placeholder::PlaceholderDialect` (`?N` sqlite, `$N` plus
+// the `CAST(.. AS TEXT)::NUMERIC` number arm on postgres) and the key binds
+// match `sql::statements::bind::encode_key_bind` semantics; the types cannot
+// be imported directly because `sql` depends on this crate.
 use crate::provider::read_sequence_sql::{
     ReadSequenceSqlCacheKey, ReadSequenceSqlCompileError, ReadSequenceSqlDialect,
     ReadSequenceSqlIdentifier, ReadSequenceSqlIr, ReadSequenceSqlKeyType, ReadSequenceSqlLimits,
@@ -7,6 +15,9 @@ use crate::provider::read_sequence_sql::{
     ReadSequenceSqlStatement,
 };
 
+// Shared dialect entrypoint for the two callers in `super`
+// (`emit_postgresql_*` / `emit_sqlite_*`): bundles dialect + limits into
+// one `ReadSequenceSqlEmitter` construction so the entrypoints stay thin.
 pub(super) fn emit_dialect_read_sequence_sql(
     plan: &ReadSequencePlan,
     ir: &ReadSequenceSqlIr,
@@ -24,6 +35,7 @@ struct ReadSequenceSqlEmitter<'a> {
     parameters: Vec<AttributeValue>,
     ctes: Vec<String>,
     batch_ctes: Vec<String>,
+    envelope_width: usize,
 }
 
 struct ReadSequenceSqlSource {
@@ -32,6 +44,8 @@ struct ReadSequenceSqlSource {
     invocation: String,
 }
 
+// Covered by `read_sequence_sql_tests.rs` (1016 lines) plus
+// `read_sequence_sql_perf_tests.rs`.
 impl<'a> ReadSequenceSqlEmitter<'a> {
     fn new(
         plan: &'a ReadSequencePlan,
@@ -39,14 +53,22 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
         dialect: ReadSequenceSqlDialect,
         limits: ReadSequenceSqlLimits,
     ) -> Self {
+        let envelope_width = ir
+            .nodes
+            .iter()
+            .map(|node| node.metadata.key_columns.len())
+            .max()
+            .unwrap_or(0)
+            .max(2);
         Self {
             plan,
             ir,
             dialect,
             limits,
-            parameters: Vec::new(),
-            ctes: Vec::new(),
+            parameters: Vec::with_capacity(ir.parameter_count.min(limits.max_parameters)),
+            ctes: Vec::with_capacity(ir.nodes.len()),
             batch_ctes: Vec::new(),
+            envelope_width,
         }
     }
 
@@ -58,8 +80,9 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
             let node = self
                 .ir
                 .nodes
-                .iter()
-                .find(|node| node.node == *node_id)
+                .get(node_id.index())
+                .filter(|node| node.node == *node_id)
+                .or_else(|| self.ir.nodes.iter().find(|node| node.node == *node_id))
                 .ok_or(ReadSequenceSqlCompileError::MissingMetadata)?;
             self.emit_node(node)?;
         }
@@ -206,7 +229,8 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
         ordinal: usize,
         key: &[AttributeValue],
     ) -> Result<String, ReadSequenceSqlCompileError> {
-        let mut row = vec![ordinal.to_string()];
+        let mut row = ordinal.to_string();
+        row.insert(0, '(');
         for (index, value) in key.iter().enumerate() {
             let key_type = metadata
                 .key_types
@@ -214,13 +238,15 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
                 .copied()
                 .ok_or(ReadSequenceSqlCompileError::InvalidKeyMetadata)?;
             self.parameters.push(value.clone());
-            row.push(parameter_marker(
+            row.push_str(", ");
+            row.push_str(&parameter_marker(
                 self.dialect,
                 self.parameters.len(),
                 key_type,
             ));
         }
-        Ok(format!("({})", row.join(", ")))
+        row.push(')');
+        Ok(row)
     }
 
     fn build_predicate_source(
@@ -292,12 +318,11 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
         let mut sql = format!(
             "SELECT {} AS node_ordinal, {} AS invocation_ordinal, 'item' AS row_kind, \
              row_number() OVER (PARTITION BY {} ORDER BY {order}) - 1 AS item_ordinal, {}, \
-             {relation}.\"attributes_blob\" AS item_json, {indexer_projection} AS indexer_json \
-             FROM {}",
+             {relation}.\"item_bytes\" AS item_json, {indexer_projection} AS indexer_json FROM {}",
             node.node.index(),
             source.invocation,
             source.invocation,
-            key_projection.join(", "),
+            key_projection,
             source.from,
         );
         if !source.where_parts.is_empty() {
@@ -313,16 +338,20 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
         metadata: &crate::provider::read_sequence_sql::ReadSequenceSqlNodeMetadata,
         relation: &str,
     ) -> String {
-        let values = (0..metadata.max_indexers.as_usize())
-            .map(|ordinal| format!("{relation}.\"__aux_indexer_{ordinal}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        match (self.dialect, values.is_empty()) {
-            (_, true) => "'[]'".to_string(),
-            (ReadSequenceSqlDialect::Sqlite, false) => format!("json_array({values})"),
-            (ReadSequenceSqlDialect::PostgreSql, false) => {
-                format!("json_build_array({values})::text")
+        let indexer_count = metadata.max_indexers.as_usize();
+        if indexer_count == 0 {
+            return "'[]'".to_string();
+        }
+        let mut values = String::new();
+        for ordinal in 0..indexer_count {
+            if ordinal != 0 {
+                values.push_str(", ");
             }
+            let _ = write!(values, "{relation}.\"__aux_indexer_{ordinal}\"");
+        }
+        match self.dialect {
+            ReadSequenceSqlDialect::Sqlite => format!("json_array({values})"),
+            ReadSequenceSqlDialect::PostgreSql => format!("json_build_array({values})::text"),
         }
     }
 
@@ -330,33 +359,23 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
         &self,
         metadata: &crate::provider::read_sequence_sql::ReadSequenceSqlNodeMetadata,
         relation: &str,
-    ) -> Vec<String> {
-        let mut projection = metadata
-            .key_columns
-            .iter()
-            .enumerate()
-            .map(|(index, column)| {
-                format!(
-                    "{} AS key_{index}",
-                    project_key_column(
-                        self.dialect,
-                        relation,
-                        column.as_str(),
-                        metadata.key_types[index],
-                    )
-                )
-            })
-            .collect::<Vec<_>>();
-        let envelope_width = self
-            .ir
-            .nodes
-            .iter()
-            .map(|node| node.metadata.key_columns.len())
-            .max()
-            .unwrap_or(0)
-            .max(2);
-        while projection.len() < envelope_width {
-            projection.push(format!("NULL AS key_{}", projection.len()));
+    ) -> String {
+        let mut projection = String::new();
+        for index in 0..self.envelope_width {
+            if index != 0 {
+                projection.push_str(", ");
+            }
+            if let Some(column) = metadata.key_columns.get(index) {
+                let expression = project_key_column(
+                    self.dialect,
+                    relation,
+                    column.as_str(),
+                    metadata.key_types[index],
+                );
+                projection.push_str(&format!("{expression} AS key_{index}"));
+            } else {
+                projection.push_str(&format!("NULL AS key_{index}"));
+            }
         }
         projection
     }
@@ -389,21 +408,30 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
     }
 
     fn finish(self) -> Result<ReadSequenceSqlStatement, ReadSequenceSqlCompileError> {
-        let unions = self
-            .ir
-            .nodes
+        let cte_bytes = self
+            .batch_ctes
             .iter()
-            .map(|node| format!("SELECT * FROM n{}", node.node.index()))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL ");
-        let mut all_ctes = self.batch_ctes;
-        all_ctes.extend(self.ctes);
-        let sql = format!(
-            "WITH {} SELECT * FROM ({}) AS read_sequence_rows ORDER BY node_ordinal, \
-             invocation_ordinal, row_kind, item_ordinal",
-            all_ctes.join(", "),
-            unions,
-        );
+            .chain(self.ctes.iter())
+            .map(String::len)
+            .sum::<usize>();
+        let mut sql = String::with_capacity(cte_bytes + self.ir.nodes.len() * 24 + 128);
+        sql.push_str("WITH ");
+        for (index, cte) in self.batch_ctes.iter().chain(self.ctes.iter()).enumerate() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(cte);
+        }
+        sql.push_str(" SELECT * FROM (");
+        for (index, node) in self.ir.nodes.iter().enumerate() {
+            if index != 0 {
+                sql.push_str(" UNION ALL ");
+            }
+            sql.push_str("SELECT * FROM n");
+            sql.push_str(&node.node.index().to_string());
+        }
+        sql.push_str(") AS read_sequence_rows ORDER BY node_ordinal, ");
+        sql.push_str("invocation_ordinal, row_kind, item_ordinal");
         if sql.len() > self.limits.max_sql_bytes {
             return Err(ReadSequenceSqlCompileError::StatementLimit);
         }
@@ -414,7 +442,7 @@ impl<'a> ReadSequenceSqlEmitter<'a> {
                 structural_digest: self.plan.graph.structural_digest.clone(),
                 schema_digest: self.ir.schema_digest.clone(),
                 dialect: self.dialect,
-                compiler_version: 1,
+                compiler_version: 2,
                 max_parameters: self.limits.max_parameters,
             },
         })
@@ -451,7 +479,7 @@ fn parameter_marker(
             format!("CAST(${number} AS TEXT)::NUMERIC")
         }
         (ReadSequenceSqlDialect::Sqlite, ReadSequenceSqlKeyType::Number) => {
-            format!("CAST(?{number} AS NUMERIC)")
+            format!("?{number}")
         }
         (ReadSequenceSqlDialect::PostgreSql, _) => format!("${number}"),
         (ReadSequenceSqlDialect::Sqlite, _) => format!("?{number}"),
@@ -492,7 +520,7 @@ fn sql_key_value_matches(expected: ReadSequenceSqlKeyType, value: &AttributeValu
     )
 }
 
-fn order_by(
+pub(super) fn order_by(
     relation: &str,
     columns: &[ReadSequenceSqlIdentifier],
     fallback_columns: &[ReadSequenceSqlIdentifier],
@@ -502,9 +530,12 @@ fn order_by(
     } else {
         columns
     };
-    columns
-        .iter()
-        .map(|column| format!("{relation}.{} ASC", quote_identifier(column.as_str())))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut output = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index != 0 {
+            output.push_str(", ");
+        }
+        let _ = write!(output, "{relation}.\"{}\" ASC", column.as_str());
+    }
+    output
 }

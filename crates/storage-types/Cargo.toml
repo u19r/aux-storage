@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 edition = "2024"
 license.workspace = true
 name = "storage-types"
@@ -9,6 +10,7 @@ doctest = false
 
 [features]
 default = []
+regional = []
 sqlite = []
 postgres = []
 rocksdb = []
@@ -19,23 +21,28 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
+lru-ttl-cache = { workspace = true }
 lz4_flex = { workspace = true }
+sha2 = { workspace = true }
 
 rust_decimal = { workspace = true }
+scheduled-bg-jobs = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 typed-builder = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
+cpu-time = { workspace = true }
 proptest = { workspace = true }
-quint-connect = { workspace = true }
 storage-derive = { path = "../storage-derive" }
 
 [lints]

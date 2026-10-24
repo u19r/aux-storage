@@ -1,8 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+};
+
+use smallvec::SmallVec;
 
 use crate::{
-    AttributeMap, AttributeValue, IndexName, ProjectionType, StorageError, StorageResult,
-    StoredTableInfo, WireItem,
+    AttributeMap, AttributeValue, AttributeValueLookup, IndexName, ProjectionType, StorageError,
+    StorageResult, StoredTableInfo, WireItem,
 };
 
 pub fn validate_gsi_projection(
@@ -10,14 +15,38 @@ pub fn validate_gsi_projection(
     index_name: Option<&IndexName>,
     projection_expression: Option<&str>,
     attributes_to_get: Option<&[String]>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&crate::VecMap<String, String>>,
 ) -> StorageResult<()> {
+    if !gsi_requires_projection_validation(table_info, index_name) {
+        return Ok(());
+    }
     let requested = requested_top_level_attributes(
         projection_expression,
         attributes_to_get,
         expression_attribute_names,
     );
     validate_gsi_required_attributes(table_info, index_name, requested.iter().map(String::as_str))
+}
+
+fn gsi_requires_projection_validation(
+    table_info: &StoredTableInfo,
+    index_name: Option<&IndexName>,
+) -> bool {
+    let Some(index_name) = index_name else {
+        return false;
+    };
+    let Some(index) = table_info
+        .global_secondary_indexes
+        .as_ref()
+        .and_then(|indexes| indexes.iter().find(|index| index.index_name == *index_name))
+    else {
+        return false;
+    };
+    !index
+        .projection
+        .projection_type
+        .as_ref()
+        .is_none_or(|projection_type| *projection_type == ProjectionType::All)
 }
 
 pub fn validate_gsi_required_attributes<'a>(
@@ -66,7 +95,7 @@ pub fn validate_gsi_required_attributes<'a>(
 fn requested_top_level_attributes(
     projection_expression: Option<&str>,
     attributes_to_get: Option<&[String]>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&crate::VecMap<String, String>>,
 ) -> Vec<String> {
     if let Some(expression) = projection_expression {
         return expression
@@ -74,8 +103,8 @@ fn requested_top_level_attributes(
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .filter_map(|path| parse_projection_path(path, expression_attribute_names))
-            .filter_map(|path| match path.into_iter().next() {
-                Some(ProjectionSegment::Key(name)) => Some(name),
+            .filter_map(|path| match path.first() {
+                Some(ProjectionSegment::Key(name)) => Some((*name).to_owned()),
                 _ => None,
             })
             .collect();
@@ -104,23 +133,20 @@ fn gsi_projects_attribute(
 pub fn project_wire_items(
     items: Vec<WireItem>,
     projection_expression: Option<&str>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&crate::VecMap<String, String>>,
 ) -> StorageResult<Vec<WireItem>> {
     let Some(projection_expression) = projection_expression else {
         return Ok(items);
     };
-    let paths = projection_expression
-        .split(',')
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .filter_map(|path| parse_projection_path(path, expression_attribute_names))
-        .collect::<Vec<_>>();
+    let projection =
+        AttributeProjection::from_expression(projection_expression, expression_attribute_names);
+    let paths = projection.paths.as_deref().unwrap_or_default();
 
     items
         .into_iter()
         .map(|item| {
             let item = item.into_attribute_map()?;
-            WireItem::from_attribute_map(&project_hash_map(&item, &paths))
+            WireItem::try_from(&AttributeProjection::project_paths(&item, paths))
         })
         .collect()
 }
@@ -130,7 +156,7 @@ pub fn project_attribute_map(
     item: AttributeMap,
     projection_expression: Option<&str>,
     attributes_to_get: Option<&[String]>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&crate::VecMap<String, String>>,
 ) -> AttributeMap {
     let Some(projection) = AttributeProjection::new(
         projection_expression,
@@ -139,37 +165,19 @@ pub fn project_attribute_map(
     ) else {
         return item;
     };
-    projection.project(&item.into_hashmap())
-}
-
-#[must_use]
-pub fn project_attribute_map_ref(
-    item: &HashMap<String, AttributeValue>,
-    projection_expression: Option<&str>,
-    attributes_to_get: Option<&[String]>,
-    expression_attribute_names: Option<&HashMap<String, String>>,
-) -> AttributeMap {
-    AttributeProjection::new(
-        projection_expression,
-        attributes_to_get,
-        expression_attribute_names,
-    )
-    .map_or_else(
-        || item.clone().into(),
-        |projection| projection.project(item),
-    )
+    projection.project(&item)
 }
 
 pub struct AttributeProjection<'a> {
-    paths: Option<Vec<Vec<ProjectionSegment>>>,
+    paths: Option<Vec<ProjectionPath<'a>>>,
     attributes: Option<&'a [String]>,
 }
 
 impl<'a> AttributeProjection<'a> {
     #[must_use]
     pub fn from_expression(
-        expression: &str,
-        expression_attribute_names: Option<&HashMap<String, String>>,
+        expression: &'a str,
+        expression_attribute_names: Option<&'a crate::VecMap<String, String>>,
     ) -> Self {
         let paths = expression
             .split(',')
@@ -193,9 +201,9 @@ impl<'a> AttributeProjection<'a> {
 
     #[must_use]
     pub fn new(
-        projection_expression: Option<&str>,
+        projection_expression: Option<&'a str>,
         attributes_to_get: Option<&'a [String]>,
-        expression_attribute_names: Option<&HashMap<String, String>>,
+        expression_attribute_names: Option<&'a crate::VecMap<String, String>>,
     ) -> Option<Self> {
         if let Some(expression) = projection_expression {
             return Some(Self::from_expression(
@@ -207,86 +215,99 @@ impl<'a> AttributeProjection<'a> {
     }
 
     #[must_use]
-    pub fn project(&self, item: &HashMap<String, AttributeValue>) -> AttributeMap {
+    pub fn project<Item>(&self, item: &Item) -> AttributeMap
+    where Item: AttributeValueLookup + ?Sized {
         if let Some(paths) = self.paths.as_deref() {
-            return project_hash_map(item, paths).into();
+            return Self::project_paths(item, paths);
         }
         let attributes = self.attributes.unwrap_or_default();
-        let mut projected = HashMap::with_capacity(attributes.len());
+        let mut projected = AttributeMap::with_capacity(attributes.len());
         for name in attributes {
-            if let Some(value) = item.get(name) {
+            if let Some(value) = item.get_attribute_value(name) {
                 projected.insert(name.clone(), value.clone());
             }
         }
-        projected.into()
+        projected
     }
-}
 
-fn project_hash_map(
-    item: &HashMap<String, AttributeValue>,
-    paths: &[Vec<ProjectionSegment>],
-) -> HashMap<String, AttributeValue> {
-    let mut root = ProjectedValue::Map(HashMap::new());
-    for path in paths {
-        if let Some(value) = get_path_value(item, path) {
-            insert_projected_value(&mut root, path, value.clone());
+    fn project_paths(
+        item: &(impl AttributeValueLookup + ?Sized),
+        paths: &[ProjectionPath<'_>],
+    ) -> AttributeMap {
+        let mut root = ProjectedValue::Map(HashMap::new());
+        for path in paths {
+            if let Some(value) = get_path_value(item, path) {
+                insert_projected_value(&mut root, path, value.clone());
+            }
         }
+        root.into_attribute_map().unwrap_or_default()
     }
-    root.into_attribute_map().unwrap_or_default()
 }
 
-#[derive(Clone)]
-enum ProjectionSegment {
-    Key(String),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectionSegment<'a> {
+    Key(&'a str),
     Index(usize),
 }
 
-fn parse_projection_path(
-    path: &str,
-    attribute_names: Option<&HashMap<String, String>>,
-) -> Option<Vec<ProjectionSegment>> {
-    let mut segments = Vec::new();
+/// A parsed document path that borrows names from its expression and aliases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionPath<'a>(SmallVec<[ProjectionSegment<'a>; 2]>);
+
+impl<'a> Deref for ProjectionPath<'a> {
+    type Target = [ProjectionSegment<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub fn parse_projection_path<'a>(
+    path: &'a str,
+    attribute_names: Option<&'a crate::VecMap<String, String>>,
+) -> Option<ProjectionPath<'a>> {
+    let mut segments = SmallVec::new();
+    let bytes = path.as_bytes();
     let mut cursor = 0usize;
-    while cursor < path.len() {
-        let bytes = path.as_bytes();
-        match bytes.get(cursor).copied()? {
+    while cursor < bytes.len() {
+        match bytes[cursor] {
             b'.' => cursor += 1,
             b'[' => {
                 cursor += 1;
-                let end = path.get(cursor..)?.find(']')? + cursor;
+                let end = bytes.get(cursor..)?.iter().position(|byte| *byte == b']')? + cursor;
                 let index = path.get(cursor..end)?.parse().ok()?;
                 segments.push(ProjectionSegment::Index(index));
                 cursor = end + 1;
             }
             _ => {
-                let end = path
-                    .get(cursor..)?
-                    .find(['.', '['])
+                let end = bytes[cursor..]
+                    .iter()
+                    .position(|byte| matches!(*byte, b'.' | b'['))
                     .map_or(path.len(), |offset| cursor + offset);
                 let raw = path.get(cursor..end)?;
                 let key = attribute_names
                     .and_then(|names| names.get(raw))
-                    .map_or_else(|| raw.to_string(), Clone::clone);
+                    .map_or(raw, String::as_str);
                 segments.push(ProjectionSegment::Key(key));
                 cursor = end;
             }
         }
     }
-    Some(segments)
+    Some(ProjectionPath(segments))
 }
 
 fn get_path_value<'a>(
-    item: &'a HashMap<String, AttributeValue>,
-    path: &[ProjectionSegment],
+    item: &'a (impl AttributeValueLookup + ?Sized),
+    path: &[ProjectionSegment<'_>],
 ) -> Option<&'a AttributeValue> {
     let (first, rest) = path.split_first()?;
     let ProjectionSegment::Key(key) = first else {
         return None;
     };
-    let mut current = item.get(key)?;
+    let mut current = item.get_attribute_value(key)?;
     for segment in rest {
         match (segment, current) {
-            (ProjectionSegment::Key(key), AttributeValue::M(map)) => current = map.get(key)?,
+            (ProjectionSegment::Key(key), AttributeValue::M(map)) => current = map.get(*key)?,
             (ProjectionSegment::Index(index), AttributeValue::L(list)) => {
                 current = list.get(*index)?;
             }
@@ -320,7 +341,7 @@ impl ProjectedValue {
         }
     }
 
-    fn into_attribute_map(self) -> Option<HashMap<String, AttributeValue>> {
+    fn into_attribute_map(self) -> Option<AttributeMap> {
         let Self::Map(map) = self else {
             return None;
         };
@@ -334,7 +355,7 @@ impl ProjectedValue {
 
 fn insert_projected_value(
     target: &mut ProjectedValue,
-    path: &[ProjectionSegment],
+    path: &[ProjectionSegment<'_>],
     value: AttributeValue,
 ) {
     let Some((segment, rest)) = path.split_first() else {
@@ -351,7 +372,7 @@ fn insert_projected_value(
                 return;
             };
             let child = map
-                .entry(key.clone())
+                .entry((*key).to_owned())
                 .or_insert_with(|| next_projected_value(rest));
             insert_projected_value(child, rest, value);
         }
@@ -370,7 +391,7 @@ fn insert_projected_value(
     }
 }
 
-fn next_projected_value(rest: &[ProjectionSegment]) -> ProjectedValue {
+fn next_projected_value(rest: &[ProjectionSegment<'_>]) -> ProjectedValue {
     match rest.first() {
         Some(ProjectionSegment::Index(_)) => ProjectedValue::List(BTreeMap::new()),
         _ => ProjectedValue::Map(HashMap::new()),

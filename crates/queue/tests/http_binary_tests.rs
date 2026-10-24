@@ -25,11 +25,27 @@ impl QueueServer {
     async fn start() -> Self {
         let port = reserve_port();
         let base_url = format!("http://127.0.0.1:{port}");
-        let child = Command::new(env!("CARGO_BIN_EXE_queue"))
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--db-path")
-            .arg(":memory:")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_queue"));
+        let storage = queue_fixture_storage();
+        let postgres_dsn = match queue_fixture_postgres_dsn() {
+            Some(base_dsn) => Some(queue_fixture_isolated_postgres_dsn(&base_dsn).await),
+            None => None,
+        };
+        command.arg("--port").arg(port.to_string());
+        if let Some(db_path) = queue_fixture_db_path() {
+            command.arg("--db-path").arg(db_path);
+        }
+        if let Some(storage) = storage {
+            command.arg("--storage").arg(storage);
+        }
+        if let Some(postgres_dsn) = postgres_dsn {
+            command
+                .arg("--postgres-dsn")
+                .arg(postgres_dsn)
+                .arg("--overrides")
+                .arg("features.backends.postgres.tls=false");
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -80,6 +96,120 @@ impl QueueServer {
             .await
             .expect("send query request")
     }
+}
+
+fn queue_fixture_storage() -> Option<&'static str> {
+    #[cfg(all(feature = "turso", not(feature = "sqlite")))]
+    {
+        Some("turso")
+    }
+    #[cfg(all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    ))]
+    {
+        Some("postgres")
+    }
+    #[cfg(not(any(
+        all(feature = "turso", not(feature = "sqlite")),
+        all(
+            feature = "postgres",
+            not(feature = "sqlite"),
+            not(feature = "turso"),
+            not(feature = "rocksdb"),
+            not(feature = "foundationdb")
+        )
+    )))]
+    {
+        None
+    }
+}
+
+fn queue_fixture_db_path() -> Option<&'static str> {
+    (queue_fixture_storage() != Some("postgres")).then_some(":memory:")
+}
+
+#[cfg(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+))]
+fn queue_fixture_postgres_dsn() -> Option<String> {
+    Some(
+        std::env::var("TEST_POSTGRES_DSN")
+            .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
+            .expect("TEST_POSTGRES_DSN or AUX_QUEUE_POSTGRES_DSN is required"),
+    )
+}
+
+#[cfg(not(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+)))]
+fn queue_fixture_postgres_dsn() -> Option<String> {
+    None
+}
+
+#[cfg(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+))]
+async fn queue_fixture_isolated_postgres_dsn(base_dsn: &str) -> String {
+    let schema = format!("queue_http_{}", uuid::Uuid::now_v7().simple());
+    let (client, connection) = tokio_postgres::connect(base_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect Postgres to create isolated queue HTTP schema");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create isolated queue HTTP schema");
+    let separator = if base_dsn.contains('?') { '&' } else { '?' };
+    format!("{base_dsn}{separator}options=-csearch_path%3D{schema}")
+}
+
+#[cfg(not(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+)))]
+async fn queue_fixture_isolated_postgres_dsn(_base_dsn: &str) -> String {
+    unreachable!("Postgres fixture DSN is only available with the Postgres-only feature cell")
+}
+
+#[test]
+fn queue_http_fixture_selects_the_only_compiled_sql_backend() {
+    let expected_storage = if cfg!(all(feature = "turso", not(feature = "sqlite"))) {
+        Some("turso")
+    } else if cfg!(all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    )) {
+        Some("postgres")
+    } else {
+        None
+    };
+    assert_eq!(queue_fixture_storage(), expected_storage);
+    let expected_db_path = (expected_storage != Some("postgres")).then_some(":memory:");
+    assert_eq!(queue_fixture_db_path(), expected_db_path);
 }
 
 impl Drop for QueueServer {

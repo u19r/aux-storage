@@ -109,6 +109,19 @@ impl From<&str> for MessageId {
 pub struct ReceiptHandle(pub String);
 
 impl ReceiptHandle {
+    pub(crate) fn has_valid_shape(&self) -> bool {
+        let Ok(bytes) = URL_SAFE.decode(&self.0) else {
+            return false;
+        };
+        let Ok(decoded) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let Some((timestamp, message_id)) = decoded.split_once(':') else {
+            return false;
+        };
+        timestamp.parse::<i64>().is_ok() && Uuid::parse_str(message_id).is_ok()
+    }
+
     #[must_use]
     pub fn new(timestamp: i64, message_id: Uuid) -> Self {
         let key = format!("{timestamp:010}:{message_id}");

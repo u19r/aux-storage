@@ -8,12 +8,11 @@ use alloc_counter::AllocationGuard;
 use crate::{
     AttributeDefinition, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement,
     KeyType, StorageEnum, StorageResult, StoredTableInfo, TableName, TableStatus, TimestampMillis,
-    context::WrappedError as _, normalize_dynamodb_number_for_write,
-    preflight_transact_put_item_key_with_table_info, preflight_transact_write_key_with_table_info,
-    transact_put_item_key_fingerprint, validate_no_duplicate_transact_item_keys,
+    constants_tests::TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS, context::WrappedError as _,
+    normalize_dynamodb_number_for_write, preflight_transact_put_item_key_with_table_info,
+    preflight_transact_write_key_with_table_info, transact_put_item_key_fingerprint,
+    validate_no_duplicate_transact_item_keys, validate_transact_key_with_unresolved_attributes,
 };
-
-const FINGERPRINT_ITERATIONS: usize = 10_000;
 
 #[test]
 fn transaction_key_preflight_normalizes_equivalent_number_fingerprints() {
@@ -44,12 +43,84 @@ fn transaction_key_preflight_normalizes_equivalent_number_fingerprints() {
     let error = validate_no_duplicate_transact_item_keys(&[put_preflight, delete_preflight])
         .expect_err("equivalent number keys should be duplicate transaction targets");
 
-    let StorageEnum::Validation { message } = error.to_enum() else {
+    let StorageEnum::Validation { message, .. } = error.to_enum() else {
         panic!("expected validation error, got {error:?}");
     };
     assert_eq!(
         message,
         "Transaction request cannot include multiple operations on one item"
+    );
+}
+
+#[test]
+fn transaction_key_fingerprint_canonicalizes_equivalent_numeric_spellings() {
+    let table_info = number_table_info();
+    let fingerprint = |pk: &str, sk: &str| {
+        transact_put_item_key_fingerprint(
+            &table_info,
+            &HashMap::from([
+                ("pk".to_string(), AttributeValue::N(pk.to_string())),
+                ("sk".to_string(), AttributeValue::N(sk.to_string())),
+            ]),
+        )
+        .expect("transaction key fingerprint")
+    };
+
+    assert_eq!(fingerprint("1", "-0"), fingerprint("1.0", "0"));
+    assert_eq!(fingerprint("1.0", "0"), fingerprint("1E0", "0E0"));
+}
+
+#[test]
+fn transaction_key_fingerprint_rejects_invalid_numeric_keys() {
+    let table_info = number_table_info();
+    let error = transact_put_item_key_fingerprint(
+        &table_info,
+        &HashMap::from([
+            ("pk".to_string(), AttributeValue::N("1E126".to_string())),
+            ("sk".to_string(), AttributeValue::N("1".to_string())),
+        ]),
+    )
+    .expect_err("out-of-range transaction key should fail");
+
+    assert!(error.to_string().contains("Invalid numeric key"));
+}
+
+#[test]
+fn read_sequence_key_validation_checks_concrete_components_when_one_is_unresolved() {
+    let table_info = number_table_info();
+    let key = KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S("planner-owned-input".to_string()),
+        ),
+        ("sk".to_string(), AttributeValue::N("1E-131".to_string())),
+    ]));
+
+    let error = validate_transact_key_with_unresolved_attributes(&table_info, &key, &["pk"])
+        .expect_err(
+            "concrete invalid numeric components must not be hidden by an unresolved input",
+        );
+
+    assert!(error.to_string().contains("supported range"));
+}
+
+#[test]
+fn read_sequence_key_validation_does_not_treat_a_literal_marker_as_unresolved() {
+    let table_info = number_table_info();
+    let key = KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S("__aux_read_sequence_input__pk".to_string()),
+        ),
+        ("sk".to_string(), AttributeValue::N("1".to_string())),
+    ]));
+
+    let error = validate_transact_key_with_unresolved_attributes(&table_info, &key, &[])
+        .expect_err("client literals must use the ordinary schema/type validator");
+
+    assert_eq!(
+        error.to_string(),
+        "The provided key element does not match the schema"
     );
 }
 
@@ -68,8 +139,8 @@ fn transaction_put_key_fingerprint_avoids_temporary_key_map_and_json_allocations
         || transact_put_item_key_fingerprint(&table_info, &item),
     );
 
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert!(
         optimized.allocation_count <= legacy.allocation_count,
@@ -102,8 +173,8 @@ fn transaction_key_fingerprint_runtime_perf_probe() {
              optimized_ms={:.3} legacy_ns_per_iter={:.2} optimized_ns_per_iter={:.2}",
             legacy.as_secs_f64() * 1_000.0,
             optimized.as_secs_f64() * 1_000.0,
-            legacy.as_nanos() as f64 / FINGERPRINT_ITERATIONS as f64,
-            optimized.as_nanos() as f64 / FINGERPRINT_ITERATIONS as f64
+            legacy.as_nanos() as f64 / TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS as f64,
+            optimized.as_nanos() as f64 / TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS as f64
         );
     }
 }
@@ -114,7 +185,7 @@ fn measure_fingerprint_allocations(
     mut fingerprint: impl FnMut() -> StorageResult<String>,
 ) -> alloc_counter::AllocationReport<'static> {
     let guard = AllocationGuard::start(module_path!(), test_name, file!(), line!(), Some(label));
-    for _ in 0..FINGERPRINT_ITERATIONS {
+    for _ in 0..TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS {
         std::hint::black_box(fingerprint().expect("fingerprint key"));
     }
     guard.finish()
@@ -122,7 +193,7 @@ fn measure_fingerprint_allocations(
 
 fn measure_fingerprint_runtime(mut fingerprint: impl FnMut() -> StorageResult<String>) -> Duration {
     let started = Instant::now();
-    for _ in 0..FINGERPRINT_ITERATIONS {
+    for _ in 0..TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS {
         std::hint::black_box(fingerprint().expect("fingerprint key"));
     }
     started.elapsed()

@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateGlobalSecondaryIndex, IndexName,
+    AttributeDefinition, AttributeMap, BillingMode, CreateGlobalSecondaryIndex, IndexName,
     KeyAttributes, MaxIndexers, OnDemandThroughput, ProvisionedThroughput, ReplicaUpdate,
     SseSpecification, StreamRetentionDuration, StreamSpecification, TableClass, TableDescription,
     TableName,
@@ -14,6 +12,20 @@ use crate::{
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct UpdateTableRequest {
     pub table_name: TableName,
+
+    /// Aux-storage extension: transfer configuration ownership to an active
+    /// replica. Submit to the current primary as a separate table control.
+    #[cfg(feature = "regional")]
+    #[serde(
+        rename = "AuxConfigurationPrimaryRegion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(
+        min_length = 1,
+        max_length = 64,
+        pattern = "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+    )]
+    pub aux_configuration_primary_region: Option<String>,
 
     /// Aux-storage extension: increase the ordered item indexer capacity.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +81,42 @@ pub struct UpdateTableRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table_class: Option<TableClass>,
+}
+
+impl UpdateTableRequest {
+    #[must_use]
+    pub fn new(table_name: TableName) -> Self {
+        Self {
+            table_name,
+            #[cfg(feature = "regional")]
+            aux_configuration_primary_region: None,
+            max_indexers: None,
+            attribute_definitions: None,
+            billing_mode: None,
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+            deletion_protection_enabled: None,
+            global_secondary_index_updates: None,
+            replica_updates: None,
+            sse_specification: None,
+            stream_specification: None,
+            aux_stream_duration_hours: None,
+            aux_default_item_stream_duration_hours: None,
+            table_class: None,
+        }
+    }
+
+    #[must_use]
+    pub fn configuration_primary_region(&self) -> Option<&str> {
+        #[cfg(feature = "regional")]
+        {
+            self.aux_configuration_primary_region.as_deref()
+        }
+        #[cfg(not(feature = "regional"))]
+        {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -134,7 +182,34 @@ pub enum TimeToLiveStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+impl std::fmt::Display for TimeToLiveStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Enabling => "ENABLING",
+            Self::Enabled => "ENABLED",
+            Self::Disabling => "DISABLING",
+            Self::Disabled => "DISABLED",
+        })
+    }
+}
+
+impl std::str::FromStr for TimeToLiveStatus {
+    type Err = crate::StorageError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ENABLING" => Ok(Self::Enabling),
+            "ENABLED" => Ok(Self::Enabled),
+            "DISABLING" => Ok(Self::Disabling),
+            "DISABLED" => Ok(Self::Disabled),
+            _ => Err(crate::StorageError::validation(format!(
+                "unknown ttl policy status: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct GlobalSecondaryIndexUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,7 +220,7 @@ pub struct GlobalSecondaryIndexUpdate {
     pub delete: Option<DeleteGlobalSecondaryIndexAction>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct UpdateGlobalSecondaryIndexAction {
     pub index_name: IndexName,
@@ -154,7 +229,7 @@ pub struct UpdateGlobalSecondaryIndexAction {
     pub provisioned_throughput: Option<ProvisionedThroughput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "PascalCase")]
 pub struct DeleteGlobalSecondaryIndexAction {
     pub index_name: IndexName,
@@ -162,6 +237,6 @@ pub struct DeleteGlobalSecondaryIndexAction {
 
 pub struct SplitDynamoItem {
     pub key_attributes: KeyAttributes,
-    pub all_attributes: HashMap<String, AttributeValue>,
-    pub non_key_attributes: HashMap<String, AttributeValue>,
+    pub all_attributes: AttributeMap,
+    pub non_key_attributes: AttributeMap,
 }

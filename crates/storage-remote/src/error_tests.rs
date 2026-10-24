@@ -11,6 +11,7 @@ fn resource_in_use_exception_maps_to_table_already_exists() {
             error_type: Some("ResourceInUseException".to_string()),
             code: None,
             message: Some("The resource which you are attempting to change is in use.".to_string()),
+            item: None,
             cancellation_reasons: None,
         },
     );
@@ -20,6 +21,73 @@ fn resource_in_use_exception_maps_to_table_already_exists() {
     assert!(matches!(
         error.to_enum(),
         StorageEnum::TableAlreadyExists { .. }
+    ));
+}
+
+#[test]
+fn resource_in_use_message_does_not_duplicate_table_already_exists_prefix() {
+    let (error, _, _) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("ResourceInUseException".to_string()),
+            code: None,
+            message: Some("Table already exists: Users".to_string()),
+            item: None,
+            cancellation_reasons: None,
+        },
+    );
+
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::TableAlreadyExists { name } if name == "Users"
+    ));
+}
+
+#[test]
+fn conditional_failure_item_is_preserved_from_remote_error() {
+    let (error, retryable, code) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("ConditionalCheckFailedException".to_string()),
+            code: None,
+            message: Some("The conditional request failed".to_string()),
+            item: Some(serde_json::json!({"pk": {"S": "item-1"}})),
+            cancellation_reasons: None,
+        },
+    );
+
+    assert!(!retryable);
+    assert_eq!(code.as_deref(), Some("ConditionalCheckFailedException"));
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::ConditionalCheckFailedWithItem { item }
+            if item.get("pk") == Some(&storage_types::AttributeValue::S("item-1".to_string()))
+    ));
+}
+
+#[test]
+fn idempotent_parameter_mismatch_maps_to_typed_storage_error() {
+    let (error, retryable, code) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some(
+                "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException".to_string(),
+            ),
+            code: None,
+            message: Some("request token was reused".to_string()),
+            item: None,
+            cancellation_reasons: None,
+        },
+    );
+
+    assert!(!retryable);
+    assert_eq!(
+        code.as_deref(),
+        Some("IdempotentParameterMismatchException")
+    );
+    assert!(matches!(
+        error.to_enum(),
+        StorageEnum::IdempotentParameterMismatch
     ));
 }
 
@@ -37,6 +105,7 @@ fn throttling_error_codes_are_retryable() {
                 error_type: Some(code.to_string()),
                 code: None,
                 message: Some("slow down".to_string()),
+                item: None,
                 cancellation_reasons: None,
             },
         );
@@ -65,6 +134,7 @@ fn table_not_found_messages_map_to_table_not_found_when_table_name_is_present() 
             error_type: Some("ResourceNotFoundException".to_string()),
             code: None,
             message: Some("Requested resource not found: Table: `Users` not found".to_string()),
+            item: None,
             cancellation_reasons: None,
         },
     );
@@ -82,6 +152,7 @@ fn unknown_error_uses_status_code_to_decide_retryability() {
             error_type: Some("CustomError".to_string()),
             code: None,
             message: Some("failed".to_string()),
+            item: None,
             cancellation_reasons: None,
         },
     );
@@ -91,6 +162,7 @@ fn unknown_error_uses_status_code_to_decide_retryability() {
             error_type: None,
             code: None,
             message: Some("bad request".to_string()),
+            item: None,
             cancellation_reasons: None,
         },
     );
@@ -117,6 +189,7 @@ fn not_leader_exception_is_retryable_for_leader_cache_refresh() {
             error_type: Some("NotLeaderException".to_string()),
             code: None,
             message: Some("retry against the current leader".to_string()),
+            item: None,
             cancellation_reasons: None,
         },
     );
@@ -137,6 +210,7 @@ fn transaction_cancellation_preserves_conditional_reason_without_retrying_transp
             error_type: Some("TransactionCanceledException".to_string()),
             code: None,
             message: Some("transaction cancelled".to_string()),
+            item: None,
             cancellation_reasons: Some(vec![
                 RemoteCancellationReason {
                     code: Some("ConditionalCheckFailed".to_string()),
@@ -179,6 +253,7 @@ fn transaction_cancellation_is_never_retryable_for_any_reason() {
                 error_type: Some("TransactionCanceledException".to_string()),
                 code: None,
                 message: None,
+                item: None,
                 cancellation_reasons: Some(vec![RemoteCancellationReason {
                     code: Some(code.to_string()),
                     message: None,
@@ -199,6 +274,7 @@ fn transaction_cancellation_preserves_reason_message_and_item() {
             error_type: Some("TransactionCanceledException".to_string()),
             code: None,
             message: None,
+            item: None,
             cancellation_reasons: Some(vec![RemoteCancellationReason {
                 code: Some("ConditionalCheckFailed".to_string()),
                 message: Some("The conditional request failed.".to_string()),
@@ -225,6 +301,7 @@ fn transaction_cancellation_defaults_null_code_to_none() {
             error_type: Some("TransactionCanceledException".to_string()),
             code: None,
             message: None,
+            item: None,
             cancellation_reasons: Some(vec![RemoteCancellationReason {
                 code: None,
                 message: None,

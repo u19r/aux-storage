@@ -4,12 +4,14 @@ use alloc_counter::AllocationGuard;
 use axum::body::Bytes;
 use storage_types::{DynamoRequestValidate, GetItemRequest, PutItemRequest};
 
-use crate::routes::dynamodb::{parse_json_request_format, parse_try_into_request};
-
-const ITERATIONS: usize = 1_000;
-const GET_BODY: &[u8] = br#"{"TableName":"table","Key":{"pk":{"S":"value"}}}"#;
-const PUT_BODY: &[u8] =
-    br#"{"TableName":"table","Item":{"pk":{"S":"value"},"data":{"S":"payload"}}}"#;
+use crate::{
+    constants_tests::{
+        DYNAMODB_DECODE_ALLOCATION_ISOLATED_ENV as ISOLATED_ENV,
+        DYNAMODB_DECODE_GET_BODY as GET_BODY, DYNAMODB_DECODE_PERF_ITERATIONS as ITERATIONS,
+        DYNAMODB_DECODE_PUT_BODY as PUT_BODY,
+    },
+    routes::dynamodb::{parse_json_request_format, parse_try_into_request},
+};
 
 fn direct<T>(body: &[u8]) -> T
 where T: serde::de::DeserializeOwned + DynamoRequestValidate {
@@ -39,7 +41,6 @@ fn measure<T>(
 
 #[test]
 fn given_small_requests_when_decoding_directly_then_allocations_are_reduced() {
-    const ISOLATED_ENV: &str = "AUX_STORAGE_API_DYNAMODB_DECODE_ALLOCATION_ISOLATED";
     if std::env::var_os(ISOLATED_ENV).is_none() {
         let status = Command::new(
             std::env::current_exe()
@@ -71,10 +72,10 @@ fn given_small_requests_when_decoding_directly_then_allocations_are_reduced() {
     });
     let direct_put = measure("put_direct_typed", || direct::<PutItemRequest>(PUT_BODY));
 
-    alloc_counter::emit_report(&legacy_get);
-    alloc_counter::emit_report(&direct_get);
-    alloc_counter::emit_report(&legacy_put);
-    alloc_counter::emit_report(&direct_put);
+    let _ = alloc_counter::emit_report(&legacy_get);
+    let _ = alloc_counter::emit_report(&direct_get);
+    let _ = alloc_counter::emit_report(&legacy_put);
+    let _ = alloc_counter::emit_report(&direct_put);
     assert!(direct_get.allocation_count < legacy_get.allocation_count);
     assert!(direct_get.allocated_bytes < legacy_get.allocated_bytes);
     assert!(direct_put.allocation_count < legacy_put.allocation_count);

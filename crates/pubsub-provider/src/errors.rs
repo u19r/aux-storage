@@ -1,7 +1,14 @@
 use http_error::HttpApiError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::constants::{
+    COMPAT_PRODUCT_NAME, SNS_INTERNAL_ERROR_TYPE, SNS_INVALID_PARAMETER_ERROR_TYPE,
+    SNS_NOT_FOUND_ERROR_TYPE,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PubsubValidationKind {
     InvalidTopicName,
     InvalidTopicArn,
@@ -35,8 +42,6 @@ impl PubsubValidationKind {
 
     #[must_use]
     pub fn aws_query_message(self, detail: Option<&str>) -> String {
-        const COMPAT_PRODUCT_NAME: &str = concat!("Amazon ", "SN", "S");
-
         match self {
             Self::InvalidTopicName => "Invalid parameter: Topic Name".to_string(),
             Self::InvalidTopicArn => "Invalid parameter: TopicArn Reason: An ARN must have at \
@@ -57,10 +62,6 @@ impl PubsubValidationKind {
         }
     }
 }
-
-pub const SNS_NOT_FOUND_ERROR_TYPE: &str = "NotFound";
-pub const SNS_INVALID_PARAMETER_ERROR_TYPE: &str = "InvalidParameter";
-pub const SNS_INTERNAL_ERROR_TYPE: &str = "InternalError";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PubsubInternalKind {
@@ -92,11 +93,17 @@ pub enum PubsubError {
         detail: Option<String>,
     },
 
+    #[error("Delivery claim lost: {delivery_id}")]
+    DeliveryClaimLost { delivery_id: String },
+
     #[error("Internal server error: {}", kind.as_code())]
     Internal {
         kind: PubsubInternalKind,
         detail: Option<String>,
     },
+
+    #[error("Internal server error: storage")]
+    Storage(#[from] storage_types::StorageError),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -145,11 +152,21 @@ impl PubsubError {
     }
 
     #[must_use]
+    pub fn delivery_claim_lost(delivery_id: impl Into<String>) -> Self {
+        Self::DeliveryClaimLost {
+            delivery_id: delivery_id.into(),
+        }
+    }
+
+    #[must_use]
     pub fn aws_query_error_type(&self) -> &'static str {
         match self {
             Self::ResourceNotFound { .. } => SNS_NOT_FOUND_ERROR_TYPE,
             Self::Validation { kind, .. } => kind.aws_query_error_type(),
-            Self::Internal { .. } | Self::Serialization(_) => SNS_INTERNAL_ERROR_TYPE,
+            Self::DeliveryClaimLost { .. }
+            | Self::Internal { .. }
+            | Self::Storage(_)
+            | Self::Serialization(_) => SNS_INTERNAL_ERROR_TYPE,
         }
     }
 
@@ -162,14 +179,20 @@ impl PubsubError {
                 _ => self.to_string(),
             },
             Self::Validation { kind, detail } => kind.aws_query_message(detail.as_deref()),
-            Self::Internal { .. } | Self::Serialization(_) => self.to_string(),
+            Self::DeliveryClaimLost { .. }
+            | Self::Internal { .. }
+            | Self::Storage(_)
+            | Self::Serialization(_) => self.to_string(),
         }
     }
 
     #[must_use]
     pub const fn aws_query_status_code(&self) -> u16 {
         match self {
-            Self::Internal { .. } | Self::Serialization(_) => 500,
+            Self::DeliveryClaimLost { .. }
+            | Self::Internal { .. }
+            | Self::Storage(_)
+            | Self::Serialization(_) => 500,
             Self::ResourceNotFound { .. } | Self::Validation { .. } => 400,
         }
     }

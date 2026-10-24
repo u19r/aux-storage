@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub struct IndexName(String);
 
 impl IndexName {
@@ -11,6 +11,11 @@ impl IndexName {
     #[must_use]
     pub fn sanitized_name(&self) -> String {
         self.0.replace(['\'', '"', ';'], "")
+    }
+
+    #[must_use]
+    pub fn is_ttl_index(&self) -> bool {
+        self.0.starts_with(crate::HIDDEN_TTL_INDEX_PREFIX)
     }
 }
 impl std::fmt::Display for IndexName {

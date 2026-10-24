@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
 use typed_builder::TypedBuilder;
 
 use crate::{
-    AllOld, AttributeValue, BatchWriteItemRequest, DeleteRequest, PutRequest,
-    StreamRetentionDuration, TableName, TransactConditionCheckRequest, TransactDeleteRequest,
-    TransactPutRequest, TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest,
-    WireItem, WriteRequest, single_table_entity::WireEntity,
+    AllOld, AttributeMap, BatchWriteItemRequest, DeleteRequest, PutItemRequest, PutRequest,
+    ReturnConsumedCapacity, StorageError, StorageResult, StreamRetentionDuration, TableName,
+    TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
+    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, VecMap, WireItem,
+    WriteRequest, single_table_entity::WireEntity,
 };
 
 #[derive(Debug, Clone)]
@@ -15,11 +14,29 @@ pub struct PutItemEncodeRequest {
     pub item: WireItem,
     pub indexers: Option<Vec<String>>,
     pub condition_expression: Option<String>,
-    pub expression_attribute_names: Option<HashMap<String, String>>,
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
+    pub expression_attribute_values: Option<AttributeMap>,
     pub return_values: Option<AllOld>,
     pub return_old_on_condition_failure: bool,
     pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
+}
+
+impl TryFrom<PutItemEncodeRequest> for PutItemRequest {
+    type Error = StorageError;
+
+    fn try_from(encoded: PutItemEncodeRequest) -> StorageResult<Self> {
+        let mut request = Self::new(encoded.table_name, encoded.item);
+        request.indexers = encoded.indexers;
+        request.condition_expression = encoded.condition_expression;
+        request.expression_attribute_names = encoded.expression_attribute_names;
+        request.expression_attribute_values = encoded.expression_attribute_values;
+        request.return_values = encoded.return_values;
+        request.return_values_on_condition_check_failure = encoded
+            .return_old_on_condition_failure
+            .then(|| "ALL_OLD".to_string());
+        request.aux_item_stream_ttl_hours = encoded.aux_item_stream_ttl_hours;
+        Ok(request)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +71,15 @@ impl WriteRetryPolicy {
     pub const fn delay(self) -> std::time::Duration {
         self.delay
     }
+
+    /// Delay after a known-aborted conflict; attempt numbers start at one.
+    #[must_use]
+    pub fn delay_after_conflict(self, attempt: u32) -> std::time::Duration {
+        let multiplier = 1_u32 << attempt.saturating_sub(1).min(31);
+        self.delay
+            .saturating_mul(multiplier)
+            .min(std::time::Duration::from_secs(1))
+    }
 }
 
 #[allow(clippy::extra_unused_lifetimes)]
@@ -61,8 +87,8 @@ impl WriteRetryPolicy {
 #[builder(field_defaults(default, setter(strip_option, into)))]
 pub struct BatchWriteItemEncodeRequest {
     #[builder(!default, setter(!strip_option))]
-    pub request_items: HashMap<TableName, Vec<EncodeWriteRequest>>,
-    pub return_consumed_capacity: Option<String>,
+    pub request_items: VecMap<TableName, Vec<EncodeWriteRequest>>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
     pub return_item_collection_metrics: Option<String>,
 }
 
@@ -85,7 +111,7 @@ impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
     type Error = crate::StorageError;
 
     fn try_from(value: BatchWriteItemEncodeRequest) -> Result<Self, Self::Error> {
-        let mut request_items = HashMap::with_capacity(value.request_items.len());
+        let mut request_items = VecMap::with_capacity(value.request_items.len());
         for (table_name, write_requests) in value.request_items {
             let mut converted = Vec::with_capacity(write_requests.len());
             for write_request in write_requests {
@@ -93,7 +119,7 @@ impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
                     Some(put_request) => {
                         let (item, indexers) = put_request.item.into_write_parts();
                         Some(PutRequest {
-                            item: item.into_attribute_map()?,
+                            item,
                             indexers,
                             aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                         })
@@ -121,16 +147,13 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
     type Error = crate::StorageError;
 
     fn try_from(value: BatchWriteItemRequest) -> Result<Self, Self::Error> {
-        let mut request_items = HashMap::with_capacity(value.request_items.len());
+        let mut request_items = VecMap::with_capacity(value.request_items.len());
         for (table_name, write_requests) in value.request_items {
             let mut converted = Vec::with_capacity(write_requests.len());
             for write_request in write_requests {
                 let put_request = match write_request.put_request {
                     Some(put_request) => Some(EncodePutRequest {
-                        item: WireEntity::from_write_parts(
-                            WireItem::from_attribute_map(&put_request.item)?,
-                            put_request.indexers,
-                        ),
+                        item: WireEntity::from_write_parts(put_request.item, put_request.indexers),
                         aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     }),
                     None => None,
@@ -159,7 +182,7 @@ pub struct TransactWriteItemsEncodeRequest {
     #[builder(!default, setter(!strip_option))]
     pub transact_items: Vec<TransactEncodeItem>,
     pub client_request_token: Option<String>,
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
     pub return_item_collection_metrics: Option<String>,
 }
 
@@ -180,8 +203,8 @@ pub struct TransactEncodePutRequest {
     #[builder(!default, setter(!strip_option))]
     pub item: WireEntity,
     pub condition_expression: Option<String>,
-    pub expression_attribute_names: Option<HashMap<String, String>>,
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
+    pub expression_attribute_values: Option<AttributeMap>,
     pub return_values_on_condition_check_failure: Option<String>,
     pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
@@ -197,7 +220,7 @@ impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
                     let (item, indexers) = put_request.item.into_write_parts();
                     Some(TransactPutRequest {
                         table_name: put_request.table_name,
-                        item: item.into_attribute_map()?,
+                        item,
                         indexers,
                         condition_expression: put_request.condition_expression,
                         expression_attribute_names: put_request.expression_attribute_names,

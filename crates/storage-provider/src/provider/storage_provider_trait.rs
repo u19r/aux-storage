@@ -1,54 +1,24 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use bg_jobs::BackgroundJobName;
 use storage_types::{
-    AllOld, BatchGetItemRequest, BatchGetWireItemResponse, BatchWriteItemEncodeRequest,
-    BatchWriteItemRequest, BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest,
-    DurableBatchPointReadProof, DurableBatchPointReadProofEntry, DurableBatchPointReadRequest,
-    DurablePointReadProof, DurablePointReadRequest, GuardedDeleteItemRequest,
-    GuardedPutItemRequest, GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest,
-    ItemVersionedWireItem, KeyAttributes, KeySchemaElement, PutItemEncodeRequest, PutItemRequest,
-    PutItemResponse, QueryTableRequest, ReadSequenceConsistency, ReplicationMutation,
-    ScanTableRequest, SplitDynamoItem, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, TableName, TableStatus, TransactWriteItemsEncodeRequest,
-    UpdateItemRequest, UpdateItemResponse, WireItem, WriteRetryPolicy,
+    BatchGetExecutionRequest, BatchGetExecutionResult, BatchGetItemRequest,
+    BatchGetWireItemResponse, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
+    BatchWriteItemResponse, CreateTableRequest, DeleteItemRequest, DurablePointReadProof,
+    DurablePointReadRequest, GuardedDeleteItemRequest, GuardedPutItemRequest,
+    GuardedTransactWriteItemsRequest, GuardedUpdateItemRequest, KeyAttributes, KeySchemaElement,
+    PutItemEncodeRequest, PutItemRequest, PutItemResponse, QueryTableRequest,
+    ReadSequenceConsistency, ScanTableRequest, SplitDynamoItem, StorageError, StorageResult,
+    StoredTableInfo, TableName, TableStatus, TransactGetItemsRequest, TransactGetItemsResponse,
+    TransactWriteItemsEncodeRequest, UpdateItemRequest, UpdateItemResponse, WireItem,
+    WriteRetryPolicy,
 };
 
+use super::{read_context_trait::StorageProviderReadContext, trait_defaults as defaults};
 use crate::{
-    AtomicItemReadModifyWriteRequest, AttributeValue, ChangeIndexMarker,
-    ListChangeIndexMarkersRequest, ReadSequenceExecution, ReadSequenceExecutionBudget,
-    StreamTrimDueMarker, StreamTrimState,
+    AtomicItemReadModifyWriteRequest, AttributeValue, BatchWriteContexts, OrderedOperationContexts,
+    PhysicalWrite, ReadSequenceExecution, ReadSequenceExecutionBudget, TtlWriteContext,
 };
-
-/// Provider-owned read context for operations that must share one backend
-/// snapshot/read version.
-#[async_trait]
-pub trait StorageProviderReadContext: Send + Sync {
-    /// Return and clear a backend signal that the current read-only attempt
-    /// must be discarded and rebuilt from a fresh snapshot.  Providers which
-    /// cannot classify retryable read failures keep the default `false`.
-    fn take_retryable_read_failure(&self) -> bool {
-        false
-    }
-
-    async fn get_item(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        consistent_read: bool,
-    ) -> StorageResult<Option<WireItem>>;
-
-    async fn batch_get_item(
-        &self,
-        request: BatchGetItemRequest,
-    ) -> StorageResult<BatchGetWireItemResponse>;
-
-    async fn query_table(
-        &self,
-        request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)>;
-}
 
 /// Trait for storage backends that can store `DynamoDB` table metadata
 #[async_trait]
@@ -58,7 +28,7 @@ pub trait StorageProvider: Send + Sync {
     /// capability to avoid a speculative whole-plan attempt on providers
     /// which will necessarily fall back to serial reads.
     fn supports_read_sequence_mapped_range(&self) -> bool {
-        false
+        defaults::supports_read_sequence_mapped_range()
     }
 
     /// Return and clear provider-pressure signals observed since the previous
@@ -67,7 +37,16 @@ pub trait StorageProvider: Send + Sync {
     /// admission controller that capacity was consumed even when the final
     /// operation succeeded.
     fn take_admission_pressure_signal(&self) -> bool {
-        false
+        defaults::take_admission_pressure_signal()
+    }
+
+    /// Purge global stream-history replay state (effects, records, pointer
+    /// tombstones) so a test wipe restores fresh-boot equivalence. Table
+    /// delete deliberately keeps this history for incarnation fail-closed;
+    /// only the wipe path calls this hook. Backends without SQL history
+    /// tables keep the default no-op.
+    async fn purge_stream_history_for_test(&self) -> StorageResult<()> {
+        defaults::purge_stream_history_for_test()
     }
 
     /// Attempt a backend whole-plan lowering. Unsupported shapes must return
@@ -79,7 +58,7 @@ pub trait StorageProvider: Send + Sync {
         _consistency: ReadSequenceConsistency,
         _continuation: Option<&str>,
     ) -> StorageResult<ReadSequenceExecution> {
-        Ok(ReadSequenceExecution::unsupported())
+        Ok(defaults::execute_read_sequence_plan())
     }
 
     /// Attempt an optimized execution with an explicit item frontier.  The
@@ -93,14 +72,14 @@ pub trait StorageProvider: Send + Sync {
         continuation: Option<&str>,
         budget: ReadSequenceExecutionBudget,
     ) -> StorageResult<ReadSequenceExecution> {
-        if budget.is_unbounded() {
-            self.execute_read_sequence_plan(plan, consistency, continuation)
-                .await
-        } else {
-            Ok(ReadSequenceExecution::Unsupported(
-                crate::ReadSequenceUnsupportedReason::ParameterLimit,
-            ))
-        }
+        defaults::execute_read_sequence_plan_with_budget(
+            self,
+            plan,
+            consistency,
+            continuation,
+            budget,
+        )
+        .await
     }
 
     /// Backend-internal helper for a lowering that combines independent
@@ -111,25 +90,19 @@ pub trait StorageProvider: Send + Sync {
         &self,
         _plan: &storage_types::ReadSequencePlan,
     ) -> StorageResult<ReadSequenceExecution> {
-        Ok(ReadSequenceExecution::Unsupported(
-            crate::ReadSequenceUnsupportedReason::OperationShape,
-        ))
+        Ok(defaults::execute_read_sequence_independent_roots())
     }
 
     fn supports_guarded_writes(&self) -> bool {
-        false
+        defaults::supports_guarded_writes()
     }
 
     fn supports_guarded_transaction_writes(&self) -> bool {
-        false
-    }
-
-    fn supports_custom_stream_duration(&self) -> bool {
-        false
+        defaults::supports_guarded_transaction_writes()
     }
 
     fn supports_change_index(&self) -> bool {
-        false
+        defaults::supports_change_index()
     }
 
     async fn begin_read_sequence_read_context(
@@ -137,23 +110,11 @@ pub trait StorageProvider: Send + Sync {
         consistency: ReadSequenceConsistency,
     ) -> StorageResult<Box<dyn StorageProviderReadContext>> {
         let _ = consistency;
-        Err(StorageError::unsupported(
-            "read-sequence provider read contexts are not supported by this backend",
-        ))
+        defaults::unsupported_begin_read_sequence_read_context().await
     }
 
     /// Initialize the storage backend
     async fn initialize_storage(&self) -> StorageResult<()>;
-
-    /// Publish that service-level initialization has completed.
-    ///
-    /// Providers may use this lifecycle hook to release background work that
-    /// was registered during backend initialization but must not run until the
-    /// manager has created its system tables.  The default is a no-op so
-    /// providers without deferred startup work remain unchanged.
-    async fn complete_initialization(&self) -> StorageResult<()> {
-        Ok(())
-    }
 
     /// Check if a table exists
     async fn table_exists(&self, table_name: &TableName) -> StorageResult<bool>;
@@ -170,28 +131,6 @@ pub trait StorageProvider: Send + Sync {
 
     /// Get table information
     async fn get_table_info(&self, table_name: &TableName) -> StorageResult<StoredTableInfo>;
-
-    async fn write_stream_trim_state(&self, _state: StreamTrimState) -> StorageResult<()> {
-        Err(StorageError::unsupported_custom_stream_duration())
-    }
-
-    async fn list_due_stream_trim_markers(
-        &self,
-        _due_before: storage_types::TimestampMillis,
-        _limit: usize,
-    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
-        Err(StorageError::unsupported_custom_stream_duration())
-    }
-
-    async fn list_change_index_markers(
-        &self,
-        request: ListChangeIndexMarkersRequest,
-    ) -> StorageResult<Vec<ChangeIndexMarker>> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "change index is not supported by this backend",
-        ))
-    }
 
     /// List all tables
     async fn list_tables(
@@ -213,177 +152,40 @@ pub trait StorageProvider: Send + Sync {
 
     async fn atomic_item_read_modify_write(
         &self,
-        _request: AtomicItemReadModifyWriteRequest,
+        request: AtomicItemReadModifyWriteRequest,
     ) -> StorageResult<Vec<u8>> {
-        Err(StorageError::unsupported(
-            "atomic item read-modify-write is not supported by this provider",
-        ))
+        defaults::atomic_item_read_modify_write(request).await
     }
 
-    /// Store an item in a table.
-    async fn put_item(
+    /// Store one item with the manager-derived physical write context.
+    async fn put_item_request(
         &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-    ) -> StorageResult<PutItemResponse> {
-        self.put_item_request(
-            PutItemRequest::new(table_name, item)
-                .with_condition_expression(condition_expression)
-                .with_expression_attribute_names(expression_attribute_names)
-                .with_expression_attribute_values(expression_attribute_values)
-                .with_return_values(return_values),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn put_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        item: HashMap<String, AttributeValue>,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<PutItemResponse> {
-        let mut request = PutItemRequest::new(table_name, item)
-            .with_condition_expression(condition_expression)
-            .with_expression_attribute_names(expression_attribute_names)
-            .with_expression_attribute_values(expression_attribute_values)
-            .with_return_values(return_values);
-        request.aux_item_stream_ttl_hours = aux_item_stream_ttl_hours;
-        self.put_item_request(request).await
-    }
-
-    async fn put_item_request(&self, request: PutItemRequest) -> StorageResult<PutItemResponse>;
+        write: PhysicalWrite<PutItemRequest, TtlWriteContext>,
+    ) -> StorageResult<PutItemResponse>;
 
     async fn put_item_request_with_retry(
         &self,
-        request: PutItemRequest,
+        write: PhysicalWrite<PutItemRequest, TtlWriteContext>,
         policy: WriteRetryPolicy,
     ) -> StorageResult<PutItemResponse> {
-        if policy.max_attempts() <= 1 {
-            return self.put_item_request(request).await;
-        }
-        for _ in 1..policy.max_attempts() {
-            match self.put_item_request(request.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() => {
-                    tokio::time::sleep(policy.delay()).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.put_item_request(request).await
+        defaults::put_item_request_with_retry(self, write, policy).await
     }
 
-    /// Store a wire-encoded item in a table.
-    ///
-    /// Backends can override this to remain wire-native end-to-end on write
-    /// paths. The default implementation preserves compatibility by decoding
-    /// to an attribute map and delegating to `put_item`.
+    /// Store one wire-encoded item with the manager-derived physical write
+    /// context.
     async fn put_item_encode(
         &self,
-        table_name: TableName,
-        item: WireItem,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
+        write: PhysicalWrite<PutItemEncodeRequest, TtlWriteContext>,
     ) -> StorageResult<PutItemResponse> {
-        let item = item.into_attribute_map()?;
-        self.put_item(
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn put_item_encode_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        item: WireItem,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        return_values: Option<AllOld>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<PutItemResponse> {
-        if aux_item_stream_ttl_hours.is_some() {
-            return Err(StorageError::unsupported_custom_stream_duration());
-        }
-        self.put_item_encode(
-            table_name,
-            item,
-            condition_expression,
-            expression_attribute_names,
-            expression_attribute_values,
-            return_values,
-        )
-        .await
+        defaults::put_item_encode(self, write).await
     }
 
     async fn put_item_encode_with_retry(
         &self,
-        request: PutItemEncodeRequest,
+        write: PhysicalWrite<PutItemEncodeRequest, TtlWriteContext>,
         policy: WriteRetryPolicy,
     ) -> StorageResult<PutItemResponse> {
-        if policy.max_attempts() <= 1 {
-            if request.return_old_on_condition_failure {
-                return self
-                    .put_item_request(PutItemRequest {
-                        table_name: request.table_name,
-                        item: request.item.into_attribute_map()?,
-                        indexers: request.indexers,
-                        condition_expression: request.condition_expression,
-                        expression_attribute_names: request.expression_attribute_names,
-                        expression_attribute_values: request.expression_attribute_values,
-                        expected: None,
-                        conditional_operator: None,
-                        return_values: request.return_values,
-                        return_consumed_capacity: None,
-                        return_item_collection_metrics: None,
-                        return_values_on_condition_check_failure: Some("ALL_OLD".to_string()),
-                        aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
-                    })
-                    .await;
-            }
-            return self
-                .put_item_encode_with_stream_ttl(
-                    request.table_name,
-                    request.item,
-                    request.condition_expression,
-                    request.expression_attribute_names,
-                    request.expression_attribute_values,
-                    request.return_values,
-                    request.aux_item_stream_ttl_hours,
-                )
-                .await;
-        }
-        for _ in 1..policy.max_attempts() {
-            match self
-                .put_item_encode_with_retry(request.clone(), WriteRetryPolicy::no_retry())
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() => {
-                    tokio::time::sleep(policy.delay()).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.put_item_encode_with_retry(request, WriteRetryPolicy::no_retry())
-            .await
+        defaults::put_item_encode_with_retry(self, write, policy).await
     }
 
     /// Retrieve an item from a table
@@ -398,206 +200,67 @@ pub trait StorageProvider: Send + Sync {
         &self,
         request: DurablePointReadRequest,
     ) -> StorageResult<DurablePointReadProof> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "durable point-read proofs are not supported by this backend",
-        ))
+        defaults::get_item_with_durable_proof(request).await
     }
 
-    async fn batch_get_item_with_durable_proofs(
+    /// Execute one BatchGet attempt. The response and any requested durable
+    /// proofs are produced from the same provider snapshot.
+    async fn execute_batch_get(
         &self,
-        request: DurableBatchPointReadRequest,
-    ) -> StorageResult<DurableBatchPointReadProof> {
-        let mut responses = HashMap::new();
-        for (table_name, keys_and_attributes) in request.request_items {
-            let mut table_proofs = Vec::with_capacity(keys_and_attributes.keys.len());
-            for key in keys_and_attributes.keys {
-                let proof = self
-                    .get_item_with_durable_proof(DurablePointReadRequest {
-                        table_name: table_name.clone(),
-                        key: key.clone(),
-                        consistent_read: keys_and_attributes.consistent_read.unwrap_or(false),
-                    })
-                    .await?;
-                table_proofs.push(DurableBatchPointReadProofEntry { key, proof });
-            }
-            responses.insert(table_name, table_proofs);
-        }
-
-        Ok(DurableBatchPointReadProof {
-            responses,
-            unprocessed_keys: HashMap::new(),
-        })
-    }
-
-    /// Delete an item from a table and optionally return the deleted item.
-    async fn delete_item(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        self.delete_item_request(
-            DeleteItemRequest::new(table_name, key)
-                .with_condition_expression(condition_expression)
-                .with_expression_attribute_names(expression_attribute_names)
-                .with_expression_attribute_values(expression_attribute_values),
-        )
-        .await
-    }
-
-    async fn delete_item_with_stream_ttl(
-        &self,
-        table_name: TableName,
-        key: KeyAttributes,
-        condition_expression: Option<String>,
-        expression_attribute_names: Option<HashMap<String, String>>,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
-    ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        let mut request = DeleteItemRequest::new(table_name, key)
-            .with_condition_expression(condition_expression)
-            .with_expression_attribute_names(expression_attribute_names)
-            .with_expression_attribute_values(expression_attribute_values);
-        request.aux_item_stream_ttl_hours = aux_item_stream_ttl_hours;
-        self.delete_item_request(request).await
+        request: BatchGetExecutionRequest,
+    ) -> StorageResult<BatchGetExecutionResult> {
+        defaults::execute_batch_get(self, request).await
     }
 
     async fn delete_item_request(
         &self,
-        request: DeleteItemRequest,
+        write: PhysicalWrite<DeleteItemRequest, TtlWriteContext>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>>;
 
     async fn guarded_put_item(
         &self,
-        request: GuardedPutItemRequest,
+        write: PhysicalWrite<GuardedPutItemRequest, TtlWriteContext>,
     ) -> StorageResult<PutItemResponse> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "guarded put is not supported by this backend",
-        ))
+        defaults::guarded_put_item(write).await
     }
 
     async fn guarded_delete_item(
         &self,
-        request: GuardedDeleteItemRequest,
+        write: PhysicalWrite<GuardedDeleteItemRequest, TtlWriteContext>,
     ) -> StorageResult<Option<HashMap<String, AttributeValue>>> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "guarded delete is not supported by this backend",
-        ))
+        defaults::guarded_delete_item(write).await
     }
 
     async fn guarded_update_item(
         &self,
-        request: GuardedUpdateItemRequest,
+        write: PhysicalWrite<GuardedUpdateItemRequest, TtlWriteContext>,
     ) -> StorageResult<UpdateItemResponse> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "guarded update is not supported by this backend",
-        ))
+        defaults::guarded_update_item(write).await
     }
 
     /// Scan a table and return items with pagination support
-    async fn scan_table(
-        &self,
-        request: &ScanTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)>;
-
-    /// Internal scan that returns present item images with their per-key stream
-    /// versions for logical catchup/export.
-    async fn scan_table_with_item_stream_versions(
-        &self,
-        request: &ScanTableRequest,
-    ) -> StorageResult<(Vec<ItemVersionedWireItem>, Option<String>)> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "versioned internal scan is not supported by this backend",
-        ))
-    }
-
-    async fn export_logical_backfill_page(
-        &self,
-        request: storage_backfill::LogicalExportRequest,
-    ) -> StorageResult<storage_backfill::LogicalExportPage> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "logical backfill export is not supported by this backend",
-        ))
-    }
-
-    async fn import_logical_backfill_chunk(
-        &self,
-        manifest: &storage_backfill::LogicalBackfillManifest,
-        chunk: storage_backfill::LogicalBackfillChunk,
-    ) -> StorageResult<storage_backfill::LogicalBackfillResult> {
-        let _ = (manifest, chunk);
-        Err(StorageError::unsupported(
-            "logical backfill import is not supported by this backend",
-        ))
-    }
-
-    async fn apply_resolved_sync_mutations(
-        &self,
-        metadata: storage_sync::SyncCommitMetadata,
-        batch: storage_sync::ResolvedSyncMutationBatch,
-    ) -> StorageResult<Vec<storage_sync::SyncMutationResponse>> {
-        let _ = (metadata, batch);
-        Err(StorageError::unsupported(
-            "resolved sync mutation apply is not supported by this backend",
-        ))
-    }
-
-    async fn last_resolved_sync_log_id(&self) -> StorageResult<Option<storage_sync::SyncLogId>> {
-        Err(StorageError::unsupported(
-            "resolved sync apply checkpoint is not supported by this backend",
-        ))
-    }
-
-    async fn persist_resolved_sync_log_entry(
-        &self,
-        metadata: &storage_sync::SyncCommitMetadata,
-        batch: &storage_sync::ResolvedSyncMutationBatch,
-    ) -> StorageResult<()> {
-        let _ = (metadata, batch);
-        Err(StorageError::unsupported(
-            "resolved sync log storage is not supported by this backend",
-        ))
-    }
-
-    async fn get_resolved_sync_log_entry(
-        &self,
-        log_id: storage_sync::SyncLogId,
-    ) -> StorageResult<Option<storage_sync::ResolvedSyncLogEntry>> {
-        let _ = log_id;
-        Err(StorageError::unsupported(
-            "resolved sync log lookup is not supported by this backend",
-        ))
-    }
-
-    async fn resolved_sync_log_entries_after(
-        &self,
-        log_id: Option<storage_sync::SyncLogId>,
-        limit: usize,
-    ) -> StorageResult<Vec<storage_sync::ResolvedSyncLogEntry>> {
-        let _ = (log_id, limit);
-        Err(StorageError::unsupported(
-            "resolved sync log scan is not supported by this backend",
-        ))
-    }
+    async fn scan_table(&self, request: &ScanTableRequest) -> StorageResult<super::RangeReadPage>;
 
     /// Query a table based on key conditions and return items with pagination
     /// support
-    async fn query_table(
+    async fn query_table(&self, request: &QueryTableRequest)
+    -> StorageResult<super::RangeReadPage>;
+
+    /// Reuse caller-resolved metadata for remote response decoding. Native
+    /// providers retain authoritative catalog binding in their transaction
+    /// through the default query path; this hint cannot replace that binding.
+    async fn query_table_with_table_info(
         &self,
         request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)>;
+        _table_info: &StoredTableInfo,
+    ) -> StorageResult<super::RangeReadPage> {
+        self.query_table(request).await
+    }
 
     async fn batch_write_item(
         &self,
         request: BatchWriteItemRequest,
+        contexts: BatchWriteContexts,
         should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse>;
 
@@ -609,10 +272,10 @@ pub trait StorageProvider: Send + Sync {
     async fn batch_write_item_encode(
         &self,
         request: BatchWriteItemEncodeRequest,
+        contexts: BatchWriteContexts,
         should_write_to_stream: bool,
     ) -> StorageResult<BatchWriteItemResponse> {
-        let mapped = BatchWriteItemRequest::try_from(request)?;
-        self.batch_write_item(mapped, should_write_to_stream).await
+        defaults::batch_write_item_encode(self, request, contexts, should_write_to_stream).await
     }
 
     async fn batch_get_item(
@@ -620,21 +283,40 @@ pub trait StorageProvider: Send + Sync {
         request: BatchGetItemRequest,
     ) -> StorageResult<BatchGetWireItemResponse>;
 
-    async fn update_item(&self, request: UpdateItemRequest) -> StorageResult<UpdateItemResponse>;
+    /// Whether this provider can execute `TransactGetItems` in its native
+    /// backend. Native providers must preserve the backend's atomic snapshot,
+    /// ordering, and error contract; callers must not emulate this operation
+    /// with sequential point reads.
+    fn supports_native_transact_get_items(&self) -> bool {
+        false
+    }
+
+    async fn transact_get_items(
+        &self,
+        _request: TransactGetItemsRequest,
+    ) -> StorageResult<TransactGetItemsResponse> {
+        Err(StorageError::unsupported(
+            "native TransactGetItems is not supported by this storage provider",
+        ))
+    }
+
+    async fn update_item(
+        &self,
+        write: PhysicalWrite<UpdateItemRequest, TtlWriteContext>,
+    ) -> StorageResult<UpdateItemResponse>;
 
     async fn transact_write_items(
         &self,
         request: storage_types::TransactWriteItemsRequest,
+        contexts: OrderedOperationContexts,
     ) -> StorageResult<storage_types::TransactWriteItemsResponse>;
 
     async fn guarded_transact_write_items(
         &self,
         request: GuardedTransactWriteItemsRequest,
+        contexts: OrderedOperationContexts,
     ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
-        let _ = request;
-        Err(StorageError::unsupported(
-            "guarded transaction writes are not supported by this backend",
-        ))
+        defaults::guarded_transact_write_items(request, contexts).await
     }
 
     /// Execute a transactional write request using wire-encoded put payloads.
@@ -645,29 +327,18 @@ pub trait StorageProvider: Send + Sync {
     async fn transact_write_items_encode(
         &self,
         request: TransactWriteItemsEncodeRequest,
+        contexts: OrderedOperationContexts,
     ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
-        let mapped = storage_types::TransactWriteItemsRequest::try_from(request)?;
-        self.transact_write_items(mapped).await
+        defaults::transact_write_items_encode(self, request, contexts).await
     }
 
     async fn transact_write_items_encode_with_retry(
         &self,
         request: TransactWriteItemsEncodeRequest,
+        contexts: OrderedOperationContexts,
         policy: WriteRetryPolicy,
     ) -> StorageResult<storage_types::TransactWriteItemsResponse> {
-        if policy.max_attempts() <= 1 {
-            return self.transact_write_items_encode(request).await;
-        }
-        for _ in 1..policy.max_attempts() {
-            match self.transact_write_items_encode(request.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(error) if error.is_retryable_write() => {
-                    tokio::time::sleep(policy.delay()).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.transact_write_items_encode(request).await
+        defaults::transact_write_items_encode_with_retry(self, request, contexts, policy).await
     }
 
     async fn update_table(
@@ -675,52 +346,18 @@ pub trait StorageProvider: Send + Sync {
         request: storage_types::UpdateTableRequest,
     ) -> StorageResult<storage_types::UpdateTableResponse>;
 
-    async fn apply_replication_mutation(&self, mutation: ReplicationMutation) -> StorageResult<()> {
-        let _ = mutation;
-        Err(StorageError::internal(
-            "replicated mutations are not supported by this backend",
-        ))
-    }
-
-    fn replication_apply_parallelism_hint(&self) -> usize {
-        1
-    }
-
     async fn update_time_to_live(
         &self,
         request: storage_types::UpdateTimeToLiveRequest,
     ) -> StorageResult<storage_types::UpdateTimeToLiveResponse> {
-        let _ = request;
-        Err(StorageError::internal(
-            "Time to live configuration is not supported by this backend",
-        ))
+        defaults::update_time_to_live(request).await
     }
 
     async fn describe_time_to_live(
         &self,
         table_name: &TableName,
     ) -> StorageResult<storage_types::DescribeTimeToLiveResponse> {
-        let _ = table_name;
-        Err(StorageError::internal(
-            "Time to live configuration is not supported by this backend",
-        ))
-    }
-
-    /// Execute a named background job immediately (best-effort).
-    ///
-    /// Default implementation is a no-op so callers can safely invoke this
-    /// without worrying if a backend supports ad-hoc execution.
-    ///
-    /// Use cases:
-    /// - Test determinism: run the GSI update job right after a write so that
-    ///   queries hitting a GSI observe the latest state without waiting for the
-    ///   timer-driven background job.
-    /// - On-demand maintenance hooks.
-    ///
-    /// Backends that support this should override and perform the work until
-    /// no progress is made (idempotent catch-up semantics).
-    async fn run_job(&self, _name: BackgroundJobName) -> StorageResult<()> {
-        Ok(())
+        defaults::describe_time_to_live(table_name).await
     }
 
     async fn split_item_into_key_and_attributes(
@@ -728,9 +365,7 @@ pub trait StorageProvider: Send + Sync {
         item: HashMap<String, AttributeValue>,
         table_name: &TableName,
     ) -> StorageResult<SplitDynamoItem> {
-        let table_info = self.get_table_info(table_name).await?;
-
-        split_item_into_key_and_attributes_sync(item, &table_info)
+        defaults::split_item_into_key_and_attributes(self, item, table_name).await
     }
 
     fn get_key_attributes(
@@ -738,56 +373,6 @@ pub trait StorageProvider: Send + Sync {
         item: &HashMap<String, AttributeValue>,
         key_schema: &[KeySchemaElement],
     ) -> StorageResult<KeyAttributes> {
-        let mut key_attributes = KeyAttributes::with_capacity(key_schema.len());
-
-        for (attr_name, attr_value) in item {
-            let key_attribute = key_schema.iter().any(|i| *attr_name == i.attribute_name);
-
-            if key_attribute {
-                key_attributes.insert(attr_name.clone(), attr_value.clone());
-            }
-        }
-
-        for table_schema_key in key_schema {
-            if !key_attributes.contains_key(&table_schema_key.attribute_name) {
-                return Err(StorageError::invalid_or_missing_key());
-            }
-        }
-
-        Ok(key_attributes)
+        defaults::get_key_attributes(item, key_schema)
     }
-}
-
-pub fn split_item_into_key_and_attributes_sync(
-    item: HashMap<String, AttributeValue>,
-    table_info: &StoredTableInfo,
-) -> StorageResult<SplitDynamoItem> {
-    let all_attributes = item.clone();
-    // Separate key attributes from non-key attributes
-    let mut key_attributes = KeyAttributes::new();
-    let mut non_key_attributes = HashMap::new();
-
-    for (attr_name, attr_value) in item {
-        let is_key = table_info
-            .key_schema
-            .iter()
-            .any(|key| key.attribute_name == attr_name);
-        if is_key {
-            key_attributes.insert(attr_name, attr_value);
-        } else {
-            non_key_attributes.insert(attr_name, attr_value);
-        }
-    }
-
-    for table_schema_key in &table_info.key_schema {
-        if !key_attributes.contains_key(&table_schema_key.attribute_name) {
-            return Err(StorageError::invalid_or_missing_key());
-        }
-    }
-
-    Ok(SplitDynamoItem {
-        key_attributes,
-        all_attributes,
-        non_key_attributes,
-    })
 }

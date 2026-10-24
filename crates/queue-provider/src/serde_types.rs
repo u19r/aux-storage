@@ -23,8 +23,6 @@ impl CreateQueueRequest {
             queue_name: decoder.required_string("QueueName")?,
             attributes: decoder.optional_string_map("Attributes")?,
         };
-        decoder.finish()?;
-
         validate_queue_name(&request.queue_name)?;
         if let Some(ref attributes) = request.attributes {
             validate_queue_attributes(attributes)?;
@@ -39,8 +37,6 @@ impl DeleteQueueRequest {
         let request = Self {
             queue_url: decoder.required_string("QueueUrl")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         Ok(request)
     }
@@ -52,8 +48,6 @@ impl ListQueuesRequest {
         let request = Self {
             queue_name_prefix: decoder.optional_string("QueueNamePrefix")?,
         };
-        decoder.finish()?;
-
         if let Some(prefix) = request.queue_name_prefix.as_deref() {
             validate_queue_name_prefix(prefix)?;
         }
@@ -67,8 +61,6 @@ impl GetQueueUrlRequest {
         let request = Self {
             queue_name: decoder.required_string("QueueName")?,
         };
-        decoder.finish()?;
-
         validate_queue_name(&request.queue_name)?;
         Ok(request)
     }
@@ -81,8 +73,6 @@ impl GetQueueAttributesRequest {
             queue_url: decoder.required_string("QueueUrl")?,
             attribute_names: decoder.optional_string_list("AttributeNames")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         if let Some(attribute_names) = request.attribute_names.as_ref() {
             validate_attribute_names(attribute_names)?;
@@ -98,8 +88,6 @@ impl SetQueueAttributesRequest {
             queue_url: decoder.required_string("QueueUrl")?,
             attributes: decoder.required_string_map("Attributes")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_queue_attributes(&request.attributes)?;
         Ok(request)
@@ -112,8 +100,6 @@ impl PurgeQueueRequest {
         let request = Self {
             queue_url: decoder.required_string("QueueUrl")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         Ok(request)
     }
@@ -136,8 +122,6 @@ impl SendMessageRequest {
             delay_seconds: decoder.optional_u32("DelaySeconds")?,
             message_attributes: decoder.optional_message_attributes("MessageAttributes")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_message_body(&request.message_body)?;
         if let Some(delay_seconds) = request.delay_seconds {
@@ -157,8 +141,6 @@ impl SendMessageBatchRequest {
             queue_url: decoder.required_string("QueueUrl")?,
             entries: decoder.required_array("Entries", decode_send_message_batch_entry)?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_batch_entries(request.entries.iter().map(|entry| entry.id.as_str()))?;
         for entry in &request.entries {
@@ -195,8 +177,6 @@ impl ReceiveMessageRequest {
             attribute_names: decoder.optional_string_list("AttributeNames")?,
             message_attribute_names: decoder.optional_string_list("MessageAttributeNames")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         if let Some(max_messages) = request.max_number_of_messages {
             validate_max_number_of_messages(max_messages)?;
@@ -218,8 +198,6 @@ impl DeleteMessageRequest {
             queue_url: decoder.required_string("QueueUrl")?,
             receipt_handle: ReceiptHandle::from(decoder.required_string("ReceiptHandle")?.as_str()),
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_receipt_handle(&request.receipt_handle)?;
         Ok(request)
@@ -233,8 +211,6 @@ impl DeleteMessageBatchRequest {
             queue_url: decoder.required_string("QueueUrl")?,
             entries: decoder.required_array("Entries", decode_delete_message_batch_entry)?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_batch_entries(request.entries.iter().map(|entry| entry.id.as_str()))?;
         for entry in &request.entries {
@@ -253,8 +229,6 @@ impl ChangeMessageVisibilityRequest {
             receipt_handle: ReceiptHandle::from(decoder.required_string("ReceiptHandle")?.as_str()),
             visibility_timeout: decoder.required_u32("VisibilityTimeout")?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_receipt_handle(&request.receipt_handle)?;
         validate_visibility_timeout(request.visibility_timeout)?;
@@ -270,8 +244,6 @@ impl ChangeMessageVisibilityBatchRequest {
             entries: decoder
                 .required_array("Entries", decode_change_message_visibility_batch_entry)?,
         };
-        decoder.finish()?;
-
         validate_queue_url(&request.queue_url)?;
         validate_batch_entries(request.entries.iter().map(|entry| entry.id.as_str()))?;
         for entry in &request.entries {

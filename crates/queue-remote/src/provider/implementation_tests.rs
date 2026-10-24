@@ -55,6 +55,7 @@ async fn remote_send_batch_maps_ten_results_in_request_order_with_one_call() {
         .expect("provider");
     let messages = (0..10)
         .map(|index| QueueMessage {
+            receive_count: 0,
             message_id: MessageId::default(),
             queue_url: queue_url.clone(),
             body: format!("message-{index}"),
@@ -300,6 +301,100 @@ async fn create_queue_skips_attribute_update_when_queue_matches() {
     assert_eq!(set_queue_attributes.calls(), 0);
 }
 
+#[tokio::test]
+async fn remote_queue_url_lookup_does_not_fetch_attributes() {
+    let server = MockServer::start();
+    let queue_url = format!("{}/123456789012/url-only", server.base_url());
+    let get_queue_url = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueUrl");
+        then.status(200).json_body_obj(&serde_json::json!({
+            "QueueUrl": queue_url
+        }));
+    });
+    let get_queue_attributes = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueAttributes");
+        then.status(500);
+    });
+
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .expect("provider");
+    let resolved = provider
+        .get_queue_url_by_name("url-only")
+        .await
+        .expect("queue URL");
+
+    assert_eq!(resolved.as_deref(), Some(queue_url.as_str()));
+    assert_eq!(get_queue_url.calls(), 1);
+    assert_eq!(get_queue_attributes.calls(), 0);
+}
+
+#[tokio::test]
+async fn remote_queue_url_projection_removes_the_attribute_round_trip() {
+    let baseline_server = MockServer::start();
+    let baseline_queue_url = format!("{}/123456789012/baseline", baseline_server.base_url());
+    let baseline_get_queue_url = baseline_server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueUrl");
+        then.status(200).json_body_obj(&serde_json::json!({
+            "QueueUrl": baseline_queue_url
+        }));
+    });
+    let baseline_get_queue_attributes = baseline_server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueAttributes");
+        then.status(200).json_body_obj(&serde_json::json!({
+            "Attributes": {
+                "VisibilityTimeout": "30",
+                "DelaySeconds": "0",
+                "MaximumMessageSize": "262144",
+                "MessageRetentionPeriod": "345600",
+                "ReceiveMessageWaitTimeSeconds": "0"
+            }
+        }));
+    });
+    let baseline_provider = RemoteQueueProvider::new(settings(baseline_server.base_url()))
+        .await
+        .expect("baseline provider");
+    let baseline = baseline_provider
+        .get_queue_by_name("baseline")
+        .await
+        .expect("baseline queue lookup")
+        .expect("baseline queue");
+
+    let candidate_server = MockServer::start();
+    let candidate_queue_url = format!("{}/123456789012/candidate", candidate_server.base_url());
+    let candidate_get_queue_url = candidate_server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueUrl");
+        then.status(200).json_body_obj(&serde_json::json!({
+            "QueueUrl": candidate_queue_url
+        }));
+    });
+    let candidate_get_queue_attributes = candidate_server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.GetQueueAttributes");
+        then.status(500);
+    });
+    let candidate_provider = RemoteQueueProvider::new(settings(candidate_server.base_url()))
+        .await
+        .expect("candidate provider");
+    let candidate = candidate_provider
+        .get_queue_url_by_name("candidate")
+        .await
+        .expect("candidate queue URL")
+        .expect("candidate URL");
+
+    assert_eq!(baseline.queue_url, baseline_queue_url);
+    assert_eq!(baseline_get_queue_url.calls(), 1);
+    assert_eq!(baseline_get_queue_attributes.calls(), 1);
+    assert_eq!(candidate, candidate_queue_url);
+    assert_eq!(candidate_get_queue_url.calls(), 1);
+    assert_eq!(candidate_get_queue_attributes.calls(), 0);
+}
+
 #[test]
 fn classify_queue_name_exists_as_resource_exists() {
     let error = classify_remote_error(
@@ -308,6 +403,38 @@ fn classify_queue_name_exists_as_resource_exists() {
     );
 
     assert!(matches!(error, QueueError::ResourceExists { .. }));
+}
+
+#[test]
+fn classify_json_queue_does_not_exist_as_resource_not_found() {
+    let error = classify_remote_error(
+        400,
+        br#"{"__type":"com.amazonaws.sqs#QueueDoesNotExist","message":"The specified queue does not exist."}"#,
+    );
+
+    assert!(matches!(
+        error,
+        QueueError::ResourceNotFound {
+            resource_type: "queue",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_query_queue_does_not_exist_as_resource_not_found() {
+    let error = classify_remote_error(
+        400,
+        br#"{"__type":"AWS.SimpleQueueService.NonExistentQueue","message":"missing"}"#,
+    );
+
+    assert!(matches!(
+        error,
+        QueueError::ResourceNotFound {
+            resource_type: "queue",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -327,4 +454,77 @@ fn queue_attribute_updates_only_returns_changed_keys() {
         updates,
         HashMap::from([("VisibilityTimeout".to_string(), "45".to_string())])
     );
+}
+
+#[tokio::test]
+async fn remote_send_message_clamps_expired_visibility_to_zero_delay() {
+    let server = MockServer::start();
+    let queue_url = format!("{}/123456789012/expired", server.base_url());
+    let send = server.mock(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "AmazonSQS.SendMessage")
+            .json_body_obj(&serde_json::json!({
+                "QueueUrl": queue_url,
+                "MessageBody": "body",
+                "DelaySeconds": 0,
+            }));
+        then.status(200).json_body_obj(&serde_json::json!({
+            "MessageId": "018f1f612a6f7ac3b9b67f65",
+            "MD5OfMessageBody": "841a2d689ad86bd1611447453c22c6fc",
+        }));
+    });
+
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .expect("provider");
+    let message_id = provider
+        .send_message(QueueMessage {
+            receive_count: 0,
+            message_id: MessageId::default(),
+            queue_url,
+            body: "body".to_string(),
+            message_attributes: None,
+            receipt_handle: None,
+            created_at: storage_types::TimestampMillis::now(),
+            visibility_timestamp: Some(storage_types::TimestampMillis::now() - 1),
+        })
+        .await
+        .expect("send message");
+
+    assert_eq!(message_id.to_string(), "018f1f612a6f7ac3b9b67f65");
+    send.assert();
+}
+
+#[tokio::test]
+async fn given_sqs_delivery_when_receiving_then_durable_attempt_and_original_age_are_requested() {
+    let server = MockServer::start();
+    let receive = server.mock(|when, then| {
+        when.method(POST).header("x-amz-target", "AmazonSQS.ReceiveMessage")
+            .json_body_includes(serde_json::json!({"AttributeNames": ["SentTimestamp", "ApproximateReceiveCount"], "MessageAttributeNames": ["All"]}).to_string());
+        then.status(200).json_body_obj(&serde_json::json!({"Messages": [{
+            "MessageId": "message", "ReceiptHandle": "receipt", "MD5OfBody": "digest", "Body": "work",
+            "Attributes": {"SentTimestamp": "1000", "ApproximateReceiveCount": "180"}
+        }]}));
+    });
+    let provider = RemoteQueueProvider::new(settings(server.base_url()))
+        .await
+        .unwrap();
+    let messages = queue_provider::QueueProvider::receive_messages(
+        &provider,
+        "queue",
+        1,
+        30u32.into(),
+        0u32.into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        messages[0].attributes.as_ref().unwrap()["ApproximateReceiveCount"],
+        "180"
+    );
+    assert_eq!(
+        messages[0].attributes.as_ref().unwrap()["SentTimestamp"],
+        "1000"
+    );
+    receive.assert_calls(1);
 }

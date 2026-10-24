@@ -9,13 +9,14 @@
 module stream_partition_split {
   pure val HASH_SPACE_END = 16
   pure val HASHES = Set(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
-  pure val PARTITION_IDS = Set(0, 1, 2, 3, 4, 5, 6, 7)
+  pure val PARTITION_IDS = Set(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
   pure val NONE = -1
   pure val SPLIT_THRESHOLD = 13
   pure val HIGH_STREAK_TARGET = 3
   pure val MIN_ROUTING_BUCKETS_TO_SPLIT = 2
   pure val INITIAL_OPEN_COUNT = 2
-  pure val PRESSURES = Set(0, SPLIT_THRESHOLD, 20)
+  // Pressure uses tenths; exact rational state models the shared PI controller.
+  pure val PRESSURES = Set(0, 3, 5, 10, SPLIT_THRESHOLD, 20, 40)
   pure val ROUTING_BUCKET_COUNTS = Set(0, 1, 2, 3)
 
   var family: Family
@@ -23,6 +24,7 @@ module stream_partition_split {
   var routingBucketCount: int
   var cooldownTicks: int
   var splitCount: int
+  var observedSamples: int
 
   type Partition = {
     id: int,
@@ -36,6 +38,8 @@ module stream_partition_split {
 
   type Controller = {
     pressure: int,
+    integral: int,
+    scale: int,
     highStreak: int,
     lowStreak: int,
   }
@@ -44,6 +48,8 @@ module stream_partition_split {
     autoscaleEnabled: bool,
     freeze: bool,
     maxOpen: int,
+    minOpen: int,
+    partitionCount: int,
     cooldownActive: bool,
     epoch: int,
     controller: Controller,
@@ -81,10 +87,14 @@ module stream_partition_split {
     autoscaleEnabled: true,
     freeze: false,
     maxOpen: 8,
+    minOpen: INITIAL_OPEN_COUNT,
+    partitionCount: INITIAL_OPEN_COUNT,
     cooldownActive: false,
     epoch: 0,
     controller: {
       pressure: 0,
+      integral: 0,
+      scale: 1,
       highStreak: 0,
       lowStreak: 0,
     },
@@ -100,6 +110,14 @@ module stream_partition_split {
       5 -> closedPartition(5),
       6 -> closedPartition(6),
       7 -> closedPartition(7),
+      8 -> closedPartition(8),
+      9 -> closedPartition(9),
+      10 -> closedPartition(10),
+      11 -> closedPartition(11),
+      12 -> closedPartition(12),
+      13 -> closedPartition(13),
+      14 -> closedPartition(14),
+      15 -> closedPartition(15),
     ),
     liveIds: Set(0, 1),
     nextId: 2,
@@ -217,6 +235,8 @@ module stream_partition_split {
         "config",
         family.config
           .with("epoch", family.config.epoch + 1)
+          .with("minOpen", openCount(family) + 1)
+          .with("partitionCount", family.liveIds.size() + 2)
           .with("cooldownActive", true)
           .with(
             "controller",
@@ -249,7 +269,8 @@ module stream_partition_split {
 
   pure def controllerHot(config, pressure) =
     config.controller.highStreak >= HIGH_STREAK_TARGET
-      and config.controller.pressure >= SPLIT_THRESHOLD
+      and 5 * config.controller.pressure + config.controller.integral
+        >= 5 * SPLIT_THRESHOLD * config.controller.scale
       and pressure >= SPLIT_THRESHOLD
 
   pure def canAutosplit(config, pressure, openPartitions, routingBucketCount) =
@@ -262,6 +283,8 @@ module stream_partition_split {
 
   pure def hotController = {
     pressure: SPLIT_THRESHOLD,
+    integral: 0,
+    scale: 1,
     highStreak: HIGH_STREAK_TARGET,
     lowStreak: 0,
   }
@@ -279,23 +302,35 @@ module stream_partition_split {
         .with("cooldownActive", cooldownActive)
     )
 
-  pure def coldController = {
-    pressure: 0,
-    highStreak: 0,
-    lowStreak: 1,
+  pure def clamp(value, low, high) =
+    if (value < low) low else if (value > high) high else value
+
+  pure def observeController(controller, nextPressure) = {
+    pure val scale = if (controller.pressure <= 0) controller.scale else 5 * controller.scale
+    pure val ewma = if (controller.pressure <= 0) nextPressure * scale
+      else 3 * controller.pressure + 2 * nextPressure * controller.scale
+    pure val integral = clamp(
+      controller.integral * (scale / controller.scale) + ewma - 10 * scale,
+      -20 * scale,
+      40 * scale,
+    )
+    {
+      pressure: ewma,
+      integral: integral,
+      scale: scale,
+      highStreak: if (nextPressure >= 10) controller.highStreak + 1 else 0,
+      lowStreak: if (nextPressure * 2 <= 7) controller.lowStreak + 1 else 0,
+    }
   }
 
-  def observeLoadState(nextPressure, nextRoutingBucketCount) = {
-    pure val nextController =
-      if (nextPressure >= SPLIT_THRESHOLD)
-        hotController
-      else
-        coldController
-    withControllerAndCooldown(
-      family,
-      nextController,
-      family.config.cooldownActive,
-    )
+  /// One observation and any resulting topology change are one transaction.
+  pure def reconcileFamily(family, nextPressure, nextRoutingBucketCount, parentId, boundary) = {
+    pure val observed = family.with("config", family.config.with(
+      "controller", observeController(family.config.controller, nextPressure)))
+    if (canAutosplit(observed.config, nextPressure, openCount(observed), nextRoutingBucketCount)
+      and partitionSplittable(observed.partitions.get(parentId)))
+      splitPartition(observed, parentId, boundary)
+    else observed
   }
 
   action init =
@@ -305,18 +340,89 @@ module stream_partition_split {
       routingBucketCount' = 0,
       cooldownTicks' = 0,
       splitCount' = 0,
+      observedSamples' = 0,
     }
 
   action observeLoad = {
     nondet nextPressure = PRESSURES.oneOf()
     nondet nextRoutingBucketCount = ROUTING_BUCKET_COUNTS.oneOf()
+    nondet parentId = openIds(family)
+      .filter(id => partitionSplittable(family.partitions.get(id))).oneOf()
+    val nextFamily = reconcileFamily(family, nextPressure, nextRoutingBucketCount, parentId, 10 + splitCount)
+    val didSplit = nextFamily.config.epoch > family.config.epoch
     all {
-      family' = observeLoadState(nextPressure, nextRoutingBucketCount),
+      family' = nextFamily,
       pressure' = nextPressure,
       routingBucketCount' = nextRoutingBucketCount,
+      cooldownTicks' = if (didSplit) 1 else cooldownTicks,
+      splitCount' = if (didSplit) splitCount + 1 else splitCount,
+      observedSamples' = observedSamples + 1,
+    }
+  }
+
+  action setPolicy = {
+    nondet freeze = Set(false, true).oneOf()
+    nondet autoscale = Set(false, true).oneOf()
+    all {
+      family' = family.with("config", family.config.with("freeze", freeze).with("autoscaleEnabled", autoscale)),
+      pressure' = pressure,
+      routingBucketCount' = routingBucketCount,
       cooldownTicks' = cooldownTicks,
       splitCount' = splitCount,
+      observedSamples' = observedSamples,
     }
+  }
+
+  /// Deliberately unsafe transition used only by the focused mutation receipt.
+  /// A topology cooldown flag must agree with its non-zero countdown.
+  action UnsafeCooldownMismatch = all {
+    family' = family,
+    pressure' = pressure,
+    routingBucketCount' = routingBucketCount,
+    cooldownTicks' = 1,
+    splitCount' = splitCount,
+    observedSamples' = observedSamples,
+  }
+
+  /// A split must not remove an open owner for any hash.
+  action UnsafeCoverageGap = all {
+    family' = family.with("liveIds", family.liveIds.exclude(Set(0))),
+    pressure' = pressure,
+    routingBucketCount' = routingBucketCount,
+    cooldownTicks' = cooldownTicks,
+    splitCount' = splitCount,
+    observedSamples' = observedSamples,
+  }
+
+  /// The topology counter must agree with the number of open partitions.
+  action UnsafeOpenCountMismatch = all {
+    family' = family,
+    pressure' = pressure,
+    routingBucketCount' = routingBucketCount,
+    cooldownTicks' = cooldownTicks,
+    splitCount' = splitCount + 1,
+    observedSamples' = observedSamples,
+  }
+
+  /// High-pressure streaks must come from real observed samples.
+  action UnsafeSyntheticHotController = all {
+    family' = family.with(
+      "config",
+      family.config.with(
+        "controller",
+        family.config.controller
+          .with("pressure", SPLIT_THRESHOLD)
+          .with("integral", 0)
+          .with("scale", 1)
+          .with("highStreak", HIGH_STREAK_TARGET)
+          .with("lowStreak", 0)
+      )
+    ),
+    pressure' = SPLIT_THRESHOLD,
+    routingBucketCount' = MIN_ROUTING_BUCKETS_TO_SPLIT,
+    cooldownTicks' = 0,
+    splitCount' = splitCount,
+    observedSamples' = 0,
   }
 
   action expireCooldown =
@@ -327,31 +433,23 @@ module stream_partition_split {
       routingBucketCount' = routingBucketCount,
       cooldownTicks' = 0,
       splitCount' = splitCount,
+      observedSamples' = observedSamples,
     }
 
-  action autosplit = {
-    nondet parentId = openIds(family)
-      .filter(id => partitionSplittable(family.partitions.get(id)))
-      .oneOf()
-    all {
-      canAutosplit(family.config, pressure, openCount(family), routingBucketCount),
-      family' = splitPartition(family, parentId, 10 + splitCount),
-      pressure' = pressure,
-      routingBucketCount' = routingBucketCount,
-      cooldownTicks' = 1,
-      splitCount' = splitCount + 1,
-    }
-  }
+  action step = any { observeLoad, expireCooldown, setPolicy }
 
-  action step =
-    any {
-      observeLoad,
-      expireCooldown,
-      autosplit,
-    }
+  action unsafeStep = UnsafeCooldownMismatch
+
+  action unsafeCoverageStep = UnsafeCoverageGap
+
+  action unsafeOpenCountStep = UnsafeOpenCountMismatch
+
+  action unsafeControllerStep = UnsafeSyntheticHotController
 
   val splitCountMatchesOpenCount =
     openCount(family) == INITIAL_OPEN_COUNT + splitCount
+      and family.config.partitionCount == family.liveIds.size()
+      and family.config.minOpen == openCount(family)
 
   val openCountWithinBounds =
     INITIAL_OPEN_COUNT <= openCount(family)
@@ -368,6 +466,31 @@ module stream_partition_split {
     routingBucketCount < MIN_ROUTING_BUCKETS_TO_SPLIT
       implies not(canAutosplit(family.config, pressure, openCount(family), routingBucketCount))
 
+  val controllerHistoryIsValid =
+    family.config.controller.highStreak <= observedSamples
+      and family.config.controller.lowStreak <= observedSamples
+
+  val coverage_witness =
+    hashCoveredExactlyOnce(family) and partitionFamilyRangesValid(family)
+
+  val split_witness =
+    splitCount > 0 and splitCountMatchesOpenCount and hashCoveredExactlyOnce(family)
+
+  val cooldown_witness =
+    family.config.cooldownActive and cooldownTicks > 0
+
+  val sustained_pressure_witness =
+    family.config.controller.highStreak >= HIGH_STREAK_TARGET
+      and observedSamples >= HIGH_STREAK_TARGET
+
+  val coverage_gap_hostile_witness = not(hashCoveredExactlyOnce(family))
+
+  val open_count_hostile_witness = not(splitCountMatchesOpenCount)
+
+  val cooldown_hostile_witness = not(cooldownStateConsistent)
+
+  val controller_hostile_witness = not(controllerHistoryIsValid)
+
   val streamSplitSafetyInvariant =
     partitionFamilyRangesValid(family)
       and hashCoveredExactlyOnce(family)
@@ -377,4 +500,5 @@ module stream_partition_split {
       and cooldownStateConsistent
       and cooldownPreventsAutosplit
       and singleRoutingBucketPreventsAutosplit
+      and controllerHistoryIsValid
 }

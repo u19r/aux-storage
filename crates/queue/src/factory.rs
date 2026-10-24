@@ -1,29 +1,24 @@
-#[cfg(feature = "rocksdb")]
-use kv::RocksDbKvStore;
+//! Construct one initialized family store for the standalone queue service.
+
 #[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
-use kv::SortedKvDbStorageProvider;
-#[cfg(feature = "foundationdb")]
-use kv::{FoundationDbConfig, FoundationDbKvStore};
-use queue_provider::{QueueBackend, QueueConfig, QueueError, QueueProvider, QueueResult};
+use kv_backend::KvStore;
+use queue_provider::{QueueBackend, QueueConfig, QueueError, QueueOperations, QueueResult};
 #[cfg(feature = "remote")]
 use queue_remote::RemoteQueueProvider;
-#[cfg(feature = "postgres")]
-use sql::PostgresStorageProvider;
-#[cfg(feature = "sqlite")]
-use sql::SQLiteStorageProvider;
-#[cfg(feature = "turso")]
-use sql::TursoStorageProvider;
+#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+use sql_backend::SqlStore;
 
-/// Factory function to create queue providers
-pub async fn create_queue_provider(config: QueueConfig) -> QueueResult<Box<dyn QueueProvider>> {
+/// Select the configured driver, initialize its physical format, and publish
+/// it.
+pub async fn create_queue_provider(config: QueueConfig) -> QueueResult<Box<dyn QueueOperations>> {
     match config.backend_type {
         #[cfg(feature = "sqlite")]
         QueueBackend::SQLite => {
-            let db_path = config
+            let path = config
                 .connection_string
-                .unwrap_or_else(|| "main.db".to_string());
-            let provider = SQLiteStorageProvider::new(&db_path).await?;
-            Ok(Box::new(provider))
+                .unwrap_or_else(|| "main.db".to_owned());
+            let driver = sql_backend::sqlite::SqliteBackend::initialize(path).await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
         }
         #[cfg(not(feature = "sqlite"))]
         QueueBackend::SQLite => Err(QueueError::internal(
@@ -31,29 +26,46 @@ pub async fn create_queue_provider(config: QueueConfig) -> QueueResult<Box<dyn Q
         )),
         #[cfg(feature = "turso")]
         QueueBackend::Turso => {
-            let db_path = config
+            let path = config
                 .connection_string
-                .unwrap_or_else(|| "main.turso.db".to_string());
-            let provider = TursoStorageProvider::new(&db_path).await?;
-            Ok(Box::new(provider))
+                .unwrap_or_else(|| "main.turso.db".to_owned());
+            let driver = sql_backend::turso::TursoBackend::initialize(&path).await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
         }
         #[cfg(not(feature = "turso"))]
         QueueBackend::Turso => Err(QueueError::internal(
             queue_provider::QueueInternalKind::TursoBackendDisabled,
         )),
-
+        #[cfg(feature = "postgres")]
+        QueueBackend::Postgres => {
+            let settings = config.postgres.ok_or_else(|| {
+                QueueError::from(storage_types::StorageError::validation(
+                    "postgres queue backend requires postgres settings with dsn and pool size",
+                ))
+            })?;
+            let driver = sql_backend::postgres::PostgresBackend::initialize(
+                &settings.dsn,
+                settings.max_pool_size,
+                settings.tls,
+            )
+            .await?;
+            Ok(Box::new(SqlStore::initialize_schema(driver).await?))
+        }
+        #[cfg(not(feature = "postgres"))]
+        QueueBackend::Postgres => Err(QueueError::internal_with_detail(
+            queue_provider::QueueInternalKind::PostgresBackendDisabled,
+            "postgres queue backend is not enabled in this build",
+        )),
         #[cfg(feature = "rocksdb")]
         QueueBackend::RocksDB => {
-            let db_path = config.connection_string.unwrap_or_else(|| {
+            let path = config.connection_string.unwrap_or_else(|| {
                 std::env::temp_dir()
                     .join("rocksdb")
                     .to_string_lossy()
-                    .to_string()
+                    .into_owned()
             });
-            let rocks_db = RocksDbKvStore::new(db_path.into())?;
-            let provider = SortedKvDbStorageProvider::new(rocks_db);
-
-            Ok(Box::new(provider))
+            let driver = kv_backend::rocksdb::RocksDbBackend::initialize(path.into())?;
+            Ok(Box::new(KvStore::initialize_format(driver).await?))
         }
         #[cfg(not(feature = "rocksdb"))]
         QueueBackend::RocksDB => Err(QueueError::internal_with_detail(
@@ -62,68 +74,38 @@ pub async fn create_queue_provider(config: QueueConfig) -> QueueResult<Box<dyn Q
         )),
         #[cfg(feature = "foundationdb")]
         QueueBackend::FoundationDb => {
-            let provider = build_foundationdb_provider(&config)?;
-            Ok(Box::new(provider))
+            let settings = config.foundationdb.unwrap_or_default();
+            let prefix = settings.subspace_prefix.as_deref().map(str::as_bytes);
+            let tenant = settings.tenant_name.as_deref().map(str::as_bytes);
+            let driver = kv_backend::foundationdb::FoundationDbBackend::initialize(
+                kv_backend::foundationdb::FoundationDbOptions {
+                    cluster_file: settings.cluster_file.as_deref(),
+                    subspace_prefix: prefix,
+                    tenant_name: tenant,
+                    cache_read_version_ms: settings.cache_read_version_ms,
+                    transaction_byte_limit: settings.transaction_byte_limit,
+                    report_conflicting_keys: settings.report_conflicting_keys,
+                },
+            )
+            .await?;
+            Ok(Box::new(KvStore::initialize_format(driver).await?))
         }
         #[cfg(not(feature = "foundationdb"))]
         QueueBackend::FoundationDb => Err(QueueError::internal(
             queue_provider::QueueInternalKind::FoundationDbBackendDisabled,
         )),
-        #[cfg(feature = "postgres")]
-        QueueBackend::Postgres => {
-            let settings = config.postgres.clone().ok_or_else(|| {
-                QueueError::from(storage_types::StorageError::validation(
-                    "postgres queue backend requires postgres settings with dsn and pool size",
-                ))
-            })?;
-            let provider = PostgresStorageProvider::new_with_tls(
-                &settings.dsn,
-                settings.max_pool_size,
-                settings.background_max_pool_size,
-                settings.tls,
-            )
-            .await?;
-            Ok(Box::new(provider))
-        }
-        #[cfg(not(feature = "postgres"))]
-        QueueBackend::Postgres => Err(QueueError::internal_with_detail(
-            queue_provider::QueueInternalKind::PostgresBackendDisabled,
-            "postgres queue backend is not enabled in this build",
-        )),
         #[cfg(feature = "remote")]
         QueueBackend::Remote => {
-            let settings = config.remote.clone().ok_or_else(|| {
+            let settings = config.remote.ok_or_else(|| {
                 QueueError::from(storage_types::StorageError::validation(
                     "remote queue backend requires remote configuration settings",
                 ))
             })?;
-            let provider = RemoteQueueProvider::new(settings).await?;
-            Ok(Box::new(provider))
+            Ok(Box::new(RemoteQueueProvider::new(settings).await?))
         }
         #[cfg(not(feature = "remote"))]
         QueueBackend::Remote => Err(QueueError::internal(
             queue_provider::QueueInternalKind::RemoteBackendNotImplemented,
         )),
     }
-}
-
-#[cfg(feature = "foundationdb")]
-fn build_foundationdb_provider(
-    config: &QueueConfig,
-) -> QueueResult<SortedKvDbStorageProvider<FoundationDbKvStore>> {
-    let settings = config.foundationdb.clone().unwrap_or_default();
-    let mut fdb_config = FoundationDbConfig::default();
-    if let Some(cluster_file_path) = settings.cluster_file {
-        fdb_config.cluster_file_path = Some(cluster_file_path);
-    }
-    if let Some(prefix) = settings.subspace_prefix {
-        fdb_config.subspace_prefix = Some(prefix.into_bytes());
-    }
-    if let Some(tenant) = settings.tenant_name {
-        fdb_config.tenant_name = Some(tenant.into_bytes());
-    }
-    fdb_config.cache_read_version_ms = settings.cache_read_version_ms;
-    fdb_config.report_conflicting_keys = settings.report_conflicting_keys;
-    let store = FoundationDbKvStore::connect(fdb_config)?;
-    Ok(SortedKvDbStorageProvider::new(store))
 }

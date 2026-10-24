@@ -1,35 +1,7 @@
-[test-groups.kv-gsi]
-max-threads = 1
-
-[test-groups.exclusive-profile]
-max-threads = 1
-
-[test-groups.kv-rocksdb-queue-regression]
-max-threads = 1
-
 [profile.default]
+default-filter = 'not package(cucumber-tests) and not binary(remote_canary_fixture)'
 
+# Wall-clock comparisons must run without competing workspace test processes.
 [[profile.default.overrides]]
-filter = 'package(kv) & test(storage_ops::provider_tests)'
-test-group = 'kv-gsi'
-threads-required = "num-cpus"
-
-[[profile.default.overrides]]
-filter = 'package(kv) & test(backends::rocksdb::queue_provider_regression_tests)'
-test-group = 'kv-rocksdb-queue-regression'
-threads-required = "num-cpus"
-
-[[profile.default.overrides]]
-filter = 'package(sql) & test(gsi_write_alloc_tests)'
-test-group = 'exclusive-profile'
-threads-required = "num-cpus"
-
-[[profile.default.overrides]]
-filter = 'package(sql) & test(stream_trim)'
-test-group = 'exclusive-profile'
-threads-required = "num-cpus"
-
-[[profile.default.overrides]]
-filter = 'package(sql) & test(stream_duration)'
-test-group = 'exclusive-profile'
+filter = 'test(parallel_delivery_perf_tests::delivery_window_reduces_wall_time_without_losing_claim_updates)'
 threads-required = "num-cpus"

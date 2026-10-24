@@ -33,6 +33,17 @@ pub trait QueueProvider: Send + Sync {
     /// Get a queue by name.
     async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>>;
 
+    /// Resolve a queue name to its URL without requiring queue attributes.
+    ///
+    /// Providers with a native URL lookup can override this to avoid fetching
+    /// metadata that the caller does not use. The default keeps existing
+    /// provider behavior and projects the URL from the full queue result.
+    async fn get_queue_url_by_name(&self, queue_name: &str) -> QueueResult<Option<String>> {
+        self.get_queue_by_name(queue_name)
+            .await
+            .map(|queue| queue.map(|queue| queue.queue_url))
+    }
+
     /// List queues, optionally filtered by prefix.
     async fn list_queues(&self, queue_name_prefix: Option<&str>) -> QueueResult<Vec<Queue>>;
 
@@ -68,6 +79,10 @@ pub trait QueueProvider: Send + Sync {
     }
 
     /// Send a message to a queue.
+    /// Coalesce an immutable stable identity while its native message is
+    /// pending.
+    async fn publish_message(&self, message: QueueMessage) -> QueueResult<MessageId>;
+
     async fn send_message(&self, message: QueueMessage) -> QueueResult<MessageId>;
 
     /// Send multiple messages to one queue.

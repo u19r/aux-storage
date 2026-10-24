@@ -1,6 +1,4 @@
-use crate::{
-    AttributeValue, ItemKey, StreamName, TableName, stream_name::STREAM_ITEM_KEY_MAX_BYTES,
-};
+use crate::{AttributeValue, ItemKey, StreamName, TableName, constants::STREAM_ITEM_KEY_MAX_BYTES};
 
 #[test]
 fn table_item_stream_keeps_small_key_payload() {
@@ -52,6 +50,12 @@ fn stream_name_table_stream_uses_sanitized_table_name() {
     let stream = StreamName::table_stream(&table);
 
     assert_eq!(String::from(stream), "orders2026/stream-table");
+}
+
+#[test]
+fn stream_name_format_markers_are_stable() {
+    assert_eq!(StreamName::TABLE_STREAM_SUFFIX, b"/stream-table");
+    assert_eq!(StreamName::ITEM_STREAM_SEGMENT, b"/stream-item/");
 }
 
 #[test]

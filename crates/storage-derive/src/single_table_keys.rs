@@ -63,14 +63,16 @@ pub(crate) fn derive_single_table_keys_impl(input: TokenStream) -> TokenStream {
                     "gsi4_sk_expr" => gsi4_sk_expr = Some(s),
                     "gsi5_pk_expr" => gsi5_pk_expr = Some(s),
                     "gsi5_sk_expr" => gsi5_sk_expr = Some(s),
-                    // Pattern metadata keys (pure documentation, not used for logic)
+                    // Pattern metadata keys (pure documentation, not used for
+                    // logic)
                     key if key.starts_with("gsi_pattern_") => {
-                        // Expect format gsi_pattern_<n> = "GPK|GSK" or "GPK" (if missing sk
-                        // pattern)
+                        // Expect format gsi_pattern_<n> = "GPK|GSK" or "GPK"
+                        // (if missing sk pattern)
                         if let Some((gpk, gsk)) = s.split_once('|') {
                             gsi_patterns.push((gpk.trim().to_string(), gsk.trim().to_string()));
                         } else {
-                            // If only one side given, we store second as placeholder
+                            // If only one side given, we store second as
+                            // placeholder
                             gsi_patterns.push((s.trim().to_string(), "<sk>".to_string()));
                         }
                     }

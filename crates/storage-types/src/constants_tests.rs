@@ -1,0 +1,15 @@
+pub(crate) const DYNAMODB_LIMITS_PERF_ITERATIONS: usize = 30_000;
+
+pub(crate) const NON_COVERING_LOOKUP_ALLOCATION_PROFILE_ITERATIONS: usize = 256;
+
+pub(crate) const REQUEST_EXPRESSION_VALIDATION_ITERATIONS: usize = 1024;
+
+pub(crate) const RESERVED_LOOKUP_ITERATIONS: usize = 100_000;
+
+pub(crate) const STREAM_ITEM_ID_PERF_ITERATIONS: usize = 200_000;
+
+pub(crate) const STREAM_ITEM_HEX: &str = "018f1f612a6f7ac3b9b67f65";
+
+pub(crate) const TRANSACTION_RUNTIME_FINGERPRINT_ITERATIONS: usize = 10_000;
+
+pub(crate) const WIRE_ITEM_ALLOC_ITERATIONS: usize = 1_024;

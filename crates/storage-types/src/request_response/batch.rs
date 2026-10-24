@@ -1,18 +1,19 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 use utoipa::ToSchema;
 
-use crate::{AttributeMap, AttributeValue, KeyAttributes, StreamRetentionDuration, TableName};
+use crate::{
+    AttributeMap, AttributeValue, KeyAttributes, ReturnConsumedCapacity, StreamRetentionDuration,
+    TableName, VecMap, WireItem,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchWriteItemRequest {
-    pub request_items: HashMap<TableName, Vec<WriteRequest>>,
+    #[schema(value_type = HashMap<TableName, Vec<WriteRequest>>)]
+    pub request_items: VecMap<TableName, Vec<WriteRequest>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_item_collection_metrics: Option<String>,
@@ -31,8 +32,12 @@ pub struct WriteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PutRequest {
-    pub item: HashMap<String, AttributeValue>,
+    #[serde(with = "crate::wire_item::dynamo_json")]
+    #[schema(value_type = HashMap<String, AttributeValue>)]
+    pub item: WireItem,
 
+    /// Names total at most 1,024 UTF-8 bytes per item, including absent
+    /// attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexers: Option<Vec<String>>,
 
@@ -49,8 +54,12 @@ pub struct PutRequest {
 pub struct TransactPutRequest {
     pub table_name: TableName,
 
-    pub item: HashMap<String, AttributeValue>,
+    #[serde(with = "crate::wire_item::dynamo_json")]
+    #[schema(value_type = HashMap<String, AttributeValue>)]
+    pub item: WireItem,
 
+    /// Names total at most 1,024 UTF-8 bytes per item, including absent
+    /// attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexers: Option<Vec<String>>,
 
@@ -58,10 +67,11 @@ pub struct TransactPutRequest {
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,10 +109,11 @@ pub struct TransactDeleteRequest {
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,7 +130,8 @@ pub struct TransactDeleteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchWriteItemResponse {
     #[serde(rename = "UnprocessedItems", skip_serializing_if = "Option::is_none")]
-    pub unprocessed_items: Option<HashMap<TableName, Vec<WriteRequest>>>,
+    #[schema(value_type = HashMap<TableName, Vec<WriteRequest>>)]
+    pub unprocessed_items: Option<VecMap<TableName, Vec<WriteRequest>>>,
 
     #[serde(
         rename = "ItemCollectionMetrics",
@@ -134,17 +146,18 @@ pub struct BatchWriteItemResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchGetItemRequest {
-    pub request_items: HashMap<TableName, KeysAndAttributes>,
+    #[schema(value_type = HashMap<TableName, KeysAndAttributes>)]
+    pub request_items: VecMap<TableName, KeysAndAttributes>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct KeysAndAttributes {
     #[schema(value_type = Vec<HashMap<String, AttributeValue>>)]
-    pub keys: SmallVec<[KeyAttributes; 8]>,
+    pub keys: Vec<KeyAttributes>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attributes_to_get: Option<Vec<String>>,
@@ -153,7 +166,8 @@ pub struct KeysAndAttributes {
     pub projection_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consistent_read: Option<bool>,
@@ -161,11 +175,18 @@ pub struct KeysAndAttributes {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BatchGetItemResponse {
-    #[serde(rename = "Responses", skip_serializing_if = "Option::is_none")]
-    pub responses: Option<HashMap<TableName, Vec<AttributeMap>>>,
+    #[serde(
+        rename = "Responses",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::wire_item::dynamo_json::optional_table_items"
+    )]
+    #[schema(value_type = HashMap<TableName, Vec<AttributeMap>>)]
+    pub responses: Option<VecMap<TableName, Vec<WireItem>>>,
 
     #[serde(rename = "UnprocessedKeys", skip_serializing_if = "Option::is_none")]
-    pub unprocessed_keys: Option<HashMap<TableName, KeysAndAttributes>>,
+    #[schema(value_type = HashMap<TableName, KeysAndAttributes>)]
+    pub unprocessed_keys: Option<VecMap<TableName, KeysAndAttributes>>,
 
     #[serde(rename = "ConsumedCapacity", skip_serializing_if = "Option::is_none")]
     pub consumed_capacity: Option<serde_json::Value>,
@@ -177,7 +198,7 @@ pub struct TransactGetItemsRequest {
     pub transact_items: Vec<TransactGetItem>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -197,7 +218,8 @@ pub struct TransactGetRequest {
     pub projection_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -211,6 +233,12 @@ pub struct TransactGetItemsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ItemResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
-    pub item: Option<AttributeMap>,
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::wire_item::dynamo_json::optional"
+    )]
+    #[schema(value_type = Option<AttributeMap>)]
+    pub item: Option<WireItem>,
 }

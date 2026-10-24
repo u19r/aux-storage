@@ -1,11 +1,14 @@
 use std::time::Instant;
 
-use crate::routes::{
-    dynamodb::{
-        BODY_READ_STAGE, ERROR_STATUS, JSON_DECODE_STAGE, MANAGER_STAGE, REQUEST_CONVERT_STAGE,
-        RESPONSE_ENCODE_STAGE, SUCCESS_STATUS,
+use crate::{
+    constants::{
+        DYNAMODB_BODY_READ_STAGE as BODY_READ_STAGE, DYNAMODB_ERROR_STATUS as ERROR_STATUS,
+        DYNAMODB_JSON_DECODE_STAGE as JSON_DECODE_STAGE, DYNAMODB_MANAGER_STAGE as MANAGER_STAGE,
+        DYNAMODB_REQUEST_CONVERT_STAGE as REQUEST_CONVERT_STAGE,
+        DYNAMODB_RESPONSE_ENCODE_STAGE as RESPONSE_ENCODE_STAGE,
+        DYNAMODB_SUCCESS_STATUS as SUCCESS_STATUS,
     },
-    dynamodb_metrics::DynamoRouteTimer,
+    routes::dynamodb_metrics::DynamoRouteTimer,
 };
 
 #[test]

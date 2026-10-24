@@ -1,12 +1,12 @@
 # bg-job-store
 
-`bg-job-store` contains internal storage-backed stores for `bg-jobs`.
+`bg-job-store` contains the aux-storage adapter for the shared scheduled-job store contract.
 
 It provides:
 
-- `SysJobLockStore`, a lease-based job lock store backed by the shared system jobs table.
-- Internal table creation and verification during async construction.
-- Storage error mapping into `bg-jobs` lock errors.
+- `ScheduledJobStore`, a bounded ordered store backed by the provider's scheduled-jobs table.
+- Explicit bootstrap and capability reporting for the common scheduler runtime.
+- Storage error mapping into the `scheduled-bg-jobs` store contract.
 
 ## Scope
 
@@ -15,10 +15,9 @@ belongs in the `queue` crate and should use queue messages directly instead of a
 
 ## Use
 
-Create the store through its async constructor so the system table is ready before it is handed to a
-`JobManager`:
+Create and bootstrap the store before handing it to `scheduled-bg-jobs`:
 
 ```rust,ignore
-let store = SysJobLockStore::new(storage_provider, worker_id).await?;
-let manager = bg_jobs::JobManager::new(Arc::new(store));
+let store = manager.scheduled_job_store().ok_or("scheduled jobs disabled")?;
+scheduled_bg_jobs::JobStore::get(&store, key).await?;
 ```

@@ -97,14 +97,16 @@
 use std::{
     fmt::{self, Debug, Display},
     path::Path,
+    sync::Arc,
     thread,
 };
 
 use crossbeam_channel::{Receiver, Sender};
 pub use rusqlite::*;
-use tokio::sync::oneshot::{self};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 const BUG_TEXT: &str = "bug in tokio-rusqlite, please report";
+const QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug)]
 /// Represents the errors specific for this library.
@@ -161,14 +163,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 type CallFn = Box<dyn FnOnce(&mut rusqlite::Connection) + Send + 'static>;
 
 enum Message {
-    Execute(CallFn),
-    Close(oneshot::Sender<std::result::Result<(), rusqlite::Error>>),
+    Execute(CallFn, OwnedSemaphorePermit),
+    Close(
+        oneshot::Sender<std::result::Result<(), rusqlite::Error>>,
+        OwnedSemaphorePermit,
+    ),
 }
 
 /// A handle to call functions in background thread.
 #[derive(Clone)]
 pub struct Connection {
     sender: Sender<Message>,
+    admission: Arc<Semaphore>,
 }
 
 impl Connection {
@@ -280,14 +286,38 @@ impl Connection {
         F: FnOnce(&mut rusqlite::Connection) -> Result<R> + 'static + Send,
         R: Send + 'static,
     {
+        // Ordinary tracing context captured once at async entry for scoped
+        // correlation (phase 7 §2.3). Held across awaits; entered around the
+        // enqueue event below and propagated by callers into the worker
+        // closure. No observer parameters.
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let permit = self.acquire_admission().await?;
         let (sender, receiver) = oneshot::channel::<Result<R>>();
 
         self.sender
-            .send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))
+            .send(Message::Execute(
+                Box::new(move |conn| {
+                    let value = function(conn);
+                    let _ = sender.send(value);
+                }),
+                permit,
+            ))
             .map_err(|_| Error::ConnectionClosed)?;
+
+        // Local aux-storage diagnostic patch (phase 7 §2.3, C2
+        // production-path): ordinary successful-enqueue event, identical in
+        // every build. Emitted only after the channel send succeeded; a
+        // failed send is never counted. Static fields plus opaque span-ID
+        // correlation; no keys, values, table names, SQL, or binds.
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _entered = span.enter();
+            tracing::trace!(
+                op = "sqlite_worker",
+                boundary = "enqueued",
+                outcome = "queued"
+            );
+        });
 
         receiver.await.map_err(|_| Error::ConnectionClosed)?
     }
@@ -306,14 +336,37 @@ impl Connection {
         F: FnOnce(&mut rusqlite::Connection) -> R + Send + 'static,
         R: Send + 'static,
     {
+        // Same ordinary context capture as `call` above.
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let permit = self
+            .acquire_admission()
+            .await
+            .expect("database connection should be open");
         let (sender, receiver) = oneshot::channel::<R>();
 
         self.sender
-            .send(Message::Execute(Box::new(move |conn| {
-                let value = function(conn);
-                let _ = sender.send(value);
-            })))
+            .send(Message::Execute(
+                Box::new(move |conn| {
+                    let value = function(conn);
+                    let _ = sender.send(value);
+                }),
+                permit,
+            ))
             .expect("database connection should be open");
+
+        // Local aux-storage diagnostic patch (phase 7 §2.3, C2
+        // production-path): ordinary successful-enqueue event, identical in
+        // every build. After the successful send; a failed send panics above
+        // without emitting. Static fields plus opaque span-ID correlation.
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _entered = span.enter();
+            tracing::trace!(
+                op = "sqlite_worker",
+                boundary = "enqueued",
+                outcome = "queued"
+            );
+        });
 
         receiver.await.expect(BUG_TEXT)
     }
@@ -335,24 +388,38 @@ impl Connection {
     ///
     /// Will return `Err` if the underlying SQLite close call fails.
     pub async fn close(self) -> Result<()> {
+        let permit = match self.admission.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Ok(()),
+        };
         let (sender, receiver) = oneshot::channel::<std::result::Result<(), rusqlite::Error>>();
 
-        if let Err(crossbeam_channel::SendError(_)) = self.sender.send(Message::Close(sender)) {
-            // If the channel is closed on the other side, it means the connection closed
-            // successfully This is a safeguard against calling close on a
-            // `Copy` of the connection
+        if let Err(crossbeam_channel::SendError(_)) =
+            self.sender.send(Message::Close(sender, permit))
+        {
+            // If the channel is closed on the other side, it means the
+            // connection closed successfully This is a safeguard against
+            // calling close on a `Copy` of the connection
             return Ok(());
         }
 
         let result = receiver.await;
 
         if result.is_err() {
-            // If we get a RecvError at this point, it also means the channel closed in the
-            // meantime we can assume the connection is closed
+            // If we get a RecvError at this point, it also means the channel
+            // closed in the meantime we can assume the connection is closed
             return Ok(());
         }
 
         result.unwrap().map_err(|e| Error::Close((self, e)))
+    }
+
+    async fn acquire_admission(&self) -> Result<OwnedSemaphorePermit> {
+        self.admission
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ConnectionClosed)
     }
 }
 
@@ -364,18 +431,24 @@ impl Debug for Connection {
 
 impl From<rusqlite::Connection> for Connection {
     fn from(conn: rusqlite::Connection) -> Self {
-        let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
-        thread::spawn(move || event_loop(conn, receiver));
+        let (sender, receiver) = crossbeam_channel::bounded::<Message>(QUEUE_CAPACITY);
+        let admission = Arc::new(Semaphore::new(QUEUE_CAPACITY));
+        thread::spawn({
+            let admission = Arc::clone(&admission);
+            move || event_loop(conn, receiver, admission)
+        });
 
-        Self { sender }
+        Self { sender, admission }
     }
 }
 
 async fn start<F>(open: F) -> rusqlite::Result<Connection>
 where F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static {
-    let (sender, receiver) = crossbeam_channel::unbounded::<Message>();
+    let (sender, receiver) = crossbeam_channel::bounded::<Message>(QUEUE_CAPACITY);
+    let admission = Arc::new(Semaphore::new(QUEUE_CAPACITY));
     let (result_sender, result_receiver) = oneshot::channel();
 
+    let worker_admission = Arc::clone(&admission);
     thread::spawn(move || {
         let conn = match open() {
             Ok(c) => c,
@@ -389,20 +462,25 @@ where F: FnOnce() -> rusqlite::Result<rusqlite::Connection> + Send + 'static {
             return;
         }
 
-        event_loop(conn, receiver);
+        event_loop(conn, receiver, worker_admission);
     });
 
     result_receiver
         .await
         .expect(BUG_TEXT)
-        .map(|_| Connection { sender })
+        .map(|_| Connection { sender, admission })
 }
 
-fn event_loop(mut conn: rusqlite::Connection, receiver: Receiver<Message>) {
+fn event_loop(
+    mut conn: rusqlite::Connection,
+    receiver: Receiver<Message>,
+    admission: Arc<Semaphore>,
+) {
+    let _admission_guard = AdmissionGuard(admission);
     while let Ok(message) = receiver.recv() {
         match message {
-            Message::Execute(f) => f(&mut conn),
-            Message::Close(s) => {
+            Message::Execute(f, _permit) => f(&mut conn),
+            Message::Close(s, _permit) => {
                 let result = conn.close();
 
                 match result {
@@ -417,5 +495,13 @@ fn event_loop(mut conn: rusqlite::Connection, receiver: Receiver<Message>) {
                 }
             }
         }
+    }
+}
+
+struct AdmissionGuard(Arc<Semaphore>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }

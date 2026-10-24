@@ -48,9 +48,9 @@ pub(crate) fn notification_body(context: NotificationRenderContext<'_>) -> Pubsu
         .as_deref()
         .unwrap_or("");
     let unsubscribe_url = unsubscribe_url(context.delivery_config, context.subscription)?;
-    let string_to_sign =
-        notification_string_to_sign(context.request, context.message_id, &timestamp);
-    let signature = sign(context.signer, &string_to_sign)?;
+    let signature = sign(context.signer, || {
+        notification_string_to_sign(context.request, context.message_id, &timestamp)
+    })?;
 
     let mut body = String::with_capacity(notification_body_capacity(
         &context,
@@ -104,15 +104,16 @@ pub(crate) fn confirmation_body(context: ConfirmationRenderContext<'_>) -> Pubsu
          SubscribeURL included in this message.",
         context.topic_arn
     );
-    let string_to_sign = confirmation_string_to_sign(
-        &message,
-        context.message_id,
-        &subscribe_url,
-        &timestamp,
-        context.token,
-        context.topic_arn,
-    );
-    let signature = sign(context.signer, &string_to_sign)?;
+    let signature = sign(context.signer, || {
+        confirmation_string_to_sign(
+            &message,
+            context.message_id,
+            &subscribe_url,
+            &timestamp,
+            context.token,
+            context.topic_arn,
+        )
+    })?;
 
     let mut body = String::with_capacity(confirmation_body_capacity(
         &context,
@@ -144,20 +145,16 @@ pub(crate) fn notification_headers(
 ) -> PubsubResult<HeaderMap> {
     let mut headers = base_headers();
     insert_header(&mut headers, "x-amz-sns-message-type", "Notification")?;
-    insert_header(
-        &mut headers,
-        "x-amz-sns-message-id",
-        &message_id.to_string(),
-    )?;
+    insert_header(&mut headers, "x-amz-sns-message-id", message_id.as_str())?;
     insert_header(
         &mut headers,
         "x-amz-sns-topic-arn",
-        &request.topic_arn.to_string(),
+        request.topic_arn.as_str(),
     )?;
     insert_header(
         &mut headers,
         "x-amz-sns-subscription-arn",
-        &subscription.subscription_arn.to_string(),
+        subscription.subscription_arn.as_str(),
     )?;
     Ok(headers)
 }
@@ -172,12 +169,8 @@ pub(crate) fn confirmation_headers(
         "x-amz-sns-message-type",
         "SubscriptionConfirmation",
     )?;
-    insert_header(
-        &mut headers,
-        "x-amz-sns-message-id",
-        &message_id.to_string(),
-    )?;
-    insert_header(&mut headers, "x-amz-sns-topic-arn", &topic_arn.to_string())?;
+    insert_header(&mut headers, "x-amz-sns-message-id", message_id.as_str())?;
+    insert_header(&mut headers, "x-amz-sns-topic-arn", topic_arn.as_str())?;
     Ok(headers)
 }
 
@@ -228,12 +221,12 @@ pub(crate) fn confirmation_string_to_sign(
 
 fn sign(
     signer: Option<&dyn PubsubNotificationSigner>,
-    string_to_sign: &str,
+    string_to_sign: impl FnOnce() -> String,
 ) -> PubsubResult<String> {
     match signer {
         Some(signer) => signer.sign(PubsubNotificationSignRequest {
             signature_version: "1",
-            string_to_sign,
+            string_to_sign: &string_to_sign(),
         }),
         None => Ok(String::new()),
     }

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::{errors::TableNameParseError, index_name::IndexName};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub struct TableName(String);
 
@@ -39,6 +41,45 @@ impl TableName {
             }
         }
         sanitized
+    }
+
+    /// Physical table name shared by the SQL backends (`table_<sanitized>`).
+    /// Postgres applies its 63-byte truncation hook on top of this.
+    #[must_use]
+    pub fn physical_table_name(&self) -> String {
+        format!("table_{}", self.sanitized_name())
+    }
+
+    /// Physical GSI table name shared by the SQL backends
+    /// (`gsi_<table>_<index>`). Postgres applies its truncation hook on top.
+    #[must_use]
+    pub fn physical_gsi_table_name(&self, index: &IndexName) -> String {
+        format!("gsi_{}_{}", self.sanitized_name(), index.sanitized_name())
+    }
+
+    /// Physical TTL index table name shared by the SQL backends.
+    #[must_use]
+    pub fn physical_ttl_index_table_name(&self) -> String {
+        format!("ttl_index_{}", self.sanitized_name())
+    }
+}
+
+impl TryFrom<String> for TableName {
+    type Error = TableNameParseError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name.trim().is_empty() {
+            return Err(TableNameParseError::Empty);
+        }
+        Ok(Self(name))
+    }
+}
+
+impl TryFrom<&str> for TableName {
+    type Error = TableNameParseError;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Self::try_from(name.to_owned())
     }
 }
 

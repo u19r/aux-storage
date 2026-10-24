@@ -1,0 +1,12 @@
+pub(crate) const DURABLE_RECORD_MAGIC: [u8; 4] = *b"ARPL";
+pub(crate) const DURABLE_RECORD_VERSION: u16 = 1;
+pub(crate) const DURABLE_HEADER_BYTES: usize = 38;
+pub const CANONICAL_EVENT_SEMANTIC_VERSION: u32 = 8;
+pub(crate) const NATIVE_WINNER_FORMAT: u8 = 3;
+pub(crate) const TRANSPORT_SEMANTIC_FRAME_MULTIPLIER: usize = 4;
+pub(crate) const TRANSPORT_CLASS_WIRE_MULTIPLIER: usize = 36;
+pub(crate) const TRANSPORT_CLASS_SOURCE_MULTIPLIER: usize = 8;
+pub(crate) const TRANSPORT_RESERVATION_CLASSES: usize = 3;
+pub(crate) const DELIVERY_EXCHANGES_PER_FRAME_EVENT: u32 = 2;
+pub(crate) const DELIVERY_SOURCE_PHASES: u32 = 2;
+pub(crate) const DELIVERY_JOB_PHASES: u32 = 4;

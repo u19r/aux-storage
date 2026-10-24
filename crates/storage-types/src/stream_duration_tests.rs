@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::{MAX_STREAM_RETENTION_HOURS, StreamRetentionDuration};
+use crate::{StreamRetentionDuration, TimestampMillis, constants::MAX_STREAM_RETENTION_HOURS};
 
 #[test]
 fn stream_retention_duration_accepts_forever_and_positive_hours() {
@@ -56,4 +56,14 @@ fn effective_item_retention_uses_max_and_forever_dominates() {
         ),
         StreamRetentionDuration::Forever
     );
+}
+
+#[test]
+fn finite_retention_computes_its_cutoff_and_forever_has_none() {
+    let reference = TimestampMillis::from_timestamp(7_200_001);
+    assert_eq!(
+        StreamRetentionDuration::FiniteHours(2).cutoff_at(reference),
+        Some(TimestampMillis::from_timestamp(1))
+    );
+    assert_eq!(StreamRetentionDuration::Forever.cutoff_at(reference), None);
 }

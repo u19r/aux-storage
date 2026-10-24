@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use utoipa::ToSchema;
 
-use crate::TimestampMillis;
+use crate::{TimestampMillis, timestamp_millis::write_rfc3339_utc};
 #[derive(Debug, Clone, PartialEq, PartialOrd, Copy, Eq, Ord, Hash, ToSchema, JsonSchema)]
 #[schema(value_type = i64, example = 1_700_000_000)]
 pub struct TimestampSeconds(i64);
@@ -70,9 +70,10 @@ impl Add<ChronoDuration> for TimestampSeconds {
 
 impl std::fmt::Display for TimestampSeconds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let datetime = DateTime::from_timestamp(self.0, 0);
-        let rfc3339 = datetime.unwrap_or(Utc::now()).to_rfc3339();
-        write!(f, "{rfc3339}")
+        let Some(datetime) = DateTime::from_timestamp(self.0, 0) else {
+            return write!(f, "{}", Utc::now().to_rfc3339());
+        };
+        write_rfc3339_utc(datetime, f)
     }
 }
 

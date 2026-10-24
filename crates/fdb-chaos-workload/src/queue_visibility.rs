@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*};
+use crate::{common::*, constants::*, imports::*};
 
 pub(crate) struct QueueVisibilityWorkload {
     name: String,
@@ -54,33 +54,16 @@ impl QueueVisibilityWorkload {
         }
     }
 
-    fn store(&self, db: SimDatabase) -> Result<FoundationDbKvStore, String> {
-        FoundationDbKvStore::from_database(
-            FoundationDbConfig {
-                cluster_file_path: None,
-                tenant_name: None,
-                subspace_prefix: Some(b"aux-storage/fdb-chaos/queue-visibility/".to_vec()),
-                cache_read_version_ms: 0,
-                immediate_gsi_consistency: false,
-                report_conflicting_keys: false,
-            },
-            db,
-        )
-        .map_err(|err| storage_error_detail(&err))
-    }
-
-    async fn provider(&self, db: SimDatabase) -> Result<Arc<FdbChaosProvider>, String> {
-        let provider = Arc::new(
-            SortedKvDbStorageProvider::new(self.store(db)?).with_database_jobs_enabled(false),
-        );
-        queue::QueueProvider::initialize(provider.as_ref())
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(provider)
-    }
-
     async fn manager(&self, db: SimDatabase) -> Result<QueueManager, String> {
-        Ok(QueueManager::new(self.provider(db).await?))
+        let driver = kv_backend::foundationdb::FoundationDbBackend::from_simulation(
+            db,
+            Some(b"aux-storage/fdb-chaos/queue-visibility/"),
+            None,
+        );
+        let store = kv_backend::KvStore::initialize_format(driver)
+            .await
+            .map_err(|error| storage_error_detail(&error))?;
+        Ok(QueueManager::new(Arc::new(store)))
     }
 
     fn queue_name(&self) -> String {

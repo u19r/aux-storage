@@ -1,4 +1,4 @@
-use storage_types::StorageEnum;
+use storage_types::{StorageEnum, StorageError};
 
 use crate::{StreamEnum, StreamError, StreamInternalKind, StreamValidationKind};
 
@@ -19,13 +19,10 @@ fn stream_validation_error_preserves_kind_and_default_message() {
     let error = StreamError::validation(StreamValidationKind::InvalidLimit);
 
     assert!(
-        matches!(
-            error,
-            StreamError::Base(StreamEnum::Validation {
+        matches!(error.base_error(), Some(StreamEnum::Validation {
                 kind: StreamValidationKind::InvalidLimit,
-                ref message,
-            }) if message == "invalid limit"
-        ),
+                message,
+            }) if message == "invalid limit"),
         "unexpected error: {error:?}"
     );
 }
@@ -35,13 +32,10 @@ fn stream_validation_error_accepts_custom_business_message() {
     let error = StreamError::validation("limit must be less than shard count");
 
     assert!(
-        matches!(
-            error,
-            StreamError::Base(StreamEnum::Validation {
+        matches!(error.base_error(), Some(StreamEnum::Validation {
                 kind: StreamValidationKind::Message,
-                ref message,
-            }) if message == "limit must be less than shard count"
-        ),
+                message,
+            }) if message == "limit must be less than shard count"),
         "unexpected error: {error:?}"
     );
 }
@@ -51,13 +45,10 @@ fn stream_internal_error_adds_operation_detail_to_default_message() {
     let error = StreamError::internal_with_detail(StreamInternalKind::CleanupTask, "cursor-a");
 
     assert!(
-        matches!(
-            error,
-            StreamError::Base(StreamEnum::Internal {
+        matches!(error.base_error(), Some(StreamEnum::Internal {
                 kind: StreamInternalKind::CleanupTask,
-                ref message,
-            }) if message == "cleanup task failed: cursor-a"
-        ),
+                message,
+            }) if message == "cleanup task failed: cursor-a"),
         "unexpected error: {error:?}"
     );
 }
@@ -101,7 +92,7 @@ fn stream_validation_and_internal_errors_map_to_storage_categories() {
     assert!(
         matches!(
             validation,
-            StorageEnum::Validation { ref message } if message == "bad name"
+            StorageEnum::Validation { ref message, .. } if message == "bad name"
         ),
         "unexpected storage error: {validation:?}"
     );
@@ -112,5 +103,25 @@ fn stream_validation_and_internal_errors_map_to_storage_categories() {
                 if message == "serialization failed: append item"
         ),
         "unexpected storage error: {internal:?}"
+    );
+}
+
+#[test]
+fn given_wrapped_storage_errors_when_converted_then_categories_are_preserved() {
+    let validation = StreamError::from(
+        StorageError::validation("invalid checkpoint").with_context("read checkpoint"),
+    )
+    .into_storage_enum();
+    let unsupported =
+        StreamError::from(StorageError::unsupported("storage contract is unavailable"))
+            .into_storage_enum();
+
+    assert!(
+        matches!(validation, StorageEnum::Validation { ref message, .. } if message == "invalid checkpoint"),
+        "unexpected storage error: {validation:?}"
+    );
+    assert!(
+        matches!(unsupported, StorageEnum::Unsupported { ref message } if message == "storage contract is unavailable"),
+        "unexpected storage error: {unsupported:?}"
     );
 }

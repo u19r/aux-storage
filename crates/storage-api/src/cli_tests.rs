@@ -15,8 +15,13 @@ use storage_provider::{RemoteCredentialStrategy, StorageBackend};
 use storage_types::StorageEnum;
 
 use crate::{
-    AppState, FilterSource, StorageApiManagerOptions, ensure_backend_matches, health_status, ready,
-    resolve_filter, shutdown_grace_period, storage_config_from_backends,
+    AppState,
+    router::{health_status, ready},
+    routes::routes_tests::for_each_conformance_backend,
+    runtime_config::{
+        FilterSource, ensure_backend_matches, resolve_filter, shutdown_grace_period,
+        storage_config_from_backends,
+    },
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -139,7 +144,7 @@ fn storage_config_from_backends_rejects_remote_without_endpoint_urls() {
 
     assert!(matches!(
         err.as_ref(),
-        StorageEnum::Validation { message }
+        StorageEnum::Validation { message, .. }
             if message.contains("remote storage requires at least one endpoint URL")
     ));
 }
@@ -159,7 +164,7 @@ fn storage_config_from_backends_rejects_conflicting_remote_credentials() {
 
     assert!(matches!(
         err.as_ref(),
-        StorageEnum::Validation { message }
+        StorageEnum::Validation { message, .. }
             if message.contains("invalid remote credentials config")
     ));
 }
@@ -238,68 +243,70 @@ fn with_env_var_restores_original_value() {
     }
 }
 
-async fn app_state() -> Arc<AppState> {
-    let db = Arc::new(DatabaseManager::new_for_test().await.expect("db"));
-    Arc::new(AppState::new_with_manager_options(
-        db,
-        StorageApiManagerOptions::default(),
-    ))
+fn app_state(db: Arc<DatabaseManager>) -> Arc<AppState> {
+    Arc::new(AppState::new(db))
 }
 
 #[tokio::test]
 async fn health_status_only_turns_unhealthy_after_sustained_failure_threshold() {
-    let app_state = app_state().await;
+    for_each_conformance_backend(|_, db| async move {
+        let app_state = app_state(db);
 
-    for index in 0..5 {
-        app_state
-            .health
-            .record_failure(format!("synthetic failure {index}"));
-    }
+        for index in 0..5 {
+            app_state
+                .health
+                .record_failure(format!("synthetic failure {index}"));
+        }
 
-    let (status_before_window, Json(body_before_window)) =
-        health_status(State(app_state.clone())).await;
-    assert_eq!(status_before_window, StatusCode::OK);
-    assert_eq!(
-        body_before_window["status"],
-        Value::String("healthy".to_string())
-    );
+        let (status_before_window, Json(body_before_window)) =
+            health_status(State(app_state.clone())).await;
+        assert_eq!(status_before_window, StatusCode::OK);
+        assert_eq!(
+            body_before_window["status"],
+            Value::String("healthy".to_string())
+        );
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let (status_after_window, Json(body_after_window)) = health_status(State(app_state)).await;
-    assert_eq!(status_after_window, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        body_after_window["status"],
-        Value::String("unhealthy".to_string())
-    );
-    assert_eq!(
-        body_after_window["reason"],
-        Value::String("synthetic failure 4".to_string())
-    );
+        let (status_after_window, Json(body_after_window)) = health_status(State(app_state)).await;
+        assert_eq!(status_after_window, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_after_window["status"],
+            Value::String("unhealthy".to_string())
+        );
+        assert_eq!(
+            body_after_window["reason"],
+            Value::String("synthetic failure 4".to_string())
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn ready_success_clears_accumulated_health_failures() {
-    let app_state = app_state().await;
+    for_each_conformance_backend(|_, db| async move {
+        let app_state = app_state(db);
 
-    for index in 0..5 {
-        app_state
-            .health
-            .record_failure(format!("transient failure {index}"));
-    }
-    tokio::time::sleep(Duration::from_secs(5)).await;
+        for index in 0..5 {
+            app_state
+                .health
+                .record_failure(format!("transient failure {index}"));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let (status_before_ready, _) = health_status(State(app_state.clone())).await;
-    assert_eq!(status_before_ready, StatusCode::SERVICE_UNAVAILABLE);
+        let (status_before_ready, _) = health_status(State(app_state.clone())).await;
+        assert_eq!(status_before_ready, StatusCode::SERVICE_UNAVAILABLE);
 
-    let (ready_status, Json(ready_body)) = ready(State(app_state.clone())).await;
-    assert_eq!(ready_status, StatusCode::OK);
-    assert_eq!(ready_body["status"], Value::String("ready".to_string()));
+        let (ready_status, Json(ready_body)) = ready(State(app_state.clone())).await;
+        assert_eq!(ready_status, StatusCode::OK);
+        assert_eq!(ready_body["status"], Value::String("ready".to_string()));
 
-    let (status_after_ready, Json(body_after_ready)) = health_status(State(app_state)).await;
-    assert_eq!(status_after_ready, StatusCode::OK);
-    assert_eq!(
-        body_after_ready["status"],
-        Value::String("healthy".to_string())
-    );
+        let (status_after_ready, Json(body_after_ready)) = health_status(State(app_state)).await;
+        assert_eq!(status_after_ready, StatusCode::OK);
+        assert_eq!(
+            body_after_ready["status"],
+            Value::String("healthy".to_string())
+        );
+    })
+    .await;
 }

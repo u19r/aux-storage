@@ -1,5 +1,8 @@
 use quote::ToTokens;
-use syn::{DeriveInput, GenericArgument, LitStr, PathArguments, Token, Type};
+use syn::{
+    Data, DeriveInput, Fields, GenericArgument, LitStr, Meta, PathArguments, Token, Type,
+    punctuated::Punctuated,
+};
 
 pub(crate) fn validate_wire_item_struct_attributes(
     input_ast: &DeriveInput,
@@ -25,29 +28,35 @@ pub(crate) fn validate_wire_item_struct_attributes(
     Ok(())
 }
 pub(crate) fn parse_wire_item_struct_serde_rename_all(input_ast: &DeriveInput) -> Option<String> {
-    let mut rename_all: Option<String> = None;
-
-    for attr in &input_ast.attrs {
-        if !attr.path().is_ident("serde") {
-            continue;
-        }
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename_all") {
-                let value: LitStr = meta.value()?.parse()?;
-                rename_all = Some(value.value());
+    parse_serde_options(&input_ast.attrs)
+        .ok()?
+        .into_iter()
+        .find_map(|option| {
+            if let Meta::NameValue(option) = option
+                && option.path.is_ident("rename_all")
+                && let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(value),
+                    ..
+                }) = option.value
+            {
+                return Some(value.value());
             }
-            Ok(())
-        });
-    }
-
-    rename_all
+            None
+        })
 }
 
 pub(crate) struct WireItemFieldAttributes {
     pub(crate) wire_name: String,
     pub(crate) parse_with: Option<syn::ExprPath>,
     pub(crate) serialize_with: Option<syn::ExprPath>,
-    pub(crate) skip_serializing_if_option_is_none: bool,
+    pub(crate) skip_serializing_if: Option<syn::ExprPath>,
+    pub(crate) default: Option<WireItemFieldDefault>,
+    pub(crate) aliases: Vec<LitStr>,
+}
+
+pub(crate) enum WireItemFieldDefault {
+    Trait,
+    Path(syn::ExprPath),
 }
 
 pub(crate) fn parse_wire_item_field_attributes(
@@ -85,8 +94,8 @@ pub(crate) fn parse_wire_item_field_attributes(
     }
 
     let serde_rename = parse_wire_item_serde_field_rename(field);
-    let skip_serializing_if_option_is_none =
-        parse_wire_item_serde_skip_option_none(field).unwrap_or(false);
+    let (serde_default, aliases) = parse_wire_item_serde_field_default(field)?;
+    let skip_serializing_if = parse_wire_item_serde_skip(field);
     let Some(field_ident) = field.ident.as_ref() else {
         return Err(syn::Error::new_spanned(
             field,
@@ -99,11 +108,14 @@ pub(crate) fn parse_wire_item_field_attributes(
         .or_else(|| serde_rename_all.map(|rule| apply_serde_rename_all_rule(&field_name, rule)))
         .or_else(|| default_wire_timestamp_alias(field_name.as_str()).map(str::to_string))
         .unwrap_or(field_name);
+    let aliases = normalize_field_aliases(&wire_name, aliases);
     Ok(WireItemFieldAttributes {
         wire_name,
         parse_with,
         serialize_with,
-        skip_serializing_if_option_is_none,
+        skip_serializing_if,
+        default: serde_default,
+        aliases,
     })
 }
 
@@ -130,62 +142,95 @@ pub(crate) fn default_wire_timestamp_alias(field_name: &str) -> Option<&'static 
 }
 
 pub(crate) fn parse_wire_item_serde_field_rename(field: &syn::Field) -> Option<String> {
-    let mut deserialize_rename: Option<String> = None;
-    let mut plain_rename: Option<String> = None;
-
-    for attr in &field.attrs {
-        if !attr.path().is_ident("serde") {
-            continue;
-        }
-        let _ = attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("rename") {
-                return Ok(());
-            }
-
-            if meta.input.peek(Token![=]) {
-                let value: LitStr = meta.value()?.parse()?;
-                plain_rename = Some(value.value());
-                return Ok(());
-            }
-
-            let _ = meta.parse_nested_meta(|nested| {
-                if nested.path.is_ident("deserialize") {
-                    let value: LitStr = nested.value()?.parse()?;
-                    deserialize_rename = Some(value.value());
-                    return Ok(());
-                }
-                if nested.path.is_ident("serialize") && plain_rename.is_none() {
-                    let value: LitStr = nested.value()?.parse()?;
+    let mut deserialize_rename = None;
+    let mut plain_rename = None;
+    for option in parse_serde_options(&field.attrs).ok()? {
+        match option {
+            Meta::NameValue(value) if value.path.is_ident("rename") => {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(value),
+                    ..
+                }) = value.value
+                {
                     plain_rename = Some(value.value());
                 }
-                Ok(())
-            });
-            Ok(())
-        });
+            }
+            Meta::List(list) if list.path.is_ident("rename") => {
+                let _ = list.parse_nested_meta(|nested| {
+                    let value: LitStr = nested.value()?.parse()?;
+                    if nested.path.is_ident("deserialize") {
+                        deserialize_rename = Some(value.value());
+                    } else if nested.path.is_ident("serialize") {
+                        plain_rename = Some(value.value());
+                    }
+                    Ok(())
+                });
+            }
+            _ => {}
+        }
     }
-
     deserialize_rename.or(plain_rename)
 }
 
-pub(crate) fn parse_wire_item_serde_skip_option_none(field: &syn::Field) -> Option<bool> {
-    let mut skip_option_none = None;
-
-    for attr in &field.attrs {
-        if !attr.path().is_ident("serde") {
-            continue;
+fn parse_serde_options(attributes: &[syn::Attribute]) -> Result<Vec<Meta>, syn::Error> {
+    let mut options = Vec::new();
+    for attribute in attributes {
+        if attribute.path().is_ident("serde")
+            && let Meta::List(list) = &attribute.meta
+        {
+            options.extend(list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?);
         }
-        let _ = attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("skip_serializing_if") {
-                return Ok(());
-            }
-            let value: LitStr = meta.value()?.parse()?;
-            let path = value.value();
-            skip_option_none = Some(path.ends_with("Option::is_none"));
-            Ok(())
-        });
     }
+    Ok(options)
+}
 
-    skip_option_none
+fn parse_wire_item_serde_field_default(
+    field: &syn::Field,
+) -> Result<(Option<WireItemFieldDefault>, Vec<LitStr>), syn::Error> {
+    let mut default = None;
+    let mut aliases = Vec::new();
+    for meta in parse_serde_options(&field.attrs)? {
+        match meta {
+            Meta::Path(path) if path.is_ident("default") => {
+                default = Some(WireItemFieldDefault::Trait);
+            }
+            Meta::NameValue(value) if value.path.is_ident("default") => {
+                default = Some(WireItemFieldDefault::Path(parse_expr_path_value(
+                    value.value,
+                )?));
+            }
+            Meta::NameValue(value) if value.path.is_ident("alias") => {
+                let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(alias),
+                    ..
+                }) = value.value
+                else {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "serde alias must be a string",
+                    ));
+                };
+                aliases.push(alias);
+            }
+            _ => {}
+        }
+    }
+    Ok((default, aliases))
+}
+
+fn parse_wire_item_serde_skip(field: &syn::Field) -> Option<syn::ExprPath> {
+    for option in parse_serde_options(&field.attrs).ok()? {
+        if let Meta::NameValue(option) = option
+            && option.path.is_ident("skip_serializing_if")
+            && let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = option.value
+        {
+            return syn::parse_str::<syn::ExprPath>(&value.value()).ok();
+        }
+    }
+    None
 }
 
 pub(crate) fn apply_serde_rename_all_rule(field_name: &str, rule: &str) -> String {
@@ -238,6 +283,11 @@ pub(crate) fn is_vec_or_option_vec_non_u8(ty: &Type) -> bool {
 
 pub(crate) fn is_vec_u8_or_option_vec_u8(ty: &Type) -> bool {
     is_vec_u8(ty) || option_inner_type(ty).is_some_and(is_vec_u8)
+}
+
+pub(crate) fn is_string_or_option_string(ty: &Type) -> bool {
+    use crate::wire_attribute_helpers::is_string_type;
+    is_string_type(ty) || option_inner_type(ty).is_some_and(is_string_type)
 }
 
 pub(crate) fn is_vec_non_u8(ty: &Type) -> bool {
@@ -308,4 +358,35 @@ pub(crate) fn option_inner_type(ty: &Type) -> Option<&Type> {
         return None;
     };
     Some(inner_ty)
+}
+
+pub(crate) fn parse_named_fields<'a>(
+    input_ast: &'a DeriveInput,
+    derive_name: &str,
+) -> Result<&'a Punctuated<syn::Field, syn::Token![,]>, syn::Error> {
+    match &input_ast.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(named) => Ok(&named.named),
+            _ => Err(syn::Error::new_spanned(
+                &input_ast.ident,
+                format!("{derive_name} only supports structs with named fields"),
+            )),
+        },
+        _ => Err(syn::Error::new_spanned(
+            &input_ast.ident,
+            format!("{derive_name} only supports structs"),
+        )),
+    }
+}
+
+fn normalize_field_aliases(canonical: &str, aliases: Vec<LitStr>) -> Vec<LitStr> {
+    let mut distinct: Vec<LitStr> = Vec::new();
+    for alias in aliases {
+        if alias.value() != canonical
+            && !distinct.iter().any(|other| other.value() == alias.value())
+        {
+            distinct.push(alias);
+        }
+    }
+    distinct
 }

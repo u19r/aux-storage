@@ -1,15 +1,72 @@
+use sha2::{Digest, Sha256};
 use storage_types::{
-    AttributeValue, StorageEnum, StorageError, StorageResult, TableName, TransactEncodeItem,
-    TransactUpdateRequest, TransactWriteItemsEncodeRequest, context::WrappedError as _,
+    AttributeValue, StorageError, StorageResult, TableName, TransactEncodeItem,
+    TransactUpdateRequest, TransactWriteItemsEncodeRequest,
 };
 
-use crate::database_manager::{
-    CAPPED_ENTITY_COUNTER_CREATE_CONDITION, CAPPED_ENTITY_COUNTER_DELETE_CONDITION,
-    CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION, CappedStorageError, CreateCappedEntityInput,
-    DatabaseManager, DeleteCappedEntityInput, ENTITY_ABSENT_CONDITION, ENTITY_EXISTS_CONDITION,
-    capped_entity_counter_expression_names, capped_entity_counter_expression_values,
-    capped_entity_counter_key, is_conditional_failure, transaction_canceled_reason_is_conditional,
+use super::constants::{
+    CAPPED_ENTITY_COUNTER_DELTA_VALUE, CAPPED_ENTITY_COUNTER_ENTITY_TYPE_NAME,
+    CAPPED_ENTITY_COUNTER_ENTITY_TYPE_VALUE, CAPPED_ENTITY_COUNTER_MAX_VALUE,
+    CAPPED_ENTITY_COUNTER_PK, CAPPED_ENTITY_COUNTER_VALUE_ATTR, CAPPED_ENTITY_COUNTER_VALUE_NAME,
+    CAPPED_ENTITY_COUNTER_ZERO_VALUE,
 };
+use crate::database_manager::{
+    CAPPED_ENTITY_COUNTER_DELETE_CONDITION, CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION,
+    CappedStorageError, CreateCappedEntityInput, DatabaseManager, DeleteCappedEntityInput,
+    ENTITY_EXISTS_CONDITION,
+};
+
+pub(super) fn capped_entity_counter_key(entity_type: &str) -> storage_types::KeyAttributes {
+    storage_types::KeyOwned::pk_sk(CAPPED_ENTITY_COUNTER_PK, entity_type).into()
+}
+
+pub(super) fn capped_entity_counter_expression_names() -> storage_types::VecMap<String, String> {
+    [
+        (
+            CAPPED_ENTITY_COUNTER_VALUE_NAME.to_string(),
+            CAPPED_ENTITY_COUNTER_VALUE_ATTR.to_string(),
+        ),
+        (
+            CAPPED_ENTITY_COUNTER_ENTITY_TYPE_NAME.to_string(),
+            storage_types::single_table_entity::ENTITY_TYPE_ATTR.to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+pub(super) fn capped_entity_counter_expression_values(
+    delta: i64,
+    entity_type: &str,
+    max_value: Option<u64>,
+    zero_value: Option<u64>,
+) -> storage_types::AttributeMap {
+    let mut values: storage_types::AttributeMap = [
+        (
+            CAPPED_ENTITY_COUNTER_DELTA_VALUE.to_string(),
+            AttributeValue::N(delta.to_string()),
+        ),
+        (
+            CAPPED_ENTITY_COUNTER_ENTITY_TYPE_VALUE.to_string(),
+            AttributeValue::S(entity_type.to_string()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    if let Some(max_value) = max_value {
+        values.insert(
+            CAPPED_ENTITY_COUNTER_MAX_VALUE.to_string(),
+            AttributeValue::N(max_value.to_string()),
+        );
+    }
+    if let Some(zero_value) = zero_value {
+        values.insert(
+            CAPPED_ENTITY_COUNTER_ZERO_VALUE.to_string(),
+            AttributeValue::N(zero_value.to_string()),
+        );
+    }
+    values
+}
 
 impl DatabaseManager {
     pub async fn create_capped_entity<T>(
@@ -25,65 +82,42 @@ impl DatabaseManager {
             counted_entity_type,
             max_value,
             additional_transact_items,
+            job_effect_authority,
         } = input;
-        let counter_index = 1 + additional_transact_items.len();
-        let item_key = item.table_key_map();
-        let wire_item = storage_types::single_table_entity::to_wire_entity(item)
-            .map_err(|err| StorageError::internal(&err.to_string()))?;
-
-        let mut transact_items = Vec::with_capacity(counter_index + 1);
-        transact_items.push(TransactEncodeItem {
-            put: Some(storage_types::TransactEncodePutRequest {
-                table_name: table_name.clone(),
-                item: wire_item,
-                condition_expression: Some(ENTITY_ABSENT_CONDITION.to_string()),
-                expression_attribute_names: None,
-                expression_attribute_values: None,
-                return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
-            }),
-            ..Default::default()
-        });
-        transact_items.extend(additional_transact_items);
-        transact_items.push(TransactEncodeItem {
-            update: Some(TransactUpdateRequest {
-                table_name: table_name.clone(),
-                key: capped_entity_counter_key(&counted_entity_type).into(),
-                update_expression: CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION.to_string(),
-                indexers: None,
-                condition_expression: Some(CAPPED_ENTITY_COUNTER_CREATE_CONDITION.to_string()),
-                expression_attribute_names: Some(capped_entity_counter_expression_names()),
-                expression_attribute_values: Some(capped_entity_counter_expression_values(
-                    1,
-                    &counted_entity_type,
-                    Some(max_value),
-                    None,
-                )),
-                return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
-            }),
-            ..Default::default()
-        });
-
+        let prepared = super::PreparedCappedEntityCreate::try_new(
+            table_name,
+            item,
+            counted_entity_type,
+            max_value,
+        )?;
+        let (request, outcome) = prepared.into_capped_transaction(additional_transact_items);
         match self
-            .transact_write_items_encode(TransactWriteItemsEncodeRequest {
-                transact_items,
-                ..Default::default()
-            })
+            .commit_capped_entity_creation(request, job_effect_authority)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(error) => Err(self
-                .classify_create_capped_entity_error(
-                    error,
-                    &table_name,
-                    item_key.into(),
-                    counted_entity_type.clone(),
-                    max_value,
-                    counter_index,
-                )
-                .await),
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let rejection = outcome.classify_error(self, &error).await?;
+                Err(rejection.map_or(CappedStorageError::StorageError(error), Into::into))
+            }
         }
+    }
+
+    async fn commit_capped_entity_creation(
+        &self,
+        request: TransactWriteItemsEncodeRequest,
+        authority: Option<scheduled_bg_jobs::JobEffectAuthority>,
+    ) -> StorageResult<()> {
+        let Some(authority) = authority else {
+            self.transact_write_items_encode(request).await?;
+            return Ok(());
+        };
+        let mut request: storage_types::TransactWriteItemsRequest = request.try_into()?;
+        let identity = serde_json::to_vec(&request.transact_items)
+            .map_err(|_| StorageError::internal("capped effect identity encoding failed"))?;
+        request.client_request_token = Some(hex::encode(&Sha256::digest(identity)[..16]));
+        self.transact_write_job_effect(request, authority).await?;
+        Ok(())
     }
 
     pub async fn delete_capped_entity(
@@ -113,7 +147,7 @@ impl DatabaseManager {
                 update: Some(TransactUpdateRequest {
                     indexers: None,
                     table_name: table_name.clone(),
-                    key: capped_entity_counter_key(&counted_entity_type).into(),
+                    key: capped_entity_counter_key(&counted_entity_type),
                     update_expression: CAPPED_ENTITY_COUNTER_UPDATE_EXPRESSION.to_string(),
                     condition_expression: Some(CAPPED_ENTITY_COUNTER_DELETE_CONDITION.to_string()),
                     expression_attribute_names: Some(capped_entity_counter_expression_names()),
@@ -144,45 +178,6 @@ impl DatabaseManager {
         }
     }
 
-    async fn classify_create_capped_entity_error(
-        &self,
-        error: StorageError,
-        table_name: &TableName,
-        item_key: storage_types::KeyAttributes,
-        counted_entity_type: String,
-        max_value: u64,
-        counter_index: usize,
-    ) -> CappedStorageError {
-        if let StorageEnum::TransactionCanceled { reasons } = error.to_enum() {
-            if transaction_canceled_reason_is_conditional(reasons, 0) {
-                return CappedStorageError::ItemExistError;
-            }
-            if transaction_canceled_reason_is_conditional(reasons, counter_index) {
-                return CappedStorageError::CapacityExceededError;
-            }
-        }
-
-        if !is_conditional_failure(&error) {
-            return CappedStorageError::StorageError(error);
-        }
-
-        match self
-            .get_item_map_with_consistent_read(table_name.clone(), item_key, true)
-            .await
-        {
-            Ok(Some(_)) => CappedStorageError::ItemExistError,
-            Ok(None) => match self
-                .load_capped_entity_counter_value(table_name, &counted_entity_type)
-                .await
-            {
-                Ok(Some(value)) if value >= max_value => CappedStorageError::CapacityExceededError,
-                Ok(_) => CappedStorageError::StorageError(error),
-                Err(counter_error) => CappedStorageError::StorageError(counter_error),
-            },
-            Err(read_error) => CappedStorageError::StorageError(read_error),
-        }
-    }
-
     async fn classify_delete_capped_entity_error(
         &self,
         error: StorageError,
@@ -190,18 +185,16 @@ impl DatabaseManager {
         item_key: storage_types::KeyAttributes,
         delete_index: usize,
     ) -> CappedStorageError {
-        if let StorageEnum::TransactionCanceled { reasons } = error.to_enum()
-            && transaction_canceled_reason_is_conditional(reasons, delete_index)
-        {
+        if error.is_canceled_condition_check_failed(delete_index) {
             return CappedStorageError::ItemNotExistsError;
         }
 
-        if !is_conditional_failure(&error) {
+        if !error.is_conditional_write_contention() {
             return CappedStorageError::StorageError(error);
         }
 
         match self
-            .get_item_map_with_consistent_read(table_name.clone(), item_key, true)
+            .get_item_with_consistent_read(table_name.clone(), item_key, true)
             .await
         {
             Ok(None) => CappedStorageError::ItemNotExistsError,
@@ -210,13 +203,13 @@ impl DatabaseManager {
         }
     }
 
-    async fn load_capped_entity_counter_value(
+    pub(super) async fn load_capped_entity_counter_value(
         &self,
         table_name: &TableName,
         counted_entity_type: &str,
     ) -> StorageResult<Option<u64>> {
         let item = self
-            .get_item_map_with_consistent_read(
+            .get_item_decode_with_consistent_read::<_, storage_types::AttributeMap>(
                 table_name.clone(),
                 capped_entity_counter_key(counted_entity_type),
                 true,

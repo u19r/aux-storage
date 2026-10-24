@@ -6,51 +6,66 @@ use utoipa::ToSchema;
 
 use crate::{
     AttributeMap, AttributeValue, AttributeValueUpdate, ConditionalOperator,
-    ExpectedAttributeValue, KeyAttributes, StreamRetentionDuration, TableName,
+    ExpectedAttributeValue, KeyAttributes, ReturnConsumedCapacity, StorageResult,
+    StreamRetentionDuration, TableName, WireItem,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[serde(rename_all = "PascalCase")]
 pub struct PutItemRequest {
     pub table_name: TableName,
 
-    pub item: HashMap<String, AttributeValue>,
+    #[serde(with = "crate::wire_item::dynamo_json")]
+    #[schema(value_type = HashMap<String, AttributeValue>)]
+    pub item: WireItem,
 
-    /// Aux-storage extension: ordered top-level string attributes addressable
-    /// by read plans.
+    /// Names total at most 1,024 UTF-8 bytes per item, including absent
+    /// attributes. Aux-storage extension: ordered top-level string
+    /// attributes addressable by read plans.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub indexers: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[builder(default)]
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[builder(default)]
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_values: Option<AllOld>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    #[builder(default)]
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_item_collection_metrics: Option<String>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_values_on_condition_check_failure: Option<String>,
 
     /// Aux-storage extension: item stream retention duration in hours.
@@ -58,12 +73,13 @@ pub struct PutItemRequest {
         rename = "AuxItemStreamTtlHours",
         skip_serializing_if = "Option::is_none"
     )]
+    #[builder(default)]
     pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl PutItemRequest {
     #[must_use]
-    pub fn new(table_name: TableName, item: HashMap<String, AttributeValue>) -> Self {
+    pub fn new(table_name: TableName, item: WireItem) -> Self {
         Self {
             table_name,
             item,
@@ -81,34 +97,11 @@ impl PutItemRequest {
         }
     }
 
-    #[must_use]
-    pub fn with_condition_expression(mut self, condition_expression: Option<String>) -> Self {
-        self.condition_expression = condition_expression;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_names(
-        mut self,
-        expression_attribute_names: Option<HashMap<String, String>>,
-    ) -> Self {
-        self.expression_attribute_names = expression_attribute_names;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_values(
-        mut self,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> Self {
-        self.expression_attribute_values = expression_attribute_values;
-        self
-    }
-
-    #[must_use]
-    pub fn with_return_values(mut self, return_values: Option<AllOld>) -> Self {
-        self.return_values = return_values;
-        self
+    /// Validate and canonicalize the owned item before billing or table
+    /// preparation. Both entry points consume the same request policy.
+    pub fn normalized_for_write(mut self) -> StorageResult<Self> {
+        self.item = self.item.normalized_for_write()?.0;
+        Ok(self)
     }
 }
 
@@ -125,8 +118,28 @@ pub struct PutItemResponse {
     pub attributes: Option<AttributeMap>,
 }
 
+impl PutItemResponse {
+    /// Shape a put response from the previous image. Only
+    /// `ReturnValues::AllOld` surfaces old attributes; every other shape
+    /// reports no attributes. Shared by KV and SQL put paths so response
+    /// shaping never diverges per backend.
+    #[must_use]
+    pub fn for_return_values(
+        old_item: Option<AttributeMap>,
+        return_values: Option<AllOld>,
+    ) -> Self {
+        let attributes = if matches!(return_values, Some(AllOld::AllOld)) {
+            old_item
+        } else {
+            None
+        };
+
+        Self { attributes }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+#[serde(rename_all = "PascalCase")]
 pub struct GetItemRequest {
     pub table_name: TableName,
 
@@ -146,11 +159,12 @@ pub struct GetItemRequest {
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 }
 
 impl GetItemRequest {
@@ -170,48 +184,64 @@ impl GetItemRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GetItemResponse {
-    #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
-    pub item: Option<AttributeMap>,
+    #[serde(
+        rename = "Item",
+        skip_serializing_if = "Option::is_none",
+        default,
+        with = "crate::wire_item::dynamo_json::optional"
+    )]
+    #[schema(value_type = Option<AttributeMap>)]
+    pub item: Option<WireItem>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields, rename_all = "PascalCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
+#[serde(rename_all = "PascalCase")]
 pub struct DeleteItemRequest {
     pub table_name: TableName,
 
     pub key: KeyAttributes,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[builder(default)]
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    #[builder(default)]
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub expected: Option<HashMap<String, ExpectedAttributeValue>>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub conditional_operator: Option<ConditionalOperator>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_values: Option<AllOld>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    #[builder(default)]
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_item_collection_metrics: Option<String>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
     pub return_values_on_condition_check_failure: Option<String>,
 
     /// Aux-storage extension: item stream retention duration in hours.
@@ -219,6 +249,7 @@ pub struct DeleteItemRequest {
         rename = "AuxItemStreamTtlHours",
         skip_serializing_if = "Option::is_none"
     )]
+    #[builder(default)]
     pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
@@ -240,36 +271,6 @@ impl DeleteItemRequest {
             aux_item_stream_ttl_hours: None,
         }
     }
-
-    #[must_use]
-    pub fn with_condition_expression(mut self, condition_expression: Option<String>) -> Self {
-        self.condition_expression = condition_expression;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_names(
-        mut self,
-        expression_attribute_names: Option<HashMap<String, String>>,
-    ) -> Self {
-        self.expression_attribute_names = expression_attribute_names;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expression_attribute_values(
-        mut self,
-        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    ) -> Self {
-        self.expression_attribute_values = expression_attribute_values;
-        self
-    }
-
-    #[must_use]
-    pub fn with_return_values(mut self, return_values: Option<AllOld>) -> Self {
-        self.return_values = return_values;
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -279,13 +280,14 @@ pub struct DeleteItemResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, TypedBuilder)]
-#[serde(deny_unknown_fields, rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
 pub struct UpdateItemRequest {
     pub table_name: TableName,
     #[builder(setter(into))]
     pub key: KeyAttributes,
-    /// Aux-storage extension: omitted preserves, present replaces, and an empty
-    /// list clears.
+    /// Names total at most 1,024 UTF-8 bytes per item, including absent
+    /// attributes. Aux-storage extension: omitted preserves, present
+    /// replaces, and an empty list clears.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub indexers: Option<Vec<String>>,
@@ -304,11 +306,12 @@ pub struct UpdateItemRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,7 +330,7 @@ pub struct UpdateItemRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]

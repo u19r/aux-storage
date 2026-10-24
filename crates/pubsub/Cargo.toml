@@ -1,5 +1,7 @@
 [package]
+rust-version.workspace = true
 publish = false
+autotests = false
 edition = "2024"
 license.workspace = true
 name = "pubsub"
@@ -11,43 +13,34 @@ doctest = false
 [[bin]]
 name = "pubsub"
 path = "src/main/mod.rs"
+required-features = ["server"]
 
 [features]
 default = ["sqlite", "server"]
 server = ["dep:axum", "dep:clap", "dep:tracing-subscriber", "dep:uuid"]
-sqlite = ["dep:sql", "sql/sqlite-backend", "queue/sqlite", "stream/sqlite"]
-turso = [
-    "dep:sql",
-    "sql/sqlite-backend",
-    "sql/turso-backend",
-    "queue/turso",
-    "stream/turso",
-]
-postgres = ["dep:sql", "sql/postgres-backend", "queue/postgres", "stream/postgres"]
-rocksdb = ["dep:kv", "kv/rocksdb-backend", "queue/rocksdb", "stream/rocksdb"]
-foundationdb = [
-    "dep:kv",
-    "kv/foundationdb-backend",
-    "queue/foundationdb",
-    "stream/foundationdb",
-]
+sqlite = ["dep:sql-backend", "sql-backend/sqlite", "queue/sqlite"]
+turso = ["dep:sql-backend", "sql-backend/turso", "queue/turso"]
+postgres = ["dep:sql-backend", "sql-backend/postgres", "queue/postgres"]
+rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "queue/rocksdb"]
+foundationdb = ["dep:kv-backend", "kv-backend/foundationdb", "queue/foundationdb"]
 
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 config = { path = "../config" }
+futures-util = { workspace = true }
 http-error = { path = "../http-error" }
 http-request = { workspace = true }
-kv = { path = "../kv", optional = true, default-features = false }
+kv-backend = { path = "../kv-backend", optional = true, default-features = false }
+metrics-facade = { workspace = true }
 pubsub-provider = { path = "../pubsub-provider" }
 queue = { path = "../queue", default-features = false }
 queue-provider = { path = "../queue-provider" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sql = { path = "../sql", optional = true, default-features = false }
+sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-types = { path = "../storage-types" }
-stream = { path = "../stream", default-features = false }
 stream-provider = { path = "../stream-provider" }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -56,8 +49,13 @@ url = { workspace = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+alloc-counter = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sns = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "aws_parity_tests"
+path = "tests/aws_parity_tests/mod.rs"

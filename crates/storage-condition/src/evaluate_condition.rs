@@ -1,28 +1,34 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
-use storage_types::AttributeValue;
+use smallvec::SmallVec;
+use storage_types::{
+    AttributeValue, AttributeValueLookup, IndexedWireItem, StorageResult, WireItem,
+    compare_dynamodb_numbers,
+};
 
-use crate::{Condition, SizeComparison, helpers::str_to_f64};
+use crate::{Condition, SizeComparison};
 
 #[must_use]
 pub fn evaluate_condition_bytes(item: Option<&[u8]>, condition: &Condition) -> bool {
-    let item: HashMap<String, AttributeValue> = item
-        .and_then(|c| storage_types::storage_serde::from_bytes(c).ok())
-        .unwrap_or_default();
-    evaluate_condition(&item, condition)
+    let item = match item.map(storage_types::storage_serde::decompress_bytes) {
+        Some(Ok(data)) => Some(WireItem::dynamo_json(data)),
+        Some(Err(_)) | None => None,
+    };
+    evaluate_wire_condition(item.as_ref(), condition).unwrap_or(false)
 }
 
 #[must_use]
 #[expect(clippy::too_many_lines)]
-#[expect(clippy::implicit_hasher)]
-pub fn evaluate_condition(item: &HashMap<String, AttributeValue>, condition: &Condition) -> bool {
+pub fn evaluate_condition(item: &impl AttributeValueLookup, condition: &Condition) -> bool {
     match condition {
         Condition::Exists { field } => get_path_value(item, field).is_some(),
         Condition::NotExists { field } => get_path_value(item, field).is_none(),
         Condition::LessThan { field, value } => {
             if let Some(field_value) = get_path_value(item, field) {
                 match field_value {
-                    AttributeValue::N(n) => str_to_f64(n) < str_to_f64(value),
+                    AttributeValue::N(n) => {
+                        compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_lt)
+                    }
                     AttributeValue::S(s) => s < value,
                     AttributeValue::B(b) => b < value,
                     _ => false,
@@ -34,7 +40,9 @@ pub fn evaluate_condition(item: &HashMap<String, AttributeValue>, condition: &Co
         Condition::LessThanEqual { field, value } => {
             if let Some(field_value) = get_path_value(item, field) {
                 match field_value {
-                    AttributeValue::N(n) => str_to_f64(n) <= str_to_f64(value),
+                    AttributeValue::N(n) => {
+                        compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_le)
+                    }
                     AttributeValue::S(s) => s <= value,
                     AttributeValue::B(b) => b <= value,
                     _ => false,
@@ -46,7 +54,9 @@ pub fn evaluate_condition(item: &HashMap<String, AttributeValue>, condition: &Co
         Condition::GreaterThan { field, value } => {
             if let Some(field_value) = get_path_value(item, field) {
                 match field_value {
-                    AttributeValue::N(n) => str_to_f64(n) > str_to_f64(value),
+                    AttributeValue::N(n) => {
+                        compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_gt)
+                    }
                     AttributeValue::S(s) => s > value,
                     AttributeValue::B(b) => b > value,
                     _ => false,
@@ -58,7 +68,9 @@ pub fn evaluate_condition(item: &HashMap<String, AttributeValue>, condition: &Co
         Condition::GreaterThanEqual { field, value } => {
             if let Some(field_value) = get_path_value(item, field) {
                 match field_value {
-                    AttributeValue::N(n) => str_to_f64(n) >= str_to_f64(value),
+                    AttributeValue::N(n) => {
+                        compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_ge)
+                    }
                     AttributeValue::S(s) => s >= value,
                     AttributeValue::B(b) => b >= value,
                     _ => false,
@@ -86,10 +98,8 @@ pub fn evaluate_condition(item: &HashMap<String, AttributeValue>, condition: &Co
             if let Some(field_value) = get_path_value(item, field) {
                 match field_value {
                     AttributeValue::N(n) => {
-                        let min = str_to_f64(min);
-                        let max = str_to_f64(max);
-                        let val = str_to_f64(n);
-                        min <= val && val <= max
+                        compare_dynamodb_numbers(n, min).is_ok_and(Ordering::is_ge)
+                            && compare_dynamodb_numbers(n, max).is_ok_and(Ordering::is_le)
                     }
                     AttributeValue::S(s) => s >= min && s <= max,
                     AttributeValue::B(b) => b >= min && b <= max,
@@ -189,7 +199,9 @@ pub fn try_evaluate_condition_with_root<E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(&n) < str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(&n, value).is_ok_and(Ordering::is_lt)
+                }
                 AttributeValue::S(s) => &s < value,
                 AttributeValue::B(b) => &b < value,
                 _ => false,
@@ -200,7 +212,9 @@ pub fn try_evaluate_condition_with_root<E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(&n) <= str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(&n, value).is_ok_and(Ordering::is_le)
+                }
                 AttributeValue::S(s) => &s <= value,
                 AttributeValue::B(b) => &b <= value,
                 _ => false,
@@ -211,7 +225,9 @@ pub fn try_evaluate_condition_with_root<E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(&n) > str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(&n, value).is_ok_and(Ordering::is_gt)
+                }
                 AttributeValue::S(s) => &s > value,
                 AttributeValue::B(b) => &b > value,
                 _ => false,
@@ -222,7 +238,9 @@ pub fn try_evaluate_condition_with_root<E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(&n) >= str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(&n, value).is_ok_and(Ordering::is_ge)
+                }
                 AttributeValue::S(s) => &s >= value,
                 AttributeValue::B(b) => &b >= value,
                 _ => false,
@@ -246,10 +264,8 @@ pub fn try_evaluate_condition_with_root<E>(
             };
             Ok(match field_value {
                 AttributeValue::N(n) => {
-                    let min = str_to_f64(min);
-                    let max = str_to_f64(max);
-                    let val = str_to_f64(&n);
-                    min <= val && val <= max
+                    compare_dynamodb_numbers(&n, min).is_ok_and(Ordering::is_ge)
+                        && compare_dynamodb_numbers(&n, max).is_ok_and(Ordering::is_le)
                 }
                 AttributeValue::S(s) => &s >= min && &s <= max,
                 AttributeValue::B(b) => &b >= min && &b <= max,
@@ -354,6 +370,63 @@ pub fn try_evaluate_condition_with_cached_roots<E>(
     try_evaluate_condition_with_cached_roots_inner(condition, root_value, &mut cache)
 }
 
+pub fn evaluate_wire_condition(
+    item: Option<&WireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    let Some(item) = item else {
+        return Ok(evaluate_condition(
+            &SelectedConditionItem {
+                fields: &[],
+                values: &[],
+            },
+            condition,
+        ));
+    };
+    let mut fields = SmallVec::<[&str; 8]>::new();
+    collect_condition_roots(condition, &mut fields);
+    let values = item.select_attribute_values(&fields)?;
+    Ok(evaluate_condition(
+        &SelectedConditionItem {
+            fields: &fields,
+            values: &values,
+        },
+        condition,
+    ))
+}
+
+struct SelectedConditionItem<'a> {
+    fields: &'a [&'a str],
+    values: &'a [Option<AttributeValue>],
+}
+
+impl AttributeValueLookup for SelectedConditionItem<'_> {
+    fn attribute_count(&self) -> usize {
+        self.values.iter().filter(|value| value.is_some()).count()
+    }
+
+    fn get_attribute_value(&self, name: &str) -> Option<&AttributeValue> {
+        self.fields
+            .iter()
+            .zip(self.values)
+            .find_map(|(field, value)| (*field == name).then_some(value.as_ref()).flatten())
+    }
+}
+
+pub fn evaluate_indexed_wire_condition(
+    item: Option<&IndexedWireItem>,
+    condition: &Condition,
+) -> StorageResult<bool> {
+    let mut root_value = |field: &str| match item {
+        Some(item) => item.resolve_attribute(field),
+        None => Ok(None),
+    };
+    if condition_has_repeated_root_field(condition) {
+        return try_evaluate_condition_with_cached_roots(condition, &mut root_value);
+    }
+    try_evaluate_condition_with_root(condition, &mut root_value)
+}
+
 #[expect(clippy::too_many_lines)]
 fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
     condition: &'c Condition,
@@ -372,7 +445,9 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(n) < str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_lt)
+                }
                 AttributeValue::S(s) => s < value,
                 AttributeValue::B(b) => b < value,
                 _ => false,
@@ -383,7 +458,9 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(n) <= str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_le)
+                }
                 AttributeValue::S(s) => s <= value,
                 AttributeValue::B(b) => b <= value,
                 _ => false,
@@ -394,7 +471,9 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(n) > str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_gt)
+                }
                 AttributeValue::S(s) => s > value,
                 AttributeValue::B(b) => b > value,
                 _ => false,
@@ -405,7 +484,9 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
                 return Ok(false);
             };
             Ok(match field_value {
-                AttributeValue::N(n) => str_to_f64(n) >= str_to_f64(value),
+                AttributeValue::N(n) => {
+                    compare_dynamodb_numbers(n, value).is_ok_and(Ordering::is_ge)
+                }
                 AttributeValue::S(s) => s >= value,
                 AttributeValue::B(b) => b >= value,
                 _ => false,
@@ -429,10 +510,8 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
             };
             Ok(match field_value {
                 AttributeValue::N(n) => {
-                    let min = str_to_f64(min);
-                    let max = str_to_f64(max);
-                    let val = str_to_f64(n);
-                    min <= val && val <= max
+                    compare_dynamodb_numbers(n, min).is_ok_and(Ordering::is_ge)
+                        && compare_dynamodb_numbers(n, max).is_ok_and(Ordering::is_le)
                 }
                 AttributeValue::S(s) => s >= min && s <= max,
                 AttributeValue::B(b) => b >= min && b <= max,
@@ -585,6 +664,38 @@ fn record_root_field<'a>(
     false
 }
 
+fn collect_condition_roots<'a>(condition: &'a Condition, roots: &mut SmallVec<[&'a str; 8]>) {
+    match condition {
+        Condition::Exists { field }
+        | Condition::NotExists { field }
+        | Condition::LessThan { field, .. }
+        | Condition::LessThanEqual { field, .. }
+        | Condition::GreaterThan { field, .. }
+        | Condition::GreaterThanEqual { field, .. }
+        | Condition::Equal { field, .. }
+        | Condition::NotEqual { field, .. }
+        | Condition::Between { field, .. }
+        | Condition::In { field, .. }
+        | Condition::Contains { field, .. }
+        | Condition::BeginsWith { field, .. }
+        | Condition::AttributeType { field, .. }
+        | Condition::Size { field, .. }
+        | Condition::SizeCompare { field, .. } => {
+            let root = root_field(field);
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        Condition::And { conditions } | Condition::Or { conditions } => {
+            for condition in conditions {
+                collect_condition_roots(condition, roots);
+            }
+        }
+        Condition::Not { condition } => collect_condition_roots(condition, roots),
+        Condition::ValueEqual { .. } | Condition::ValueNotEqual { .. } => {}
+    }
+}
+
 fn root_field(path: &str) -> &str {
     let root_end = next_path_separator(path, 0).unwrap_or(path.len());
     path.get(..root_end).unwrap_or_default()
@@ -593,7 +704,7 @@ fn root_field(path: &str) -> &str {
 fn dynamodb_attribute_values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
     match (left, right) {
         (AttributeValue::N(left), AttributeValue::N(right)) => {
-            str_to_f64(left).total_cmp(&str_to_f64(right)).is_eq()
+            compare_dynamodb_numbers(left, right).is_ok_and(Ordering::is_eq)
         }
         (AttributeValue::SS(left), AttributeValue::SS(right))
         | (AttributeValue::NS(left), AttributeValue::NS(right))
@@ -658,12 +769,12 @@ fn decoded_binary_starts_with(value: &str, operand: &str) -> bool {
 }
 
 fn get_path_value<'a>(
-    item: &'a HashMap<String, AttributeValue>,
+    item: &'a impl AttributeValueLookup,
     path: &str,
 ) -> Option<&'a AttributeValue> {
     let mut cursor = 0usize;
     let root_end = next_path_separator(path, cursor).unwrap_or(path.len());
-    let mut current = item.get(path.get(cursor..root_end)?)?;
+    let mut current = item.get_attribute_value(path.get(cursor..root_end)?)?;
     cursor = root_end;
 
     while cursor < path.len() {
@@ -714,13 +825,13 @@ fn try_get_path_value<E>(
                 let Some(key) = path.get(cursor..end) else {
                     return Ok(None);
                 };
-                let AttributeValue::M(map) = current else {
+                let AttributeValue::M(mut map) = current else {
                     return Ok(None);
                 };
-                let Some(value) = map.get(key) else {
+                let Some(value) = map.remove(key) else {
                     return Ok(None);
                 };
-                current = value.clone();
+                current = value;
                 cursor = end;
             }
             Some(b'[') => {
@@ -738,10 +849,10 @@ fn try_get_path_value<E>(
                 let AttributeValue::L(list) = current else {
                     return Ok(None);
                 };
-                let Some(value) = list.get(index) else {
+                let Some(value) = list.into_iter().nth(index) else {
                     return Ok(None);
                 };
-                current = value.clone();
+                current = value;
                 cursor = end + 1;
             }
             _ => return Ok(None),

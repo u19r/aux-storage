@@ -19,20 +19,50 @@ impl ExclusiveStartKey {
         match self {
             Self::Token(token) => Ok(token.clone()),
             Self::Key(key) => {
+                let schema_error = || {
+                    StorageError::validation("The provided key element does not match the schema")
+                };
+                let index_schema = index_name
+                    .map(|name| {
+                        table_info
+                            .global_secondary_indexes
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .find(|index| index.index_name == *name)
+                            .map(|index| index.key_schema.as_slice())
+                            .ok_or_else(schema_error)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let schema = || table_info.key_schema.iter().chain(index_schema);
+                if key
+                    .iter()
+                    .any(|(name, _)| !schema().any(|element| element.attribute_name == name))
+                {
+                    return Err(schema_error());
+                }
+                for element in schema() {
+                    let value = key.get(&element.attribute_name).ok_or_else(schema_error)?;
+                    let definition = table_info
+                        .attribute_definitions
+                        .iter()
+                        .find(|definition| definition.attribute_name == element.attribute_name)
+                        .ok_or_else(schema_error)?;
+                    if !value.matches_key_type(&definition.attribute_type) {
+                        return Err(schema_error());
+                    }
+                    crate::validate_key_attribute_value_for_schema(element, value)?;
+                }
                 let item_key = if let Some(index_name) = index_name {
-                    let index_key_schema = table_info
-                        .global_secondary_indexes
-                        .as_ref()
-                        .and_then(|indexes| indexes.iter().find(|i| i.index_name == *index_name))
-                        .map_or(&table_info.key_schema, |idx| &idx.key_schema);
                     ItemKey::from_key_schema_for_index(
                         table_info.table_name.clone(),
                         &table_info.key_schema,
                         index_name,
-                        index_key_schema,
+                        index_schema,
                         key,
                     )?
-                    .ok_or_else(StorageError::invalid_or_missing_key)?
+                    .ok_or_else(schema_error)?
                 } else {
                     ItemKey::from_key_schema(
                         table_info.table_name.clone(),

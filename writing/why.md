@@ -52,7 +52,7 @@ Offering SQLite, in-memory storage, and DynamoDB not only as an API but also as 
 
 Developers will continue costing more than hardware.
 
-Most developers do not know how to design applications around DynamoDB, and many will never need to. But there is a small group who do, who enjoy the model, and who can be productive with it. For that group, a more accessible version of DynamoDB may let them spend minimally more time on operations and and build much faster.
+Most developers do not know how to design applications around DynamoDB, and many will never need to. But there is a small group who do, who enjoy the model, and who can be productive with it. For that group, a more accessible version of DynamoDB may let them spend minimally more time on operations and build much faster.
 
 The DynamoDB API can be extended with new index types to solve common query pattern frustrations. When self-hosted, these index types can be affordable while still keeping compute and memory costs bounded.
 
@@ -60,7 +60,7 @@ DynamoDB ETL is an under-explored area in open source. Unlocking easy ETL will m
 
 For a developer experienced with DynamoDB, a product that offers the same API for SQLite, Postgres, and FoundationDB may provide a clean roadmap. If the developer needs stronger HA at small scale, it should be possible to offer that capability with modest operational burden if they accept a latency tradeoff.
 
-In some workloads, a much smaller self-hosted FoundationDB deployment could replace a much larger DynamoDB bill. The exact ratio depends on workload shape, team skill, and operational tolerance. Testing so far shows a reasonable comparison is $1,000 of self-hosted DynamoDB spend runs the same workloads as $15,000 to $40,000 of AWS DynamoDB.
+In some workloads, a much smaller self-hosted FoundationDB deployment could replace a much larger DynamoDB bill. The exact ratio depends on workload shape, team skill, and operational tolerance. Compare the complete cost of equivalent workloads, including database operations and the team responsible for running them.
 
 There are some features or needs that don't need to be met. The entire DynamoDB API does not need to be implemented byte-for-byte. Infinite scaling can be dropped. Multi-tenancy and security can be handled in different layers.
 

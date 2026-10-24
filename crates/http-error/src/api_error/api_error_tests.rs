@@ -189,7 +189,7 @@ fn admission_rejection_maps_to_503_with_retry_hint() {
     assert_eq!(handler.status_code, 503);
     assert_eq!(
         handler.error_type,
-        "com.amazonaws.dynamodb.v20120810#ServiceUnavailableException"
+        "com.amazonaws.dynamodb.v20120810#ServiceUnavailable"
     );
     assert_eq!(
         handler
@@ -208,6 +208,7 @@ fn admission_rejection_maps_to_503_with_retry_hint() {
 #[test]
 fn storage_validation_adds_dynamodb_prefix_for_update_expression_messages() {
     let storage_err: StorageError = StorageEnum::Validation {
+        kind: storage_types::StorageValidationKind::Message,
         message: "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"SET\""
             .to_string(),
     }

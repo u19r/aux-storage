@@ -19,8 +19,8 @@ fn expression_heavy_condition_parser_avoids_keyword_and_placeholder_reallocation
     let baseline = measure_legacy_condition_parse(expression, &names, &values);
     let optimized = measure_current_condition_parse(expression, &names, &values);
 
-    alloc_counter::emit_report(&baseline);
-    alloc_counter::emit_report(&optimized);
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&optimized);
 
     assert!(
         optimized.allocation_count < baseline.allocation_count,
@@ -36,6 +36,24 @@ fn expression_heavy_condition_parser_avoids_keyword_and_placeholder_reallocation
         baseline.allocated_bytes,
         optimized.allocated_bytes
     );
+}
+
+#[test]
+#[ignore = "manual allocation comparison for ASTRA-016"]
+fn given_owned_parser_operands_when_parsing_then_report_astra_016_allocations() {
+    let names = HashMap::from([
+        ("#root".to_string(), "root".to_string()),
+        ("#child".to_string(), "child".to_string()),
+    ]);
+    let values = HashMap::from([
+        (":left".to_string(), AttributeValue::S("left".repeat(1024))),
+        (":lower".to_string(), AttributeValue::N("2".to_string())),
+        (":upper".to_string(), AttributeValue::N("8".to_string())),
+    ]);
+    let expression = "#root.#child[2].leaf = \"葉葉葉\" AND (:left) < #root.#child[2].leaf AND \
+                      #root.#child[2].leaf BETWEEN :lower AND :upper";
+    let report = measure_current_condition_parse(expression, &names, &values);
+    let _ = alloc_counter::emit_report(&report);
 }
 
 fn measure_current_condition_parse(

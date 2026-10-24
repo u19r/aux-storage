@@ -1,0 +1,8 @@
+pub const AUDIT_SCHEMA_VERSION: u8 = 2;
+pub const LOGICAL_PROFILE_ITEMS: usize = 512;
+pub const LOGICAL_PROFILE_BATCH: usize = 25;
+pub const LOGICAL_PROFILE_INDEXES: usize = 3;
+pub const LOGICAL_PROFILE_PAYLOAD_BYTES: usize = 1_100;
+pub const PROFILE_PAYLOAD_BYTES: [usize; 3] = [800, 1_150, 1_500];
+pub const POSTGRES_PROFILE_ENVIRONMENT: [&str; 2] = ["TEST_POSTGRES_DSN", "CUCUMBER_POSTGRES_DSN"];
+pub const VISIBLE_ATTRIBUTES: usize = 10;

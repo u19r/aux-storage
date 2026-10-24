@@ -6,6 +6,8 @@ use core::str::FromStr;
 
 use rust_decimal::prelude::*;
 
+use crate::constants::NUMERIC_HEX;
+
 /// Binary encoding for Decimal values with variable length encoding that
 /// preserves lexicographic sort order
 pub trait SortableVec {
@@ -60,7 +62,8 @@ impl SortableVec for Decimal {
     fn encode(&self) -> Vec<u8> {
         let decimal = self;
         if decimal.is_zero() {
-            // Special case for zero - use a value between negative and positive numbers
+            // Special case for zero - use a value between negative and positive
+            // numbers
             return vec![0b0000_1111]; // 15 - sorts between negatives (0-14) and positives (16+)
         }
 
@@ -80,7 +83,8 @@ impl SortableVec for Decimal {
         let magnitude = calculate_magnitude(abs_decimal);
         let scale_index = magnitude_to_scale_index(magnitude);
 
-        // Create a normalized value for sorting: multiply to get a large integer
+        // Create a normalized value for sorting: multiply to get a large
+        // integer
         let normalized_value = create_normalized_value(abs_decimal, scale_index);
         let normalized_bytes = encode_normalized_value(normalized_value);
 
@@ -88,15 +92,16 @@ impl SortableVec for Decimal {
         let scale_bytes = encode_scale(scale);
         let mantissa_bytes = encode_significand(mantissa_u64);
 
-        // Create the header byte: reserved(4) + scale_index(4) using least significant
-        // bits This ensures all decimal numbers sort before UTF-8 characters
-        // (which start at 65+)
+        // Create the header byte: reserved(4) + scale_index(4) using least
+        // significant bits This ensures all decimal numbers sort before UTF-8
+        // characters (which start at 65+)
         let mut result = Vec::with_capacity(
             1 + normalized_bytes.len() + scale_bytes.len() + mantissa_bytes.len(),
         );
 
         if is_positive {
-            // For positive numbers: use scale_index directly in least significant bits
+            // For positive numbers: use scale_index directly in least
+            // significant bits
 
             let header = 0b0001_0000 | (scale_index as u8); // 0001SSSS format
             result.push(header);
@@ -104,7 +109,8 @@ impl SortableVec for Decimal {
             result.extend_from_slice(&scale_bytes);
             result.extend_from_slice(&mantissa_bytes);
         } else {
-            // For negative numbers: use inverted scale index to preserve sort order
+            // For negative numbers: use inverted scale index to preserve sort
+            // order
             let inverted_scale = 15 - scale_index;
 
             let header = inverted_scale as u8; // 0000SSSS format (no high bits set)
@@ -188,44 +194,32 @@ static SCALING_FACTORS: [i32; 16] = [
 ];
 
 /// Calculate the order of magnitude for scale index selection
-fn calculate_magnitude(decimal: Decimal) -> i32 {
+pub(crate) fn calculate_magnitude(decimal: Decimal) -> i32 {
     if decimal.is_zero() {
         return 0;
     }
 
-    // Use string representation to calculate magnitude
-    let str_repr = decimal.abs().to_string();
-    let decimal_pos = str_repr.find('.').unwrap_or(str_repr.len());
-
-    // Count digits before decimal point
-
-    let integer_part = &str_repr[..decimal_pos];
-    let non_zero_digits = integer_part.trim_start_matches('0');
-
-    if non_zero_digits.is_empty() {
-        // Number is less than 1, need to count leading zeros after decimal
-        if let Some(decimal_idx) = str_repr.find('.') {
-            let fractional_part = &str_repr[decimal_idx + 1..];
-            let leading_zeros =
-                fractional_part.len() - fractional_part.trim_start_matches('0').len();
-
-            -(leading_zeros as i32 + 1)
-        } else {
-            0
-        }
-    } else {
-        (non_zero_digits.len() as i32) - 1
+    // Decimal stores the integer mantissa and decimal scale directly.  The
+    // first significant digit therefore has base-10 exponent
+    // `mantissa_digits - scale - 1`; counting digits avoids formatting a
+    // temporary String on every key encode.
+    let mut mantissa = decimal.mantissa().unsigned_abs();
+    let mut mantissa_digits = 1i32;
+    while mantissa >= 10 {
+        mantissa /= 10;
+        mantissa_digits += 1;
     }
+    mantissa_digits - decimal.scale() as i32 - 1
 }
 
 /// Create a normalized integer value for sorting within the same magnitude
 /// class
 fn create_normalized_value(decimal: Decimal, _scale_index: usize) -> u64 {
-    // Multiply by a large factor to create an integer representation that preserves
-    // ordering
+    // Multiply by a large factor to create an integer representation that
+    // preserves ordering
 
-    // Use a smaller normalization factor to avoid overflow while still preserving
-    // precision
+    // Use a smaller normalization factor to avoid overflow while still
+    // preserving precision
     let normalization_factor = Decimal::new(1_000_000i64, 0); // 10^6
 
     // Handle multiplication overflow gracefully
@@ -241,8 +235,8 @@ fn create_normalized_value(decimal: Decimal, _scale_index: usize) -> u64 {
 /// Encode normalized value using fixed-length encoding for proper negative
 /// number sorting
 fn encode_normalized_value(value: u64) -> Vec<u8> {
-    // Use fixed 8-byte big-endian encoding to ensure proper lexicographic sorting
-    // when bytes are inverted for negative numbers
+    // Use fixed 8-byte big-endian encoding to ensure proper lexicographic
+    // sorting when bytes are inverted for negative numbers
     value.to_be_bytes().to_vec()
 }
 
@@ -385,11 +379,10 @@ impl From<rust_decimal::Error> for DecimalEncodingError {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        out.push(NUMERIC_HEX[(b >> 4) as usize] as char);
+        out.push(NUMERIC_HEX[(b & 0x0f) as usize] as char);
     }
     out
 }

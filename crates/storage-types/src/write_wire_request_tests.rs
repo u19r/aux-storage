@@ -15,7 +15,7 @@ fn sample_wire_item() -> WireItem {
             AttributeValue::S("FIXTURE".to_string()),
         ),
     ]);
-    WireItem::from_attribute_map(&item).expect("wire item")
+    WireItem::try_from(&item).unwrap()
 }
 
 fn transaction_with_25_four_kib_items() -> TransactWriteItemsEncodeRequest {
@@ -69,8 +69,8 @@ fn owned_transaction_retry_handoff_avoids_payload_clones_tests() {
     }
     let owned = owned_guard.finish();
 
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&owned);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&owned);
     assert!(legacy.allocated_bytes >= 3 * 25 * 4 * 1024);
     assert_eq!(owned.allocation_count, 0);
     assert_eq!(owned.allocated_bytes, 0);
@@ -101,33 +101,35 @@ fn batch_write_item_encode_request_converts_put_item_tests() {
         )]))
         .build();
 
-    let mapped = crate::BatchWriteItemRequest::try_from(request).expect("mapped request");
-    let writes = mapped
-        .request_items
-        .get(&table)
-        .expect("table write requests");
+    let mapped = crate::BatchWriteItemRequest::try_from(request).unwrap();
+    let writes = mapped.request_items.get(&table).unwrap();
     assert_eq!(writes.len(), 1);
-    let put = writes[0].put_request.as_ref().expect("put request");
-    assert!(matches!(put.item.get("pk"), Some(AttributeValue::S(v)) if v == "P#1"));
-    assert!(matches!(put.item.get("sk"), Some(AttributeValue::S(v)) if v == "S#1"));
+    let put = writes[0].put_request.as_ref().unwrap();
+    assert!(
+        matches!(put.item.attribute_value("pk").unwrap(), Some(AttributeValue::S(v)) if v == "P#1")
+    );
+    assert!(
+        matches!(put.item.attribute_value("sk").unwrap(), Some(AttributeValue::S(v)) if v == "S#1")
+    );
 }
 
 #[test]
 fn batch_write_item_request_converts_put_item_to_encode_tests() {
     let table = TableName::new("encode_batch_table");
     let request = BatchWriteItemRequest {
-        request_items: HashMap::from([(
+        request_items: crate::VecMap::from_iter([(
             table.clone(),
             vec![WriteRequest {
                 put_request: Some(PutRequest {
-                    item: HashMap::from([
+                    item: WireItem::try_from(&HashMap::from([
                         ("pk".to_string(), AttributeValue::S("P#1".to_string())),
                         ("sk".to_string(), AttributeValue::S("S#1".to_string())),
                         (
                             "entity_type".to_string(),
                             AttributeValue::S("FIXTURE".to_string()),
                         ),
-                    ]),
+                    ]))
+                    .unwrap(),
                     indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
@@ -138,19 +140,16 @@ fn batch_write_item_request_converts_put_item_to_encode_tests() {
         return_item_collection_metrics: None,
     };
 
-    let mapped = BatchWriteItemEncodeRequest::try_from(request).expect("mapped request");
-    let writes = mapped
-        .request_items
-        .get(&table)
-        .expect("table write requests");
+    let mapped = BatchWriteItemEncodeRequest::try_from(request).unwrap();
+    let writes = mapped.request_items.get(&table).unwrap();
     assert_eq!(writes.len(), 1);
-    let put = writes[0].put_request.as_ref().expect("put request");
+    let put = writes[0].put_request.as_ref().unwrap();
     assert_eq!(
-        put.item.item().attribute_value("pk").expect("pk lookup"),
+        put.item.item().attribute_value("pk").unwrap(),
         Some(AttributeValue::S("P#1".to_string()))
     );
     assert_eq!(
-        put.item.item().attribute_value("sk").expect("sk lookup"),
+        put.item.item().attribute_value("sk").unwrap(),
         Some(AttributeValue::S("S#1".to_string()))
     );
 }
@@ -173,13 +172,12 @@ fn transact_write_items_encode_request_converts_put_item_tests() {
         .client_request_token("tok-1")
         .build();
 
-    let mapped = crate::TransactWriteItemsRequest::try_from(request).expect("mapped request");
+    let mapped = crate::TransactWriteItemsRequest::try_from(request).unwrap();
     assert_eq!(mapped.transact_items.len(), 1);
-    let put = mapped.transact_items[0]
-        .put
-        .as_ref()
-        .expect("mapped transact put");
-    assert!(matches!(put.item.get("pk"), Some(AttributeValue::S(v)) if v == "P#1"));
+    let put = mapped.transact_items[0].put.as_ref().unwrap();
+    assert!(
+        matches!(put.item.attribute_value("pk").unwrap(), Some(AttributeValue::S(v)) if v == "P#1")
+    );
     assert_eq!(
         put.condition_expression.as_deref(),
         Some("attribute_not_exists(pk)")

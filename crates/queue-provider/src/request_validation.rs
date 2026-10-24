@@ -15,7 +15,7 @@ use crate::{
         ChangeMessageVisibilityRequest, CreateQueueRequest, DeleteMessageBatchRequest,
         DeleteMessageBatchRequestEntry, DeleteMessageRequest, DeleteQueueRequest,
         GetQueueAttributesRequest, GetQueueUrlRequest, ListQueuesRequest, MessageAttributeValue,
-        PurgeQueueRequest, Queue, ReceiveMessageRequest, SendMessageBatchRequest,
+        PurgeQueueRequest, Queue, QueueMessage, ReceiveMessageRequest, SendMessageBatchRequest,
         SendMessageBatchRequestEntry, SendMessageRequest, SetQueueAttributesRequest,
     },
 };
@@ -93,6 +93,17 @@ impl QueueRequestValidation for SendMessageRequest {
         }
         if let Some(message_attributes) = self.message_attributes.as_ref() {
             queue_validation(validate_message_attributes(message_attributes))?;
+        }
+        Ok(())
+    }
+}
+
+impl QueueMessage {
+    /// Reuse public send validation for already captured message content.
+    pub fn validate_for_send(&self) -> QueueResult<()> {
+        queue_validation(validate_message_body(&self.body))?;
+        if let Some(attributes) = &self.message_attributes {
+            queue_validation(validate_message_attributes(attributes))?;
         }
         Ok(())
     }

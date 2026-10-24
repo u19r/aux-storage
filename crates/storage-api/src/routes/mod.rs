@@ -1,6 +1,9 @@
 pub mod dynamodb;
 mod dynamodb_metrics;
+#[cfg(any(test, feature = "internal-test-routes"))]
 pub mod internal;
+#[cfg(any(feature = "queue", feature = "pubsub"))]
+mod messaging_admission;
 pub mod pubsub;
 pub mod queue;
 
@@ -15,6 +18,18 @@ mod create_table_tests;
 
 #[cfg(test)]
 mod batch_get_item_tests;
+#[cfg(test)]
+mod batch_get_response_tests;
+
+#[cfg(test)]
+mod range_response_tests;
+#[cfg(test)]
+mod write_extraction_tests;
+#[cfg(test)]
+mod write_path_tests;
+
+#[cfg(test)]
+mod batch_get_item_perf_tests;
 
 #[cfg(test)]
 mod read_sequence_tests;
@@ -47,13 +62,7 @@ mod update_item_tests;
 mod update_table_tests;
 
 #[cfg(test)]
-pub mod routes_support_tests;
-
-#[cfg(test)]
-pub mod routes_test_support;
-
-#[cfg(test)]
-mod dynamodb_tests;
+pub mod routes_tests;
 
 #[cfg(test)]
 mod dynamodb_stage_tests;
@@ -62,4 +71,4 @@ mod dynamodb_stage_tests;
 mod internal_tests;
 
 #[cfg(test)]
-mod sync_internal_tests;
+mod system_stream_scope_tests;

@@ -1,5 +1,5 @@
 use super::gsi_lag::{
-    GSI_LAG_CRITICAL_LIMIT_MS, GSI_LAG_HARD_LIMIT_MS, GSI_LAG_SOFT_LIMIT_MS,
+    GSI_LAG_CRITICAL_LIMIT_MS, GSI_LAG_HARD_LIMIT_MS, GSI_LAG_SOFT_LIMIT_MS, GsiLagPolicy,
     GsiPropagationGovernor, GsiWritePressure,
 };
 
@@ -50,4 +50,20 @@ fn given_caught_up_observation_when_checking_target_then_lag_is_reset() {
 
     assert!(!governor.lag_above_target());
     assert_eq!(governor.write_pressure(2_000), GsiWritePressure::Allow);
+}
+
+#[test]
+fn given_hard_lag_when_time_advances_then_pressure_decision_stays_non_allow() {
+    let governor = GsiPropagationGovernor::new(GsiLagPolicy {
+        target_ms: 1,
+        soft_limit_ms: 2,
+        hard_limit_ms: 3,
+        critical_limit_ms: 4,
+    });
+    governor.observe_lag(3, 10);
+
+    assert!(matches!(
+        governor.write_pressure(10_000),
+        GsiWritePressure::Delay(_) | GsiWritePressure::Throttle
+    ));
 }

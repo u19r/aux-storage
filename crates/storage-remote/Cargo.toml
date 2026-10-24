@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "storage-remote"
 version = "0.1.0"
@@ -11,25 +12,33 @@ doctest = false
 [dependencies]
 async-trait = { workspace = true }
 aws-sigv4-signing = { workspace = true }
+base64 = { workspace = true }
+bg-job-store = { path = "../bg-job-store" }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 http = { workspace = true }
 http-request = { workspace = true }
 httpdate = { workspace = true }
 metrics = { workspace = true }
 metrics-facade = { workspace = true }
 rand = { workspace = true }
+scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+storage-common = { path = "../storage-common" }
 storage-provider = { path = "../storage-provider" }
-storage-sync = { path = "../storage-sync" }
 storage-types = { path = "../storage-types" }
 stream = { path = "../stream", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+alloc-counter = { workspace = true }
 httpmock = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio = { workspace = true, features = ["macros"] }
+storage-observability-test-support = { path = "../storage-observability-test-support" }
+tokio = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

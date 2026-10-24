@@ -1,0 +1,50 @@
+[package]
+rust-version.workspace = true
+publish = false
+edition = "2024"
+license.workspace = true
+name = "kv-backend"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = []
+fault-injection = ["dep:tracing"]
+foundationdb = ["dep:foundationdb"]
+simulation = ["foundationdb"]
+test-support = []
+rocksdb = ["dep:rocksdb"]
+
+[dependencies]
+async-trait = { workspace = true }
+bg-job-store = { path = "../bg-job-store" }
+bytes = { workspace = true }
+foundationdb = { workspace = true, optional = true }
+foundationdb-tuple = { workspace = true }
+futures = { workspace = true }
+infrastructure-provider = { workspace = true }
+metrics-facade = { workspace = true }
+pubsub-provider = { path = "../pubsub-provider" }
+queue-provider = { path = "../queue-provider" }
+rocksdb = { workspace = true, optional = true }
+scheduled-bg-jobs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common" }
+storage-condition = { path = "../storage-condition" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { path = "../storage-types", default-features = false, features = ["rocksdb"] }
+stream-provider = { path = "../stream-provider" }
+tokio = { workspace = true }
+tracing = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

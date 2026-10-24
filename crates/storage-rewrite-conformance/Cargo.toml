@@ -1,0 +1,61 @@
+[package]
+rust-version.workspace = true
+publish = false
+edition = "2024"
+license.workspace = true
+name = "storage-rewrite-conformance"
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:sql-backend", "sql-backend/sqlite", "sql-backend/fault-injection"]
+turso = ["dep:sql-backend", "sql-backend/turso", "sql-backend/fault-injection"]
+rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "kv-backend/fault-injection"]
+postgres = [
+    "dep:sql-backend",
+    "dep:tokio-postgres",
+    "sql-backend/postgres",
+    "sql-backend/fault-injection",
+]
+foundationdb = [
+    "dep:kv-backend",
+    "kv-backend/foundationdb",
+    "kv-backend/test-support",
+    "kv-backend/fault-injection",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bg-job-store = { path = "../bg-job-store" }
+futures = { workspace = true }
+http-error = { path = "../http-error" }
+kv-backend = { path = "../kv-backend", optional = true, default-features = false }
+metrics-facade = { workspace = true }
+pubsub = { path = "../pubsub", default-features = false }
+pubsub-provider = { path = "../pubsub-provider" }
+queue = { path = "../queue", default-features = false }
+queue-provider = { path = "../queue-provider" }
+scheduled-bg-jobs = { workspace = true }
+scheduled-bg-jobs-conformance = { workspace = true }
+serde_json = { workspace = true }
+sql-backend = { path = "../sql-backend", optional = true, default-features = false }
+storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common" }
+storage-observability-test-support = { path = "../storage-observability-test-support" }
+storage-provider = { path = "../storage-provider" }
+storage-types = { path = "../storage-types" }
+stream-provider = { path = "../stream-provider" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true, optional = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

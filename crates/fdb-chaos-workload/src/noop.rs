@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*};
+use crate::{common::*, constants::*, imports::*};
 
 pub(crate) struct NoopWorkload {
     name: String,

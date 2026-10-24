@@ -9,14 +9,14 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::{
-    dynamodb_binary::SENTINEL_KEY,
-    single_table_entity::{
+    constants::{
         CREATED_AT_ALIAS_ATTR, CREATED_AT_ATTR, EXPIRES_AT_ALIAS_ATTR, EXPIRES_AT_ATTR,
         UPDATED_AT_ALIAS_ATTR, UPDATED_AT_ATTR,
     },
+    dynamodb_binary::SENTINEL_KEY,
 };
 
-#[derive(Debug, Clone, ToSchema, PartialEq)]
+#[derive(Debug, Clone, ToSchema, PartialEq, Eq)]
 #[schema(no_recursion)]
 pub enum AttributeValue {
     S(String),
@@ -28,10 +28,21 @@ pub enum AttributeValue {
     BOOL(bool),
     NULL(bool),
     L(Vec<AttributeValue>),
+    // TODO: compare nested-map allocation costs with AttributeMap using
+    // equal-work benchmarks.
     M(HashMap<String, AttributeValue>),
 }
 
 impl AttributeValue {
+    pub fn matches_key_type(&self, expected: &crate::KeyAttributeType) -> bool {
+        matches!(
+            (self, expected),
+            (Self::S(_), crate::KeyAttributeType::S)
+                | (Self::N(_), crate::KeyAttributeType::N)
+                | (Self::B(_), crate::KeyAttributeType::B)
+        )
+    }
+
     pub fn inner_str(&self) -> Result<&str, ConversionError> {
         use AttributeValue as AV;
         match self {
@@ -55,7 +66,7 @@ impl AttributeValue {
         }
     }
 
-    fn variant_name(&self) -> &'static str {
+    pub(crate) fn variant_name(&self) -> &'static str {
         match self {
             AttributeValue::S(_) => "S",
             AttributeValue::N(_) => "N",
@@ -89,13 +100,28 @@ pub fn canonical_dynamo_json(value: &AttributeValue) -> Result<String, Conversio
 pub fn canonical_dynamo_map_json(
     map: &HashMap<String, AttributeValue>,
 ) -> Result<String, ConversionError> {
-    let ordered = map
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    serde_json::to_string(&ordered).map_err(|err| ConversionError::Serialization(err.to_string()))
+    serde_json::to_string(&CanonicalDynamoMap(map))
+        .map_err(|err| ConversionError::Serialization(err.to_string()))
 }
 
+struct CanonicalDynamoMap<'a>(&'a HashMap<String, AttributeValue>);
+
+impl Serialize for CanonicalDynamoMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        let mut entries = self.0.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(left, _)| *left);
+
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (name, value) in entries {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+// TODO: measure serialization allocations and CPU in complete provider
+// responses.
 impl Serialize for AttributeValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
@@ -112,7 +138,8 @@ impl Serialize for AttributeValue {
             AttributeValue::BOOL(value) => map.serialize_entry("BOOL", value)?,
             AttributeValue::NULL(value) => map.serialize_entry("NULL", value)?,
             AttributeValue::L(value) => map.serialize_entry("L", value)?,
-            AttributeValue::M(value) => map.serialize_entry("M", value)?,
+            // Nested maps also participate in deterministic stream digests.
+            AttributeValue::M(value) => map.serialize_entry("M", &CanonicalDynamoMap(value))?,
         }
         map.end()
     }
@@ -137,24 +164,7 @@ impl<'de> Deserialize<'de> for AttributeValue {
             fn visit_map<M>(self, mut map: M) -> Result<AttributeValue, M::Error>
             where M: MapAccess<'de> {
                 if let Some(key) = map.next_key::<String>()? {
-                    let value = match key.as_str() {
-                        "S" => AttributeValue::S(map.next_value()?),
-                        "N" => AttributeValue::N(map.next_value()?),
-                        "B" => AttributeValue::B(map.next_value()?),
-                        "SS" => AttributeValue::SS(map.next_value()?),
-                        "NS" => AttributeValue::NS(map.next_value()?),
-                        "BS" => AttributeValue::BS(map.next_value()?),
-                        "BOOL" => AttributeValue::BOOL(map.next_value()?),
-                        "NULL" => AttributeValue::NULL(map.next_value()?),
-                        "L" => AttributeValue::L(map.next_value()?),
-                        "M" => AttributeValue::M(map.next_value()?),
-                        _ => {
-                            return Err(serde::de::Error::unknown_field(
-                                &key,
-                                &["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"],
-                            ));
-                        }
-                    };
+                    let value = deserialize_tagged_attribute(&key, &mut map)?;
 
                     // Ensure there are no additional fields
                     if map.next_key::<String>()?.is_some() {
@@ -174,8 +184,47 @@ impl<'de> Deserialize<'de> for AttributeValue {
     }
 }
 
+pub(crate) fn deserialize_tagged_attribute<'de, M>(
+    tag: &str,
+    map: &mut M,
+) -> Result<AttributeValue, M::Error>
+where
+    M: serde::de::MapAccess<'de>,
+{
+    match tag {
+        "S" => Ok(AttributeValue::S(map.next_value()?)),
+        "N" => Ok(AttributeValue::N(map.next_value()?)),
+        "B" => Ok(AttributeValue::B(map.next_value()?)),
+        "BOOL" => Ok(AttributeValue::BOOL(map.next_value()?)),
+        "NULL" => Ok(AttributeValue::NULL(map.next_value()?)),
+        _ => deserialize_collection_attribute(tag, map),
+    }
+}
+
+fn deserialize_collection_attribute<'de, M>(
+    tag: &str,
+    map: &mut M,
+) -> Result<AttributeValue, M::Error>
+where
+    M: serde::de::MapAccess<'de>,
+{
+    match tag {
+        "SS" => Ok(AttributeValue::SS(map.next_value()?)),
+        "NS" => Ok(AttributeValue::NS(map.next_value()?)),
+        "BS" => Ok(AttributeValue::BS(map.next_value()?)),
+        "L" => Ok(AttributeValue::L(map.next_value()?)),
+        "M" => Ok(AttributeValue::M(
+            map.next_value::<crate::AttributeMap>()?.into_hashmap(),
+        )),
+        _ => Err(serde::de::Error::unknown_field(
+            tag,
+            &["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"],
+        )),
+    }
+}
+
 /// Error type for conversion between structs and `HashMap`<AttributeValue>
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ConversionError {
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -280,6 +329,56 @@ impl AttributeValue {
             }
         }
     }
+
+    pub(crate) fn into_json_value(self) -> Result<JsonValue, ConversionError> {
+        match self {
+            AttributeValue::S(value) | AttributeValue::B(value) => Ok(JsonValue::String(value)),
+            AttributeValue::N(value) => {
+                if let Ok(number) = value.parse::<serde_json::Number>() {
+                    Ok(JsonValue::Number(number))
+                } else {
+                    Ok(JsonValue::String(value))
+                }
+            }
+            AttributeValue::SS(values) | AttributeValue::BS(values) => Ok(JsonValue::Array(
+                values.into_iter().map(JsonValue::String).collect(),
+            )),
+            AttributeValue::NS(values) => Ok(JsonValue::Array(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .parse::<serde_json::Number>()
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::String(value))
+                    })
+                    .collect(),
+            )),
+            AttributeValue::BOOL(value) => Ok(JsonValue::Bool(value)),
+            AttributeValue::NULL(is_null) => {
+                if is_null {
+                    Ok(JsonValue::Null)
+                } else {
+                    Err(ConversionError::UnsupportedType("NULL(false)".to_string()))
+                }
+            }
+            AttributeValue::L(values) => values
+                .into_iter()
+                .map(AttributeValue::into_json_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map(JsonValue::Array),
+            AttributeValue::M(values) => {
+                let mut entries = values.into_iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+                let mut object = serde_json::Map::with_capacity(entries.len());
+                for (key, value) in entries {
+                    object.insert(key, value.into_json_value()?);
+                }
+                Ok(JsonValue::Object(object))
+            }
+        }
+    }
 }
 
 struct PlainJsonAttributeValue<'a>(&'a AttributeValue);
@@ -364,7 +463,7 @@ pub fn from_hashmap<T>(map: HashMap<String, AttributeValue>) -> Result<T, Conver
 where T: for<'de> Deserialize<'de> {
     let mut obj = serde_json::Map::new();
     for (key, attr_value) in map {
-        obj.insert(key, attr_value.to_json_value()?);
+        obj.insert(key, attr_value.into_json_value()?);
     }
     normalize_timestamp_attribute_aliases(&mut obj);
 

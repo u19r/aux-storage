@@ -1,121 +1,42 @@
+use serde::de::DeserializeOwned;
+
 use crate::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest,
     DYNAMODB_STREAM_RECORDS_LIMIT_MAX, DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE,
     DYNAMODB_STREAM_RECORDS_LIMIT_MIN, DeleteItemRequest, DeleteTableRequest,
-    DescribeStreamRequest, DescribeTableRequest, GetItemRequest, GetRecordsRequest,
-    GetShardIteratorRequest, GetStreamRecordsRequest, KeyAttributes, KeyType, ListStreamsRequest,
-    ListTablesRequest, PutItemRequest, QueryRequest, ReadSequenceRequest, ScanRequest, TableName,
-    TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest, UpdateTableRequest,
+    DescribeStreamRequest, DescribeSystemStreamRequest, DescribeTableRequest, GetItemRequest,
+    GetRecordsRequest, GetShardIteratorRequest, GetStreamRecordsRequest, KeyAttributes, KeyType,
+    ListStreamsRequest, ListTablesRequest, PutItemRequest, QueryRequest, ReadSequenceRequest,
+    ScanRequest, TableName, TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
+    UpdateTableRequest,
+    constants::{
+        DESCRIBE_STREAM_FIELDS, DESCRIBE_SYSTEM_STREAM_FIELDS,
+        DYNAMODB_CLIENT_REQUEST_TOKEN_MAX_CHARS, GET_RECORDS_FIELDS, GET_SHARD_ITERATOR_FIELDS,
+        GET_STREAM_RECORDS_FIELDS, LIST_STREAMS_FIELDS, LIST_TABLES_FIELDS, MAX_LIST_TABLES_LIMIT,
+    },
     dynamodb_limits::{
-        MAX_LIST_TABLES_LIMIT, validate_attribute_name, validate_index_name, validate_item,
+        validate_attribute_name, validate_index_name, validate_index_name_lazy,
         validate_projected_attribute_limit, validate_transaction_request_size,
     },
     request_expression_validation::{
-        validate_expression_attribute_name_keys, validate_expression_attribute_value_keys,
-        validate_expression_set,
+        expression_kind::ExpressionKind, validate_expression_attribute_name_keys,
+        validate_expression_attribute_value_keys, validate_expression_set,
+        validate_expression_value_operands,
     },
 };
 
-const LIST_TABLES_FIELDS: &[&str] = &["ExclusiveStartTableName", "Limit"];
-const LIST_STREAMS_FIELDS: &[&str] = &["ExclusiveStartStreamArn", "Limit", "TableName"];
-const DESCRIBE_STREAM_FIELDS: &[&str] =
-    &["ExclusiveStartShardId", "Limit", "ShardFilter", "StreamArn"];
-const GET_SHARD_ITERATOR_FIELDS: &[&str] = &[
-    "SequenceNumber",
-    "ShardId",
-    "ShardIteratorType",
-    "StreamArn",
-];
-const GET_RECORDS_FIELDS: &[&str] = &["Limit", "ShardIterator"];
-const PUT_ITEM_FIELDS: &[&str] = &[
-    "TableName",
-    "Item",
-    "ConditionExpression",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Expected",
-    "ConditionalOperator",
-    "ReturnValues",
-    "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
-    "ReturnValuesOnConditionCheckFailure",
-    "AuxItemStreamTtlHours",
-];
-const GET_ITEM_FIELDS: &[&str] = &[
-    "TableName",
-    "Key",
-    "AttributesToGet",
-    "ConsistentRead",
-    "ProjectionExpression",
-    "ExpressionAttributeNames",
-    "ReturnConsumedCapacity",
-];
-const DELETE_ITEM_FIELDS: &[&str] = &[
-    "TableName",
-    "Key",
-    "ConditionExpression",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Expected",
-    "ConditionalOperator",
-    "ReturnValues",
-    "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
-    "ReturnValuesOnConditionCheckFailure",
-    "AuxItemStreamTtlHours",
-];
-const UPDATE_ITEM_FIELDS: &[&str] = &[
-    "TableName",
-    "Key",
-    "UpdateExpression",
-    "AttributeUpdates",
-    "ConditionExpression",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Expected",
-    "ConditionalOperator",
-    "ReturnValues",
-    "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
-    "ReturnValuesOnConditionCheckFailure",
-    "AuxItemStreamTtlHours",
-];
-const QUERY_FIELDS: &[&str] = &[
-    "TableName",
-    "IndexName",
-    "KeyConditionExpression",
-    "AttributesToGet",
-    "ConditionalOperator",
-    "FilterExpression",
-    "ProjectionExpression",
-    "QueryFilter",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Limit",
-    "ExclusiveStartKey",
-    "ReturnConsumedCapacity",
-    "ConsistentRead",
-    "ScanIndexForward",
-    "Select",
-];
-const SCAN_FIELDS: &[&str] = &[
-    "TableName",
-    "IndexName",
-    "AttributesToGet",
-    "ConditionalOperator",
-    "ProjectionExpression",
-    "FilterExpression",
-    "ScanFilter",
-    "ExpressionAttributeNames",
-    "ExpressionAttributeValues",
-    "Limit",
-    "ExclusiveStartKey",
-    "ReturnConsumedCapacity",
-    "TotalSegments",
-    "Segment",
-    "ConsistentRead",
-    "Select",
-];
+fn deserialize_request_with_return_consumed_capacity<T: DeserializeOwned>(
+    value: serde_json::Value,
+    prefixed_capacity_error: bool,
+) -> Result<T, String> {
+    let (request, invalid_capacity) =
+        crate::return_consumed_capacity::deserialize_request_value(value)
+            .map_err(|error| format!("Invalid request format: {error}"))?;
+    if let Some(value) = invalid_capacity {
+        validate_return_consumed_capacity(Some(&value), prefixed_capacity_error)?;
+    }
+    Ok(request)
+}
 
 pub(crate) fn reject_unknown_fields(
     value: &serde_json::Value,
@@ -138,11 +59,27 @@ pub trait DynamoRequestValidate {
 impl DynamoRequestValidate for PutItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
-        if self.item.is_empty() {
-            return Err("Item cannot be empty".to_string());
-        }
-        validate_item(&self.item, "Item").map_err(prefixed_number_validation_message)?;
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
+        self.item
+            .validate_for_write("Item")
+            .map_err(prefixed_number_validation_message)?;
+        self.validate_write_options()
+    }
+}
+
+impl PutItemRequest {
+    /// Validate and normalize a write together, inspecting the item only once.
+    pub fn normalized_for_dynamodb(
+        mut self,
+    ) -> crate::StorageResult<(Self, crate::LogicalItemSize)> {
+        validate_table_name(&self.table_name).map_err(crate::StorageError::raw_validation)?;
+        let (item, size) = self.item.normalized_for_write()?;
+        self.item = item;
+        self.validate_write_options()
+            .map_err(crate::StorageError::raw_validation)?;
+        Ok((self, size))
+    }
+
+    fn validate_write_options(&self) -> Result<(), String> {
         validate_return_item_collection_metrics(
             self.return_item_collection_metrics.as_deref(),
             true,
@@ -161,7 +98,10 @@ impl DynamoRequestValidate for PutItemRequest {
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
-            [(self.condition_expression.as_deref(), "ConditionExpression")],
+            [(
+                self.condition_expression.as_deref(),
+                ExpressionKind::Condition,
+            )],
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
             true,
@@ -176,12 +116,11 @@ impl DynamoRequestValidate for GetItemRequest {
         if self.key.is_empty() {
             return Err("The provided key element does not match the schema".to_string());
         }
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), false)?;
         validate_expression_set(
             [(
                 self.projection_expression.as_deref(),
-                "ProjectionExpression",
+                ExpressionKind::Projection,
             )],
             self.expression_attribute_names.as_ref(),
             None,
@@ -194,7 +133,6 @@ impl DynamoRequestValidate for DeleteItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
         validate_key_not_empty(&self.key)?;
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         validate_return_item_collection_metrics(
             self.return_item_collection_metrics.as_deref(),
             true,
@@ -213,7 +151,10 @@ impl DynamoRequestValidate for DeleteItemRequest {
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
-            [(self.condition_expression.as_deref(), "ConditionExpression")],
+            [(
+                self.condition_expression.as_deref(),
+                ExpressionKind::Condition,
+            )],
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
             true,
@@ -232,7 +173,6 @@ impl DynamoRequestValidate for UpdateItemRequest {
         {
             return Err("UpdateExpression cannot be empty".to_string());
         }
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), false)?;
         validate_return_item_collection_metrics(
             self.return_item_collection_metrics.as_deref(),
             true,
@@ -258,8 +198,11 @@ impl DynamoRequestValidate for UpdateItemRequest {
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
         validate_expression_set(
             [
-                (self.condition_expression.as_deref(), "ConditionExpression"),
-                (self.update_expression.as_deref(), "UpdateExpression"),
+                (
+                    self.condition_expression.as_deref(),
+                    ExpressionKind::Condition,
+                ),
+                (self.update_expression.as_deref(), ExpressionKind::Update),
             ],
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
@@ -269,61 +212,89 @@ impl DynamoRequestValidate for UpdateItemRequest {
     }
 }
 
+pub(crate) fn validate_query_fields(
+    table_name: &TableName,
+    key_condition_expression: &str,
+    filter_expression: Option<&str>,
+    projection_expression: Option<&str>,
+    expression_attribute_names: Option<&crate::VecMap<String, String>>,
+    expression_attribute_values: Option<&crate::AttributeMap>,
+) -> Result<(), String> {
+    validate_table_name(table_name)?;
+    if key_condition_expression.is_empty() {
+        return Err("KeyConditionExpression cannot be empty".to_string());
+    }
+    if key_condition_expression.trim().is_empty() || key_condition_expression == "invalid condition"
+    {
+        return Err("Invalid KeyConditionExpression".to_string());
+    }
+    validate_expression_size_for_label(
+        Some(key_condition_expression),
+        "KeyConditionExpression",
+        false,
+        false,
+    )?;
+    validate_expression_size_for_label(filter_expression, "FilterExpression", false, false)?;
+    validate_expression_size_for_label(
+        projection_expression,
+        "ProjectionExpression",
+        false,
+        false,
+    )?;
+    validate_expression_attribute_name_keys(expression_attribute_names, false)?;
+    validate_expression_attribute_value_keys(expression_attribute_values, false)?;
+    validate_expression_set(
+        [
+            (Some(key_condition_expression), ExpressionKind::KeyCondition),
+            (filter_expression, ExpressionKind::Filter),
+            (projection_expression, ExpressionKind::Projection),
+        ],
+        expression_attribute_names,
+        expression_attribute_values,
+        false,
+    )?;
+    Ok(())
+}
+
+impl QueryRequest {
+    /// ReadSequence input binding changes values after the graph's structural
+    /// validation. Recheck only value-dependent rules, not names or syntax.
+    pub fn validate_bound_values(&self) -> Result<(), String> {
+        for (expression, kind) in [
+            (
+                Some(self.key_condition_expression.as_str()),
+                ExpressionKind::KeyCondition,
+            ),
+            (self.filter_expression.as_deref(), ExpressionKind::Filter),
+        ] {
+            if let Some(expression) = expression {
+                validate_expression_value_operands(
+                    expression,
+                    kind,
+                    self.expression_attribute_values.as_ref(),
+                    false,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DynamoRequestValidate for QueryRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
-        validate_table_name(&self.table_name)?;
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
-        if self.key_condition_expression.is_empty() {
-            return Err("KeyConditionExpression cannot be empty".to_string());
-        }
-        if self.key_condition_expression.trim().is_empty()
-            || self.key_condition_expression == "invalid condition"
-        {
-            return Err("Invalid KeyConditionExpression".to_string());
-        }
-        validate_expression_size_for_label(
-            Some(&self.key_condition_expression),
-            "KeyConditionExpression",
-            false,
-            false,
-        )?;
-        validate_expression_size_for_label(
+        validate_query_fields(
+            &self.table_name,
+            &self.key_condition_expression,
             self.filter_expression.as_deref(),
-            "FilterExpression",
-            false,
-            false,
-        )?;
-        validate_expression_size_for_label(
             self.projection_expression.as_deref(),
-            "ProjectionExpression",
-            false,
-            false,
-        )?;
-        validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), false)?;
-        validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), false)?;
-        validate_expression_set(
-            [
-                (
-                    Some(self.key_condition_expression.as_str()),
-                    "KeyConditionExpression",
-                ),
-                (self.filter_expression.as_deref(), "FilterExpression"),
-                (
-                    self.projection_expression.as_deref(),
-                    "ProjectionExpression",
-                ),
-            ],
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
-            false,
-        )?;
-        Ok(())
+        )
     }
 }
 
 impl DynamoRequestValidate for BatchGetItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         if self.request_items.is_empty() {
             return Err("The requestItems parameter is required for BatchGetItem".to_string());
         }
@@ -363,7 +334,7 @@ impl DynamoRequestValidate for BatchGetItemRequest {
             validate_expression_set(
                 [(
                     keys_and_attributes.projection_expression.as_deref(),
-                    "ProjectionExpression",
+                    ExpressionKind::Projection,
                 )],
                 keys_and_attributes.expression_attribute_names.as_ref(),
                 None,
@@ -440,11 +411,10 @@ impl DynamoRequestValidate for TransactWriteItemsRequest {
 
 impl DynamoRequestValidate for TransactGetItemsRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
-        validate_return_consumed_capacity(self.return_consumed_capacity.as_deref(), true)?;
         if self.transact_items.is_empty() {
             return Err("TransactItems cannot be empty".to_string());
         }
-        if self.transact_items.len() > 100 {
+        if self.transact_items.len() > crate::constants::MAX_TRANSACTION_MEMBERS {
             return Err("TransactItems cannot contain more than 100 operations".to_string());
         }
         for item in &self.transact_items {
@@ -458,7 +428,7 @@ impl DynamoRequestValidate for TransactGetItemsRequest {
             validate_expression_set(
                 [(
                     item.get.projection_expression.as_deref(),
-                    "ProjectionExpression",
+                    ExpressionKind::Projection,
                 )],
                 item.get.expression_attribute_names.as_ref(),
                 None,
@@ -526,7 +496,9 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
         }
 
         for ad in &request.attribute_definitions {
-            validate_attribute_name(&ad.attribute_name, "AttributeName in AttributeDefinitions")?;
+            validate_attribute_name(&ad.attribute_name, || {
+                "AttributeName in AttributeDefinitions".into()
+            })?;
 
             if !ad
                 .attribute_name
@@ -593,7 +565,9 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
             for gsi in gsis {
                 validate_index_name(&gsi.index_name, "IndexName")?;
                 for key in &gsi.key_schema {
-                    validate_attribute_name(&key.attribute_name, "GSI KeySchema AttributeName")?;
+                    validate_attribute_name(&key.attribute_name, || {
+                        "GSI KeySchema AttributeName".into()
+                    })?;
                 }
                 validate_projection_attributes(&gsi.projection)?;
             }
@@ -602,7 +576,9 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
             for lsi in lsis {
                 validate_index_name(&lsi.index_name, "IndexName")?;
                 for key in &lsi.key_schema {
-                    validate_attribute_name(&key.attribute_name, "LSI KeySchema AttributeName")?;
+                    validate_attribute_name(&key.attribute_name, || {
+                        "LSI KeySchema AttributeName".into()
+                    })?;
                 }
                 validate_projection_attributes(&lsi.projection)?;
             }
@@ -670,9 +646,8 @@ impl TryFrom<serde_json::Value> for PutItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, PUT_ITEM_FIELDS)?;
-        let request: PutItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<PutItemRequest>(value, true)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -683,9 +658,8 @@ impl TryFrom<serde_json::Value> for GetItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, GET_ITEM_FIELDS)?;
-        let request: GetItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<GetItemRequest>(value, true)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -696,9 +670,8 @@ impl TryFrom<serde_json::Value> for DeleteItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, DELETE_ITEM_FIELDS)?;
-        let request: DeleteItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<DeleteItemRequest>(value, true)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -709,9 +682,8 @@ impl TryFrom<serde_json::Value> for UpdateItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, UPDATE_ITEM_FIELDS)?;
-        let request: UpdateItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<UpdateItemRequest>(value, false)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -722,55 +694,49 @@ impl TryFrom<serde_json::Value> for ScanRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, SCAN_FIELDS)?;
-        let request: ScanRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<ScanRequest>(value, true)?;
 
-        if request.table_name.as_ref().is_empty() {
-            return Err("TableName cannot be empty".to_string());
-        }
+        request.validate_for_dynamodb()?;
 
-        validate_return_consumed_capacity(request.return_consumed_capacity.as_deref(), true)?;
+        Ok(request)
+    }
+}
 
-        if let Some(filter_expr) = &request.filter_expression
+impl DynamoRequestValidate for ScanRequest {
+    fn validate_for_dynamodb(&self) -> Result<(), String> {
+        validate_table_name(&self.table_name)?;
+
+        if let Some(filter_expr) = &self.filter_expression
             && (filter_expr.trim().is_empty() || filter_expr == "invalid filter")
         {
             return Err("Invalid FilterExpression".to_string());
         }
-        validate_expression_size_for_label(
-            request.filter_expression.as_deref(),
-            "FilterExpression",
-            false,
-            false,
-        )?;
-        validate_expression_size_for_label(
-            request.projection_expression.as_deref(),
-            "ProjectionExpression",
-            false,
-            false,
-        )?;
-        validate_expression_attribute_name_keys(
-            request.expression_attribute_names.as_ref(),
-            false,
-        )?;
-        validate_expression_attribute_value_keys(
-            request.expression_attribute_values.as_ref(),
-            false,
-        )?;
+        for (expression, label) in [
+            (self.filter_expression.as_deref(), "FilterExpression"),
+            (
+                self.projection_expression.as_deref(),
+                "ProjectionExpression",
+            ),
+        ] {
+            validate_expression_size_for_label(expression, label, false, false)?;
+        }
+        validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), false)?;
+        validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), false)?;
         validate_expression_set(
             [
-                (request.filter_expression.as_deref(), "FilterExpression"),
+                (self.filter_expression.as_deref(), ExpressionKind::Filter),
                 (
-                    request.projection_expression.as_deref(),
-                    "ProjectionExpression",
+                    self.projection_expression.as_deref(),
+                    ExpressionKind::Projection,
                 ),
             ],
-            request.expression_attribute_names.as_ref(),
-            request.expression_attribute_values.as_ref(),
+            self.expression_attribute_names.as_ref(),
+            self.expression_attribute_values.as_ref(),
             false,
         )?;
 
-        Ok(request)
+        Ok(())
     }
 }
 
@@ -778,9 +744,8 @@ impl TryFrom<serde_json::Value> for QueryRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        reject_unknown_fields(&value, QUERY_FIELDS)?;
-        let request: QueryRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<QueryRequest>(value, true)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -791,10 +756,10 @@ impl TryFrom<serde_json::Value> for GetStreamRecordsRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        let request: GetStreamRecordsRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        reject_unknown_fields(&value, GET_STREAM_RECORDS_FIELDS)?;
+        let request = GetStreamRecordsRequest::from_json_value(value)?;
 
-        match (&request.table_name, request.system_stream) {
+        match (request.table_name(), request.is_system_stream()) {
             (Some(table_name), false) if table_name.as_ref().is_empty() => {
                 return Err("TableName cannot be empty".to_string());
             }
@@ -807,8 +772,8 @@ impl TryFrom<serde_json::Value> for GetStreamRecordsRequest {
             }
         }
 
-        if let Some(limit) = request.limit {
-            let maximum = if request.system_stream {
+        if let Some(limit) = request.limit() {
+            let maximum = if request.is_system_stream() {
                 crate::SYSTEM_STREAM_RECORDS_LIMIT_MAX
             } else {
                 DYNAMODB_STREAM_RECORDS_LIMIT_MAX
@@ -817,6 +782,7 @@ impl TryFrom<serde_json::Value> for GetStreamRecordsRequest {
                 return Err(format!("Limit must be between 1 and {maximum}"));
             }
         }
+        request.validate().map_err(|error| error.to_string())?;
         Ok(request)
     }
 }
@@ -874,6 +840,18 @@ impl TryFrom<serde_json::Value> for DescribeStreamRequest {
         }
 
         Ok(request)
+    }
+}
+
+impl TryFrom<serde_json::Value> for DescribeSystemStreamRequest {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        if !value.is_object() {
+            return Err("Invalid request format: expected a JSON object".to_string());
+        }
+        reject_unknown_fields(&value, DESCRIBE_SYSTEM_STREAM_FIELDS)?;
+        serde_json::from_value(value).map_err(|error| format!("Invalid request format: {error}"))
     }
 }
 
@@ -950,79 +928,71 @@ impl TryFrom<serde_json::Value> for BatchWriteItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        let request: BatchWriteItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request = deserialize_request_with_return_consumed_capacity::<BatchWriteItemRequest>(
+            value, true,
+        )?;
 
-        validate_return_consumed_capacity(request.return_consumed_capacity.as_deref(), true)?;
+        request.validate_for_dynamodb()?;
+        Ok(request)
+    }
+}
+
+impl DynamoRequestValidate for BatchWriteItemRequest {
+    fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_enum_value(
-            request.return_item_collection_metrics.as_deref(),
+            self.return_item_collection_metrics.as_deref(),
             "returnItemCollectionMetrics",
             &["SIZE", "NONE"],
             true,
         )?;
-
-        if request.request_items.is_empty() {
+        if self.request_items.is_empty() {
             return Err("RequestItems cannot be empty".to_string());
         }
-
         let mut total_requests = 0;
-        for (table_name, write_requests) in &request.request_items {
+        for (table_name, write_requests) in &self.request_items {
             if table_name.as_ref().is_empty() {
                 return Err("TableName cannot be empty".to_string());
             }
-
             if write_requests.is_empty() {
                 return Err(format!(
                     "RequestItems for table '{table_name}' cannot be empty"
                 ));
             }
-
             total_requests += write_requests.len();
-
-            for write_request in write_requests {
-                if write_request.put_request.is_some() && write_request.delete_request.is_some() {
-                    return Err("WriteRequest must contain exactly one of PutRequest or \
-                                DeleteRequest"
-                        .to_string());
-                }
-
-                if write_request.put_request.is_none() && write_request.delete_request.is_none() {
-                    return Err("WriteRequest must contain exactly one of PutRequest or \
-                                DeleteRequest"
-                        .to_string());
-                }
-
-                if let Some(put_request) = &write_request.put_request
-                    && put_request.item.is_empty()
-                {
-                    return Err("PutRequest Item cannot be empty".to_string());
-                }
-                if let Some(put_request) = &write_request.put_request {
-                    validate_item(&put_request.item, "PutRequest Item")?;
-                }
-
-                if let Some(delete_request) = &write_request.delete_request
-                    && delete_request.key.is_empty()
-                {
-                    return Err("DeleteRequest Key cannot be empty".to_string());
-                }
+            for request in write_requests {
+                validate_batch_write_member(request)?;
             }
         }
-
         if total_requests > 25 {
             return Err("Too many items requested. Maximum allowed: 25".to_string());
         }
-
-        Ok(request)
+        Ok(())
     }
+}
+
+fn validate_batch_write_member(request: &crate::WriteRequest) -> Result<(), String> {
+    if request.put_request.is_some() == request.delete_request.is_some() {
+        return Err(
+            "WriteRequest must contain exactly one of PutRequest or DeleteRequest".to_string(),
+        );
+    }
+    if let Some(put) = &request.put_request {
+        put.item.validate_for_write("PutRequest Item")?;
+    }
+    if let Some(delete) = &request.delete_request
+        && delete.key.is_empty()
+    {
+        return Err("DeleteRequest Key cannot be empty".to_string());
+    }
+    Ok(())
 }
 
 impl TryFrom<serde_json::Value> for BatchGetItemRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        let request: BatchGetItemRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request =
+            deserialize_request_with_return_consumed_capacity::<BatchGetItemRequest>(value, true)?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -1033,9 +1003,9 @@ impl TryFrom<serde_json::Value> for TransactWriteItemsRequest {
     type Error = String;
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
-        validate_transaction_request_size(&value, "TransactWriteItems request")?;
-        let request: TransactWriteItemsRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request = deserialize_request_with_return_consumed_capacity::<TransactWriteItemsRequest>(
+            value, true,
+        )?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
@@ -1047,18 +1017,34 @@ impl TryFrom<serde_json::Value> for TransactGetItemsRequest {
 
     fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
         validate_transaction_request_size(&value, "TransactGetItems request")?;
-        let request: TransactGetItemsRequest =
-            serde_json::from_value(value).map_err(|e| format!("Invalid request format: {e}"))?;
+        let request = deserialize_request_with_return_consumed_capacity::<TransactGetItemsRequest>(
+            value, true,
+        )?;
 
         request.validate_for_dynamodb()?;
         Ok(request)
     }
 }
 
+pub fn validate_client_request_token(token: Option<&str>) -> Result<(), String> {
+    let Some(token) = token else {
+        return Ok(());
+    };
+    // Smithy string length counts Unicode scalar values, not UTF-8 bytes.
+    let length = token
+        .chars()
+        .take(DYNAMODB_CLIENT_REQUEST_TOKEN_MAX_CHARS + 1)
+        .count();
+    if !(1..=DYNAMODB_CLIENT_REQUEST_TOKEN_MAX_CHARS).contains(&length) {
+        return Err("ClientRequestToken must contain between 1 and 36 characters".to_string());
+    }
+    Ok(())
+}
+
 fn validate_transact_write_items_request(
     request: &TransactWriteItemsRequest,
 ) -> Result<(), String> {
-    validate_return_consumed_capacity(request.return_consumed_capacity.as_deref(), true)?;
+    validate_client_request_token(request.client_request_token.as_deref())?;
     validate_enum_value(
         request.return_item_collection_metrics.as_deref(),
         "returnItemCollectionMetrics",
@@ -1070,7 +1056,7 @@ fn validate_transact_write_items_request(
         return Err("TransactItems cannot be empty".to_string());
     }
 
-    if request.transact_items.len() > 100 {
+    if request.transact_items.len() > crate::constants::MAX_TRANSACTION_MEMBERS {
         return Err("TransactItems cannot contain more than 100 operations".to_string());
     }
 
@@ -1099,7 +1085,7 @@ fn validate_transact_write_items_request(
                 item_index,
             )?;
             validate_table_name(&put.table_name)?;
-            validate_item(&put.item, "TransactItems Put Item")?;
+            put.item.validate_for_write("TransactItems Put Item")?;
             validate_expression_size_for_label(
                 put.condition_expression.as_deref(),
                 "ConditionExpression",
@@ -1115,7 +1101,10 @@ fn validate_transact_write_items_request(
                 false,
             )?;
             validate_expression_set(
-                [(put.condition_expression.as_deref(), "ConditionExpression")],
+                [(
+                    put.condition_expression.as_deref(),
+                    ExpressionKind::Condition,
+                )],
                 put.expression_attribute_names.as_ref(),
                 put.expression_attribute_values.as_ref(),
                 false,
@@ -1154,10 +1143,13 @@ fn validate_transact_write_items_request(
             )?;
             validate_expression_set(
                 [
-                    (Some(update.update_expression.as_str()), "UpdateExpression"),
+                    (
+                        Some(update.update_expression.as_str()),
+                        ExpressionKind::Update,
+                    ),
                     (
                         update.condition_expression.as_deref(),
-                        "ConditionExpression",
+                        ExpressionKind::Condition,
                     ),
                 ],
                 update.expression_attribute_names.as_ref(),
@@ -1190,7 +1182,7 @@ fn validate_transact_write_items_request(
             validate_expression_set(
                 [(
                     delete.condition_expression.as_deref(),
-                    "ConditionExpression",
+                    ExpressionKind::Condition,
                 )],
                 delete.expression_attribute_names.as_ref(),
                 delete.expression_attribute_values.as_ref(),
@@ -1222,7 +1214,7 @@ fn validate_transact_write_items_request(
             validate_expression_set(
                 [(
                     Some(check.condition_expression.as_str()),
-                    "ConditionExpression",
+                    ExpressionKind::Condition,
                 )],
                 check.expression_attribute_names.as_ref(),
                 check.expression_attribute_values.as_ref(),
@@ -1235,12 +1227,12 @@ fn validate_transact_write_items_request(
 }
 
 fn validate_transact_expression_attribute_value_payloads(
-    values: Option<&std::collections::HashMap<String, crate::AttributeValue>>,
+    values: Option<&crate::AttributeMap>,
 ) -> Result<(), String> {
     let Some(values) = values else {
         return Ok(());
     };
-    for (key, value) in values {
+    for (key, value) in values.iter() {
         if let Err(message) =
             crate::validate_attribute_value_for_write(value, "ExpressionAttributeValues")
         {
@@ -1279,7 +1271,7 @@ fn validate_return_consumed_capacity(value: Option<&str>, prefixed: bool) -> Res
     validate_enum_value(
         value,
         "returnConsumedCapacity",
-        &["INDEXES", "TOTAL", "NONE"],
+        &crate::ReturnConsumedCapacity::VALID_WIRE_VALUES,
         prefixed,
     )
 }
@@ -1307,8 +1299,14 @@ fn validate_transact_write_return_values_on_condition_check_failure(
     member_name: &str,
     item_index: usize,
 ) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if matches!(value, "ALL_OLD" | "NONE") {
+        return Ok(());
+    }
     validate_return_values_on_condition_check_failure(
-        value,
+        Some(value),
         &format!(
             "transactItems.{}.member.{member_name}.returnValuesOnConditionCheckFailure",
             item_index + 1
@@ -1352,7 +1350,9 @@ fn validate_enum_value(
 fn validate_projection_attributes(projection: &crate::Projection) -> Result<(), String> {
     if let Some(attributes) = &projection.non_key_attributes {
         for attribute in attributes {
-            validate_attribute_name(attribute, "Projection NonKeyAttributes attribute name")?;
+            validate_attribute_name(attribute, || {
+                "Projection NonKeyAttributes attribute name".into()
+            })?;
         }
     }
     Ok(())
@@ -1400,10 +1400,9 @@ impl TryFrom<serde_json::Value> for UpdateTableRequest {
                             "GlobalSecondaryIndexUpdates[{i}].Create.KeySchema cannot be empty"
                         ));
                     }
-                    validate_index_name(
-                        &create.index_name,
-                        &format!("GlobalSecondaryIndexUpdates[{i}].Create.IndexName"),
-                    )?;
+                    validate_index_name_lazy(&create.index_name, || {
+                        format!("GlobalSecondaryIndexUpdates[{i}].Create.IndexName")
+                    })?;
                     validate_projection_attributes(&create.projection)?;
                 }
                 if let Some(update) = &u.update
@@ -1414,10 +1413,9 @@ impl TryFrom<serde_json::Value> for UpdateTableRequest {
                     ));
                 }
                 if let Some(update) = &u.update {
-                    validate_index_name(
-                        &update.index_name,
-                        &format!("GlobalSecondaryIndexUpdates[{i}].Update.IndexName"),
-                    )?;
+                    validate_index_name_lazy(&update.index_name, || {
+                        format!("GlobalSecondaryIndexUpdates[{i}].Update.IndexName")
+                    })?;
                 }
                 if let Some(delete) = &u.delete
                     && delete.index_name.as_ref().trim().is_empty()
@@ -1427,10 +1425,9 @@ impl TryFrom<serde_json::Value> for UpdateTableRequest {
                     ));
                 }
                 if let Some(delete) = &u.delete {
-                    validate_index_name(
-                        &delete.index_name,
-                        &format!("GlobalSecondaryIndexUpdates[{i}].Delete.IndexName"),
-                    )?;
+                    validate_index_name_lazy(&delete.index_name, || {
+                        format!("GlobalSecondaryIndexUpdates[{i}].Delete.IndexName")
+                    })?;
                 }
             }
         }

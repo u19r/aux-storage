@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*, table_atomicity::*};
+use crate::{common::*, constants::*, imports::*, table_atomicity::*};
 
 impl TableAtomicityWorkload {
     pub(crate) fn owned_key(&self, index: u64) -> String {
@@ -31,8 +31,8 @@ impl TableAtomicityWorkload {
         format!("value-client-{}-{sequence}", self.client_id)
     }
 
-    pub(crate) fn item(&self, key: &str, value: &str) -> HashMap<String, AttributeValue> {
-        let mut item = HashMap::from([
+    pub(crate) fn item(&self, key: &str, value: &str) -> storage_types::AttributeMap {
+        let mut item = storage_types::AttributeMap::from_iter([
             ("pk".to_string(), AttributeValue::S(key.to_string())),
             ("payload".to_string(), AttributeValue::S(value.to_string())),
         ]);
@@ -57,15 +57,16 @@ impl TableAtomicityWorkload {
 
     pub(crate) fn item_trim_scope(&self, key: &str) -> Option<TrimScopeExpectation> {
         self.item_stream_ttl_for_key(key)?;
-        let key_schema = [KeySchemaElement {
-            attribute_name: "pk".to_string(),
-            key_type: KeyType::Hash,
-        }];
-        let item_key =
-            ItemKey::from_key_schema(self.table_name(), &key_schema, &self.key_attributes(key))
-                .ok()?;
-        let stream_name = StreamName::table_item_stream(&self.table_name(), &item_key).ok()?;
-        Some(TrimScopeExpectation::item(item_trim_scope_id(&stream_name)))
+        let table = self
+            .table_binding
+            .as_ref()
+            .expect("start captured the table binding");
+        let address =
+            stream_provider::dynamo_item_history_address(table, &self.key_attributes(key))
+                .expect("workload keys match the captured table schema");
+        Some(TrimScopeExpectation::item(
+            storage_provider::item_retention_scope_id(&address),
+        ))
     }
 
     pub(crate) fn gsi_projection(&self, key: &str, value: &str) -> Option<(String, String)> {
@@ -78,7 +79,7 @@ impl TableAtomicityWorkload {
 
     pub(crate) fn gsi_entry_from_item(
         &self,
-        item: &HashMap<String, AttributeValue>,
+        item: &impl storage_types::AttributeValueLookup,
     ) -> Result<GsiEntry, String> {
         let key = string_attr(item, "pk")?;
         let value = string_attr(item, "payload")?;
@@ -86,14 +87,14 @@ impl TableAtomicityWorkload {
         Ok(GsiEntry::new(key, sort, value))
     }
 
-    pub(crate) fn key_attributes(&self, key: &str) -> HashMap<String, AttributeValue> {
-        HashMap::from([("pk".to_string(), AttributeValue::S(key.to_string()))])
+    pub(crate) fn key_attributes(&self, key: &str) -> KeyAttributes {
+        KeyAttributes::from([("pk".to_string(), AttributeValue::S(key.to_string()))])
     }
 
     pub(crate) fn payload_from_item(
         &self,
         key: &str,
-        item: Option<HashMap<String, AttributeValue>>,
+        item: Option<storage_types::AttributeMap>,
     ) -> Result<Option<String>, String> {
         let Some(item) = item else {
             return Ok(None);

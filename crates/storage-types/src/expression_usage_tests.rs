@@ -1,7 +1,5 @@
-use std::collections::{HashMap, HashSet};
-
 use crate::{
-    AttributeValue, extract_expression_attribute_placeholders,
+    AttributeMap, AttributeValue, VecMap, extract_expression_attribute_placeholders,
     subset_expression_attribute_values_for_expression, validate_expression_attribute_usage,
 };
 
@@ -10,16 +8,14 @@ fn extract_expression_attribute_placeholders_ignores_quoted_placeholders() {
     let expression = "#field = ':ignored' AND #name = :value";
     let (names, values) = extract_expression_attribute_placeholders(expression);
 
-    assert_eq!(
-        names,
-        HashSet::from(["#field".to_string(), "#name".to_string()])
-    );
-    assert_eq!(values, HashSet::from([":value".to_string()]));
+    assert_eq!(names.as_slice(), ["#field", "#name"]);
+    assert_eq!(values.as_slice(), [":value"]);
 }
 
 #[test]
 fn validate_expression_attribute_usage_reports_unused_values() {
-    let values = HashMap::from([(":pk".to_string(), AttributeValue::S("ignored".to_string()))]);
+    let values =
+        AttributeMap::from_iter([(":pk".to_string(), AttributeValue::S("ignored".to_string()))]);
     let error = validate_expression_attribute_usage(None, Some(&values), ["pk = :pk_val"])
         .expect_err("expected validation error for unused values");
 
@@ -31,7 +27,7 @@ fn validate_expression_attribute_usage_reports_unused_values() {
 
 #[test]
 fn validate_expression_attribute_usage_reports_unused_names() {
-    let names = HashMap::from([("#field".to_string(), "field".to_string())]);
+    let names = VecMap::from_iter([("#field".to_string(), "field".to_string())]);
     let error = validate_expression_attribute_usage(Some(&names), None, ["pk = :pk_val"])
         .expect_err("expected validation error for unused names");
 
@@ -43,8 +39,8 @@ fn validate_expression_attribute_usage_reports_unused_names() {
 
 #[test]
 fn validate_expression_attribute_usage_allows_usage_across_multiple_expressions() {
-    let names = HashMap::from([("#status".to_string(), "status".to_string())]);
-    let values = HashMap::from([
+    let names = VecMap::from_iter([("#status".to_string(), "status".to_string())]);
+    let values = AttributeMap::from_iter([
         (":pk".to_string(), AttributeValue::S("tenant#1".to_string())),
         (
             ":status".to_string(),
@@ -63,7 +59,7 @@ fn validate_expression_attribute_usage_allows_usage_across_multiple_expressions(
 
 #[test]
 fn subset_expression_attribute_values_for_expression_filters_unused_values() {
-    let values = HashMap::from([
+    let values = AttributeMap::from_iter([
         (":pk".to_string(), AttributeValue::S("tenant#1".to_string())),
         (":sk".to_string(), AttributeValue::S("meta".to_string())),
         (

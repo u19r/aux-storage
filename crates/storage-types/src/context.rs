@@ -4,7 +4,15 @@ pub trait ErrorContext<S, T, E> {
 
     fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T, E>
     where Self: Sized {
-        self.context(f())
+        self.context(LazyContext(f))
+    }
+}
+
+struct LazyContext<F>(F);
+
+impl<F: FnOnce() -> String> From<LazyContext<F>> for String {
+    fn from(value: LazyContext<F>) -> Self {
+        (value.0)()
     }
 }
 
@@ -50,35 +58,43 @@ impl<I: std::fmt::Display> std::fmt::Display for dyn WrappedError<I> {
     }
 }
 
+/// Immutable frames shared by error values generated across crate boundaries.
+/// The generated owners keep their frame private; this type is public only for
+/// macro expansion in downstream crates.
+#[doc(hidden)]
+pub enum ErrorContextFrame<I> {
+    Base(I),
+    Context {
+        error: std::sync::Arc<ErrorContextFrame<I>>,
+        context: String,
+    },
+}
+
 #[macro_export]
 macro_rules! err_context {
     ($error_name:ident, $enum_name:ident) => {
+        pub struct $error_name(std::sync::Arc<$crate::context::ErrorContextFrame<$enum_name>>);
+
+        impl Clone for $error_name {
+            fn clone(&self) -> Self {
+                Self(std::sync::Arc::clone(&self.0))
+            }
+        }
+
         impl<U, E: Into<$error_name>> $crate::context::ErrorContext<$error_name, U, $error_name>
             for Result<U, E>
         where E: From<$error_name>
         {
             fn context(self, context: impl Into<String>) -> Result<U, $error_name> {
-                match self {
-                    Ok(t) => Ok(t),
-                    Err(e) => Err($error_name::Context {
-                        error: Box::new(e.into()),
-                        context: context.into(),
-                    }),
-                }
+                self.map_err(|error| error.into().with_context(context))
             }
-        }
-
-        pub enum $error_name {
-            Base($enum_name),
-            Context {
-                error: Box<$error_name>,
-                context: String,
-            },
         }
 
         impl<T: Into<$enum_name>> From<T> for $error_name {
             fn from(value: T) -> Self {
-                $error_name::Base(value.into())
+                Self(std::sync::Arc::new(
+                    $crate::context::ErrorContextFrame::Base(value.into()),
+                ))
             }
         }
 
@@ -86,24 +102,35 @@ macro_rules! err_context {
 
         impl std::fmt::Display for $error_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_fmt(format_args!("{}", self.as_ref()))
+                std::fmt::Display::fmt(self.as_ref(), f)
             }
         }
 
         impl $crate::context::WrappedError<$enum_name> for $error_name {
             fn to_enum(&self) -> &$enum_name {
-                match self {
-                    $error_name::Base(b) => b,
-                    $error_name::Context { error, .. } => error.to_enum(),
+                let mut frame = self.0.as_ref();
+                loop {
+                    match frame {
+                        $crate::context::ErrorContextFrame::Base(error) => return error,
+                        $crate::context::ErrorContextFrame::Context { error, .. } => {
+                            frame = error.as_ref();
+                        }
+                    }
                 }
             }
 
             fn recursive_context(&self, mut context: Vec<String>) -> (&$enum_name, Vec<String>) {
-                match self {
-                    $error_name::Base(b) => (b, context),
-                    $error_name::Context { error, context: c } => {
-                        context.push(c.to_string());
-                        error.recursive_context(context)
+                let mut frame = self.0.as_ref();
+                loop {
+                    match frame {
+                        $crate::context::ErrorContextFrame::Base(error) => return (error, context),
+                        $crate::context::ErrorContextFrame::Context {
+                            error,
+                            context: message,
+                        } => {
+                            context.push(message.clone());
+                            frame = error.as_ref();
+                        }
                     }
                 }
             }
@@ -112,33 +139,60 @@ macro_rules! err_context {
         impl std::fmt::Debug for $error_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
                 use std::error::Error;
-                let (err, ctx) =
-                    <$error_name as $crate::context::WrappedError<$enum_name>>::recursive_context(
-                        self,
-                        Vec::new(),
-                    );
-                f.write_fmt(format_args!("{err}"))?;
-
-                if !ctx.is_empty() {
-                    f.write_fmt(format_args!("\n\nContext:\n"))?;
+                let (error, contexts) = <$error_name as $crate::context::WrappedError<
+                    $enum_name,
+                >>::recursive_context(self, Vec::new());
+                write!(f, "{error}")?;
+                if !contexts.is_empty() {
+                    writeln!(f, "\n\nContext:")?;
                 }
-                for (i, ctx) in ctx.iter().enumerate() {
-                    f.write_fmt(format_args!("    {}: {ctx}\n", i + 1))?;
+                for (index, context) in contexts.iter().enumerate() {
+                    writeln!(f, "    {}: {context}", index + 1)?;
                 }
-
-                if let Some(source) = err.source() {
-                    f.write_fmt(format_args!("\nCaused by: {source:?}"))?;
+                if let Some(source) = error.source() {
+                    write!(f, "\nCaused by: {source:?}")?;
                 }
                 Ok(())
             }
         }
 
+        impl $error_name {
+            /// Add operation context without copying the original cause.
+            #[must_use]
+            pub fn with_context(self, context: impl Into<String>) -> Self {
+                Self(std::sync::Arc::new(
+                    $crate::context::ErrorContextFrame::Context {
+                        error: self.0,
+                        context: context.into(),
+                    },
+                ))
+            }
+
+            /// Preserve callers whose retry policy accepts only an unwrapped
+            /// base failure, rather than failures carrying operation context.
+            #[must_use]
+            pub fn base_error(&self) -> Option<&$enum_name> {
+                match self.0.as_ref() {
+                    $crate::context::ErrorContextFrame::Base(error) => Some(error),
+                    $crate::context::ErrorContextFrame::Context { .. } => None,
+                }
+            }
+
+            #[must_use]
+            pub fn into_enum(self) -> $enum_name {
+                match std::sync::Arc::try_unwrap(self.0) {
+                    Ok($crate::context::ErrorContextFrame::Base(error)) => error,
+                    Ok($crate::context::ErrorContextFrame::Context { error, .. }) => {
+                        Self(error).into_enum()
+                    }
+                    Err(shared) => Self(shared).as_ref().clone(),
+                }
+            }
+        }
+
         impl AsRef<$enum_name> for $error_name {
             fn as_ref(&self) -> &$enum_name {
-                match self {
-                    $error_name::Base(b) => b,
-                    $error_name::Context { error, .. } => error.as_ref().as_ref(),
-                }
+                <$error_name as $crate::context::WrappedError<$enum_name>>::to_enum(self)
             }
         }
     };

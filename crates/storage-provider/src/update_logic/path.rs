@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-
-use storage_types::{AttributeValue, StorageError, StorageResult};
+use storage_types::{
+    AttributeMap, AttributeValue, AttributeValueLookup, StorageError, StorageResult,
+};
 
 pub(super) fn resolve_document_path(
     path: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<String> {
     if !path.contains('#') {
         return Ok(path.to_string());
@@ -20,7 +20,7 @@ pub(super) fn resolve_document_path(
 
 fn resolve_path_aliases(
     path: &str,
-    expression_attribute_names: Option<&HashMap<String, String>>,
+    expression_attribute_names: Option<&storage_types::VecMap<String, String>>,
 ) -> StorageResult<String> {
     let Some(names) = expression_attribute_names else {
         return Ok(path.to_string());
@@ -56,7 +56,7 @@ fn resolve_path_aliases(
 }
 
 pub(super) fn set_attribute_value(
-    item: &mut HashMap<String, AttributeValue>,
+    item: &mut AttributeMap,
     field: &str,
     value: AttributeValue,
 ) -> StorageResult<()> {
@@ -69,20 +69,17 @@ pub(super) fn set_attribute_value(
 }
 
 pub(super) fn get_attribute_value<'a>(
-    item: &'a HashMap<String, AttributeValue>,
+    item: &'a impl AttributeValueLookup,
     field: &str,
 ) -> Option<&'a AttributeValue> {
     if is_top_level_path(field) {
-        return item.get(field);
+        return item.get_attribute_value(field);
     }
     let path = parse_update_path(field).ok()?;
     get_path_value(item, &path)
 }
 
-pub(super) fn remove_attribute_value(
-    item: &mut HashMap<String, AttributeValue>,
-    field: &str,
-) -> StorageResult<()> {
+pub(super) fn remove_attribute_value(item: &mut AttributeMap, field: &str) -> StorageResult<()> {
     if is_top_level_path(field) {
         item.remove(field);
         return Ok(());
@@ -157,14 +154,14 @@ fn parse_update_path(path: &str) -> StorageResult<Vec<UpdatePathSegment>> {
 }
 
 fn get_path_value<'a>(
-    item: &'a HashMap<String, AttributeValue>,
+    item: &'a impl AttributeValueLookup,
     path: &[UpdatePathSegment],
 ) -> Option<&'a AttributeValue> {
     let (first, rest) = path.split_first()?;
     let UpdatePathSegment::Name(name) = first else {
         return None;
     };
-    let mut value = item.get(name)?;
+    let mut value = item.get_attribute_value(name)?;
     for segment in rest {
         match (segment, value) {
             (UpdatePathSegment::Name(name), AttributeValue::M(map)) => {
@@ -180,7 +177,7 @@ fn get_path_value<'a>(
 }
 
 fn set_path_value(
-    item: &mut HashMap<String, AttributeValue>,
+    item: &mut AttributeMap,
     path: &[UpdatePathSegment],
     value: AttributeValue,
 ) -> StorageResult<()> {
@@ -196,12 +193,14 @@ fn set_path_value(
         item.insert(name.clone(), value);
         return Ok(());
     }
-    let root = item.get_mut(name).ok_or_else(|| {
+    let mut root = item.remove(name).ok_or_else(|| {
         StorageError::validation(
             "The document path provided in the update expression is invalid for update",
         )
     })?;
-    set_nested_path_value(root, rest, value)
+    let result = set_nested_path_value(&mut root, rest, value);
+    item.insert(name.clone(), root);
+    result
 }
 
 fn set_nested_path_value(
@@ -255,10 +254,7 @@ fn set_nested_path_value(
     }
 }
 
-fn remove_path_value(
-    item: &mut HashMap<String, AttributeValue>,
-    path: &[UpdatePathSegment],
-) -> StorageResult<()> {
+fn remove_path_value(item: &mut AttributeMap, path: &[UpdatePathSegment]) -> StorageResult<()> {
     let Some((first, rest)) = path.split_first() else {
         return Ok(());
     };
@@ -269,10 +265,12 @@ fn remove_path_value(
         item.remove(name);
         return Ok(());
     }
-    let Some(root) = item.get_mut(name) else {
+    let Some(mut root) = item.remove(name) else {
         return remove_missing_path_result(rest);
     };
-    remove_nested_path_value(root, rest)
+    let result = remove_nested_path_value(&mut root, rest);
+    item.insert(name.clone(), root);
+    result
 }
 
 fn remove_nested_path_value(

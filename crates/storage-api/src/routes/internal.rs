@@ -4,29 +4,124 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Json, Response as AxumResponse},
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{Json, Response as AxumResponse},
 };
 use http_error::{ErrorResponse, HttpApiError};
-use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use storage::AdmissionClass;
-use storage_sync::{SyncNodeId, SyncTypeConfig};
 use storage_types::{
-    GetStreamRecordsRequest, ReplicationApplyRequest, ReplicationHeartbeatRequest,
+    GetStreamRecordsRequest, SystemStreamContractError, SystemStreamScope, TimestampMillis,
+};
+use stream_provider::{
+    SystemStreamLineage, SystemStreamSplitChild, SystemStreamSplitOperationId,
+    SystemStreamSplitRequest, SystemStreamTrimContinuation, SystemStreamTrimOperationId,
+    SystemStreamTrimPageRequest,
 };
 
 use crate::{
-    constants::STORAGE_GATEWAY_API_KEY_HEADER,
+    manager::StorageApiManager,
     routes::dynamodb::{
         parse_json_request, parse_json_value, parse_try_into_request, response_to_http,
     },
-    types::{AppState, ReplicationLogicalBackfillImportRequest, SyncLearnerJoinRequest},
+    types::AppState,
 };
 
-// Internal sync endpoints are part of the Raft control plane. They must stay
-// credential-gated and internal-network only; public callers should use the
-// DynamoDB-compatible `/storage` route and leader-hint retry path instead.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct SystemStreamSplitControlRequest {
+    source_scope: SystemStreamScope,
+    operation_id: String,
+    parent: SystemStreamLineageControl,
+    children: [SystemStreamSplitChildControl; 2],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct SystemStreamLineageControl {
+    shard_id: String,
+    lineage_id: String,
+    parent_lineage_id: Option<String>,
+    sealed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct SystemStreamSplitChildControl {
+    lineage: SystemStreamLineageControl,
+    initial_sequence: u64,
+}
+
+impl TryFrom<SystemStreamSplitControlRequest> for SystemStreamSplitRequest {
+    type Error = HttpApiError;
+
+    fn try_from(payload: SystemStreamSplitControlRequest) -> Result<Self, Self::Error> {
+        let operation_id = SystemStreamSplitOperationId::try_new(payload.operation_id)
+            .map_err(split_contract_error)?;
+        let parent = payload.parent.try_into().map_err(split_contract_error)?;
+        let [left, right] = payload.children.map(TryInto::try_into);
+        let children = [
+            left.map_err(split_contract_error)?,
+            right.map_err(split_contract_error)?,
+        ];
+        SystemStreamSplitRequest::try_new(payload.source_scope, parent, children, operation_id)
+            .map_err(split_contract_error)
+    }
+}
+
+impl TryFrom<SystemStreamLineageControl> for SystemStreamLineage {
+    type Error = SystemStreamContractError;
+
+    fn try_from(value: SystemStreamLineageControl) -> Result<Self, Self::Error> {
+        Self::try_new(
+            value.shard_id,
+            value.lineage_id,
+            value.parent_lineage_id,
+            value.sealed,
+        )
+    }
+}
+
+impl TryFrom<SystemStreamSplitChildControl> for SystemStreamSplitChild {
+    type Error = SystemStreamContractError;
+
+    fn try_from(value: SystemStreamSplitChildControl) -> Result<Self, Self::Error> {
+        Self::try_new(value.lineage.try_into()?, value.initial_sequence)
+    }
+}
+
+fn split_contract_error(error: SystemStreamContractError) -> HttpApiError {
+    HttpApiError::validation_error(error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct SystemStreamTrimControlRequest {
+    source_scope: SystemStreamScope,
+    cutoff_timestamp: i64,
+    limit: usize,
+    continuation: Option<SystemStreamTrimContinuationControl>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct SystemStreamTrimContinuationControl {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct AdmissionConnectionQuery {
+    connection_id: Option<String>,
+}
+
+impl AdmissionConnectionQuery {
+    fn connection_id(&self) -> &str {
+        self.connection_id.as_deref().unwrap_or("default")
+    }
+}
 
 #[utoipa::path(
     post,
@@ -54,6 +149,7 @@ pub async fn clear_all_tables_endpoint(
     params(
         ("job_name" = String, Path, description = "Background job name to run in the test harness")
     ),
+    request_body = serde_json::Value,
     responses(
         (status = 200, description = "Background job executed", body = serde_json::Value),
         (status = 400, description = "Bad request", body = ErrorResponse),
@@ -63,41 +159,113 @@ pub async fn clear_all_tables_endpoint(
 pub async fn run_background_job_endpoint(
     State(app_state): State<Arc<AppState>>,
     Path(job_name): Path<String>,
+    body: Bytes,
 ) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
+    if body.is_empty() {
+        return Err(
+            HttpApiError::validation_error("background job request body is required").into(),
+        );
+    }
+    let mut payload = parse_json_value(&body)?;
+    let Some(payload) = payload.as_object_mut() else {
+        return Err(
+            HttpApiError::validation_error("background job payload must be a JSON object").into(),
+        );
+    };
+    payload.insert("JobName".to_string(), serde_json::Value::String(job_name));
     let response = app_state
         .storage_manager
-        .run_background_job(serde_json::json!({ "JobName": job_name }))
+        .run_background_job(serde_json::Value::Object(std::mem::take(payload)))
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
 }
 
-pub async fn cache_diagnostics_endpoint() -> Json<storage::StorageCacheReadDiagnostics> {
-    Json(storage::storage_cache_read_diagnostics())
+/// Split one exact logical SystemStream lineage through the admitted
+/// storage-manager boundary. The provider validates the request against its
+/// current catalog and owns Applied/Replayed disposition.
+pub async fn split_system_stream_endpoint(
+    State(app_state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let payload = parse_json_request::<SystemStreamSplitControlRequest>(&body)?;
+    let request = payload
+        .try_into()
+        .map_err(|error: HttpApiError| -> (StatusCode, Json<ErrorResponse>) { error.into() })?;
+    let result = app_state
+        .storage_manager
+        .split_system_stream(request)
+        .await
+        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
+    Ok(Json(json!({
+        "Disposition": format!("{:?}", result.disposition()),
+        "SourceScope": result.source_scope(),
+    })))
+}
+
+/// Invoke one real, provider-owned logical SystemStream trim page.  The
+/// request deliberately contains no caller-supplied frontier or physical key;
+/// the backend derives protection from its durable checkpoint/catalog state.
+pub async fn trim_system_stream_endpoint(
+    State(app_state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let payload = parse_json_request::<SystemStreamTrimControlRequest>(&body)?;
+    let cutoff_timestamp = TimestampMillis::from_timestamp(payload.cutoff_timestamp);
+    let operation_id = SystemStreamTrimOperationId::new(&payload.source_scope, cutoff_timestamp);
+    let continuation = payload
+        .continuation
+        .map(|continuation| {
+            SystemStreamTrimContinuation::try_new(
+                operation_id,
+                continuation.sequence,
+                continuation.bytes,
+            )
+        })
+        .transpose()
+        .map_err(storage_system_error)?;
+    let request = SystemStreamTrimPageRequest::try_new(
+        payload.source_scope,
+        cutoff_timestamp,
+        payload.limit,
+        continuation,
+    )
+    .map_err(storage_system_error)?;
+    let result = app_state
+        .storage_manager
+        .run_system_stream_trim_page(request)
+        .await
+        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
+    Ok(Json(json!({
+        "ReclaimedRecords": result.reclaimed_records(),
+        "NextContinuation": result.next_continuation().map(|continuation| json!({
+            "Sequence": continuation.sequence(),
+            "Bytes": continuation.as_bytes(),
+        })),
+    })))
 }
 
 /// Test-only synchronization primitive mounted only with the existing
-/// internal-helper flag.  It holds a real foreground permit so BDD and local
+/// internal-helper flag. It holds a real foreground permit so BDD and local
 /// canary checks exercise the production admission queue without injecting
-/// fake provider latency.
+/// fake provider latency. The optional connection query selects a configured
+/// physical controller and defaults to the synthetic single-backend route.
 pub async fn hold_admission_endpoint(
     State(app_state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    Query(query): Query<AdmissionConnectionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, HeaderMap, Json<ErrorResponse>)> {
     let permit = app_state
         .db_manager
-        .default_admission_controller()
-        .acquire(AdmissionClass::PointRead)
+        .acquire_admission(query.connection_id(), AdmissionClass::PointRead)
         .await
-        .map_err(|rejection| -> (StatusCode, Json<ErrorResponse>) {
-            HttpApiError::from(storage::StorageError::service_unavailable(
-                rejection.retry_after_seconds,
-            ))
-            .into()
-        })?;
+        .map_err(storage_admission_error)?;
     let released = app_state.admission_test_release.notified();
     app_state.admission_test_holds.lock().await.push(permit);
     released.await;
-    Ok(Json(serde_json::json!({"status": "released"})))
+    Ok(Json(serde_json::json!({
+        "status": "released",
+        "connection_id": query.connection_id(),
+    })))
 }
 
 pub async fn release_admission_endpoint(
@@ -111,31 +279,50 @@ pub async fn release_admission_endpoint(
 
 pub async fn admission_diagnostics_endpoint(
     State(app_state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let snapshot = app_state
+    Query(query): Query<AdmissionConnectionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let controller = app_state
         .db_manager
-        .default_admission_controller()
-        .snapshot();
-    Json(serde_json::json!({
+        .admission_controller(query.connection_id())
+        .ok_or_else(|| {
+            HttpApiError::validation_error(format!(
+                "storage connection '{}' is not configured",
+                query.connection_id()
+            ))
+        })?;
+    let snapshot = controller.snapshot();
+    Ok(Json(serde_json::json!({
         "connection_id": snapshot.connection_id,
         "enabled": snapshot.enabled,
         "state": format!("{:?}", snapshot.state),
         "limit": snapshot.desired_limit,
-        "queue_capacity": app_state
-            .db_manager
-            .default_admission_controller()
-            .config()
-            .queue_capacity,
-        "max_queue_wait_ms": app_state
-            .db_manager
-            .default_admission_controller()
-            .config()
-            .max_queue_wait_ms,
+        "queue_capacity": controller.config().queue_capacity,
+        "max_queue_wait_ms": controller.config().max_queue_wait_ms,
         "in_flight": snapshot.in_flight,
         "control_in_flight": snapshot.control_in_flight,
         "queue_depth": snapshot.queue_depth,
         "rejection_count": snapshot.rejection_count,
-    }))
+    })))
+}
+
+/// Admit one provider handle through a selected production controller. This
+/// endpoint exists only with internal helper routes and returns after the
+/// named permit is admitted and completed.
+pub async fn probe_admission_endpoint(
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<AdmissionConnectionQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, HeaderMap, Json<ErrorResponse>)> {
+    let connection_id = query.connection_id().to_string();
+    app_state
+        .db_manager
+        .run_dynamo_admitted(&connection_id, AdmissionClass::PointRead, |_dynamo| async {
+            Ok::<(), storage_types::StorageError>(())
+        })
+        .await
+        .map_err(storage_admission_error)?;
+    Ok(Json(serde_json::json!({
+        "connection_id": connection_id,
+    })))
 }
 
 #[utoipa::path(
@@ -156,6 +343,28 @@ pub async fn append_table_stream_record_endpoint(
     let response = app_state
         .storage_manager
         .append_table_stream_record(payload)
+        .await
+        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
+    Ok(response_to_http(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/_internal/test/table-stream-records/reconcile",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Table append durability inspected", body = serde_json::Value),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn reconcile_table_stream_record_endpoint(
+    State(app_state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
+    let response = app_state
+        .storage_manager
+        .reconcile_table_stream_record(parse_json_value(&body)?)
         .await
         .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
     Ok(response_to_http(response))
@@ -184,356 +393,17 @@ pub async fn get_stream_records_endpoint(
     Ok(response_to_http(response))
 }
 
-#[utoipa::path(
-    post,
-    path = "/_internal/storage/replication/apply",
-    request_body = ReplicationApplyRequest,
-    responses(
-        (status = 200, description = "Replication mutations were processed", body = storage_types::ReplicationApplyResponse),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong service token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn apply_replication_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_replication_service_request(&app_state, &headers)?;
-    let request = parse_json_request::<ReplicationApplyRequest>(&body)?;
-    let response = app_state
-        .storage_manager
-        .apply_replication(request)
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(response_to_http(response))
+fn storage_system_error(error: storage_types::StorageError) -> (StatusCode, Json<ErrorResponse>) {
+    HttpApiError::from(error).into()
 }
 
-#[utoipa::path(
-    post,
-    path = "/_internal/storage/replication/logical-backfill/import",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "Logical backfill chunk imported", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong service token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn import_replication_logical_backfill_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_replication_service_request(&app_state, &headers)?;
-    let request = parse_json_request::<ReplicationLogicalBackfillImportRequest>(&body)?;
-    let response = app_state
-        .storage_manager
-        .import_replication_logical_backfill(request)
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(response_to_http(response))
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/storage/replication/heartbeat",
-    request_body = ReplicationHeartbeatRequest,
-    responses(
-        (status = 200, description = "Replication heartbeat acknowledged", body = storage_types::ReplicationHeartbeatResponse),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong service token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn replication_heartbeat_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_replication_service_request(&app_state, &headers)?;
-    let request = parse_json_request::<ReplicationHeartbeatRequest>(&body)?;
-    let response = app_state
-        .storage_manager
-        .heartbeat_replication(request)
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(response_to_http(response))
-}
-
-#[utoipa::path(
-    get,
-    path = "/_internal/storage/replication/health",
-    responses(
-        (status = 200, description = "Replication health returned", body = storage_types::ReplicationHealthResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong service token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn replication_health_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_replication_service_request(&app_state, &headers)?;
-    let response = app_state
-        .storage_manager
-        .replication_health()
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(response_to_http(response))
-}
-
-#[utoipa::path(
-    get,
-    path = "/_internal/sync/health",
-    responses(
-        (status = 200, description = "Sync health returned", body = serde_json::Value),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_health_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let response = app_state
-        .storage_manager
-        .sync_health()
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(response_to_http(response))
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/sync/raft/learners",
-    request_body = SyncLearnerJoinRequest,
-    responses(
-        (status = 200, description = "Learner was admitted to the sync Raft cluster", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_raft_add_learner_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let request = parse_json_request::<SyncLearnerJoinRequest>(&body)?;
-    let response = sync_learner_join_handler(&app_state)?
-        .add_sync_learner(request)
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(Json(response).into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/sync/raft/learners/{node_id}/promote",
-    responses(
-        (status = 200, description = "Learner was promoted to a sync Raft voter", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_raft_promote_learner_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    Path(node_id): Path<u64>,
-    headers: HeaderMap,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let response = sync_learner_join_handler(&app_state)?
-        .promote_sync_learner(node_id)
-        .await
-        .map_err(<(StatusCode, Json<ErrorResponse>)>::from)?;
-    Ok(Json(response).into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/sync/raft/append",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "OpenRaft append-entries response returned", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_raft_append_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let request = parse_json_request::<AppendEntriesRequest<SyncTypeConfig>>(&body)?;
-    let response = sync_raft_rpc_handler(&app_state)?
-        .append_entries(request)
-        .await
-        .map_err(sync_raft_error)?;
-    Ok(Json(response).into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/sync/raft/snapshot",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "OpenRaft snapshot response returned", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_raft_snapshot_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let request = parse_json_request::<InstallSnapshotRequest<SyncTypeConfig>>(&body)?;
-    let response = sync_raft_rpc_handler(&app_state)?
-        .install_snapshot(request)
-        .await
-        .map_err(sync_raft_error)?;
-    Ok(Json(response).into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/_internal/sync/raft/vote",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "OpenRaft vote response returned", body = serde_json::Value),
-        (status = 400, description = "Bad request", body = ErrorResponse),
-        (status = 401, description = "Authentication required", body = ErrorResponse),
-        (status = 403, description = "Wrong sync internal token", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    )
-)]
-pub async fn sync_raft_vote_endpoint(
-    State(app_state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<AxumResponse, (StatusCode, Json<ErrorResponse>)> {
-    authorize_sync_internal_request(&app_state, &headers)?;
-    let request = parse_json_request::<VoteRequest<SyncNodeId>>(&body)?;
-    let response = sync_raft_rpc_handler(&app_state)?
-        .vote(request)
-        .await
-        .map_err(sync_raft_error)?;
-    Ok(Json(response).into_response())
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "internal Axum route helpers share the existing JSON error tuple shape"
-)]
-fn sync_raft_rpc_handler(
-    app_state: &AppState,
-) -> Result<&dyn crate::types::SyncRaftRpcHandler, (StatusCode, Json<ErrorResponse>)> {
-    app_state.sync_raft_rpc_handler().ok_or_else(|| {
-        HttpApiError::dynamodb_error(
-            "ServiceUnavailable",
-            "sync raft runtime is not configured",
-            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-        )
-        .into()
-    })
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "internal Axum route helpers share the existing JSON error tuple shape"
-)]
-fn sync_learner_join_handler(
-    app_state: &AppState,
-) -> Result<&dyn crate::types::SyncLearnerJoinHandler, (StatusCode, Json<ErrorResponse>)> {
-    app_state.sync_learner_join_handler().ok_or_else(|| {
-        HttpApiError::dynamodb_error(
-            "ServiceUnavailable",
-            "sync learner join handler is not configured",
-            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-        )
-        .into()
-    })
-}
-
-fn sync_raft_error<E: std::fmt::Display>(error: E) -> (StatusCode, Json<ErrorResponse>) {
-    HttpApiError::internal_server_error(format!("sync raft rpc failed: {error}")).into()
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "internal Axum route helpers share the existing JSON error tuple shape"
-)]
-fn authorize_sync_internal_request(
-    app_state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some(expected_token) = app_state.sync_internal_token() else {
-        return Err(HttpApiError::access_denied_error(
-            "sync internal endpoint token is not configured",
-        )
-        .into());
-    };
-    let Some(actual_token) = headers
-        .get(STORAGE_GATEWAY_API_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(
-            HttpApiError::unauthorized_error("missing sync internal endpoint token").into(),
-        );
-    };
-    if actual_token != expected_token {
-        return Err(
-            HttpApiError::access_denied_error("invalid sync internal endpoint token").into(),
-        );
+fn storage_admission_error(
+    error: storage_types::StorageError,
+) -> (StatusCode, HeaderMap, Json<ErrorResponse>) {
+    let (status, body) = HttpApiError::from(error).into();
+    let mut headers = HeaderMap::new();
+    if let Some(retry_after_seconds) = body.0.retry_after_seconds {
+        headers.insert("retry-after", HeaderValue::from(retry_after_seconds));
     }
-    Ok(())
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "internal Axum route helpers share the existing JSON error tuple shape"
-)]
-fn authorize_replication_service_request(
-    app_state: &AppState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if !app_state.has_replication_service_tokens() {
-        return Err(HttpApiError::access_denied_error(
-            "replication service endpoint token is not configured",
-        )
-        .into());
-    }
-    let Some(actual_token) = headers
-        .get(STORAGE_GATEWAY_API_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(
-            HttpApiError::unauthorized_error("missing replication service endpoint token").into(),
-        );
-    };
-    if !app_state.accepts_replication_service_token(actual_token) {
-        return Err(HttpApiError::access_denied_error(
-            "invalid replication service endpoint token",
-        )
-        .into());
-    }
-    Ok(())
+    (status, headers, body)
 }

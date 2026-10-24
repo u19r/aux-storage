@@ -1,4 +1,4 @@
-use crate::{common::*, imports::*, table_atomicity::*};
+use crate::{common::*, constants::*, imports::*, table_atomicity::*};
 
 impl TableAtomicityWorkload {
     pub(crate) async fn check_gsi_exactness(
@@ -6,11 +6,13 @@ impl TableAtomicityWorkload {
         manager: &DatabaseManager,
     ) -> Result<(), String> {
         let partitions = self.gsi_seen_partitions.iter().cloned().collect::<Vec<_>>();
-        for partition in partitions {
+        self.trace_check_progress("gsi_snapshot", "start", 0);
+        for (partition_ordinal, partition) in partitions.into_iter().enumerate() {
             if self.gsi_unclassified_partitions.contains(&partition) {
                 continue;
             }
-            let (items, _) = manager
+            self.trace_check_progress("gsi_partition_read", "start", partition_ordinal as u64);
+            let page = manager
                 .query_index_map(
                     QueryIndexInput::builder()
                         .table_name(self.table_name())
@@ -24,6 +26,8 @@ impl TableAtomicityWorkload {
                 )
                 .await
                 .map_err(|err| storage_error_detail(&err))?;
+            let items = page.items;
+            self.trace_check_progress("gsi_partition_read", "finish", partition_ordinal as u64);
             let mut actual = BTreeSet::new();
             for item in &items {
                 actual.insert(self.gsi_entry_from_item(item)?);
@@ -47,16 +51,18 @@ impl TableAtomicityWorkload {
                 actual.len()
             ));
         }
+        self.trace_check_progress("gsi_snapshot", "finish", self.gsi_audit_count);
         Ok(())
     }
 
     pub(crate) async fn check_trim_state_exactness(
         &mut self,
-        provider: &FdbChaosProvider,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
+        self.trace_check_progress("trim_state", "start", self.trim_audit_count);
         let due_before = TimestampMillis::now() + (73 * 60 * 60 * 1000);
         let markers =
-            StreamDurationTrimBackend::list_due_stream_trim_markers(provider, due_before, 1_000)
+            StreamRetentionRepository::list_due_stream_trim_markers(provider, due_before, 1_000)
                 .await
                 .map_err(|err| storage_error_detail(&err))?;
         let table_name = self.table_name();
@@ -66,15 +72,18 @@ impl TableAtomicityWorkload {
             .into_iter()
             .filter(|marker| marker.scope.table_name == table_name)
         {
-            let state = StreamDurationTrimBackend::load_stream_trim_state(provider, &marker.scope)
-                .await
-                .map_err(|err| storage_error_detail(&err))?
-                .ok_or_else(|| {
-                    format!(
-                        "stream trim marker has no state scope={} policy_version={}",
-                        marker.scope.scope_id, marker.policy_version
-                    )
-                })?;
+            let mut states = StreamRetentionRepository::load_stream_trim_states(
+                provider,
+                std::slice::from_ref(&marker.scope),
+            )
+            .await
+            .map_err(|err| storage_error_detail(&err))?;
+            let state = states.pop().flatten().ok_or_else(|| {
+                format!(
+                    "stream trim marker has no state scope={} policy_version={}",
+                    marker.scope.scope_id, marker.policy_version
+                )
+            })?;
             if !state.marker_matches(&marker) {
                 continue;
             }
@@ -146,18 +155,22 @@ impl TableAtomicityWorkload {
         }
 
         self.trim_audit_count += (current_table_scopes.len() + expected_item_scopes.len()) as u64;
+        self.trace_check_progress("trim_state", "finish", self.trim_audit_count);
         Ok(())
     }
 
     pub(crate) async fn run_pre_expiry_stream_trim(
         &mut self,
-        provider: &FdbChaosProvider,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
-        provider
-            .run_job(STREAM_TRIM_JOB)
+        self.trace_check_progress("trim_job", "start", self.trim_execution_count);
+        let now = TimestampMillis::now();
+        StreamDurationTrimWorker::new(provider, StreamDurationTrimConfig::default())
+            .run_due_page(now, now)
             .await
             .map_err(|err| storage_error_detail(&err))?;
         self.trim_execution_count = self.trim_execution_count.saturating_add(1);
+        self.trace_check_progress("trim_job", "finish", self.trim_execution_count);
         Ok(())
     }
 
@@ -165,6 +178,7 @@ impl TableAtomicityWorkload {
         &mut self,
         manager: &DatabaseManager,
     ) -> Result<(), String> {
+        self.trace_check_progress("stream_records", "start", 0);
         let expected = self
             .history
             .events()
@@ -188,6 +202,7 @@ impl TableAtomicityWorkload {
             })
             .collect::<BTreeSet<_>>();
         if expected.is_empty() {
+            self.trace_check_progress("stream_records", "finish", 0);
             return Ok(());
         }
 
@@ -207,18 +222,18 @@ impl TableAtomicityWorkload {
                 )
                 .await
                 .map_err(|err| storage_error_detail(&err))?;
-            for record in response.records {
-                let Some(new_image) = record.new_image else {
+            for record in response.records() {
+                let Some(new_image) = record.new_image.as_ref() else {
                     continue;
                 };
-                let key = string_attr(&new_image, "pk")?;
+                let key = string_attr(new_image, "pk")?;
                 if self.owned_key_index(&key).is_none() {
                     continue;
                 }
-                let value = string_attr(&new_image, "payload")?;
+                let value = string_attr(new_image, "payload")?;
                 actual.insert((key, value));
             }
-            let Some(next_page_token) = response.last_evaluated_key else {
+            let Some(next_page_token) = response.last_evaluated_key().map(str::to_owned) else {
                 break;
             };
             page_token = Some(next_page_token);
@@ -240,41 +255,37 @@ impl TableAtomicityWorkload {
         }
 
         self.stream_audit_count += expected.len() as u64;
+        self.trace_check_progress("stream_records", "finish", self.stream_audit_count);
         Ok(())
     }
 
     pub(crate) async fn check_direct_stream_pointers(
         &mut self,
-        provider: &FdbChaosProvider,
+        db: SimDatabase,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
-        let audit = provider
-            .audit_table_stream_pointer_integrity(&self.table_name(), 10_000)
+        use storage_provider::DynamoPort;
+        let table = self.table_name();
+        let cache = provider.metadata_cache();
+        let info = provider
+            .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+                Box::pin(async move {
+                    storage_provider::resolve_table_in_attempt(attempt, &cache, &table)
+                        .await
+                        .map(|(table, _)| table)
+                })
+            })
             .await
-            .map_err(|err| storage_error_detail(&err))?;
-        if audit.anomaly_count() > 0 {
-            self.record_anomaly(
-                AnomalyKind::AuditValueMismatch,
-                format!("{}/direct-stream-pointers", self.table_name()),
-                Some(
-                    "missing_system=0, missing_table_pointer=0, missing_item_stream=0, \
-                     missing_item_pointer=0, orphaned_table_pointer=0"
-                        .to_string(),
-                ),
-                Some(format!("{audit:?}")),
-                "direct compact stream pointer scan found missing pointer side effects".to_string(),
-            );
-            return Err(format!(
-                "direct stream pointer mismatch missing_system={} missing_table_pointer={} \
-                 missing_item_stream={} missing_item_pointer={} orphaned_table_pointer={}",
-                audit.missing_system_rows,
-                audit.missing_table_pointer_indexes,
-                audit.missing_item_stream_rows,
-                audit.missing_item_pointer_indexes,
-                audit.orphaned_table_pointer_indexes,
-            ));
+            .map_err(|error| storage_error_detail(&error))?;
+        let stream = storage_types::ItemHistoryAddress {
+            history_id: info.history_id,
+            stream_name: StreamName::table_stream(&self.table_name()),
         }
-        self.direct_stream_pointer_audit_count += audit.table_stream_rows;
-        self.direct_stream_pointer_decoupled_target_count += audit.decoupled_pointer_target_rows;
+        .physical_stream_name();
+        let (rows, decoupled) =
+            super::table_stream_audit::audit_stream_pointers(self.driver(db), stream).await?;
+        self.direct_stream_pointer_audit_count += rows;
+        self.direct_stream_pointer_decoupled_target_count += decoupled;
         Ok(())
     }
 }

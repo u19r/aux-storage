@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_sigv4_signing::{AwsRequestSigner, AwsStaticCredentials, CredentialSource, SignableBody};
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use http_request::reqwest::Client;
 use queue_provider::{
@@ -11,11 +12,12 @@ use queue_provider::{
     DeleteMessageBatchRequest, DeleteMessageBatchRequestEntry, DeleteMessageBatchResponse,
     DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
     GetQueueAttributesResponse, GetQueueUrlRequest, GetQueueUrlResponse, ListQueuesRequest,
-    ListQueuesResponse, MessageId, PurgeQueueRequest, Queue, QueueError, QueueInternalKind,
-    QueueMessage, QueueProvider, QueueResult, QueueValidationKind, ReceiptHandle,
-    ReceiveMessageRequest, ReceiveMessageResponse, RemoteCredentialStrategy, RemoteQueueSettings,
+    ListQueuesResponse, MessageId, PublishMessageRequest, PurgeQueueRequest, Queue, QueueError,
+    QueueInternalKind, QueueMessage, QueueOperations, QueueProvider, QueueResult,
+    QueueValidationKind, ReceiptHandle, ReceiveMessageRequest, ReceiveMessageResponse,
+    RemoteCredentialStrategy, RemoteQueueSettings, SQS_NON_EXISTENT_QUEUE_ERROR_TYPE,
     SendMessageBatchRequest, SendMessageBatchRequestEntry, SendMessageBatchResponse,
-    SendMessageRequest, SendMessageResponse, SetQueueAttributesRequest,
+    SendMessageRequest, SendMessageResponse, SetQueueAttributesRequest, sqs_json_error_type,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::instrument;
@@ -98,7 +100,7 @@ impl RemoteQueueProvider {
         serde_json::from_slice(&bytes).map_err(QueueError::from)
     }
 
-    async fn invoke_bytes<Request>(&self, target: &str, request: &Request) -> QueueResult<Vec<u8>>
+    async fn invoke_bytes<Request>(&self, target: &str, request: &Request) -> QueueResult<Bytes>
     where Request: Serialize + ?Sized {
         let endpoint = self.endpoint()?;
         let body = serde_json::to_vec(request)?;
@@ -126,7 +128,7 @@ impl RemoteQueueProvider {
         if !status.is_success() {
             return Err(classify_remote_error(status.as_u16(), &bytes));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     async fn build_headers(
@@ -160,7 +162,9 @@ impl RemoteQueueProvider {
     }
 
     async fn ensure_queue_matches(&self, queue: Queue) -> QueueResult<Queue> {
-        let Some(mut existing_queue) = self.get_queue_by_name(&queue.queue_name).await? else {
+        let Some(mut existing_queue) =
+            QueueProvider::get_queue_by_name(self, &queue.queue_name).await?
+        else {
             return Err(QueueError::internal_with_detail(
                 QueueInternalKind::RemoteBackendNotImplemented,
                 format!(
@@ -173,7 +177,7 @@ impl RemoteQueueProvider {
         let attribute_updates =
             queue_attribute_updates(&existing_queue.attributes, &queue.attributes);
         if !attribute_updates.is_empty() {
-            self.set_queue_attributes(&existing_queue.queue_url, attribute_updates)
+            QueueProvider::set_queue_attributes(self, &existing_queue.queue_url, attribute_updates)
                 .await?;
             existing_queue.attributes = queue.attributes;
         }
@@ -232,6 +236,13 @@ impl QueueProvider for RemoteQueueProvider {
     }
 
     async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
+        let Some(queue_url) = QueueProvider::get_queue_url_by_name(self, queue_name).await? else {
+            return Ok(None);
+        };
+        QueueProvider::get_queue(self, &queue_url).await
+    }
+
+    async fn get_queue_url_by_name(&self, queue_name: &str) -> QueueResult<Option<String>> {
         let response = self
             .invoke::<_, GetQueueUrlResponse>(
                 "AmazonSQS.GetQueueUrl",
@@ -241,7 +252,7 @@ impl QueueProvider for RemoteQueueProvider {
             )
             .await;
         match response {
-            Ok(queue) => self.get_queue(&queue.queue_url).await,
+            Ok(response) => Ok(Some(response.queue_url)),
             Err(QueueError::ResourceNotFound { .. }) => Ok(None),
             Err(err) => Err(err),
         }
@@ -306,6 +317,26 @@ impl QueueProvider for RemoteQueueProvider {
         Ok(())
     }
 
+    async fn publish_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
+        let response: SendMessageResponse = self
+            .invoke(
+                "AmazonSQS.PublishMessage",
+                &PublishMessageRequest {
+                    message_id: message.message_id,
+                    message: SendMessageRequest {
+                        queue_url: message.queue_url,
+                        message_body: message.body,
+                        delay_seconds: message
+                            .visibility_timestamp
+                            .map(delay_seconds_from_timestamp),
+                        message_attributes: message.message_attributes,
+                    },
+                },
+            )
+            .await?;
+        Ok(response.message_id)
+    }
+
     async fn send_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
         let response: SendMessageResponse = self
             .invoke(
@@ -313,10 +344,9 @@ impl QueueProvider for RemoteQueueProvider {
                 &SendMessageRequest {
                     queue_url: message.queue_url,
                     message_body: message.body,
-                    delay_seconds: message.visibility_timestamp.map(|visibility| {
-                        let now = storage_types::TimestampMillis::now().timestamp_millis();
-                        visibility.timestamp_millis().saturating_sub(now) as u32 / 1000
-                    }),
+                    delay_seconds: message
+                        .visibility_timestamp
+                        .map(delay_seconds_from_timestamp),
                     message_attributes: message.message_attributes,
                 },
             )
@@ -385,8 +415,11 @@ impl QueueProvider for RemoteQueueProvider {
                     max_number_of_messages: Some(max_messages),
                     visibility_timeout: Some(*visibility_timeout),
                     wait_time_seconds: Some(*wait_time_seconds),
-                    attribute_names: None,
-                    message_attribute_names: None,
+                    attribute_names: Some(vec![
+                        "SentTimestamp".into(),
+                        "ApproximateReceiveCount".into(),
+                    ]),
+                    message_attribute_names: Some(vec!["All".into()]),
                 },
             )
             .await?;
@@ -506,9 +539,126 @@ impl QueueProvider for RemoteQueueProvider {
     }
 }
 
+#[async_trait]
+impl QueueOperations for RemoteQueueProvider {
+    async fn create_queue(&self, queue: Queue) -> QueueResult<Queue> {
+        QueueProvider::create_queue(self, queue).await
+    }
+
+    async fn get_queue(&self, queue_url: &str) -> QueueResult<Option<Queue>> {
+        QueueProvider::get_queue(self, queue_url).await
+    }
+
+    async fn get_queue_by_name(&self, queue_name: &str) -> QueueResult<Option<Queue>> {
+        QueueProvider::get_queue_by_name(self, queue_name).await
+    }
+
+    async fn get_queue_url_by_name(&self, queue_name: &str) -> QueueResult<Option<String>> {
+        QueueProvider::get_queue_url_by_name(self, queue_name).await
+    }
+
+    async fn list_queues(&self, prefix: Option<&str>) -> QueueResult<Vec<Queue>> {
+        QueueProvider::list_queues(self, prefix).await
+    }
+
+    async fn delete_queue(&self, queue_url: &str) -> QueueResult<()> {
+        QueueProvider::delete_queue(self, queue_url).await
+    }
+
+    async fn purge_queue(&self, queue_url: &str) -> QueueResult<()> {
+        QueueProvider::purge_queue(self, queue_url).await
+    }
+
+    async fn get_queue_with_message_counts(
+        &self,
+        queue_url: &str,
+    ) -> QueueResult<Option<(Queue, queue_provider::QueueMessageCounts)>> {
+        QueueProvider::get_queue_with_message_counts(self, queue_url).await
+    }
+
+    async fn set_queue_attributes(
+        &self,
+        queue_url: &str,
+        attributes: std::collections::HashMap<String, String>,
+    ) -> QueueResult<()> {
+        QueueProvider::set_queue_attributes(self, queue_url, attributes).await
+    }
+
+    async fn publish_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
+        QueueProvider::publish_message(self, message).await
+    }
+
+    async fn send_message(&self, message: QueueMessage) -> QueueResult<MessageId> {
+        QueueProvider::send_message(self, message).await
+    }
+
+    async fn send_messages(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> QueueResult<Vec<QueueResult<MessageId>>> {
+        QueueProvider::send_messages(self, messages).await
+    }
+
+    async fn receive_messages(
+        &self,
+        queue_url: &str,
+        max_messages: u32,
+        visibility_timeout: storage_types::DurationSeconds,
+        wait_time_seconds: storage_types::DurationSeconds,
+    ) -> QueueResult<Vec<queue_provider::MessageResponse>> {
+        QueueProvider::receive_messages(
+            self,
+            queue_url,
+            max_messages,
+            visibility_timeout,
+            wait_time_seconds,
+        )
+        .await
+    }
+
+    async fn delete_message(&self, queue_url: &str, receipt: ReceiptHandle) -> QueueResult<()> {
+        QueueProvider::delete_message(self, queue_url, receipt).await
+    }
+
+    async fn delete_messages(
+        &self,
+        queue_url: &str,
+        receipts: Vec<ReceiptHandle>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        QueueProvider::delete_messages(self, queue_url, receipts).await
+    }
+
+    async fn change_message_visibility(
+        &self,
+        queue_url: &str,
+        receipt: ReceiptHandle,
+        visibility_timeout: storage_types::DurationSeconds,
+    ) -> QueueResult<()> {
+        QueueProvider::change_message_visibility(self, queue_url, receipt, visibility_timeout).await
+    }
+
+    async fn change_message_visibilities(
+        &self,
+        queue_url: &str,
+        entries: Vec<(ReceiptHandle, storage_types::DurationSeconds)>,
+    ) -> QueueResult<Vec<QueueResult<()>>> {
+        QueueProvider::change_message_visibilities(self, queue_url, entries).await
+    }
+
+    async fn update_message_snapshot_checkpoint(
+        &self,
+        queue_url: &str,
+        receipt: ReceiptHandle,
+        checkpoint_data: String,
+    ) -> QueueResult<()> {
+        QueueProvider::update_message_snapshot_checkpoint(self, queue_url, receipt, checkpoint_data)
+            .await
+    }
+}
+
 fn delay_seconds_from_timestamp(visibility: storage_types::TimestampMillis) -> u32 {
     let now = storage_types::TimestampMillis::now().timestamp_millis();
-    let delay_ms = visibility.timestamp_millis().saturating_sub(now);
+    let delay_ms = visibility.timestamp_millis().saturating_sub(now).max(0);
     u32::try_from(delay_ms / 1_000).unwrap_or(u32::MAX)
 }
 
@@ -646,7 +796,9 @@ pub(crate) fn classify_remote_error(status: u16, body: &[u8]) -> QueueError {
             resource_id: message,
         };
     }
-    if status == 404 || error_type.contains("NonExistentQueue") {
+    let is_json_queue_not_found =
+        error_type == sqs_json_error_type(SQS_NON_EXISTENT_QUEUE_ERROR_TYPE);
+    if status == 404 || error_type.contains("NonExistentQueue") || is_json_queue_not_found {
         return QueueError::ResourceNotFound {
             resource_type: "queue",
             resource_id: message,
@@ -660,12 +812,8 @@ pub(crate) fn classify_remote_error(status: u16, body: &[u8]) -> QueueError {
     }
     if status == 400 {
         return QueueError::validation_with_detail(
-            QueueValidationKind::MessageNotFound,
-            if error_type.is_empty() {
-                message
-            } else {
-                error_type
-            },
+            QueueValidationKind::InvalidParameterValue,
+            message,
         );
     }
     QueueError::internal_with_detail(QueueInternalKind::RemoteBackendNotImplemented, message)

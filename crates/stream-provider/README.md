@@ -1,199 +1,41 @@
-# Stream Provider
+# stream-provider
 
-The Stream Provider crate provides a trait-based abstraction for implementing time-ordered streaming data storage with cursor-based navigation. This crate enables storing sequences of items with timestamps and tracking multiple named cursors to maintain reading positions within streams.
+`stream-provider` defines typed stream, cursor, retained-image, and logical SystemStream
+contracts. Concrete storage providers implement the
+[StreamProvider trait](src/stream_provider/provider_trait.rs).
 
-## Overview
+## User streams
 
-Streams are time-ordered collections of items that can be read forwards or backwards. They support:
+Call `initialize_stream` before using a provider. `create_stream` takes a `UserStreamName`,
+an optional `DurationSeconds` retention value, and a `StreamPartitioningMode`; it returns
+the physical `StreamName` used by append and read operations. `get_stream` and
+`delete_stream` take the logical `UserStreamName`.
 
-- **Time-ordered storage**: Items are stored with timestamps for chronological ordering
-- **Named cursors**: Create and manage multiple reading positions within a stream
-- **TTL support**: Optional time-to-live for automatic cleanup of old items
-- **Pagination**: Iterator-based reading with page tokens
-- **Background cleanup**: Automatic deletion of expired items with configurable parallelism
+`append_item` takes a `StreamName`, borrowed item bytes, and an optional partition key,
+and returns a `StreamItemId`. `read_forward` and `read_backward` take an optional exclusive
+`StreamItemId` boundary and a limit from 1 through 1,000. Forward reads return oldest items
+first; backward reads return newest items first. Treat returned continuation identifiers
+as provider-owned boundaries.
 
-## Core Concepts
+## Cursors
 
-### Streams
+Cursor operations use typed `CursorName` and `StreamName` values. `create_cursor` starts a
+cursor at a `CursorPosition`. `read_from_cursor` reads a page without advancing it;
+call `advance_cursor` only after the consumer has durably handled the page.
 
-A stream is identified by a **stream prefix** and contains time-ordered items. The stream prefix acts as the namespace for all items in the stream and must be provided when creating a stream.
+Protected bootstrap cursors use separate typed operations. Generic cursor reads, advances,
+and deletion do not authorize changes to protected bootstrap state.
 
-**Stream Name Restrictions:**
+## Logical history and retained images
 
-- Length: 1-255 characters
-- Allowed characters: alphanumeric, hyphens, underscores, periods
-- Must not start or end with special characters
-- Case-sensitive
+SystemStream pages carry logical scope, lineage, and checkpoint identities. Providers
+without the required logical-history capability return an unsupported error. Splits must
+atomically seal the parent, publish child lineages, and record a durable operation receipt;
+replaying the same operation returns its recorded result.
 
-### Cursors
+Pointer reads resolve the exact retained item version named by a stored pointer. Missing or
+corrupt history is an error, even when a newer version is available. Background consumers
+may omit deleted source incarnations only when their provider contract permits it.
 
-Cursors are named bookmarks that track reading positions within a stream. Multiple cursors can exist per stream, allowing different consumers to track their own reading positions.
-
-**Cursor Name Restrictions:**
-
-- Length: 1-64 characters
-- Allowed characters: alphanumeric, hyphens, underscores
-- Must not start or end with special characters
-- Case-sensitive
-- Must be unique within a stream
-
-### TTL and Background Cleanup
-
-Streams can optionally configure a TTL (time-to-live) value in seconds. A background task runs every minute to clean up expired items:
-
-- **Processing schedule**: Maximum once per minute
-- **Parallelism**: Configurable number of streams processed concurrently
-- **Resource management**: Automatically adjusts timing to avoid overloading
-- **Scale**: Designed to handle 100,000+ streams efficiently
-- **Timing behavior**: If processing takes >1 minute, continues immediately; otherwise sleeps for remaining time
-
-## StreamProvider Trait Methods
-
-### Stream Management
-
-#### `initialize() -> StreamResult<()>`
-
-Initialize the stream storage backend. Must be called before using other methods.
-
-#### `create_stream(stream_name: &str, stream_prefix: &str, ttl_seconds: Option<u64>) -> StreamResult<()>`
-
-Create a new stream with the specified name and storage prefix. Optionally configure TTL for automatic cleanup.
-
-#### `delete_stream(stream_name: &str) -> StreamResult<()>`
-
-Delete a stream and all its items and cursors.
-
-### Item Operations
-
-#### `append_item(stream_name: &str, item_data: &[u8]) -> StreamResult<ItemId>`
-
-Add an item to the end of the stream with the current timestamp. Returns the item ID.
-
-#### `read_forward(stream_name: &str, page_token: Option<&str>, limit: u32) -> StreamResult<StreamPage>`
-
-Read items in chronological order (oldest first). Use page token for pagination.
-
-#### `read_backward(stream_name: &str, page_token: Option<&str>, limit: u32) -> StreamResult<StreamPage>`
-
-Read items in reverse chronological order (newest first). Use page token for pagination.
-
-### Cursor Management
-
-#### `create_cursor(stream_name: &str, cursor_name: &str, position: CursorPosition) -> StreamResult<()>`
-
-Create a named cursor at the specified position:
-
-- `CursorPosition::Head`: Start at the beginning (oldest items)
-- `CursorPosition::Tail`: Start at the end (newest items)
-
-Returns error if cursor name already exists.
-
-#### `read_from_cursor(stream_name: &str, cursor_name: &str, limit: u32) -> StreamResult<CursorPage>`
-
-Read items starting from cursor position, advancing the cursor automatically.
-
-#### `delete_cursor(stream_name: &str, cursor_name: &str) -> StreamResult<()>`
-
-Delete a named cursor.
-
-### Background Cleanup
-
-#### `start_cleanup_task(parallelism: usize) -> StreamResult<()>`
-
-Start the background TTL cleanup task with specified parallelism factor.
-
-#### `stop_cleanup_task() -> StreamResult<()>`
-
-Stop the background cleanup task gracefully.
-
-## Usage Examples
-
-### Basic Stream Operations
-
-```rust
-use stream_provider::{StreamProvider, CursorPosition};
-
-// Initialize provider
-let provider = MyStreamProvider::new("./data").await?;
-provider.initialize().await?;
-
-// Create a stream with 1 hour TTL
-provider.create_stream("events", "app/events/", Some(3600)).await?;
-
-// Add items
-let item1_id = provider.append_item("events", b"first event").await?;
-let item2_id = provider.append_item("events", b"second event").await?;
-
-// Read forward (chronological order)
-let page = provider.read_forward("events", None, 10).await?;
-for item in page.items {
-    println!("Item: {:?}", item.data);
-}
-```
-
-### Cursor-based Reading
-
-```rust
-// Create cursor at stream head
-provider.create_cursor("events", "consumer1", CursorPosition::Head).await?;
-
-// Read from cursor (auto-advances)
-let cursor_page = provider.read_from_cursor("events", "consumer1", 5).await?;
-println!("Read {} items", cursor_page.items.len());
-
-// Create another cursor at tail
-provider.create_cursor("events", "consumer2", CursorPosition::Tail).await?;
-```
-
-### Background Cleanup
-
-```rust
-// Start cleanup with 4 parallel workers
-provider.start_cleanup_task(4).await?;
-
-// Cleanup runs automatically every minute
-// Process up to 4 streams concurrently
-// Handles timing to avoid overload
-
-// Stop when shutting down
-provider.stop_cleanup_task().await?;
-```
-
-### Pagination
-
-```rust
-// Read with pagination
-let mut page_token = None;
-loop {
-    let page = provider.read_forward("events", page_token.as_deref(), 100).await?;
-
-    for item in page.items {
-        // Process item
-    }
-
-    if page.next_token.is_none() {
-        break;
-    }
-    page_token = page.next_token;
-}
-```
-
-## Error Handling
-
-The trait uses `StreamResult<T>` for all operations, which maps to common error scenarios:
-
-- **StreamNotFound**: Stream does not exist
-- **CursorNotFound**: Cursor does not exist
-- **CursorAlreadyExists**: Attempted to create duplicate cursor
-- **InvalidStreamName**: Stream name violates restrictions
-- **InvalidCursorName**: Cursor name violates restrictions
-- **StorageError**: Backend storage operation failed
-- **ValidationError**: Invalid parameters or state
-
-## Implementation Notes
-
-- All operations are async and thread-safe
-- Implementations should handle concurrent access gracefully
-- TTL cleanup should not interfere with active read/write operations
-- Page tokens should be opaque and implementation-specific
-- Timestamps should use UTC and be monotonic when possible
+Operations return typed `StreamResult` errors. Backend capabilities and retention policy
+remain explicit; callers must not infer support from another provider's behavior.

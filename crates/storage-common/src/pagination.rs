@@ -7,9 +7,6 @@
 //! - Absent limit uses the provided default.
 use storage_types::{StorageError, StorageResult};
 
-pub const DEFAULT_GENERIC_LIMIT: u32 = 100;
-pub const MAX_GENERIC_LIMIT: u32 = 10_000;
-
 /// Normalize a requested limit into an effective limit enforcing default and
 /// max.
 pub fn normalize_limit(

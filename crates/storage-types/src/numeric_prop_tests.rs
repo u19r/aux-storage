@@ -8,8 +8,8 @@ use crate::numeric::SortableNumeric;
 // sign and decimals
 fn numeric_string_strategy() -> impl Strategy<Value = String> {
     // Limit length to keep shrinking efficient and avoid extremely huge numbers
-    // Format: optional '-' then 1..10 digits, optional fractional part with 1..6
-    // digits
+    // Format: optional '-' then 1..10 digits, optional fractional part with
+    // 1..6 digits
     let int_part = "[0-9]{1,10}"; // we will filter leading zeros except single zero below
     let frac_part = "[0-9]{1,6}";
     // Build a regex that captures integers or decimals: -?\d+(?:\.\d+)?
@@ -17,15 +17,15 @@ fn numeric_string_strategy() -> impl Strategy<Value = String> {
     prop::string::string_regex(&format!("-?(?:{int_part})(?:\\.{frac_part})?"))
         .unwrap()
         .prop_filter("normalize numbers", |s| {
-            // Reject forms like '-' or '.' or '-.' (shouldn't happen) and enforce no
-            // leading zeros unless zero itself
+            // Reject forms like '-' or '.' or '-.' (shouldn't happen) and
+            // enforce no leading zeros unless zero itself
             if s.is_empty() || s == "-" {
                 return false;
             }
             let parts: Vec<&str> = s.split('.').collect();
             let int = parts[0];
-            // Use strip_prefix to satisfy clippy::manual_strip; safe because we only remove
-            // ASCII '-'
+            // Use strip_prefix to satisfy clippy::manual_strip; safe because we
+            // only remove ASCII '-'
             let int_digits = int.strip_prefix('-').unwrap_or(int);
             if int_digits.len() > 1 && int_digits.starts_with('0') {
                 return false;

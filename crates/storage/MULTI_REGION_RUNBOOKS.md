@@ -8,7 +8,7 @@ It assumes:
 
 - multi-region replication is leaderless
 - the system stream is the durable replication journal
-- replication endpoints are private and authenticated
+- replication endpoints are private and network-scoped
 - stream trim and background jobs still run, but trim must remain replication-safe and must not cut history sooner than the last 72 hours
 
 ## What Operators Need To Watch
@@ -20,7 +20,7 @@ For each source and destination region pair, watch:
 - checkpoint freshness
 - last successful heartbeat age
 - heartbeat round-trip time
-- auth failures
+- protocol or endpoint failures
 - bootstrap progress
 - stream growth
 
@@ -37,17 +37,16 @@ Suggested interpretation:
 - unhealthy
   - heartbeats are stale or absent
   - checkpoints are not moving
-  - auth failures or endpoint failures are persistent
+  - protocol or endpoint failures are persistent
 
 ## Standard Preconditions
 
 Before enabling or changing multi-region tables:
 
 1. Confirm every region has a reachable replication endpoint.
-2. Confirm inbound `storage-replication` auth is enabled.
-3. Confirm stream trim is replication-safe for the deployment and enforces the minimum retention floor.
-4. Confirm metrics and alerts are live.
-5. Confirm enough disk headroom exists for backlog growth.
+2. Confirm stream trim is replication-safe for the deployment and enforces the minimum retention floor.
+3. Confirm metrics and alerts are live.
+4. Confirm enough disk headroom exists for backlog growth.
 
 ## Add Replica
 
@@ -58,12 +57,11 @@ Goal:
 Procedure:
 
 1. Verify the destination region is healthy and reachable.
-2. Verify the destination accepts the current or next `storage-replication` token.
-3. Ensure region registry and runtime peer configuration are present.
-4. Call `UpdateTable` with `ReplicaUpdates.Create`.
-5. Confirm the control-plane state shows the new replica in bootstrap or creating state.
-6. Watch bootstrap progress and lag until steady-state catchup completes.
-7. Confirm the replica transitions to `ACTIVE`.
+2. Ensure region registry and runtime peer configuration are present.
+3. Call `UpdateTable` with `ReplicaUpdates.Create`.
+4. Confirm the control-plane state shows the new replica in bootstrap or creating state.
+5. Watch bootstrap progress and lag until steady-state catchup completes.
+6. Confirm the replica transitions to `ACTIVE`.
 
 Expected signals:
 
@@ -73,7 +71,7 @@ Expected signals:
 
 If bootstrap stalls:
 
-- check auth failures
+- check protocol or endpoint failures
 - check destination endpoint reachability
 - check stream replay worker logs
 - check disk and CPU saturation on the destination
@@ -113,7 +111,7 @@ Expected system behavior:
 
 Operator actions:
 
-1. Confirm whether the outage is network, auth, or full region failure.
+1. Confirm whether the outage is network, protocol, or full region failure.
 2. Confirm local writes remain healthy in surviving regions.
 3. Watch disk growth in regions producing backlog.
 4. Do not reset checkpoints during a normal outage.
@@ -128,7 +126,7 @@ Goal:
 Procedure:
 
 1. Restore region service health.
-2. Confirm replication endpoint auth succeeds.
+2. Confirm the replication endpoint is reachable.
 3. Confirm heartbeats resume.
 4. Watch backlog drain from the last stored checkpoint.
 5. Verify lag returns toward steady-state baseline.
@@ -175,26 +173,6 @@ Rule:
 
 - prefer a clean rebuild over a clever but risky manual repair
 
-## Token Rotation With Overlap
-
-Goal:
-
-- rotate replication credentials without downtime
-
-Procedure:
-
-1. Mint a new `storage-replication` token.
-2. Distribute the new token to all regions as an accepted inbound token.
-3. Add the new token to outbound runtime config as the next token.
-4. Confirm both old and new tokens are accepted inbound.
-5. Switch outbound senders to the new token.
-6. Watch heartbeat and apply success with the new token.
-7. Revoke the old token after the overlap window closes.
-
-Failure mode:
-
-- if auth failures spike immediately after switch, re-enable the old token inbound, restore outbound use of the old token, and diagnose propagation drift
-
 ## Partition Detection
 
 A partition may exist even when user traffic is low.
@@ -203,14 +181,14 @@ Primary signals:
 
 - missed heartbeats
 - asymmetrical region-to-region lag
-- one-way auth or endpoint failures
+- one-way protocol or endpoint failures
 
 Procedure:
 
 1. Check the region pair matrix from the health endpoint.
 2. Compare heartbeat staleness in both directions.
 3. Confirm whether the issue is one-way or two-way.
-4. Check network path, TLS, DNS, and auth separately.
+4. Check private network routing, configured endpoint reachability, and DNS separately.
 5. Keep user writes local and avoid unnecessary operator churn unless data loss or misconfiguration is suspected.
 
 ## Growing Lag Or Backpressure
@@ -250,33 +228,20 @@ Procedure:
 5. Verify trim is not deleting history needed for acceptable peer recovery.
 6. Escalate if projected capacity crosses agreed headroom limits.
 
-## Security Incident On Replication Auth
-
-Use this when a token is believed to be exposed or misused.
-
-Procedure:
-
-1. Mint a replacement token immediately.
-2. Add the replacement as accepted inbound across all regions.
-3. Switch outbound senders to the new token.
-4. Revoke the compromised token as soon as healthy traffic is confirmed.
-5. Review logs for unexpected replication endpoint usage.
-
 ## Recommended Chaos Drills
 
 Run these regularly once the feature exists:
 
 1. Kill one region while writes continue in another.
 2. Partition one region pair while keeping the rest of the mesh healthy.
-3. Rotate tokens during active write traffic.
-4. Rebuild one region from empty state.
-5. Force a large backlog and verify steady recovery without local write impact.
+3. Rebuild one region from empty state.
+4. Force a large backlog and verify steady recovery without local write impact.
 
 ## Escalation Guide
 
 Escalate immediately when:
 
-- replication auth fails across multiple pairs
+- replication protocol or endpoint failures persist across multiple pairs
 - loop prevention appears broken
 - lag continues rising after the peer is confirmed healthy
 - checkpoint corruption is suspected
@@ -286,4 +251,4 @@ Escalate after observation when:
 
 - a short outage is recovering normally
 - lag is falling and checkpoints are moving
-- health recovered after token rotation
+- health recovered after endpoint recovery

@@ -62,8 +62,8 @@ fn queue_foundationdb_builder_preserves_optional_cluster_settings() {
         tenant_name: Some("tenant".to_string()),
         subspace_prefix: Some("queue".to_string()),
         cache_read_version_ms: 10,
-        immediate_gsi_consistency: false,
         report_conflicting_keys: true,
+        ..Default::default()
     });
 
     let foundationdb = config.foundationdb.expect("foundationdb settings");
@@ -84,7 +84,7 @@ fn queue_foundationdb_builder_uses_the_shared_cache_default() {
             .foundationdb
             .expect("foundationdb settings")
             .cache_read_version_ms,
-        50
+        storage_types::FOUNDATIONDB_DEFAULT_CACHE_READ_VERSION_MS
     );
 }
 

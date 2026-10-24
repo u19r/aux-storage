@@ -10,7 +10,7 @@ use tokio::{
     time::sleep,
 };
 
-pub struct ConfigWatchGuard {
+pub(crate) struct ConfigWatchGuard {
     _watcher: RecommendedWatcher,
     handle: JoinHandle<()>,
 }
@@ -25,7 +25,7 @@ impl Drop for ConfigWatchGuard {
     clippy::needless_pass_by_value,
     reason = "spawn takes ownership to satisfy watcher lifetime and async task requirements"
 )]
-pub fn spawn(
+pub(crate) fn spawn(
     path: PathBuf,
     initial: Arc<Config>,
     config_manager: Arc<dyn MutableConfigManager>,

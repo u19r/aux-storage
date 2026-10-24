@@ -24,11 +24,12 @@ use stream_provider::{
 };
 
 use crate::{
-    PubsubAction, PubsubDeliveryConfig, PubsubManager, PubsubSuccess,
+    manager::{PubsubDeliveryConfig, PubsubManager},
     notification::{
         NotificationRenderContext, PubsubNotificationSignRequest, PubsubNotificationSigner,
         notification_body, notification_headers, notification_string_to_sign,
     },
+    protocol::{PubsubAction, PubsubSuccess},
 };
 
 #[derive(Default)]
@@ -145,17 +146,148 @@ impl Transport for RecordingHttpTransport {
 }
 
 async fn create_test_queue_manager() -> TestQueueManager {
-    let config = QueueConfig {
+    let config = pubsub_fixture_queue_config();
+    let provider = create_queue_provider(config).await.unwrap();
+    TestQueueManager::new(Arc::from(provider))
+}
+
+#[cfg(all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")))]
+fn pubsub_fixture_queue_config() -> QueueConfig {
+    QueueConfig {
+        backend_type: QueueBackend::Turso,
+        connection_string: Some(":memory:".to_string()),
+        file_path: None,
+        postgres: None,
+        foundationdb: None,
+        remote: None,
+    }
+}
+
+#[cfg(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+))]
+fn pubsub_fixture_queue_config() -> QueueConfig {
+    let dsn = std::env::var("TEST_POSTGRES_DSN")
+        .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
+        .expect("TEST_POSTGRES_DSN or AUX_QUEUE_POSTGRES_DSN is required");
+    QueueConfig {
+        backend_type: QueueBackend::Postgres,
+        connection_string: Some(dsn.clone()),
+        file_path: None,
+        postgres: Some(queue::PostgresSettings {
+            dsn,
+            max_pool_size: 4,
+            background_max_pool_size: 4,
+            tls: false,
+        }),
+        foundationdb: None,
+        remote: None,
+    }
+}
+
+#[cfg(not(any(
+    all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")),
+    all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    )
+)))]
+fn pubsub_fixture_queue_config() -> QueueConfig {
+    QueueConfig {
         backend_type: QueueBackend::SQLite,
         connection_string: Some(":memory:".to_string()),
         file_path: None,
         postgres: None,
         foundationdb: None,
         remote: None,
-    };
-    let provider = create_queue_provider(config).await.unwrap();
-    provider.initialize().await.unwrap();
-    TestQueueManager::new(Arc::from(provider))
+    }
+}
+
+fn pubsub_fixture_queue_backend() -> QueueBackend {
+    #[cfg(all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")))]
+    {
+        return QueueBackend::Turso;
+    }
+    #[cfg(all(
+        feature = "postgres",
+        not(feature = "sqlite"),
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "foundationdb")
+    ))]
+    {
+        return QueueBackend::Postgres;
+    }
+    #[cfg(not(any(
+        all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")),
+        all(
+            feature = "postgres",
+            not(feature = "sqlite"),
+            not(feature = "turso"),
+            not(feature = "rocksdb"),
+            not(feature = "foundationdb")
+        )
+    )))]
+    {
+        QueueBackend::SQLite
+    }
+}
+
+#[test]
+fn pubsub_manager_fixture_selects_the_only_compiled_sql_backend() {
+    let backend = pubsub_fixture_queue_backend();
+    assert_eq!(
+        matches!(backend, QueueBackend::Turso),
+        cfg!(all(
+            feature = "turso",
+            not(feature = "sqlite"),
+            not(feature = "postgres")
+        ))
+    );
+    assert_eq!(
+        matches!(backend, QueueBackend::Postgres),
+        cfg!(all(
+            feature = "postgres",
+            not(feature = "sqlite"),
+            not(feature = "turso"),
+            not(feature = "rocksdb"),
+            not(feature = "foundationdb")
+        ))
+    );
+}
+
+#[cfg(all(
+    feature = "postgres",
+    not(feature = "sqlite"),
+    not(feature = "turso"),
+    not(feature = "rocksdb"),
+    not(feature = "foundationdb")
+))]
+#[tokio::test]
+async fn postgres_queue_provider_initialization_is_concurrent_safe() {
+    async fn initialize(config: QueueConfig) -> Result<(), String> {
+        create_queue_provider(config)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("create queue provider: {error:?}"))
+    }
+
+    let (first, second, third, fourth) = tokio::join!(
+        initialize(pubsub_fixture_queue_config()),
+        initialize(pubsub_fixture_queue_config()),
+        initialize(pubsub_fixture_queue_config()),
+        initialize(pubsub_fixture_queue_config()),
+    );
+    for result in [first, second, third, fourth] {
+        result.expect("concurrent PostgreSQL queue initialization should be idempotent");
+    }
 }
 
 async fn first_subscription(
@@ -389,6 +521,7 @@ async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
         })
         .await
         .unwrap();
+    assert_eq!(provider.materialize_publish_intents(10).await.unwrap(), 1);
     let record_id = DeliveryRecordId(format!(
         "{}:{}",
         subscription.subscription_arn, publish.message_id
@@ -707,6 +840,7 @@ async fn process_due_deliveries_retries_then_fails_builtin_http_delivery() {
             max_attempts: 2,
             retry_base_delay: Duration::ZERO,
             request_timeout: Duration::from_secs(1),
+            delivery_concurrency: 1,
             subscribe_url_base: None,
             unsubscribe_url_base: None,
             signing_cert_url: None,

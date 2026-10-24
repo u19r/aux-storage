@@ -6,8 +6,8 @@ use crate::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
     DeleteTableRequest, DescribeTableRequest, GetItemRequest, GetStreamRecordsRequest,
     ListTablesRequest, PutItemRequest, QueryRequest, ScanRequest, StreamRetentionDuration,
-    TableName, TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
-    UpdateTableRequest,
+    SystemStreamCheckpointToken, TableName, TransactGetItemsRequest, TransactWriteItemsRequest,
+    UpdateItemRequest, UpdateTableRequest,
 };
 
 fn valid_create_table_payload() -> serde_json::Value {
@@ -31,7 +31,7 @@ fn create_table_accepts_aux_stream_duration_extensions() {
     payload["AuxStreamDurationHours"] = json!(168);
     payload["AuxDefaultItemStreamDurationHours"] = json!(-1);
 
-    let request = CreateTableRequest::try_from(payload).expect("duration extensions should parse");
+    let request = CreateTableRequest::try_from(payload).unwrap();
 
     assert_eq!(
         request.aux_stream_duration_hours,
@@ -45,11 +45,32 @@ fn create_table_accepts_aux_stream_duration_extensions() {
 
 #[test]
 fn create_table_omits_aux_stream_duration_extensions_by_default() {
-    let request =
-        CreateTableRequest::try_from(valid_create_table_payload()).expect("request should parse");
+    let request = CreateTableRequest::try_from(valid_create_table_payload()).unwrap();
 
     assert_eq!(request.aux_stream_duration_hours, None);
     assert_eq!(request.aux_default_item_stream_duration_hours, None);
+}
+
+#[test]
+fn create_table_rejects_duplicate_gsi_names_before_backend_layout() {
+    let mut payload = valid_create_table_payload();
+    payload["GlobalSecondaryIndexes"] = json!([
+        {
+            "IndexName": "by_pk",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" }
+        },
+        {
+            "IndexName": "by_pk",
+            "KeySchema": [{ "AttributeName": "sk", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" }
+        }
+    ]);
+    let request = CreateTableRequest::try_from(payload).unwrap();
+    let error = request
+        .stored_table_info_at(crate::TimestampMillis::from_timestamp(0))
+        .unwrap_err();
+    assert!(error.to_string().contains("duplicate GSI name 'by_pk'"));
 }
 
 #[test]
@@ -65,7 +86,7 @@ fn create_table_rejects_invalid_aux_stream_duration_extensions() {
         let mut payload = valid_create_table_payload();
         payload[field] = value;
 
-        let err = CreateTableRequest::try_from(payload).expect_err("invalid duration should fail");
+        let err = CreateTableRequest::try_from(payload).unwrap_err();
 
         assert!(
             err.contains("Invalid request format"),
@@ -82,7 +103,7 @@ fn update_table_accepts_aux_stream_duration_extensions() {
         "AuxDefaultItemStreamDurationHours": 24
     });
 
-    let request = UpdateTableRequest::try_from(payload).expect("duration extensions should parse");
+    let request = UpdateTableRequest::try_from(payload).unwrap();
 
     assert_eq!(
         request.aux_stream_duration_hours,
@@ -109,7 +130,7 @@ fn update_table_rejects_invalid_aux_stream_duration_extensions() {
             field: value
         });
 
-        let err = UpdateTableRequest::try_from(payload).expect_err("invalid duration should fail");
+        let err = UpdateTableRequest::try_from(payload).unwrap_err();
 
         assert!(
             err.contains("Invalid request format"),
@@ -185,12 +206,11 @@ fn item_write_requests_accept_aux_item_stream_ttl_extension() {
         ]
     });
 
-    let put = PutItemRequest::try_from(put).expect("put ttl should parse");
-    let update = UpdateItemRequest::try_from(update).expect("update ttl should parse");
-    let delete = DeleteItemRequest::try_from(delete).expect("delete ttl should parse");
-    let batch = BatchWriteItemRequest::try_from(batch).expect("batch ttl should parse");
-    let transact =
-        TransactWriteItemsRequest::try_from(transact).expect("transact ttl should parse");
+    let put = PutItemRequest::try_from(put).unwrap();
+    let update = UpdateItemRequest::try_from(update).unwrap();
+    let delete = DeleteItemRequest::try_from(delete).unwrap();
+    let batch = BatchWriteItemRequest::try_from(batch).unwrap();
+    let transact = TransactWriteItemsRequest::try_from(transact).unwrap();
 
     assert_eq!(
         put.aux_item_stream_ttl_hours,
@@ -205,14 +225,20 @@ fn item_write_requests_accept_aux_item_stream_ttl_extension() {
         Some(StreamRetentionDuration::FiniteHours(168))
     );
     assert_eq!(
-        batch.request_items[&TableName::new("TestTable")][0]
+        batch
+            .request_items
+            .get(&TableName::new("TestTable"))
+            .unwrap()[0]
             .put_request
             .as_ref()
             .and_then(|put| put.aux_item_stream_ttl_hours),
         Some(StreamRetentionDuration::FiniteHours(12))
     );
     assert_eq!(
-        batch.request_items[&TableName::new("TestTable")][1]
+        batch
+            .request_items
+            .get(&TableName::new("TestTable"))
+            .unwrap()[1]
             .delete_request
             .as_ref()
             .and_then(|delete| delete.aux_item_stream_ttl_hours),
@@ -281,26 +307,22 @@ fn item_write_requests_reject_invalid_aux_item_stream_ttl_extension() {
         }]
     });
 
-    let put_err = PutItemRequest::try_from(put_zero).expect_err("put zero should fail");
-    let update_err =
-        UpdateItemRequest::try_from(update_string).expect_err("update string should fail");
-    let delete_err =
-        DeleteItemRequest::try_from(delete_negative).expect_err("delete negative should fail");
+    let put_err = PutItemRequest::try_from(put_zero).unwrap_err();
+    let update_err = UpdateItemRequest::try_from(update_string).unwrap_err();
+    let delete_err = DeleteItemRequest::try_from(delete_negative).unwrap_err();
     assert!(put_err.contains("Invalid request format"));
     assert!(update_err.contains("Invalid request format"));
     assert!(delete_err.contains("Invalid request format"));
 
-    let batch_err =
-        BatchWriteItemRequest::try_from(batch_fraction).expect_err("batch fraction should fail");
-    let transact_err = TransactWriteItemsRequest::try_from(transact_too_large)
-        .expect_err("transact too large should fail");
+    let batch_err = BatchWriteItemRequest::try_from(batch_fraction).unwrap_err();
+    let transact_err = TransactWriteItemsRequest::try_from(transact_too_large).unwrap_err();
 
     assert!(batch_err.contains("Invalid request format"));
     assert!(transact_err.contains("Invalid request format"));
 }
 
 #[test]
-fn get_item_rejects_unknown_fields() {
+fn get_item_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
         "Key": {"id": {"S": "test123"}},
@@ -308,8 +330,8 @@ fn get_item_rejects_unknown_fields() {
     });
 
     let result: Result<GetItemRequest, String> = payload.try_into();
-    let err = result.expect_err("GetItem should reject unknown fields");
-    assert!(err.contains("unknown field"), "unexpected error: {err}");
+    let request = result.unwrap();
+    assert_eq!(request.table_name.as_ref(), "TestTable");
 }
 
 #[test]
@@ -319,13 +341,13 @@ fn get_item_empty_key_uses_dynamodb_schema_message() {
         "Key": {},
     });
 
-    let err = GetItemRequest::try_from(payload).expect_err("empty key should fail");
+    let err = GetItemRequest::try_from(payload).unwrap_err();
 
     assert_eq!(err, "The provided key element does not match the schema");
 }
 
 #[test]
-fn put_item_rejects_unknown_fields() {
+fn put_item_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
         "Item": {"id": {"S": "test123"}},
@@ -333,12 +355,12 @@ fn put_item_rejects_unknown_fields() {
     });
 
     let result: Result<PutItemRequest, String> = payload.try_into();
-    let err = result.expect_err("PutItem should reject unknown fields");
-    assert!(err.contains("unknown field"), "unexpected error: {err}");
+    let request = result.unwrap();
+    assert_eq!(request.table_name.as_ref(), "TestTable");
 }
 
 #[test]
-fn delete_item_rejects_unknown_fields() {
+fn delete_item_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
         "Key": {"id": {"S": "test123"}},
@@ -346,24 +368,24 @@ fn delete_item_rejects_unknown_fields() {
     });
 
     let result: Result<DeleteItemRequest, String> = payload.try_into();
-    let err = result.expect_err("DeleteItem should reject unknown fields");
-    assert!(err.contains("unknown field"), "unexpected error: {err}");
+    let request = result.unwrap();
+    assert_eq!(request.table_name.as_ref(), "TestTable");
 }
 
 #[test]
-fn scan_rejects_unknown_fields() {
+fn scan_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
         "InvalidField": "invalid",
     });
 
     let result: Result<ScanRequest, String> = payload.try_into();
-    let err = result.expect_err("Scan should reject unknown fields");
-    assert!(err.contains("unknown field"), "unexpected error: {err}");
+    let request = result.unwrap();
+    assert_eq!(request.table_name.as_ref(), "TestTable");
 }
 
 #[test]
-fn query_rejects_unknown_fields() {
+fn query_ignores_unknown_fields() {
     let payload = json!({
         "TableName": "TestTable",
         "KeyConditionExpression": "pk = :pk_val",
@@ -372,8 +394,8 @@ fn query_rejects_unknown_fields() {
     });
 
     let result: Result<QueryRequest, String> = payload.try_into();
-    let err = result.expect_err("Query should reject unknown fields");
-    assert!(err.contains("unknown field"), "unexpected error: {err}");
+    let request = result.unwrap();
+    assert_eq!(request.table_name.as_ref(), "TestTable");
 }
 
 #[test]
@@ -503,7 +525,7 @@ fn create_table_rejects_invalid_table_and_key_shapes() {
 
     for (case_name, payload, expected_error) in cases {
         let result: Result<CreateTableRequest, String> = payload.try_into();
-        let err = result.expect_err(case_name);
+        let err = result.unwrap_err();
         assert!(
             err.contains(expected_error),
             "{case_name}: expected error containing '{expected_error}', got '{err}'"
@@ -518,14 +540,8 @@ fn delete_and_describe_table_reject_empty_table_names() {
     let delete_result: Result<DeleteTableRequest, String> = payload.clone().try_into();
     let describe_result: Result<DescribeTableRequest, String> = payload.try_into();
 
-    assert_eq!(
-        delete_result.expect_err("delete table should fail"),
-        "TableName cannot be empty"
-    );
-    assert_eq!(
-        describe_result.expect_err("describe table should fail"),
-        "TableName cannot be empty"
-    );
+    assert_eq!(delete_result.unwrap_err(), "TableName cannot be empty");
+    assert_eq!(describe_result.unwrap_err(), "TableName cannot be empty");
 }
 
 #[test]
@@ -539,10 +555,8 @@ fn get_stream_records_rejects_limits_outside_supported_range() {
         "Limit": 1001
     });
 
-    let too_small_err =
-        GetStreamRecordsRequest::try_from(too_small).expect_err("limit below minimum should fail");
-    let too_large_err =
-        GetStreamRecordsRequest::try_from(too_large).expect_err("limit above maximum should fail");
+    let too_small_err = GetStreamRecordsRequest::try_from(too_small).unwrap_err();
+    let too_large_err = GetStreamRecordsRequest::try_from(too_large).unwrap_err();
 
     assert_eq!(too_small_err, crate::DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE);
     assert_eq!(too_large_err, crate::DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE);
@@ -552,13 +566,116 @@ fn get_stream_records_rejects_limits_outside_supported_range() {
 fn given_system_stream_when_large_page_is_requested_then_request_is_valid() {
     let request = json!({
         "SystemStream": true,
+        "SourceScope": {
+            "Version": 1,
+            "ScopeId": "catalog",
+            "Generation": 1,
+        },
         "Limit": 8192
     });
 
-    let parsed = GetStreamRecordsRequest::try_from(request).expect("valid system stream request");
+    let parsed = GetStreamRecordsRequest::try_from(request).unwrap();
 
-    assert!(parsed.system_stream);
-    assert!(parsed.table_name.is_none());
+    assert!(parsed.is_system_stream());
+    assert!(parsed.table_name().is_none());
+}
+
+#[test]
+fn system_stream_without_source_scope_is_rejected_before_provider_reads() {
+    let request = json!({
+        "SystemStream": true,
+    });
+
+    let error = GetStreamRecordsRequest::try_from(request).unwrap_err();
+
+    assert_eq!(error, "SystemStream SourceScope is required");
+}
+
+#[test]
+fn system_stream_rejects_legacy_last_evaluated_key_resume_tokens() {
+    let request = json!({
+        "SystemStream": true,
+        "SourceScope": {
+            "Version": 1,
+            "ScopeId": "catalog",
+            "Generation": 1,
+        },
+        "LastEvaluatedKey": "legacy-raw-token",
+    });
+
+    let error = GetStreamRecordsRequest::try_from(request).unwrap_err();
+
+    assert_eq!(error, "LastEvaluatedKey is not supported for SystemStream");
+}
+
+#[test]
+fn system_stream_checkpoint_requires_source_scope() {
+    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16))).unwrap();
+    let request = json!({
+        "SystemStream": true,
+        "Checkpoint": token.as_str(),
+    });
+
+    let error = GetStreamRecordsRequest::try_from(request).unwrap_err();
+
+    assert_eq!(error, "SystemStream Checkpoint requires SourceScope");
+}
+
+#[test]
+fn ordinary_stream_rejects_system_scope_and_checkpoint_fields() {
+    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16))).unwrap();
+    let request = json!({
+        "TableName": "TestTable",
+        "SourceScope": {
+            "Version": 1,
+            "ScopeId": "catalog",
+            "Generation": 1,
+        },
+        "Checkpoint": token.as_str(),
+    });
+
+    let error = GetStreamRecordsRequest::try_from(request).unwrap_err();
+
+    assert_eq!(error, "SystemStream fields require SystemStream=true");
+}
+
+#[test]
+fn ordinary_get_stream_records_request_preserves_legacy_table_cursor_wire_shape() {
+    let payload = json!({
+        "TableName": "LedgerEntries",
+        "LastEvaluatedKey": "cursor-1",
+        "Limit": 100,
+    });
+
+    let parsed = GetStreamRecordsRequest::try_from(payload).unwrap();
+
+    assert!(!parsed.is_system_stream());
+    assert_eq!(
+        parsed.table_name().map(TableName::as_ref),
+        Some("LedgerEntries")
+    );
+    assert_eq!(parsed.last_evaluated_key(), Some("cursor-1"));
+    assert_eq!(parsed.limit(), Some(100));
+    assert_eq!(
+        serde_json::to_value(parsed).unwrap(),
+        json!({
+            "TableName": "LedgerEntries",
+            "SystemStream": false,
+            "LastEvaluatedKey": "cursor-1",
+            "Limit": 100,
+        })
+    );
+}
+
+#[test]
+fn ordinary_get_stream_records_request_rejects_unknown_wire_fields() {
+    let error = GetStreamRecordsRequest::try_from(json!({
+        "TableName": "LedgerEntries",
+        "UnexpectedField": true,
+    }))
+    .unwrap_err();
+
+    assert!(error.contains("unknown field"), "unexpected error: {error}");
 }
 
 #[test]
@@ -568,7 +685,7 @@ fn given_conflicting_stream_source_when_request_is_parsed_then_request_is_reject
         "SystemStream": true
     });
 
-    let error = GetStreamRecordsRequest::try_from(request).expect_err("conflicting stream source");
+    let error = GetStreamRecordsRequest::try_from(request).unwrap_err();
 
     assert_eq!(error, "TableName and SystemStream cannot be used together");
 }
@@ -603,12 +720,10 @@ fn batch_and_transaction_requests_reject_structurally_invalid_operations() {
         }]
     });
 
-    let batch_write_err = BatchWriteItemRequest::try_from(batch_write_both_payload)
-        .expect_err("batch write with two operations should fail");
-    let batch_get_err = BatchGetItemRequest::try_from(batch_get_empty_key_payload)
-        .expect_err("batch get with empty key should fail");
-    let transact_err = TransactWriteItemsRequest::try_from(transact_write_multiple_ops_payload)
-        .expect_err("transact write item with multiple operations should fail");
+    let batch_write_err = BatchWriteItemRequest::try_from(batch_write_both_payload).unwrap_err();
+    let batch_get_err = BatchGetItemRequest::try_from(batch_get_empty_key_payload).unwrap_err();
+    let transact_err =
+        TransactWriteItemsRequest::try_from(transact_write_multiple_ops_payload).unwrap_err();
 
     assert!(batch_write_err.contains("exactly one of PutRequest or DeleteRequest"));
     assert_eq!(
@@ -640,21 +755,21 @@ fn update_table_rejects_invalid_gsi_update_shapes() {
         }]
     });
 
-    let update_err = UpdateTableRequest::try_from(empty_index_name_payload)
-        .expect_err("blank update index name should fail");
-    let create_err = UpdateTableRequest::try_from(missing_create_key_schema_payload)
-        .expect_err("missing create key schema should fail");
+    let update_err = UpdateTableRequest::try_from(empty_index_name_payload).unwrap_err();
+    let create_err = UpdateTableRequest::try_from(missing_create_key_schema_payload).unwrap_err();
 
     assert!(update_err.contains("Update.IndexName cannot be empty"));
     assert!(create_err.contains("Create.KeySchema cannot be empty"));
 }
 
 #[test]
-fn update_item_rejects_unknown_fields_and_missing_identity() {
+fn update_item_ignores_unknown_fields_and_rejects_missing_identity() {
     let unknown_field_payload = json!({
         "TableName": "TestTable",
         "Key": { "pk": { "S": "1" } },
         "UpdateExpression": "SET #name = :value",
+        "ExpressionAttributeNames": { "#name": "name" },
+        "ExpressionAttributeValues": { ":value": { "S": "value" } },
         "UnknownField": true
     });
     let empty_table_payload = json!({
@@ -668,14 +783,11 @@ fn update_item_rejects_unknown_fields_and_missing_identity() {
         "UpdateExpression": "SET #name = :value"
     });
 
-    let unknown_field_err =
-        UpdateItemRequest::try_from(unknown_field_payload).expect_err("unknown field should fail");
-    let empty_table_err =
-        UpdateItemRequest::try_from(empty_table_payload).expect_err("empty table should fail");
-    let empty_key_err =
-        UpdateItemRequest::try_from(empty_key_payload).expect_err("empty key should fail");
+    let unknown_field_request = UpdateItemRequest::try_from(unknown_field_payload).unwrap();
+    let empty_table_err = UpdateItemRequest::try_from(empty_table_payload).unwrap_err();
+    let empty_key_err = UpdateItemRequest::try_from(empty_key_payload).unwrap_err();
 
-    assert!(unknown_field_err.contains("unknown field"));
+    assert_eq!(unknown_field_request.table_name.as_ref(), "TestTable");
     assert_eq!(empty_table_err, "TableName cannot be empty");
     assert_eq!(empty_key_err, "Key cannot be empty");
 }
@@ -696,10 +808,8 @@ fn update_item_rejects_missing_and_invalid_expression_attribute_values_with_dyna
         "ExpressionAttributeValues": { "value": { "S": "name" } }
     });
 
-    let missing_value_err =
-        UpdateItemRequest::try_from(missing_value_payload).expect_err("missing value should fail");
-    let invalid_value_key_err = UpdateItemRequest::try_from(invalid_value_key_payload)
-        .expect_err("invalid expression value key should fail");
+    let missing_value_err = UpdateItemRequest::try_from(missing_value_payload).unwrap_err();
+    let invalid_value_key_err = UpdateItemRequest::try_from(invalid_value_key_payload).unwrap_err();
 
     assert_eq!(
         missing_value_err,
@@ -729,10 +839,8 @@ fn update_item_rejects_missing_and_invalid_expression_attribute_names_with_dynam
         "ExpressionAttributeValues": { ":value": { "S": "name" } }
     });
 
-    let missing_name_err =
-        UpdateItemRequest::try_from(missing_name_payload).expect_err("missing name should fail");
-    let invalid_name_key_err = UpdateItemRequest::try_from(invalid_name_key_payload)
-        .expect_err("invalid expression name key should fail");
+    let missing_name_err = UpdateItemRequest::try_from(missing_name_payload).unwrap_err();
+    let invalid_name_key_err = UpdateItemRequest::try_from(invalid_name_key_payload).unwrap_err();
 
     assert_eq!(
         missing_name_err,
@@ -757,10 +865,8 @@ fn scan_rejects_missing_expression_values_and_invalid_filter_syntax() {
         "FilterExpression": "invalid filter"
     });
 
-    let missing_values_err = ScanRequest::try_from(missing_values_payload)
-        .expect_err("missing expression values should fail");
-    let invalid_filter_err = ScanRequest::try_from(invalid_filter_payload)
-        .expect_err("invalid filter syntax should fail");
+    let missing_values_err = ScanRequest::try_from(missing_values_payload).unwrap_err();
+    let invalid_filter_err = ScanRequest::try_from(invalid_filter_payload).unwrap_err();
 
     assert_eq!(
         missing_values_err,
@@ -820,41 +926,39 @@ fn query_and_scan_reject_expression_attribute_errors_with_dynamodb_messages() {
     });
 
     assert_eq!(
-        QueryRequest::try_from(query_missing_value).expect_err("missing value should fail"),
+        QueryRequest::try_from(query_missing_value).unwrap_err(),
         "Invalid KeyConditionExpression: An expression attribute value used in expression is not \
          defined; attribute value: :pk"
     );
     assert_eq!(
-        QueryRequest::try_from(query_invalid_value_key).expect_err("invalid value key should fail"),
+        QueryRequest::try_from(query_invalid_value_key).unwrap_err(),
         "ExpressionAttributeValues contains invalid key: Syntax error; key: \"pk\""
     );
     assert_eq!(
-        QueryRequest::try_from(query_missing_name).expect_err("missing name should fail"),
+        QueryRequest::try_from(query_missing_name).unwrap_err(),
         "Invalid ProjectionExpression: An expression attribute name used in the document path is \
          not defined; attribute name: #name"
     );
     assert_eq!(
-        ScanRequest::try_from(scan_invalid_name_key).expect_err("invalid name key should fail"),
+        ScanRequest::try_from(scan_invalid_name_key).unwrap_err(),
         "ExpressionAttributeNames contains invalid key: Syntax error; key: \"name\""
     );
     assert_eq!(
-        ScanRequest::try_from(scan_unused_name).expect_err("unused name should fail"),
+        ScanRequest::try_from(scan_unused_name).unwrap_err(),
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_reserved_comment).expect_err("reserved word should fail"),
+        GetItemRequest::try_from(get_reserved_comment).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_reserved_name_lowercase)
-            .expect_err("lowercase reserved word should fail"),
+        GetItemRequest::try_from(get_reserved_name_lowercase).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          name"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_reserved_update_keyword)
-            .expect_err("reserved update keyword in projection should fail"),
+        GetItemRequest::try_from(get_reserved_update_keyword).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: ADD"
     );
     assert!(GetItemRequest::try_from(get_reserved_alias).is_ok());
@@ -1055,133 +1159,116 @@ fn write_condition_expressions_reject_attribute_errors_with_dynamodb_prefix() {
     });
 
     assert_eq!(
-        PutItemRequest::try_from(put_missing_value).expect_err("missing value should fail"),
+        PutItemRequest::try_from(put_missing_value).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: An expression attribute value \
          used in expression is not defined; attribute value: :value"
     );
     assert_eq!(
-        DeleteItemRequest::try_from(delete_invalid_name_key)
-            .expect_err("invalid name key should fail"),
+        DeleteItemRequest::try_from(delete_invalid_name_key).unwrap_err(),
         "1 validation error detected: ExpressionAttributeNames contains invalid key: Syntax \
          error; key: \"name\""
     );
     assert_eq!(
-        DeleteItemRequest::try_from(delete_reserved_word).expect_err("reserved word should fail"),
+        DeleteItemRequest::try_from(delete_reserved_word).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Attribute name is a reserved \
          keyword; reserved keyword: COUNT"
     );
     assert!(PutItemRequest::try_from(put_single_parenthesized_condition).is_ok());
     assert_eq!(
-        PutItemRequest::try_from(put_double_parenthesized_condition)
-            .expect_err("redundant whole-expression parentheses should fail"),
+        PutItemRequest::try_from(put_double_parenthesized_condition).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The expression has redundant \
          parentheses;"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_double_parenthesized_operand)
-            .expect_err("redundant operand parentheses should fail"),
+        PutItemRequest::try_from(put_double_parenthesized_operand).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The expression has redundant \
          parentheses;"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_nested_reserved_word)
-            .expect_err("nested reserved word should fail"),
+        PutItemRequest::try_from(put_nested_reserved_word).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Attribute name is a reserved \
          keyword; reserved keyword: COMMENT"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_function_nested_reserved_word)
-            .expect_err("function argument reserved word should fail"),
+        PutItemRequest::try_from(put_function_nested_reserved_word).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Attribute name is a reserved \
          keyword; reserved keyword: COMMENT"
     );
     assert!(PutItemRequest::try_from(put_function_alias_nested_reserved_word).is_ok());
     assert_eq!(
-        PutItemRequest::try_from(put_contains_same_operand)
-            .expect_err("contains same path and operand should fail"),
+        PutItemRequest::try_from(put_contains_same_operand).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The first operand must be \
          distinct from the remaining operands for this operator or function; operator: contains, \
          first operand: [name]"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_trailing_open_parenthesis)
-            .expect_err("trailing open parenthesis should fail"),
+        PutItemRequest::try_from(put_trailing_open_parenthesis).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \
          \"<EOF>\", near: \"(\""
     );
     assert_eq!(
-        PutItemRequest::try_from(put_attribute_type_literal)
-            .expect_err("attribute_type literal type should fail"),
+        PutItemRequest::try_from(put_attribute_type_literal).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Incorrect operand type for \
          operator or function; operator or function: attribute_type, operand type: \
-         {S,SS,N,NS,B,BS,BOOL,NULL,L,M,HD,DOUBLE,FLOAT,HDS,FS,DOUBLESET,DICT,DECIMAL,INT,\
-         DECIMALSET,INTSET}"
+         {FS,NULL,DICT,DOUBLESET,M,DOUBLE,SS,DECIMALSET,S,INT,HDS,FLOAT,B,INTSET,L,DECIMAL,N,NS,\
+         BOOL,BS,HD}"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_attribute_type_invalid_type_name)
-            .expect_err("invalid attribute_type code should fail"),
+        PutItemRequest::try_from(put_attribute_type_invalid_type_name).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Invalid attribute type name \
          found; type: STRING, valid types: {S,SS,N,NS,B,BS,BOOL,NULL,L,M}"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_begins_with_number_operand)
-            .expect_err("begins_with non-string/binary operand should fail"),
+        PutItemRequest::try_from(put_begins_with_number_operand).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Incorrect operand type for \
          operator or function; operator or function: begins_with, operand type: N"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_contains_one_arg).expect_err("contains one arg should fail"),
+        PutItemRequest::try_from(put_contains_one_arg).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Incorrect number of operands \
          for operator or function; operator or function: contains, number of operands: 1"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_begins_with_three_args)
-            .expect_err("begins_with three args should fail"),
+        PutItemRequest::try_from(put_begins_with_three_args).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Incorrect number of operands \
          for operator or function; operator or function: begins_with, number of operands: 3"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_attribute_type_no_args)
-            .expect_err("attribute_type no args should fail"),
+        PutItemRequest::try_from(put_attribute_type_no_args).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \")\", \
          near: \"()\""
     );
     assert_eq!(
-        PutItemRequest::try_from(put_size_two_args).expect_err("size two args should fail"),
+        PutItemRequest::try_from(put_size_two_args).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Incorrect number of operands \
          for operator or function; operator or function: size, number of operands: 2"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_size_no_comparison)
-            .expect_err("size without comparison should fail"),
+        PutItemRequest::try_from(put_size_no_comparison).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The function is not allowed to \
          be used this way in an expression; function: size"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_size_nested_function_arg)
-            .expect_err("size with function argument should fail"),
+        PutItemRequest::try_from(put_size_nested_function_arg).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The function is not allowed to \
          be used this way in an expression; function: contains"
     );
     assert!(PutItemRequest::try_from(put_size_greater_than).is_ok());
     assert!(PutItemRequest::try_from(put_size_between).is_ok());
     assert_eq!(
-        PutItemRequest::try_from(put_between_number_bounds_reversed)
-            .expect_err("BETWEEN number lower bound greater than upper should fail"),
+        PutItemRequest::try_from(put_between_number_bounds_reversed).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The BETWEEN operator requires \
          upper bound to be greater than or equal to lower bound; lower bound operand: \
          AttributeValue: {N:5}, upper bound operand: AttributeValue: {N:4}"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_between_string_bounds_reversed)
-            .expect_err("BETWEEN string lower bound greater than upper should fail"),
+        PutItemRequest::try_from(put_between_string_bounds_reversed).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The BETWEEN operator requires \
          upper bound to be greater than or equal to lower bound; lower bound operand: \
          AttributeValue: {S:z}, upper bound operand: AttributeValue: {S:a}"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_between_binary_bounds_reversed)
-            .expect_err("BETWEEN binary lower bound greater than upper should fail"),
+        PutItemRequest::try_from(put_between_binary_bounds_reversed).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The BETWEEN operator requires \
          upper bound to be greater than or equal to lower bound; lower bound operand: \
          AttributeValue: {B:eg==}, upper bound operand: AttributeValue: {B:YQ==}"
@@ -1210,84 +1297,77 @@ fn expression_attribute_names_reject_aggregate_size_above_dynamodb_limit() {
     });
 
     assert_eq!(
-        DeleteItemRequest::try_from(delete_item).expect_err("large names should fail"),
+        DeleteItemRequest::try_from(delete_item).unwrap_err(),
         "1 validation error detected: ExpressionAttributeNames exceeds max size"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_write)
-            .expect_err("transaction large names should fail"),
+        TransactWriteItemsRequest::try_from(transact_write).unwrap_err(),
         "ExpressionAttributeNames exceeds max size"
     );
 }
 
 #[test]
 fn write_condition_expressions_reject_reversed_between_bounds_for_all_write_shapes() {
-    let expected = "1 validation error detected: Invalid ConditionExpression: The BETWEEN \
-                    operator requires upper bound to be greater than or equal to lower bound; \
-                    lower bound operand: AttributeValue: {N:5}, upper bound operand: \
-                    AttributeValue: {N:4}";
-    let expression_attribute_values = json!({
-        ":lower": { "N": "5" },
-        ":upper": { "N": "4" }
-    });
+    for (lower, upper) in [
+        ("5", "4"),
+        ("9007199254740993", "9007199254740992"),
+        ("-9007199254740992", "-9007199254740993"),
+    ] {
+        let detail = format!(
+            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater \
+             than or equal to lower bound; lower bound operand: AttributeValue: {{N:{lower}}}, \
+             upper bound operand: AttributeValue: {{N:{upper}}}"
+        );
+        let expected = format!("1 validation error detected: {detail}");
+        let expression_attribute_values = json!({
+            ":lower": { "N": lower },
+            ":upper": { "N": upper }
+        });
 
-    let put = json!({
-        "TableName": "TestTable",
-        "Item": { "pk": { "S": "1" } },
-        "ConditionExpression": "pk BETWEEN :lower AND :upper",
-        "ExpressionAttributeValues": expression_attribute_values.clone()
-    });
-    let delete = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "ConditionExpression": "pk BETWEEN :lower AND :upper",
-        "ExpressionAttributeValues": expression_attribute_values.clone()
-    });
-    let update = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "UpdateExpression": "SET touched = :touched",
-        "ConditionExpression": "pk BETWEEN :lower AND :upper",
-        "ExpressionAttributeValues": {
-            ":touched": { "S": "yes" },
-            ":lower": { "N": "5" },
-            ":upper": { "N": "4" }
-        }
-    });
-    let transact_write = json!({
-        "TransactItems": [
-            {
-                "ConditionCheck": {
-                    "TableName": "TestTable",
-                    "Key": { "pk": { "S": "1" } },
-                    "ConditionExpression": "pk BETWEEN :lower AND :upper",
-                    "ExpressionAttributeValues": expression_attribute_values
-                }
+        let put = json!({
+            "TableName": "TestTable",
+            "Item": { "pk": { "S": "1" } },
+            "ConditionExpression": "pk BETWEEN :lower AND :upper",
+            "ExpressionAttributeValues": expression_attribute_values.clone()
+        });
+        let delete = json!({
+            "TableName": "TestTable",
+            "Key": { "pk": { "S": "1" } },
+            "ConditionExpression": "pk BETWEEN :lower AND :upper",
+            "ExpressionAttributeValues": expression_attribute_values.clone()
+        });
+        let update = json!({
+            "TableName": "TestTable",
+            "Key": { "pk": { "S": "1" } },
+            "UpdateExpression": "SET touched = :touched",
+            "ConditionExpression": "pk BETWEEN :lower AND :upper",
+            "ExpressionAttributeValues": {
+                ":touched": { "S": "yes" },
+                ":lower": { "N": lower },
+                ":upper": { "N": upper }
             }
-        ]
-    });
+        });
+        let transact_write = json!({
+            "TransactItems": [
+                {
+                    "ConditionCheck": {
+                        "TableName": "TestTable",
+                        "Key": { "pk": { "S": "1" } },
+                        "ConditionExpression": "pk BETWEEN :lower AND :upper",
+                        "ExpressionAttributeValues": expression_attribute_values
+                    }
+                }
+            ]
+        });
 
-    assert_eq!(
-        PutItemRequest::try_from(put).expect_err("PutItem should reject reversed BETWEEN bounds"),
-        expected
-    );
-    assert_eq!(
-        DeleteItemRequest::try_from(delete)
-            .expect_err("DeleteItem should reject reversed BETWEEN bounds"),
-        expected
-    );
-    assert_eq!(
-        UpdateItemRequest::try_from(update)
-            .expect_err("UpdateItem should reject reversed BETWEEN bounds"),
-        expected
-    );
-    assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_write)
-            .expect_err("TransactWriteItems should reject reversed BETWEEN bounds"),
-        "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater \
-         than or equal to lower bound; lower bound operand: AttributeValue: {N:5}, upper bound \
-         operand: AttributeValue: {N:4}"
-    );
+        assert_eq!(PutItemRequest::try_from(put).unwrap_err(), expected);
+        assert_eq!(DeleteItemRequest::try_from(delete).unwrap_err(), expected);
+        assert_eq!(UpdateItemRequest::try_from(update).unwrap_err(), expected);
+        assert_eq!(
+            TransactWriteItemsRequest::try_from(transact_write).unwrap_err(),
+            detail
+        );
+    }
 }
 
 #[test]
@@ -1400,26 +1480,22 @@ fn update_and_transaction_expressions_reject_functions_in_wrong_contexts() {
     });
 
     assert_eq!(
-        UpdateItemRequest::try_from(update_contains_value)
-            .expect_err("contains cannot produce an update value"),
+        UpdateItemRequest::try_from(update_contains_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: The function is not allowed in an \
          update expression; function: contains"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_size_value)
-            .expect_err("size cannot produce an update value"),
+        UpdateItemRequest::try_from(update_size_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: The function is not allowed in an \
          update expression; function: size"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_nested_list_append)
-            .expect_err("nested list_append should fail"),
+        UpdateItemRequest::try_from(update_nested_list_append).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: The function is not allowed to be \
          used this way in an expression; function: list_append"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_nested_if_not_exists_first_arg)
-            .expect_err("if_not_exists first argument must be a path"),
+        UpdateItemRequest::try_from(update_nested_if_not_exists_first_arg).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Operator or function requires a \
          document path; operator or function: if_not_exists"
     );
@@ -1428,32 +1504,28 @@ fn update_and_transaction_expressions_reject_functions_in_wrong_contexts() {
         "DynamoDB accepts if_not_exists as a list_append operand"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(condition_if_not_exists)
-            .expect_err("if_not_exists cannot be used in a condition expression"),
+        UpdateItemRequest::try_from(condition_if_not_exists).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The function is not allowed in \
          a condition expression; function: if_not_exists"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(mixed_update_and_condition_invalid)
-            .expect_err("UpdateItem reports condition-context errors first"),
+        UpdateItemRequest::try_from(mixed_update_and_condition_invalid).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: The function is not allowed in \
          a condition expression; function: if_not_exists"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_update_contains_value)
-            .expect_err("transaction update should reject condition function in update"),
+        TransactWriteItemsRequest::try_from(transact_update_contains_value).unwrap_err(),
         "Invalid UpdateExpression: The function is not allowed in an update expression; function: \
          contains"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_condition_if_not_exists)
-            .expect_err("transaction condition should reject update function in condition"),
+        TransactWriteItemsRequest::try_from(transact_condition_if_not_exists).unwrap_err(),
         "Invalid ConditionExpression: The function is not allowed in a condition expression; \
          function: if_not_exists"
     );
     assert_eq!(
         TransactWriteItemsRequest::try_from(transact_mixed_update_and_condition_invalid)
-            .expect_err("TransactWriteItems reports update-context errors first"),
+            .unwrap_err(),
         "Invalid UpdateExpression: The function is not allowed in an update expression; function: \
          contains"
     );
@@ -1638,83 +1710,71 @@ fn update_and_transaction_expressions_reject_update_action_grammar_errors() {
     });
 
     assert_eq!(
-        UpdateItemRequest::try_from(update_duplicate_set)
-            .expect_err("duplicate SET section should fail"),
+        UpdateItemRequest::try_from(update_duplicate_set).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: The \"SET\" section can only be \
          used once in an update expression;"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_repeated_path)
-            .expect_err("repeated update path should fail"),
+        UpdateItemRequest::try_from(update_repeated_path).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Two document paths overlap with \
          each other; must remove or rewrite one of these paths; path one: [fieldx], path two: \
          [fieldx]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_overlapping_path)
-            .expect_err("overlapping update paths should fail"),
+        UpdateItemRequest::try_from(update_overlapping_path).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Two document paths overlap with \
          each other; must remove or rewrite one of these paths; path one: [mapx], path two: \
          [mapx, num]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_overlapping_list_index_path)
-            .expect_err("overlapping list-index update paths should fail"),
+        UpdateItemRequest::try_from(update_overlapping_list_index_path).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Two document paths overlap with \
          each other; must remove or rewrite one of these paths; path one: [lst, [0]], path two: \
          [lst, [0], ok]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_overlapping_alias_path)
-            .expect_err("alias-resolved overlapping update paths should fail"),
+        UpdateItemRequest::try_from(update_overlapping_alias_path).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Two document paths overlap with \
          each other; must remove or rewrite one of these paths; path one: [fieldx], path two: \
          [fieldx]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_add_no_value)
-            .expect_err("ADD without value should fail"),
+        UpdateItemRequest::try_from(update_add_no_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"<EOF>\", \
          near: \"numx\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_set_missing_arithmetic_operand)
-            .expect_err("SET arithmetic without right operand should fail"),
+        UpdateItemRequest::try_from(update_set_missing_arithmetic_operand).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"<EOF>\", \
          near: \"+\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_set_unsupported_arithmetic_operator)
-            .expect_err("SET multiplication should fail"),
+        UpdateItemRequest::try_from(update_set_unsupported_arithmetic_operator).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"*\", near: \
          \"numx * :v\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_delete_no_value)
-            .expect_err("DELETE without value should fail"),
+        UpdateItemRequest::try_from(update_delete_no_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"<EOF>\", \
          near: \"setx\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_add_literal_value)
-            .expect_err("ADD literal value should fail"),
+        UpdateItemRequest::try_from(update_add_literal_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"1\", near: \
          \"numx 1\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_delete_literal_value)
-            .expect_err("DELETE literal value should fail"),
+        UpdateItemRequest::try_from(update_delete_literal_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \"a\", near: \
          \"setx a\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_add_list_value).expect_err("ADD list value should fail"),
+        UpdateItemRequest::try_from(update_add_list_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Incorrect operand type for \
          operator or function; operator: ADD, operand type: LIST, typeSet: ALLOWED_FOR_ADD_OPERAND"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_delete_string_value)
-            .expect_err("DELETE string value should fail"),
+        UpdateItemRequest::try_from(update_delete_string_value).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Incorrect operand type for \
          operator or function; operator: DELETE, operand type: STRING, typeSet: \
          ALLOWED_FOR_ADD_OPERAND"
@@ -1725,31 +1785,27 @@ fn update_and_transaction_expressions_reject_update_action_grammar_errors() {
     assert!(UpdateItemRequest::try_from(update_alias_reserved_nested_path).is_ok());
     assert!(UpdateItemRequest::try_from(update_list_alias_reserved_child).is_ok());
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_duplicate_set)
-            .expect_err("transaction duplicate SET section should fail"),
+        TransactWriteItemsRequest::try_from(transact_duplicate_set).unwrap_err(),
         "Invalid UpdateExpression: The \"SET\" section can only be used once in an update \
          expression;"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_repeated_path)
-            .expect_err("transaction repeated update path should fail"),
+        TransactWriteItemsRequest::try_from(transact_repeated_path).unwrap_err(),
         "Invalid UpdateExpression: Two document paths overlap with each other; must remove or \
          rewrite one of these paths; path one: [fieldx], path two: [fieldx]"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_overlapping_list_index_path)
-            .expect_err("transaction overlapping list-index update paths should fail"),
+        TransactWriteItemsRequest::try_from(transact_overlapping_list_index_path).unwrap_err(),
         "Invalid UpdateExpression: Two document paths overlap with each other; must remove or \
          rewrite one of these paths; path one: [lst, [0]], path two: [lst, [0], ok]"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_set_missing_arithmetic_operand)
-            .expect_err("transaction SET arithmetic without right operand should fail"),
+        TransactWriteItemsRequest::try_from(transact_set_missing_arithmetic_operand).unwrap_err(),
         "Invalid UpdateExpression: Syntax error; token: \"<EOF>\", near: \"+\""
     );
     assert_eq!(
         TransactWriteItemsRequest::try_from(transact_set_unsupported_arithmetic_operator)
-            .expect_err("transaction SET division should fail"),
+            .unwrap_err(),
         "Invalid UpdateExpression: Syntax error; token: \"/\", near: \"numx / :v\""
     );
 }
@@ -1865,53 +1921,48 @@ fn list_index_document_paths_match_dynamodb_expression_validation() {
     });
 
     assert_eq!(
-        GetItemRequest::try_from(get_raw_reserved_list)
-            .expect_err("raw reserved list path should fail"),
+        GetItemRequest::try_from(get_raw_reserved_list).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          list"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_raw_reserved_child)
-            .expect_err("raw reserved child path should fail"),
+        GetItemRequest::try_from(get_raw_reserved_child).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert!(GetItemRequest::try_from(get_alias_list_path).is_ok());
     assert_eq!(
-        GetItemRequest::try_from(get_empty_index).expect_err("empty index should fail"),
+        GetItemRequest::try_from(get_empty_index).unwrap_err(),
         "Invalid ProjectionExpression: Syntax error; token: \"]\", near: \"[].\""
     );
     assert_eq!(
-        DeleteItemRequest::try_from(delete_raw_reserved_child)
-            .expect_err("condition raw reserved child should fail"),
+        DeleteItemRequest::try_from(delete_raw_reserved_child).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Attribute name is a reserved \
          keyword; reserved keyword: COMMENT"
     );
     assert!(DeleteItemRequest::try_from(delete_alias_list_path).is_ok());
     assert_eq!(
-        DeleteItemRequest::try_from(delete_alpha_index).expect_err("alpha index should fail"),
+        DeleteItemRequest::try_from(delete_alpha_index).unwrap_err(),
         "1 validation error detected: Invalid ConditionExpression: Syntax error; token: \"abc\", \
          near: \"[abc]\""
     );
     assert_eq!(
-        ScanRequest::try_from(scan_raw_reserved_child)
-            .expect_err("filter raw reserved child should fail"),
+        ScanRequest::try_from(scan_raw_reserved_child).unwrap_err(),
         "Invalid FilterExpression: Attribute name is a reserved keyword; reserved keyword: COMMENT"
     );
     assert!(ScanRequest::try_from(scan_alias_list_path).is_ok());
     assert_eq!(
-        ScanRequest::try_from(scan_negative_index).expect_err("negative index should fail"),
+        ScanRequest::try_from(scan_negative_index).unwrap_err(),
         "Invalid FilterExpression: Syntax error; token: \"-\", near: \"[-1\""
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_raw_reserved_child)
-            .expect_err("update raw reserved child should fail"),
+        UpdateItemRequest::try_from(update_raw_reserved_child).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Attribute name is a reserved \
          keyword; reserved keyword: COMMENT"
     );
     assert!(UpdateItemRequest::try_from(update_alias_list_path).is_ok());
     assert_eq!(
-        UpdateItemRequest::try_from(update_unclosed_index).expect_err("unclosed index should fail"),
+        UpdateItemRequest::try_from(update_unclosed_index).unwrap_err(),
         "1 validation error detected: Invalid UpdateExpression: Syntax error; token: \".\", near: \
          \"0.#comment\""
     );
@@ -2027,42 +2078,35 @@ fn transaction_expressions_reject_attribute_errors_with_dynamodb_messages() {
     });
 
     assert_eq!(
-        TransactGetItemsRequest::try_from(transact_get_reserved_projection)
-            .expect_err("reserved projection should fail"),
+        TransactGetItemsRequest::try_from(transact_get_reserved_projection).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert_eq!(
-        TransactGetItemsRequest::try_from(transact_get_missing_name)
-            .expect_err("missing name should fail"),
+        TransactGetItemsRequest::try_from(transact_get_missing_name).unwrap_err(),
         "Invalid ProjectionExpression: An expression attribute name used in the document path is \
          not defined; attribute name: #comment"
     );
     assert_eq!(
-        TransactGetItemsRequest::try_from(transact_get_invalid_name_key)
-            .expect_err("invalid name key should fail"),
+        TransactGetItemsRequest::try_from(transact_get_invalid_name_key).unwrap_err(),
         "ExpressionAttributeNames contains invalid key: Syntax error; key: \"comment\""
     );
     assert!(TransactGetItemsRequest::try_from(transact_get_alias_reserved_projection).is_ok());
     assert_eq!(
-        TransactWriteItemsRequest::try_from(condition_check_missing_value)
-            .expect_err("missing value should fail"),
+        TransactWriteItemsRequest::try_from(condition_check_missing_value).unwrap_err(),
         "Invalid ConditionExpression: An expression attribute value used in expression is not \
          defined; attribute value: :value"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(condition_check_invalid_value_key)
-            .expect_err("invalid value key should fail"),
+        TransactWriteItemsRequest::try_from(condition_check_invalid_value_key).unwrap_err(),
         "ExpressionAttributeValues contains invalid key: Syntax error; key: \"value\""
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(update_reserved_word)
-            .expect_err("reserved update word should fail"),
+        TransactWriteItemsRequest::try_from(update_reserved_word).unwrap_err(),
         "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: COMMENT"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(update_condition_syntax)
-            .expect_err("invalid condition syntax should fail"),
+        TransactWriteItemsRequest::try_from(update_condition_syntax).unwrap_err(),
         "Invalid ConditionExpression: Syntax error; token: \"<EOF>\", near: \"=\""
     );
     assert!(
@@ -2070,7 +2114,7 @@ fn transaction_expressions_reject_attribute_errors_with_dynamodb_messages() {
     );
     assert_eq!(
         TransactWriteItemsRequest::try_from(condition_check_double_parenthesized_condition)
-            .expect_err("transaction redundant parentheses should fail"),
+            .unwrap_err(),
         "Invalid ConditionExpression: The expression has redundant parentheses;"
     );
 }
@@ -2106,15 +2150,14 @@ fn batch_write_and_batch_get_reject_limits_and_empty_tables() {
         }
     });
 
-    let batch_write_empty_err = BatchWriteItemRequest::try_from(batch_write_empty_request_items)
-        .expect_err("empty request items should fail");
-    let batch_write_too_many_err = BatchWriteItemRequest::try_from(batch_write_too_many_payload)
-        .expect_err("too many write items should fail");
+    let batch_write_empty_err =
+        BatchWriteItemRequest::try_from(batch_write_empty_request_items).unwrap_err();
+    let batch_write_too_many_err =
+        BatchWriteItemRequest::try_from(batch_write_too_many_payload).unwrap_err();
     let batch_get_empty_table_err =
-        BatchGetItemRequest::try_from(batch_get_empty_table_name_payload)
-            .expect_err("empty table name should fail");
-    let batch_get_too_many_err = BatchGetItemRequest::try_from(batch_get_too_many_payload)
-        .expect_err("too many get items should fail");
+        BatchGetItemRequest::try_from(batch_get_empty_table_name_payload).unwrap_err();
+    let batch_get_too_many_err =
+        BatchGetItemRequest::try_from(batch_get_too_many_payload).unwrap_err();
 
     assert_eq!(batch_write_empty_err, "RequestItems cannot be empty");
     assert_eq!(
@@ -2174,28 +2217,24 @@ fn query_scan_and_batch_requests_reject_invalid_return_parameters() {
          constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]";
 
     assert_eq!(
-        QueryRequest::try_from(query_invalid_return_consumed_capacity)
-            .expect_err("invalid Query ReturnConsumedCapacity should fail"),
+        QueryRequest::try_from(query_invalid_return_consumed_capacity).unwrap_err(),
         invalid_return_consumed_capacity_message
     );
     assert_eq!(
-        ScanRequest::try_from(scan_invalid_return_consumed_capacity)
-            .expect_err("invalid Scan ReturnConsumedCapacity should fail"),
+        ScanRequest::try_from(scan_invalid_return_consumed_capacity).unwrap_err(),
         invalid_return_consumed_capacity_message
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(batch_get_invalid_return_consumed_capacity)
-            .expect_err("invalid BatchGetItem ReturnConsumedCapacity should fail"),
+        BatchGetItemRequest::try_from(batch_get_invalid_return_consumed_capacity).unwrap_err(),
         invalid_return_consumed_capacity_message
     );
     assert_eq!(
-        BatchWriteItemRequest::try_from(batch_write_invalid_return_consumed_capacity)
-            .expect_err("invalid BatchWriteItem ReturnConsumedCapacity should fail"),
+        BatchWriteItemRequest::try_from(batch_write_invalid_return_consumed_capacity).unwrap_err(),
         invalid_return_consumed_capacity_message
     );
     assert_eq!(
         BatchWriteItemRequest::try_from(batch_write_invalid_return_item_collection_metrics)
-            .expect_err("invalid BatchWriteItem ReturnItemCollectionMetrics should fail"),
+            .unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnItemCollectionMetrics' failed to \
          satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"
     );
@@ -2299,51 +2338,45 @@ fn batch_get_projection_expressions_reject_attribute_errors_with_dynamodb_messag
     });
 
     assert_eq!(
-        BatchGetItemRequest::try_from(raw_reserved_projection)
-            .expect_err("raw reserved projection should fail"),
+        BatchGetItemRequest::try_from(raw_reserved_projection).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(nested_reserved_projection)
-            .expect_err("nested reserved projection should fail"),
+        BatchGetItemRequest::try_from(nested_reserved_projection).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(alias_parent_raw_reserved_child)
-            .expect_err("raw reserved child projection should fail"),
+        BatchGetItemRequest::try_from(alias_parent_raw_reserved_child).unwrap_err(),
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: \
          COMMENT"
     );
     assert!(BatchGetItemRequest::try_from(alias_nested_reserved_projection).is_ok());
     assert_eq!(
-        BatchGetItemRequest::try_from(invalid_name_key).expect_err("invalid name key should fail"),
+        BatchGetItemRequest::try_from(invalid_name_key).unwrap_err(),
         "ExpressionAttributeNames contains invalid key: Syntax error; key: \"m\""
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(missing_name).expect_err("missing name should fail"),
+        BatchGetItemRequest::try_from(missing_name).unwrap_err(),
         "Invalid ProjectionExpression: An expression attribute name used in the document path is \
          not defined; attribute name: #m"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(unused_name).expect_err("unused name should fail"),
+        BatchGetItemRequest::try_from(unused_name).unwrap_err(),
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#unused}"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(too_long_projection_name)
-            .expect_err("too long name token should fail"),
+        BatchGetItemRequest::try_from(too_long_projection_name).unwrap_err(),
         "ExpressionAttributeNames contains invalid key: The expression attribute map contains a \
          key that is too long; size of key: 256"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(too_long_projection_expression)
-            .expect_err("too long projection expression should fail"),
+        BatchGetItemRequest::try_from(too_long_projection_expression).unwrap_err(),
         "Invalid ProjectionExpression: Expression size has exceeded the maximum allowed size;"
     );
     assert_eq!(
-        BatchGetItemRequest::try_from(overlapping_projection)
-            .expect_err("overlapping projection should fail"),
+        BatchGetItemRequest::try_from(overlapping_projection).unwrap_err(),
         "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or \
          rewrite one of these paths; path one: [m], path two: [m, child]"
     );
@@ -2375,15 +2408,14 @@ fn transact_write_and_update_table_reject_empty_operation_sets() {
         }]
     });
 
-    let empty_transact_err = TransactWriteItemsRequest::try_from(empty_transact_items_payload)
-        .expect_err("empty transact items should fail");
+    let empty_transact_err =
+        TransactWriteItemsRequest::try_from(empty_transact_items_payload).unwrap_err();
     let too_many_transact_err =
-        TransactWriteItemsRequest::try_from(too_many_transact_items_payload)
-            .expect_err("too many transact items should fail");
-    let empty_gsi_updates_err = UpdateTableRequest::try_from(empty_gsi_updates_payload)
-        .expect_err("empty gsi updates should fail");
-    let delete_blank_index_err = UpdateTableRequest::try_from(delete_blank_index_payload)
-        .expect_err("blank delete index name should fail");
+        TransactWriteItemsRequest::try_from(too_many_transact_items_payload).unwrap_err();
+    let empty_gsi_updates_err =
+        UpdateTableRequest::try_from(empty_gsi_updates_payload).unwrap_err();
+    let delete_blank_index_err =
+        UpdateTableRequest::try_from(delete_blank_index_payload).unwrap_err();
 
     assert_eq!(empty_transact_err, "TransactItems cannot be empty");
     assert_eq!(
@@ -2452,37 +2484,32 @@ fn transact_write_request_parameter_validation_matches_dynamodb() {
     });
 
     assert_eq!(
-        TransactWriteItemsRequest::try_from(invalid_return_consumed_capacity)
-            .expect_err("invalid ReturnConsumedCapacity should fail"),
+        TransactWriteItemsRequest::try_from(invalid_return_consumed_capacity).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy \
          constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(invalid_return_item_collection_metrics)
-            .expect_err("invalid ReturnItemCollectionMetrics should fail"),
+        TransactWriteItemsRequest::try_from(invalid_return_item_collection_metrics).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnItemCollectionMetrics' failed to \
          satisfy constraint: Member must satisfy enum value set: [SIZE, NONE]"
     );
     assert_eq!(
         TransactWriteItemsRequest::try_from(invalid_return_values_on_condition_failure)
-            .expect_err("invalid ReturnValuesOnConditionCheckFailure should fail"),
+            .unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at \
          'transactItems.1.member.put.returnValuesOnConditionCheckFailure' failed to satisfy \
          constraint: Member must satisfy enum value set: [ALL_OLD, NONE]"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(empty_expression_names)
-            .expect_err("empty ExpressionAttributeNames should fail"),
+        TransactWriteItemsRequest::try_from(empty_expression_names).unwrap_err(),
         "ExpressionAttributeNames must not be empty"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(empty_expression_values)
-            .expect_err("empty ExpressionAttributeValues should fail"),
+        TransactWriteItemsRequest::try_from(empty_expression_values).unwrap_err(),
         "ExpressionAttributeValues must not be empty"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(empty_transact_item)
-            .expect_err("empty transact write item should fail"),
+        TransactWriteItemsRequest::try_from(empty_transact_item).unwrap_err(),
         "Invalid Request: TransactWriteRequest should contain Delete or Put or Update request"
     );
 }
@@ -2568,77 +2595,68 @@ fn single_item_and_transact_get_request_parameter_validation_matches_dynamodb() 
     });
 
     assert_eq!(
-        PutItemRequest::try_from(put_empty_values).expect_err("empty values should fail"),
+        PutItemRequest::try_from(put_empty_values).unwrap_err(),
         "1 validation error detected: ExpressionAttributeValues must not be empty"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_invalid_return_values_on_condition_failure)
-            .expect_err("invalid ReturnValuesOnConditionCheckFailure should fail"),
+        PutItemRequest::try_from(put_invalid_return_values_on_condition_failure).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' \
          failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_invalid_return_consumed_capacity)
-            .expect_err("invalid ReturnConsumedCapacity should fail"),
+        PutItemRequest::try_from(put_invalid_return_consumed_capacity).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy \
          constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
     assert_eq!(
-        PutItemRequest::try_from(put_invalid_return_item_collection_metrics)
-            .expect_err("invalid ReturnItemCollectionMetrics should fail"),
+        PutItemRequest::try_from(put_invalid_return_item_collection_metrics).unwrap_err(),
         "1 validation error detected: ReturnItemCollectionMetrics can only be SIZE or NONE"
     );
     assert_eq!(
-        DeleteItemRequest::try_from(delete_invalid_return_values_on_condition_failure)
-            .expect_err("invalid ReturnValuesOnConditionCheckFailure should fail"),
+        DeleteItemRequest::try_from(delete_invalid_return_values_on_condition_failure).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' \
          failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_invalid_return_values_on_condition_failure)
-            .expect_err("invalid ReturnValuesOnConditionCheckFailure should fail"),
+        UpdateItemRequest::try_from(update_invalid_return_values_on_condition_failure).unwrap_err(),
         "Value 'BOGUS' at 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: \
          Member must satisfy enum value set: [ALL_OLD, NONE]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_invalid_return_consumed_capacity)
-            .expect_err("invalid ReturnConsumedCapacity should fail"),
+        UpdateItemRequest::try_from(update_invalid_return_consumed_capacity).unwrap_err(),
         "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must \
          satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
     assert_eq!(
-        UpdateItemRequest::try_from(update_invalid_return_item_collection_metrics)
-            .expect_err("invalid ReturnItemCollectionMetrics should fail"),
+        UpdateItemRequest::try_from(update_invalid_return_item_collection_metrics).unwrap_err(),
         "1 validation error detected: ReturnItemCollectionMetrics can only be SIZE or NONE"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_invalid_return_consumed_capacity)
-            .expect_err("invalid ReturnConsumedCapacity should fail"),
+        GetItemRequest::try_from(get_invalid_return_consumed_capacity).unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy \
          constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
     assert_eq!(
-        GetItemRequest::try_from(get_empty_expression_names)
-            .expect_err("empty ExpressionAttributeNames should fail"),
+        GetItemRequest::try_from(get_empty_expression_names).unwrap_err(),
         "ExpressionAttributeNames must not be empty"
     );
     assert_eq!(
         TransactGetItemsRequest::try_from(transact_get_invalid_return_consumed_capacity)
-            .expect_err("invalid ReturnConsumedCapacity should fail"),
+            .unwrap_err(),
         "1 validation error detected: Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy \
          constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
     );
     assert_eq!(
-        TransactGetItemsRequest::try_from(transact_get_empty_expression_names)
-            .expect_err("empty ExpressionAttributeNames should fail"),
+        TransactGetItemsRequest::try_from(transact_get_empty_expression_names).unwrap_err(),
         "ExpressionAttributeNames must not be empty"
     );
 }
 
 #[test]
 fn dynamodb_limit_boundaries_are_accepted() {
-    let max_item = "x".repeat(crate::MAX_ITEM_SIZE_BYTES - "pk".len());
-    let max_binary_item_bytes = crate::MAX_ITEM_SIZE_BYTES - "pk".len() - "p".len() - "data".len();
+    let max_item = "x".repeat(crate::constants::MAX_ITEM_SIZE_BYTES - "pk".len());
+    let max_binary_item_bytes =
+        crate::constants::MAX_ITEM_SIZE_BYTES - "pk".len() - "p".len() - "data".len();
     let max_nested_list_binary_item_bytes = max_binary_item_bytes - 3 - 1;
     let max_nested_map_binary_item_bytes = max_binary_item_bytes - 3 - 1 - "child".len();
     let nested_map_binary_set_first_member_bytes = max_nested_map_binary_item_bytes / 2 - 1;
@@ -2757,12 +2775,13 @@ fn dynamodb_limit_boundaries_are_accepted() {
 
 #[test]
 fn dynamodb_item_limits_reject_invalid_requests() {
-    let max_binary_item_bytes = crate::MAX_ITEM_SIZE_BYTES - "pk".len() - "p".len() - "data".len();
+    let max_binary_item_bytes =
+        crate::constants::MAX_ITEM_SIZE_BYTES - "pk".len() - "p".len() - "data".len();
     let max_nested_list_binary_item_bytes = max_binary_item_bytes - 3 - 1;
     let max_nested_map_binary_item_bytes = max_binary_item_bytes - 3 - 1 - "child".len();
     let oversized_item = json!({
         "TableName": "TestTable",
-        "Item": { "pk": { "S": "x".repeat(crate::MAX_ITEM_SIZE_BYTES) } }
+        "Item": { "pk": { "S": "x".repeat(crate::constants::MAX_ITEM_SIZE_BYTES) } }
     });
     let oversized_binary_item = json!({
         "TableName": "TestTable",
@@ -2841,60 +2860,53 @@ fn dynamodb_item_limits_reject_invalid_requests() {
     });
     let oversized_attribute_name = json!({
         "TableName": "TestTable",
-        "Item": { "x".repeat(crate::MAX_ATTRIBUTE_NAME_BYTES + 1): { "S": "1" } }
+        "Item": { "x".repeat(crate::constants::MAX_ATTRIBUTE_NAME_BYTES + 1): { "S": "1" } }
     });
     let too_deep_item = json!({
         "TableName": "TestTable",
-        "Item": { "pk": nested_attribute_value(crate::MAX_ATTRIBUTE_NESTING_DEPTH + 1) }
+        "Item": { "pk": nested_attribute_value(crate::constants::MAX_ATTRIBUTE_NESTING_DEPTH + 1) }
     });
 
     assert_eq!(
-        PutItemRequest::try_from(oversized_item).expect_err("oversized item should fail"),
+        PutItemRequest::try_from(oversized_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_binary_item)
-            .expect_err("oversized binary item should fail by decoded byte length"),
+        PutItemRequest::try_from(oversized_binary_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_binary_set_item)
-            .expect_err("oversized binary set item should fail by decoded byte length"),
+        PutItemRequest::try_from(oversized_binary_set_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_numeric_set_item)
-            .expect_err("oversized numeric set item should use numeric byte accounting"),
+        PutItemRequest::try_from(oversized_numeric_set_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_nested_list_number_item)
-            .expect_err("oversized nested number list item should include list overhead"),
+        PutItemRequest::try_from(oversized_nested_list_number_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_nested_map_numeric_set_item)
-            .expect_err("oversized nested numeric set map item should include map overhead"),
+        PutItemRequest::try_from(oversized_nested_map_numeric_set_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_nested_list_binary_item)
-            .expect_err("oversized nested binary list item should include list overhead"),
+        PutItemRequest::try_from(oversized_nested_list_binary_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert_eq!(
-        PutItemRequest::try_from(oversized_nested_map_binary_set_item)
-            .expect_err("oversized nested binary set map item should include map overhead"),
+        PutItemRequest::try_from(oversized_nested_map_binary_set_item).unwrap_err(),
         "Item size has exceeded the maximum allowed size"
     );
     assert!(
         PutItemRequest::try_from(oversized_attribute_name)
-            .expect_err("oversized attribute name should fail")
+            .unwrap_err()
             .contains("attribute name cannot exceed")
     );
     assert!(
         PutItemRequest::try_from(too_deep_item)
-            .expect_err("deep item should fail")
+            .unwrap_err()
             .contains("nesting depth")
     );
 }
@@ -2951,17 +2963,17 @@ fn dynamodb_index_limits_reject_invalid_requests() {
 
     assert!(
         CreateTableRequest::try_from(too_short_index_name)
-            .expect_err("short index name should fail")
+            .unwrap_err()
             .contains("between 3 and 255")
     );
     assert!(
         CreateTableRequest::try_from(invalid_index_name)
-            .expect_err("invalid index name should fail")
+            .unwrap_err()
             .contains("invalid characters")
     );
     assert!(
         CreateTableRequest::try_from(too_many_projected)
-            .expect_err("too many projected attributes should fail")
+            .unwrap_err()
             .contains("Projected attributes")
     );
 }
@@ -2988,21 +3000,21 @@ fn dynamodb_expression_and_api_limits_reject_invalid_requests() {
 
     assert!(
         ScanRequest::try_from(scan)
-            .expect_err("long filter should fail")
+            .unwrap_err()
             .contains("FilterExpression")
     );
     assert!(
         QueryRequest::try_from(query)
-            .expect_err("long projection should fail")
+            .unwrap_err()
             .contains("ProjectionExpression")
     );
     assert!(
         PutItemRequest::try_from(put)
-            .expect_err("long condition should fail")
+            .unwrap_err()
             .contains("ConditionExpression")
     );
     assert_eq!(
-        ListTablesRequest::try_from(list_tables).expect_err("list limit should fail"),
+        ListTablesRequest::try_from(list_tables).unwrap_err(),
         "Limit must be between 1 and 100"
     );
 }
@@ -3023,19 +3035,19 @@ fn dynamodb_transaction_limits_reject_invalid_requests() {
         "TransactItems": [{
             "Put": {
                 "TableName": "TestTable",
-                "Item": { "pk": { "S": "x".repeat(crate::MAX_TRANSACTION_REQUEST_BYTES) } }
+                "Item": { "pk": { "S": "x".repeat(crate::constants::MAX_TRANSACTION_REQUEST_BYTES) } }
             }
         }]
     });
 
     assert_eq!(
-        TransactGetItemsRequest::try_from(too_many_gets).expect_err("too many gets should fail"),
+        TransactGetItemsRequest::try_from(too_many_gets).unwrap_err(),
         "TransactItems cannot contain more than 100 operations"
     );
     assert!(
         TransactWriteItemsRequest::try_from(oversized_request)
-            .expect_err("oversized transaction should fail")
-            .contains("TransactWriteItems request cannot exceed")
+            .unwrap_err()
+            .contains("Item size has exceeded the maximum allowed size")
     );
 }
 
@@ -3114,7 +3126,7 @@ fn put_item_rejects_invalid_sets_before_insert() {
             "Item": item
         });
         assert_eq!(
-            PutItemRequest::try_from(put_item).expect_err("invalid set should fail"),
+            PutItemRequest::try_from(put_item).unwrap_err(),
             expected_message
         );
     }
@@ -3151,13 +3163,11 @@ fn shared_item_validation_rejects_invalid_sets_in_batch_and_transaction_puts() {
     });
 
     assert_eq!(
-        BatchWriteItemRequest::try_from(batch_write)
-            .expect_err("BatchWriteItem PutRequest should reject invalid sets"),
+        BatchWriteItemRequest::try_from(batch_write).unwrap_err(),
         "One or more parameter values were invalid: Input collection contains duplicates."
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_write)
-            .expect_err("TransactWriteItems Put should reject invalid sets"),
+        TransactWriteItemsRequest::try_from(transact_write).unwrap_err(),
         "One or more parameter values were invalid: Input collection [\"QQ==\",\"QQ==\"]of type \
          BS contains duplicates."
     );
@@ -3210,7 +3220,7 @@ fn update_expression_values_reject_invalid_sets_before_execution() {
             "ExpressionAttributeValues": expression_attribute_values
         });
         assert_eq!(
-            UpdateItemRequest::try_from(update_item).expect_err("invalid update set should fail"),
+            UpdateItemRequest::try_from(update_item).unwrap_err(),
             expected_message
         );
     }
@@ -3248,14 +3258,12 @@ fn transaction_update_expression_values_reject_invalid_sets_before_execution() {
     });
 
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_set_duplicate)
-            .expect_err("transaction SET should reject invalid sets"),
+        TransactWriteItemsRequest::try_from(transact_set_duplicate).unwrap_err(),
         "ExpressionAttributeValues contains invalid value: Input collection contains duplicates \
          for key :set"
     );
     assert_eq!(
-        TransactWriteItemsRequest::try_from(transact_add_empty)
-            .expect_err("transaction ADD should reject empty sets"),
+        TransactWriteItemsRequest::try_from(transact_add_empty).unwrap_err(),
         "ExpressionAttributeValues contains invalid value: One or more parameter values were \
          invalid: Binary sets should not be empty for key :set"
     );

@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use crate::{
-    StorageEnum, StorageError, TableNamespace, TableNamespaceParseError, WireAttributeDecode,
+    StorageEnum, StorageError, TableNamespace, WireAttributeDecode,
+    table_namespace::TableNamespaceParseError,
 };
 
 #[test]
@@ -51,7 +52,7 @@ fn table_namespace_rejects_invalid_length_and_characters() {
     assert!(
         matches!(
             length_error,
-            TableNamespaceParseError::InvalidLength {
+            TableNamespaceParseError::Length {
                 expected: TableNamespace::KEY_LENGTH,
                 ..
             }
@@ -59,10 +60,7 @@ fn table_namespace_rejects_invalid_length_and_characters() {
         "unexpected error: {length_error:?}"
     );
     assert!(
-        matches!(
-            character_error,
-            TableNamespaceParseError::InvalidCharacters { .. }
-        ),
+        matches!(character_error, TableNamespaceParseError::Characters { .. }),
         "unexpected error: {character_error:?}"
     );
 }
@@ -94,11 +92,8 @@ fn table_namespace_schema_bounds_include_system_and_canonical_namespaces() {
 
 fn assert_internal_message(error: StorageError, expected: &str) {
     assert!(
-        matches!(
-            error,
-            StorageError::Base(StorageEnum::InternalServerError { ref message })
-                if message.contains(expected)
-        ),
+        matches!(error.base_error(), Some(StorageEnum::InternalServerError { message })
+                if message.contains(expected)),
         "unexpected error: {error:?}"
     );
 }

@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeValue, KeyAttributes, StreamRetentionDuration, TableName, TransactDeleteRequest,
-    TransactPutRequest,
+    AttributeMap, KeyAttributes, ReturnConsumedCapacity, StreamRetentionDuration, TableName,
+    TransactDeleteRequest, TransactPutRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
@@ -17,7 +15,7 @@ pub struct TransactWriteItemsRequest {
     pub client_request_token: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub return_consumed_capacity: Option<String>,
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_item_collection_metrics: Option<String>,
@@ -48,6 +46,8 @@ pub struct TransactUpdateRequest {
 
     pub update_expression: String,
 
+    /// Names total at most 1,024 UTF-8 bytes per item, including absent
+    /// attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexers: Option<Vec<String>>,
 
@@ -55,10 +55,11 @@ pub struct TransactUpdateRequest {
     pub condition_expression: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_values: Option<AttributeMap>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
@@ -81,10 +82,11 @@ pub struct TransactConditionCheckRequest {
     pub condition_expression: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_names: Option<HashMap<String, String>>,
+    #[schema(value_type = HashMap<String, String>)]
+    pub expression_attribute_names: Option<crate::VecMap<String, String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+    pub expression_attribute_values: Option<AttributeMap>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]

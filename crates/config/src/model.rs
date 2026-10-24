@@ -5,21 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     backends::{Backends, StorageConnectionsConfig},
-    cache::{
-        CacheTtlOverridesConfig, DistributedCacheConfig, StoragePointReadCacheConfig,
-        StorageQueryProofCacheConfig,
-    },
     constants::{
-        DEFAULT_CONFIG_VERSION, DEFAULT_HTTP_BIND_ADDR, DEFAULT_JOBS_JITTER_PERCENT,
-        DEFAULT_JOBS_MAX_IMMEDIATE_WORKERS, DEFAULT_LOG_DESTINATION,
-        DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS, DEFAULT_STORAGE_REPLICATION_BATCH_BYTE_LIMIT,
-        DEFAULT_STORAGE_REPLICATION_BATCH_MUTATION_LIMIT,
-        DEFAULT_STORAGE_REPLICATION_HEARTBEAT_INTERVAL_MS,
-        DEFAULT_STORAGE_REPLICATION_HEARTBEAT_JITTER_MS,
-        DEFAULT_STORAGE_REPLICATION_POLL_INTERVAL_MS, DEFAULT_TRACING_LOG_LEVEL,
+        DEFAULT_CONFIG_VERSION, DEFAULT_HTTP_BIND_ADDR, DEFAULT_JOBS_GSI_BACKFILL_INTERVAL_MS,
+        DEFAULT_JOBS_JITTER_PERCENT, DEFAULT_JOBS_MAX_IMMEDIATE_WORKERS, DEFAULT_LOG_DESTINATION,
+        DEFAULT_SLOW_OPERATION_LOG_THRESHOLD_MS, DEFAULT_TRACING_LOG_LEVEL,
     },
     messaging::{PubsubConfig, QueueConfig},
-    sync_replication::StorageSyncReplicationConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -294,6 +285,11 @@ pub struct Features {
     #[serde(default)]
     #[schemars(default)]
     pub storage_connections: Option<StorageConnectionsConfig>,
+    /// Startup-only regional configuration files, keyed by native connection
+    /// ID.
+    #[serde(default)]
+    #[schemars(default)]
+    pub regional_connections: std::collections::HashMap<String, std::path::PathBuf>,
     #[serde(default)]
     #[schemars(default)]
     pub tracing: Tracing,
@@ -305,68 +301,7 @@ pub struct Features {
     pub runtime: RuntimeFeatures,
     #[serde(default)]
     #[schemars(default)]
-    pub cache_ttls: CacheTtlOverridesConfig,
-    #[serde(default)]
-    #[schemars(default)]
-    pub storage_point_read_cache: StoragePointReadCacheConfig,
-    #[serde(default)]
-    #[schemars(default)]
-    pub storage_query_proof_cache: StorageQueryProofCacheConfig,
-    #[serde(default)]
-    #[schemars(default)]
-    pub distributed_cache: DistributedCacheConfig,
-    #[serde(default)]
-    #[schemars(default)]
-    pub storage_sync_replication: StorageSyncReplicationConfig,
-    #[serde(default)]
-    #[schemars(default)]
-    pub read_sequence: ReadSequenceConfig,
-    #[serde(default)]
-    #[schemars(default)]
     pub storage_admission: StorageAdmissionConfig,
-}
-
-/// Operational strategy selection for the ReadSequence DAG lowerings.
-///
-/// This is deliberately configuration-only.  The request contract always
-/// validates and executes through the ordinary DAG scheduler; the mode only
-/// controls whether an optional provider lowering may be attempted.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReadSequenceExecutionMode {
-    Off,
-    Shadow,
-    #[default]
-    On,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[schemars(deny_unknown_fields)]
-pub struct ReadSequenceConfig {
-    #[serde(default)]
-    #[schemars(default)]
-    pub mode: ReadSequenceExecutionMode,
-    /// Percentage of requests eligible for shadow comparison.  Sampling is
-    /// deterministic from the request digest and is capped at 100.
-    #[serde(default = "default_read_sequence_shadow_sample_percent")]
-    #[schemars(
-        default = "default_read_sequence_shadow_sample_percent",
-        range(min = 0, max = 100)
-    )]
-    pub shadow_sample_percent: u8,
-}
-
-impl Default for ReadSequenceConfig {
-    fn default() -> Self {
-        Self {
-            mode: ReadSequenceExecutionMode::default(),
-            shadow_sample_percent: default_read_sequence_shadow_sample_percent(),
-        }
-    }
-}
-
-const fn default_read_sequence_shadow_sample_percent() -> u8 {
-    1
 }
 
 fn default_backends() -> Backends {
@@ -431,11 +366,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-pub struct PrometheusMetricsConfig {
-    #[serde(default)]
-    #[schemars(default)]
-    pub bearer_token: Option<String>,
-}
+pub struct PrometheusMetricsConfig {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -493,9 +424,9 @@ pub struct Jobs {
     #[serde(default = "default_jobs_jitter_percent")]
     #[schemars(default = "default_jobs_jitter_percent")]
     pub jitter_percent: u8,
-    #[serde(default)]
-    #[schemars(default)]
-    pub storage_replication: StorageReplicationConfig,
+    #[serde(default = "default_jobs_gsi_backfill_interval_ms")]
+    #[schemars(default = "default_jobs_gsi_backfill_interval_ms")]
+    pub gsi_backfill_interval_ms: u64,
 }
 
 impl Default for Jobs {
@@ -503,7 +434,7 @@ impl Default for Jobs {
         Self {
             max_immediate_workers: default_jobs_max_immediate_workers(),
             jitter_percent: default_jobs_jitter_percent(),
-            storage_replication: StorageReplicationConfig::default(),
+            gsi_backfill_interval_ms: default_jobs_gsi_backfill_interval_ms(),
         }
     }
 }
@@ -516,81 +447,6 @@ fn default_jobs_jitter_percent() -> u8 {
     DEFAULT_JOBS_JITTER_PERCENT
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct StorageReplicationConfig {
-    #[serde(default)]
-    #[schemars(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    #[schemars(default)]
-    pub self_region: Option<String>,
-    #[serde(default)]
-    #[schemars(default)]
-    pub peers: Vec<StorageReplicationPeerConfig>,
-    #[serde(default = "default_storage_replication_poll_interval_ms")]
-    #[schemars(default = "default_storage_replication_poll_interval_ms")]
-    pub poll_interval_ms: u64,
-    #[serde(default = "default_storage_replication_heartbeat_interval_ms")]
-    #[schemars(default = "default_storage_replication_heartbeat_interval_ms")]
-    pub heartbeat_interval_ms: u64,
-    #[serde(default = "default_storage_replication_heartbeat_jitter_ms")]
-    #[schemars(default = "default_storage_replication_heartbeat_jitter_ms")]
-    pub heartbeat_jitter_ms: u64,
-    #[serde(default = "default_storage_replication_batch_mutation_limit")]
-    #[schemars(default = "default_storage_replication_batch_mutation_limit")]
-    pub batch_mutation_limit: u32,
-    #[serde(default = "default_storage_replication_batch_byte_limit")]
-    #[schemars(default = "default_storage_replication_batch_byte_limit")]
-    pub batch_byte_limit: u64,
-}
-
-impl Default for StorageReplicationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            self_region: None,
-            peers: Vec::new(),
-            poll_interval_ms: default_storage_replication_poll_interval_ms(),
-            heartbeat_interval_ms: default_storage_replication_heartbeat_interval_ms(),
-            heartbeat_jitter_ms: default_storage_replication_heartbeat_jitter_ms(),
-            batch_mutation_limit: default_storage_replication_batch_mutation_limit(),
-            batch_byte_limit: default_storage_replication_batch_byte_limit(),
-        }
-    }
-}
-
-impl StorageReplicationConfig {
-    #[must_use]
-    pub const fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct StorageReplicationPeerConfig {
-    pub region_name: String,
-    pub endpoint_url: String,
-    pub service_token: String,
-}
-
-fn default_storage_replication_poll_interval_ms() -> u64 {
-    DEFAULT_STORAGE_REPLICATION_POLL_INTERVAL_MS
-}
-
-fn default_storage_replication_heartbeat_interval_ms() -> u64 {
-    DEFAULT_STORAGE_REPLICATION_HEARTBEAT_INTERVAL_MS
-}
-
-fn default_storage_replication_heartbeat_jitter_ms() -> u64 {
-    DEFAULT_STORAGE_REPLICATION_HEARTBEAT_JITTER_MS
-}
-
-fn default_storage_replication_batch_mutation_limit() -> u32 {
-    DEFAULT_STORAGE_REPLICATION_BATCH_MUTATION_LIMIT
-}
-
-fn default_storage_replication_batch_byte_limit() -> u64 {
-    DEFAULT_STORAGE_REPLICATION_BATCH_BYTE_LIMIT
+fn default_jobs_gsi_backfill_interval_ms() -> u64 {
+    DEFAULT_JOBS_GSI_BACKFILL_INTERVAL_MS
 }

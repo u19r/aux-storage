@@ -1,4 +1,6 @@
-use super::parse_read_sequence_metrics;
+use super::{
+    ReadSequenceDagCheckReport, parse_read_sequence_metrics, validate_read_sequence_report,
+};
 
 #[test]
 fn read_sequence_checker_sums_client_metrics() {
@@ -15,7 +17,49 @@ fn read_sequence_checker_sums_client_metrics() {
     .expect("read-sequence metrics");
     assert_eq!(report.attempts, 3);
     assert_eq!(report.published, 3);
+    assert_eq!(report.retries, 0);
     assert_eq!(report.oracle_checks, 3);
+    assert_eq!(report.ordinary_attempts, 0);
+    assert_eq!(report.mapped_attempts, 0);
+    assert_eq!(report.mapped_selected, 0);
+    assert_eq!(report.mapped_fallbacks, 0);
     assert_eq!(report.mismatches, 0);
     assert_eq!(report.errors, 0);
+}
+
+#[test]
+fn read_sequence_checker_accepts_retried_ordinary_attempts() {
+    for (ordinary_attempts, mapped_attempts, retries) in [(17, 16, 2), (22, 22, 6)] {
+        let report = ReadSequenceDagCheckReport {
+            attempts: 16,
+            published: 16,
+            retries,
+            oracle_checks: ordinary_attempts,
+            ordinary_attempts,
+            mapped_attempts,
+            mapped_selected: mapped_attempts,
+            mapped_fallbacks: 0,
+            mismatches: 0,
+            errors: 0,
+        };
+        validate_read_sequence_report(&report).expect("retried report is valid");
+    }
+}
+
+#[test]
+fn read_sequence_checker_rejects_unaccounted_mapped_outcome() {
+    let report = ReadSequenceDagCheckReport {
+        attempts: 1,
+        published: 1,
+        retries: 0,
+        oracle_checks: 1,
+        ordinary_attempts: 1,
+        mapped_attempts: 1,
+        mapped_selected: 0,
+        mapped_fallbacks: 0,
+        mismatches: 0,
+        errors: 0,
+    };
+    let error = validate_read_sequence_report(&report).expect_err("missing mapped outcome");
+    assert!(error.contains("mapped outcomes"));
 }

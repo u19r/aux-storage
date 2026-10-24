@@ -293,10 +293,10 @@ impl AdmissionControllerMbtDriver {
             queue_capacity: 2,
             max_queue_wait_ms: 10,
         };
-        admission_transition::transition_for_model(
+        admission_transition::admission_transition_tests::transition_for_model(
             &runtime_config,
             &mut state,
-            admission_transition::ModelSignals {
+            admission_transition::admission_transition_tests::ModelSignals {
                 saturated: signals.saturated,
                 pressure: signals.pressure,
                 enough_samples: signals.enough_samples,

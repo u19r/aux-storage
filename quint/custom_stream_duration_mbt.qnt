@@ -15,6 +15,11 @@ module custom_stream_duration_mbt {
   var lastOutcome: str
   var effectiveHours: int
   var deleteCount: int
+  var firstRemainingVersion: int
+  var oldestRetainedVersion: int
+  var nextDueHours: int
+  var markerState: str
+  var boundaryCeiling: int
 
   pure val FOREVER = -1
   pure val PAGE_SIZE = 2
@@ -78,11 +83,52 @@ module custom_stream_duration_mbt {
     else
       0
 
+  pure def firstRemaining(streamCase, now) =
+    if (streamCase.currentVersion == 0)
+      0
+    else
+      minInt(
+        streamCase.latestVersion,
+        streamCase.currentVersion + actualDeleteCount(streamCase, now)
+      )
+
+  pure def nextDue(streamCase, now) =
+    if (streamCase.markerVersion != streamCase.currentPolicyVersion)
+      now
+    else if (effectiveRetentionHours(streamCase) == FOREVER)
+      0
+    else if (firstRemaining(streamCase, now) == 0)
+      0
+    else if (actualDeleteCount(streamCase, now) == 0)
+      if (boundaryLimit(streamCase) <= 1)
+        now + 1
+      else {
+        val candidate = firstRemaining(streamCase, now) + effectiveRetentionHours(streamCase)
+        if (candidate <= now) now + 1 else candidate
+      }
+    else
+      firstRemaining(streamCase, now) + effectiveRetentionHours(streamCase)
+
+  pure def markerStateFor(streamCase, now) =
+    if (streamCase.markerVersion != streamCase.currentPolicyVersion)
+      "stale"
+    else if (effectiveRetentionHours(streamCase) == FOREVER)
+      "forever"
+    else if (actualDeleteCount(streamCase, now) > 0)
+      "trimmed"
+    else
+      "protected_or_not_due"
+
   action init = all {
     lastCase' = initialCase,
     lastOutcome' = "not_checked",
     effectiveHours' = effectiveRetentionHours(initialCase),
     deleteCount' = 0,
+    firstRemainingVersion' = firstRemaining(initialCase, 5),
+    oldestRetainedVersion' = initialCase.currentVersion,
+    nextDueHours' = 5,
+    markerState' = "pending",
+    boundaryCeiling' = boundaryLimit(initialCase),
   }
 
   action Check = {
@@ -105,10 +151,16 @@ module custom_stream_duration_mbt {
       protectedBefore: protectedBefore,
     }
     all {
+      retainedTablePointerVersion <= streamCase.latestVersion,
       lastCase' = streamCase,
       lastOutcome' = outcomeFor(streamCase, 5),
       effectiveHours' = effectiveRetentionHours(streamCase),
       deleteCount' = actualDeleteCount(streamCase, 5),
+      firstRemainingVersion' = firstRemaining(streamCase, 5),
+      oldestRetainedVersion' = firstRemaining(streamCase, 5),
+      nextDueHours' = nextDue(streamCase, 5),
+      markerState' = markerStateFor(streamCase, 5),
+      boundaryCeiling' = boundaryLimit(streamCase),
     }
   }
 
@@ -166,4 +218,40 @@ module custom_stream_duration_mbt {
       retainedTablePointerVersion: 2,
       protectedBefore: 0,
     }, 5) == 1)
+
+  run protectedNoProgressMovesToNextDueBucket =
+    true.expect(nextDue({
+      tableHours: 2,
+      itemHours: 2,
+      markerVersion: 1,
+      currentPolicyVersion: 1,
+      currentVersion: 1,
+      latestVersion: 1,
+      retainedTablePointerVersion: 1,
+      protectedBefore: 3,
+    }, 5) == 6)
+
+  run protectedNoProgressAtNextHourMovesAgain =
+    true.expect(nextDue({
+      tableHours: 2,
+      itemHours: 2,
+      markerVersion: 1,
+      currentPolicyVersion: 1,
+      currentVersion: 1,
+      latestVersion: 1,
+      retainedTablePointerVersion: 1,
+      protectedBefore: 3,
+    }, 6) == 7)
+
+  run inclusiveProtectedFutureDueIsPreserved =
+    true.expect(nextDue({
+      tableHours: 4,
+      itemHours: 4,
+      markerVersion: 1,
+      currentPolicyVersion: 1,
+      currentVersion: 3,
+      latestVersion: 5,
+      retainedTablePointerVersion: 0,
+      protectedBefore: 3,
+    }, 5) == 7)
 }

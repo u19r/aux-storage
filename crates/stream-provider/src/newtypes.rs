@@ -15,6 +15,12 @@ impl CursorName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    #[must_use]
+    pub fn is_reserved_bootstrap(&self) -> bool {
+        self.0
+            .starts_with(crate::constants::BOOTSTRAP_CURSOR_PREFIX)
+    }
 }
 
 impl Deref for CursorName {

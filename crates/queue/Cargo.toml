@@ -1,5 +1,7 @@
 [package]
+rust-version.workspace = true
 publish = false
+autotests = false
 edition = "2024"
 license.workspace = true
 name = "queue"
@@ -11,6 +13,7 @@ doctest = false
 [[bin]]
 name = "queue"
 path = "src/main/mod.rs"
+required-features = ["server"]
 
 [features]
 default = ["sqlite", "server"]
@@ -18,36 +21,36 @@ server = [
     "dep:axum",
     "dep:clap",
     "dep:metrics-exporter-prometheus",
-    "dep:serde",
     "dep:tracing-subscriber",
     "dep:uuid",
 ]
-sqlite = ["dep:sql", "sql/sqlite-backend", "storage-types/sqlite"]
-turso = ["dep:sql", "sql/sqlite-backend", "sql/turso-backend", "storage-types/turso"]
-postgres = ["dep:sql", "sql/postgres-backend", "storage-types/postgres"]
-rocksdb = ["dep:kv", "storage-types/rocksdb"]
-foundationdb = ["dep:kv", "kv/foundationdb-backend"]
+sqlite = ["dep:sql-backend", "sql-backend/sqlite", "storage-types/sqlite"]
+turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso"]
+postgres = ["dep:sql-backend", "sql-backend/postgres", "storage-types/postgres"]
+rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "storage-types/rocksdb"]
+foundationdb = ["dep:kv-backend", "kv-backend/foundationdb"]
 remote = ["dep:queue-remote"]
 opt-loop-profiling = ["dep:opt-loop-probe"]
 
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true, optional = true }
-bg-jobs = { path = "../bg-jobs" }
+bg-jobs-tokio = { workspace = true }
 clap = { workspace = true, optional = true }
 config = { path = "../config" }
 http-error = { path = "../http-error" }
-kv = { path = "../kv", optional = true, default-features = false }
+kv-backend = { path = "../kv-backend", optional = true, default-features = false }
 md5 = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-facade = { workspace = true }
 opt-loop-probe = { workspace = true, optional = true }
 queue-provider = { path = "../queue-provider" }
 queue-remote = { path = "../queue-remote", optional = true }
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-sql = { path = "../sql", optional = true, default-features = false }
+sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-types = { path = "../storage-types" }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
@@ -59,8 +62,20 @@ aws-config = { workspace = true }
 aws-sdk-sqs = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+storage-observability-test-support = { path = "../storage-observability-test-support" }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "aws_parity_tests"
+path = "tests/aws_parity_tests/mod.rs"
+required-features = ["server"]
+
+[[test]]
+name = "http_binary_tests"
+path = "tests/http_binary_tests.rs"
+required-features = ["server"]

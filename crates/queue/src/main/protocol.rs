@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use axum::{
     Json,
     body::Bytes,
@@ -15,7 +17,7 @@ use queue_provider::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-const QUEUE_JSON_TARGET_PREFIX: &str = concat!("Amazon", "SQ", "S.");
+use crate::constants::QUEUE_JSON_TARGET_PREFIX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueProtocol {
@@ -231,16 +233,15 @@ fn query_ok_response<T: Serialize>(request_id: &str, action: QueueAction, value:
     let action_name = action.name();
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\"?>");
-    body.push_str(&format!(
-        "<{action_name}Response xmlns=\"http://queue.amazonaws.com/doc/2012-11-05/\">"
-    ));
-    body.push_str(&format!("<{action_name}Result>"));
+    push_query_open_tag(&mut body, action_name, "Response");
+    body.push_str(" xmlns=\"http://queue.amazonaws.com/doc/2012-11-05/\">");
+    push_query_tag(&mut body, action_name, "Result");
     write_query_value(&mut body, None, &value);
-    body.push_str(&format!("</{action_name}Result>"));
+    push_query_close_tag(&mut body, action_name, "Result");
     body.push_str("<ResponseMetadata><RequestId>");
-    body.push_str(&escape_xml(request_id));
+    append_escaped_xml(&mut body, request_id);
     body.push_str("</RequestId></ResponseMetadata>");
-    body.push_str(&format!("</{action_name}Response>"));
+    push_query_close_tag(&mut body, action_name, "Response");
 
     let mut response = (StatusCode::OK, body).into_response();
     add_query_headers(response.headers_mut(), request_id, None);
@@ -254,13 +255,14 @@ fn query_error_response(
     message: &str,
 ) -> Response {
     let code = error_type.rsplit('.').next().unwrap_or(error_type);
-    let body = format!(
-        "<?xml version=\"1.0\"?><ErrorResponse><Error><Type>Sender</Type><Code>{}</\
-         Code><Message>{}</Message></Error><RequestId>{}</RequestId></ErrorResponse>",
-        escape_xml(code),
-        escape_xml(message),
-        escape_xml(request_id)
-    );
+    let mut body =
+        String::from("<?xml version=\"1.0\"?><ErrorResponse><Error><Type>Sender</Type><Code>");
+    append_escaped_xml(&mut body, code);
+    body.push_str("</Code><Message>");
+    append_escaped_xml(&mut body, message);
+    body.push_str("</Message></Error><RequestId>");
+    append_escaped_xml(&mut body, request_id);
+    body.push_str("</RequestId></ErrorResponse>");
     let mut response = (status, body).into_response();
     add_query_headers(response.headers_mut(), request_id, Some(error_type));
     response
@@ -298,8 +300,10 @@ fn write_named_query_value(output: &mut String, name: &str, value: &Value) {
     output.push('>');
     match value {
         Value::Object(_) | Value::Array(_) => write_query_value(output, Some(name), value),
-        Value::String(value) => output.push_str(&escape_xml(value)),
-        Value::Number(value) => output.push_str(&escape_xml(&value.to_string())),
+        Value::String(value) => append_escaped_xml(output, value),
+        Value::Number(value) => {
+            let _ = write!(output, "{value}");
+        }
         Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Null => {}
     }
@@ -318,9 +322,9 @@ fn write_attribute_entries(output: &mut String, map: &serde_json::Map<String, Va
     for key in keys {
         let value = map.get(key).and_then(Value::as_str).unwrap_or_default();
         output.push_str("<Attribute><Name>");
-        output.push_str(&escape_xml(key));
+        append_escaped_xml(output, key);
         output.push_str("</Name><Value>");
-        output.push_str(&escape_xml(value));
+        append_escaped_xml(output, value);
         output.push_str("</Value></Attribute>");
     }
 }
@@ -334,13 +338,35 @@ fn array_member_name(name: Option<&str>) -> &'static str {
     }
 }
 
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn push_query_open_tag(output: &mut String, action_name: &str, suffix: &str) {
+    output.push('<');
+    output.push_str(action_name);
+    output.push_str(suffix);
+}
+
+fn push_query_tag(output: &mut String, action_name: &str, suffix: &str) {
+    push_query_open_tag(output, action_name, suffix);
+    output.push('>');
+}
+
+fn push_query_close_tag(output: &mut String, action_name: &str, suffix: &str) {
+    output.push_str("</");
+    output.push_str(action_name);
+    output.push_str(suffix);
+    output.push('>');
+}
+
+fn append_escaped_xml(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 pub(crate) fn add_common_headers(

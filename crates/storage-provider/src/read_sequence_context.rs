@@ -1,12 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use storage_types::{
     BatchGetItemRequest, BatchGetWireItemResponse, KeyAttributes, QueryTableRequest,
-    ReadSequenceRequest, StorageError, StorageResult, TableName, TryFromWireItem, WireItem,
+    ReadSequenceRequest, StorageError, StorageResult, TableName, TryFromWireItem, VecMap, WireItem,
 };
 
 use crate::provider::StorageProviderReadContext;
@@ -131,24 +128,23 @@ impl ReadSequenceReadContext {
     pub async fn query_table_as<T>(
         &self,
         request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<T>, Option<String>)>
+    ) -> StorageResult<crate::RangeReadPage<T>>
     where
         T: TryFromWireItem,
     {
         let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
-        let (items, cursor) = self.provider_context.query_table(request).await?;
+        let page = self.provider_context.query_table(request).await?;
         drop(database_call);
-        self.account_items(items.len())?;
-        let decoded = items
-            .iter()
-            .map(T::try_from_wire_item)
-            .collect::<StorageResult<Vec<_>>>()?;
-        Ok((decoded, cursor))
+        self.account_items(page.items.len())?;
+        page.try_map(T::try_from_wire_item)
     }
 
     fn account_items(&self, count: usize) -> StorageResult<()> {
         let count = u32::try_from(count)
             .map_err(|_| StorageError::validation("ReadSequence item count exceeds u32"))?;
+        if count == 0 {
+            return Ok(());
+        }
         loop {
             let current = self.items_read.load(Ordering::Acquire);
             let next = current
@@ -171,14 +167,14 @@ impl ReadSequenceReadContext {
 /// A decoded batch response for typed ReadSequence callers.
 #[derive(Debug, Clone)]
 pub struct ReadSequenceBatchGetResponse<T> {
-    pub responses: Option<HashMap<TableName, Vec<T>>>,
-    pub unprocessed_keys: Option<HashMap<TableName, storage_types::KeysAndAttributes>>,
+    pub responses: Option<VecMap<TableName, Vec<T>>>,
+    pub unprocessed_keys: Option<VecMap<TableName, storage_types::KeysAndAttributes>>,
     pub consumed_capacity: Option<serde_json::Value>,
 }
 
 fn decode_tables<T>(
-    tables: HashMap<TableName, Vec<WireItem>>,
-) -> StorageResult<HashMap<TableName, Vec<T>>>
+    tables: VecMap<TableName, Vec<WireItem>>,
+) -> StorageResult<VecMap<TableName, Vec<T>>>
 where T: TryFromWireItem {
     tables
         .into_iter()
@@ -239,11 +235,11 @@ impl StorageProviderReadContext for ReadSequenceReadContext {
     async fn query_table(
         &self,
         request: &QueryTableRequest,
-    ) -> StorageResult<(Vec<WireItem>, Option<String>)> {
+    ) -> StorageResult<crate::RangeReadPage> {
         let database_call = metrics_facade::begin_database_call("read_sequence.query_table");
-        let (items, cursor) = self.provider_context.query_table(request).await?;
+        let page = self.provider_context.query_table(request).await?;
         drop(database_call);
-        self.account_items(items.len())?;
-        Ok((items, cursor))
+        self.account_items(page.items.len())?;
+        Ok(page)
     }
 }

@@ -47,6 +47,7 @@ fn default_postgres_max_pool_size() -> usize {
 
 #[derive(Debug, Clone)]
 pub struct FoundationDbSettings {
+    pub transaction_byte_limit: Option<std::num::NonZeroUsize>,
     pub cluster_file: Option<String>,
     pub tenant_name: Option<String>,
     pub subspace_prefix: Option<String>,
@@ -57,6 +58,7 @@ pub struct FoundationDbSettings {
 impl Default for FoundationDbSettings {
     fn default() -> Self {
         Self {
+            transaction_byte_limit: None,
             cluster_file: None,
             tenant_name: None,
             subspace_prefix: None,

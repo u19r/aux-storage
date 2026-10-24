@@ -2,10 +2,12 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use storage_types::{
-    AttributeMap, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE,
-    DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, DYNAMODB_RESOURCE_IN_USE_MESSAGE,
-    DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE, DYNAMODB_THROTTLING_MESSAGE,
-    DYNAMODB_TRANSACTION_CANCELED_MESSAGE, StorageEnum, StorageError, context::WrappedError as _,
+    AttributeMap, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
+    DYNAMODB_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+    DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE, DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE,
+    DYNAMODB_RESOURCE_IN_USE_MESSAGE, DYNAMODB_RESOURCE_NOT_FOUND_MESSAGE,
+    DYNAMODB_THROTTLING_MESSAGE, DYNAMODB_TRANSACTION_CANCELED_MESSAGE, StorageEnum, StorageError,
+    context::WrappedError as _,
 };
 use utoipa::ToSchema;
 
@@ -153,7 +155,8 @@ impl ErrorEnvelope {
 }
 
 /// HTTP API error type that doesn't depend on Axum
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpApiError {
     pub error_type: String,
     pub message: String,
@@ -221,7 +224,7 @@ impl HttpApiError {
 
     pub fn service_unavailable(retry_after_seconds: u64) -> Self {
         Self::dynamodb_protocol_error(
-            "ServiceUnavailableException",
+            "ServiceUnavailable",
             "Storage is temporarily unavailable.",
             503,
         )
@@ -362,7 +365,7 @@ impl From<StorageError> for HttpApiError {
             StorageEnum::TableNotFound { message, .. } => {
                 Self::dynamodb_protocol_error("ResourceNotFoundException", message.clone(), 400)
             }
-            StorageEnum::Validation { message } => Self::dynamodb_protocol_error(
+            StorageEnum::Validation { message, .. } => Self::dynamodb_protocol_error(
                 "ValidationException",
                 dynamodb_validation_message(message),
                 400,
@@ -370,17 +373,34 @@ impl From<StorageError> for HttpApiError {
             StorageEnum::RawValidation { message } => {
                 Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
             }
+            StorageEnum::HistoryExpired => Self::dynamodb_protocol_error(
+                "HistoryExpired",
+                "The public history cursor has expired",
+                400,
+            ),
             StorageEnum::DeletionProtectionEnabled { message, .. } => {
                 Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
             }
 
-            StorageEnum::InternalServerError { message } => {
-                Self::dynamodb_protocol_error("InternalServerError", message.clone(), 500)
-            }
+            StorageEnum::InternalServerError { .. } => Self::dynamodb_protocol_error(
+                "InternalServerError",
+                DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+                500,
+            ),
             StorageEnum::ServiceUnavailable {
                 retry_after_seconds,
                 ..
             } => Self::service_unavailable(*retry_after_seconds),
+            // Commit uncertainty stays internal. A DynamoDB 500 does not
+            // assert whether a write took effect.
+            StorageEnum::SyncNotLeader { .. }
+            | StorageEnum::SyncSubmissionAmbiguous { .. }
+            | StorageEnum::InfrastructureResult(_)
+            | StorageEnum::HistoryUnavailable => Self::dynamodb_protocol_error(
+                "InternalServerError",
+                DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
+                500,
+            ),
             StorageEnum::GuardConflict { message } => Self::internal_server_error(message.clone()),
             StorageEnum::Unsupported { message } => Self::internal_server_error(message.clone()),
             StorageEnum::TransactionConflict { message } => {
@@ -391,6 +411,14 @@ impl From<StorageError> for HttpApiError {
                 message.clone(),
                 400,
             ),
+            StorageEnum::IdempotentParameterMismatch => Self::dynamodb_protocol_error(
+                "IdempotentParameterMismatchException",
+                DYNAMODB_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+                400,
+            ),
+            StorageEnum::IdempotencyReplay { .. } => {
+                Self::internal_server_error("native idempotency replay escaped its owning provider")
+            }
             StorageEnum::ConditionalCheckFailed => Self::dynamodb_protocol_error(
                 "ConditionalCheckFailedException",
                 DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
@@ -535,21 +563,23 @@ impl From<HttpApiError> for (axum::http::StatusCode, axum::response::Json<ErrorR
             _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         };
 
+        let retry_after_seconds = error
+            .response_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, value)| value.parse::<u64>().ok());
+        let (message, transaction_message) = if error.cancellation_reasons.is_some() {
+            (String::new(), Some(error.message))
+        } else {
+            (error.message, None)
+        };
         let response = ErrorResponse {
             error_type: error.error_type,
-            message: if error.cancellation_reasons.is_some() {
-                String::new()
-            } else {
-                error.message.clone()
-            },
-            transaction_message: error.cancellation_reasons.as_ref().map(|_| error.message),
+            message,
+            transaction_message,
             cancellation_reasons: error.cancellation_reasons,
             item: error.item.map(|item| *item),
-            retry_after_seconds: error
-                .response_headers
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-                .and_then(|(_, value)| value.parse::<u64>().ok()),
+            retry_after_seconds,
             ..Default::default()
         };
 

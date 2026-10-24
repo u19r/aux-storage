@@ -1,7 +1,6 @@
 use http_error::HttpApiError;
-use storage::AdmissionClass;
-use storage_types::{StreamName, TableName};
-use stream_provider::StreamError;
+use storage_types::TableName;
+use stream_provider::{StreamAppendOperationId, TableAppendReconciliation};
 
 use crate::{manager::StorageApiManagerImpl, types::Response};
 
@@ -10,48 +9,73 @@ impl StorageApiManagerImpl {
         &self,
         payload: serde_json::Value,
     ) -> Result<Response, HttpApiError> {
-        let table_name = payload
-            .get("TableName")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                HttpApiError::validation_error(
-                    "TableName is required for TestUtil.AppendTableStreamRecord",
-                )
-            })?;
-        let data = payload
-            .get("Data")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                HttpApiError::validation_error(
-                    "Data is required for TestUtil.AppendTableStreamRecord",
-                )
-            })?;
-
-        let table = TableName::new(table_name);
-        let stream_name = StreamName::table_stream(&table);
-        let admitted = self
+        let (table, data) = read_table_append(&payload)?;
+        let operation = match payload.get("OperationId") {
+            Some(value) => read_append_operation(value)?,
+            None => StreamAppendOperationId::fresh(),
+        };
+        let id = self
             .db()
-            .admit_default_provider(AdmissionClass::Write)
+            .append_table_stream_record_for_operation(operation, &table, data.as_bytes())
             .await
             .map_err(HttpApiError::from)?;
-        let append_result = admitted
-            .run_stream(|provider| async move {
-                provider
-                    .append_item(stream_name, data.as_bytes(), None)
-                    .await
-            })
-            .await;
-        let stream_item_id = append_result.map_err(|err: StreamError| {
-            HttpApiError::internal_server_error(format!(
-                "failed to append table stream record: {err}"
-            ))
-        })?;
+        Ok(Response::Raw(serde_json::json!({
+            "Message": "Table stream record appended", "StreamItemId": id.to_string(), "OperationId": operation.token()
+        })))
+    }
 
-        let response = serde_json::json!({
-            "Message": "Table stream record appended",
-            "StreamItemId": stream_item_id.to_string()
-        });
+    pub(super) async fn reconcile_table_stream_record_internal(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<Response, HttpApiError> {
+        let (table, data) = read_table_append(&payload)?;
+        let operation = payload
+            .get("OperationId")
+            .ok_or_else(|| {
+                HttpApiError::validation_error("OperationId is required for append reconciliation")
+            })
+            .and_then(read_append_operation)?;
+        let result = self
+            .db()
+            .reconcile_table_stream_record(operation, table, data.as_bytes().to_vec())
+            .await
+            .map_err(HttpApiError::from)?;
+        let response = match result {
+            TableAppendReconciliation::Durable(id) => {
+                serde_json::json!({"Outcome": "Durable", "StreamItemId": id.to_string(), "OperationId": operation.token()})
+            }
+            TableAppendReconciliation::Unresolved => {
+                serde_json::json!({"Outcome": "Unresolved", "OperationId": operation.token()})
+            }
+        };
         Ok(Response::Raw(response))
     }
+}
+
+fn read_table_append(payload: &serde_json::Value) -> Result<(TableName, &str), HttpApiError> {
+    let table = payload
+        .get("TableName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            HttpApiError::validation_error("TableName is required for a table stream append")
+        })?;
+    let data = payload
+        .get("Data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            HttpApiError::validation_error("Data is required for a table stream append")
+        })?;
+    Ok((TableName::new(table), data))
+}
+
+fn read_append_operation(
+    value: &serde_json::Value,
+) -> Result<StreamAppendOperationId, HttpApiError> {
+    let token = value.as_str().ok_or_else(|| {
+        HttpApiError::validation_error("OperationId must be an append operation UUID")
+    })?;
+    StreamAppendOperationId::parse(token).map_err(|_| {
+        HttpApiError::validation_error("OperationId must be a nonzero append operation UUID")
+    })
 }

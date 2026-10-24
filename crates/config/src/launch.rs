@@ -4,8 +4,8 @@ use clap::Parser;
 use serde_json::Value;
 
 use crate::{
-    Backends, Config, ConfigError, Cors, MetricsConfig, RootConfig, StorageReplicationConfig,
-    StorageSyncReplicationConfig, Tracing, load_optional_with_overrides,
+    Backends, Config, ConfigError, Cors, MetricsConfig, RootConfig, Tracing, constants::VARIABLES,
+    load_optional_with_overrides,
 };
 
 #[derive(Parser, Debug)]
@@ -81,8 +81,6 @@ pub struct StorageApiLaunchEffectiveConfig {
     pub tracing: Tracing,
     pub metrics: MetricsConfig,
     pub backends: Backends,
-    pub storage_replication: StorageReplicationConfig,
-    pub storage_sync_replication: StorageSyncReplicationConfig,
     pub enable_background_workers: bool,
     pub enable_internal_helper_routes: bool,
     pub config_watch_path: Option<PathBuf>,
@@ -126,8 +124,6 @@ impl StorageApiLaunchConfig {
             tracing: root.features.tracing.clone(),
             metrics: root.features.metrics.clone(),
             backends: root.features.backends.clone(),
-            storage_replication: root.jobs.storage_replication.clone(),
-            storage_sync_replication: root.features.storage_sync_replication.clone(),
             enable_background_workers: root.features.runtime.enable_background_workers,
             enable_internal_helper_routes: args.enable_internal_helper_routes,
             config_watch_path: args.config.clone(),
@@ -255,53 +251,6 @@ pub(crate) fn collect_storage_admission_environment_overrides<F>(
     lookup: F,
 ) -> Result<Vec<(String, String)>, ConfigError>
 where F: for<'a> Fn(&'a str) -> Result<String, std::env::VarError> {
-    const VARIABLES: &[(&str, &str, bool)] = &[
-        (
-            "AUX_STORAGE_INITIAL_SUSTAINABLE_THROUGHPUT_RPS",
-            "features.storage_admission.initial_sustainable_throughput_rps",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_INITIAL_SUSTAINABLE_THROUGHPUT_RPS",
-            "features.storage_admission.initial_sustainable_throughput_rps",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_ENABLED",
-            "features.storage_admission.enabled",
-            true,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_INITIAL_LATENCY_ESTIMATE_MS",
-            "features.storage_admission.initial_latency_estimate_ms",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_MINIMUM_CONCURRENCY",
-            "features.storage_admission.minimum_concurrency",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_MAXIMUM_CONCURRENCY",
-            "features.storage_admission.maximum_concurrency",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_CONTROL_RESERVE_CONCURRENCY",
-            "features.storage_admission.control_reserve_concurrency",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_QUEUE_CAPACITY",
-            "features.storage_admission.queue_capacity",
-            false,
-        ),
-        (
-            "AUX_STORAGE_ADMISSION_MAX_QUEUE_WAIT_MS",
-            "features.storage_admission.max_queue_wait_ms",
-            false,
-        ),
-    ];
     let mut overrides = Vec::new();
     for (variable, path, is_bool) in VARIABLES {
         let Ok(value) = lookup(variable) else {

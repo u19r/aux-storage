@@ -1,6 +1,8 @@
 use http::StatusCode;
 use serde::Deserialize;
-use storage_types::{StorageEnum, StorageError, parse_dynamodb_table_not_found_message};
+use storage_types::{
+    AttributeMap, StorageEnum, StorageError, parse_dynamodb_table_not_found_message,
+};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct RemoteErrorResponse {
@@ -10,6 +12,8 @@ pub struct RemoteErrorResponse {
     pub code: Option<String>,
     #[serde(default, rename = "message", alias = "Message")]
     pub message: Option<String>,
+    #[serde(default, rename = "Item", alias = "item")]
+    pub item: Option<serde_json::Value>,
     #[serde(
         default,
         rename = "CancellationReasons",
@@ -40,28 +44,41 @@ pub fn classify_error_response(
     let message = error
         .message
         .unwrap_or_else(|| "remote operation failed".to_string());
+    let conditional_failure_item = error
+        .item
+        .and_then(|item| serde_json::from_value::<AttributeMap>(item).ok());
+    let table_name = message
+        .strip_prefix("Table already exists: ")
+        .unwrap_or(&message)
+        .to_string();
 
     let (storage_error, retryable) = match code.as_deref() {
         Some("ProvisionedThroughputExceededException") => (
-            StorageError::Base(StorageEnum::ProvisionedThroughputExceeded { message }),
+            StorageError::from(StorageEnum::ProvisionedThroughputExceeded { message }),
             true,
         ),
         Some("ThrottlingException") => {
-            (StorageError::Base(StorageEnum::Throttled { message }), true)
+            (StorageError::from(StorageEnum::Throttled { message }), true)
         }
         Some("RequestLimitExceeded" | "RequestLimitExceededException") => {
-            (StorageError::Base(StorageEnum::RequestLimitExceeded), true)
+            (StorageError::from(StorageEnum::RequestLimitExceeded), true)
         }
         Some("LimitExceededException") => (
-            StorageError::Base(StorageEnum::LimitExceeded { message }),
+            StorageError::from(StorageEnum::LimitExceeded { message }),
             true,
         ),
-        Some("ConditionalCheckFailedException") => (
-            StorageError::Base(StorageEnum::ConditionalCheckFailed),
-            false,
-        ),
+        Some("ConditionalCheckFailedException") => match conditional_failure_item {
+            Some(item) => (
+                StorageError::from(StorageEnum::ConditionalCheckFailedWithItem { item }),
+                false,
+            ),
+            None => (
+                StorageError::from(StorageEnum::ConditionalCheckFailed),
+                false,
+            ),
+        },
         Some("TransactionConflictException") => (
-            StorageError::Base(StorageEnum::TransactionConflict { message }),
+            StorageError::from(StorageEnum::TransactionConflict { message }),
             true,
         ),
         Some("TransactionCanceledException") => {
@@ -72,16 +89,19 @@ pub fn classify_error_response(
                 .map(encode_cancellation_reason)
                 .collect::<Vec<_>>();
             (
-                StorageError::Base(StorageEnum::TransactionCanceled { reasons }),
+                StorageError::from(StorageEnum::TransactionCanceled { reasons }),
                 false,
             )
         }
         Some("TransactionInProgressException") => (
-            StorageError::Base(StorageEnum::TransactionInProgress { message }),
+            StorageError::from(StorageEnum::TransactionInProgress { message }),
             true,
         ),
+        Some("IdempotentParameterMismatchException") => {
+            (StorageError::idempotent_parameter_mismatch(), false)
+        }
         Some("NotLeaderException") => (
-            StorageError::Base(StorageEnum::AwsService {
+            StorageError::from(StorageEnum::AwsService {
                 code: Some("NotLeaderException".to_string()),
                 message,
             }),
@@ -92,7 +112,7 @@ pub fn classify_error_response(
                 (StorageError::table_not_found(&table_name), false)
             } else {
                 (
-                    StorageError::Base(StorageEnum::ResourceNotFound {
+                    StorageError::from(StorageEnum::ResourceNotFound {
                         resource_type: "dynamodb",
                         resource_id: message.clone(),
                     }),
@@ -101,8 +121,8 @@ pub fn classify_error_response(
             }
         }
         Some("ResourceInUseException") => (
-            StorageError::Base(StorageEnum::TableAlreadyExists {
-                name: message.clone(),
+            StorageError::from(StorageEnum::TableAlreadyExists {
+                name: table_name.clone(),
             }),
             false,
         ),
@@ -111,7 +131,7 @@ pub fn classify_error_response(
                 (StorageError::table_not_found(&table_name), false)
             } else {
                 (
-                    StorageError::Base(StorageEnum::ResourceNotFound {
+                    StorageError::from(StorageEnum::ResourceNotFound {
                         resource_type: "dynamodb",
                         resource_id: message.clone(),
                     }),
@@ -120,29 +140,30 @@ pub fn classify_error_response(
             }
         }
         Some("TableAlreadyExistsException") => (
-            StorageError::Base(StorageEnum::TableAlreadyExists {
-                name: message.clone(),
-            }),
+            StorageError::from(StorageEnum::TableAlreadyExists { name: table_name }),
             false,
         ),
         Some("ValidationException") => (
-            StorageError::Base(StorageEnum::Validation { message }),
+            StorageError::from(StorageEnum::Validation {
+                kind: storage_types::StorageValidationKind::Message,
+                message,
+            }),
             false,
         ),
         Some("AccessDeniedException" | "AccessDenied") => (
-            StorageError::Base(StorageEnum::AccessDenied { message }),
+            StorageError::from(StorageEnum::AccessDenied { message }),
             false,
         ),
         Some("MissingAuthenticationTokenException") => (
-            StorageError::Base(StorageEnum::MissingAuthenticationToken),
+            StorageError::from(StorageEnum::MissingAuthenticationToken),
             false,
         ),
         Some("UnrecognizedClientException") => (
-            StorageError::Base(StorageEnum::Authentication { message }),
+            StorageError::from(StorageEnum::Authentication { message }),
             false,
         ),
         Some("ExpiredTokenException") => (
-            StorageError::Base(StorageEnum::AwsService {
+            StorageError::from(StorageEnum::AwsService {
                 code: Some("ExpiredTokenException".to_string()),
                 message,
             }),
@@ -153,18 +174,18 @@ pub fn classify_error_response(
             (StorageError::service_unavailable(1), true)
         }
         Some("SerializationException") => (
-            StorageError::Base(StorageEnum::AwsSerialization(message)),
+            StorageError::from(StorageEnum::AwsSerialization(message)),
             false,
         ),
         Some(unknown) => (
-            StorageError::Base(StorageEnum::AwsService {
+            StorageError::from(StorageEnum::AwsService {
                 code: Some(unknown.to_string()),
                 message,
             }),
             status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
         ),
         None => (
-            StorageError::Base(StorageEnum::AwsService {
+            StorageError::from(StorageEnum::AwsService {
                 code: None,
                 message,
             }),

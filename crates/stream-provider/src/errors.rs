@@ -53,6 +53,32 @@ pub enum StreamInternalKind {
     Message,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamContinuityKind {
+    CursorMissing,
+    CursorIdentityMismatch,
+    BoundaryMismatch,
+    ResumePositionMissing,
+    CursorPositionRegressed,
+    ProtectedRetentionLost,
+    Unsupported,
+}
+
+impl StreamContinuityKind {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::CursorMissing => "protected cursor is missing",
+            Self::CursorIdentityMismatch => "protected cursor identity mismatch",
+            Self::BoundaryMismatch => "protected cursor boundary mismatch",
+            Self::ResumePositionMissing => "protected cursor resume position is missing",
+            Self::CursorPositionRegressed => "protected cursor position regressed",
+            Self::ProtectedRetentionLost => "protected stream retention was lost",
+            Self::Unsupported => "protected cursor continuity is unsupported",
+        }
+    }
+}
+
 impl StreamInternalKind {
     #[must_use]
     pub const fn message(self) -> &'static str {
@@ -115,16 +141,16 @@ impl From<&str> for StreamInternalInput {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum StreamEnum {
     #[error("Database error: {0}")]
     Database(#[from] Error),
 
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("Serialization error: {}", .0.as_ref())]
+    Serialization(#[from] lru_ttl_cache::SharedCause<serde_json::Error>),
 
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("IO error: {}", .0.as_ref())]
+    Io(#[from] lru_ttl_cache::SharedCause<std::io::Error>),
 
     #[error("Requested resource not found: {resource_type}: {resource_id} not found")]
     ResourceNotFound {
@@ -141,6 +167,12 @@ pub enum StreamEnum {
     #[error("Validation error: {message}")]
     Validation {
         kind: StreamValidationKind,
+        message: String,
+    },
+
+    #[error("Stream continuity error: {message}")]
+    Continuity {
+        kind: StreamContinuityKind,
         message: String,
     },
 
@@ -162,14 +194,14 @@ impl StreamError {
             StreamValidationInput::Kind(kind) => (kind, kind.message().to_string()),
             StreamValidationInput::Message(message) => (StreamValidationKind::Message, message),
         };
-        Self::Base(StreamEnum::Validation { kind, message })
+        Self::from(StreamEnum::Validation { kind, message })
     }
 
     pub fn validation_with_detail(
         kind: StreamValidationKind,
         detail: impl std::fmt::Display,
     ) -> Self {
-        Self::Base(StreamEnum::Validation {
+        Self::from(StreamEnum::Validation {
             kind,
             message: detail.to_string(),
         })
@@ -180,46 +212,53 @@ impl StreamError {
             StreamInternalInput::Kind(kind) => (kind, kind.message().to_string()),
             StreamInternalInput::Message(message) => (StreamInternalKind::Message, message),
         };
-        Self::Base(StreamEnum::Internal { kind, message })
+        Self::from(StreamEnum::Internal { kind, message })
     }
 
     pub fn internal_with_detail(kind: StreamInternalKind, detail: impl std::fmt::Display) -> Self {
-        Self::Base(StreamEnum::Internal {
+        Self::from(StreamEnum::Internal {
+            kind,
+            message: format!("{}: {detail}", kind.message()),
+        })
+    }
+
+    pub fn continuity(kind: StreamContinuityKind, detail: impl std::fmt::Display) -> Self {
+        Self::from(StreamEnum::Continuity {
             kind,
             message: format!("{}: {detail}", kind.message()),
         })
     }
 
     pub fn stream_already_exists(name: impl Into<String>) -> Self {
-        Self::Base(StreamEnum::ResourceExists {
+        Self::from(StreamEnum::ResourceExists {
             resource_type: "stream",
             resource_id: name.into(),
         })
     }
 
     pub fn stream_not_found(name: impl Into<String>) -> Self {
-        Self::Base(StreamEnum::ResourceNotFound {
+        Self::from(StreamEnum::ResourceNotFound {
             resource_type: "stream",
             resource_id: name.into(),
         })
     }
 
     pub fn cursor_not_found(name: impl Into<String>) -> Self {
-        Self::Base(StreamEnum::ResourceNotFound {
+        Self::from(StreamEnum::ResourceNotFound {
             resource_type: "cursor",
             resource_id: name.into(),
         })
     }
 
     pub fn cursor_already_exists(name: impl Into<String>) -> Self {
-        Self::Base(StreamEnum::ResourceExists {
-            resource_type: "stream",
+        Self::from(StreamEnum::ResourceExists {
+            resource_type: "cursor",
             resource_id: name.into(),
         })
     }
 
     pub fn item_not_found(id: impl Into<String>) -> Self {
-        Self::Base(StreamEnum::ResourceNotFound {
+        Self::from(StreamEnum::ResourceNotFound {
             resource_type: "stream_item",
             resource_id: id.into(),
         })
@@ -241,7 +280,12 @@ impl StreamError {
 impl From<StreamEnum> for StorageEnum {
     fn from(value: StreamEnum) -> Self {
         match value {
-            StreamEnum::Validation { message, .. } => StorageEnum::Validation { message },
+            StreamEnum::StorageError(error) => error.into_enum(),
+            StreamEnum::Validation { message, .. } => StorageEnum::Validation {
+                kind: storage_types::StorageValidationKind::Message,
+                message,
+            },
+            StreamEnum::Continuity { message, .. } => StorageEnum::InternalServerError { message },
             StreamEnum::Internal { message, .. } => StorageEnum::InternalServerError { message },
             StreamEnum::ResourceExists {
                 resource_type,
@@ -268,15 +312,73 @@ impl From<StreamEnum> for StorageEnum {
 impl StreamError {
     #[must_use]
     pub fn into_storage_enum(self) -> StorageEnum {
-        fn get_inner(stream_err: StreamError) -> StreamEnum {
-            match stream_err {
-                StreamError::Base(error) => error,
-                StreamError::Context { error, .. } => get_inner(*error),
-            }
-        }
-
-        StorageEnum::from(get_inner(self))
+        StorageEnum::from(self.into_enum())
     }
 }
 
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
+
+impl StreamError {
+    /// Preserve stream resource identity when a native attempt returns a
+    /// storage error. DynamoDB's storage display deliberately hides it.
+    pub fn from_storage_error(error: StorageError) -> Self {
+        match error.as_ref() {
+            StorageEnum::ResourceNotFound {
+                resource_type,
+                resource_id,
+            } => Self::from(StreamEnum::ResourceNotFound {
+                resource_type,
+                resource_id: resource_id.clone(),
+            }),
+            StorageEnum::ResourceExists {
+                resource_type,
+                resource_id,
+            } => Self::from(StreamEnum::ResourceExists {
+                resource_type,
+                resource_id: resource_id.clone(),
+            }),
+            _ => Self::from(error),
+        }
+    }
+
+    /// Lower a stream error into the shared storage error for harmonised
+    /// repository boundaries. Inner storage errors pass through untouched;
+    /// stream-native failures keep their exact identity via the matching
+    /// `StorageEnum` shape.
+    #[must_use]
+    pub fn into_storage_error(self) -> StorageError {
+        match self.into_enum() {
+            StreamEnum::StorageError(error) => error,
+            StreamEnum::ResourceNotFound {
+                resource_type,
+                resource_id,
+            } => StorageEnum::ResourceNotFound {
+                resource_type,
+                resource_id,
+            }
+            .into(),
+            StreamEnum::ResourceExists {
+                resource_type,
+                resource_id,
+            } => StorageEnum::ResourceExists {
+                resource_type,
+                resource_id,
+            }
+            .into(),
+            StreamEnum::Validation { message, .. } => StorageError::validation(message),
+            other => StorageError::internal(&other.to_string()),
+        }
+    }
+}
+
+impl From<serde_json::Error> for StreamEnum {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(error.into())
+    }
+}
+
+impl From<std::io::Error> for StreamEnum {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.into())
+    }
+}

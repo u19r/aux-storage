@@ -18,8 +18,6 @@ pub fn profile_integer_overrides(profile: &str, workload: &str) -> Vec<(&'static
         ],
         ("local-soak", "queue_visibility") => vec![("operationCount", 3)],
         ("nightly-soak", "queue_visibility") => vec![("operationCount", 10)],
-        ("local-soak", "partition_family") => vec![("operationCount", 0)],
-        ("nightly-soak", "partition_family") => vec![("operationCount", 8)],
         _ => Vec::new(),
     }
 }

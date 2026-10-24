@@ -1,5 +1,6 @@
 use http_error::HttpApiError;
-use storage_types::StorageError;
+use serde::{Deserialize, Serialize};
+use storage_types::{StorageEnum, StorageError};
 use thiserror::Error;
 
 use crate::constants::{
@@ -8,7 +9,8 @@ use crate::constants::{
     SQS_RECEIPT_HANDLE_INVALID_ERROR_TYPE, SQS_RECEIPT_HANDLE_INVALID_MESSAGE,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QueueValidationKind {
     InvalidParameterValue,
     InvalidQueueUrlFormat,
@@ -274,6 +276,37 @@ impl QueueError {
 }
 
 pub type QueueResult<T> = std::result::Result<T, QueueError>;
+
+impl QueueError {
+    /// Lower a queue error into the shared storage error for harmonised
+    /// repository boundaries. Inner storage errors pass through untouched;
+    /// queue-native failures keep their exact SQS-parity identity via the
+    /// matching `StorageEnum` shape.
+    #[must_use]
+    pub fn into_storage_error(self) -> StorageError {
+        match self {
+            Self::StorageError(error) | Self::TransactWrite(error) => error,
+            Self::ResourceNotFound {
+                resource_type,
+                resource_id,
+            } => StorageError::from(StorageEnum::ResourceNotFound {
+                resource_type,
+                resource_id,
+            }),
+            Self::ResourceExists {
+                resource_type,
+                resource_id,
+            } => StorageError::from(StorageEnum::ResourceExists {
+                resource_type,
+                resource_id,
+            }),
+            Self::Validation { .. } | Self::Internal { .. } | Self::BatchEntry { .. } => {
+                StorageError::internal(&self.to_string())
+            }
+            Self::Serialization(error) => StorageError::internal(&error.to_string()),
+        }
+    }
+}
 
 impl From<QueueError> for HttpApiError {
     fn from(error: QueueError) -> Self {

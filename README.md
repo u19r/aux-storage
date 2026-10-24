@@ -30,7 +30,7 @@ The DynamoDB-compatible endpoint is:
 POST http://127.0.0.1:3000/storage
 ```
 
-Queue and stream crates can be used directly as libraries, or through their service binaries where enabled.
+Queue and pubsub crates can be used directly as libraries or through their service binaries where enabled. The stream crate is a library.
 
 ## Storage API Configuration
 
@@ -66,7 +66,7 @@ cargo run -p storage-api --bin storage-api -- \
   --overrides 'http.bind_addr="127.0.0.1:9000",features.runtime.enable_background_workers=false'
 ```
 
-Example SQLite config using environment variable interpolation:
+Example SQLite config:
 
 ```json
 {
@@ -80,10 +80,7 @@ Example SQLite config using environment variable interpolation:
   },
   "features": {
     "metrics": {
-      "enabled": true,
-      "prometheus": {
-        "bearer_token": "${STORAGE_API_METRICS_TOKEN}"
-      }
+      "enabled": true
     },
     "backends": {
       "sqlite": { "db_path": "./data/storage.sqlite" }
@@ -126,14 +123,18 @@ Generate the schema with:
 cargo run -p config --bin config -- --write-schema crates/config/config.schema.json
 ```
 
-Sensitive values include Postgres DSNs, remote credentials, and replication
-service tokens. Prometheus metrics are served from `/metrics` by default; set
-`features.metrics.enabled` to `false` to disable the endpoint, or set
-`features.metrics.prometheus.bearer_token` to require
-`Authorization: Bearer <token>`. Do not print effective config in production
-logs unless the output is redacted.
+Sensitive values include Postgres DSNs and remote credentials. Prometheus
+metrics are served from `/metrics` by default; set `features.metrics.enabled`
+to `false` to disable the endpoint. Do not print effective config in
+production logs unless the output is redacted.
 
 ## Networking Security Boundary
+
+The service does not authenticate inbound DynamoDB, queue, pubsub, or metrics requests.
+The default bind address is `0.0.0.0:8080`, and `/metrics` is enabled by default.
+Restrict inbound access with private ingress, security groups, or an authenticating proxy.
+The former Prometheus `bearer_token` configuration is no longer supported; configure
+metrics access at the ingress boundary or disable it with `features.metrics.enabled=false`.
 
 Aux-storage treats configured replication peers and HTTP/SNS subscription endpoints as trusted
 customer-controlled network destinations. It permits HTTP and private addresses; it does not
@@ -146,7 +147,7 @@ network policy to restrict access. Network transport security is outside aux-sto
 The workspace is structured around backend features:
 
 - `sqlite`: embedded local database via the vendored `tokio-rusqlite` adapter.
-- `turso`: remote/libSQL-compatible storage where the relevant crate enables it.
+- `turso`: embedded Turso databases where the relevant crate enables them.
 - `postgres`: service database backend for SQL-backed deployments.
 - `rocksdb`: embedded key-value backend for local and single-node deployments.
 - `foundationdb`: distributed ordered key-value backend for partitioned deployments.
@@ -170,16 +171,6 @@ Prefer existing DynamoDB-compatible APIs when they already express the workflow:
 for independent point reads and `TransactGetItems` for small transactional point-read sets. Use
 `ReadSequence` when later reads depend on attributes returned by earlier reads and the whole workflow
 must stay bounded by fanout, total-read, and response-size limits.
-
-The backend lowering mode is configured outside the request under
-`features.read_sequence`:
-
-- `on` (the default) uses a supported whole-plan lowering and falls back to the ordinary DAG;
-- `shadow` samples an optimized result but returns the ordinary DAG response;
-- `off` is the rollback setting and runs the ordinary DAG only.
-
-Set `shadow_sample_percent` from 0 through 100 to bound shadow work. Changing this setting never
-restores the removed ordered executor or accepts the superseded request/token contract.
 
 Example target and request shape:
 

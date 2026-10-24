@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 edition = "2024"
 license.workspace = true
 name = "pubsub-provider"
@@ -9,9 +10,12 @@ doctest = false
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 http-error = { path = "../http-error" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+storage-common = { path = "../storage-common" }
 storage-types = { path = "../storage-types" }
 thiserror = { workspace = true }
 uuid = { workspace = true }

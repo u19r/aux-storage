@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::{AttributeValue, KeyAttributes};
-
-pub const DEFAULT_PK_NAME: &str = "pk";
-pub const DEFAULT_SK_NAME: &str = "sk";
+use crate::{
+    AttributeValue, KeyAttributes,
+    constants::{DEFAULT_PK_NAME, DEFAULT_SK_NAME},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarValueRef<'a> {
@@ -535,8 +535,8 @@ impl<'a> ExprValueRef<'a> {
 }
 
 #[must_use]
-pub fn expr_names_to_map(values: &[ExprNameRef<'_>]) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(values.len());
+pub fn expr_names_to_map(values: &[ExprNameRef<'_>]) -> crate::VecMap<String, String> {
+    let mut out = crate::VecMap::with_capacity(values.len());
     for pair in values {
         out.insert(pair.placeholder.to_string(), pair.name.to_string());
     }
@@ -544,8 +544,8 @@ pub fn expr_names_to_map(values: &[ExprNameRef<'_>]) -> HashMap<String, String> 
 }
 
 #[must_use]
-pub fn expr_values_to_map(values: &[ExprValueRef<'_>]) -> HashMap<String, AttributeValue> {
-    let mut out = HashMap::with_capacity(values.len());
+pub fn expr_values_to_map(values: &[ExprValueRef<'_>]) -> crate::AttributeMap {
+    let mut out = crate::AttributeMap::with_capacity(values.len());
     for pair in values {
         out.insert(
             pair.placeholder.to_string(),

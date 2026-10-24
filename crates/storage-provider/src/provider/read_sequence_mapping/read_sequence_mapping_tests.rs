@@ -16,7 +16,7 @@ use crate::provider::{
 fn plan() -> ReadSequencePlan {
     let root = ReadSequenceNode {
         name: "root".into(),
-        operation: ReadSequenceNodeOperation::Query(storage_types::QueryRequest {
+        operation: ReadSequenceNodeOperation::Query(Box::new(storage_types::QueryRequest {
             table_name: storage_types::TableName::new("items"),
             index_name: None,
             key_condition_expression: "pk = :pk".into(),
@@ -37,7 +37,7 @@ fn plan() -> ReadSequencePlan {
             consistent_read: None,
             scan_index_forward: None,
             select: None,
-        }),
+        })),
         inputs: None,
         iterate: None,
         after: None,
@@ -53,7 +53,7 @@ fn plan() -> ReadSequencePlan {
     };
     let child = ReadSequenceNode {
         name: "child".into(),
-        operation: ReadSequenceNodeOperation::Get(GetItemRequest {
+        operation: ReadSequenceNodeOperation::Get(Box::new(GetItemRequest {
             table_name: storage_types::TableName::new("items"),
             key: [("pk".into(), storage_types::read_sequence_input_marker("pk"))]
                 .into_iter()
@@ -63,7 +63,7 @@ fn plan() -> ReadSequencePlan {
             projection_expression: None,
             expression_attribute_names: None,
             return_consumed_capacity: None,
-        }),
+        })),
         inputs: Some([("pk".into(), input)].into_iter().collect()),
         iterate: Some("pk".into()),
         after: None,
@@ -153,7 +153,7 @@ fn given_eligible_edge_when_selecting_repeatedly_then_allocations_are_bounded() 
     }
 
     let report = guard.finish();
-    alloc_counter::emit_report(&report);
+    let _ = alloc_counter::emit_report(&report);
     assert!(report.allocation_count <= 21_000);
     assert!(report.allocated_bytes <= 1_700_000);
 }
@@ -365,6 +365,52 @@ fn generated_small_dags_have_deterministic_maximal_selection() {
     }
 }
 
+#[test]
+fn given_duplicate_descriptors_when_selecting_then_first_descriptor_preserves_reason() {
+    let descriptors = [
+        (
+            ReadSequenceNodeId::from_index(0),
+            ReadSequencePhysicalDescriptor::default(),
+        ),
+        (
+            ReadSequenceNodeId::from_index(0),
+            ReadSequencePhysicalDescriptor {
+                operation: ReadSequencePhysicalOperation::PrefixRange,
+                tuple_schema: true,
+                tuple_prefix_safe: true,
+                selector_physical: true,
+                ..Default::default()
+            },
+        ),
+        (
+            ReadSequenceNodeId::from_index(1),
+            ReadSequencePhysicalDescriptor {
+                operation: ReadSequencePhysicalOperation::Point,
+                tuple_schema: true,
+                tuple_prefix_safe: true,
+                selector_physical: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    let selection = select_read_sequence_mapped_edges(
+        &plan(),
+        &descriptors,
+        ReadSequenceMappedOptions {
+            foundationdb: true,
+            api_version: 740,
+            enabled: true,
+            consistency: ReadSequenceConsistency::Eventual,
+        },
+    );
+
+    assert_eq!(
+        selection.assessments[0].reason,
+        Some(ReadSequenceMappedRejectionReason::SourceNotRange)
+    );
+    assert!(selection.selected.is_empty());
+}
+
 fn generated_plan(
     mut shape: usize,
 ) -> (
@@ -382,13 +428,13 @@ fn generated_plan(
         }
         let parent_index = choice - 1;
         let input_name = format!("parent{parent_index}");
-        node.operation = ReadSequenceNodeOperation::Get(GetItemRequest::new(
+        node.operation = ReadSequenceNodeOperation::Get(Box::new(GetItemRequest::new(
             storage_types::TableName::new("items"),
             KeyAttributes::from([(
                 String::from("id"),
                 storage_types::read_sequence_input_marker(&input_name),
             )]),
-        ));
+        )));
         node.inputs_mut().insert(
             input_name.clone(),
             ReadSequenceNodeInput {
@@ -425,10 +471,10 @@ fn generated_plan(
 fn generated_get(name: &str) -> ReadSequenceNode {
     ReadSequenceNode {
         name: name.to_string(),
-        operation: ReadSequenceNodeOperation::Get(GetItemRequest::new(
+        operation: ReadSequenceNodeOperation::Get(Box::new(GetItemRequest::new(
             storage_types::TableName::new("items"),
             KeyAttributes::from([(String::from("id"), AttributeValue::S(name.to_string()))]),
-        )),
+        ))),
         inputs: None,
         iterate: None,
         after: None,
@@ -438,10 +484,10 @@ fn generated_get(name: &str) -> ReadSequenceNode {
 fn get_query_plan() -> ReadSequencePlan {
     let parent = ReadSequenceNode {
         name: "account".into(),
-        operation: ReadSequenceNodeOperation::Get(GetItemRequest::new(
+        operation: ReadSequenceNodeOperation::Get(Box::new(GetItemRequest::new(
             storage_types::TableName::new("accounts"),
             KeyAttributes::from([(String::from("pk"), AttributeValue::S("account-1".into()))]),
-        )),
+        ))),
         inputs: None,
         iterate: None,
         after: None,
@@ -460,7 +506,7 @@ fn get_query_plan() -> ReadSequencePlan {
     );
     let child = ReadSequenceNode {
         name: "events".into(),
-        operation: ReadSequenceNodeOperation::Query(query),
+        operation: ReadSequenceNodeOperation::Query(Box::new(query)),
         inputs: Some(
             [(
                 String::from("account"),

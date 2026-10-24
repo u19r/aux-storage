@@ -4,14 +4,13 @@ use std::{
 };
 
 use alloc_counter::AllocationGuard;
+use storage_provider::BatchGetKeyIdentity;
 use storage_types::{
     AttributeDefinition, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement,
     KeyType, StoredTableInfo, TableName, TableStatus, TimestampMillis,
 };
 
-use super::storage_manager_impl_batch_get_item::BatchGetKeyIdentity;
-
-const ITERATIONS: usize = 10_000;
+use crate::constants_tests::BATCH_GET_ITEM_PERF_ITERATIONS as ITERATIONS;
 
 #[test]
 fn batch_get_typed_key_fingerprint_avoids_canonical_json_allocations() {
@@ -50,8 +49,8 @@ fn batch_get_typed_key_fingerprint_avoids_canonical_json_allocations() {
     }
     let typed = typed.finish();
 
-    alloc_counter::emit_report(&legacy);
-    alloc_counter::emit_report(&typed);
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&typed);
     assert!(
         typed.allocation_count < legacy.allocation_count,
         "typed fingerprint allocations={} legacy={}",
@@ -74,19 +73,46 @@ fn batch_get_key_identity_normalizes_equivalent_numbers() {
             "pk".to_string(),
             AttributeValue::S("tenant-123".to_string()),
         ),
-        ("sk".to_string(), AttributeValue::N("1.23E4".to_string())),
+        ("sk".to_string(), AttributeValue::N("1".to_string())),
     ]));
     let second = KeyAttributes::from(HashMap::from([
         (
             "pk".to_string(),
             AttributeValue::S("tenant-123".to_string()),
         ),
-        ("sk".to_string(), AttributeValue::N("12300".to_string())),
+        ("sk".to_string(), AttributeValue::N("1.0".to_string())),
+    ]));
+    let third = KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
+        ("sk".to_string(), AttributeValue::N("1E0".to_string())),
+    ]));
+    let negative_zero = KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
+        ("sk".to_string(), AttributeValue::N("-0".to_string())),
+    ]));
+    let zero = KeyAttributes::from(HashMap::from([
+        (
+            "pk".to_string(),
+            AttributeValue::S("tenant-123".to_string()),
+        ),
+        ("sk".to_string(), AttributeValue::N("0".to_string())),
     ]));
     let mut seen = HashSet::new();
 
     assert!(seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &first)));
     assert!(!seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &second)));
+    assert!(!seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &third)));
+    assert!(seen.insert(BatchGetKeyIdentity::new(
+        &table_info.key_schema,
+        &negative_zero
+    )));
+    assert!(!seen.insert(BatchGetKeyIdentity::new(&table_info.key_schema, &zero)));
 }
 
 fn table_info() -> StoredTableInfo {

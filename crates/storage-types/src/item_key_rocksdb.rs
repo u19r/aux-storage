@@ -1,11 +1,12 @@
 use crate::{
-    AttributeValue, IndexKey, IndexKeyPrefix, IndexName, ItemKey, SerializesToKey, StreamItemId,
+    AttributeValue, IndexKey, IndexKeyPrefix, IndexName, ItemKey, KeyAttributeType,
+    KeySchemaElement, SerializesToKey, StorageError, StorageResult, StoredTableInfo, StreamItemId,
     StreamKey, StreamName, TableKey, TableName,
-    item_key::{ItemKeyEnum, ItemKeyError},
+    item_key::ItemKeyError,
+    item_key_ordered::{
+        serialize_attribute_value, serialize_index_key_part_values, serialize_key_part_values,
+    },
 };
-
-const DYNAMODB_NUMBER_KEY_EXPONENT_BIAS: i32 = 1000;
-const DYNAMODB_NUMBER_KEY_DIGITS: usize = 38;
 
 impl ItemKey {
     #[must_use]
@@ -69,35 +70,6 @@ impl ItemKey {
         let stream_item_key: StreamKey = &stream_name + stream_item_id;
         Ok(stream_item_key)
     }
-
-    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
-        match self {
-            ItemKey::Table(key) => key.sorted_storage_suffix(),
-            ItemKey::Index(key) => key.sorted_storage_suffix(),
-            ItemKey::IndexPrefix(key) => key.sorted_storage_suffix(),
-        }
-    }
-}
-
-impl TableKey {
-    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
-        serialize_key_part_values(&self.hash_key, self.range_key.as_ref())
-    }
-}
-
-impl IndexKeyPrefix {
-    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
-        serialize_key_part_values(&self.hash_key, self.range_key.as_ref())
-    }
-}
-
-impl IndexKey {
-    pub fn sorted_storage_suffix(&self) -> Result<Vec<u8>, ItemKeyError> {
-        let mut key_parts = serialize_key_part_values(&self.hash_key, self.range_key.as_ref())?;
-        let table_key_bytes = self.table_key.sorted_storage_suffix()?;
-        ItemKey::add_length_prefixed_part_rocksdb(&mut key_parts, &table_key_bytes);
-        Ok(key_parts)
-    }
 }
 
 impl SerializesToKey for ItemKey {
@@ -125,7 +97,7 @@ impl SerializesToKey for IndexKeyPrefix {
     fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
         let mut key_parts: Vec<u8> =
             ItemKey::index_prefix_from_name(&self.table_name, &self.index_id);
-        key_parts.extend(serialize_key_part_values(
+        key_parts.extend(serialize_index_key_part_values(
             &self.hash_key,
             self.range_key.as_ref(),
         )?);
@@ -137,197 +109,162 @@ impl SerializesToKey for IndexKey {
     fn serialize_to_bytes(&self) -> Result<Vec<u8>, ItemKeyError> {
         let mut key_parts: Vec<u8> =
             ItemKey::index_prefix_from_name(&self.table_name, &self.index_id);
-        key_parts.extend(serialize_key_part_values(
+        key_parts.extend(serialize_index_key_part_values(
             &self.hash_key,
             self.range_key.as_ref(),
         )?);
         let table_key_bytes =
             serialize_key_part_values(&self.table_key.hash_key, self.table_key.range_key.as_ref())?;
-        ItemKey::add_length_prefixed_part_rocksdb(&mut key_parts, &table_key_bytes);
+        ItemKey::append_length_prefixed_key(&mut key_parts, &table_key_bytes)?;
         Ok(key_parts)
     }
 }
 
-fn serialize_key_part_values(
-    hash_key: &AttributeValue,
-    range_key: Option<&AttributeValue>,
-) -> Result<Vec<u8>, ItemKeyError> {
-    let mut parts = Vec::new();
-
-    // Add hash key with length prefix
-    let hash_bytes = ItemKey::serialize_attribute_value_to_bytes(hash_key)?;
-    ItemKey::add_length_prefixed_part_rocksdb(&mut parts, &hash_bytes);
-
-    if let Some(range_key) = range_key {
-        // Add range key with length prefix
-        let range_bytes = ItemKey::serialize_attribute_value_to_bytes(range_key)?;
-        // DO NOT ADD length prefix here, only hash key is prefixed for storage keys.
-        parts.extend(&range_bytes);
-    }
-
-    Ok(parts)
-}
-
 impl ItemKey {
-    fn add_length_prefixed_part_rocksdb(parts: &mut Vec<u8>, data: &[u8]) {
-        // Use 2 bytes: 10 bits for length, 2 bits for version (00), 4 bits reserved for
-        // flags. Cap length at 1023 and convert safely.
-        let length_u16 = u16::try_from(data.len()).unwrap_or(u16::MAX);
-        let length = length_u16.min(1023);
-        // Version is 00 (0), flags are 0000 (0)
-        let prefix = length << 6; // Shift length to upper 10 bits, version/flags = 0
-        parts.extend(prefix.to_be_bytes());
-        parts.extend(data);
-    }
-}
-
-fn serialize_attribute_value(attribute_value: &AttributeValue) -> Result<Vec<u8>, ItemKeyError> {
-    match attribute_value {
-        AttributeValue::S(s) => Ok(s.as_bytes().to_vec()),
-        AttributeValue::N(n) => encode_dynamodb_number_key(n),
-        AttributeValue::B(b) => Ok(b.as_bytes().to_vec()),
-        _ => Err(ItemKeyEnum::Validation(
-            "Only S, N, and B types are supported for keys".to_string(),
-        )
-        .into()),
-    }
-}
-
-fn encode_dynamodb_number_key(raw: &str) -> Result<Vec<u8>, ItemKeyError> {
-    let parsed = ParsedDynamodbNumber::parse(raw)
-        .map_err(|message| ItemKeyEnum::Deserialization(message.to_string()))?;
-    let Some(parsed) = parsed else {
-        return Ok(vec![1]);
-    };
-
-    let biased_exponent = parsed.adjusted_exponent + DYNAMODB_NUMBER_KEY_EXPONENT_BIAS;
-    let biased_exponent = u16::try_from(biased_exponent)
-        .map_err(|err| ItemKeyEnum::Deserialization(err.to_string()))?;
-    let mut payload = Vec::with_capacity(2 + DYNAMODB_NUMBER_KEY_DIGITS);
-    payload.extend_from_slice(&biased_exponent.to_be_bytes());
-    payload.extend_from_slice(parsed.digits.as_bytes());
-    payload.resize(2 + DYNAMODB_NUMBER_KEY_DIGITS, b'0');
-
-    if parsed.negative {
-        let mut encoded = Vec::with_capacity(1 + payload.len());
-        encoded.push(0);
-        encoded.extend(payload.into_iter().map(|byte| !byte));
-        Ok(encoded)
-    } else {
-        let mut encoded = Vec::with_capacity(1 + payload.len());
-        encoded.push(2);
-        encoded.extend(payload);
-        Ok(encoded)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedDynamodbNumber {
-    negative: bool,
-    adjusted_exponent: i32,
-    digits: String,
-}
-
-impl ParsedDynamodbNumber {
-    fn parse(raw: &str) -> Result<Option<Self>, &'static str> {
-        let bytes = raw.as_bytes();
-        if bytes.is_empty() {
-            return Err("empty number");
-        }
-
-        let mut index = 0usize;
-        let negative = match bytes.first() {
-            Some(b'-') => {
-                index += 1;
-                true
-            }
-            Some(b'+') => {
-                index += 1;
-                false
-            }
-            _ => false,
+    /// Decode the ordered native key independently of its stored item image.
+    pub fn from_sorted_storage_suffix(
+        table: &StoredTableInfo,
+        index: Option<&IndexName>,
+        suffix: &[u8],
+    ) -> StorageResult<Self> {
+        let mut decoder = OrderedKeyDecoder {
+            table,
+            bytes: suffix,
         };
-
-        let mut digits = String::new();
-        let mut fractional_digits = 0i32;
-        let mut saw_digit = false;
-
-        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            saw_digit = true;
-            digits.push(bytes[index] as char);
-            index += 1;
+        match index {
+            Some(name) => decoder.index_key(name),
+            None => decoder.table_key().map(Self::Table),
         }
+    }
+}
 
-        if bytes.get(index) == Some(&b'.') {
-            index += 1;
-            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-                saw_digit = true;
-                digits.push(bytes[index] as char);
-                fractional_digits += 1;
-                index += 1;
-            }
+struct OrderedKeyDecoder<'a> {
+    table: &'a StoredTableInfo,
+    bytes: &'a [u8],
+}
+
+impl<'a> OrderedKeyDecoder<'a> {
+    fn table_key(&mut self) -> StorageResult<TableKey> {
+        let mut schema = KeySchemaElement::ordered(&self.table.key_schema);
+        let hash = schema
+            .next()
+            .ok_or_else(|| StorageError::internal("native table key lacks a schema"))?;
+        let hash_bytes = self.length_prefixed()?;
+        let hash = self.attribute(hash, hash_bytes)?;
+        let range = schema
+            .next()
+            .map(|field| self.attribute(field, self.bytes))
+            .transpose()?;
+        if range.is_none() && !self.bytes.is_empty() {
+            return Err(StorageError::internal(
+                "native table key has trailing bytes",
+            ));
         }
+        self.bytes = &[];
+        let key = TableKey::new(self.table.table_name.clone(), hash, range);
+        key.validate_dynamodb_key()?;
+        Ok(key)
+    }
 
-        if !saw_digit {
-            return Err("number must contain a digit");
+    fn index_key(&mut self, name: &IndexName) -> StorageResult<ItemKey> {
+        let index = self
+            .table
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|index| &index.index_name == name)
+            .ok_or_else(|| StorageError::internal("native index key lacks a schema"))?;
+        let mut schema = KeySchemaElement::ordered(&index.key_schema);
+        let hash = schema
+            .next()
+            .ok_or_else(|| StorageError::internal("native index key lacks a hash schema"))?;
+        let hash_bytes = self.length_prefixed()?;
+        let hash = self.attribute(hash, hash_bytes)?;
+        let range = if let Some(field) = schema.next() {
+            let bytes = self.index_range()?;
+            Some(self.attribute(field, &bytes)?)
+        } else {
+            None
+        };
+        let table_bytes = self.length_prefixed()?;
+        if !self.bytes.is_empty() {
+            return Err(StorageError::internal(
+                "native index key has trailing bytes",
+            ));
         }
+        let mut table_decoder = OrderedKeyDecoder {
+            table: self.table,
+            bytes: table_bytes,
+        };
+        let table_key = table_decoder.table_key()?;
+        Ok(ItemKey::index_key(
+            self.table.table_name.clone(),
+            name.clone(),
+            hash,
+            range,
+            table_key,
+        ))
+    }
 
-        let mut exponent = 0i32;
-        if matches!(bytes.get(index), Some(b'e') | Some(b'E')) {
-            index += 1;
-            let exponent_sign = match bytes.get(index) {
-                Some(b'-') => {
-                    index += 1;
-                    -1
+    fn length_prefixed(&mut self) -> StorageResult<&'a [u8]> {
+        let length = self
+            .bytes
+            .get(..2)
+            .ok_or_else(|| StorageError::internal("native key length is truncated"))?;
+        let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        let value = self
+            .bytes
+            .get(2..2 + length)
+            .ok_or_else(|| StorageError::internal("native key value is truncated"))?;
+        self.bytes = &self.bytes[2 + length..];
+        Ok(value)
+    }
+
+    fn index_range(&mut self) -> StorageResult<Vec<u8>> {
+        let mut value = Vec::new();
+        loop {
+            match self.bytes.first() {
+                Some(0) => {
+                    self.bytes = &self.bytes[1..];
+                    return Ok(value);
                 }
-                Some(b'+') => {
-                    index += 1;
-                    1
+                Some(1) if self.bytes.len() >= 2 => {
+                    value.push(self.bytes[1]);
+                    self.bytes = &self.bytes[2..];
                 }
-                _ => 1,
-            };
-            let exponent_start = index;
-            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-                index += 1;
+                _ => {
+                    return Err(StorageError::internal(
+                        "native index range key is truncated or invalid",
+                    ));
+                }
             }
-            if exponent_start == index {
-                return Err("invalid exponent");
+        }
+    }
+
+    fn attribute(&self, field: &KeySchemaElement, bytes: &[u8]) -> StorageResult<AttributeValue> {
+        let kind = self
+            .table
+            .attribute_definitions
+            .iter()
+            .find(|definition| definition.attribute_name == field.attribute_name)
+            .ok_or_else(|| {
+                StorageError::internal("native key field lacks its attribute definition")
+            })?
+            .attribute_type;
+        match kind {
+            KeyAttributeType::S => String::from_utf8(bytes.to_vec())
+                .map(AttributeValue::S)
+                .map_err(|_| StorageError::internal("native string key is not UTF-8")),
+            KeyAttributeType::N => crate::dynamodb_number::decode_dynamodb_number_key_bytes(bytes)
+                .map(AttributeValue::N)
+                .map_err(|_| StorageError::internal("native number key is invalid")),
+            KeyAttributeType::B => {
+                use base64::Engine as _;
+                Ok(AttributeValue::B(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ))
             }
-            let exponent_value = raw
-                .get(exponent_start..index)
-                .ok_or("invalid exponent")?
-                .parse::<i32>()
-                .map_err(|_| "invalid exponent")?;
-            exponent = exponent_value * exponent_sign;
         }
-
-        if index != bytes.len() {
-            return Err("invalid number");
-        }
-
-        let leading_zeroes = digits.bytes().take_while(|byte| *byte == b'0').count();
-        digits.drain(..leading_zeroes);
-        if digits.is_empty() {
-            return Ok(None);
-        }
-
-        let trailing_zeroes = digits
-            .bytes()
-            .rev()
-            .take_while(|byte| *byte == b'0')
-            .count();
-        if trailing_zeroes > 0 {
-            let new_len = digits.len() - trailing_zeroes;
-            digits.truncate(new_len);
-        }
-
-        let exponent = exponent - fractional_digits + i32::try_from(trailing_zeroes).unwrap_or(0);
-        let adjusted_exponent = i32::try_from(digits.len()).unwrap_or(i32::MAX) + exponent - 1;
-
-        Ok(Some(Self {
-            negative,
-            adjusted_exponent,
-            digits,
-        }))
     }
 }

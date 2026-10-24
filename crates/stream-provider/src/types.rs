@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use storage_types::{
-    DurationSeconds, ItemStreamVersion, ReplicationEventMetadata, StreamItemId, StreamName,
-    TableName, TimestampMillis, UserStreamName,
+    DurationSeconds, ItemRevision, ItemStreamVersion, ItemWriteVersions, StreamItemId, StreamName,
+    SystemStreamPosition, TableName, TimestampMillis, UserStreamName,
 };
 use utoipa::ToSchema;
 
@@ -94,6 +93,11 @@ pub struct StreamPointer {
     pub stream_item_id: StreamItemId,
     pub indexers: Vec<String>,
     pub old_indexers: Option<Vec<String>>,
+    /// Logical SystemStream identity, when the storage backend has persisted
+    /// shard lineage.  Physical pointers without this metadata are not valid
+    /// public SystemStream records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_position: Option<SystemStreamPosition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,76 +110,83 @@ pub struct EmbeddedStreamItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StoredStreamPointer {
     Pointer {
+        history_id: storage_types::TableHistoryId,
         stream_name: StreamName,
         table_name: TableName,
         item_stream_version: ItemStreamVersion,
+        item_revision: ItemRevision,
         indexers: Vec<String>,
         old_indexers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        replication: Option<ReplicationEventMetadata>,
     },
     Embedded {
+        history_id: storage_types::TableHistoryId,
         stream_name: StreamName,
         table_name: TableName,
         item_stream_version: ItemStreamVersion,
+        item_revision: ItemRevision,
         items: Vec<EmbeddedStreamItem>,
         indexers: Vec<String>,
         old_indexers: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        replication: Option<ReplicationEventMetadata>,
     },
 }
 
 impl StoredStreamPointer {
+    pub fn history_address(&self) -> storage_types::ItemHistoryAddress {
+        let (Self::Pointer {
+            history_id,
+            stream_name,
+            ..
+        }
+        | Self::Embedded {
+            history_id,
+            stream_name,
+            ..
+        }) = self;
+        storage_types::ItemHistoryAddress {
+            history_id: *history_id,
+            stream_name: stream_name.clone(),
+        }
+    }
+
+    pub fn matches_table_history(&self, target: storage_types::TableHistoryId) -> bool {
+        let (Self::Pointer { history_id, .. } | Self::Embedded { history_id, .. }) = self;
+        *history_id == target
+    }
+
     #[must_use]
     pub fn pointer(
-        stream_name: StreamName,
+        history: storage_types::ItemHistoryAddress,
         table_name: TableName,
-        item_stream_version: ItemStreamVersion,
+        versions: ItemWriteVersions,
     ) -> Self {
         Self::Pointer {
-            stream_name,
+            history_id: history.history_id,
+            stream_name: history.stream_name,
             table_name,
-            item_stream_version,
+            item_stream_version: versions.item_stream_version,
+            item_revision: versions.item_revision,
             indexers: Vec::new(),
             old_indexers: None,
-            replication: None,
         }
     }
 
     #[must_use]
     pub fn embedded(
-        stream_name: StreamName,
+        history: storage_types::ItemHistoryAddress,
         table_name: TableName,
-        item_stream_version: ItemStreamVersion,
+        versions: ItemWriteVersions,
         items: Vec<EmbeddedStreamItem>,
     ) -> Self {
         Self::Embedded {
-            stream_name,
+            history_id: history.history_id,
+            stream_name: history.stream_name,
             table_name,
-            item_stream_version,
+            item_stream_version: versions.item_stream_version,
+            item_revision: versions.item_revision,
             items,
             indexers: Vec::new(),
             old_indexers: None,
-            replication: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_replication_metadata(mut self, replication: ReplicationEventMetadata) -> Self {
-        match &mut self {
-            StoredStreamPointer::Pointer {
-                replication: pointer_replication,
-                ..
-            }
-            | StoredStreamPointer::Embedded {
-                replication: pointer_replication,
-                ..
-            } => {
-                *pointer_replication = Some(replication);
-            }
-        }
-        self
     }
 
     #[must_use]
@@ -259,56 +270,6 @@ impl StoredStreamPointer {
             } => *item_stream_version,
         }
     }
-
-    #[must_use]
-    pub fn into_stream_pointer(self, pointer_stream_item_id: StreamItemId) -> StreamPointer {
-        let (stream_name, table_name, item_stream_version, indexers, old_indexers) = match self {
-            StoredStreamPointer::Pointer {
-                stream_name,
-                table_name,
-                item_stream_version,
-                indexers,
-                old_indexers,
-                ..
-            } => (
-                stream_name,
-                table_name,
-                item_stream_version,
-                indexers,
-                old_indexers,
-            ),
-            StoredStreamPointer::Embedded {
-                stream_name,
-                table_name,
-                item_stream_version,
-                indexers,
-                old_indexers,
-                ..
-            } => (
-                stream_name,
-                table_name,
-                item_stream_version,
-                indexers,
-                old_indexers,
-            ),
-        };
-        StreamPointer {
-            stream_name,
-            table_name,
-            item_stream_version,
-            stream_item_id: pointer_stream_item_id,
-            indexers,
-            old_indexers,
-        }
-    }
-
-    #[must_use]
-    pub fn replication_metadata(&self) -> Option<&ReplicationEventMetadata> {
-        match self {
-            StoredStreamPointer::Pointer { replication, .. }
-            | StoredStreamPointer::Embedded { replication, .. } => replication.as_ref(),
-        }
-    }
 }
 
 pub struct PointerRecordsResult {
@@ -367,14 +328,14 @@ pub enum StreamPartitioningMode {
     KeyOrdered,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPage {
     pub items: Vec<StreamItem>,
     pub last_evaluated_key: Option<StreamItemId>,
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorPage {
     pub items: Vec<StreamItem>,
     pub cursor_position: StreamItemId,
@@ -389,191 +350,10 @@ pub enum CursorPosition {
     Tail,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateStreamRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(
-        min_length = 1,
-        max_length = 255,
-        pattern = "^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$",
-        example = "user-events"
-    )]
-    pub stream_name: String,
-
-    #[serde(rename = "StreamPrefix")]
-    #[schema(min_length = 1, max_length = 1024, example = "app/users/events/")]
-    pub stream_prefix: String,
-
-    #[serde(rename = "TTLSeconds", skip_serializing_if = "Option::is_none")]
-    #[schema(minimum = 1, maximum = 31_536_000, example = 3600)]
-    pub ttl_seconds: Option<u64>,
-
-    #[serde(rename = "PartitioningMode", skip_serializing_if = "Option::is_none")]
-    #[schema(example = "single")]
-    pub partitioning_mode: Option<StreamPartitioningMode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateStreamResponse {
-    #[serde(rename = "StreamName")]
-    #[schema(example = "user-events")]
-    pub stream_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AppendItemRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-
-    #[serde(rename = "Data")]
-    #[schema(format = "binary", example = "base64-encoded-data")]
-    pub data: Vec<u8>,
-
-    #[serde(rename = "PartitionKey", skip_serializing_if = "Option::is_none")]
-    #[schema(example = "tenant-123")]
-    pub partition_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AppendItemResponse {
-    #[serde(rename = "ItemId")]
-    #[schema(value_type = String, example = "5fea7756-0ea4-451a-a703-a558b933e274")]
-    pub item_id: StreamItemId,
-
-    #[serde(rename = "Timestamp")]
-    #[schema(value_type = String, example = "2024-01-01T12:00:00Z")]
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadStreamRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-
-    #[serde(rename = "PageToken", skip_serializing_if = "Option::is_none")]
-    #[schema(example = "eyJ0aW1lc3RhbXAiOiIyMDI0LTAxLTAxVDEyOjAwOjAwWiJ9")]
-    pub page_token: Option<String>,
-
-    #[serde(rename = "Limit", skip_serializing_if = "Option::is_none")]
-    #[schema(minimum = 1, maximum = 1000, example = 100)]
-    pub limit: Option<usize>,
-
-    #[serde(rename = "Direction")]
-    #[schema(example = "forward")]
-    pub direction: ReadDirection,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum ReadDirection {
     #[serde(rename = "forward")]
     Forward,
     #[serde(rename = "backward")]
     Backward,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadStreamResponse {
-    #[serde(rename = "Items")]
-    pub items: Vec<StreamItemResponse>,
-
-    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
-    #[schema(example = "eyJ0aW1lc3RhbXAiOiIyMDI0LTAxLTAxVDEyOjAwOjAwWiJ9")]
-    pub next_token: Option<String>,
-
-    #[serde(rename = "HasMore")]
-    pub has_more: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct StreamItemResponse {
-    #[serde(rename = "ItemId")]
-    #[schema(value_type = String, example = "5fea7756-0ea4-451a-a703-a558b933e274")]
-    pub item_id: StreamItemId,
-
-    #[serde(rename = "Data")]
-    #[schema(format = "binary", example = "base64-encoded-data")]
-    pub data: Vec<u8>,
-
-    #[serde(rename = "Timestamp")]
-    #[schema(value_type = String, example = "2024-01-01T12:00:00Z")]
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateCursorRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-
-    #[serde(rename = "CursorName")]
-    #[schema(
-        min_length = 1,
-        max_length = 64,
-        pattern = "^[a-zA-Z0-9][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$",
-        example = "consumer1"
-    )]
-    pub cursor_name: String,
-
-    #[serde(rename = "Position")]
-    #[schema(example = "head")]
-    pub position: CursorPosition,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateCursorResponse {
-    #[serde(rename = "CursorName")]
-    #[schema(example = "consumer1")]
-    pub cursor_name: String,
-
-    #[serde(rename = "Position")]
-    #[schema(example = "head")]
-    pub position: CursorPosition,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadFromCursorRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-
-    #[serde(rename = "CursorName")]
-    #[schema(min_length = 1, max_length = 64, example = "consumer1")]
-    pub cursor_name: String,
-
-    #[serde(rename = "Limit", skip_serializing_if = "Option::is_none")]
-    #[schema(minimum = 1, maximum = 1000, example = 100)]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadFromCursorResponse {
-    #[serde(rename = "Items")]
-    pub items: Vec<StreamItemResponse>,
-
-    #[serde(rename = "CursorPosition")]
-    #[schema(value_type = String, example = "5fea7756-0ea4-451a-a703-a558b933e274")]
-    pub cursor_position: StreamItemId,
-
-    #[serde(rename = "HasMore")]
-    pub has_more: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DeleteStreamRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DeleteCursorRequest {
-    #[serde(rename = "StreamName")]
-    #[schema(min_length = 1, max_length = 255, example = "user-events")]
-    pub stream_name: String,
-
-    #[serde(rename = "CursorName")]
-    #[schema(min_length = 1, max_length = 64, example = "consumer1")]
-    pub cursor_name: String,
 }

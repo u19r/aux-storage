@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 edition = "2024"
 license.workspace = true
@@ -10,15 +11,15 @@ doctest = false
 
 [features]
 default = ["sqlite"]
-sqlite = ["dep:sql", "sql/sqlite-backend"]
-turso = ["dep:sql", "sql/sqlite-backend", "sql/turso-backend"]
-postgres = ["dep:sql", "sql/postgres-backend"]
-rocksdb = ["dep:kv", "kv/rocksdb-backend"]
-foundationdb = ["dep:kv", "kv/foundationdb-backend"]
+sqlite = ["dep:sql-backend", "sql-backend/sqlite", "storage-types/sqlite"]
+turso = ["dep:sql-backend", "sql-backend/turso", "storage-types/turso"]
+postgres = ["dep:sql-backend", "sql-backend/postgres", "storage-types/postgres"]
+rocksdb = ["dep:kv-backend", "kv-backend/rocksdb", "storage-types/rocksdb"]
+foundationdb = ["dep:kv-backend", "kv-backend/foundationdb"]
 
 [dependencies]
-kv = { path = "../kv", optional = true, default-features = false }
-sql = { path = "../sql", optional = true, default-features = false }
+kv-backend = { path = "../kv-backend", optional = true, default-features = false }
+sql-backend = { path = "../sql-backend", optional = true, default-features = false }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }
 stream-provider = { path = "../stream-provider" }
@@ -26,7 +27,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+alloc-counter = { workspace = true }
+storage-observability-test-support = { path = "../storage-observability-test-support" }
 tempfile = { workspace = true }
+tokio-postgres = { workspace = true }
 
 [lints]
 workspace = true

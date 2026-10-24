@@ -92,21 +92,6 @@ impl WireItemKeyAttributes {
         }
         len
     }
-
-    pub(super) fn append_to_attribute_map(self, map: &mut HashMap<String, AttributeValue>) {
-        map.insert(self.hash_key_name.into_owned(), self.hash_key);
-        if let (Some(name), Some(value)) = (self.sort_key_name, self.sort_key) {
-            map.insert(name.into_owned(), value);
-        }
-    }
-}
-
-fn intern_common_key_name(name: &str) -> Cow<'static, str> {
-    match name {
-        "pk" => Cow::Borrowed("pk"),
-        "sk" => Cow::Borrowed("sk"),
-        _ => Cow::Owned(name.to_string()),
-    }
 }
 
 pub(super) fn scalar_attribute_len(value: &AttributeValue) -> usize {
@@ -124,38 +109,19 @@ pub(super) fn blob_is_empty_json_object(blob: &[u8]) -> bool {
     trim_ascii_whitespace(blob) == b"{}"
 }
 
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    let mut end = bytes.len();
-    while start < end && bytes[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    while end > start && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &bytes[start..end]
-}
-
 pub(super) fn number_from_key_attributes(
     key_attributes: &WireItemKeyAttributes,
     field: &str,
-) -> Option<i64> {
+) -> StorageResult<Option<i64>> {
     if key_attributes.hash_key_name == field {
-        return number_from_attribute_value(&key_attributes.hash_key);
+        return number_from_attribute_value(&key_attributes.hash_key, field);
     }
     if key_attributes.sort_key_name.as_deref() == Some(field)
         && let Some(sort_key) = key_attributes.sort_key.as_ref()
     {
-        return number_from_attribute_value(sort_key);
+        return number_from_attribute_value(sort_key, field);
     }
-    None
-}
-
-fn number_from_attribute_value(value: &AttributeValue) -> Option<i64> {
-    match value {
-        AttributeValue::N(raw) => raw.parse::<i64>().ok(),
-        _ => None,
-    }
+    Ok(None)
 }
 
 pub(super) fn string_from_key_attributes<'a>(
@@ -171,13 +137,6 @@ pub(super) fn string_from_key_attributes<'a>(
         return string_from_attribute_value(sort_key);
     }
     None
-}
-
-fn string_from_attribute_value(value: &AttributeValue) -> Option<&str> {
-    match value {
-        AttributeValue::S(raw) => Some(raw.as_str()),
-        _ => None,
-    }
 }
 
 pub(super) fn scalar_from_key_attributes<'a>(
@@ -207,4 +166,40 @@ pub(super) fn attribute_from_key_attributes<'a>(
         return key_attributes.sort_key.as_ref();
     }
     None
+}
+
+fn intern_common_key_name(name: &str) -> Cow<'static, str> {
+    match name {
+        "pk" => Cow::Borrowed("pk"),
+        "sk" => Cow::Borrowed("sk"),
+        _ => Cow::Owned(name.to_string()),
+    }
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+fn number_from_attribute_value(value: &AttributeValue, field: &str) -> StorageResult<Option<i64>> {
+    match value {
+        AttributeValue::N(raw) => raw.parse::<i64>().map(Some).map_err(|error| {
+            StorageError::internal(&format!("invalid {field} number attribute: {error}"))
+        }),
+        _ => Ok(None),
+    }
+}
+
+fn string_from_attribute_value(value: &AttributeValue) -> Option<&str> {
+    match value {
+        AttributeValue::S(raw) => Some(raw.as_str()),
+        _ => None,
+    }
 }

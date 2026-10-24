@@ -1,6 +1,6 @@
 # DynamoDB compatibility matrix
 
-Last updated: 2026-05-22
+Last updated: 2026-10-24
 
 Legend: ✅ supported | 🟡 partial or different | ❌ unsupported
 
@@ -11,7 +11,7 @@ Legend: ✅ supported | 🟡 partial or different | ❌ unsupported
 | DynamoDB JSON HTTP endpoint                | ✅     |                                                                                                                                    |
 | AWS SDK-style request bodies               | ✅     |                                                                                                                                    |
 | SQLite backend                             | ✅     |                                                                                                                                    |
-| Turso/libSQL backend                       | ✅     |                                                                                                                                    |
+| Turso backend                       | ✅     |                                                                                                                                    |
 | Postgres backend                           | ✅     |                                                                                                                                    |
 | RocksDB backend                            | ✅     |                                                                                                                                    |
 | FoundationDB backend                       | ✅     |                                                                                                                                    |
@@ -41,7 +41,7 @@ Legend: ✅ supported | 🟡 partial or different | ❌ unsupported
 | Key-condition expressions                  | ✅     |                                                                                                                                    |
 | Filter expressions                         | ✅     |                                                                                                                                    |
 | Projection expressions                     | ✅     |                                                                                                                                    |
-| Strongly consistent reads                  | ✅     | Possible consistent GSI reads as well                                                                                              |
+| Strongly consistent reads                  | ✅     | Base-table reads only; strongly consistent GSI reads are rejected.                                                                                              |
 | Pagination markers                         | ✅     |                                                                                                                                    |
 | Table streams                              | 🟡     | Not the AWS DynamoDB Streams API.                                                                                                  |
 | TTL expiry behavior                        | ✅     |                                                                                                                                    |

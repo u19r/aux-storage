@@ -35,28 +35,41 @@ pub fn query_fields_to_json(fields: impl IntoIterator<Item = (String, String)>) 
             message_attribute_names.insert(index, Value::String(value));
             continue;
         }
-        if collect_message_attribute(&mut message_attributes, &key, &value) {
+        if let Some((index, field)) = indexed_field(&key, "MessageAttribute") {
+            let field = field.strip_prefix("Value.").unwrap_or(field);
+            if matches!(field, "Name" | "DataType" | "StringValue" | "BinaryValue") {
+                message_attributes
+                    .entry(index)
+                    .or_default()
+                    .insert(field.to_string(), Value::String(value));
+                continue;
+            }
+        }
+        if let Some((index, field)) = indexed_field(&key, "SendMessageBatchRequestEntry") {
+            send_entries
+                .entry(index)
+                .or_default()
+                .insert(field.to_string(), query_scalar(field, value));
             continue;
         }
-        if collect_batch_entry(
-            &mut send_entries,
-            &key,
-            &value,
-            "SendMessageBatchRequestEntry",
-        ) || collect_batch_entry(
-            &mut delete_entries,
-            &key,
-            &value,
-            "DeleteMessageBatchRequestEntry",
-        ) || collect_batch_entry(
-            &mut visibility_entries,
-            &key,
-            &value,
-            "ChangeMessageVisibilityBatchRequestEntry",
-        ) {
+        if let Some((index, field)) = indexed_field(&key, "DeleteMessageBatchRequestEntry") {
+            delete_entries
+                .entry(index)
+                .or_default()
+                .insert(field.to_string(), query_scalar(field, value));
             continue;
         }
-        payload.insert(key.clone(), query_scalar(&key, value));
+        if let Some((index, field)) =
+            indexed_field(&key, "ChangeMessageVisibilityBatchRequestEntry")
+        {
+            visibility_entries
+                .entry(index)
+                .or_default()
+                .insert(field.to_string(), query_scalar(field, value));
+            continue;
+        }
+        let scalar = query_scalar(&key, value);
+        payload.insert(key, scalar);
     }
 
     let attributes = attributes
@@ -118,41 +131,6 @@ fn indexed_field<'a>(key: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
 fn indexed_member(key: &str, prefix: &str) -> Option<usize> {
     let index = key.strip_prefix(prefix)?.strip_prefix('.')?.parse().ok()?;
     (index > 0).then_some(index)
-}
-
-fn collect_batch_entry(
-    output: &mut BTreeMap<usize, serde_json::Map<String, Value>>,
-    key: &str,
-    value: &str,
-    prefix: &str,
-) -> bool {
-    let Some((index, field)) = indexed_field(key, prefix) else {
-        return false;
-    };
-    output
-        .entry(index)
-        .or_default()
-        .insert(field.to_string(), query_scalar(field, value.to_string()));
-    true
-}
-
-fn collect_message_attribute(
-    output: &mut BTreeMap<usize, serde_json::Map<String, Value>>,
-    key: &str,
-    value: &str,
-) -> bool {
-    let Some((index, field)) = indexed_field(key, "MessageAttribute") else {
-        return false;
-    };
-    let field = field.strip_prefix("Value.").unwrap_or(field);
-    if !matches!(field, "Name" | "DataType" | "StringValue" | "BinaryValue") {
-        return false;
-    }
-    output
-        .entry(index)
-        .or_default()
-        .insert(field.to_string(), Value::String(value.to_string()));
-    true
 }
 
 fn query_scalar(key: &str, value: String) -> Value {

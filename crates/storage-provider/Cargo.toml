@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 edition = "2024"
 license.workspace = true
 name = "storage-provider"
@@ -7,21 +8,36 @@ version = "0.1.0"
 [lib]
 doctest = false
 
+[features]
+runtime-integration = []
+test-support = ["uuid"]
+
 [dependencies]
 async-trait = { workspace = true }
-bg-jobs = { path = "../bg-jobs" }
+bytes = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+infrastructure-provider = { workspace = true }
+lru-ttl-cache = { workspace = true }
 metrics-facade = { workspace = true }
+queue-provider = { path = "../queue-provider" }
+scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 storage-backfill = { path = "../storage-backfill" }
+storage-common = { path = "../storage-common" }
 storage-condition = { path = "../storage-condition" }
-storage-sync = { path = "../storage-sync" }
 storage-types = { path = "../storage-types" }
+stream-provider = { path = "../stream-provider" }
 tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }
 anyhow = { workspace = true }
+cpu-time = { workspace = true }
 quint-connect = { workspace = true }
 
 [lints]

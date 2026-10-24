@@ -2,14 +2,11 @@
 //! messages.
 
 use crate::{
-    DYNAMODB_ACCESS_DENIED_MESSAGE, DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE,
-    DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE, DYNAMODB_LIMIT_EXCEEDED_MESSAGE,
+    DYNAMODB_CONDITIONAL_CHECK_FAILED_MESSAGE, DYNAMODB_INTERNAL_SERVER_ERROR_MESSAGE,
     DYNAMODB_MISSING_AUTH_TOKEN_MESSAGE, DYNAMODB_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
     DYNAMODB_REQUEST_LIMIT_EXCEEDED_MESSAGE, DYNAMODB_THROTTLING_MESSAGE,
-    DYNAMODB_TRANSACTION_CANCELED_MESSAGE, DYNAMODB_TRANSACTION_CONFLICT_MESSAGE,
-    DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE, DYNAMODB_UNRECOGNIZED_CLIENT_MESSAGE, StorageEnum,
-    StorageError, StorageValidationKind, context::WrappedError as _,
-    dynamodb_table_not_found_message,
+    DYNAMODB_TRANSACTION_CANCELED_MESSAGE, StorageEnum, StorageError, StorageValidationKind,
+    context::WrappedError as _, dynamodb_table_not_found_message,
 };
 
 fn display(err: StorageError) -> String {
@@ -46,7 +43,10 @@ fn transaction_conflict_message() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_TRANSACTION_CONFLICT_MESSAGE);
+    assert_eq!(
+        display(err),
+        "Operation was rejected because there is an ongoing transaction for the item."
+    );
 }
 
 #[test]
@@ -55,7 +55,10 @@ fn transaction_in_progress_message() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_TRANSACTION_IN_PROGRESS_MESSAGE);
+    assert_eq!(
+        display(err),
+        "The transaction with the given request token is already in progress."
+    );
 }
 
 #[test]
@@ -123,7 +126,7 @@ fn local_admission_rejection_is_safe_retryable_and_distinct_from_throttling() {
     assert_eq!(*retry_after_seconds, 1);
     assert_eq!(display(error), "Storage is temporarily unavailable.");
 
-    let upstream = StorageError::Base(StorageEnum::Throttled {
+    let upstream = StorageError::from(StorageEnum::Throttled {
         message: "provider pressure".to_string(),
     });
     assert!(matches!(upstream.to_enum(), StorageEnum::Throttled { .. }));
@@ -135,7 +138,7 @@ fn limit_exceeded_message_canonical() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_LIMIT_EXCEEDED_MESSAGE);
+    assert_eq!(display(err), "Too many operations for a given subscriber.");
 }
 
 #[test]
@@ -156,7 +159,10 @@ fn authentication_message_canonical() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_UNRECOGNIZED_CLIENT_MESSAGE);
+    assert_eq!(
+        display(err),
+        "The Access Key ID or security token is invalid."
+    );
 }
 
 #[test]
@@ -165,5 +171,5 @@ fn access_denied_message_canonical() {
         message: "details".into(),
     }
     .into();
-    assert_eq!(display(err), DYNAMODB_ACCESS_DENIED_MESSAGE);
+    assert_eq!(display(err), "Access denied.");
 }

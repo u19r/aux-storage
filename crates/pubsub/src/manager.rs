@@ -1,31 +1,25 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use http_request::{HttpClient, StatusCode};
+use futures_util::{StreamExt as _, stream};
+use http_request::HttpClient;
 use pubsub_provider::{
     ClaimDeliveryRecordsRequest, ConfirmSubscriptionRequest, ConfirmSubscriptionResponse,
-    CreateTopicRequest, CreateTopicResponse, DeliveryRecord, DeliveryRecordId, DeliveryRecordKind,
-    DeliveryStatus, DeliveryTarget, GetSubscriptionAttributesRequest,
-    GetSubscriptionAttributesResponse, GetTopicAttributesRequest, GetTopicAttributesResponse,
-    ListSubscriptionsRequest, ListSubscriptionsResponse, ListTopicsRequest, ListTopicsResponse,
-    PublishRequest, PublishResponse, PubsubError, PubsubMessageId, PubsubProvider, PubsubResult,
-    PubsubValidationKind, SetSubscriptionAttributesRequest, SetTopicAttributesRequest,
-    SubscribeRequest, SubscribeResponse, Subscription, SubscriptionProtocol, TopicArn, TopicName,
+    CreateTopicRequest, CreateTopicResponse, DeliveryClaimLimit, DeliveryRecord,
+    GetSubscriptionAttributesRequest, GetSubscriptionAttributesResponse, GetTopicAttributesRequest,
+    GetTopicAttributesResponse, ListSubscriptionsRequest, ListSubscriptionsResponse,
+    ListTopicsRequest, ListTopicsResponse, PublishRequest, PublishResponse, PubsubError,
+    PubsubMessageId, PubsubProvider, PubsubResult, PubsubValidationKind,
+    SetSubscriptionAttributesRequest, SetTopicAttributesRequest, SubscribeRequest,
+    SubscribeResponse, SubscriptionProtocol, TopicArn, TopicName,
 };
 use queue::QueueManager;
-use queue_provider::{MessageAttributeValue, SendMessageRequest};
 use storage_types::TimestampMillis;
-use stream_provider::{
-    SubscriptionDestination, SubscriptionMessage, SubscriptionMessageSender,
-    SubscriptionSendOutcome,
-};
+use stream_provider::SubscriptionMessageSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    notification::{
-        ConfirmationRenderContext, NotificationRenderContext, PubsubNotificationSigner,
-        confirmation_body, confirmation_headers, notification_body, notification_headers,
-    },
+    notification::PubsubNotificationSigner,
     protocol::{PubsubAction, PubsubSuccess, SubscriptionView},
 };
 
@@ -151,6 +145,11 @@ impl PubsubManagerBuilder {
 pub struct PubsubDeliveryConfig {
     pub worker_id: String,
     pub lease_duration: Duration,
+    /// Maximum number of claimed deliveries dispatched concurrently.
+    ///
+    /// The claim lease must cover the slowest in-flight delivery window. A
+    /// value of zero is treated as one to keep configuration fail-safe.
+    pub delivery_concurrency: usize,
     pub max_attempts: u32,
     pub retry_base_delay: Duration,
     pub request_timeout: Duration,
@@ -164,6 +163,7 @@ impl Default for PubsubDeliveryConfig {
         Self {
             worker_id: "pubsub-worker".to_string(),
             lease_duration: Duration::from_secs(30),
+            delivery_concurrency: 8,
             max_attempts: 5,
             retry_base_delay: Duration::from_secs(1),
             request_timeout: Duration::from_secs(10),
@@ -174,14 +174,15 @@ impl Default for PubsubDeliveryConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct PubsubManager {
-    provider: Arc<dyn PubsubProvider>,
-    queue_manager: Option<Arc<QueueManager>>,
-    subscription_message_sender: Option<Arc<dyn SubscriptionMessageSender>>,
-    notification_signer: Option<Arc<dyn PubsubNotificationSigner>>,
-    http_client: Option<HttpClient>,
+    pub(super) provider: Arc<dyn PubsubProvider>,
+    pub(super) queue_manager: Option<Arc<QueueManager>>,
+    pub(super) subscription_message_sender: Option<Arc<dyn SubscriptionMessageSender>>,
+    pub(super) notification_signer: Option<Arc<dyn PubsubNotificationSigner>>,
+    pub(super) http_client: Option<HttpClient>,
     delivery_admission: Arc<dyn PubsubDeliveryAdmission>,
-    delivery_config: PubsubDeliveryConfig,
+    pub(super) delivery_config: PubsubDeliveryConfig,
 }
 
 impl PubsubManager {
@@ -259,16 +260,7 @@ impl PubsubManager {
             ));
         }
         let subscription = self.provider.create_subscription(request).await?;
-        if let Some(token) = subscription.confirmation.token() {
-            self.record_confirmation_delivery(&subscription, token)
-                .await?;
-        }
-        let subscription_arn = if subscription.confirmation.pending_confirmation() {
-            "pending confirmation".to_string()
-        } else {
-            subscription.subscription_arn.to_string()
-        };
-        Ok(SubscribeResponse { subscription_arn })
+        Ok(SubscribeResponse::from(&subscription))
     }
 
     pub async fn confirm_subscription(
@@ -324,28 +316,60 @@ impl PubsubManager {
     }
 
     pub async fn process_due_deliveries(&self, limit: usize) -> PubsubResult<usize> {
-        let _admission_permit = self.delivery_admission.acquire().await?;
+        let delivery_limit = DeliveryClaimLimit::try_from(limit)?;
+        let permit = self.delivery_admission.acquire().await?;
+        let manager = self.clone();
+        use tracing::{Instrument as _, instrument::WithSubscriber as _};
+        let settlement = async move {
+            let _permit = permit;
+            manager
+                .execute_due_deliveries((limit, delivery_limit))
+                .await
+        };
+        match tokio::spawn(
+            metrics_facade::inherit_request_cost(settlement)
+                .instrument(tracing::Span::current())
+                .with_current_subscriber(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(PubsubError::storage("pubsub delivery settlement stopped")),
+        }
+    }
+
+    async fn execute_due_deliveries(
+        &self,
+        (limit, delivery_limit): (usize, DeliveryClaimLimit),
+    ) -> PubsubResult<usize> {
         self.provider.materialize_publish_intents(limit).await?;
         let now = TimestampMillis::now();
-        let lease_expires_at = TimestampMillis::from_timestamp(
-            now.timestamp_millis()
-                .saturating_add(duration_millis_i64(self.delivery_config.lease_duration)),
-        );
+        let lease_expires_at = self.delivery_lease_deadline(now);
         let records = self
             .provider
             .claim_delivery_records(ClaimDeliveryRecordsRequest {
                 owner: self.delivery_config.worker_id.clone(),
                 now,
                 lease_expires_at,
-                limit,
+                limit: delivery_limit,
             })
             .await?
             .records;
         let count = records.len();
-        for record in records {
-            self.process_delivery_record(record).await?;
+        let concurrency = self.delivery_config.delivery_concurrency.max(1);
+        let mut deliveries = stream::iter(records)
+            .map(|record| self.process_delivery_record(record))
+            .buffered(concurrency);
+        let mut first_error = None;
+        while let Some(result) = deliveries.next().await {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(count)
+        first_error.map_or(Ok(count), Err)
     }
 
     pub async fn execute_query_action(&self, action: PubsubAction) -> PubsubResult<PubsubSuccess> {
@@ -429,338 +453,9 @@ impl PubsubManager {
         }
     }
 
-    async fn record_confirmation_delivery(
-        &self,
-        subscription: &Subscription,
-        token: &str,
-    ) -> PubsubResult<()> {
-        let now = TimestampMillis::now();
-        let message_id = PubsubMessageId::new();
-        self.provider
-            .put_delivery_record(DeliveryRecord {
-                id: DeliveryRecordId(format!(
-                    "{}:{}:confirmation",
-                    subscription.subscription_arn, message_id
-                )),
-                kind: DeliveryRecordKind::SubscriptionConfirmation {
-                    token: token.to_string(),
-                },
-                message_id,
-                subscription_arn: subscription.subscription_arn.clone(),
-                subscription: None,
-                message_body: None,
-                subject: None,
-                message_attributes: HashMap::new(),
-                target: DeliveryTarget::BuiltIn,
-                status: DeliveryStatus::Pending,
-                attempts: 0,
-                next_attempt_at: None,
-                lease_owner: None,
-                lease_expires_at: None,
-                last_error: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-    }
-
     async fn process_delivery_record(&self, record: DeliveryRecord) -> PubsubResult<()> {
-        let subscription = match record.subscription.clone() {
-            Some(subscription) => subscription,
-            None => {
-                let Some(subscription) = self
-                    .provider
-                    .get_subscription(&record.subscription_arn)
-                    .await?
-                else {
-                    self.update_delivery(
-                        record,
-                        DeliveryStatus::Failed,
-                        Some("subscription not found".to_string()),
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                subscription
-            }
-        };
-        if let DeliveryRecordKind::SubscriptionConfirmation { token } = record.kind.clone() {
-            self.process_confirmation_delivery(record, subscription, token)
-                .await?;
-            return Ok(());
-        }
-        let Some(message_body) = record.message_body.clone() else {
-            self.update_delivery(
-                record,
-                DeliveryStatus::Failed,
-                Some("message body missing".to_string()),
-            )
-            .await?;
-            return Ok(());
-        };
-        let request = PublishRequest {
-            topic_arn: subscription.topic_arn.clone(),
-            message: message_body,
-            subject: record.subject.clone(),
-            message_attributes: record.message_attributes.clone(),
-        };
-
-        match record.target {
-            DeliveryTarget::CustomSender => {
-                self.process_custom_delivery(record, subscription, request)
-                    .await
-            }
-            DeliveryTarget::BuiltIn => {
-                self.process_builtin_delivery(record, subscription, request)
-                    .await
-            }
-        }
-    }
-
-    async fn process_custom_delivery(
-        &self,
-        record: DeliveryRecord,
-        subscription: Subscription,
-        request: PublishRequest,
-    ) -> PubsubResult<()> {
-        let Some(sender) = self.subscription_message_sender.as_ref() else {
-            self.schedule_or_fail(record, "custom sender is not configured")
-                .await?;
-            return Ok(());
-        };
-        let destination = subscription_destination(&subscription);
-        let message = SubscriptionMessage::new(
-            subscription.subscription_arn.to_string(),
-            record.message_id.to_string(),
-            destination,
-            request.message.as_bytes().to_vec(),
-        )
-        .with_attributes(request.message_attributes);
-        match sender.send_subscription_message(message).await {
-            Ok(SubscriptionSendOutcome::Delivered) => {
-                self.update_delivery(record, DeliveryStatus::Delivered, None)
-                    .await
-            }
-            Ok(SubscriptionSendOutcome::AcceptedForDelivery) => {
-                self.update_delivery(record, DeliveryStatus::AcceptedByCustomSender, None)
-                    .await
-            }
-            Err(error) => self.schedule_or_fail(record, &error.to_string()).await,
-        }
-    }
-
-    async fn process_builtin_delivery(
-        &self,
-        record: DeliveryRecord,
-        subscription: Subscription,
-        request: PublishRequest,
-    ) -> PubsubResult<()> {
-        match subscription.protocol {
-            SubscriptionProtocol::Queue => {
-                let Some(queue_manager) = self.queue_manager.as_ref() else {
-                    self.schedule_or_fail(record, "queue manager is not configured")
-                        .await?;
-                    return Ok(());
-                };
-                let message_body = if subscription.raw_message_delivery {
-                    request.message.clone()
-                } else {
-                    self.pubsub_notification_body(&request, &record.message_id, &subscription)?
-                };
-                let message_attributes = if subscription.raw_message_delivery {
-                    queue_message_attributes(&request.message_attributes)
-                } else {
-                    None
-                };
-                match queue_manager
-                    .send_message(SendMessageRequest {
-                        queue_url: subscription.endpoint,
-                        message_body,
-                        delay_seconds: None,
-                        message_attributes,
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        self.update_delivery(record, DeliveryStatus::Delivered, None)
-                            .await
-                    }
-                    Err(error) => self.schedule_or_fail(record, &error.to_string()).await,
-                }
-            }
-            SubscriptionProtocol::Http | SubscriptionProtocol::Https => {
-                let body =
-                    self.pubsub_notification_body(&request, &record.message_id, &subscription)?;
-                let Some(http_client) = self.http_client.as_ref() else {
-                    self.schedule_or_fail(record, "HTTP client is not configured")
-                        .await?;
-                    return Ok(());
-                };
-                let headers = notification_headers(&record.message_id, &subscription, &request)?;
-                match http_client
-                    .post(subscription.endpoint.as_str())
-                    .headers(headers)
-                    .timeout(self.delivery_config.request_timeout)
-                    .body(body)
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        self.update_delivery(record, DeliveryStatus::Delivered, None)
-                            .await
-                    }
-                    Ok(response) => {
-                        let status = response.status();
-                        if is_retryable_status(status) {
-                            self.schedule_or_fail(record, &format!("HTTP delivery status {status}"))
-                                .await
-                        } else {
-                            self.update_delivery(
-                                record,
-                                DeliveryStatus::Failed,
-                                Some(format!("HTTP delivery status {status}")),
-                            )
-                            .await
-                        }
-                    }
-                    Err(error) => self.schedule_or_fail(record, &error.to_string()).await,
-                }
-            }
-        }
-    }
-
-    async fn process_confirmation_delivery(
-        &self,
-        record: DeliveryRecord,
-        subscription: Subscription,
-        token: String,
-    ) -> PubsubResult<()> {
-        if !matches!(
-            subscription.protocol,
-            SubscriptionProtocol::Http | SubscriptionProtocol::Https
-        ) {
-            self.update_delivery(
-                record,
-                DeliveryStatus::Failed,
-                Some("subscription confirmation is only supported for HTTP endpoints".to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
-        if !subscription.confirmation.pending_confirmation() {
-            self.update_delivery(record, DeliveryStatus::Delivered, None)
-                .await?;
-            return Ok(());
-        }
-        let Some(http_client) = self.http_client.as_ref() else {
-            self.schedule_or_fail(record, "HTTP client is not configured")
-                .await?;
-            return Ok(());
-        };
-        let body = confirmation_body(ConfirmationRenderContext {
-            topic_arn: &subscription.topic_arn,
-            message_id: &record.message_id,
-            token: &token,
-            delivery_config: &self.delivery_config,
-            signer: self.notification_signer.as_deref(),
-        })?;
-        let headers = confirmation_headers(&record.message_id, &subscription.topic_arn)?;
-        match http_client
-            .post(subscription.endpoint.as_str())
-            .headers(headers)
-            .timeout(self.delivery_config.request_timeout)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                self.update_delivery(record, DeliveryStatus::Delivered, None)
-                    .await
-            }
-            Ok(response) => {
-                let status = response.status();
-                if is_retryable_status(status) {
-                    self.schedule_or_fail(record, &format!("HTTP delivery status {status}"))
-                        .await
-                } else {
-                    self.update_delivery(
-                        record,
-                        DeliveryStatus::Failed,
-                        Some(format!("HTTP delivery status {status}")),
-                    )
-                    .await
-                }
-            }
-            Err(error) => self.schedule_or_fail(record, &error.to_string()).await,
-        }
-    }
-
-    async fn schedule_or_fail(&self, mut record: DeliveryRecord, error: &str) -> PubsubResult<()> {
-        let attempts = record.attempts.saturating_add(1);
-        if attempts >= self.delivery_config.max_attempts {
-            self.update_delivery_record(record, DeliveryStatus::Failed, Some(error.to_string()))
-                .await
-        } else {
-            record.attempts = attempts;
-            record.status = DeliveryStatus::RetryScheduled;
-            let now = TimestampMillis::now();
-            record.next_attempt_at = Some(TimestampMillis::from_timestamp(
-                now.timestamp_millis()
-                    .saturating_add(self.retry_delay_millis(attempts)),
-            ));
-            record.lease_owner = None;
-            record.lease_expires_at = None;
-            record.last_error = Some(error.to_string());
-            record.updated_at = now;
-            self.provider.update_delivery_record(record).await
-        }
-    }
-
-    async fn update_delivery(
-        &self,
-        record: DeliveryRecord,
-        status: DeliveryStatus,
-        last_error: Option<String>,
-    ) -> PubsubResult<()> {
-        self.update_delivery_record(record, status, last_error)
-            .await
-    }
-
-    async fn update_delivery_record(
-        &self,
-        mut record: DeliveryRecord,
-        status: DeliveryStatus,
-        last_error: Option<String>,
-    ) -> PubsubResult<()> {
-        record.attempts = record.attempts.saturating_add(1);
-        record.status = status;
-        record.next_attempt_at = None;
-        record.lease_owner = None;
-        record.lease_expires_at = None;
-        record.last_error = last_error;
-        record.updated_at = TimestampMillis::now();
-        self.provider.update_delivery_record(record).await
-    }
-
-    fn retry_delay_millis(&self, attempts: u32) -> i64 {
-        let exponent = attempts.saturating_sub(1).min(10);
-        duration_millis_i64(self.delivery_config.retry_base_delay)
-            .saturating_mul(2_i64.saturating_pow(exponent))
-    }
-
-    fn pubsub_notification_body(
-        &self,
-        request: &PublishRequest,
-        message_id: &PubsubMessageId,
-        subscription: &Subscription,
-    ) -> PubsubResult<String> {
-        notification_body(NotificationRenderContext {
-            request,
-            message_id,
-            subscription,
-            delivery_config: &self.delivery_config,
-            signer: self.notification_signer.as_deref(),
-        })
+        let outcome = self.deliver_claimed_record(record).await?;
+        self.provider.update_delivery_record(outcome).await
     }
 }
 
@@ -790,41 +485,6 @@ fn validate_subscription_attributes<'a>(
     Ok(())
 }
 
-fn queue_message_attributes(
-    attributes: &HashMap<String, String>,
-) -> Option<HashMap<String, MessageAttributeValue>> {
-    if attributes.is_empty() {
-        return None;
-    }
-    Some(
-        attributes
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    MessageAttributeValue {
-                        string_value: Some(value.clone()),
-                        binary_value: None,
-                        data_type: "String".to_string(),
-                    },
-                )
-            })
-            .collect(),
-    )
-}
-
-fn subscription_destination(subscription: &Subscription) -> SubscriptionDestination {
-    SubscriptionDestination::new(
-        subscription.protocol.as_str(),
-        subscription.endpoint.clone(),
-    )
-    .with_extra_json(subscription.extra_json.clone())
-}
-
-fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-fn duration_millis_i64(duration: Duration) -> i64 {
+pub(super) fn duration_millis_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }

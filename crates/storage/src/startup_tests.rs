@@ -1,12 +1,55 @@
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::collections::HashMap;
 
 use storage_provider::{RemoteCredentialStrategy, StorageBackend};
+#[cfg(feature = "sqlite")]
+use storage_types::TableName;
 
-use crate::startup::{
-    authoritative_cache_options_from_features, point_read_cache_from_features,
-    query_proof_cache_from_features, resolve_point_read_cache_max_bytes_for,
-    storage_config_from_backends, storage_connection_registry_from_features,
-};
+use crate::startup::{storage_config_from_backends, storage_connection_registry_from_features};
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn given_sqlite_startup_when_factory_initializes_then_system_tables_exist_and_customer_tables_do_not()
+ {
+    let features = config::Features {
+        backends: config::Backends {
+            sqlite: Some(config::SqliteBackendConfig {
+                db_path: ":memory:".to_string(),
+                immediate_gsi_consistency: false,
+            }),
+            turso: None,
+            postgres: None,
+            rocksdb: None,
+            foundationdb: None,
+            remote: None,
+        },
+        ..config::Features::default()
+    };
+
+    let manager = crate::startup::database_manager_from_features(
+        &features,
+        crate::DatabaseManagerRuntimeOptions::default(),
+    )
+    .await
+    .expect("native sqlite startup");
+
+    for table_name in [
+        crate::Tables::sys_namespaces(),
+        crate::Tables::sys_analytics(),
+    ] {
+        assert!(
+            manager
+                .table_exists(&table_name)
+                .await
+                .expect("system table lookup")
+        );
+    }
+    assert!(
+        !manager
+            .table_exists(&TableName::new("ordinary_table"))
+            .await
+            .expect("customer table lookup")
+    );
+}
 
 #[cfg(feature = "turso")]
 #[test]
@@ -369,201 +412,4 @@ fn storage_registry_rejects_a_default_connection_that_is_not_declared() {
     assert!(format!("{error}").contains(
         "default connection 'missing' missing in features.storage_connections.connections"
     ));
-}
-
-#[test]
-fn storage_point_read_cache_defaults_to_disabled() {
-    let cache = point_read_cache_from_features(&config::Features::default());
-
-    assert!(!cache.is_enabled());
-}
-
-#[test]
-fn storage_point_read_cache_can_be_enabled_from_features() {
-    let features = config::Features {
-        storage_point_read_cache: config::StoragePointReadCacheConfig {
-            enabled: true,
-            capacity: 123,
-            max_bytes: Some(456),
-            memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-                mode: config::StoragePointReadCacheMemoryBudgetMode::AutoPerCore {
-                    megabytes_per_core: 100,
-                },
-            },
-            ttl_seconds: 45,
-            eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-            ..config::StoragePointReadCacheConfig::default()
-        },
-        ..config::Features::default()
-    };
-
-    let cache = point_read_cache_from_features(&features);
-
-    assert!(cache.is_enabled());
-}
-
-#[test]
-fn point_read_cache_auto_budget_scales_by_available_core_count() {
-    let cache_config = config::StoragePointReadCacheConfig {
-        enabled: true,
-        capacity: 1_000_000,
-        max_bytes: None,
-        memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-            mode: config::StoragePointReadCacheMemoryBudgetMode::AutoPerCore {
-                megabytes_per_core: 100,
-            },
-        },
-        ttl_seconds: 60,
-        eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-        ..config::StoragePointReadCacheConfig::default()
-    };
-
-    let resolved = resolve_point_read_cache_max_bytes_for(
-        &cache_config,
-        std::num::NonZeroUsize::new(4).expect("4 is non-zero"),
-        Some(8 * 1024 * 1024 * 1024),
-    );
-
-    assert_eq!(resolved, 400 * 1024 * 1024);
-}
-
-#[test]
-fn point_read_cache_percent_budget_uses_effective_memory_limit() {
-    let cache_config = config::StoragePointReadCacheConfig {
-        enabled: true,
-        capacity: 1_000_000,
-        max_bytes: None,
-        memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-            mode: config::StoragePointReadCacheMemoryBudgetMode::PercentOfAvailableMemory {
-                percent: 25,
-            },
-        },
-        ttl_seconds: 60,
-        eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-        ..config::StoragePointReadCacheConfig::default()
-    };
-
-    let resolved = resolve_point_read_cache_max_bytes_for(
-        &cache_config,
-        std::num::NonZeroUsize::new(8).expect("8 is non-zero"),
-        Some(2 * 1024 * 1024 * 1024),
-    );
-
-    assert_eq!(resolved, 512 * 1024 * 1024);
-}
-
-#[test]
-fn point_read_cache_percent_budget_falls_back_to_per_core_budget_without_memory_limit() {
-    let cache_config = config::StoragePointReadCacheConfig {
-        enabled: true,
-        capacity: 1_000_000,
-        max_bytes: None,
-        memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-            mode: config::StoragePointReadCacheMemoryBudgetMode::PercentOfAvailableMemory {
-                percent: 25,
-            },
-        },
-        ttl_seconds: 60,
-        eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-        ..config::StoragePointReadCacheConfig::default()
-    };
-
-    let resolved = resolve_point_read_cache_max_bytes_for(
-        &cache_config,
-        NonZeroUsize::new(2).expect("2 is non-zero"),
-        None,
-    );
-
-    assert_eq!(resolved, 200 * 1024 * 1024);
-}
-
-#[test]
-fn point_read_cache_fixed_byte_budget_is_never_zero() {
-    let cache_config = config::StoragePointReadCacheConfig {
-        enabled: true,
-        capacity: 1_000_000,
-        max_bytes: None,
-        memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-            mode: config::StoragePointReadCacheMemoryBudgetMode::FixedBytes { bytes: 0 },
-        },
-        ttl_seconds: 60,
-        eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-        ..config::StoragePointReadCacheConfig::default()
-    };
-
-    let resolved = resolve_point_read_cache_max_bytes_for(
-        &cache_config,
-        NonZeroUsize::new(8).expect("8 is non-zero"),
-        Some(2 * 1024 * 1024 * 1024),
-    );
-
-    assert_eq!(resolved, 1);
-}
-
-#[test]
-fn point_read_cache_legacy_max_bytes_overrides_budget_policy() {
-    let features = config::Features {
-        storage_point_read_cache: config::StoragePointReadCacheConfig {
-            enabled: true,
-            capacity: 123,
-            max_bytes: Some(16 * 1024 * 1024),
-            memory_budget: config::StoragePointReadCacheMemoryBudgetConfig {
-                mode: config::StoragePointReadCacheMemoryBudgetMode::PercentOfAvailableMemory {
-                    percent: 80,
-                },
-            },
-            ttl_seconds: 45,
-            eviction_policy: config::StoragePointReadCacheEvictionPolicy::TwoQueue,
-            ..config::StoragePointReadCacheConfig::default()
-        },
-        ..config::Features::default()
-    };
-
-    let cache = point_read_cache_from_features(&features);
-
-    assert!(cache.is_enabled());
-}
-
-#[test]
-fn storage_query_proof_cache_defaults_to_disabled() {
-    let cache = query_proof_cache_from_features(&config::Features::default());
-
-    assert!(!cache.is_enabled());
-}
-
-#[test]
-fn storage_query_proof_cache_can_be_enabled_from_features() {
-    let features = config::Features {
-        storage_query_proof_cache: config::StorageQueryProofCacheConfig {
-            enabled: true,
-            max_query_spaces: 32,
-            max_manifest_entries: 256,
-            max_coverage_ranges: 64,
-            eviction_policy: config::StorageQueryProofCacheEvictionPolicy::PartitionLru,
-        },
-        ..config::Features::default()
-    };
-
-    let cache = query_proof_cache_from_features(&features);
-
-    assert!(cache.is_enabled());
-}
-
-#[test]
-fn authoritative_cache_options_follow_the_point_read_cache_feature_flags() {
-    let features = config::Features {
-        storage_point_read_cache: config::StoragePointReadCacheConfig {
-            authoritative_strong_point_reads: true,
-            authoritative_write_preimages: true,
-            strong_read_through_warming: true,
-            ..config::StoragePointReadCacheConfig::default()
-        },
-        ..config::Features::default()
-    };
-
-    let options = authoritative_cache_options_from_features(&features);
-
-    assert!(options.authoritative_strong_point_reads);
-    assert!(options.authoritative_write_preimages);
-    assert!(options.strong_read_through_warming);
 }

@@ -1,4 +1,5 @@
 [package]
+rust-version.workspace = true
 publish = false
 name = "storage-common"
 version = "0.1.0"
@@ -10,16 +11,18 @@ description = "Backend-agnostic shared helpers for storage providers (pagination
 rocksdb = ["storage-types/rocksdb"]
 
 [dependencies]
-async-trait = { workspace = true }
-bg-jobs = { path = "../bg-jobs" }
-md5 = { workspace = true }
 metrics = { workspace = true }
+metrics-facade = { workspace = true }
 rand = { workspace = true }
+scheduled-bg-jobs = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 smallvec = { workspace = true }
 storage-types = { path = "../storage-types" }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 alloc-counter = { workspace = true }

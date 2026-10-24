@@ -1,8 +1,93 @@
 use std::str::FromStr;
 
+use alloc_counter::AllocationGuard;
 use rust_decimal::Decimal;
 
-use crate::numeric::{SortableNumeric, SortableVec};
+use crate::numeric::{SortableNumeric, SortableVec, calculate_magnitude};
+
+fn legacy_calculate_magnitude(decimal: Decimal) -> i32 {
+    if decimal.is_zero() {
+        return 0;
+    }
+    let string = decimal.abs().to_string();
+    let decimal_pos = string.find('.').unwrap_or(string.len());
+    let integer_part = string
+        .get(..decimal_pos)
+        .expect("decimal separator is on a character boundary");
+    let non_zero_digits = integer_part.trim_start_matches('0');
+    if non_zero_digits.is_empty() {
+        let fractional_part = string
+            .get(decimal_pos + 1..)
+            .expect("fractional digits start on a character boundary");
+        let leading_zeros = fractional_part.len() - fractional_part.trim_start_matches('0').len();
+        -(leading_zeros as i32 + 1)
+    } else {
+        non_zero_digits.len() as i32 - 1
+    }
+}
+
+fn magnitude_fixture() -> [Decimal; 10] {
+    [
+        Decimal::ZERO,
+        Decimal::from(1),
+        Decimal::from(999),
+        Decimal::from(1_000),
+        Decimal::from_str("0.1").expect("decimal"),
+        Decimal::from_str("0.00100").expect("decimal"),
+        Decimal::from_str("1000.000").expect("decimal"),
+        Decimal::from_i128_with_scale(1, 28),
+        Decimal::from_str("9999999999999999999999999999").expect("decimal"),
+        Decimal::from_i128_with_scale(-12_345_678, 3),
+    ]
+}
+
+#[test]
+fn sortable_numeric_magnitude_preserves_decimal_boundaries() {
+    for decimal in magnitude_fixture() {
+        assert_eq!(
+            calculate_magnitude(decimal),
+            legacy_calculate_magnitude(decimal),
+            "magnitude changed for {decimal}"
+        );
+    }
+}
+
+#[test]
+fn sortable_numeric_magnitude_avoids_format_allocations() {
+    let values = magnitude_fixture();
+    let legacy_guard = AllocationGuard::start(
+        module_path!(),
+        "sortable_numeric_magnitude_allocation_profile",
+        file!(),
+        line!(),
+        Some("legacy_to_string"),
+    );
+    for _ in 0..256 {
+        for decimal in values {
+            std::hint::black_box(legacy_calculate_magnitude(decimal));
+        }
+    }
+    let legacy = legacy_guard.finish();
+
+    let candidate_guard = AllocationGuard::start(
+        module_path!(),
+        "sortable_numeric_magnitude_allocation_profile",
+        file!(),
+        line!(),
+        Some("mantissa_scale"),
+    );
+    for _ in 0..256 {
+        for decimal in values {
+            std::hint::black_box(calculate_magnitude(decimal));
+        }
+    }
+    let candidate = candidate_guard.finish();
+
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&candidate);
+    assert!(candidate.allocation_count < legacy.allocation_count);
+    assert!(candidate.allocated_bytes < legacy.allocated_bytes);
+}
 
 #[test]
 fn encode_decode_zero() {
@@ -95,9 +180,9 @@ fn encode_decode_decimals() {
 
 #[test]
 fn sort_order_preservation() {
-    // Test the sequence from the original comment, but in correct numerical order
-    // From smallest to largest: -1000.0001 < -999 < 0.12345678 < 12.45 < 1234.0001
-    // < 1239
+    // Test the sequence from the original comment, but in correct numerical
+    // order From smallest to largest: -1000.0001 < -999 < 0.12345678 < 12.45 <
+    // 1234.0001 < 1239
     let test_cases = [
         Decimal::new(-10_000_001, 4), // -1000.0001
         Decimal::from(-999),          // -999

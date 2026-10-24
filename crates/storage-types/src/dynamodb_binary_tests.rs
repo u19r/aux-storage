@@ -1,9 +1,10 @@
+use alloc_counter::AllocationGuard;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    StorageEnum, StorageError, WireAttributeDecode,
+    StorageEnum, WireAttributeDecode,
     dynamodb_binary::{self, SENTINEL_KEY, parse_required_dynamo_binary},
 };
 
@@ -123,11 +124,8 @@ fn parse_required_dynamo_binary_decodes_unpadded_base64() {
 fn parse_required_dynamo_binary_errors_when_missing() {
     let error = parse_required_dynamo_binary(None, "payload").expect_err("missing value must fail");
     assert!(
-        matches!(
-            error,
-            StorageError::Base(StorageEnum::InternalServerError { ref message })
-                if message == "missing required field payload"
-        ),
+        matches!(error.base_error(), Some(StorageEnum::InternalServerError { message })
+                if message == "missing required field payload"),
         "unexpected error: {error:?}"
     );
 }
@@ -137,11 +135,8 @@ fn parse_required_dynamo_binary_errors_when_invalid() {
     let error =
         parse_required_dynamo_binary(Some("%%%"), "payload").expect_err("invalid base64 must fail");
     assert!(
-        matches!(
-            error,
-            StorageError::Base(StorageEnum::InternalServerError { ref message })
-                if message.starts_with("invalid payload field binary payload:")
-        ),
+        matches!(error.base_error(), Some(StorageEnum::InternalServerError { message })
+                if message.starts_with("invalid payload field binary payload:")),
         "unexpected error: {error:?}"
     );
 }
@@ -158,4 +153,72 @@ fn wire_attribute_decode_option_vec_u8_decodes_none() {
     let decoded = <Option<Vec<u8>> as WireAttributeDecode>::decode(None, "payload")
         .expect("missing optional value should decode to None");
     assert_eq!(decoded, None);
+}
+
+fn legacy_decode_binary_payload(raw: &str) -> Vec<u8> {
+    let value: serde_json::Value = serde_json::from_str(raw).expect("valid JSON");
+    let payload = value.get("payload").expect("payload field");
+    let encoded = match payload {
+        serde_json::Value::String(encoded) => encoded,
+        serde_json::Value::Object(fields) => fields
+            .get(SENTINEL_KEY)
+            .and_then(serde_json::Value::as_str)
+            .expect("sentinel string"),
+        _ => unreachable!("fixture has a binary payload"),
+    };
+    dynamodb_binary::decode_base64_string(encoded).expect("valid base64")
+}
+
+fn measure_binary_decode(
+    label: &'static str,
+    raw: &'static str,
+    decode: fn(&str) -> Vec<u8>,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "dynamodb_binary_decode_allocation_profile_tests",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    for _ in 0..256 {
+        let decoded = decode(raw);
+        std::hint::black_box(decoded.len());
+    }
+    guard.finish()
+}
+
+fn direct_decode_binary_payload(raw: &str) -> Vec<u8> {
+    serde_json::from_str::<RequiredBinaryPayload>(raw)
+        .expect("binary payload")
+        .payload
+}
+
+#[test]
+fn given_sentinel_binary_payload_when_decoding_then_json_dom_is_not_allocated() {
+    let raw = r#"{"payload":{"__dynamodb_binary":"SGVsbG8="}}"#;
+    let legacy = measure_binary_decode("json_dom", raw, legacy_decode_binary_payload);
+    let direct = measure_binary_decode("visitor", raw, direct_decode_binary_payload);
+
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&direct);
+    assert!(direct.allocation_count < legacy.allocation_count);
+    assert!(direct.allocated_bytes < legacy.allocated_bytes);
+}
+
+#[test]
+fn given_optional_bytes_when_wire_encoded_then_binary_and_null_remain_distinct() {
+    for (bytes, expected) in [
+        (None, crate::AttributeValue::NULL(true)),
+        (Some(vec![]), crate::AttributeValue::B(String::new())),
+        (
+            Some(vec![5, 6, 7]),
+            crate::AttributeValue::B("BQYH".to_string()),
+        ),
+    ] {
+        assert_eq!(
+            dynamodb_binary::encode_optional(&bytes, "payload").expect("wire binary"),
+            expected
+        );
+    }
 }

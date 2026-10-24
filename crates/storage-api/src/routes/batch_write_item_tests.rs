@@ -5,8 +5,9 @@ use storage_types::{
 };
 
 use crate::{
-    routes::routes_test_support::{
-        default_conformance_backends, handle_batch_get_item, handle_batch_write_item,
+    routes::routes_tests::{
+        default_conformance_backends, for_each_conformance_backend, handle_batch_get_item,
+        handle_batch_write_item,
     },
     types::Response,
 };
@@ -149,40 +150,77 @@ async fn batch_write_duplicate_keys_reject_across_conformance_backends() {
 
 #[tokio::test]
 async fn batch_write_put_accepts_aux_item_stream_ttl_without_storing_attribute() {
-    let db = crate::routes::routes_test_support::create_test_db().await;
-    create_batch_table(db.as_ref()).await;
+    for_each_conformance_backend(|_backend, db| async move {
+        create_batch_table(db.as_ref()).await;
 
-    let response = handle_batch_write_item(
-        db.clone(),
-        json!({
-            "RequestItems": {
-                "BatchWriteRouteTable": [{
-                    "PutRequest": {
-                        "Item": {
-                            "pk": {"S": "aux-item"},
-                            "payload": {"S": "stored"}
-                        },
-                        "AuxItemStreamTtlHours": 96
-                    }
-                }]
-            }
-        })
-        .try_into()
-        .expect("batch write request with aux ttl"),
-    )
-    .await
-    .expect("batch write with custom item stream ttl");
-    assert_empty_batch_write_response(&response, "default");
+        let response = handle_batch_write_item(
+            db.clone(),
+            json!({
+                "RequestItems": {
+                    "BatchWriteRouteTable": [{
+                        "PutRequest": {
+                            "Item": {
+                                "pk": {"S": "aux-item"},
+                                "payload": {"S": "stored"}
+                            },
+                            "AuxItemStreamTtlHours": 96
+                        }
+                    }]
+                }
+            })
+            .try_into()
+            .expect("batch write request with aux ttl"),
+        )
+        .await
+        .expect("batch write with custom item stream ttl");
+        assert_empty_batch_write_response(&response, "default");
 
-    let item = batch_get_item(db, "aux-item", "default").await;
-    assert_eq!(
-        item.get("payload"),
-        Some(&AttributeValue::S("stored".to_string()))
-    );
-    assert!(
-        !item.contains_key("AuxItemStreamTtlHours"),
-        "aux item stream ttl is request metadata, not item data"
-    );
+        let item = batch_get_item(db, "aux-item", "default").await;
+        assert_eq!(
+            item.get("payload"),
+            Some(&AttributeValue::S("stored".to_string()))
+        );
+        assert!(
+            !item.contains_key("AuxItemStreamTtlHours"),
+            "aux item stream ttl is request metadata, not item data"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn batch_write_missing_table_returns_canonical_resource_not_found() {
+    for backend in default_conformance_backends() {
+        let db = backend.create_db().await;
+        let err = handle_batch_write_item(
+            db,
+            json!({
+                "RequestItems": {
+                    "MissingBatchWriteRouteTable": [{
+                        "PutRequest": {
+                            "Item": {"pk": {"S": "missing"}}
+                        }
+                    }]
+                }
+            })
+            .try_into()
+            .expect("batch write request"),
+        )
+        .await
+        .expect_err("missing batch write table should fail");
+
+        assert_eq!(err.status_code, 400, "{}", backend.name);
+        assert_eq!(
+            err.error_type, "com.amazonaws.dynamodb.v20120810#ResourceNotFoundException",
+            "{}",
+            backend.name
+        );
+        assert_eq!(
+            err.message, "Requested resource not found",
+            "{}",
+            backend.name
+        );
+    }
 }
 
 #[tokio::test]
@@ -393,18 +431,18 @@ async fn batch_get_item(
     )
     .await
     .unwrap_or_else(|err| panic!("{backend_name} batch get after batch write: {err:?}"));
-    let Response::BatchGetWire(response) = response else {
-        panic!("{backend_name} expected batch get wire response");
+    let Response::BatchGetItem(mut response) = response else {
+        panic!("{backend_name} expected batch get response");
     };
-    let mut response = response
-        .into_batch_get_response()
-        .unwrap_or_else(|err| panic!("{backend_name} decode batch get response: {err}"));
-    response
-        .responses
-        .as_mut()
-        .and_then(|responses| responses.remove(&TableName::new("BatchWriteRouteTable")))
-        .and_then(|mut items| items.pop())
-        .unwrap_or_else(|| panic!("{backend_name} expected batch get item for {key}"))
+    storage_types::AttributeMap::try_from(
+        response
+            .responses
+            .as_mut()
+            .and_then(|responses| responses.remove(&TableName::new("BatchWriteRouteTable")))
+            .and_then(|mut items| items.pop())
+            .unwrap_or_else(|| panic!("{backend_name} expected batch get item for {key}")),
+    )
+    .unwrap()
 }
 
 async fn create_batch_table(db: &storage::DatabaseManager) {
@@ -479,18 +517,16 @@ async fn batch_get_payloads(
     )
     .await
     .unwrap_or_else(|err| panic!("{backend_name} batch get after batch write: {err:?}"));
-    let Response::BatchGetWire(response) = response else {
-        panic!("{backend_name} expected batch get wire response");
+    let Response::BatchGetItem(response) = response else {
+        panic!("{backend_name} expected batch get response");
     };
-    let response = response
-        .into_batch_get_response()
-        .unwrap_or_else(|err| panic!("{backend_name} decode batch get response: {err}"));
     let mut payloads = response
         .responses
         .and_then(|mut responses| responses.remove(&TableName::new("BatchWriteRouteTable")))
         .unwrap_or_default()
         .into_iter()
         .map(|item| {
+            let item = storage_types::AttributeMap::try_from(item).unwrap();
             let Some(AttributeValue::S(payload)) = item.get("payload") else {
                 panic!("{backend_name} batch get item missing payload: {item:?}");
             };
@@ -509,7 +545,7 @@ fn assert_empty_batch_write_response(response: &Response, backend_name: &str) {
         response
             .unprocessed_items
             .as_ref()
-            .is_some_and(std::collections::HashMap::is_empty),
+            .is_some_and(|items| items.is_empty()),
         "{}",
         backend_name
     );

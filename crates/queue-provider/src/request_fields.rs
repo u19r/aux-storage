@@ -14,7 +14,6 @@ type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 pub(crate) struct RequestDecoder {
     fields: JsonMap,
-    allowed: &'static [&'static str],
 }
 
 impl RequestDecoder {
@@ -35,20 +34,7 @@ impl RequestDecoder {
                 "Unknown field: {key}"
             )));
         }
-        Ok(Self { fields, allowed })
-    }
-
-    pub(crate) fn finish(self) -> Result<(), HttpApiError> {
-        if let Some(key) = self
-            .fields
-            .keys()
-            .find(|key| !self.allowed.contains(&key.as_str()))
-        {
-            return Err(HttpApiError::validation_error(format!(
-                "Unknown field: {key}"
-            )));
-        }
-        Ok(())
+        Ok(Self { fields })
     }
 
     pub(crate) fn required_string(&mut self, field: &'static str) -> Result<String, HttpApiError> {
@@ -171,10 +157,9 @@ impl RequestDecoder {
         };
         let mut output = HashMap::with_capacity(map.len());
         for (name, value) in map {
-            output.insert(
-                name.clone(),
-                decode_message_attribute_value(value, format!("{field}.{name}"))?,
-            );
+            let path = format!("{field}.{name}");
+            let attribute = decode_message_attribute_value(value, path)?;
+            output.insert(name, attribute);
         }
         Ok(Some(output))
     }
@@ -195,7 +180,6 @@ pub(crate) fn decode_send_message_batch_entry(
         delay_seconds: decoder.optional_u32("DelaySeconds")?,
         message_attributes: decoder.optional_message_attributes("MessageAttributes")?,
     };
-    decoder.finish()?;
     Ok(entry)
 }
 
@@ -208,7 +192,6 @@ pub(crate) fn decode_delete_message_batch_entry(
         id: decoder.required_string("Id")?,
         receipt_handle: ReceiptHandle::from(decoder.required_string("ReceiptHandle")?.as_str()),
     };
-    decoder.finish()?;
     Ok(entry)
 }
 
@@ -223,7 +206,6 @@ pub(crate) fn decode_change_message_visibility_batch_entry(
         receipt_handle: ReceiptHandle::from(decoder.required_string("ReceiptHandle")?.as_str()),
         visibility_timeout: decoder.required_u32("VisibilityTimeout")?,
     };
-    decoder.finish()?;
     Ok(entry)
 }
 
@@ -237,14 +219,12 @@ fn decode_message_attribute_value(
         binary_value: decoder.optional_string("BinaryValue")?,
         data_type: decoder.required_string("DataType")?,
     };
-    decoder.finish()?;
     Ok(attribute)
 }
 
 struct NestedDecoder {
     path: String,
     fields: JsonMap,
-    allowed: &'static [&'static str],
 }
 
 impl NestedDecoder {
@@ -262,25 +242,7 @@ impl NestedDecoder {
                 "Unknown field: {path}.{key}"
             )));
         }
-        Ok(Self {
-            path,
-            fields,
-            allowed,
-        })
-    }
-
-    fn finish(self) -> Result<(), HttpApiError> {
-        if let Some(key) = self
-            .fields
-            .keys()
-            .find(|key| !self.allowed.contains(&key.as_str()))
-        {
-            return Err(HttpApiError::validation_error(format!(
-                "Unknown field: {}.{key}",
-                self.path
-            )));
-        }
-        Ok(())
+        Ok(Self { path, fields })
     }
 
     fn field_path(&self, field: &str) -> String {
@@ -331,10 +293,9 @@ impl NestedDecoder {
         };
         let mut output = HashMap::with_capacity(map.len());
         for (name, value) in map {
-            output.insert(
-                name.clone(),
-                decode_message_attribute_value(value, format!("{path}.{name}"))?,
-            );
+            let nested_path = format!("{path}.{name}");
+            let attribute = decode_message_attribute_value(value, nested_path)?;
+            output.insert(name, attribute);
         }
         Ok(Some(output))
     }
@@ -342,17 +303,37 @@ impl NestedDecoder {
 
 fn json_u32(field: &str, value: serde_json::Value) -> Result<Option<u32>, HttpApiError> {
     match value {
-        serde_json::Value::Number(value) => value
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .map(Some)
-            .ok_or_else(|| wrong_type(field, "unsigned 32-bit integer")),
-        serde_json::Value::String(value) => value
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| wrong_type(field, "unsigned 32-bit integer")),
+        serde_json::Value::Number(value) => {
+            if value.as_i64().is_some_and(|value| value < 0) {
+                return Err(negative_range_error(field));
+            }
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map(Some)
+                .ok_or_else(|| wrong_type(field, "unsigned 32-bit integer"))
+        }
+        serde_json::Value::String(value) => {
+            if value.trim_start().starts_with('-') {
+                return Err(negative_range_error(field));
+            }
+            value
+                .parse::<u32>()
+                .map(Some)
+                .map_err(|_| wrong_type(field, "unsigned 32-bit integer"))
+        }
         serde_json::Value::Null => Ok(None),
         _ => Err(wrong_type(field, "unsigned 32-bit integer")),
+    }
+}
+
+fn negative_range_error(field: &str) -> HttpApiError {
+    if field == "DelaySeconds" || field.ends_with(".DelaySeconds") {
+        HttpApiError::validation_error("DelaySeconds must be between 0 and 900")
+    } else if field == "VisibilityTimeout" || field.ends_with(".VisibilityTimeout") {
+        HttpApiError::validation_error("VisibilityTimeout must be between 0 and 43200 seconds")
+    } else {
+        wrong_type(field, "unsigned 32-bit integer")
     }
 }
 

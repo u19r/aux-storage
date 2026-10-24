@@ -6,10 +6,11 @@ use thiserror::Error;
 
 use crate::{
     AttributeDefinition, AttributeValue, AttributeValueLookup, IndexName, KeyAttributeType,
-    KeyAttributes, KeySchemaElement, KeyType, StoredTableInfo, TableName, err_context,
+    KeyAttributes, KeySchemaElement, KeyType, StorageError, StoredTableInfo, TableName,
+    err_context,
 };
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ItemKeyEnum {
     #[error("Item key not a number")]
     Serialization(String),
@@ -49,6 +50,10 @@ impl TableKey {
     ) -> Result<Self, ItemKeyError> {
         let (hash_key, range_key) = keys_for_schema(key_schema, item)?;
         Ok(Self::new(table_name, hash_key, range_key))
+    }
+
+    pub fn validate_dynamodb_key(&self) -> Result<(), StorageError> {
+        crate::dynamodb_limits::validate_table_key(self)
     }
 
     /// NOTE: Not sorted! Use for page token only
@@ -270,6 +275,66 @@ impl ItemKey {
         }
     }
 
+    /// Recover Dynamo key fields for a page boundary from its table schema.
+    /// GSI boundaries carry both index and table key fields.
+    pub fn key_attributes(&self, table: &StoredTableInfo) -> Result<KeyAttributes, StorageError> {
+        if self.table_name() != &table.table_name {
+            return Err(StorageError::internal("page key belongs to another table"));
+        }
+        let mut attributes = KeyAttributes::new();
+        match self {
+            Self::Table(key) => {
+                insert_schema_values(
+                    &mut attributes,
+                    &table.key_schema,
+                    &key.hash_key,
+                    key.range_key.as_ref(),
+                );
+            }
+            Self::Index(key) => {
+                insert_schema_values(
+                    &mut attributes,
+                    &table.key_schema,
+                    &key.table_key.hash_key,
+                    key.table_key.range_key.as_ref(),
+                );
+                let schema = table
+                    .global_secondary_indexes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|index| index.index_name == key.index_id)
+                    .ok_or_else(|| {
+                        StorageError::internal("page index is absent from table metadata")
+                    })?;
+                insert_schema_values(
+                    &mut attributes,
+                    &schema.key_schema,
+                    &key.hash_key,
+                    key.range_key.as_ref(),
+                );
+            }
+            Self::IndexPrefix(key) => {
+                let schema = table
+                    .global_secondary_indexes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|index| index.index_name == key.index_id)
+                    .ok_or_else(|| {
+                        StorageError::internal("page index is absent from table metadata")
+                    })?;
+                insert_schema_values(
+                    &mut attributes,
+                    &schema.key_schema,
+                    &key.hash_key,
+                    key.range_key.as_ref(),
+                );
+            }
+        }
+        Ok(attributes)
+    }
+
     /// NOTE: Not sorted! Use for page token only
     pub fn hash_range_key_part(&self) -> Result<Vec<u8>, ItemKeyError> {
         match self {
@@ -285,8 +350,8 @@ impl ItemKey {
     }
 
     pub fn add_length_prefixed_part(parts: &mut Vec<u8>, data: &[u8]) {
-        // Use 2 bytes: 10 bits for length, 2 bits for version (00), 4 bits reserved for
-        // flags. Cap length at 1023 and convert safely.
+        // Use 2 bytes: 10 bits for length, 2 bits for version (00), 4 bits
+        // reserved for flags. Cap length at 1023 and convert safely.
         let length_u16 = u16::try_from(data.len()).unwrap_or(u16::MAX);
         let length = length_u16.min(1023);
         // Version is 00 (0), flags are 0000 (0)
@@ -308,8 +373,8 @@ impl ItemKey {
         let mut keys = KeyAttributes::new();
 
         if let Some(index_name) = index_name {
-            // For GSI, expect 2-4 parts: gsi_hash, optional gsi_range, table_hash, optional
-            // table_range
+            // For GSI, expect 2-4 parts: gsi_hash, optional gsi_range,
+            // table_hash, optional table_range
             if decoded_parts.len() < 2 || decoded_parts.len() > 4 {
                 return Err(invalid_token());
             }
@@ -471,8 +536,8 @@ impl ItemKey {
                 return Ok(None);
             };
 
-            // For GSI, encode up to 4 parts: gsi_hash, optional gsi_range, table_hash,
-            // optional table_range
+            // For GSI, encode up to 4 parts: gsi_hash, optional gsi_range,
+            // table_hash, optional table_range
             let mut parts = Vec::new();
 
             // Add GSI hash key
@@ -614,6 +679,23 @@ pub(crate) fn split_next_token_to_keys(key: &[u8]) -> Vec<Vec<u8>> {
     }
 
     parts
+}
+
+fn insert_schema_values(
+    attributes: &mut KeyAttributes,
+    schema: &[KeySchemaElement],
+    hash: &AttributeValue,
+    range: Option<&AttributeValue>,
+) {
+    for element in schema {
+        let value = match element.key_type {
+            KeyType::Hash => Some(hash),
+            KeyType::Range => range,
+        };
+        if let Some(value) = value {
+            attributes.insert(element.attribute_name.clone(), value.clone());
+        }
+    }
 }
 
 pub(crate) fn string_to_attribute_value(

@@ -1,51 +1,46 @@
 use std::collections::HashMap;
 
-use storage::DatabaseManager;
 use storage_types::{
-    AttributeValue, ItemStreamVersion, KeySchemaElement, KeyType, StreamItemId, StreamName,
-    TableName, TimestampMillis,
+    AttributeValue, SystemStreamCheckpoint, SystemStreamCheckpointToken, SystemStreamPosition,
+    SystemStreamScope, SystemStreamSourceTableName, TableName,
 };
-use stream_provider::{StreamDataType, StreamItem, StreamPointer};
+use stream_provider::{SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamStoredRecord};
 
-use crate::manager::storage_manager_impl_get_stream_records::system_stream_record;
-
-#[tokio::test]
-async fn given_missing_delete_tombstone_when_system_record_is_built_then_keys_are_preserved() {
-    let database = DatabaseManager::new_for_test()
-        .await
-        .expect("create test database");
+#[test]
+fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_are_preserved() {
     let key_image = HashMap::from([("pk".to_string(), AttributeValue::S("absent".to_string()))]);
-    let pointer_id = StreamItemId::from([1; 12]);
-    let pointer = StreamPointer {
-        indexers: Vec::new(),
-        old_indexers: None,
-        stream_name: StreamName::new(b"missing-delete/stream-item/absent"),
-        table_name: TableName::new("missing-delete"),
-        item_stream_version: ItemStreamVersion::new(1),
-        stream_item_id: pointer_id,
+    let scope = SystemStreamScope::try_new("catalog", 1).expect("scope");
+    let position = SystemStreamPosition::try_new("shard-1", "lineage-1", "offset-1")
+        .expect("logical position");
+    let record = SystemStreamStoredRecord {
+        source_table_name: SystemStreamSourceTableName::try_new("missing-delete")
+            .expect("logical source table"),
+        keys: key_image.clone().into(),
+        old_image: None,
+        new_image: None,
+        position: position.clone(),
     };
-    let images = [StreamItem {
-        id: StreamItemId::from(ItemStreamVersion::new(1)),
-        stream_name: None,
-        data: storage_types::storage_serde::to_bytes(&key_image).expect("encode key image"),
-        data_type: StreamDataType::DeleteMarker,
-        created_at: TimestampMillis::now(),
-    }];
-    let key_schema = [KeySchemaElement {
-        attribute_name: "pk".to_string(),
-        key_type: KeyType::Hash,
-    }];
-
-    let record = system_stream_record(
-        database.initialization_stream_provider().as_ref(),
-        pointer,
-        &images,
-        &key_schema,
+    let checkpoint =
+        SystemStreamCheckpoint::try_new(scope.clone(), vec![position]).expect("logical checkpoint");
+    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16)))
+        .expect("checkpoint token");
+    let page = SystemStreamPage::new(
+        scope,
+        vec![record.into_stream_record().unwrap()],
+        SystemStreamIssuedCheckpoint::new(token, checkpoint).expect("issued checkpoint"),
+        true,
     )
-    .expect("build tombstone record");
+    .expect("canonical SystemStream page");
 
-    assert_eq!(record.keys, key_image);
+    let response = page.into_response().expect("SystemStream response");
+    let record = &response.records()[0];
+    assert_eq!(record.keys, key_image.into());
     assert!(record.new_image.is_none());
     assert!(record.old_image.is_none());
-    assert_eq!(record.sequence_number, pointer_id.to_string());
+    assert_eq!(record.sequence_number, "offset-1");
+    assert!(record.cursor.is_none());
+    assert_eq!(
+        record.source_table_name.as_ref().map(TableName::as_ref),
+        Some("missing-delete")
+    );
 }

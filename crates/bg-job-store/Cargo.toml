@@ -1,19 +1,24 @@
 [package]
+rust-version.workspace = true
 publish = false
 edition = "2024"
 license.workspace = true
 name = "bg-job-store"
 version = "0.1.0"
-description = "Job lock store implementations for bg-jobs"
+description = "Provider-backed scheduled-job store adapter"
 
 [lib]
 doctest = false
 
 [dependencies]
-async-trait = { workspace = true }
-bg-jobs = { path = "../bg-jobs" }
+bytes = { workspace = true }
+scheduled-bg-jobs = { workspace = true }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

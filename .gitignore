@@ -1,5 +1,6 @@
 stack_outputs_*
 target
+!/crates/regional-replication/src/journal/target/
 .vscode/*
 !.vscode/settings.json
 

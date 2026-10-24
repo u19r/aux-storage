@@ -1,13 +1,20 @@
 use std::collections::HashMap;
 
+use alloc_counter::AllocationGuard;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
+use storage_types::TimestampMillis;
 
-use crate::types::{
-    ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
-    DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest, GetQueueAttributesRequest,
-    GetQueueUrlRequest, ListQueuesRequest, MessageAttributeValue, PurgeQueueRequest,
-    ReceiveMessageRequest, SendMessageBatchRequest, SendMessageRequest, SetQueueAttributesRequest,
-    md5_of_message_attributes,
+use crate::{
+    MessageId, ReceiptHandle,
+    types::{
+        ChangeMessageVisibilityBatchRequest, ChangeMessageVisibilityRequest, CreateQueueRequest,
+        DeleteMessageBatchRequest, DeleteMessageRequest, DeleteQueueRequest,
+        GetQueueAttributesRequest, GetQueueUrlRequest, ListQueuesRequest, MessageAttributeValue,
+        MessageResponse, PurgeQueueRequest, QueueMessage, ReceiveMessageRequest,
+        SendMessageBatchRequest, SendMessageRequest, SetQueueAttributesRequest,
+        VisibleQueueMessage, md5_of_message_attributes,
+    },
 };
 
 #[test]
@@ -409,7 +416,6 @@ fn change_message_visibility_batch_request_validates_visibility_timeout() {
 }
 
 #[test]
-#[ignore = "Implement validation errors when an API is available"]
 fn send_message_request_delay_seconds_negative() {
     let json = json!({
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
@@ -421,6 +427,63 @@ fn send_message_request_delay_seconds_negative() {
     assert!(result.is_err());
     let error = result.unwrap_err();
     assert_eq!(error.message, "DelaySeconds must be between 0 and 900");
+}
+
+#[test]
+fn send_message_request_delay_seconds_string_and_malformed_values_preserve_contracts() {
+    let base = json!({
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+        "MessageBody": "Hello"
+    });
+
+    for value in [json!("-1"), json!(901)] {
+        let mut request = base.clone();
+        request["DelaySeconds"] = value;
+        assert_eq!(
+            SendMessageRequest::from_json(request).unwrap_err().message,
+            "DelaySeconds must be between 0 and 900"
+        );
+    }
+
+    for value in [
+        json!(u64::from(u32::MAX) + 1),
+        json!(1.5),
+        json!("not-a-number"),
+    ] {
+        let mut request = base.clone();
+        request["DelaySeconds"] = value;
+        assert_eq!(
+            SendMessageRequest::from_json(request).unwrap_err().message,
+            "DelaySeconds must be a unsigned 32-bit integer"
+        );
+    }
+
+    for request in [
+        base.clone(),
+        json!({
+            "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+            "MessageBody": "Hello",
+            "DelaySeconds": null
+        }),
+    ] {
+        assert!(SendMessageRequest::from_json(request).is_ok());
+    }
+}
+
+#[test]
+fn send_message_batch_request_negative_delay_uses_range_error() {
+    let result = SendMessageBatchRequest::from_json(json!({
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+        "Entries": [{
+            "Id": "entry",
+            "MessageBody": "Hello",
+            "DelaySeconds": "-1"
+        }]
+    }));
+    assert_eq!(
+        result.unwrap_err().message,
+        "DelaySeconds must be between 0 and 900"
+    );
 }
 
 #[test]
@@ -464,6 +527,214 @@ fn message_attribute_md5_matches_aws_canonical_encoding_for_strings() {
         md5_of_message_attributes(&attributes).as_deref(),
         Some("59f4208f3c9087f6253ce0fce97917da")
     );
+}
+
+#[test]
+fn message_attribute_md5_streams_binary_and_string_values() {
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "binary".to_string(),
+        MessageAttributeValue {
+            string_value: None,
+            binary_value: Some(STANDARD.encode([0, 1, 2, 255])),
+            data_type: "Binary.custom".to_string(),
+        },
+    );
+    attributes.insert(
+        "string".to_string(),
+        MessageAttributeValue {
+            string_value: Some("value".to_string()),
+            binary_value: None,
+            data_type: "String".to_string(),
+        },
+    );
+
+    assert_eq!(
+        md5_of_message_attributes(&attributes),
+        legacy_md5_of_message_attributes(&attributes)
+    );
+}
+
+#[test]
+fn message_attribute_md5_rejects_missing_value_without_hashing_partial_input() {
+    let mut attributes = HashMap::new();
+    attributes.insert(
+        "missing".to_string(),
+        MessageAttributeValue {
+            string_value: None,
+            binary_value: None,
+            data_type: "String".to_string(),
+        },
+    );
+
+    assert_eq!(md5_of_message_attributes(&attributes), None);
+}
+
+#[test]
+fn message_response_moves_receipt_handle_without_changing_wire_fields() {
+    let candidate = sample_invisible_message().into_message_response();
+    let baseline = legacy_message_response(sample_queue_message());
+    assert_eq!(
+        serde_json::to_value(candidate.unwrap()).unwrap(),
+        serde_json::to_value(baseline.unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn message_response_receipt_ownership_reduces_allocations() {
+    let baseline = measure_message_response_allocations("clone_receipt", || {
+        legacy_message_response(sample_queue_message())
+    });
+    let candidate = measure_message_response_allocations("move_receipt", || {
+        sample_invisible_message().into_message_response()
+    });
+
+    let _ = alloc_counter::emit_report(&baseline);
+    let _ = alloc_counter::emit_report(&candidate);
+    assert!(candidate.allocation_count < baseline.allocation_count);
+    assert!(candidate.allocated_bytes < baseline.allocated_bytes);
+}
+
+fn sample_invisible_message() -> crate::types::InvisibleQueueMessage {
+    VisibleQueueMessage::new(sample_queue_message()).into_invisible(
+        ReceiptHandle("receipt-handle-with-enough-length-for-a-real-message".to_string()),
+        TimestampMillis::now(),
+    )
+}
+
+fn sample_queue_message() -> QueueMessage {
+    QueueMessage {
+        receive_count: 0,
+        message_id: MessageId::default(),
+        queue_url: "https://queue.example.test/queue".to_string(),
+        body: "payload".to_string(),
+        message_attributes: Some(HashMap::from([(
+            "source".to_string(),
+            MessageAttributeValue {
+                string_value: Some("test".to_string()),
+                binary_value: None,
+                data_type: "String".to_string(),
+            },
+        )])),
+        receipt_handle: Some(ReceiptHandle(
+            "receipt-handle-with-enough-length-for-a-real-message".to_string(),
+        )),
+        created_at: TimestampMillis::from_timestamp(1_700_000_000_123),
+        visibility_timestamp: None,
+    }
+}
+
+fn legacy_message_response(message: QueueMessage) -> Option<MessageResponse> {
+    let receipt_handle = message.receipt_handle.clone()?;
+    let mut response = MessageResponse::from_message(message, receipt_handle.clone());
+    response.receipt_handle = receipt_handle.to_string();
+    Some(response)
+}
+
+fn measure_message_response_allocations(
+    label: &'static str,
+    build: impl Fn() -> Option<MessageResponse>,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "message_response_receipt_ownership_profile_tests",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    let mut checksum = 0usize;
+    for _ in 0..64 {
+        checksum =
+            checksum.saturating_add(build().expect("invisible message").receipt_handle.len());
+    }
+    std::hint::black_box(checksum);
+    guard.finish()
+}
+
+#[test]
+fn message_attribute_md5_streaming_reduces_large_payload_allocations() {
+    let attributes = large_message_attributes();
+    let legacy = measure_message_attribute_md5_allocations("legacy", || {
+        legacy_md5_of_message_attributes(&attributes)
+    });
+    let streaming = measure_message_attribute_md5_allocations("streaming", || {
+        md5_of_message_attributes(&attributes)
+    });
+
+    let _ = alloc_counter::emit_report(&legacy);
+    let _ = alloc_counter::emit_report(&streaming);
+    assert!(streaming.allocation_count < legacy.allocation_count);
+    assert!(streaming.allocated_bytes < legacy.allocated_bytes);
+}
+
+fn large_message_attributes() -> HashMap<String, MessageAttributeValue> {
+    (0..10)
+        .map(|index| {
+            (
+                format!("attribute-{index}"),
+                MessageAttributeValue {
+                    string_value: Some("value".repeat(2_048)),
+                    binary_value: None,
+                    data_type: "String".to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn measure_message_attribute_md5_allocations(
+    label: &'static str,
+    hash: impl Fn() -> Option<String>,
+) -> alloc_counter::AllocationReport<'static> {
+    let guard = AllocationGuard::start(
+        module_path!(),
+        "message_attribute_md5_allocation_profile_tests",
+        file!(),
+        line!(),
+        Some(label),
+    );
+    let mut checksum = 0usize;
+    for _ in 0..8 {
+        checksum = checksum.saturating_add(hash().expect("valid message attributes").len());
+    }
+    std::hint::black_box(checksum);
+    guard.finish()
+}
+
+fn legacy_md5_of_message_attributes(
+    attributes: &HashMap<String, MessageAttributeValue>,
+) -> Option<String> {
+    let mut encoded = Vec::new();
+    let mut names: Vec<_> = attributes.keys().collect();
+    names.sort();
+
+    for name in names {
+        let value = attributes.get(name)?;
+        legacy_encode_string(&mut encoded, name);
+        legacy_encode_string(&mut encoded, &value.data_type);
+        if value.data_type.starts_with("Binary") {
+            encoded.push(2);
+            let binary_value = value.binary_value.as_ref()?;
+            let decoded = STANDARD.decode(binary_value).ok()?;
+            legacy_encode_binary(&mut encoded, &decoded);
+        } else {
+            encoded.push(1);
+            let string_value = value.string_value.as_ref()?;
+            legacy_encode_string(&mut encoded, string_value);
+        }
+    }
+
+    Some(format!("{:x}", md5::compute(encoded)))
+}
+
+fn legacy_encode_string(output: &mut Vec<u8>, value: &str) {
+    legacy_encode_binary(output, value.as_bytes());
+}
+
+fn legacy_encode_binary(output: &mut Vec<u8>, value: &[u8]) {
+    let length = value.len().min(u32::MAX as usize) as u32;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value);
 }
 
 #[test]
@@ -637,7 +908,6 @@ fn change_message_visibility_request_valid() {
 }
 
 #[test]
-#[ignore = "Implement validation errors when an API is available"]
 fn change_message_visibility_request_invalid_timeout() {
     let json = json!({
         "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
@@ -650,6 +920,22 @@ fn change_message_visibility_request_invalid_timeout() {
     let error = result.unwrap_err();
     assert_eq!(
         error.message,
+        "VisibilityTimeout must be between 0 and 43200 seconds"
+    );
+}
+
+#[test]
+fn change_message_visibility_batch_negative_timeout_uses_range_error() {
+    let result = ChangeMessageVisibilityBatchRequest::from_json(json!({
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
+        "Entries": [{
+            "Id": "entry",
+            "ReceiptHandle": "handle",
+            "VisibilityTimeout": "-1"
+        }]
+    }));
+    assert_eq!(
+        result.unwrap_err().message,
         "VisibilityTimeout must be between 0 and 43200 seconds"
     );
 }

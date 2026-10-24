@@ -1,33 +1,11 @@
-use crate::imports::*;
-
-pub(crate) const WORKLOAD_KV_SMOKE: &str = "kv_smoke";
-pub(crate) const WORKLOAD_NOOP: &str = "noop";
-pub(crate) const WORKLOAD_PARTITION_FAMILY: &str = "partition_family";
-pub(crate) const WORKLOAD_PUBSUB_DELIVERY: &str = "pubsub_delivery";
-pub(crate) const WORKLOAD_QUEUE_VISIBILITY: &str = "queue_visibility";
-pub(crate) const WORKLOAD_TABLE_ATOMICITY: &str = "table_atomicity";
-pub(crate) const WORKLOAD_READ_SEQUENCE_DAG: &str = "read_sequence_dag";
-pub(crate) const OPTION_PROFILE: &str = "profile";
-pub(crate) const OPTION_OPERATION_COUNT: &str = "operationCount";
-pub(crate) const OPTION_HISTORY_SAMPLE_LIMIT: &str = "historySampleLimit";
-pub(crate) const OPTION_ARTIFACT_ROOT: &str = "artifactRoot";
-pub(crate) const OPTION_KEY_COUNT: &str = "keyCount";
-pub(crate) const OPTION_ACTIVE_CLIENT_COUNT: &str = "activeClientCount";
-pub(crate) const OPTION_SHARED_KEY_COUNT: &str = "sharedKeyCount";
-pub(crate) const OPTION_SHARED_OPERATION_PERCENT: &str = "sharedOperationPercent";
-// Keep workload-local controls distinct from fdbserver's reserved simulation
-// options.  The runner still sets the process-wide seed/buggify flags, while
-// these values let a workload use the same CLI choices deterministically.
-pub(crate) const OPTION_SEED: &str = "readSequenceSeed";
-pub(crate) const OPTION_BUGGIFY: &str = "readSequenceBuggify";
-pub(crate) const GSI_INDEX_NAME: &str = "by_category_score";
-pub(crate) const GSI_CATEGORY_ATTR: &str = "category";
-pub(crate) const GSI_SCORE_ATTR: &str = "score";
-pub(crate) const TABLE_STREAM_DURATION_HOURS: u16 = 2;
-pub(crate) const ITEM_STREAM_TTL_HOURS: u16 = 1;
-pub(crate) const QUEUE_REDELIVERY_WAIT_SECONDS: u32 = 5;
-
-pub(crate) type FdbChaosProvider = SortedKvDbStorageProvider<FoundationDbKvStore>;
+use crate::{
+    constants::{
+        OPTION_ACTIVE_CLIENT_COUNT, OPTION_ARTIFACT_ROOT, OPTION_BUGGIFY,
+        OPTION_HISTORY_SAMPLE_LIMIT, OPTION_KEY_COUNT, OPTION_OPERATION_COUNT, OPTION_PROFILE,
+        OPTION_SEED, OPTION_SHARED_KEY_COUNT, OPTION_SHARED_OPERATION_PERCENT,
+    },
+    imports::*,
+};
 
 pub(crate) fn option_or_default<T>(context: &WorkloadContext, name: &str, default: T) -> T
 where T: std::str::FromStr {
@@ -60,29 +38,11 @@ pub(crate) fn gsi_score(key: &str, value: &str) -> String {
     (hash % 100_000).to_string()
 }
 
-pub(crate) fn item_trim_scope_id(stream_name: &StreamName) -> String {
-    let mut scope_id = String::with_capacity("kv-stream:".len() + stream_name.as_ref().len() * 2);
-    scope_id.push_str("kv-stream:");
-    for byte in stream_name.as_ref() {
-        scope_id.push(hex_nibble(byte >> 4));
-        scope_id.push(hex_nibble(byte & 0x0f));
-    }
-    scope_id
-}
-
-pub(crate) fn hex_nibble(value: u8) -> char {
-    match value {
-        0..=9 => char::from(b'0' + value),
-        10..=15 => char::from(b'a' + (value - 10)),
-        _ => '?',
-    }
-}
-
 pub(crate) fn string_attr(
-    item: &HashMap<String, AttributeValue>,
+    item: &impl storage_types::AttributeValueLookup,
     name: &str,
 ) -> Result<String, String> {
-    match item.get(name) {
+    match item.get_attribute_value(name) {
         Some(AttributeValue::S(value)) => Ok(value.clone()),
         Some(other) => Err(format!("attribute {name} has non-string value: {other:?}")),
         None => Err(format!("attribute {name} is missing")),
@@ -90,10 +50,10 @@ pub(crate) fn string_attr(
 }
 
 pub(crate) fn number_attr(
-    item: &HashMap<String, AttributeValue>,
+    item: &impl storage_types::AttributeValueLookup,
     name: &str,
 ) -> Result<String, String> {
-    match item.get(name) {
+    match item.get_attribute_value(name) {
         Some(AttributeValue::N(value)) => Ok(value.clone()),
         Some(other) => Err(format!("attribute {name} has non-number value: {other:?}")),
         None => Err(format!("attribute {name} is missing")),

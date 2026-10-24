@@ -1,4 +1,4 @@
-use crate::err_validation;
+use crate::errors::err_validation;
 
 #[test]
 fn validation_format() {

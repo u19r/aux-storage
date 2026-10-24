@@ -1,10 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use serde::Serialize;
 use storage_derive::{SingleTableKeys, WireItemEncode};
-use storage_provider::StorageProvider;
 #[cfg(feature = "foundationdb")]
-use storage_provider::{FoundationDbSettings, StorageBackend, StorageConfig};
+use storage_provider::FoundationDbSettings;
+use storage_provider::{SqliteSettings, StorageBackend, StorageConfig};
 use storage_types::{
     AttributeDefinition, AttributeValue, BatchWriteItemEncodeRequest, BatchWriteItemRequest,
     CreateGlobalSecondaryIndex, CreateTableRequest, EncodePutRequest, EncodeWriteRequest,
@@ -12,12 +12,13 @@ use storage_types::{
     StreamSpecification, StreamViewType, TableName, TableNamespace, TimestampMillis,
     TransactEncodeItem, TransactEncodePutRequest, TransactPutRequest, TransactUpdateRequest,
     TransactWriteItem, TransactWriteItemsEncodeRequest, TransactWriteItemsRequest, WireItem,
-    WriteRequest, single_table_entity::SingleTableEntity,
+    WriteRequest, context::WrappedError as _, project_attribute_map,
+    single_table_entity::SingleTableEntity,
 };
 
 use crate::{
     CappedStorageError, CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions,
-    DeleteCappedEntityInput, QueryIndexInput, QueryTableInput, Tables,
+    QueryIndexInput, QueryTableInput, Tables, database_manager::DeleteCappedEntityInput,
 };
 
 #[cfg(feature = "foundationdb")]
@@ -40,7 +41,7 @@ async fn create_hash_table(db: &DatabaseManager, table_name: &TableName) {
 }
 
 async fn create_hash_table_with_stream(db: &DatabaseManager, table_name: &TableName) {
-    let request = CreateTableRequest::new(
+    let mut request = CreateTableRequest::new(
         table_name.clone(),
         vec![AttributeDefinition {
             attribute_name: "pk".to_string(),
@@ -51,12 +52,45 @@ async fn create_hash_table_with_stream(db: &DatabaseManager, table_name: &TableN
             key_type: KeyType::Hash,
         }],
         storage_types::BillingMode::PayPerRequest,
-    )
-    .with_stream_specification(Some(StreamSpecification {
+    );
+    request.stream_specification = Some(StreamSpecification {
         stream_enabled: true,
         stream_view_type: Some(StreamViewType::NewAndOldImages),
-    }));
+    });
     db.create_table(&request).await.expect("create table");
+}
+
+#[tokio::test]
+async fn given_valid_system_and_namespace_like_table_names_when_crud_runs_then_names_are_not_routed()
+ {
+    let db = DatabaseManager::new_for_test()
+        .await
+        .expect("create test database manager");
+
+    for table_name in [
+        TableName::new("system"),
+        TableName::new("ns_1BCDEFGHJKMNPQRSTVWXYZ0"),
+    ] {
+        create_hash_table(&db, &table_name).await;
+        let key = HashMap::from([("pk".to_string(), AttributeValue::S("item".to_string()))]);
+        db.put_item(
+            crate::PutItemInput::builder()
+                .table_name(table_name.clone())
+                .item(HashMap::from([(
+                    "pk".to_string(),
+                    AttributeValue::S("item".to_string()),
+                )]))
+                .build(),
+        )
+        .await
+        .expect("valid table name should use the logical table directly");
+        assert!(
+            db.get_item_decode::<_, storage_types::AttributeMap>(table_name, key)
+                .await
+                .expect("read direct logical table")
+                .is_some()
+        );
+    }
 }
 
 async fn create_pk_sk_table(db: &DatabaseManager, table_name: &TableName) {
@@ -128,12 +162,13 @@ async fn create_single_table_mode_db() -> DatabaseManager {
 
 #[cfg(feature = "foundationdb")]
 #[tokio::test]
-#[ignore = "requires a local FoundationDB cluster on 127.0.0.1:4689"]
 async fn foundationdb_database_manager_bootstraps_system_tables() {
-    if !std::path::Path::new(LOCAL_FDB_CLUSTER_FILE).is_file() {
-        eprintln!("Skipping FoundationDB manager bootstrap test: cluster file missing");
-        return;
-    }
+    let cluster_file = std::env::var("TEST_FDB_CLUSTER_FILE")
+        .unwrap_or_else(|_| LOCAL_FDB_CLUSTER_FILE.to_string());
+    assert!(
+        std::path::Path::new(&cluster_file).is_file(),
+        "FoundationDB manager test requires {cluster_file}"
+    );
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
@@ -147,11 +182,12 @@ async fn foundationdb_database_manager_bootstraps_system_tables() {
         turso: None,
         rocksdb: None,
         foundationdb: Some(FoundationDbSettings {
-            cluster_file: Some(LOCAL_FDB_CLUSTER_FILE.to_string()),
+            cluster_file: Some(cluster_file),
             tenant_name: None,
             subspace_prefix: Some(format!("tests/storage-manager-bootstrap/{nanos}/")),
             cache_read_version_ms: 0,
             immediate_gsi_consistency: true,
+            transaction_byte_limit: None,
         }),
         remote: None,
     };
@@ -160,9 +196,6 @@ async fn foundationdb_database_manager_bootstraps_system_tables() {
         config,
         DatabaseManagerRuntimeOptions::builder()
             .enable_database_jobs(false)
-            .enable_background_refresh(false)
-            .enable_background_watchers(false)
-            .run_gsi_maintenance_after_write(None)
             .build(),
     )
     .await
@@ -227,14 +260,14 @@ impl storage_types::single_table_entity::SingleTableEntity for TestTimestampEnti
     }
 }
 
-fn read_updated_at_ms(item: &HashMap<String, AttributeValue>) -> i64 {
+fn read_updated_at_ms(item: &storage_types::AttributeMap) -> i64 {
     match item.get("u_at").or_else(|| item.get("updated_at")) {
         Some(AttributeValue::N(value)) => value.parse::<i64>().expect("updated_at should parse"),
         other => panic!("expected numeric updated_at, got: {other:?}"),
     }
 }
 
-fn read_count_value(item: &HashMap<String, AttributeValue>) -> u64 {
+fn read_count_value(item: &storage_types::AttributeMap) -> u64 {
     match item.get("value") {
         Some(AttributeValue::N(value)) => value.parse::<u64>().expect("count should parse"),
         other => panic!("expected numeric count value, got: {other:?}"),
@@ -263,7 +296,7 @@ fn query_index_input_conversion_preserves_projection_expression() {
     );
 }
 
-fn assert_no_single_table_metadata(item: &HashMap<String, AttributeValue>) {
+fn assert_no_single_table_metadata(item: &storage_types::AttributeMap) {
     for attr in [
         "created_at",
         "updated_at",
@@ -302,10 +335,6 @@ async fn clear_all_tables_preserves_internal_system_tables() {
         .await
         .expect("create user table");
 
-    Tables::create_sys_jobs_table(&db)
-        .await
-        .expect("create system jobs table");
-
     db.clear_all_tables().await.expect("clear all tables");
 
     let has_user_table = db
@@ -317,17 +346,69 @@ async fn clear_all_tables_preserves_internal_system_tables() {
         "clear_all_tables should remove user tables"
     );
 
-    let has_j_table = db
-        .table_exists(&Tables::sys_jobs())
-        .await
-        .expect("query j table existence");
-    assert!(has_j_table, "clear_all_tables should recreate j table");
-
     let has_r_table = db
-        .table_exists(&Tables::sys_storage_replication())
+        .table_exists(&TableName::new("rep"))
         .await
         .expect("query r table existence");
-    assert!(has_r_table, "clear_all_tables should recreate r table");
+    assert!(
+        !has_r_table,
+        "legacy replication tables must not be recreated"
+    );
+
+    for table in [Tables::sys_namespaces(), Tables::sys_analytics()] {
+        assert!(
+            db.table_exists(&table)
+                .await
+                .expect("query bootstrap table existence"),
+            "clear_all_tables should recreate {table} table"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_fresh_sqlite_manager_when_reopened_then_system_gsi_done_state_is_persisted() {
+    let database_path =
+        crate::storage_test_support_tests::unique_path("sqlite-system-gsi-bootstrap");
+    let config = StorageConfig {
+        backend_type: StorageBackend::SQLite,
+        connection_string: Some(database_path.to_string_lossy().into_owned()),
+        file_path: None,
+        sqlite: Some(SqliteSettings {
+            immediate_gsi_consistency: true,
+            force_file_backed_database: true,
+        }),
+        postgres: None,
+        turso: None,
+        rocksdb: None,
+        foundationdb: None,
+        remote: None,
+    };
+    let runtime_options = DatabaseManagerRuntimeOptions::builder()
+        .enable_database_jobs(false)
+        .build();
+
+    let db = DatabaseManager::new_with_config_and_runtime_options(
+        config.clone(),
+        runtime_options.clone(),
+    )
+    .await
+    .expect("fresh sqlite database manager should bootstrap system GSIs");
+    assert!(
+        db.table_exists(&Tables::sys_namespaces())
+            .await
+            .expect("query fresh system namespaces table")
+    );
+    drop(db);
+
+    let reopened = DatabaseManager::new_with_config_and_runtime_options(config, runtime_options)
+        .await
+        .expect("reopened sqlite database manager should preload system GSI");
+    assert!(
+        reopened
+            .table_exists(&Tables::sys_namespaces())
+            .await
+            .expect("query reopened system namespaces table")
+    );
 }
 
 #[tokio::test]
@@ -354,18 +435,12 @@ async fn sys_namespaces_bootstrap_enables_streams_for_analytics_polling() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sys_namespaces_bootstrap_upgrades_existing_table_without_streams() {
-    let provider = Arc::new(
-        sql::SQLiteStorageProvider::new(":memory:")
-            .await
-            .expect("create sqlite provider"),
-    );
-    provider
-        .initialize_storage()
+    let db = crate::database_manager::construction_tests::sqlite_manager_without_system_tables()
         .await
-        .expect("initialize sqlite provider");
-    let db = DatabaseManager::new_with_mocks(provider).expect("create mock database manager");
+        .expect("create initialized SQLite manager");
 
     db.create_table(&CreateTableRequest::new(
         Tables::sys_namespaces(),
@@ -393,12 +468,6 @@ async fn sys_namespaces_bootstrap_upgrades_existing_table_without_streams() {
     ))
     .await
     .expect("create legacy system namespace table");
-    Tables::create_sys_jobs_table(&db)
-        .await
-        .expect("create system jobs table");
-    Tables::create_sys_storage_replication_table(&db)
-        .await
-        .expect("create system replication table");
 
     Tables::create_sys_namespaces_table(&db)
         .await
@@ -416,11 +485,12 @@ async fn sys_namespaces_bootstrap_upgrades_existing_table_without_streams() {
     );
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn namespace_table_bootstrap_enables_streams_for_analytics_polling() {
-    let db = DatabaseManager::new_for_test()
+    let db = crate::database_manager::construction_tests::sqlite_manager_without_system_tables()
         .await
-        .expect("create test database manager");
+        .expect("create initialized SQLite manager");
     let namespace = TableNamespace::system();
 
     Tables::create_namespace_table(&db, &namespace)
@@ -442,28 +512,55 @@ async fn namespace_table_bootstrap_enables_streams_for_analytics_polling() {
     assert_eq!(table_info.max_indexers.get(), 2);
 }
 
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn given_created_namespace_when_bootstrapped_again_then_existing_table_is_preserved() {
+    let db = DatabaseManager::new_for_test()
+        .await
+        .expect("create test database manager");
+    let namespace = TableNamespace::from_seed("repeated-namespace-bootstrap");
+    Tables::create_namespace_table(&db, &namespace)
+        .await
+        .expect("create namespace table");
+    let before = db
+        .get_table_info(&Tables::namespace(&namespace))
+        .await
+        .expect("read existing namespace table");
+
+    Tables::create_namespace_table(&db, &namespace)
+        .await
+        .expect("repeated namespace bootstrap must succeed");
+
+    let after = db
+        .get_table_info(&Tables::namespace(&namespace))
+        .await
+        .expect("read preserved namespace table");
+    assert_eq!(
+        serde_json::to_value((
+            after.key_schema,
+            after.max_indexers,
+            after.stream_specification,
+        ))
+        .expect("serialize preserved schema"),
+        serde_json::to_value((
+            before.key_schema,
+            before.max_indexers,
+            before.stream_specification,
+        ))
+        .expect("serialize original schema")
+    );
+}
+
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn namespace_table_bootstrap_upgrades_existing_table_without_streams() {
-    let provider = Arc::new(
-        sql::SQLiteStorageProvider::new(":memory:")
-            .await
-            .expect("create sqlite provider"),
-    );
-    provider
-        .initialize_storage()
+    let db = crate::database_manager::construction_tests::sqlite_manager_without_system_tables()
         .await
-        .expect("initialize sqlite provider");
-    let db = DatabaseManager::new_with_mocks(provider).expect("create mock database manager");
+        .expect("create initialized SQLite manager");
     let namespace = TableNamespace::system();
     let table_name = Tables::namespace(&namespace);
 
     create_pk_sk_table(&db, &table_name).await;
-    Tables::create_sys_jobs_table(&db)
-        .await
-        .expect("create system jobs table");
-    Tables::create_sys_storage_replication_table(&db)
-        .await
-        .expect("create system replication table");
 
     Tables::create_namespace_table(&db, &namespace)
         .await
@@ -480,31 +577,6 @@ async fn namespace_table_bootstrap_upgrades_existing_table_without_streams() {
             .is_some_and(|stream| stream.stream_enabled)
     );
     assert_eq!(table_info.max_indexers.get(), 2);
-}
-
-#[tokio::test]
-async fn shared_namespace_table_bootstrap_enables_streams_for_analytics_polling() {
-    let db = DatabaseManager::new_for_test()
-        .await
-        .expect("create test database manager");
-
-    Tables::create_shared_namespace_table(&db, 0)
-        .await
-        .expect("create shared namespace table");
-
-    let table_info = db
-        .maintenance_provider()
-        .get_table_info(&Tables::shared_namespace(0))
-        .await
-        .expect("load shared namespace table");
-    let stream = table_info
-        .stream_specification
-        .expect("shared namespace table should have stream config");
-    assert!(stream.stream_enabled);
-    assert_eq!(
-        stream.stream_view_type,
-        Some(storage_types::StreamViewType::NewAndOldImages)
-    );
 }
 
 #[tokio::test]
@@ -531,7 +603,7 @@ async fn default_put_item_persists_exact_customer_attributes() {
     .expect("put item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -574,17 +646,17 @@ async fn get_stream_records_for_table_name_uses_stream_record_sequence() {
         .await
         .expect("read stream records");
 
-    assert_eq!(response.records.len(), 1);
+    assert_eq!(response.records().len(), 1);
     assert_eq!(
-        response.records[0].cursor.as_deref(),
-        Some(response.records[0].sequence_number.as_str())
+        response.records()[0].cursor.as_deref(),
+        Some(response.records()[0].sequence_number.as_str())
     );
     assert_eq!(
-        response.records[0].keys.get("pk"),
+        response.records()[0].keys.get("pk"),
         Some(&AttributeValue::S("item#1".to_string()))
     );
     assert_eq!(
-        response.records[0]
+        response.records()[0]
             .new_image
             .as_ref()
             .and_then(|item| item.get("payload")),
@@ -604,7 +676,7 @@ async fn get_stream_records_after_empty_page_does_not_skip_future_writes() {
         .get_stream_records_for_table_name(&table_name, None, Some(10))
         .await
         .expect("read empty stream records");
-    assert!(empty_response.records.is_empty());
+    assert!(empty_response.records().is_empty());
 
     db.put_item(
         crate::PutItemInput::builder()
@@ -627,15 +699,15 @@ async fn get_stream_records_after_empty_page_does_not_skip_future_writes() {
     let future_response = db
         .get_stream_records_for_table_name(
             &table_name,
-            empty_response.last_evaluated_key.as_deref(),
+            empty_response.last_evaluated_key(),
             Some(10),
         )
         .await
         .expect("read future stream records");
 
-    assert_eq!(future_response.records.len(), 1);
+    assert_eq!(future_response.records().len(), 1);
     assert_eq!(
-        future_response.records[0].keys.get("pk"),
+        future_response.records()[0].keys.get("pk"),
         Some(&AttributeValue::S("item#future".to_string()))
     );
 }
@@ -649,17 +721,18 @@ async fn default_batch_write_item_persists_exact_customer_attributes() {
     create_hash_table(&db, &table_name).await;
 
     db.batch_write_item(BatchWriteItemRequest {
-        request_items: HashMap::from([(
+        request_items: storage_types::VecMap::from_iter([(
             table_name.clone(),
             vec![WriteRequest {
                 put_request: Some(PutRequest {
-                    item: HashMap::from([
+                    item: WireItem::try_from(&HashMap::from([
                         ("pk".to_string(), AttributeValue::S("item#1".to_string())),
                         (
                             "payload".to_string(),
                             AttributeValue::S("customer-value".to_string()),
                         ),
-                    ]),
+                    ]))
+                    .expect("encode item"),
                     indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
@@ -673,7 +746,7 @@ async fn default_batch_write_item_persists_exact_customer_attributes() {
     .expect("batch write should succeed");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -707,17 +780,18 @@ async fn batch_write_rejects_invalid_indexer_declaration_before_writing() {
 
     let error = db
         .batch_write_item(BatchWriteItemRequest {
-            request_items: HashMap::from([(
+            request_items: storage_types::VecMap::from_iter([(
                 table_name.clone(),
                 vec![WriteRequest {
                     put_request: Some(PutRequest {
-                        item: HashMap::from([
+                        item: WireItem::try_from(&HashMap::from([
                             ("pk".to_string(), AttributeValue::S("item#1".to_string())),
                             (
                                 "customer_id".to_string(),
                                 AttributeValue::N("7".to_string()),
                             ),
-                        ]),
+                        ]))
+                        .expect("encode item"),
                         indexers: Some(vec!["customer_id".to_string()]),
                         aux_item_stream_ttl_hours: None,
                     }),
@@ -736,7 +810,7 @@ async fn batch_write_rejects_invalid_indexer_declaration_before_writing() {
             .contains("Indexers:attribute_must_be_string")
     );
     assert!(
-        db.get_item_map(
+        db.get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -748,45 +822,54 @@ async fn batch_write_rejects_invalid_indexer_declaration_before_writing() {
 }
 
 #[tokio::test]
-async fn default_put_item_refreshes_existing_updated_at_metadata() {
+async fn default_put_item_preserves_customer_timestamp_attributes() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
     let table_name = TableName::new("default_put_existing_timestamp");
     create_hash_table(&db, &table_name).await;
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("item#1".to_string())),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ATTR.to_string(),
+            AttributeValue::N("1".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("2".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ATTR.to_string(),
+            AttributeValue::N("3".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("4".to_string()),
+        ),
+    ]);
 
     db.put_item(
         crate::PutItemInput::builder()
             .table_name(table_name.clone())
-            .item(HashMap::from([
-                ("pk".to_string(), AttributeValue::S("item#1".to_string())),
-                (
-                    storage_types::single_table_entity::UPDATED_AT_ATTR.to_string(),
-                    AttributeValue::N("1".to_string()),
-                ),
-            ]))
+            .item(item.clone())
             .build(),
     )
     .await
     .expect("put item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
         .await
         .expect("get item")
         .expect("item should exist");
-    assert!(read_updated_at_ms(&stored) > 1);
-    assert!(
-        !stored.contains_key(storage_types::single_table_entity::UPDATED_AT_ATTR),
-        "storage manager should normalize updated_at to the compact storage alias"
-    );
+    assert_eq!(stored, storage_types::AttributeMap::from(item));
 }
 
 #[tokio::test]
-async fn default_batch_write_item_refreshes_entity_timestamp_payloads() {
+async fn default_batch_write_item_preserves_timestamp_payloads() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
@@ -802,13 +885,14 @@ async fn default_batch_write_item_refreshes_entity_timestamp_payloads() {
         .0
         .to_attribute_map()
         .expect("decode entity");
+    let expected = item.clone();
 
     db.batch_write_item(BatchWriteItemRequest {
-        request_items: HashMap::from([(
+        request_items: storage_types::VecMap::from_iter([(
             table_name.clone(),
             vec![WriteRequest {
                 put_request: Some(PutRequest {
-                    item,
+                    item: WireItem::try_from(item).expect("encode item"),
                     indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
@@ -822,11 +906,11 @@ async fn default_batch_write_item_refreshes_entity_timestamp_payloads() {
     .expect("batch write should succeed");
 
     let stored = db
-        .get_item_map(table_name, entity.table_key_map())
+        .get_item_decode::<_, storage_types::AttributeMap>(table_name, entity.table_key_map())
         .await
         .expect("get item")
         .expect("item should exist");
-    assert!(read_updated_at_ms(&stored) > 1);
+    assert_eq!(stored, expected);
 }
 
 #[tokio::test]
@@ -867,7 +951,7 @@ async fn default_update_item_does_not_inject_updated_at() {
     .expect("update item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -879,23 +963,36 @@ async fn default_update_item_does_not_inject_updated_at() {
 }
 
 #[tokio::test]
-async fn default_update_item_refreshes_existing_updated_at_metadata() {
+async fn default_update_item_preserves_existing_timestamp_attributes() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
     let table_name = TableName::new("default_update_existing_timestamp");
     create_hash_table(&db, &table_name).await;
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("item#1".to_string())),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ATTR.to_string(),
+            AttributeValue::N("1".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("2".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ATTR.to_string(),
+            AttributeValue::N("3".to_string()),
+        ),
+        (
+            storage_types::single_table_entity::CREATED_AT_ALIAS_ATTR.to_string(),
+            AttributeValue::N("4".to_string()),
+        ),
+    ]);
 
     db.put_item(
         crate::PutItemInput::builder()
             .table_name(table_name.clone())
-            .item(HashMap::from([
-                ("pk".to_string(), AttributeValue::S("item#1".to_string())),
-                (
-                    storage_types::single_table_entity::UPDATED_AT_ALIAS_ATTR.to_string(),
-                    AttributeValue::N("1".to_string()),
-                ),
-            ]))
+            .item(item.clone())
             .build(),
     )
     .await
@@ -919,14 +1016,19 @@ async fn default_update_item_refreshes_existing_updated_at_metadata() {
     .expect("update item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
         .await
         .expect("get item")
         .expect("item should exist");
-    assert!(read_updated_at_ms(&stored) > 1);
+    let mut expected = item;
+    expected.insert(
+        "payload".to_string(),
+        AttributeValue::S("customer-value".to_string()),
+    );
+    assert_eq!(stored, storage_types::AttributeMap::from(expected));
 }
 
 #[tokio::test]
@@ -936,7 +1038,7 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
         .expect("create test database manager");
     let table_name = TableName::new("default_custom_gsi_numeric_sort");
     let index_name = IndexName::new("by_score");
-    let request = CreateTableRequest::new(
+    let mut request = CreateTableRequest::new(
         table_name.clone(),
         vec![
             AttributeDefinition {
@@ -957,8 +1059,8 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
             key_type: KeyType::Hash,
         }],
         storage_types::BillingMode::PayPerRequest,
-    )
-    .with_global_secondary_indexes(Some(vec![CreateGlobalSecondaryIndex {
+    );
+    request.global_secondary_indexes = Some(vec![CreateGlobalSecondaryIndex {
         index_name: index_name.clone(),
         key_schema: vec![
             KeySchemaElement {
@@ -975,22 +1077,23 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
             non_key_attributes: None,
         },
         provisioned_throughput: None,
-    }]));
+    }]);
     db.create_table(&request).await.expect("create table");
 
     db.batch_write_item(BatchWriteItemRequest {
-        request_items: HashMap::from([(
+        request_items: storage_types::VecMap::from_iter([(
             table_name.clone(),
             vec![WriteRequest {
                 put_request: Some(PutRequest {
-                    item: HashMap::from([
+                    item: WireItem::try_from(&HashMap::from([
                         ("pk".to_string(), AttributeValue::S("item#1".to_string())),
                         (
                             "category".to_string(),
                             AttributeValue::S("games".to_string()),
                         ),
                         ("score".to_string(), AttributeValue::N("42".to_string())),
-                    ]),
+                    ]))
+                    .expect("encode item"),
                     indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
@@ -1003,16 +1106,15 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
     .await
     .expect("batch write should succeed");
 
-    let (items, _) = db
+    let expression_attribute_names =
+        storage_types::VecMap::from_iter([("#selected".to_string(), "score".to_string())]);
+    let page = db
         .query_index_map(
             QueryIndexInput::builder()
                 .table_name(table_name.clone())
                 .index_name(index_name.clone())
                 .key_condition_expression("category = :category AND score = :score".to_string())
-                .expression_attribute_names(HashMap::from([(
-                    "#selected".to_string(),
-                    "score".to_string(),
-                )]))
+                .expression_attribute_names(expression_attribute_names.clone())
                 .expression_attribute_values(HashMap::from([
                     (
                         ":category".to_string(),
@@ -1026,11 +1128,22 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
         .await
         .expect("query custom index");
 
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].len(), 1);
-    assert_no_single_table_metadata(&items[0]);
+    assert_eq!(page.items.len(), 1);
+    assert_no_single_table_metadata(&page.items[0]);
+    assert_eq!(page.items[0].len(), 1);
+    assert_eq!(page.progress.evaluated_count, 1);
+    assert!(page.progress.evaluated_bytes > 0);
+    assert!(page.progress.last_evaluated_key.is_some());
+    assert!(!page.items[0].contains_key("pk"));
+    assert!(!page.items[0].contains_key("category"));
     assert_eq!(
-        items[0].get("score"),
+        project_attribute_map(
+            page.items[0].clone(),
+            Some("#selected"),
+            None,
+            Some(&expression_attribute_names),
+        )
+        .get("score"),
         Some(&AttributeValue::N("42".to_string()))
     );
 
@@ -1262,7 +1375,7 @@ async fn put_item_stamps_updated_at_millis() {
     .expect("put item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1298,7 +1411,7 @@ async fn put_item_never_stamps_updated_at_before_created_at() {
     .expect("put item");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1306,6 +1419,193 @@ async fn put_item_never_stamps_updated_at_before_created_at() {
         .expect("get item")
         .expect("item should exist");
     assert_eq!(read_updated_at_ms(&stored), created_at_ms);
+}
+
+#[tokio::test]
+async fn given_explicit_timestamp_when_put_and_conditional_update_then_caller_clock_is_preserved() {
+    let db = create_single_table_mode_db().await;
+    let table = TableName::new("explicit_timestamp");
+    create_hash_table(&db, &table).await;
+    let key = storage_types::KeyAttributes::from_iter([(
+        "pk".to_string(),
+        AttributeValue::S("one".to_string()),
+    )]);
+    for field in ["updated_at", "u_at"] {
+        let item = WireItem::dynamo_json(format!(r#"{{"pk":{{"S":"one"}},"c_at":{{"N":"1900000000000"}},"{field}":{{"N":"1900000000001"}}}}"#).into_bytes());
+        db.put_item(
+            crate::PutItemInput::builder()
+                .table_name(table.clone())
+                .item(item)
+                .build(),
+        )
+        .await
+        .expect("put explicit clock");
+        let stored = db
+            .get_item(table.clone(), key.clone())
+            .await
+            .expect("get item")
+            .expect("stored item");
+        assert_eq!(
+            stored.number_attribute_i64(field).expect("read timestamp"),
+            Some(1_900_000_000_001)
+        );
+    }
+    let update = |expected: i64| {
+        crate::UpdateItemInput::builder()
+            .table_name(table.clone())
+            .key(key.clone())
+            .update_expression("SET u_at = :next".to_string())
+            .condition_expression("u_at = :expected".to_string())
+            .expression_attribute_values(storage_types::AttributeMap::from_iter([
+                (
+                    ":next".to_string(),
+                    AttributeValue::N("1900000000002".to_string()),
+                ),
+                (
+                    ":expected".to_string(),
+                    AttributeValue::N(expected.to_string()),
+                ),
+            ]))
+            .build()
+    };
+    db.update_item(update(1_900_000_000_001i64))
+        .await
+        .expect("conditional update");
+    let error = db
+        .update_item(update(1_900_000_000_001i64))
+        .await
+        .expect_err("stale clock must fail");
+    assert!(error.is_conditional_write_contention());
+    let stored = db
+        .get_item(table, key)
+        .await
+        .expect("get updated item")
+        .expect("stored item");
+    assert_eq!(
+        stored.number_attribute_i64("u_at").expect("read timestamp"),
+        Some(1_900_000_000_002)
+    );
+}
+
+#[tokio::test]
+async fn given_explicit_timestamp_when_transaction_put_and_update_then_caller_clock_is_preserved() {
+    let db = create_single_table_mode_db().await;
+    let table = TableName::new("explicit_transaction_timestamp");
+    create_hash_table(&db, &table).await;
+    let key = storage_types::KeyAttributes::from_iter([(
+        "pk".to_string(),
+        AttributeValue::S("one".to_string()),
+    )]);
+    db.transact_write_items(TransactWriteItemsRequest {
+        transact_items: vec![TransactWriteItem {
+            put: Some(TransactPutRequest {
+                table_name: table.clone(),
+                item: WireItem::dynamo_json(
+                    br#"{"pk":{"S":"one"},"u_at":{"N":"1900000000001"}}"#.to_vec(),
+                ),
+                indexers: None,
+                condition_expression: Some("attribute_not_exists(pk)".to_string()),
+                expression_attribute_names: None,
+                expression_attribute_values: None,
+                return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .expect("transaction put");
+    let stored = db
+        .get_item(table.clone(), key.clone())
+        .await
+        .expect("get inserted item")
+        .expect("stored item");
+    assert_eq!(
+        stored.number_attribute_i64("u_at").expect("read timestamp"),
+        Some(1_900_000_000_001)
+    );
+    db.transact_write_items(TransactWriteItemsRequest {
+        transact_items: vec![TransactWriteItem {
+            update: Some(TransactUpdateRequest {
+                table_name: table.clone(),
+                key: key.clone(),
+                update_expression: "SET updated_at = :next".to_string(),
+                condition_expression: Some("u_at = :expected".to_string()),
+                indexers: None,
+                expression_attribute_names: None,
+                expression_attribute_values: Some(storage_types::AttributeMap::from_iter([
+                    (
+                        ":next".to_string(),
+                        AttributeValue::N("1900000000002".to_string()),
+                    ),
+                    (
+                        ":expected".to_string(),
+                        AttributeValue::N("1900000000001".to_string()),
+                    ),
+                ])),
+                return_values_on_condition_check_failure: None,
+                aux_item_stream_ttl_hours: None,
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .expect("transaction update");
+    let stored = db
+        .get_item(table, key)
+        .await
+        .expect("get updated item")
+        .expect("stored item");
+    assert_eq!(
+        stored.number_attribute_i64("u_at").expect("read timestamp"),
+        Some(1_900_000_000_002)
+    );
+}
+
+#[tokio::test]
+async fn given_missing_timestamp_value_when_update_then_request_is_rejected() {
+    let db = create_single_table_mode_db().await;
+    let table = TableName::new("missing_timestamp_value");
+    create_hash_table(&db, &table).await;
+    let key = storage_types::KeyAttributes::from_iter([(
+        "pk".to_string(),
+        AttributeValue::S("one".to_string()),
+    )]);
+    db.put_item(
+        crate::PutItemInput::builder()
+            .table_name(table.clone())
+            .item(WireItem::dynamo_json(
+                br#"{"pk":{"S":"one"},"u_at":{"N":"123"}}"#.to_vec(),
+            ))
+            .build(),
+    )
+    .await
+    .expect("seed item");
+    let error = db
+        .update_item(
+            crate::UpdateItemInput::builder()
+                .table_name(table.clone())
+                .key(key.clone())
+                .update_expression("SET u_at = :missing".to_string())
+                .build(),
+        )
+        .await
+        .expect_err("missing value must fail");
+    assert!(
+        matches!(error.to_enum(), storage_types::StorageEnum::RawValidation { message }
+        if message.contains("attribute value: :missing"))
+    );
+    let stored = db
+        .get_item(table, key)
+        .await
+        .expect("get unchanged item")
+        .expect("stored item");
+    assert_eq!(
+        stored.number_attribute_i64("u_at").expect("read timestamp"),
+        Some(123)
+    );
 }
 
 #[tokio::test]
@@ -1329,7 +1629,7 @@ async fn update_item_injects_updated_at_when_expression_has_no_set_clause() {
     .await
     .expect("put item");
     let before = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name.clone(),
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1352,7 +1652,7 @@ async fn update_item_injects_updated_at_when_expression_has_no_set_clause() {
     .expect("update item");
 
     let after = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1409,7 +1709,7 @@ async fn update_item_preserves_add_clause_before_set_when_stamping_updated_at() 
     .expect("update should preserve ADD clause and succeed");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([(
                 "pk".to_string(),
@@ -1438,17 +1738,18 @@ async fn batch_write_item_stamps_updated_at() {
     create_hash_table(&db, &table_name).await;
 
     let request = BatchWriteItemRequest {
-        request_items: HashMap::from([(
+        request_items: storage_types::VecMap::from_iter([(
             table_name.clone(),
             vec![WriteRequest {
                 put_request: Some(PutRequest {
-                    item: HashMap::from([
+                    item: WireItem::try_from(&HashMap::from([
                         ("pk".to_string(), AttributeValue::S("item#1".to_string())),
                         (
                             "payload".to_string(),
                             AttributeValue::S("value".to_string()),
                         ),
-                    ]),
+                    ]))
+                    .expect("encode item"),
                     indexers: None,
                     aux_item_stream_ttl_hours: None,
                 }),
@@ -1463,7 +1764,7 @@ async fn batch_write_item_stamps_updated_at() {
         .expect("batch write should succeed");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1491,7 +1792,7 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
     .await
     .expect("seed existing item");
     let existing_before = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name.clone(),
             HashMap::from([(
                 "pk".to_string(),
@@ -1508,13 +1809,14 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
             TransactWriteItem {
                 put: Some(TransactPutRequest {
                     table_name: table_name.clone(),
-                    item: HashMap::from([
+                    item: WireItem::try_from(&HashMap::from([
                         ("pk".to_string(), AttributeValue::S("item#new".to_string())),
                         (
                             "payload".to_string(),
                             AttributeValue::S("value".to_string()),
                         ),
-                    ]),
+                    ]))
+                    .expect("encode item"),
                     indexers: None,
                     condition_expression: None,
                     expression_attribute_names: None,
@@ -1555,7 +1857,7 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
     .expect("transact write should succeed");
 
     let inserted = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name.clone(),
             HashMap::from([("pk".to_string(), AttributeValue::S("item#new".to_string()))]),
         )
@@ -1565,7 +1867,7 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
     assert!(read_updated_at_ms(&inserted) > 0);
 
     let existing_after = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([(
                 "pk".to_string(),
@@ -1599,7 +1901,7 @@ async fn transact_write_items_encode_stamps_updated_at_for_put_and_update() {
     .await
     .expect("seed existing item");
 
-    let encoded_put = WireItem::from_attribute_map(&HashMap::from([
+    let encoded_put = WireItem::try_from(&HashMap::from([
         ("pk".to_string(), AttributeValue::S("item#new".to_string())),
         (
             "payload".to_string(),
@@ -1652,7 +1954,7 @@ async fn transact_write_items_encode_stamps_updated_at_for_put_and_update() {
     .expect("transact write encode should succeed");
 
     let inserted = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#new".to_string()))]),
         )
@@ -1663,7 +1965,7 @@ async fn transact_write_items_encode_stamps_updated_at_for_put_and_update() {
 }
 
 #[tokio::test]
-async fn default_transact_write_items_encode_refreshes_entity_timestamp_payloads() {
+async fn default_transact_write_items_encode_preserves_timestamp_payloads() {
     let db = DatabaseManager::new_for_test()
         .await
         .expect("create test database manager");
@@ -1673,13 +1975,20 @@ async fn default_transact_write_items_encode_refreshes_entity_timestamp_payloads
         entity_id: "one".to_string(),
         updated_at: 1,
     };
+    let encoded =
+        storage_types::single_table_entity::to_wire_entity(&entity).expect("encode entity");
+    let expected = encoded
+        .clone()
+        .into_write_parts()
+        .0
+        .to_attribute_map()
+        .expect("decode entity");
 
     db.transact_write_items_encode(TransactWriteItemsEncodeRequest {
         transact_items: vec![TransactEncodeItem {
             put: Some(TransactEncodePutRequest {
                 table_name: table_name.clone(),
-                item: storage_types::single_table_entity::to_wire_entity(&entity)
-                    .expect("encode entity"),
+                item: encoded,
                 condition_expression: None,
                 expression_attribute_names: None,
                 expression_attribute_values: None,
@@ -1698,11 +2007,11 @@ async fn default_transact_write_items_encode_refreshes_entity_timestamp_payloads
     .expect("transaction write should succeed");
 
     let stored = db
-        .get_item_map(table_name, entity.table_key_map())
+        .get_item_decode::<_, storage_types::AttributeMap>(table_name, entity.table_key_map())
         .await
         .expect("get item")
         .expect("item should exist");
-    assert!(read_updated_at_ms(&stored) > 1);
+    assert_eq!(stored, expected);
 }
 
 #[tokio::test]
@@ -1711,7 +2020,7 @@ async fn batch_write_item_encode_stamps_updated_at() {
     let table_name = TableName::new("batch_write_encode_updated_at");
     create_hash_table(&db, &table_name).await;
 
-    let put_item = WireItem::from_attribute_map(&HashMap::from([
+    let put_item = WireItem::try_from(&HashMap::from([
         ("pk".to_string(), AttributeValue::S("item#1".to_string())),
         (
             "payload".to_string(),
@@ -1720,7 +2029,7 @@ async fn batch_write_item_encode_stamps_updated_at() {
     ]))
     .expect("encode put request");
     db.batch_write_item_encode(BatchWriteItemEncodeRequest {
-        request_items: HashMap::from([(
+        request_items: storage_types::VecMap::from_iter([(
             table_name.clone(),
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
@@ -1737,7 +2046,7 @@ async fn batch_write_item_encode_stamps_updated_at() {
     .expect("batch write encode should succeed");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([("pk".to_string(), AttributeValue::S("item#1".to_string()))]),
         )
@@ -1778,11 +2087,11 @@ async fn transact_write_items_encode_preserves_add_clause_before_set_when_stampi
                 update_expression: "ADD #count :one SET #hour = :hour".to_string(),
                 indexers: None,
                 condition_expression: None,
-                expression_attribute_names: Some(HashMap::from([
+                expression_attribute_names: Some(storage_types::VecMap::from_iter([
                     ("#count".to_string(), "count".to_string()),
                     ("#hour".to_string(), "hour".to_string()),
                 ])),
-                expression_attribute_values: Some(HashMap::from([
+                expression_attribute_values: Some(storage_types::AttributeMap::from_iter([
                     (":one".to_string(), AttributeValue::N("1".to_string())),
                     (
                         ":hour".to_string(),
@@ -1803,7 +2112,7 @@ async fn transact_write_items_encode_preserves_add_clause_before_set_when_stampi
     .expect("transact write encode should keep ADD clause and succeed");
 
     let stored = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([(
                 "pk".to_string(),
@@ -1826,6 +2135,7 @@ async fn transact_write_items_encode_preserves_add_clause_before_set_when_stampi
     assert!(read_updated_at_ms(&stored) > 0);
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn capped_entity_helpers_work_in_default_manager_mode() {
     let db = DatabaseManager::new_for_test()
@@ -1860,6 +2170,7 @@ async fn capped_entity_helpers_work_in_default_manager_mode() {
     .expect("delete capped entity");
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn create_capped_entity_enforces_capacity_and_tracks_counter() {
     let db = create_single_table_mode_db().await;
@@ -1901,7 +2212,7 @@ async fn create_capped_entity_enforces_capacity_and_tracks_counter() {
     assert!(matches!(err, CappedStorageError::CapacityExceededError));
 
     let counter = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name,
             HashMap::from([
                 ("pk".to_string(), AttributeValue::S("COUNT".to_string())),
@@ -1917,6 +2228,7 @@ async fn create_capped_entity_enforces_capacity_and_tracks_counter() {
     assert_eq!(read_count_value(&counter), 2);
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn create_capped_entity_reports_existing_item_before_capacity() {
     let db = create_single_table_mode_db().await;
@@ -1952,6 +2264,7 @@ async fn create_capped_entity_reports_existing_item_before_capacity() {
     assert!(matches!(err, CappedStorageError::ItemExistError));
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn delete_capped_entity_decrements_counter_and_is_missing_aware() {
     let db = create_single_table_mode_db().await;
@@ -1984,7 +2297,7 @@ async fn delete_capped_entity_decrements_counter_and_is_missing_aware() {
     .expect("delete capped entity");
 
     let counter = db
-        .get_item_map(
+        .get_item_decode::<_, storage_types::AttributeMap>(
             table_name.clone(),
             HashMap::from([
                 ("pk".to_string(), AttributeValue::S("COUNT".to_string())),
@@ -2010,4 +2323,88 @@ async fn delete_capped_entity_decrements_counter_and_is_missing_aware() {
         .await
         .expect_err("second delete should report missing item");
     assert!(matches!(err, CappedStorageError::ItemNotExistsError));
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn given_prepared_capped_create_when_leading_guard_and_capacity_reject_then_original_guard_error_and_state_are_preserved()
+ {
+    let db = create_single_table_mode_db().await;
+    let table = TableName::new("prepared_capped_guard");
+    create_pk_sk_table(&db, &table).await;
+    let first = TestCappedEntity {
+        entity_id: "first".into(),
+        payload: "first".into(),
+    };
+    let second = TestCappedEntity {
+        entity_id: "second".into(),
+        payload: "second".into(),
+    };
+    let counted_type = "PLATFORM_BILLING_CATALOG_PRODUCT";
+    db.create_capped_entity(
+        CreateCappedEntityInput::builder()
+            .table_name(table.clone())
+            .item(&first)
+            .counted_entity_type(counted_type)
+            .max_value(1_u64)
+            .build(),
+    )
+    .await
+    .unwrap();
+    for candidate in [&first, &second] {
+        let leading = storage_types::TransactEncodeItem {
+            condition_check: Some(storage_types::TransactConditionCheckRequest {
+                table_name: table.clone(),
+                key: storage_types::KeyOwned::pk_sk("required", "charge").into(),
+                condition_expression: "attribute_exists(pk)".into(),
+                expression_attribute_names: None,
+                expression_attribute_values: None,
+                return_values_on_condition_check_failure: None,
+            }),
+            ..Default::default()
+        };
+        let (request, outcome) = crate::PreparedCappedEntityCreate::try_new(
+            table.clone(),
+            candidate,
+            counted_type.into(),
+            1,
+        )
+        .unwrap()
+        .into_transaction(vec![leading]);
+        let error = db.transact_write_items_encode(request).await.unwrap_err();
+        assert!(error.is_canceled_condition_check_failed(0));
+        assert!(error.is_canceled_condition_check_failed(2));
+        assert!(outcome.classify_error(&db, &error).await.unwrap().is_none());
+        assert!(error.is_canceled_condition_check_failed(0));
+    }
+    assert!(
+        db.get_item_decode::<_, storage_types::AttributeMap>(table.clone(), second.table_key_map())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let capacity = db
+        .create_capped_entity(
+            CreateCappedEntityInput::builder()
+                .table_name(table.clone())
+                .item(&second)
+                .counted_entity_type(counted_type)
+                .max_value(1_u64)
+                .build(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        capacity,
+        CappedStorageError::CapacityExceededError
+    ));
+    let first_saved = db
+        .get_item_decode::<_, storage_types::AttributeMap>(table, first.table_key_map())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first_saved.get("payload"),
+        Some(&AttributeValue::S("first".into()))
+    );
 }

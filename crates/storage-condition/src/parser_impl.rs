@@ -1,8 +1,30 @@
 use std::collections::HashMap;
 
-use storage_types::AttributeValue;
+use storage_types::{AttributeValue, AttributeValueLookup, VecMap};
 
-use crate::{Condition, SizeComparison, helpers::attribute_value_scalar_to_string};
+use crate::{
+    Condition, SizeComparison,
+    helpers::{attribute_value_scalar_to_string, attribute_value_scalar_to_string_owned},
+};
+
+pub(crate) trait ExpressionNameLookup {
+    fn get_expression_name(&self, placeholder: &str) -> Option<&String>;
+}
+
+// Legacy SQL/KV callers and their tests still use this lookup. The new
+// operation path calls the VecMap/AttributeMap parser; remove this adapter
+// with those callers at the public cutover.
+impl ExpressionNameLookup for HashMap<String, String> {
+    fn get_expression_name(&self, placeholder: &str) -> Option<&String> {
+        self.get(placeholder)
+    }
+}
+
+impl ExpressionNameLookup for VecMap<String, String> {
+    fn get_expression_name(&self, placeholder: &str) -> Option<&String> {
+        self.get(placeholder)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token<'a> {
@@ -269,7 +291,8 @@ impl<'a> Lexer<'a> {
 fn between_upper_is_less_than_lower(lower: &AttributeValue, upper: &AttributeValue) -> bool {
     match (lower, upper) {
         (AttributeValue::N(lower), AttributeValue::N(upper)) => {
-            compare_dynamodb_numbers(upper, lower).is_some_and(std::cmp::Ordering::is_lt)
+            storage_types::compare_dynamodb_numbers(upper, lower)
+                .is_ok_and(std::cmp::Ordering::is_lt)
         }
         (AttributeValue::S(lower), AttributeValue::S(upper)) => upper < lower,
         (AttributeValue::B(lower), AttributeValue::B(upper)) => {
@@ -283,14 +306,6 @@ fn between_upper_is_less_than_lower(lower: &AttributeValue, upper: &AttributeVal
         }
         _ => false,
     }
-}
-
-fn compare_dynamodb_numbers(left: &str, right: &str) -> Option<std::cmp::Ordering> {
-    Some(
-        left.parse::<f64>()
-            .ok()?
-            .total_cmp(&right.parse::<f64>().ok()?),
-    )
 }
 
 fn dynamodb_attribute_value_display(value: &AttributeValue) -> String {
@@ -358,8 +373,8 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         match &self.current_token {
             Token::LeftParen => {
@@ -462,8 +477,8 @@ impl<'a> Parser<'a> {
 
     fn try_parse_parenthesized_operand_comparison(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         let mut parser = self.clone();
         parser.expect_token(&Token::LeftParen)?;
@@ -486,8 +501,8 @@ impl<'a> Parser<'a> {
 
     fn parse_value_left_comparison(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         let left_value = self.parse_attribute_value(attribute_values)?;
         self.parse_value_left_comparison_from_value(left_value, attribute_names, attribute_values)
@@ -496,8 +511,8 @@ impl<'a> Parser<'a> {
     fn parse_value_left_comparison_from_value(
         &mut self,
         left_value: AttributeValue,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         match &self.current_token {
             Token::Equal => {
@@ -533,25 +548,25 @@ impl<'a> Parser<'a> {
             Token::LessThan => {
                 self.advance()?;
                 let field = self.parse_attribute_path(attribute_names)?;
-                let value = attribute_value_scalar_to_string(&left_value);
+                let value = attribute_value_scalar_to_string_owned(left_value);
                 Ok(Condition::GreaterThan { field, value })
             }
             Token::LessThanEqual => {
                 self.advance()?;
                 let field = self.parse_attribute_path(attribute_names)?;
-                let value = attribute_value_scalar_to_string(&left_value);
+                let value = attribute_value_scalar_to_string_owned(left_value);
                 Ok(Condition::GreaterThanEqual { field, value })
             }
             Token::GreaterThan => {
                 self.advance()?;
                 let field = self.parse_attribute_path(attribute_names)?;
-                let value = attribute_value_scalar_to_string(&left_value);
+                let value = attribute_value_scalar_to_string_owned(left_value);
                 Ok(Condition::LessThan { field, value })
             }
             Token::GreaterThanEqual => {
                 self.advance()?;
                 let field = self.parse_attribute_path(attribute_names)?;
-                let value = attribute_value_scalar_to_string(&left_value);
+                let value = attribute_value_scalar_to_string_owned(left_value);
                 Ok(Condition::LessThanEqual { field, value })
             }
             other => Err(format!(
@@ -562,11 +577,11 @@ impl<'a> Parser<'a> {
 
     fn parse_attribute_path(
         &mut self,
-        attribute_names: &HashMap<String, String>,
+        attribute_names: &dyn ExpressionNameLookup,
     ) -> Result<String, String> {
         let mut path = match &self.current_token {
             Token::AttributeName(name) => {
-                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                let actual_name = attribute_names.get_expression_name(name).ok_or_else(|| {
                     format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 self.advance()?;
@@ -590,7 +605,7 @@ impl<'a> Parser<'a> {
                 Token::Dot => {
                     self.advance()?;
                     path.push('.');
-                    path.push_str(&self.parse_attribute_path_segment(attribute_names)?);
+                    self.append_attribute_path_segment(attribute_names, &mut path)?;
                 }
                 Token::LeftBracket => {
                     self.advance()?;
@@ -613,36 +628,38 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_attribute_path_segment(
+    fn append_attribute_path_segment(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-    ) -> Result<String, String> {
+        attribute_names: &dyn ExpressionNameLookup,
+        path: &mut String,
+    ) -> Result<(), String> {
         match &self.current_token {
             Token::AttributeName(name) => {
-                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                let actual_name = attribute_names.get_expression_name(name).ok_or_else(|| {
                     format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 self.advance()?;
-                Ok(actual_name.clone())
+                path.push_str(actual_name);
             }
             Token::Identifier(name) => {
-                let name = (*name).to_string();
+                let name = *name;
                 self.advance()?;
-                Ok(name)
+                path.push_str(name);
             }
-            other => Err(format!("Expected attribute path segment, found {other:?}")),
+            other => return Err(format!("Expected attribute path segment, found {other:?}")),
         }
+        Ok(())
     }
 
     fn next_token_starts_same_path(
         &self,
         field: &str,
-        attribute_names: &HashMap<String, String>,
+        attribute_names: &dyn ExpressionNameLookup,
     ) -> Result<bool, String> {
         match &self.current_token {
             Token::Identifier(name) => Ok(*name == field),
             Token::AttributeName(name) => {
-                let actual_name = attribute_names.get(*name).ok_or_else(|| {
+                let actual_name = attribute_names.get_expression_name(name).ok_or_else(|| {
                     format!("Attribute name {name} not found in ExpressionAttributeNames")
                 })?;
                 Ok(actual_name == field)
@@ -653,7 +670,7 @@ impl<'a> Parser<'a> {
 
     fn parse_attribute_value(
         &mut self,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<AttributeValue, String> {
         match &self.current_token {
             Token::LeftParen => {
@@ -663,14 +680,17 @@ impl<'a> Parser<'a> {
                 Ok(value)
             }
             Token::AttributeValue(name) => {
-                let value = attribute_values.get(*name).ok_or_else(|| {
+                let value = attribute_values.get_attribute_value(name).ok_or_else(|| {
                     format!("Attribute value {name} not found in ExpressionAttributeValues")
                 })?;
                 self.advance()?;
                 Ok(value.clone())
             }
-            Token::String(value) => {
-                let value = value.clone();
+            Token::String(_) => {
+                let Token::String(value) = std::mem::replace(&mut self.current_token, Token::Eof)
+                else {
+                    unreachable!("current token was checked as a string")
+                };
                 self.advance()?;
                 Ok(AttributeValue::S(value))
             }
@@ -685,7 +705,7 @@ impl<'a> Parser<'a> {
 
     fn parse_value(
         &mut self,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<String, String> {
         match &self.current_token {
             Token::LeftParen => {
@@ -695,14 +715,17 @@ impl<'a> Parser<'a> {
                 Ok(value)
             }
             Token::AttributeValue(name) => {
-                let value = attribute_values.get(*name).ok_or_else(|| {
+                let value = attribute_values.get_attribute_value(name).ok_or_else(|| {
                     format!("Attribute value {name} not found in ExpressionAttributeValues")
                 })?;
                 self.advance()?;
                 Ok(attribute_value_scalar_to_string(value))
             }
-            Token::String(value) => {
-                let value = value.clone();
+            Token::String(_) => {
+                let Token::String(value) = std::mem::replace(&mut self.current_token, Token::Eof)
+                else {
+                    unreachable!("current token was checked as a string")
+                };
                 self.advance()?;
                 Ok(value)
             }
@@ -717,7 +740,7 @@ impl<'a> Parser<'a> {
 
     fn parse_value_list(
         &mut self,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Vec<AttributeValue>, String> {
         let mut values = Vec::new();
 
@@ -746,7 +769,7 @@ impl<'a> Parser<'a> {
     fn parse_size_comparison(
         &mut self,
         field: String,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         if matches!(self.current_token, Token::Between) {
             self.advance()?;
@@ -762,10 +785,10 @@ impl<'a> Parser<'a> {
                     dynamodb_attribute_value_display(&max_value)
                 ));
             }
-            let min = attribute_value_scalar_to_string(&min_value)
+            let min = attribute_value_scalar_to_string_owned(min_value)
                 .parse::<usize>()
                 .map_err(|_| "Size must be a number")?;
-            let max = attribute_value_scalar_to_string(&max_value)
+            let max = attribute_value_scalar_to_string_owned(max_value)
                 .parse::<usize>()
                 .map_err(|_| "Size must be a number")?;
             return Ok(Condition::And {
@@ -813,8 +836,8 @@ impl<'a> Parser<'a> {
     fn parse_comparison(
         &mut self,
         field: String,
-        _attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        _attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         match &self.current_token {
             Token::Equal => {
@@ -867,8 +890,8 @@ impl<'a> Parser<'a> {
                         dynamodb_attribute_value_display(&max_value)
                     ));
                 }
-                let min = attribute_value_scalar_to_string(&min_value);
-                let max = attribute_value_scalar_to_string(&max_value);
+                let min = attribute_value_scalar_to_string_owned(min_value);
+                let max = attribute_value_scalar_to_string_owned(max_value);
                 Ok(Condition::Between { field, min, max })
             }
 
@@ -879,7 +902,8 @@ impl<'a> Parser<'a> {
                 // is itself a collection (e.g., SS/NS/BS/L) to represent the
                 // entire IN list. If more than one value is present (comma
                 // separated), fall back to the standard list parsing.
-                // First, check if the next token is a single attribute value placeholder.
+                // First, check if the next token is a single attribute value
+                // placeholder.
                 let single_placeholder_name = if let Token::AttributeValue(n) = &self.current_token
                 {
                     Some(*n)
@@ -888,7 +912,7 @@ impl<'a> Parser<'a> {
                 };
 
                 if let Some(name) = single_placeholder_name {
-                    let raw = attribute_values.get(name).cloned();
+                    let raw = attribute_values.get_attribute_value(name).cloned();
 
                     // Consume the attribute value token to inspect what's next
                     self.advance()?;
@@ -953,8 +977,8 @@ impl<'a> Parser<'a> {
 
     fn parse_and_expression(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         let mut left = self.parse_not_expression(attribute_names, attribute_values)?;
 
@@ -979,8 +1003,8 @@ impl<'a> Parser<'a> {
 
     fn parse_not_expression(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         if matches!(self.current_token, Token::Not) {
             self.advance()?;
@@ -995,8 +1019,8 @@ impl<'a> Parser<'a> {
 
     fn parse_or_expression(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         let mut left = self.parse_and_expression(attribute_names, attribute_values)?;
 
@@ -1021,8 +1045,8 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse(
         &mut self,
-        attribute_names: &HashMap<String, String>,
-        attribute_values: &HashMap<String, AttributeValue>,
+        attribute_names: &dyn ExpressionNameLookup,
+        attribute_values: &dyn AttributeValueLookup,
     ) -> Result<Condition, String> {
         let condition = self.parse_or_expression(attribute_names, attribute_values)?;
 

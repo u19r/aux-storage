@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use storage_types::TimestampMillis;
@@ -8,23 +8,6 @@ use crate::{
     PubsubError, PubsubMessageId, PubsubResult, PubsubValidationKind, SubscriptionArn, TopicArn,
     TopicName,
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PubsubArnParts {
-    pub partition: String,
-    pub region: String,
-    pub account_id: String,
-}
-
-impl Default for PubsubArnParts {
-    fn default() -> Self {
-        Self {
-            partition: "aws".to_string(),
-            region: "us-east-1".to_string(),
-            account_id: "000000000000".to_string(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Topic {
@@ -57,6 +40,17 @@ impl Topic {
                 self.display_name.clone().unwrap_or_default(),
             ),
         ])
+    }
+}
+
+impl From<CreateTopicRequest> for Topic {
+    fn from(request: CreateTopicRequest) -> Self {
+        Self {
+            topic_arn: TopicArn::compose("aws", "us-east-1", "000000000000", &request.name),
+            name: request.name,
+            display_name: request.attributes.get("DisplayName").cloned(),
+            created_at: TimestampMillis::now(),
+        }
     }
 }
 
@@ -151,6 +145,26 @@ impl Subscription {
     }
 }
 
+impl From<SubscribeRequest> for Subscription {
+    fn from(request: SubscribeRequest) -> Self {
+        let subscription_arn = SubscriptionArn::compose(&request.topic_arn);
+        let confirmation = request.protocol.subscription_confirmation();
+        Self {
+            subscription_arn,
+            topic_arn: request.topic_arn,
+            protocol: request.protocol,
+            endpoint: request.endpoint,
+            raw_message_delivery: request
+                .attributes
+                .get("RawMessageDelivery")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            confirmation,
+            extra_json: request.extra_json,
+            created_at: TimestampMillis::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubscriptionConfirmation {
@@ -186,6 +200,33 @@ pub enum DeliveryTarget {
     CustomSender,
 }
 
+impl From<DeliveryTarget> for &'static str {
+    fn from(target: DeliveryTarget) -> Self {
+        match target {
+            DeliveryTarget::BuiltIn => "built_in",
+            DeliveryTarget::CustomSender => "custom_sender",
+        }
+    }
+}
+
+impl fmt::Display for DeliveryTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str((*self).into())
+    }
+}
+
+impl FromStr for DeliveryTarget {
+    type Err = PubsubError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "built_in" => Ok(Self::BuiltIn),
+            "custom_sender" => Ok(Self::CustomSender),
+            _ => Err(PubsubError::storage("invalid delivery target")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
@@ -194,6 +235,39 @@ pub enum DeliveryStatus {
     AcceptedByCustomSender,
     RetryScheduled,
     Failed,
+}
+
+impl From<DeliveryStatus> for &'static str {
+    fn from(status: DeliveryStatus) -> Self {
+        match status {
+            DeliveryStatus::Pending => "pending",
+            DeliveryStatus::Delivered => "delivered",
+            DeliveryStatus::AcceptedByCustomSender => "accepted_by_custom_sender",
+            DeliveryStatus::RetryScheduled => "retry_scheduled",
+            DeliveryStatus::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for DeliveryStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str((*self).into())
+    }
+}
+
+impl FromStr for DeliveryStatus {
+    type Err = PubsubError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "delivered" => Ok(Self::Delivered),
+            "accepted_by_custom_sender" => Ok(Self::AcceptedByCustomSender),
+            "retry_scheduled" => Ok(Self::RetryScheduled),
+            "failed" => Ok(Self::Failed),
+            _ => Err(PubsubError::storage("invalid delivery status")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,6 +288,7 @@ pub struct DeliveryRecord {
     pub target: DeliveryTarget,
     pub status: DeliveryStatus,
     pub attempts: u32,
+    pub claim_generation: u64,
     pub next_attempt_at: Option<TimestampMillis>,
     #[serde(default)]
     pub lease_owner: Option<String>,
@@ -224,7 +299,49 @@ pub struct DeliveryRecord {
     pub updated_at: TimestampMillis,
 }
 
+/// Mutable delivery outcome guarded by the claim that produced it.
+///
+/// The delivery payload and subscription snapshot are intentionally absent:
+/// once a record is accepted, those values are immutable. Providers must
+/// apply this outcome only when both the generation and owner still match the
+/// active claim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryRecordUpdate {
+    pub record_id: DeliveryRecordId,
+    pub expected_claim_generation: u64,
+    pub expected_lease_owner: String,
+    pub status: DeliveryStatus,
+    pub attempts: u32,
+    pub next_attempt_at: Option<TimestampMillis>,
+    pub last_error: Option<String>,
+    pub updated_at: TimestampMillis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingNotificationContext {
+    pub accepted_at: TimestampMillis,
+    pub custom_sender_enabled: bool,
+}
+
+impl PendingNotificationContext {
+    #[must_use]
+    pub const fn new(accepted_at: TimestampMillis, custom_sender_enabled: bool) -> Self {
+        Self {
+            accepted_at,
+            custom_sender_enabled,
+        }
+    }
+}
+
 impl DeliveryRecord {
+    /// The physical delivery stores use signed 64-bit claim generations.
+    /// Reject an unrepresentable record before any batch member is written.
+    pub fn validate_storage_range(&self) -> PubsubResult<()> {
+        i64::try_from(self.claim_generation)
+            .map(|_| ())
+            .map_err(|_| PubsubError::storage("delivery claim generation exceeds storage range"))
+    }
+
     #[must_use]
     pub fn pending_notification(
         request: &PublishRequest,
@@ -232,8 +349,22 @@ impl DeliveryRecord {
         subscription: &Subscription,
         custom_sender_enabled: bool,
     ) -> Self {
-        let now = TimestampMillis::now();
-        let target = if custom_sender_enabled
+        Self::pending_notification_at(
+            request,
+            message_id,
+            subscription,
+            PendingNotificationContext::new(TimestampMillis::now(), custom_sender_enabled),
+        )
+    }
+
+    #[must_use]
+    pub fn pending_notification_at(
+        request: &PublishRequest,
+        message_id: &PubsubMessageId,
+        subscription: &Subscription,
+        context: PendingNotificationContext,
+    ) -> Self {
+        let target = if context.custom_sender_enabled
             && matches!(
                 subscription.protocol,
                 SubscriptionProtocol::Http | SubscriptionProtocol::Https
@@ -254,12 +385,13 @@ impl DeliveryRecord {
             target,
             status: DeliveryStatus::Pending,
             attempts: 0,
+            claim_generation: 0,
             next_attempt_at: None,
             lease_owner: None,
             lease_expires_at: None,
             last_error: None,
-            created_at: now,
-            updated_at: now,
+            created_at: context.accepted_at,
+            updated_at: context.accepted_at,
         }
     }
 
@@ -274,6 +406,51 @@ impl DeliveryRecord {
                 .lease_expires_at
                 .is_none_or(|lease_expires_at| lease_expires_at <= now)
     }
+
+    /// Physical due indexes use this bound; claim policy still checks the row.
+    pub fn due_at(&self) -> Option<TimestampMillis> {
+        if !matches!(
+            self.status,
+            DeliveryStatus::Pending | DeliveryStatus::RetryScheduled
+        ) {
+            return None;
+        }
+        let mut due = self.created_at;
+        if let Some(next) = self.next_attempt_at {
+            due = due.max(next);
+        }
+        if let Some(lease) = self.lease_expires_at {
+            due = due.max(lease);
+        }
+        Some(due)
+    }
+
+    /// Build the mutable outcome for this record's active claim.
+    pub fn update_for_claim(
+        &self,
+        status: DeliveryStatus,
+        attempts: u32,
+        next_attempt_at: Option<TimestampMillis>,
+        last_error: Option<String>,
+        updated_at: TimestampMillis,
+    ) -> PubsubResult<DeliveryRecordUpdate> {
+        let Some(expected_lease_owner) = self.lease_owner.clone() else {
+            return Err(PubsubError::delivery_claim_lost(self.id.0.clone()));
+        };
+        if self.claim_generation == 0 {
+            return Err(PubsubError::delivery_claim_lost(self.id.0.clone()));
+        }
+        Ok(DeliveryRecordUpdate {
+            record_id: self.id.clone(),
+            expected_claim_generation: self.claim_generation,
+            expected_lease_owner,
+            status,
+            attempts,
+            next_attempt_at,
+            last_error,
+            updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -286,12 +463,44 @@ pub enum DeliveryRecordKind {
     },
 }
 
+impl<'a> From<&'a DeliveryRecordKind> for (&'static str, Option<&'a str>) {
+    fn from(kind: &'a DeliveryRecordKind) -> Self {
+        match kind {
+            DeliveryRecordKind::Notification => ("notification", None),
+            DeliveryRecordKind::SubscriptionConfirmation { token } => {
+                ("subscription_confirmation", Some(token))
+            }
+        }
+    }
+}
+
+impl fmt::Display for DeliveryRecordKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (kind, _): (&str, Option<&str>) = self.into();
+        formatter.write_str(kind)
+    }
+}
+
+impl TryFrom<(&str, Option<String>)> for DeliveryRecordKind {
+    type Error = PubsubError;
+
+    fn try_from((kind, token): (&str, Option<String>)) -> Result<Self, Self::Error> {
+        match kind {
+            "notification" => Ok(Self::Notification),
+            "subscription_confirmation" => Ok(Self::SubscriptionConfirmation {
+                token: token.unwrap_or_default(),
+            }),
+            _ => Err(PubsubError::storage("invalid delivery kind")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaimDeliveryRecordsRequest {
     pub owner: String,
     pub now: TimestampMillis,
     pub lease_expires_at: TimestampMillis,
-    pub limit: usize,
+    pub limit: crate::DeliveryClaimLimit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

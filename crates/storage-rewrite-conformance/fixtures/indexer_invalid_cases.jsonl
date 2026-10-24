@@ -1,0 +1,13 @@
+{"name":"number","indexed_value":{"N":"1"},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"binary","indexed_value":{"B":"AA=="},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"bool","indexed_value":{"BOOL":true},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"null","indexed_value":{"NULL":true},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"map","indexed_value":{"M":{}},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"list","indexed_value":{"L":[]},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"string-set","indexed_value":{"SS":["x"]},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"number-set","indexed_value":{"NS":["1"]},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"binary-set","indexed_value":{"BS":["AA=="]},"indexers":["indexed"],"message":"Indexers:attribute_must_be_string"}
+{"name":"empty-string","indexed_value":{"S":""},"indexers":["indexed"],"message":"Indexers:empty_string"}
+{"name":"duplicate","indexed_value":null,"indexers":["indexed","indexed"],"message":"Indexers:duplicate_attribute"}
+{"name":"too-many","indexed_value":null,"indexers":["a","b","c"],"message":"Indexers:too_many"}
+{"name":"empty-name","indexed_value":null,"indexers":[""],"message":"Indexers:empty_attribute"}

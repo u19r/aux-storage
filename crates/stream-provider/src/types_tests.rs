@@ -5,9 +5,15 @@ use crate::{EmbeddedStreamItem, StoredStreamPointer, StreamDataType};
 #[test]
 fn stored_stream_pointer_serializes_required_item_stream_version() {
     let pointer = StoredStreamPointer::embedded(
-        StreamName::new(b"item-stream"),
+        storage_types::ItemHistoryAddress {
+            history_id: 1u32.into(),
+            stream_name: StreamName::new(b"item-stream"),
+        },
         TableName::new("test_table"),
-        ItemStreamVersion::new(7),
+        storage_types::ItemWriteVersions {
+            item_revision: storage_types::ItemRevision::initial(),
+            item_stream_version: ItemStreamVersion::new(7),
+        },
         vec![EmbeddedStreamItem {
             data: b"item".to_vec(),
             data_type: StreamDataType::DynamoDbJson,
@@ -26,9 +32,15 @@ fn stored_stream_pointer_serializes_required_item_stream_version() {
 #[test]
 fn stored_stream_pointer_rejects_old_format_without_item_stream_version() {
     let pointer = StoredStreamPointer::pointer(
-        StreamName::new(b"item-stream"),
+        storage_types::ItemHistoryAddress {
+            history_id: 1u32.into(),
+            stream_name: StreamName::new(b"item-stream"),
+        },
         TableName::new("test_table"),
-        ItemStreamVersion::new(7),
+        storage_types::ItemWriteVersions {
+            item_revision: storage_types::ItemRevision::initial(),
+            item_stream_version: ItemStreamVersion::new(7),
+        },
     );
     let mut old_format = serde_json::to_value(pointer).expect("pointer should serialize");
     old_format
@@ -40,4 +52,29 @@ fn stored_stream_pointer_rejects_old_format_without_item_stream_version() {
         .expect_err("old-format pointers must be rejected");
 
     assert!(err.to_string().contains("item_stream_version"));
+}
+
+#[test]
+fn stored_pointer_requires_a_positive_item_revision_separate_from_stream_version() {
+    let pointer = StoredStreamPointer::pointer(
+        storage_types::ItemHistoryAddress {
+            history_id: 1u32.into(),
+            stream_name: StreamName::new(b"item-stream"),
+        },
+        TableName::new("test_table"),
+        storage_types::ItemWriteVersions {
+            item_revision: storage_types::ItemRevision::try_from(3_u64).expect("revision"),
+            item_stream_version: ItemStreamVersion::new(900_000),
+        },
+    );
+    let mut value = serde_json::to_value(pointer).expect("serialize pointer");
+    assert_eq!(value["item_revision"], 3);
+    assert_eq!(value["item_stream_version"], 900_000);
+    value["item_revision"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<StoredStreamPointer>(value.clone()).is_err());
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("item_revision");
+    assert!(serde_json::from_value::<StoredStreamPointer>(value).is_err());
 }

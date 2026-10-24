@@ -7,6 +7,25 @@
 
 extern crate self as storage;
 
+/// The supported facade for the exact provider-backed aux-common scheduled-job
+/// runtime store contract. Consumers should use this name rather than
+/// depending on the implementation crate.
+///
+/// Store commits are atomic: a failed check applies no mutation and returns
+/// `Conflict`; `Unknown` is reserved for an ambiguous post-dispatch outcome
+/// that must be reconciled by the caller. The supported backend levels are
+/// SQLite `Local`, Turso `Local`, RocksDB `Local`, remote DynamoDB-compatible
+/// storage `Distributed`, Postgres `Distributed`, and FoundationDB
+/// `Distributed`. Remote scheduled-job access is library-only over a
+/// private-network HTTP endpoint using the existing DynamoDB-compatible
+/// actions. Its service contract requires strong reads, atomic conditional
+/// transactions, and durable operation receipts, so independent clients share
+/// one distributed scheduled-job namespace without exposing backend technology
+/// in this facade.
+pub use bg_job_store::{ScheduledJobStore, ScheduledJobStoreError};
+#[cfg(feature = "foundationdb")]
+pub use kv_backend::foundationdb::shutdown_foundationdb_network;
+
 pub mod common {
     pub use storage_common::*;
 }
@@ -19,106 +38,69 @@ pub mod derive {
     pub use storage_derive::*;
 }
 
+/// Supported provider configuration and stable provider contracts for embedded
+/// consumers.
+///
+/// This is an explicit facade rather than a wildcard export: each name is
+/// either part of [`DatabaseManager`]'s public signatures or is used by an
+/// existing storage consumer. The re-exports retain the provider crate's type
+/// identity while keeping backend implementations behind this facade.
 pub mod provider {
-    pub use storage_provider::*;
+    pub use storage_provider::{
+        AtomicItemReadModifyWriteRequest, AtomicItemTransform, AtomicItemWriteDecision,
+        FoundationDbSettings, JobTerminalProjection, PostgresSettings, RangeReadItem,
+        RangeReadPage, ReadSequenceBatchGetResponse, ReadSequenceExecuted, ReadSequenceExecution,
+        ReadSequenceExecutionBudget, ReadSequenceFlatResult, ReadSequenceFlatRow,
+        ReadSequenceReadContext, ReadSequenceReadLimits, ReadSequenceUnsupportedReason,
+        RemoteCredentialStrategy, RemoteStaticCredentials, RemoteStorageSettings,
+        RemoteTimeoutOverrides, RocksdbSettings, SqliteSettings, StorageBackend, StorageConfig,
+        StorageConnectionConfig, StorageConnectionRegistry, StorageProvider,
+        StorageProviderReadContext, TursoSettings,
+    };
 }
 
 pub mod types {
     pub use storage_types::*;
 }
 
-#[cfg(feature = "rocksdb")]
-pub use kv::{RocksDbKvStore, SortedKvDbStorageProvider};
-#[cfg(feature = "foundationdb")]
-pub use kv::{foundationdb_operation_metrics_reset, foundationdb_operation_metrics_snapshot};
-
 pub mod admission;
-mod builder;
-pub mod cache;
-#[cfg(feature = "cache-write-planner")]
-pub(crate) use cache::write_planner as cache_write_planner;
-pub(crate) use cache::{
-    batch_get_runtime as cache_batch_get_runtime, coordinator as cache_coordinator,
-    point_read as point_read_cache, point_read_runtime as cache_point_read_runtime,
-    point_read_store as point_read_cache_store, point_read_types as point_read_cache_types,
-    query_proof as query_proof_cache, query_proof_request, query_proof_store, query_proof_types,
-    query_runtime as cache_query_runtime, read_observability as cache_read_observability,
-};
-pub use cache_coordinator::StorageAuthoritativeCacheOptions;
-pub use cache_read_observability::{StorageCacheReadDiagnostics, storage_cache_read_diagnostics};
+mod maintenance_runtime;
+pub mod point_read;
+mod provider_bundle;
 #[cfg(feature = "remote")]
 pub use storage_remote::RemoteStorageProvider;
 
 mod newtypes;
-pub use builder::{create_storage_provider, create_storage_provider_bundle};
+#[cfg(feature = "remote")]
+pub use provider_bundle::{RemoteScheduledJobStoreConfig, connect_remote_scheduled_job_store};
 mod constants;
+#[cfg(all(feature = "test-support", feature = "foundationdb"))]
+mod foundationdb_test_scope;
+#[cfg(all(feature = "test-support", feature = "foundationdb"))]
+pub use foundationdb_test_scope::FoundationDbTestScope;
 mod database_manager;
-mod dynamo_json;
-mod migration;
-pub(crate) use migration::namespace_routing;
-pub use migration::{index_keys as migration_index_keys, namespace_migration};
-mod multi_region;
-pub(crate) use multi_region::{metrics as multi_region_metrics, model as multi_region_model};
+#[cfg(all(test, feature = "test-support", feature = "foundationdb"))]
+mod foundationdb_test_scope_tests;
 pub mod startup;
 mod updated_at_apply;
 #[cfg(test)]
 mod updated_at_apply_tests;
 pub use admission::{
-    AdmissionClass, AdmissionConfig, AdmissionConfigError, AdmissionController, AdmissionOutcome,
-    AdmissionPermit, AdmissionRegistry, AdmissionRejection, AdmissionRejectionReason,
-    AdmissionSnapshot, AdmissionState, ControlPermit,
+    AdmissionClass, AdmissionConfig, AdmissionOutcome, AdmissionPermit, ControlPermit,
 };
-#[cfg(all(test, feature = "cache-write-planner"))]
-pub(crate) use database_manager::DatabaseManagerTestPauseHandle;
 pub use database_manager::{
-    AdmittedProvider, CappedStorageError, CreateCappedEntityInput, DatabaseManager,
-    DatabaseManagerRuntimeOptions, DatabaseManagerRuntimeOptionsBuilder, DeleteCappedEntityInput,
-    DeleteItemInput, PutItemEntityEncodeInput, PutItemInput, QueryIndexInput, QueryTableInput,
-    ReplicationMutationApplyOutcome, ResolvedBatchGetPlan, ResolvedGetItem,
-    ResolvedStorageOperation, ScanTableInput, UpdateItemInput,
-};
-pub use multi_region_metrics::{
-    increment_multi_region_apply_total, increment_multi_region_auth_failure_total,
-    record_multi_region_heartbeat_rtt, record_multi_region_heartbeat_staleness,
-    record_multi_region_replication_lag, record_multi_region_sender_queue_depth,
-};
-pub use multi_region_model::{
-    OutboundReplicationBatch, OutboundReplicationMutationRecord, PeerCheckpointRecord,
-    PeerReplicationStatusRecord, TableBootstrapCursorRecord, TableReplicationConfigRecord,
-    peer_checkpoint_put_request, table_bootstrap_cursor_put_request,
-};
-pub use namespace_migration::{
-    BeginDualWriteInput, CompleteCutoverInput, DualWriteCoordinator,
-    MigrationBackfillEntitySummary, MigrationBackfillInput, MigrationBackfillSummary,
-};
-#[cfg(test)]
-pub(crate) use namespace_routing::CutoverWatcher;
-pub use namespace_routing::{
-    CutoverEvent, CutoverEventStatus, NamespaceRequestRewriter, NamespaceRoute,
-    NamespaceSourceTable, NamespaceStorageMigrationMode, NamespaceStorageMode, RouteTarget,
-    is_retryable_pause_error, namespace_source_table,
-};
-pub use point_read_cache::{
-    AuthoritativePointReadHit, AuthoritativePointReadPurpose, AuthoritativePointReadResult,
-    DurableAbsenceProof, DurableItemRevision, InMemoryPointReadCache, InMemoryPointReadCacheConfig,
-    NoopPointReadCache, PointReadBatchGetResult, PointReadCache, PointReadCacheEvictionPolicy,
-    PointReadGetRequest, PointReadGetResult, noop_point_read_cache,
-};
-pub use query_proof_cache::{
-    InMemoryQueryProofCache, NoopQueryProofCache, QueryProofCache, QueryProofMaterializedPage,
-    noop_query_proof_cache,
-};
-pub use query_proof_types::{
-    InMemoryQueryProofCacheConfig, QueryCoverageRange, QueryCoverageState, QueryManifestEntry,
-    QueryManifestKey, QueryManifestSnapshot, QueryProofCacheEvictionPolicy,
+    CappedEntityCreateOutcome, CappedEntityCreateRejection, CappedStorageError,
+    CreateCappedEntityInput, DatabaseManager, DatabaseManagerRuntimeOptions, DeleteItemInput,
+    DomainEffectAuthorization, PreparedCappedEntityCreate, PutItemEntityEncodeInput, PutItemInput,
+    QueryIndexInput, QueryTableInput, UpdateItemInput,
 };
 pub use storage_types::*;
 
 mod tables;
 pub use tables::Tables;
 
-#[cfg(test)]
-mod builder_tests;
+#[cfg(all(test, feature = "sqlite"))]
+mod contract_tests;
 #[cfg(test)]
 mod database_manager_tests;
 #[cfg(test)]
@@ -127,4 +109,12 @@ mod storage_tests;
 #[cfg(test)]
 mod startup_tests;
 #[cfg(test)]
-mod storage_test_support;
+mod storage_test_support_tests;
+
+pub use database_manager::CanonicalHistoryResponse;
+pub use provider_bundle::StorageProviderBundle;
+#[cfg(feature = "regional")]
+pub use regional_replication::runtime::RegionalRuntime;
+
+#[cfg(all(feature = "regional", feature = "test-support"))]
+pub mod regional_test_support;

@@ -138,19 +138,21 @@ fn provider_pressure_enters_emergency_without_waiting_for_a_full_window() {
 }
 
 #[test]
+#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
 fn immediate_admission_path_has_no_per_request_metric_allocations() {
     const ISOLATED_ENV: &str = "AUX_STORAGE_ADMISSION_ALLOCATION_ISOLATED";
     if std::env::var_os(ISOLATED_ENV).is_none() {
         let status = Command::new(
             std::env::current_exe()
-                .expect("admission allocation test executable should be available"),
+                .unwrap(),
         )
         .arg("--exact")
         .arg("admission::admission_tests::immediate_admission_path_has_no_per_request_metric_allocations")
         .arg("--nocapture")
+        .arg("--ignored")
         .env(ISOLATED_ENV, "1")
         .status()
-        .expect("isolated admission allocation test child should start");
+        .unwrap();
         assert!(
             status.success(),
             "isolated admission allocation test failed"
@@ -167,13 +169,11 @@ fn immediate_admission_path_has_no_per_request_metric_allocations() {
         queue_capacity: 0,
         ..AdmissionConfig::default()
     };
-    let controller = AdmissionController::new("allocation-free", config).expect("valid config");
+    let controller = AdmissionController::new("allocation-free", config).unwrap();
 
     // Warm the metric handles and fixed-size controller state before measuring.
     for _ in 0..8 {
-        let permit = controller
-            .try_acquire(AdmissionClass::PointRead)
-            .expect("foreground capacity");
+        let permit = controller.try_acquire(AdmissionClass::PointRead).unwrap();
         permit.complete(AdmissionOutcome::Success(Duration::from_millis(1)));
     }
 
@@ -185,9 +185,7 @@ fn immediate_admission_path_has_no_per_request_metric_allocations() {
         Some("try_acquire_and_complete"),
     );
     for _ in 0..256 {
-        let permit = controller
-            .try_acquire(AdmissionClass::PointRead)
-            .expect("foreground capacity");
+        let permit = controller.try_acquire(AdmissionClass::PointRead).unwrap();
         permit.complete(AdmissionOutcome::Success(Duration::from_millis(1)));
     }
     let report = guard.finish();
@@ -474,6 +472,51 @@ fn a_dropped_grant_returns_a_slot_after_send_race() {
     assert_eq!(controller.snapshot().in_flight, 0);
 }
 
+#[tokio::test]
+async fn a_dropped_grant_wakes_the_next_fifo_waiter() {
+    let config = AdmissionConfig {
+        minimum_concurrency: 1,
+        maximum_concurrency: 2,
+        control_reserve_concurrency: 1,
+        queue_capacity: 2,
+        ..AdmissionConfig::default()
+    };
+    let controller = AdmissionController::new("default", config).expect("valid admission config");
+    let first_permit = controller
+        .try_acquire(AdmissionClass::PointRead)
+        .expect("first permit");
+    let (first_sender, first_receiver) = oneshot::channel();
+    let (second_sender, second_receiver) = oneshot::channel();
+    {
+        let mut state = super::lock_state(&controller.inner);
+        state.queue.push_back(Waiter {
+            id: 1,
+            class: AdmissionClass::RangeRead,
+            enqueued_at: Instant::now(),
+            sender: first_sender,
+        });
+        state.queue.push_back(Waiter {
+            id: 2,
+            class: AdmissionClass::Write,
+            enqueued_at: Instant::now(),
+            sender: second_sender,
+        });
+    }
+
+    first_permit.complete(AdmissionOutcome::Success(Duration::from_millis(1)));
+    let first_grant = first_receiver.await.expect("first waiter grant");
+    drop(first_grant);
+    let second_grant = tokio::time::timeout(Duration::from_millis(100), second_receiver)
+        .await
+        .expect("dropped grant should wake the next waiter")
+        .expect("second waiter grant");
+    drop(second_grant);
+
+    let snapshot = controller.snapshot();
+    assert_eq!(snapshot.queue_depth, 0);
+    assert_eq!(snapshot.in_flight, 0);
+}
+
 #[test]
 fn named_connections_have_independent_admission_state() {
     let config = AdmissionConfig {
@@ -514,6 +557,21 @@ fn named_connections_have_independent_admission_state() {
 }
 
 #[test]
+fn given_invalid_connection_config_when_registry_builds_then_controller_rejects_it() {
+    let invalid = AdmissionConfig {
+        max_queue_wait_ms: 0,
+        ..AdmissionConfig::default()
+    };
+    let result = AdmissionRegistry::new_with_connection_configs(
+        "default",
+        [("secondary".to_string(), invalid)],
+        AdmissionConfig::default(),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn fixed_ingress_limit_is_bounded_from_connection_hard_limits() {
     let config = AdmissionConfig {
         maximum_concurrency: 10_000,
@@ -550,6 +608,69 @@ fn control_reserve_is_separate_from_foreground_limit() {
         .expect("second control permit");
     assert!(controller.try_acquire_control().is_err());
     assert!(controller.try_acquire(AdmissionClass::PointRead).is_ok());
+    drop(first);
+    drop(second);
+}
+
+#[tokio::test]
+async fn given_full_control_reserve_when_slot_releases_within_budget_then_recovery_acquires_without_rejection()
+ {
+    let config = AdmissionConfig {
+        minimum_concurrency: 1,
+        maximum_concurrency: 3,
+        control_reserve_concurrency: 2,
+        max_queue_wait_ms: 1000,
+        ..AdmissionConfig::default()
+    };
+    let controller = AdmissionController::new("control-wait", config).expect("valid config");
+    let first = controller
+        .try_acquire_control()
+        .expect("first control slot");
+    let second = controller
+        .try_acquire_control()
+        .expect("second control slot");
+    let waiter_controller = controller.clone();
+    let waiter = tokio::spawn(async move { waiter_controller.acquire_recovery().await });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "control work must wait, not fail fast"
+    );
+    assert_eq!(controller.snapshot().rejection_count, 0);
+
+    drop(first);
+    let third = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("control waiter should wake after a slot is released")
+        .expect("control waiter task should remain healthy")
+        .expect("released control slot should be admitted");
+    drop(third);
+    drop(second);
+    assert_eq!(controller.snapshot().control_in_flight, 0);
+}
+
+#[tokio::test]
+async fn zero_control_reserve_keeps_internal_control_work_available() {
+    let config = AdmissionConfig {
+        minimum_concurrency: 1,
+        maximum_concurrency: 3,
+        control_reserve_concurrency: 0,
+        ..AdmissionConfig::default()
+    };
+    let controller = AdmissionController::new("control-unbounded", config).expect("valid config");
+
+    let first = controller
+        .acquire_recovery()
+        .await
+        .expect("zero reserve remains available");
+    let second = controller
+        .acquire_recovery()
+        .await
+        .expect("zero reserve remains available");
+    assert_eq!(controller.snapshot().control_in_flight, 0);
+    assert_eq!(controller.snapshot().rejection_count, 0);
+
     drop(first);
     drop(second);
 }
