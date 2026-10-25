@@ -136,18 +136,18 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 ############################################
 # Shared crates pinned to a published aux-common revision.
-alloc-counter = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-http-request = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
 
 # Scheduled jobs use the shared aux-common contract; storage owns provider adapters.
-bg-jobs-tokio = { package = "bg-jobs-tokio", version = "0.2.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-scheduled-bg-jobs = { package = "bg-jobs", version = "0.2.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
-scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", version = "0.1.0", git = "https://github.com/u19r/aux-common", rev = "662da2358c5c2bebecc85dd892c45deb825eabc6" }
+bg-jobs-tokio = { git = "https://github.com/u19r/aux-common", package = "bg-jobs-tokio", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
 
 ############################################
 # Local path dependencies
