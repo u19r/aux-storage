@@ -1,0 +1,543 @@
+{
+  "generated_by": "aux-infra: just versions-sync",
+  "source_digest": "91be1d6fa3137f87ac7037528b7ebeddaa88181ee0b736578f566d8011dad55d",
+  "repository": "aux-storage",
+  "payload_digest": "e76acc5118ec3b1319115126c1b227bcf8435676fdf16c107eeb7eb4d3712ff9",
+  "catalog": {
+    "schema": 1,
+    "tools": {
+      "rust": {
+        "version": "1.99.1",
+        "purpose": "Selected release",
+        "downloads": {}
+      },
+      "mold": {
+        "version": "3.0.0",
+        "purpose": "Selected release",
+        "downloads": {
+          "x86_64": {
+            "repository": "rui314/mold",
+            "tag": "v{version}",
+            "asset": "mold-{version}-x86_64-linux.tar.gz"
+          },
+          "aarch64": {
+            "repository": "rui314/mold",
+            "tag": "v{version}",
+            "asset": "mold-{version}-aarch64-linux.tar.gz"
+          }
+        }
+      },
+      "node": {
+        "version": "26.12.1",
+        "purpose": "Selected release",
+        "downloads": {}
+      },
+      "protoc": {
+        "version": "36.2",
+        "purpose": "Selected release",
+        "downloads": {
+          "x86_64": {
+            "repository": "protocolbuffers/protobuf",
+            "tag": "v{version}",
+            "asset": "protoc-{version}-linux-x86_64.zip"
+          },
+          "aarch64": {
+            "repository": "protocolbuffers/protobuf",
+            "tag": "v{version}",
+            "asset": "protoc-{version}-linux-aarch_64.zip"
+          }
+        }
+      },
+      "foundationdb": {
+        "version": "7.4.8",
+        "purpose": "Selected release",
+        "downloads": {}
+      },
+      "rustfmt": {
+        "version": "nightly",
+        "purpose": "Moving upstream channel resolved during AMI provisioning",
+        "downloads": {}
+      },
+      "ubi": {
+        "version": "9.8",
+        "purpose": "Shared UBI 9 builder and runtime release",
+        "downloads": {}
+      },
+      "infra_cli": {
+        "version": "infra-cli-d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e",
+        "purpose": "Checksum-bound first-party deployment CLI; publish the reviewed replacement before enabling canonical callers",
+        "downloads": {
+          "installer": {
+            "repository": "u19r/aux-infra",
+            "tag": "{version}",
+            "asset": "install-infra-cli-release.sh"
+          },
+          "linux_arm64": {
+            "repository": "u19r/aux-infra",
+            "tag": "{version}",
+            "asset": "infra-cli-linux-arm64"
+          },
+          "linux_x64": {
+            "repository": "u19r/aux-infra",
+            "tag": "{version}",
+            "asset": "infra-cli-linux-x64"
+          }
+        }
+      }
+    },
+    "images": {
+      "ubi": {
+        "repository": "registry.access.redhat.com/ubi9/ubi",
+        "tag": "{{tools.ubi.version}}"
+      },
+      "ubi_micro": {
+        "repository": "registry.access.redhat.com/ubi9/ubi-micro",
+        "tag": "{{tools.ubi.version}}"
+      },
+      "dockerfile": {
+        "repository": "docker.io/docker/dockerfile",
+        "tag": "1.28"
+      }
+    },
+    "actions": {
+      "actions_checkout": {
+        "repository": "actions/checkout",
+        "version": "v7.0.1"
+      },
+      "actions_upload_artifact": {
+        "repository": "actions/upload-artifact",
+        "version": "v7.0.2"
+      },
+      "actions_setup_node": {
+        "repository": "actions/setup-node",
+        "version": "v7.1.0"
+      }
+    },
+    "cache_images": [],
+    "repositories": [
+      "aux-storage"
+    ]
+  },
+  "lock": {
+    "schema": 1,
+    "tools": {
+      "mold": {
+        "selection": "3.0.0",
+        "revision": "",
+        "downloads": {
+          "x86_64": {
+            "url": "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz",
+            "sha256": "6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189"
+          },
+          "aarch64": {
+            "url": "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-aarch64-linux.tar.gz",
+            "sha256": "52c759d3689babaea4c42af2f31062a74ab83e17ffb5a8090232534c67b70577"
+          }
+        }
+      },
+      "protoc": {
+        "selection": "36.2",
+        "revision": "",
+        "downloads": {
+          "x86_64": {
+            "url": "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip",
+            "sha256": "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278"
+          },
+          "aarch64": {
+            "url": "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-aarch_64.zip",
+            "sha256": "8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a"
+          }
+        }
+      },
+      "infra_cli": {
+        "selection": "infra-cli-d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e",
+        "revision": "d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e",
+        "downloads": {
+          "installer": {
+            "url": "https://github.com/u19r/aux-infra/releases/download/infra-cli-d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e/install-infra-cli-release.sh",
+            "sha256": "52c695a0aae24f524850b22c446c3a355fde2ffbaf1a76c6c213297d3b932195"
+          },
+          "linux_arm64": {
+            "url": "https://github.com/u19r/aux-infra/releases/download/infra-cli-d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e/infra-cli-linux-arm64",
+            "sha256": "c6f1039efd8da0db9b1dba94c3402e54974d80212c0ca1e7dc11aa8fd2134bd8"
+          },
+          "linux_x64": {
+            "url": "https://github.com/u19r/aux-infra/releases/download/infra-cli-d1ecfe2f3d24ff1dd2392f39bc277aaa8362539e/infra-cli-linux-x64",
+            "sha256": "8e1882af99fba6201225df53edc96de81aeb1b3f78115a8ab517911b4d0d0c84"
+          }
+        }
+      }
+    },
+    "images": {
+      "ubi": {
+        "selection": "registry.access.redhat.com/ubi9/ubi:9.8",
+        "digest": "sha256:217dd5692d369799d34d09ffb6f5f3404efebc7900834490fdf9ae92fd6721d4",
+        "revision": "4fed77deb378a5b25e394fe33b2b061be0d026b8"
+      },
+      "ubi_micro": {
+        "selection": "registry.access.redhat.com/ubi9/ubi-micro:9.8",
+        "digest": "sha256:5be877a2a280ae36eb9ab80ca4efb28bbf77c57abbba38137cdc37a03b8465e6",
+        "revision": "f9d3e906f73b403e748bc95bb774a380d66c1f8e"
+      },
+      "dockerfile": {
+        "selection": "docker.io/docker/dockerfile:1.28",
+        "digest": "sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b",
+        "revision": "f5b59a1f2fb25a0cb7072c398cab9aed7835da4e"
+      }
+    },
+    "actions": {
+      "actions_checkout": {
+        "selection": "actions/checkout@v7.0.1",
+        "revision": "3d3c42e5aac5ba805825da76410c181273ba90b1"
+      },
+      "actions_upload_artifact": {
+        "selection": "actions/upload-artifact@v7.0.2",
+        "revision": "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+      },
+      "actions_setup_node": {
+        "selection": "actions/setup-node@v7.1.0",
+        "revision": "949feb2413d6458794dcd2491c4babbbce0c15c1"
+      }
+    }
+  },
+  "bindings": {
+    "schema": 1,
+    "bindings": [
+      {
+        "kind": "text",
+        "key": "tools.rust.version",
+        "template": "{{tools.rust.version}}",
+        "files": [
+          "aux-storage/Cargo.toml",
+          "aux-storage/rust-toolchain.toml"
+        ],
+        "pattern": "(?:channel|rust-version)\\s*=\\s*\"(?<value>[^\"]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.rust.version",
+        "template": "{{tools.rust.version}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "RUST_VERSION=(?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.rust.version",
+        "template": "{{tools.rust.version}}",
+        "files": [
+          "aux-storage/scripts/aws-dsql-spot-local.sh"
+        ],
+        "pattern": "--(?:default-toolchain|toolchain) (?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.rust.version",
+        "template": "{{tools.rust.version}}",
+        "files": [
+          "aux-storage/scripts/aws-dsql-spot-local.sh"
+        ],
+        "pattern": "(?:cargo|rustc) \\+(?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.mold.version",
+        "template": "{{tools.mold.version}}",
+        "files": [
+          "aux-storage/.cargo/config.toml",
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile",
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "aux-mold-(?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.mold.version",
+        "template": "{{tools.mold.version}}",
+        "files": [
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "mold-(?<value>\\d+\\.\\d+\\.\\d+)-",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.mold.version",
+        "template": "{{tools.mold.version}}",
+        "files": [
+          "aux-storage/.github/workflows/ci.yml",
+          "aux-storage/.github/workflows/dependency-update-prs.yml",
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "mold (?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.mold.version",
+        "template": "{{tools.mold.version}}",
+        "files": [
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "mold/releases/download/v(?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.mold.version",
+        "template": "{{tools.mold.version}}",
+        "files": [
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "mold (?<value>\\d+\\\\\\.\\d+\\\\\\.\\d+)",
+        "encoding": "regex"
+      },
+      {
+        "kind": "text",
+        "key": "lock.tools.mold.x86_64.sha256",
+        "template": "{{lock.tools.mold.x86_64.sha256}}",
+        "files": [
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "archive_arch=x86_64\\s+checksum=(?<value>[a-f0-9]{64})",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "lock.tools.mold.aarch64.sha256",
+        "template": "{{lock.tools.mold.aarch64.sha256}}",
+        "files": [
+          "aux-storage/scripts/install-mold.sh"
+        ],
+        "pattern": "archive_arch=aarch64\\s+checksum=(?<value>[a-f0-9]{64})",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.foundationdb.version",
+        "template": "{{tools.foundationdb.version}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "FDB_VERSION[=:]\\s*[\"\\x27]?(?<value>\\d+\\.\\d+\\.\\d+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "images.ubi.reference",
+        "template": "{{images.ubi.reference}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "(?<value>(?:registry\\.local/registry\\.access\\.redhat\\.com/ubi9/ubi|registry\\.access\\.redhat\\.com/ubi9/ubi)(?::[a-zA-Z0-9_.+-]+)?@sha256:(?:\\\\\\n[ \\t]*)?[a-f0-9]{64})",
+        "encoding": "rust-wrapped"
+      },
+      {
+        "kind": "text",
+        "key": "images.ubi_micro.reference",
+        "template": "{{images.ubi_micro.reference}}",
+        "files": [
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "(?<value>(?:registry\\.local/registry\\.access\\.redhat\\.com/ubi9/ubi\\-micro|registry\\.access\\.redhat\\.com/ubi9/ubi\\-micro)(?::[a-zA-Z0-9_.+-]+)?@sha256:(?:\\\\\\n[ \\t]*)?[a-f0-9]{64})",
+        "encoding": "rust-wrapped"
+      },
+      {
+        "kind": "text",
+        "key": "images.dockerfile.tag",
+        "template": "{{images.dockerfile.tag}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "(?:registry\\.local/docker/dockerfile|docker\\.io/docker/dockerfile|docker/dockerfile):(?<value>[a-zA-Z0-9_.+-]+)(?![a-zA-Z0-9_.+-]*@sha256)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "images.dockerfile.tag",
+        "template": "{{images.dockerfile.tag}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "docker/dockerfile:(?<value>\\d+\\.\\d+(?:\\.\\d+)?)(?![\\d.]*@sha256)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "actions.actions_checkout.revision",
+        "template": "{{actions.actions_checkout.revision}}",
+        "files": [
+          "aux-storage/.github/workflows/ci.yml",
+          "aux-storage/.github/workflows/dependency-update-prs.yml",
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "actions/checkout@(?<value>[a-zA-Z0-9_.-]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "actions.actions_upload_artifact.revision",
+        "template": "{{actions.actions_upload_artifact.revision}}",
+        "files": [
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "actions/upload\\-artifact@(?<value>[a-zA-Z0-9_.-]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "actions.actions_setup_node.revision",
+        "template": "{{actions.actions_setup_node.revision}}",
+        "files": [
+          "aux-storage/.github/workflows/ci.yml"
+        ],
+        "pattern": "actions/setup\\-node@(?<value>[a-zA-Z0-9_.-]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.protoc.version",
+        "template": "{{tools.protoc.version}}",
+        "files": [
+          "aux-storage/docker/aws-benchmark-binaries.Dockerfile",
+          "aux-storage/docker/storage-api.Dockerfile"
+        ],
+        "pattern": "PROTOC_VERSION[=:]\\s*[\"\\x27]?(?<value>\\d+(?:\\.\\d+){1,2})",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.node.version",
+        "template": "{{tools.node.version}}",
+        "files": [
+          "aux-storage/.github/workflows/ci.yml"
+        ],
+        "pattern": "node-version:\\s*[\"\\x27]?(?<value>\\d+(?:\\.\\d+){0,2}(?:\\.x)?)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.rustfmt.version",
+        "template": "{{tools.rustfmt.version}}",
+        "files": [
+          "aux-storage/justfile"
+        ],
+        "pattern": "cargo \\+(?<value>nightly(?:-\\d+-\\d+-\\d+)?)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.rust.version",
+        "template": "{{tools.rust.version}}",
+        "files": [
+          "aux-storage/docker-bake.hcl"
+        ],
+        "pattern": "variable \"RUST_VERSION\"\\s*\\{\\s*default\\s*=\\s*\"(?<value>[^\"\\n]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.protoc.version",
+        "template": "{{tools.protoc.version}}",
+        "files": [
+          "aux-storage/docker-bake.hcl"
+        ],
+        "pattern": "variable \"PROTOC_VERSION\"\\s*\\{\\s*default\\s*=\\s*\"(?<value>[^\"\\n]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.foundationdb.version",
+        "template": "{{tools.foundationdb.version}}",
+        "files": [
+          "aux-storage/docker-bake.hcl"
+        ],
+        "pattern": "variable \"FDB_VERSION\"\\s*\\{\\s*default\\s*=\\s*\"(?<value>[^\"\\n]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "images.ubi.reference",
+        "template": "{{images.ubi.reference}}",
+        "files": [
+          "aux-storage/docker-bake.hcl"
+        ],
+        "pattern": "variable \"UBI_IMAGE\"\\s*\\{\\s*default\\s*=\\s*\"(?<value>[^\"\\n]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "images.ubi_micro.reference",
+        "template": "{{images.ubi_micro.reference}}",
+        "files": [
+          "aux-storage/docker-bake.hcl"
+        ],
+        "pattern": "variable \"UBI_MICRO_IMAGE\"\\s*\\{\\s*default\\s*=\\s*\"(?<value>[^\"\\n]+)\"",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.foundationdb.version",
+        "template": "{{tools.foundationdb.version}}",
+        "files": [
+          "aux-storage/justfile"
+        ],
+        "pattern": "FDB_VERSION='(?<value>\\d+\\.\\d+\\.\\d+)'",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "tools.infra_cli.version",
+        "template": "{{tools.infra_cli.version}}",
+        "files": [
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "INFRA_CLI_VERSION: (?<value>[^\\s]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "lock.tools.infra_cli.installer.sha256",
+        "template": "{{lock.tools.infra_cli.installer.sha256}}",
+        "files": [
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "INFRA_CLI_INSTALLER_SHA256: (?<value>[^\\s]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "lock.tools.infra_cli.linux_arm64.sha256",
+        "template": "{{lock.tools.infra_cli.linux_arm64.sha256}}",
+        "files": [
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "INFRA_CLI_LINUX_ARM64_SHA256: (?<value>[^\\s]+)",
+        "encoding": "plain"
+      },
+      {
+        "kind": "text",
+        "key": "lock.tools.infra_cli.linux_x64.sha256",
+        "template": "{{lock.tools.infra_cli.linux_x64.sha256}}",
+        "files": [
+          "aux-storage/.github/workflows/deploy.yml"
+        ],
+        "pattern": "INFRA_CLI_LINUX_X64_SHA256: (?<value>[^\\s]+)",
+        "encoding": "plain"
+      }
+    ],
+    "copies": []
+  }
+}

@@ -6,10 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.5", features = ["time"] }
+rustix = { version = "1.1.6", features = ["time"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.6", features = ["fs"] }
 
 [dependencies]
 async-trait.workspace = true
@@ -40,7 +40,7 @@ bg-job-store = { path = "../bg-job-store" }
 bg-jobs-tokio = { workspace = true, features = ["test-support"] }
 replication-contract-tests = { path = "../replication-contract-tests", features = ["native-sqlite"] }
 reqwest.workspace = true
-rustix = { version = "1.1.5", features = ["time"] }
+rustix = { version = "1.1.6", features = ["time"] }
 sql-backend = { path = "../sql-backend", features = ["sqlite"] }
 
 [lints]

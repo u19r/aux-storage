@@ -1,3 +1,4 @@
+# Versions: software-versions.json; details in software-version-consumers.md.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
@@ -55,12 +56,12 @@ url = "2.5.8"
 # awslabs
 aws-config = "1.13.0"
 aws-credential-types = "1.3.1"
-aws-sdk-dynamodb = { version = "1.134.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sns = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sqs = { version = "1.117.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sigv4 = "1.6.3"
-aws-smithy-runtime-api = "1.19.1"
-aws-smithy-types = "1.9.0"
+aws-sdk-dynamodb = { version = "1.136.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sns = { version = "1.121.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sigv4 = "1.6.4"
+aws-smithy-runtime-api = "1.19.2"
+aws-smithy-types = "1.9.1"
 
 ############################################
 # dtolnay
@@ -118,11 +119,11 @@ foundationdb-tuple = { version = "0.11.0", git = "https://github.com/foundationd
 hostname = "0.4.2"
 httpmock = "0.9.0"
 ipnet = "2.12.2"
-jsonschema = { version = "0.60.1", default-features = false, features = ["resolve-file"] }
+jsonschema = { version = "0.60.2", default-features = false, features = ["resolve-file"] }
 lz4_flex = "0.14.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-notify = "8.2.0"
+notify = "8.2.1"
 proptest = "1.12.0"
 quint-connect = "=0.1.2"
 rust_decimal = "1.43.0"
@@ -136,18 +137,18 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 ############################################
 # Shared crates pinned to a published aux-common revision.
-alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+alloc-counter = { git = "https://github.com/u19r/aux-common", package = "alloc-counter", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+alloc-counter-macros = { git = "https://github.com/u19r/aux-common", package = "alloc-counter-macros", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+aws-sigv4-signing = { git = "https://github.com/u19r/aux-common", package = "aws-sigv4-signing", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+http-request = { git = "https://github.com/u19r/aux-common", package = "http-request", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+lru-ttl-cache = { git = "https://github.com/u19r/aux-common", package = "lru-ttl-cache", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+metrics-facade = { git = "https://github.com/u19r/aux-common", package = "metrics-facade", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+opt-loop-probe = { git = "https://github.com/u19r/aux-common", package = "opt-loop-probe", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
 
 # Scheduled jobs use the shared aux-common contract; storage owns provider adapters.
-bg-jobs-tokio = { git = "https://github.com/u19r/aux-common", package = "bg-jobs-tokio", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
-scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "af8fa7864eff802a1c1beb404b1ff1f1271f6c0a" }
+bg-jobs-tokio = { git = "https://github.com/u19r/aux-common", package = "bg-jobs-tokio", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+scheduled-bg-jobs = { package = "bg-jobs", git = "https://github.com/u19r/aux-common", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
+scheduled-bg-jobs-conformance = { package = "bg-jobs-conformance", git = "https://github.com/u19r/aux-common", rev = "13a283d32223ed27a37e9cf17f22ac16d26ca8a9" }
 
 ############################################
 # Local path dependencies
@@ -157,7 +158,7 @@ replication-types = { path = "crates/replication-types" }
 storage-types = { path = "crates/storage-types" }
 tokio-rusqlite = { path = "vended/tokio-rusqlite" }
 
-rusqlite = { version = "0.41.0", features = ["backup", "bundled", "hooks", "uuid"] }
+rusqlite = { version = "0.41.1", features = ["backup", "bundled", "hooks", "uuid"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
