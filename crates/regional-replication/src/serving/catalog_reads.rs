@@ -2,17 +2,17 @@ use std::{borrow::Cow, sync::Arc};
 
 use storage_provider::{
     DynamoAttempt, describe_time_to_live_from_table, get_table_stream_records_from_table,
-    latest_table_stream_pointer_from_table,
+    table_stream_checkpoint_from_table,
 };
 use storage_types::{
     BoundTableInfo, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, GetStreamRecordsRequest,
-    GetStreamRecordsResponse, StorageResult, StoredTableInfo, StreamItemId, TableName,
+    GetStreamRecordsResponse, StorageResult, StoredTableInfo, TableName,
 };
 
 use super::{read_operations::single_table, reads::RegionalPointRead};
 
 pub(super) struct TableInfoRead(pub(super) TableName);
-pub(super) struct StreamPointerRead(pub(super) TableName);
+pub(super) struct StreamPointerRead(pub(super) storage_types::TableHistoryTarget);
 
 impl RegionalPointRead for TableInfoRead {
     type Response = Arc<StoredTableInfo>;
@@ -42,10 +42,16 @@ impl RegionalPointRead for DescribeTimeToLiveRequest {
     }
 }
 
-impl RegionalPointRead for GetStreamRecordsRequest {
+pub(super) struct TableStreamRead(
+    pub(super) GetStreamRecordsRequest,
+    pub(super) storage_types::TimestampMillis,
+);
+
+impl RegionalPointRead for TableStreamRead {
     type Response = GetStreamRecordsResponse;
     fn table_names(&self) -> Cow<'_, [TableName]> {
-        self.table_name()
+        self.0
+            .table_name()
             .map_or(&[][..], std::slice::from_ref)
             .into()
     }
@@ -54,20 +60,54 @@ impl RegionalPointRead for GetStreamRecordsRequest {
         attempt: &mut A,
         tables: Vec<StorageResult<Arc<BoundTableInfo>>>,
     ) -> StorageResult<Self::Response> {
-        get_table_stream_records_from_table(attempt, single_table(tables)?.as_ref(), &self).await
+        get_table_stream_records_from_table(
+            attempt,
+            single_table(tables)?.as_ref(),
+            &self.0,
+            self.1,
+        )
+        .await
     }
 }
 
 impl RegionalPointRead for StreamPointerRead {
-    type Response = Option<StreamItemId>;
+    type Response = storage_types::TableStreamCheckpoint;
     fn table_names(&self) -> Cow<'_, [TableName]> {
-        std::slice::from_ref(&self.0).into()
+        std::slice::from_ref(&self.0.table_name).into()
     }
     async fn execute<A: DynamoAttempt>(
         self,
         attempt: &mut A,
         tables: Vec<StorageResult<Arc<BoundTableInfo>>>,
     ) -> StorageResult<Self::Response> {
-        latest_table_stream_pointer_from_table(attempt, single_table(tables)?.as_ref()).await
+        let table = single_table(tables)?;
+        if table.history_id != self.0.history_id {
+            return Err(storage_types::StorageError::table_not_found(
+                &self.0.table_name,
+            ));
+        }
+        table_stream_checkpoint_from_table(attempt, &table).await
+    }
+}
+
+pub(super) struct DynamoStreamRead<S>(pub(super) S, pub(super) storage_types::TimestampMillis);
+
+impl<S: storage_provider::DynamoStreamRead> RegionalPointRead for DynamoStreamRead<S> {
+    type Response = S::Response;
+    fn metadata_failure(self, error: storage_types::StorageError) -> StorageResult<Self::Response> {
+        self.0.metadata_failure(error)
+    }
+    fn table_names(&self) -> Cow<'_, [TableName]> {
+        std::slice::from_ref(&self.0.target().table_name).into()
+    }
+    async fn execute<A: DynamoAttempt>(
+        self,
+        attempt: &mut A,
+        tables: Vec<StorageResult<Arc<BoundTableInfo>>>,
+    ) -> StorageResult<Self::Response> {
+        match single_table(tables) {
+            Ok(table) => self.0.execute(attempt, table.as_ref(), self.1).await,
+            Err(error) => self.0.metadata_failure(error),
+        }
     }
 }

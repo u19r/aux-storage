@@ -31,7 +31,7 @@ struct PreparedExpiration {
 /// Original history, deterministic child disposition, source links and native
 /// deletion effects remain in this caller-owned attempt.
 pub(crate) async fn capture_expiration_deletions<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,
@@ -121,7 +121,7 @@ async fn allocate_expiration_publications<
     Ok((publications, provenance))
 }
 
-async fn prepare_expiration<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+async fn prepare_expiration<A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt>(
     journal: &JournalStore,
     attempt: &mut A,
     input: (
@@ -154,10 +154,7 @@ async fn prepare_expiration<A: stream_provider::retained_image::RetainedOwnershi
         digest: event.publication().digest(),
         disposition: EventDisposition::WinnerApplied,
     };
-    accepted.include_unpublished(
-        journal,
-        ((&event).into(), &receipt, Some(table.state().physical)),
-    )?;
+    accepted.include_unpublished(journal, ((&event).into(), &receipt, table.state().physical))?;
     Ok(PreparedExpiration { winner, partition })
 }
 

@@ -13,7 +13,7 @@ impl JournalStore {
     pub(crate) async fn begin_source_capture<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,
@@ -99,7 +99,7 @@ impl JournalStore {
     pub(crate) async fn freeze_capture_schema<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,
@@ -117,6 +117,7 @@ impl JournalStore {
                 return Err(corrupt_record());
             }
             let physical = attempt.read_table_at_stamp(&state.name, stamp).await?;
+            storage_provider::require_enabled_table_stream(&physical)?;
             self.require_table_gsi_ready(attempt, &physical).await?;
             let ttl = attempt.read_ttl_config(&physical).await?;
             if let Some(policy) = &ttl {
@@ -141,7 +142,7 @@ impl JournalStore {
     pub(crate) async fn observe_source_schema<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

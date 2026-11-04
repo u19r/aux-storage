@@ -14,9 +14,8 @@ use storage_types::{
     AttributeDefinition, AttributeValue, CreateTableRequest, DeleteItemRequest, ItemKey,
     KeyAttributeType, KeySchemaElement, KeyType, PutItemRequest, QueryTableRequest,
     STORAGE_LEADER_HINT_HEADER, STORAGE_NOT_LEADER_ERROR_TYPE, ScanTableRequest, StorageEnum,
-    StreamItemId, StreamName, TableName, TransactWriteItemsRequest, context::WrappedError as _,
+    StreamItemId, TableName, TransactWriteItemsRequest, context::WrappedError as _,
 };
-use stream::StreamProvider;
 
 use crate::{RemoteStorageProvider, constants::MAX_ENDPOINT_RETRIES};
 
@@ -58,6 +57,7 @@ fn describe_table_body(
         "Table": {
             "TableName": table_name.as_ref(),
             "TableStatus": "ACTIVE",
+            "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
             "CreationDateTime": 0,
             "AttributeDefinitions": attributes,
             "KeySchema": key_schema,
@@ -509,74 +509,60 @@ async fn transaction_cancellation_is_returned_once_with_complete_reasons() {
 }
 
 #[tokio::test]
-async fn table_stream_records_are_forwarded_to_the_remote_storage_api() {
+async fn given_bound_table_stream_when_read_remotely_then_identity_and_cursor_are_forwarded() {
+    use storage_types::{GetStreamRecordsRequest, TableHistoryTarget, TableStreamCheckpoint};
     let server = MockServer::start_async().await;
     let provider = provider_for(&server).await;
-    let table_name = TableName::new("tenant_a");
-    let starting_cursor = "000000000000000000000001"
-        .parse::<StreamItemId>()
-        .expect("starting cursor");
-    let next_cursor = "000000000000000000000002";
-
-    let stream_mock = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetStreamRecords")
-                .path("/")
-                .body_includes("\"TableName\":\"tenant_a\"")
-                .body_includes("\"LastEvaluatedKey\":\"000000000000000000000001\"")
-                .body_includes("\"Limit\":25");
-            then.status(200).json_body(serde_json::json!({
-                "TableName": "tenant_a",
-                "Records": [{
-                    "Keys": {"pk": {"S": "metric_batch_1"}},
-                    "SequenceNumber": "sequence_1",
-                    "NewImage": {"value": {"N": "7"}}
-                }],
-                "LastEvaluatedKey": next_cursor,
-                "TableFrontier": storage_types::TableStreamFrontier {
-                    table_history_id: 1u32.into(),
-                    oldest: Some(starting_cursor),
-                    head: Some(next_cursor.parse().expect("frontier head")),
-                }
-            }));
-        })
-        .await;
-
-    let (records, cursor) = provider
-        .get_stream_records_from_pointer_stream(
-            StreamName::table_stream(&table_name),
-            &[],
-            Some(starting_cursor),
-            Some(25),
+    let target = TableHistoryTarget {
+        table_name: TableName::new("tenant_a"),
+        history_id: 1_u32.into(),
+    };
+    let starting_pointer = StreamItemId::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let next_pointer = StreamItemId::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let scope = storage_types::SystemStreamScope::try_new("source", 1).unwrap();
+    let checkpoint = |offset: &str| {
+        TableStreamCheckpoint::try_new(
+            target.history_id,
+            scope.clone(),
+            vec![storage_types::SystemStreamPosition::try_new("shard", "lineage", offset).unwrap()],
+            storage_types::TableStreamReadProgress {
+                next_lane: 0,
+                initial_visibility_cutoff: None,
+            },
         )
-        .await
-        .expect("remote table stream records");
-
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sequence_number, "sequence_1");
-    assert_eq!(cursor.expect("next cursor").to_string(), next_cursor);
+        .unwrap()
+        .to_string()
+    };
+    let starting_cursor = checkpoint("1");
+    let next_cursor = checkpoint("2");
+    let stream_mock = server.mock_async(|when, then| {
+        when.method(POST)
+            .header("x-amz-target", "DynamoDB_20120810.GetStreamRecords")
+            .path("/")
+            .body_includes("\"TableName\":\"tenant_a\"")
+            .body_includes(format!("\"LastEvaluatedKey\":\"{starting_cursor}\""))
+            .body_includes("\"TableHistoryId\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]")
+            .body_includes("\"Limit\":25");
+        then.status(200).json_body(serde_json::json!({
+            "TableName": "tenant_a",
+            "Records": [{ "Keys": {"pk": {"S": "metric_batch_1"}}, "SequenceNumber": "sequence_1", "Item": {"value": {"N": "7"}} }],
+            "LastEvaluatedKey": next_cursor,
+            "TableFrontier": storage_types::TableStreamFrontier { table_history_id: target.history_id, source_scope: scope.clone(), lanes: vec![storage_types::TableStreamLaneFrontier {
+                shard_id: storage_types::SystemStreamShardId::try_new("shard").unwrap(), lineage_id: storage_types::SystemStreamLineageId::try_new("lineage").unwrap(),
+                oldest: Some(starting_pointer.into()), head: Some(next_pointer.into()),
+            }] }
+        }));
+    }).await;
+    let response = storage_provider::DynamoOperations::get_stream_records(
+        &provider,
+        GetStreamRecordsRequest::table_at_incarnation(target, Some(starting_cursor), Some(25)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.records().len(), 1);
+    assert_eq!(response.records()[0].sequence_number, "sequence_1");
+    assert_eq!(response.last_evaluated_key(), Some(next_cursor.as_str()));
     stream_mock.assert_calls_async(1).await;
-}
-
-#[tokio::test]
-async fn given_system_stream_when_remote_records_are_read_then_operation_is_rejected() {
-    let server = MockServer::start_async().await;
-    let provider = provider_for(&server).await;
-    let error = provider
-        .get_stream_records_from_pointer_stream(
-            StreamName::system_table_stream(),
-            &[],
-            None,
-            Some(25),
-        )
-        .await
-        .expect_err("remote system stream lineage is unsupported");
-    assert!(
-        error
-            .to_string()
-            .contains("Unsupported storage provider operation")
-    );
 }
 
 #[tokio::test]
@@ -596,6 +582,7 @@ async fn create_table_issues_remote_call() {
                 "TableDescription": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": attributes,
                     "KeySchema": key_schema,
@@ -642,6 +629,7 @@ async fn create_table_enables_controls_for_managed_tables() {
                 "TableDescription": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": create_attributes,
                     "KeySchema": create_key_schema,
@@ -666,6 +654,7 @@ async fn create_table_enables_controls_for_managed_tables() {
                 "Table": {
                     "TableName": "sys",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("sys").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -702,6 +691,7 @@ async fn create_table_enables_controls_for_managed_tables() {
                 "TableDescription": {
                     "TableName": "sys",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("sys").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -769,6 +759,7 @@ async fn create_table_skips_managed_controls_when_auxfn_storage_surface_does_not
                 "TableDescription": {
                     "TableName": "sys",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("sys").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -792,6 +783,7 @@ async fn create_table_skips_managed_controls_when_auxfn_storage_surface_does_not
                 "Table": {
                     "TableName": "sys",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("sys").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -882,6 +874,7 @@ fn describe_table_mock<'a>(
                 "Table": {
                     "TableName": table_name,
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -994,6 +987,7 @@ async fn failover_retries_next_endpoint_on_server_error() {
                 "Table": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -1056,6 +1050,7 @@ async fn validation_error_does_not_trigger_failover() {
                 "Table": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -1113,6 +1108,7 @@ async fn not_leader_hint_promotes_leader_endpoint_and_retries() {
                 "Table": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -1176,6 +1172,7 @@ async fn http_redirects_are_not_followed_implicitly() {
                 "Table": {
                     "TableName": table_name.as_ref(),
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, (table_name.as_ref()).as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -1227,4 +1224,76 @@ async fn single_endpoint_exhausts_retries() {
 
     let hits = failing_mock.calls_async().await;
     assert_eq!(hits, MAX_ENDPOINT_RETRIES);
+}
+
+#[tokio::test]
+async fn given_dynamodb_stream_requests_when_forwarded_then_standard_actions_preserve_images() {
+    use storage_provider::DynamoOperations;
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let description = server.mock_async(|when, then| {
+        when.method(POST).path("/").header("x-amz-target", "DynamoDBStreams_20120810.DescribeStream")
+            .json_body(serde_json::json!({"StreamArn": "stream-arn"}));
+        then.status(200).json_body(serde_json::json!({"StreamDescription": {
+            "StreamArn": "stream-arn", "StreamLabel": "label", "StreamStatus": "ENABLED",
+            "StreamViewType": "NEW_AND_OLD_IMAGES", "CreationRequestDateTime": 1,
+            "TableName": "tenant_a", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "Shards": [{"ShardId": "shard-1", "SequenceNumberRange": {"StartingSequenceNumber": "1"}}]
+        }}));
+    }).await;
+    let iterator = server.mock_async(|when, then| {
+        when.method(POST).path("/").header("x-amz-target", "DynamoDBStreams_20120810.GetShardIterator")
+            .json_body(serde_json::json!({"StreamArn": "stream-arn", "ShardId": "shard-1", "ShardIteratorType": "LATEST"}));
+        then.status(200).json_body(serde_json::json!({"ShardIterator": "iterator-1"}));
+    }).await;
+    let records = server.mock_async(|when, then| {
+        when.method(POST).path("/").header("x-amz-target", "DynamoDBStreams_20120810.GetRecords")
+            .json_body(serde_json::json!({"ShardIterator": "iterator-1", "Limit": 1}));
+        then.status(200).json_body(serde_json::json!({"NextShardIterator": "iterator-2", "Records": [{
+            "eventID": "event-1", "eventName": "MODIFY", "eventVersion": "1.0",
+            "eventSource": "aws:dynamodb", "awsRegion": "eu-north-1", "dynamodb": {
+                "Keys": {"pk": {"S": "key"}}, "SequenceNumber": "1", "StreamViewType": "NEW_AND_OLD_IMAGES",
+                "SizeBytes": 100, "OldImage": {"pk": {"S": "key"}, "value": {"S": "old"}},
+                "NewImage": {"pk": {"S": "key"}, "value": {"S": "new"}}
+            }
+        }]}));
+    }).await;
+    let described = provider
+        .describe_stream(
+            serde_json::from_value(serde_json::json!({"StreamArn": "stream-arn"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(described.stream_description.shards[0].shard_id, "shard-1");
+    let issued = provider.get_shard_iterator(serde_json::from_value(serde_json::json!({"StreamArn": "stream-arn", "ShardId": "shard-1", "ShardIteratorType": "LATEST"})).unwrap()).await.unwrap();
+    let page = provider
+        .get_records(storage_types::GetRecordsRequest {
+            shard_iterator: issued.shard_iterator,
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.next_shard_iterator.as_deref(), Some("iterator-2"));
+    assert_eq!(page.records[0].event_name, "MODIFY");
+    assert_eq!(
+        page.records[0]
+            .dynamodb
+            .old_image
+            .as_ref()
+            .unwrap()
+            .get("value"),
+        Some(&AttributeValue::S("old".into()))
+    );
+    assert_eq!(
+        page.records[0]
+            .dynamodb
+            .new_image
+            .as_ref()
+            .unwrap()
+            .get("value"),
+        Some(&AttributeValue::S("new".into()))
+    );
+    for mock in [description, iterator, records] {
+        mock.assert_calls_async(1).await;
+    }
 }

@@ -4,17 +4,14 @@ use std::future::Future;
 
 use storage_common::ttl::{TtlConfigRecord, TtlPolicyChange};
 use storage_types::{
-    BoundTableInfo, StorageResult, TimestampMillis, UpdateTimeToLiveRequest,
+    BoundTableInfo, StorageResult, TimeToLiveSpecification, TimestampMillis,
     UpdateTimeToLiveResponse,
 };
 
-use crate::{
-    DescribeTimeToLiveAttempt, SemanticDecision, TableMetadataCache,
-    dynamo_catalog::resolve_prepared_table_in_attempt,
-};
+use crate::{DescribeTimeToLiveAttempt, SemanticDecision};
 
 pub trait UpdateTimeToLiveAttempt:
-    DescribeTimeToLiveAttempt + crate::TableUpdateTransaction<Catalog = BoundTableInfo>
+    DescribeTimeToLiveAttempt + crate::TableUpdateTransaction
 {
     fn write_ttl_config(
         &mut self,
@@ -47,33 +44,27 @@ pub trait UpdateTimeToLiveAttempt:
 /// `Enabling` until the bounded maintenance job finishes its existing items.
 pub async fn update_time_to_live_in_attempt<A: UpdateTimeToLiveAttempt>(
     attempt: &mut A,
-    cache: &TableMetadataCache,
-    request: &UpdateTimeToLiveRequest,
+    table: &BoundTableInfo,
+    specification: &TimeToLiveSpecification,
     now: TimestampMillis,
 ) -> StorageResult<SemanticDecision<UpdateTimeToLiveResponse>> {
     let mut settlement =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
-        let (prepared, _) =
-            match resolve_prepared_table_in_attempt(attempt, cache, &request.table_name).await? {
-                SemanticDecision::Accepted(table) => table,
-                SemanticDecision::Rejected(error) => return Ok(SemanticDecision::Rejected(error)),
-            };
-        let table = prepared.table;
-        let existing = attempt.read_ttl_config(&table).await?;
+        let existing = attempt.read_ttl_config(table).await?;
         let change = match TtlPolicyChange::try_new(
-            &request.table_name,
-            &request.time_to_live_specification,
+            &table.info.table_name,
+            specification,
             existing.as_ref(),
             now,
         )? {
             SemanticDecision::Accepted(change) => change,
             SemanticDecision::Rejected(error) => return Ok(SemanticDecision::Rejected(error)),
         };
-        attempt.install_ttl_policy(&table, change).await?;
+        attempt.install_ttl_policy(table, change).await?;
         Ok(SemanticDecision::Accepted(UpdateTimeToLiveResponse {
-            time_to_live_specification: request.time_to_live_specification.clone(),
+            time_to_live_specification: specification.clone(),
         }))
     }
     .await;

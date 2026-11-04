@@ -21,6 +21,7 @@ fn identity() -> KvTableIdentity {
         }],
         index_id_high_water: 1,
         deleted: false,
+        external_cleanup_required: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn build() -> GsiBuild<Vec<u8>> {
     .unwrap();
     GsiBuild::new(
         GsiBuildTarget {
+            history_id: 1u32.into(),
             table_name: TableName::new("orders"),
             index_name: IndexName::new("by-status"),
             incarnation: TargetIncarnation::from(index_incarnation(1, 1)),
@@ -55,6 +57,11 @@ fn given_invalid_kv_build_records_when_decoding_lifecycle_then_missing_and_chang
     assert!(decode_gsi_lifecycle(&identity(), vec![None]).is_err());
     for target in [
         GsiBuildTarget {
+            history_id: 2u32.into(),
+            ..build().target
+        },
+        GsiBuildTarget {
+            history_id: 1u32.into(),
             table_name: TableName::new("another-table"),
             ..build().target
         },

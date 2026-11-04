@@ -126,6 +126,7 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
             indexes
                 .into_iter()
                 .map(|index| GlobalSecondaryIndex {
+                    capture_for_build: false,
                     index_name: index.index_name,
                     key_schema: index.key_schema,
                     projection: index.projection,
@@ -136,7 +137,6 @@ pub(crate) fn to_table_info(table: TableDescription) -> StoredTableInfo {
         item_count: table.item_count,
         stream_specification: table.stream_specification,
         table_stream_duration: storage_types::StreamRetentionDuration::default(),
-        default_item_stream_duration: storage_types::StreamRetentionDuration::default(),
         deletion_protection_enabled: table.deletion_protection_enabled,
     }
 }
@@ -430,6 +430,7 @@ pub(super) fn error_label(error: &StorageError) -> &'static str {
         StorageEnum::InternalServerError { .. } => "internal_server_error",
         StorageEnum::HistoryUnavailable => "history_unavailable",
         StorageEnum::HistoryExpired => "history_expired",
+        StorageEnum::TrimmedDataAccess => "trimmed_data_access",
         StorageEnum::GuardConflict { .. } => "guard_conflict",
         StorageEnum::Unsupported { .. } => "unsupported",
         StorageEnum::ConditionalCheckFailed

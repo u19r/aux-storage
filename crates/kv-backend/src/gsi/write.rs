@@ -1,12 +1,38 @@
 //! Apply shared projection decisions to KV GSI rows.
 
+use std::collections::BTreeMap;
+
 use foundationdb_tuple::{TupleDepth, TupleUnpack, pack_into, unpack};
 use storage_backfill::{GsiProjectionKey, GsiProjectionWriteBatch};
-use storage_provider::{GsiProjectionOwner, GsiWriteSource};
+use storage_provider::GsiWriteSource;
 use storage_types::{BoundTableInfo, ItemRevision, StorageError, StorageResult, WireItem};
 
 use super::key_layout::{ProjectionKeys, projection_suffix};
 use crate::catalog::{KvIndexKind, KvTableIdentity};
+
+#[derive(Default)]
+pub(crate) struct ProjectionChanges {
+    pub(super) rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl ProjectionChanges {
+    pub(crate) fn into_mutations(self) -> StorageResult<Vec<crate::KvMutation>> {
+        let mut mutations = Vec::new();
+        mutations
+            .try_reserve_exact(self.rows.len())
+            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        for (key, value) in self.rows {
+            let is_image = key.first() == Some(&crate::constants::GSI_PROJECTION_FAMILY);
+            mutations.push(match (is_image, value) {
+                (true, Some(value)) => crate::KvMutation::Put { key, value },
+                (true, None) => crate::KvMutation::Delete { key },
+                (false, Some(value)) => crate::KvMutation::PutUnchunked { key, value },
+                (false, None) => crate::KvMutation::DeleteUnchunked { key },
+            });
+        }
+        Ok(mutations)
+    }
+}
 
 pub(crate) struct GsiWriteInput<'a> {
     pub identity: &'a KvTableIdentity,
@@ -18,76 +44,26 @@ pub(crate) struct GsiWriteInput<'a> {
 
 /// Encode the writes already decided by the shared GSI executor. Its
 /// destination observations were protected in this native attempt.
-pub(crate) async fn prepare_gsi_writes<A: crate::KvAttempt>(
+pub(crate) fn prepare_gsi_writes<A: crate::KvAttempt>(
     catalog: &mut crate::catalog::KvCatalogAttempt<'_, A>,
     input: GsiWriteInput<'_>,
 ) -> StorageResult<()> {
     let mut operation =
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(catalog);
     let catalog = operation.as_mut();
-    let result = async {
-        let table = input.table;
-        let (rows, plans) = bind_gsi_writes(input)?;
-        let mut transitions = Vec::new();
-        let mut writes = Vec::new();
-        transitions
-            .try_reserve_exact(rows.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        writes
-            .try_reserve_exact(rows.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let previous = BoundGsiWrite::load_descriptors(catalog, table, &rows).await?;
-        let mut images =
-            stream_provider::retained_image::AcceptedProjectionPlan::prepare_batch(catalog, plans)
-                .await?
-                .into_iter();
-        for (row, previous) in rows.into_iter().zip(previous) {
-            let image =
-                match row.state {
-                    ProjectionWriteState::Live => Some(images.next().ok_or_else(|| {
-                        StorageError::internal("Missing GSI projection descriptor")
-                    })?),
-                    ProjectionWriteState::Deleted => None,
-                };
-            transitions.push(
-                row.owner
-                    .prepare_transition(previous.as_ref(), image.as_ref())?,
-            );
-            writes.push((row, image));
-        }
-        // Tree edits hydrate the old leaf under its current ownership receipt.
-        // Stage them before replacing that receipt; the caller commits both
-        // together.
-        for (row, image) in writes {
-            row.store(catalog, table, image).await?;
-        }
-        stream_provider::retained_image::RetainedOwnerTransition::prepare_batch(
-            catalog,
-            transitions,
-        )
-        .await?;
-        if images.next().is_some() {
-            return Err(StorageError::internal("Unused GSI projection descriptor"));
+    let result = (|| {
+        for row in bind_gsi_writes(input)? {
+            row.store(&mut catalog.projection_changes)?;
         }
         Ok(())
-    }
-    .await;
+    })();
     operation.complete(result)
 }
 
-fn bind_gsi_writes(
-    input: GsiWriteInput<'_>,
-) -> StorageResult<(
-    Vec<BoundGsiWrite>,
-    Vec<stream_provider::retained_image::AcceptedProjectionPlan>,
-)> {
+fn bind_gsi_writes(input: GsiWriteInput<'_>) -> StorageResult<Vec<BoundGsiWrite>> {
     let mut rows = Vec::new();
-    let mut plans = Vec::new();
     let writes = input.writes.into_iter();
     rows.try_reserve_exact(writes.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    plans
-        .try_reserve_exact(writes.len())
         .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
     for write in writes {
         input.source.validate(&write)?;
@@ -103,13 +79,9 @@ fn bind_gsi_writes(
             Some(position) => input.prepared.swap_remove(position),
             None => PreparedGsiWrite::try_new(input.table, &write.key, write.row.as_ref())?,
         };
-        let (row, image) = prepared.bind(input.identity, input.table, write.item_version)?;
-        if let Some(image) = image {
-            plans.push(image);
-        }
-        rows.push(row);
+        rows.push(prepared.bind(input.identity, write.item_version)?);
     }
-    Ok((rows, plans))
+    Ok(rows)
 }
 
 /// A new live image or an old-image tombstone, without its protected revision.
@@ -117,12 +89,7 @@ pub(crate) struct PreparedGsiWrite {
     pub(crate) history_id: storage_types::TableHistoryId,
     pub(crate) key: GsiProjectionKey,
     suffix: Vec<u8>,
-    image: PreparedProjectionImage,
-}
-
-enum PreparedProjectionImage {
-    NewItem(stream_provider::retained_image::AcceptedProjectionPlan),
-    DeletedItem,
+    image: Option<Vec<u8>>,
 }
 
 impl PreparedGsiWrite {
@@ -131,16 +98,20 @@ impl PreparedGsiWrite {
         key: &GsiProjectionKey,
         row: Option<&storage_backfill::GsiProjectedRow>,
     ) -> StorageResult<Self> {
-        let image = match row {
-            Some(row) => PreparedProjectionImage::NewItem(
-                stream_provider::retained_image::AcceptedProjectionPlan::try_new(
+        let image = row
+            .map(|row| {
+                let image = row.projected_image()?;
+                let declaration = storage_types::IndexerDeclaration::try_new(
+                    Vec::new(),
+                    storage_types::MaxIndexers::ZERO,
+                )?;
+                storage_types::MaterializedItemRecord::encode(
                     table.history_id,
-                    &row.source_item,
-                    &row.projection,
-                )?,
-            ),
-            None => PreparedProjectionImage::DeletedItem,
-        };
+                    &image,
+                    &declaration,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             history_id: table.history_id,
             key: key.clone(),
@@ -152,12 +123,8 @@ impl PreparedGsiWrite {
     fn bind(
         self,
         identity: &KvTableIdentity,
-        table: &BoundTableInfo,
         revision: ItemRevision,
-    ) -> StorageResult<(
-        BoundGsiWrite,
-        Option<stream_provider::retained_image::AcceptedProjectionPlan>,
-    )> {
+    ) -> StorageResult<BoundGsiWrite> {
         let index_id = identity
             .indexes
             .iter()
@@ -166,125 +133,25 @@ impl PreparedGsiWrite {
             })
             .ok_or_else(|| StorageError::internal("GSI projection has no KV index identity"))?
             .index_id;
-        let owner = GsiProjectionOwner::try_new(
-            table,
-            &self.key,
-            &super::key_layout::index_incarnation(identity.table_id, index_id).into(),
-        )?;
         let keys = ProjectionKeys::try_from_suffix(identity.table_id, index_id, self.suffix)?;
-        let (image, state) = match self.image {
-            PreparedProjectionImage::NewItem(image) => (Some(image), ProjectionWriteState::Live),
-            PreparedProjectionImage::DeletedItem => (None, ProjectionWriteState::Deleted),
-        };
-        Ok((
-            BoundGsiWrite {
-                keys,
-                index: self.key.index_name,
-                revision,
-                state,
-                owner,
-            },
-            image,
-        ))
+        Ok(BoundGsiWrite {
+            keys,
+            revision,
+            image: self.image,
+        })
     }
 }
 
 struct BoundGsiWrite {
-    index: storage_types::IndexName,
     keys: ProjectionKeys,
     revision: ItemRevision,
-    state: ProjectionWriteState,
-    owner: GsiProjectionOwner,
-}
-
-enum ProjectionWriteState {
-    Live,
-    Deleted,
+    image: Option<Vec<u8>>,
 }
 
 impl BoundGsiWrite {
-    async fn load_descriptors<A: crate::KvAttempt>(
-        catalog: &mut crate::catalog::KvCatalogAttempt<'_, A>,
-        table: &BoundTableInfo,
-        rows: &[Self],
-    ) -> StorageResult<Vec<Option<stream_provider::retained_image::RetainedProjectionRecord>>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        let count = rows
-            .len()
-            .checked_mul(2)
-            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        let mut keys = Vec::new();
-        let mut previous = Vec::new();
-        keys.try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        previous
-            .try_reserve_exact(rows.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        for row in rows {
-            keys.push(copy_descriptor_bytes(&row.keys.live)?);
-            keys.push(copy_descriptor_bytes(&row.keys.tombstone)?);
-        }
-        let maximum =
-            (stream_provider::retained_image::RetainedProjectionRecord::encoded_length_bound()?
-                + 10
-                + crate::constants::GSI_REVISION_BYTES)
-                .checked_mul(rows.len())
-                .ok_or_else(|| StorageError::internal("GSI descriptor read bound overflow"))?;
-        let mut values = catalog
-            .attempt
-            .get_batch_bounded(
-                keys,
-                crate::ReadProtection::Conflict,
-                std::num::NonZeroUsize::new(maximum)
-                    .ok_or_else(|| StorageError::internal("Empty GSI descriptor budget"))?,
-            )
-            .await?;
-        if values.len() != count {
-            return Err(StorageError::internal("GSI descriptor read count differs"));
-        }
-        let keys = rows
-            .iter()
-            .flat_map(|row| [&row.keys.live, &row.keys.tombstone]);
-        for (key, value) in keys.zip(&mut values) {
-            if let Some(pending) = catalog.projection_tree.rows.get(key) {
-                *value = pending.as_deref().map(copy_descriptor_bytes).transpose()?;
-            }
-        }
-        for values in values.as_chunks::<2>().0 {
-            let state = decode_projection_state(table, values[0].as_deref(), values[1].as_deref())?;
-            match state {
-                Some(PhysicalProjection::Live(_)) => {
-                    let value = values[0].as_deref().ok_or_else(|| {
-                        StorageError::internal("Missing live projection descriptor")
-                    })?;
-                    let envelope = ProjectionEnvelope::decode(value)?;
-                    previous.push(Some(
-                        stream_provider::retained_image::RetainedProjectionRecord::decode(
-                            envelope.item,
-                            table.history_id,
-                            crate::constants::PAGE_READ_BYTES.get(),
-                        )?,
-                    ));
-                }
-                Some(PhysicalProjection::Tombstone(_)) | None => previous.push(None),
-            }
-        }
-        Ok(previous)
-    }
-
-    async fn store<A: crate::KvAttempt>(
-        self,
-        catalog: &mut crate::catalog::KvCatalogAttempt<'_, A>,
-        table: &BoundTableInfo,
-        image: Option<stream_provider::retained_image::RetainedProjectionRecord>,
-    ) -> StorageResult<()> {
-        let (value, tombstone) = match self.state {
-            ProjectionWriteState::Live => {
-                let image = image
-                    .ok_or_else(|| StorageError::internal("Missing GSI projection descriptor"))?
-                    .encode()?;
+    fn store(self, changes: &mut ProjectionChanges) -> StorageResult<()> {
+        let (value, tombstone) = match self.image {
+            Some(image) => {
                 let bytes = 10usize
                     .checked_add(image.len())
                     .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
@@ -297,27 +164,18 @@ impl BoundGsiWrite {
                 value.extend_from_slice(&image);
                 (Some(value), None)
             }
-            ProjectionWriteState::Deleted => (
+            None => (
                 None,
-                Some(copy_descriptor_bytes(&self.revision.get().to_be_bytes())?),
+                Some(copy_projection_bytes(&self.revision.get().to_be_bytes())?),
             ),
         };
-        super::tree_write::store_tree(
-            catalog,
-            super::tree_write::TreeWrite {
-                table,
-                index: &self.index,
-                scope: self.keys.scope,
-                word: self.keys.word,
-                value,
-                tombstone,
-            },
-        )
-        .await
+        changes.rows.insert(self.keys.live, value);
+        changes.rows.insert(self.keys.tombstone, tombstone);
+        Ok(())
     }
 }
 
-pub(super) fn copy_descriptor_bytes(bytes: &[u8]) -> StorageResult<Vec<u8>> {
+pub(super) fn copy_projection_bytes(bytes: &[u8]) -> StorageResult<Vec<u8>> {
     let mut copied = Vec::new();
     copied
         .try_reserve_exact(bytes.len())
@@ -340,10 +198,10 @@ pub(super) fn decode_projection_state(
         (Some(_), Some(_)) => Err(StorageError::internal("GSI has live and tombstone rows")),
         (Some(bytes), None) => {
             let projection = ProjectionEnvelope::decode(bytes)?;
-            stream_provider::retained_image::RetainedProjectionRecord::decode(
+            storage_types::MaterializedItemRecord::decode(
                 projection.item,
                 table.history_id,
-                crate::constants::PAGE_READ_BYTES.get(),
+                storage_types::MaterializedItemRecord::encoded_length_bound(),
             )?;
             ItemRevision::try_from(projection.revision)
                 .map(PhysicalProjection::Live)
@@ -368,7 +226,7 @@ struct ProjectionEnvelope<'a> {
     item: &'a [u8],
 }
 
-pub(crate) struct HydratedProjection {
+pub(crate) struct DecodedProjection {
     pub image: WireItem,
     pub revision: ItemRevision,
 }
@@ -385,91 +243,20 @@ impl<'a> ProjectionEnvelope<'a> {
     }
 }
 
-pub(super) fn projection_read_work(table: &BoundTableInfo, value: &[u8]) -> StorageResult<usize> {
-    let maximum = crate::constants::PAGE_READ_BYTES.get();
+pub(super) fn decode_projection(
+    table: &BoundTableInfo,
+    value: &[u8],
+) -> StorageResult<DecodedProjection> {
     let envelope = ProjectionEnvelope::decode(value)?;
-    ItemRevision::try_from(envelope.revision)?;
-    stream_provider::retained_image::RetainedProjectionRecord::decode(
+    let revision = ItemRevision::try_from(envelope.revision)?;
+    let image = storage_types::MaterializedItemRecord::decode(
         envelope.item,
         table.history_id,
-        maximum,
+        storage_types::MaterializedItemRecord::encoded_length_bound(),
     )?
-    .read_work_bytes(maximum)
-}
-
-pub(crate) async fn hydrate_projections<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
->(
-    attempt: &mut A,
-    table: &BoundTableInfo,
-    values: &[crate::KvEntry],
-    target: &storage_backfill::GsiBuildTarget,
-) -> StorageResult<Vec<HydratedProjection>> {
-    let mut settlement =
-        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-    let attempt = settlement.as_mut();
-    let result = async {
-        let maximum = crate::constants::PAGE_READ_BYTES.get();
-        let mut records = Vec::with_capacity(values.len());
-        let mut revisions = Vec::with_capacity(values.len());
-        for value in values {
-            let envelope = ProjectionEnvelope::decode(&value.value)?;
-            revisions.push(ItemRevision::try_from(envelope.revision)?);
-            records.push(
-                stream_provider::retained_image::RetainedProjectionRecord::decode(
-                    envelope.item,
-                    table.history_id,
-                    maximum,
-                )?,
-            );
-        }
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-        if target.table_name != table.table_name {
-            return Err(StorageError::internal(
-                "GSI hydration target differs from table",
-            ));
-        }
-        let proofs = records
-            .iter()
-            .map(stream_provider::retained_image::RetainedProjectionRecord::owner_proof)
-            .collect::<StorageResult<Vec<_>>>()?;
-        let images = stream_provider::retained_image::RetainedProjectionRecord::hydrate(
-            attempt, records, maximum,
-        )
-        .await?;
-        if images.len() != revisions.len() {
-            return Err(StorageError::internal("GSI hydration count differs"));
-        }
-        let receipts = images
-            .iter()
-            .zip(proofs)
-            .map(|(image, proof)| {
-                storage_provider::GsiProjectionOwner::from_image(
-                    table,
-                    &target.index_name,
-                    &target.incarnation,
-                    image,
-                )?
-                .prepare_read_receipt(proof)
-            })
-            .collect::<StorageResult<Vec<_>>>()?;
-        stream_provider::retained_image::RetainedOwnerRecord::require_current_batch(
-            attempt, &receipts,
-        )
-        .await?;
-        Ok(images
-            .into_iter()
-            .zip(revisions)
-            .map(|(stored, revision)| HydratedProjection {
-                image: stored,
-                revision,
-            })
-            .collect())
-    }
-    .await;
-    settlement.complete(result)
+    .into_stored(storage_types::MaxIndexers::ZERO)?
+    .item;
+    Ok(DecodedProjection { image, revision })
 }
 
 impl<'a> TupleUnpack<'a> for ProjectionEnvelope<'a> {

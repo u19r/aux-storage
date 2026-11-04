@@ -28,7 +28,6 @@ fn table() -> Arc<StoredTableInfo> {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
-        default_item_stream_duration: StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
         deletion_protection_enabled: false,
     })
 }
@@ -40,6 +39,7 @@ fn keys_only_gsi_table() -> Arc<StoredTableInfo> {
         attribute_type: KeyAttributeType::S,
     });
     table.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+        capture_for_build: false,
         index_name: IndexName::new("gsi"),
         key_schema: vec![KeySchemaElement {
             attribute_name: "gsi_pk".to_string(),

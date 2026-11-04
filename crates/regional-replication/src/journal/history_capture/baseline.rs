@@ -44,7 +44,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_retained_baseline_page<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -72,7 +72,16 @@ impl JournalStore {
             let page = self
                 .load_baseline_page(
                     attempt,
-                    (request.proposal.operation().lineage, input.1.after.clone()),
+                    (
+                        replication_provider::control::borrow_addition_source(
+                            &request.proposal,
+                            &self.region,
+                        )
+                        .map_err(|_| corrupt_record())?
+                        .physical,
+                        request.proposal.operation().lineage,
+                        input.1.after.clone(),
+                    ),
                     (input.0, budget),
                 )
                 .await?;

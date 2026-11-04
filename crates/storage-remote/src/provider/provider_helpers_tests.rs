@@ -69,7 +69,6 @@ fn table_info() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: Default::default(),
-        default_item_stream_duration: Default::default(),
         deletion_protection_enabled: false,
     }
 }

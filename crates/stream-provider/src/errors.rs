@@ -46,37 +46,8 @@ pub enum StreamInternalKind {
     CleanupTask,
     Deserialization,
     InvalidOrMissingKeyAttribute,
-    ParseNewImage,
-    ParseOldImage,
-    ParseStreamPointer,
     Serialization,
     Message,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamContinuityKind {
-    CursorMissing,
-    CursorIdentityMismatch,
-    BoundaryMismatch,
-    ResumePositionMissing,
-    CursorPositionRegressed,
-    ProtectedRetentionLost,
-    Unsupported,
-}
-
-impl StreamContinuityKind {
-    #[must_use]
-    pub const fn message(self) -> &'static str {
-        match self {
-            Self::CursorMissing => "protected cursor is missing",
-            Self::CursorIdentityMismatch => "protected cursor identity mismatch",
-            Self::BoundaryMismatch => "protected cursor boundary mismatch",
-            Self::ResumePositionMissing => "protected cursor resume position is missing",
-            Self::CursorPositionRegressed => "protected cursor position regressed",
-            Self::ProtectedRetentionLost => "protected stream retention was lost",
-            Self::Unsupported => "protected cursor continuity is unsupported",
-        }
-    }
 }
 
 impl StreamInternalKind {
@@ -86,9 +57,6 @@ impl StreamInternalKind {
             Self::CleanupTask => "cleanup task failed",
             Self::Deserialization => "deserialization failed",
             Self::InvalidOrMissingKeyAttribute => "invalid or missing key attribute",
-            Self::ParseNewImage => "parse new image failed",
-            Self::ParseOldImage => "parse old image failed",
-            Self::ParseStreamPointer => "parse stream pointer failed",
             Self::Serialization => "serialization failed",
             Self::Message => "internal server error",
         }
@@ -170,12 +138,6 @@ pub enum StreamEnum {
         message: String,
     },
 
-    #[error("Stream continuity error: {message}")]
-    Continuity {
-        kind: StreamContinuityKind,
-        message: String,
-    },
-
     #[error(transparent)]
     StorageError(#[from] StorageError),
 
@@ -217,13 +179,6 @@ impl StreamError {
 
     pub fn internal_with_detail(kind: StreamInternalKind, detail: impl std::fmt::Display) -> Self {
         Self::from(StreamEnum::Internal {
-            kind,
-            message: format!("{}: {detail}", kind.message()),
-        })
-    }
-
-    pub fn continuity(kind: StreamContinuityKind, detail: impl std::fmt::Display) -> Self {
-        Self::from(StreamEnum::Continuity {
             kind,
             message: format!("{}: {detail}", kind.message()),
         })
@@ -285,7 +240,6 @@ impl From<StreamEnum> for StorageEnum {
                 kind: storage_types::StorageValidationKind::Message,
                 message,
             },
-            StreamEnum::Continuity { message, .. } => StorageEnum::InternalServerError { message },
             StreamEnum::Internal { message, .. } => StorageEnum::InternalServerError { message },
             StreamEnum::ResourceExists {
                 resource_type,

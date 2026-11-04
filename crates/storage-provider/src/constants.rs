@@ -6,13 +6,18 @@ use std::{
 use storage_types::WriteRetryPolicy;
 
 pub(crate) const NAME_REUSE_DELAY_MILLIS: i64 = 30_000;
+pub(crate) const DYNAMODB_STREAM_ITERATOR_VERSION: &str = "aux-stream-v2";
 
 /// One known-abort retry policy for every local Dynamo write family.
+/// The initial jitter must span multiple timer ticks to disperse hot-key
+/// writers.
 pub const DYNAMO_WRITE_RETRY: WriteRetryPolicy =
-    WriteRetryPolicy::new(12, Duration::from_millis(1));
+    WriteRetryPolicy::new(12, Duration::from_millis(5));
 
 /// Bound physical catalog reads before decoding table metadata or names.
 pub const CATALOG_READ_BYTES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
+pub(crate) const TABLE_STREAM_INITIALIZATION_KEY_BYTES: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(255);
 
 /// SQL page-progress budget for full-request receipts persisted by previous
 /// writers. The first row may exceed it; this is not a hard receipt or native
@@ -36,7 +41,6 @@ pub(crate) const INTERNAL_TABLE_NAMES: [&str; 3] = ["sys", "ana", "rep"];
 
 /// Query and Scan count logical source bytes before filtering and projection.
 pub const MAX_RANGE_READ_EVALUATED_BYTES: u64 = 1024 * 1024;
-pub const STREAM_TRIM_DUE_BUCKET_MILLIS: i64 = 60 * 60 * 1000;
 pub const EXPIRATION_SCAN_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(4 * 1024 * 1024 - 1);
 pub(crate) const SCHEDULED_JOB_MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
@@ -60,6 +64,23 @@ pub(crate) const JOB_EFFECT_RECEIPT_PREFIX: &str = "job-effect:";
 /// Global bounded discovery scope for exact retired index incarnations.
 pub(crate) const GSI_RECLAIM_NAMESPACE: &str = "dynamo-gsi-reclaim";
 
-/// Projection custody identity; the digest never participates in index
-/// ordering.
-pub(crate) const GSI_PROJECTION_OWNER_IDENTITY_TAG: &[u8] = b"aux-storage-projection-owner-v1";
+/// Bound catch-up pointer admission before resolving history payloads.
+pub(crate) const GSI_STREAM_PAGE_ROWS: u32 = 32;
+
+/// Exact current/predecessor admission includes native stream envelopes.
+pub(crate) const TABLE_HISTORY_READ_BYTES: NonZeroUsize =
+    NonZeroUsize::MIN.saturating_add(8 * 1024 * 1024 - 1);
+/// Reserve protocol fields in addition to the measured frontier and token.
+pub(crate) const TABLE_STREAM_RESPONSE_RESERVE_BYTES: usize = 64 * 1024;
+
+/// DynamoDB GetRecords returns at most 1 MiB per page.
+pub(crate) const DYNAMODB_STREAM_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Bound one cleanup transaction independently of marker discovery size.
+pub(crate) const TABLE_CLEANUP_PAGE_ROWS: usize = 32;
+/// Pending table work yields one discovery window before its next job turn.
+pub(crate) const TABLE_CLEANUP_YIELD_MILLIS: u8 = 1;
+pub(crate) const TABLE_RECLAIM_SYSTEM_ROWS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
+
+pub(crate) const TABLE_STREAM_INITIALIZATION_NAMESPACE: &str =
+    "aux-storage:stream-initialization:v1";

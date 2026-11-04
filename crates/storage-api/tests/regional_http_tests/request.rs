@@ -142,6 +142,7 @@ impl HttpRegion {
 
     pub(super) async fn enable(&self) -> Result<()> {
         self.request("CreateTable", json!({"TableName": TABLE, "BillingMode": "PAY_PER_REQUEST",
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "value", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}], "GlobalSecondaryIndexes": [{"IndexName": "value-index", "KeySchema": [{"AttributeName": "value", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}]})).await?;
         self.put("baseline", "before-enable").await?;

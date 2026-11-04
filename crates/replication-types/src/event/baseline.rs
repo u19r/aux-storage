@@ -67,7 +67,7 @@ impl BaselineItem {
             rank: EffectRank::Mutation,
         };
         Ok((
-            version.clone().expiration_id(),
+            version.expiration_id()?,
             AcceptedItemEvent {
                 source_table: self.source_table,
                 lineage: self.lineage,

@@ -40,8 +40,14 @@ impl JournalStore {
             };
             self.require_reenable_copy_complete(attempt, scope, protection)
                 .await?;
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 crate::constants::RETAINED_TRANSFER_PROGRESS_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let row = self
@@ -133,8 +139,14 @@ impl JournalStore {
                 }
                 RetainedTransferStage::Complete => return Ok(()),
             };
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 crate::constants::RETAINED_TRANSFER_PROGRESS_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let row = self

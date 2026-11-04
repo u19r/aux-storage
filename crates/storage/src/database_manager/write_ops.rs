@@ -1,3 +1,4 @@
+use futures::TryFutureExt;
 use storage_types::{
     AttributeMap, DeleteItemRequest, ExprNameRef, ExprValueRef, KeyRef, PutItemRequest,
     PutItemResponse, ReturnValuesOldNewUpdated, StorageResult, TableName, UpdateItemRequest,
@@ -27,9 +28,8 @@ impl DatabaseManager {
         request.return_values_on_condition_check_failure = input
             .return_old_on_condition_failure
             .then(|| "ALL_OLD".to_string());
-        request.aux_item_stream_ttl_hours = input.aux_item_stream_ttl_hours;
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("put_item", dynamo.put_item(request)).await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation("put_item", async move { dynamo.put_item(request).await })
         })
         .await
     }
@@ -49,12 +49,13 @@ impl DatabaseManager {
             return_values_on_condition_check_failure: input
                 .return_old_on_condition_failure
                 .then(|| "ALL_OLD".to_string()),
-            aux_item_stream_ttl_hours: input.aux_item_stream_ttl_hours,
         };
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("delete_item", dynamo.delete_item(request))
-                .await
-                .map(|response| response.attributes)
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation(
+                "delete_item",
+                async move { dynamo.delete_item(request).await },
+            )
+            .map_ok(|response| response.attributes)
         })
         .await
     }
@@ -83,12 +84,14 @@ impl DatabaseManager {
                     .return_old_on_condition_failure
                     .then(|| "ALL_OLD".to_string()),
             )
-            .aux_item_stream_ttl_hours(input.aux_item_stream_ttl_hours)
             .build();
         request.update_expression =
             (!input.update_expression.trim().is_empty()).then_some(input.update_expression);
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("update_item", dynamo.update_item(request)).await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation(
+                "update_item",
+                async move { dynamo.update_item(request).await },
+            )
         })
         .await
     }
@@ -119,7 +122,6 @@ impl DatabaseManager {
             expression_attribute_values,
             return_values,
             return_old_on_condition_failure: false,
-            aux_item_stream_ttl_hours: None,
         })
         .await
     }

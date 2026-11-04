@@ -106,6 +106,10 @@ pub fn storage_error_diagnostic(error: &StorageError) -> (&'static str, &str) {
             ("HistoryUnavailable", "required history is unavailable")
         }
         StorageEnum::HistoryExpired => ("HistoryExpired", "the public history cursor has expired"),
+        StorageEnum::TrimmedDataAccess => (
+            "TrimmedDataAccessException",
+            "the stream cursor has expired",
+        ),
         StorageEnum::ConditionalCheckFailed
         | StorageEnum::ConditionalCheckFailedWithItem { .. } => {
             ("ConditionalCheckFailedException", "condition failed")

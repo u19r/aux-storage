@@ -5,11 +5,11 @@ use std::num::NonZeroU32;
 use storage_types::{AttemptMode, StorageError, StorageResult, StreamItemId, StreamName};
 
 use crate::{
-    ReadDirection, StreamAttempt, StreamCursor, StreamError, StreamItem, StreamKind, StreamPage,
+    ReadDirection, StreamAttempt, StreamError, StreamItem, StreamKind, StreamPage,
     StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
     system_stream::{
         SystemStreamCheckpointLookup, SystemStreamCheckpointReceipt, SystemStreamHistory,
-        SystemStreamHistoryRecord, SystemStreamStoredRecord,
+        SystemStreamHistoryRecord,
     },
     validate_limit,
 };
@@ -57,7 +57,6 @@ pub enum SystemStreamReadKind<'a> {
     Rows(AddressedStreamRead<'a>),
     Catalog,
     Checkpoint(SystemStreamCheckpointLookup<'a>),
-    Cursors,
 }
 
 impl StreamRowKind {
@@ -80,15 +79,13 @@ pub enum StreamReadResult {
     Item(Option<StreamItem>),
     SystemCatalog(SystemStreamHistory),
     SystemCheckpoint(Option<SystemStreamCheckpointReceipt>),
-    SystemCursors(Vec<StreamCursor>),
 }
 
 /// One physical logical-history read, with its pointer rows in the same order.
 pub struct SystemStreamHistoryReadPage {
     pub retired_through: Option<storage_types::SystemStreamPosition>,
-    pub records: Vec<SystemStreamStoredRecord>,
+    pub records: Vec<storage_types::SystemHistoryRecord>,
     pub observations: Vec<SystemStreamHistoryRecord>,
-    pub pointers: Vec<Option<StreamItem>>,
     pub more: bool,
 }
 
@@ -130,15 +127,6 @@ impl StreamReadResult {
             )),
         }
     }
-
-    pub(crate) fn into_system_cursors(self) -> StorageResult<Vec<StreamCursor>> {
-        match self {
-            Self::SystemCursors(cursors) => Ok(cursors),
-            _ => Err(StorageError::internal(
-                "stream backend returned another read kind",
-            )),
-        }
-    }
 }
 
 /// A physical point read must agree with both components of its address.
@@ -175,7 +163,7 @@ pub(crate) async fn read<P: StreamPort>(
             Box::pin(async move {
                 let mut request = request;
                 request.partitioning_mode =
-                    crate::stream_kind::read_partitioning_mode(attempt, &kind).await?;
+                    crate::stream_kind::resolve_stream_layout(attempt, &kind).await?;
                 let rows = attempt
                     .read_stream(kind.row_read(StreamRowReadKind::Page(&request)))
                     .await?

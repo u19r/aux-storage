@@ -1,3 +1,4 @@
+use futures::TryFutureExt;
 use storage_types::{
     BatchGetItemRequest, BatchGetItemResponse, GetItemRequest, GetStreamRecordsRequest,
     GetStreamRecordsResponse, KeyAttributes, StorageError, StorageResult, TableName,
@@ -56,10 +57,9 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             "default",
             crate::admission::AdmissionClass::PointRead,
-            |dynamo| async move {
-                let response =
-                    record_storage_operation("get_item", dynamo.get_item(request)).await?;
-                Ok(response.item)
+            |dynamo| {
+                record_storage_operation("get_item", async move { dynamo.get_item(request).await })
+                    .map_ok(|response| response.item)
             },
         )
         .await
@@ -116,7 +116,7 @@ impl DatabaseManager {
                     record_storage_operation("batch_get_item", dynamo.batch_get_item(request))
                         .await?;
                 // Detached task output destroys the payload before its
-                // reservation.
+                // reservation. Only the response contributes profiling bytes.
                 Ok((response, reservation))
             },
         )

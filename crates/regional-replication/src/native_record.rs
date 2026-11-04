@@ -9,11 +9,12 @@ use infrastructure_provider::{
     },
 };
 use replication_provider::record::RecordCodec;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use storage_types::{InfrastructureContext, InfrastructureResultKind, Revision, StorageResult};
 
 /// Bounded record mechanics. Policy remains with the regional flow that calls
 /// it.
+#[derive(Clone)]
 pub(crate) struct NativeRecords {
     pub(crate) limits: InfrastructureLimits,
     codec: RecordCodec,
@@ -47,18 +48,6 @@ impl NativeRecords {
         native: replication_provider::runtime_configuration::limits::NativeBudgets,
     ) -> StorageResult<()> {
         let account = self.require_history_account_capacity()?;
-        let image_custody = self.require_image_custody_capacity()?;
-        let owner = stream_provider::retained_image::RetainedOwnerRecord::encoded_length_bound(
-            self.limits.max_key_bytes().get(),
-            self.limits.max_record_bytes().get(),
-        )?;
-        if owner > self.limits.max_record_bytes().get() {
-            return Err(corrupt_record());
-        }
-        let owner = owner
-            .checked_add(self.limits.max_key_bytes().get())
-            .ok_or_else(corrupt_record)?;
-        self.limits.check_batch(1, owner)?;
         let declaration = self
             .codec
             .encoded_payload_bound(native.maximum_history_declaration_bytes)?;
@@ -70,25 +59,12 @@ impl NativeRecords {
             .checked_add(self.limits.max_key_bytes().get())
             .ok_or_else(corrupt_record)?;
         self.limits.check_batch(1, declaration_batch)?;
-        let original = stream_provider::retained_image::RetainedPayload::encoded_length_bound(
-            stream_provider::retained_image::RetainedImageManifest::metadata_length_bound(
-                native.maximum_canonical_event_bytes.get(),
-            )?,
-        )?;
-        let retained =
-            stream_provider::retained_image::RetainedImageManifest::encoded_records_length_bound(
-                native.maximum_canonical_event_bytes.get(),
-            )?;
-        let bodies = stream_provider::MAX_RETAINED_MANIFEST_BODIES;
-        let graph =
-            stream_provider::retained_image::ownership_graph_length_bound(bodies, 1, self.limits)?;
-        // Every complete body is bounded by the original; the larger manifest
-        // encoding bound also qualifies each individual body record.
-        if original > self.limits.max_record_bytes().get() {
-            return Err(storage_types::StorageError::validation(
-                "native protected records cannot retain every legal original event",
-            ));
-        }
+        let original = self
+            .codec
+            .encoded_payload_bound(
+                self.original_payload_bound(native.maximum_canonical_event_bytes.get())?,
+            )?
+            .get();
         // The native receipt embeds the whole delivery pointer; its encoded
         // bound also bounds the separately indexed pointer without another size
         // assertion.
@@ -105,24 +81,11 @@ impl NativeRecords {
                 .checked_add(self.limits.max_key_bytes().get())
                 .ok_or_else(corrupt_record)?,
         )?;
-        // The aggregate includes independently encoded manifest/body values.
-        // Image/declaration body keys and all bounded waves' capacity effects
-        // join the original, receipt and delivery-index batch in this same
-        // attempt.
-        let acceptance = retained
+        // Original, receipt and delivery index own their complete values.
+        let acceptance = original
             .checked_add(receipt.get().checked_mul(2).ok_or_else(corrupt_record)?)
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    self.limits
-                        .max_key_bytes()
-                        .get()
-                        .checked_mul(bodies.checked_add(3)?)?,
-                )
-            })
+            .and_then(|bytes| bytes.checked_add(self.limits.max_key_bytes().get().checked_mul(3)?))
             .and_then(|bytes| bytes.checked_add(account.checked_mul(3)?))
-            .and_then(|bytes| bytes.checked_add(image_custody))
-            .and_then(|bytes| bytes.checked_add(owner))
-            .and_then(|bytes| bytes.checked_add(graph))
             .ok_or_else(corrupt_record)?;
         self.require_receipt_allowances(native, acceptance)?;
         self.acceptance_codec
@@ -148,8 +111,8 @@ impl NativeRecords {
             || acceptance > native.attempt.data_bytes.get()
         {
             return Err(storage_types::StorageError::validation(
-                "native customer/import component allowance cannot retain its original, ownership \
-                 graph and required receipts",
+                "native customer/import component allowance cannot retain its original and \
+                 required receipts",
             ));
         }
         Ok(())
@@ -193,7 +156,10 @@ impl NativeRecords {
         settlement_guard.complete(result)
     }
 
-    pub(crate) fn decode<T: DeserializeOwned>(&self, record: &DurableRecord) -> StorageResult<T> {
+    pub(crate) fn decode<'record, T: Deserialize<'record>>(
+        &self,
+        record: &'record DurableRecord,
+    ) -> StorageResult<T> {
         self.codec.decode(&record.bytes).map_err(Into::into)
     }
 
@@ -259,7 +225,7 @@ impl NativeRecords {
             if changes.is_empty() {
                 return Ok(());
             }
-            let charge = self.prepare_history_charge(attempt, (changes, 0)).await?;
+            let charge = self.prepare_history_charge(attempt, changes).await?;
             let waves = RecordBatch::plan_waves([charge.as_slice(), changes], self.limits)?;
             for batch in waves.into_iter().flatten() {
                 self.store_batch(attempt, &batch).await?;

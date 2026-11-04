@@ -13,10 +13,29 @@ use crate::{
 pub struct StreamName(pub(crate) Vec<u8>);
 
 impl StreamName {
-    // Legacy SQL/KV providers still parse these logical addresses. Shorten
-    // them when those providers are deleted at the single-owner cutover.
+    // Logical sources retain table/key labels; physical history uses IDs.
     pub const TABLE_STREAM_SUFFIX: &'static [u8] = b"/stream-table";
     pub const ITEM_STREAM_SEGMENT: &'static [u8] = b"/stream-item/";
+
+    pub fn table_history_id(&self) -> crate::StorageResult<Option<crate::TableHistoryId>> {
+        let Some(rest) = self.0.strip_prefix(b"history/") else {
+            return Ok(None);
+        };
+        let invalid = || crate::StorageError::raw_validation("Invalid table history namespace");
+        let (identity, suffix) = rest.split_at_checked(32).ok_or_else(invalid)?;
+        if !suffix
+            .strip_prefix(b"/")
+            .is_some_and(|suffix| !suffix.is_empty())
+        {
+            return Err(invalid());
+        }
+        let identity_text = std::str::from_utf8(identity).map_err(|_| invalid())?;
+        let id = Uuid::parse_str(identity_text).map_err(|_| invalid())?;
+        if id.is_nil() || id.simple().to_string().as_bytes() != identity {
+            return Err(invalid());
+        }
+        Ok(Some(id.into()))
+    }
 
     #[must_use]
     pub fn new(name: &[u8]) -> Self {

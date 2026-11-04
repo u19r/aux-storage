@@ -17,8 +17,7 @@ pub(crate) const OPTION_BUGGIFY: &str = "readSequenceBuggify";
 pub(crate) const GSI_INDEX_NAME: &str = "by_category_score";
 pub(crate) const GSI_CATEGORY_ATTR: &str = "category";
 pub(crate) const GSI_SCORE_ATTR: &str = "score";
-pub(crate) const TABLE_STREAM_DURATION_HOURS: u16 = 2;
-pub(crate) const ITEM_STREAM_TTL_HOURS: u16 = 1;
+pub(crate) const TABLE_STREAM_DURATION_HOURS: u16 = 24;
 pub(crate) const QUEUE_REDELIVERY_WAIT_SECONDS: u32 = 5;
 
 pub(crate) const KV_SMOKE_NATIVE_ATTEMPTS: u32 = 5;

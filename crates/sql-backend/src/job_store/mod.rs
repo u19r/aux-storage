@@ -1,7 +1,6 @@
 mod commit;
 mod limits;
 mod range;
-mod receipt;
 mod sql_statements;
 mod store;
 

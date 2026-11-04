@@ -3,7 +3,6 @@ pub mod dynamo_json;
 mod item;
 mod json_field;
 mod key_attributes;
-pub(crate) mod ordinal_projection;
 pub(crate) mod projection;
 pub(crate) mod residual;
 mod scalar;

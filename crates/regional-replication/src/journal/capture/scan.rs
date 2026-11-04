@@ -27,7 +27,7 @@ use crate::{bootstrap::SourceCaptureStatus, journal::JournalStore, native_record
 
 impl JournalStore {
     pub(crate) async fn read_capture_baselines<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -53,7 +53,15 @@ impl JournalStore {
             }
             self.load_baseline_page(
                 attempt,
-                (proposal.operation().lineage, input.0),
+                (
+                    proposal
+                        .participant(&self.region)
+                        .map_err(|_| corrupt_record())?
+                        .proposed
+                        .physical,
+                    proposal.operation().lineage,
+                    input.0,
+                ),
                 (
                     input.1,
                     crate::bootstrap::copy_scope::BaselineCopyBudget {
@@ -69,7 +77,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn advance_source_capture<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + DynamoAttempt
             + CatalogAttempt
             + PrimaryStateScanAttempt
@@ -133,7 +141,7 @@ impl JournalStore {
     }
 
     async fn scan_source_baseline<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + DynamoAttempt
             + PrimaryStateScanAttempt
             + ItemTombstoneScanAttempt,
@@ -193,7 +201,7 @@ impl JournalStore {
     }
 
     async fn adopt_source_row<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + DynamoAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + DynamoAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -206,16 +214,15 @@ impl JournalStore {
     ) -> StorageResult<()> {
         let (record, table, row_key) = input;
         let (observed, lifecycle) = attempt.observe_for_write(&table, &row_key).await?;
-        let (provenance, image, indexers, body) = match &observed {
+        let (provenance, image, indexers) = match &observed {
             ItemWriteObservation::Live {
                 stored, provenance, ..
             } => (
                 provenance,
                 Some(&stored.item),
                 Some(stored.indexers.as_slice()),
-                stored.source,
             ),
-            ItemWriteObservation::Deleted { provenance, .. } => (provenance, None, None, None),
+            ItemWriteObservation::Deleted { provenance, .. } => (provenance, None, None),
             ItemWriteObservation::Absent => return Ok(()),
         };
         let key = codec.encode_key(&row_key).map_err(|_| corrupt_record())?;
@@ -231,9 +238,7 @@ impl JournalStore {
             .proposal
             .participant(&record.proposal.operation().home_region)
             .map_err(|_| corrupt_record())?;
-        let exact = self
-            .load_baseline_image(attempt, (source.proposed.physical, image, body), codec)
-            .await?;
+        let exact = self.prepare_baseline_image(image, codec)?;
         let baseline = BaselineItem {
             source_table: source.proposed.configuration.table,
             lineage: record.proposal.operation().lineage,
@@ -242,7 +247,7 @@ impl JournalStore {
             canonical_key: key,
             images: SourceImagesRef {
                 old: None,
-                new: exact.as_ref(),
+                new: exact,
                 old_indexers: None,
                 new_indexers: indexers,
             },

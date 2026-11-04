@@ -1,45 +1,9 @@
-use storage_types::{
-    IndexName, ItemStreamVersion, StreamItemId, TableName, TimestampMillis,
-    maintenance::TargetIncarnation,
-};
-use stream_provider::{StreamDataType, StreamItem};
+use storage_types::{IndexName, TableName, maintenance::TargetIncarnation};
 
 use crate::gsi::{
-    GsiBuild, GsiBuildTarget, GsiCatchingUp, GsiChange, GsiFailureReason, GsiObservation,
-    GsiReferencedHistory, GsiReferencedHistoryItem, GsiState, GsiStreamObservation,
-    GsiStreamPageEnd,
+    GsiBuild, GsiBuildTarget, GsiCatchingUp, GsiChange, GsiFailureReason, GsiObservation, GsiState,
+    GsiStreamObservation, GsiStreamPageEnd,
 };
-
-#[test]
-fn referenced_history_items_are_grouped_by_candidate() {
-    let histories =
-        GsiReferencedHistory::group([history_item(0, 2), history_item(0, 1), history_item(2, 3)])
-            .expect("ordered referenced history is valid");
-
-    assert_eq!(histories.len(), 2);
-    assert_eq!(histories[0].candidate_ordinal, 0);
-    assert_eq!(histories[0].items.len(), 2);
-    assert_eq!(histories[1].candidate_ordinal, 2);
-    assert_eq!(histories[1].items.len(), 1);
-}
-
-#[test]
-fn referenced_history_items_reject_out_of_order_candidates() {
-    assert!(GsiReferencedHistory::group([history_item(2, 1), history_item(1, 2)]).is_err());
-}
-
-#[test]
-fn given_malformed_history_images_when_grouped_then_corruption_is_rejected() {
-    for versions in [vec![3, 2, 1], vec![2, 2], vec![1, 2]] {
-        let result = GsiReferencedHistory::group(
-            versions.into_iter().map(|version| history_item(4, version)),
-        );
-        assert!(
-            result.is_err(),
-            "history must be a descending current/predecessor pair"
-        );
-    }
-}
 
 #[test]
 fn stream_origin_does_not_imply_a_history_gap() {
@@ -84,24 +48,11 @@ fn catching_up(
 ) -> GsiBuild<String> {
     GsiBuild {
         target: GsiBuildTarget {
+            history_id: 1u32.into(),
             table_name: TableName::new("gsi_history"),
             index_name: IndexName::new("by_group"),
             incarnation: TargetIncarnation::from([1; 16]),
         },
         state: GsiState::CatchingUp(GsiCatchingUp { cursor, high }),
-    }
-}
-
-fn history_item(candidate_ordinal: usize, version: u64) -> GsiReferencedHistoryItem {
-    let id = StreamItemId::from(ItemStreamVersion::new(version));
-    GsiReferencedHistoryItem {
-        candidate_ordinal,
-        item: StreamItem {
-            id,
-            stream_name: None,
-            data: Vec::new(),
-            data_type: StreamDataType::DynamoDbJson,
-            created_at: TimestampMillis::from_timestamp(i64::try_from(version).expect("test ID")),
-        },
     }
 }

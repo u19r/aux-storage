@@ -29,17 +29,12 @@ fn valid_create_table_payload() -> serde_json::Value {
 fn create_table_accepts_aux_stream_duration_extensions() {
     let mut payload = valid_create_table_payload();
     payload["AuxStreamDurationHours"] = json!(168);
-    payload["AuxDefaultItemStreamDurationHours"] = json!(-1);
 
     let request = CreateTableRequest::try_from(payload).unwrap();
 
     assert_eq!(
         request.aux_stream_duration_hours,
-        Some(StreamRetentionDuration::FiniteHours(168))
-    );
-    assert_eq!(
-        request.aux_default_item_stream_duration_hours,
-        Some(StreamRetentionDuration::Forever)
+        Some(StreamRetentionDuration::from_hours(168).unwrap())
     );
 }
 
@@ -48,7 +43,6 @@ fn create_table_omits_aux_stream_duration_extensions_by_default() {
     let request = CreateTableRequest::try_from(valid_create_table_payload()).unwrap();
 
     assert_eq!(request.aux_stream_duration_hours, None);
-    assert_eq!(request.aux_default_item_stream_duration_hours, None);
 }
 
 #[test]
@@ -76,12 +70,13 @@ fn create_table_rejects_duplicate_gsi_names_before_backend_layout() {
 #[test]
 fn create_table_rejects_invalid_aux_stream_duration_extensions() {
     for (field, value) in [
+        ("AuxStreamDurationHours", json!(1)),
+        ("AuxStreamDurationHours", json!(23)),
         ("AuxStreamDurationHours", json!(0)),
         ("AuxStreamDurationHours", json!(-2)),
         ("AuxStreamDurationHours", json!(61321)),
         ("AuxStreamDurationHours", json!(1.5)),
         ("AuxStreamDurationHours", json!("72")),
-        ("AuxDefaultItemStreamDurationHours", json!(0)),
     ] {
         let mut payload = valid_create_table_payload();
         payload[field] = value;
@@ -100,7 +95,6 @@ fn update_table_accepts_aux_stream_duration_extensions() {
     let payload = json!({
         "TableName": "TestTable",
         "AuxStreamDurationHours": -1,
-        "AuxDefaultItemStreamDurationHours": 24
     });
 
     let request = UpdateTableRequest::try_from(payload).unwrap();
@@ -109,21 +103,18 @@ fn update_table_accepts_aux_stream_duration_extensions() {
         request.aux_stream_duration_hours,
         Some(StreamRetentionDuration::Forever)
     );
-    assert_eq!(
-        request.aux_default_item_stream_duration_hours,
-        Some(StreamRetentionDuration::FiniteHours(24))
-    );
 }
 
 #[test]
 fn update_table_rejects_invalid_aux_stream_duration_extensions() {
     for (field, value) in [
+        ("AuxStreamDurationHours", json!(1)),
+        ("AuxStreamDurationHours", json!(23)),
         ("AuxStreamDurationHours", json!(0)),
         ("AuxStreamDurationHours", json!(-2)),
         ("AuxStreamDurationHours", json!(61321)),
         ("AuxStreamDurationHours", json!(1.5)),
         ("AuxStreamDurationHours", json!("72")),
-        ("AuxDefaultItemStreamDurationHours", json!(0)),
     ] {
         let payload = json!({
             "TableName": "TestTable",
@@ -137,188 +128,6 @@ fn update_table_rejects_invalid_aux_stream_duration_extensions() {
             "{field}: unexpected error: {err}"
         );
     }
-}
-
-#[test]
-fn item_write_requests_accept_aux_item_stream_ttl_extension() {
-    let put = json!({
-        "TableName": "TestTable",
-        "Item": { "pk": { "S": "1" } },
-        "AuxItemStreamTtlHours": -1
-    });
-    let update = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "UpdateExpression": "SET #value = :value",
-        "ExpressionAttributeNames": { "#value": "value" },
-        "ExpressionAttributeValues": { ":value": { "S": "next" } },
-        "AuxItemStreamTtlHours": 24
-    });
-    let delete = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "AuxItemStreamTtlHours": 168
-    });
-    let batch = json!({
-        "RequestItems": {
-            "TestTable": [
-                {
-                    "PutRequest": {
-                        "Item": { "pk": { "S": "1" } },
-                        "AuxItemStreamTtlHours": 12
-                    }
-                },
-                {
-                    "DeleteRequest": {
-                        "Key": { "pk": { "S": "2" } },
-                        "AuxItemStreamTtlHours": 6
-                    }
-                }
-            ]
-        }
-    });
-    let transact = json!({
-        "TransactItems": [
-            {
-                "Put": {
-                    "TableName": "TestTable",
-                    "Item": { "pk": { "S": "1" } },
-                    "AuxItemStreamTtlHours": 8
-                }
-            },
-            {
-                "Delete": {
-                    "TableName": "TestTable",
-                    "Key": { "pk": { "S": "3" } },
-                    "AuxItemStreamTtlHours": 4
-                }
-            },
-            {
-                "Update": {
-                    "TableName": "TestTable",
-                    "Key": { "pk": { "S": "2" } },
-                    "UpdateExpression": "SET #value = :value",
-                    "ExpressionAttributeNames": { "#value": "value" },
-                    "ExpressionAttributeValues": { ":value": { "S": "next" } },
-                    "AuxItemStreamTtlHours": -1
-                }
-            }
-        ]
-    });
-
-    let put = PutItemRequest::try_from(put).unwrap();
-    let update = UpdateItemRequest::try_from(update).unwrap();
-    let delete = DeleteItemRequest::try_from(delete).unwrap();
-    let batch = BatchWriteItemRequest::try_from(batch).unwrap();
-    let transact = TransactWriteItemsRequest::try_from(transact).unwrap();
-
-    assert_eq!(
-        put.aux_item_stream_ttl_hours,
-        Some(StreamRetentionDuration::Forever)
-    );
-    assert_eq!(
-        update.aux_item_stream_ttl_hours,
-        Some(StreamRetentionDuration::FiniteHours(24))
-    );
-    assert_eq!(
-        delete.aux_item_stream_ttl_hours,
-        Some(StreamRetentionDuration::FiniteHours(168))
-    );
-    assert_eq!(
-        batch
-            .request_items
-            .get(&TableName::new("TestTable"))
-            .unwrap()[0]
-            .put_request
-            .as_ref()
-            .and_then(|put| put.aux_item_stream_ttl_hours),
-        Some(StreamRetentionDuration::FiniteHours(12))
-    );
-    assert_eq!(
-        batch
-            .request_items
-            .get(&TableName::new("TestTable"))
-            .unwrap()[1]
-            .delete_request
-            .as_ref()
-            .and_then(|delete| delete.aux_item_stream_ttl_hours),
-        Some(StreamRetentionDuration::FiniteHours(6))
-    );
-    assert_eq!(
-        transact.transact_items[0]
-            .put
-            .as_ref()
-            .and_then(|put| put.aux_item_stream_ttl_hours),
-        Some(StreamRetentionDuration::FiniteHours(8))
-    );
-    assert_eq!(
-        transact.transact_items[1]
-            .delete
-            .as_ref()
-            .and_then(|delete| delete.aux_item_stream_ttl_hours),
-        Some(StreamRetentionDuration::FiniteHours(4))
-    );
-    assert_eq!(
-        transact.transact_items[2]
-            .update
-            .as_ref()
-            .and_then(|update| update.aux_item_stream_ttl_hours),
-        Some(StreamRetentionDuration::Forever)
-    );
-}
-
-#[test]
-fn item_write_requests_reject_invalid_aux_item_stream_ttl_extension() {
-    let put_zero = json!({
-        "TableName": "TestTable",
-        "Item": { "pk": { "S": "1" } },
-        "AuxItemStreamTtlHours": 0
-    });
-    let update_string = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "UpdateExpression": "SET #value = :value",
-        "ExpressionAttributeNames": { "#value": "value" },
-        "ExpressionAttributeValues": { ":value": { "S": "next" } },
-        "AuxItemStreamTtlHours": "24"
-    });
-    let delete_negative = json!({
-        "TableName": "TestTable",
-        "Key": { "pk": { "S": "1" } },
-        "AuxItemStreamTtlHours": -2
-    });
-    let batch_fraction = json!({
-        "RequestItems": {
-            "TestTable": [{
-                "PutRequest": {
-                    "Item": { "pk": { "S": "1" } },
-                    "AuxItemStreamTtlHours": 1.5
-                }
-            }]
-        }
-    });
-    let transact_too_large = json!({
-        "TransactItems": [{
-            "Delete": {
-                "TableName": "TestTable",
-                "Key": { "pk": { "S": "1" } },
-                "AuxItemStreamTtlHours": 61321
-            }
-        }]
-    });
-
-    let put_err = PutItemRequest::try_from(put_zero).unwrap_err();
-    let update_err = UpdateItemRequest::try_from(update_string).unwrap_err();
-    let delete_err = DeleteItemRequest::try_from(delete_negative).unwrap_err();
-    assert!(put_err.contains("Invalid request format"));
-    assert!(update_err.contains("Invalid request format"));
-    assert!(delete_err.contains("Invalid request format"));
-
-    let batch_err = BatchWriteItemRequest::try_from(batch_fraction).unwrap_err();
-    let transact_err = TransactWriteItemsRequest::try_from(transact_too_large).unwrap_err();
-
-    assert!(batch_err.contains("Invalid request format"));
-    assert!(transact_err.contains("Invalid request format"));
 }
 
 #[test]

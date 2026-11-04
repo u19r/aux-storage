@@ -5,7 +5,7 @@ use super::JournalStore;
 use crate::{
     constants::OPERATION_SUFFIX,
     native_record::corrupt_record,
-    origin::{OriginOperationReceipt, RecoveryOperation},
+    origin::{OperationReceiptState, OriginOperationReceipt, RecoveryOperation},
 };
 
 impl JournalStore {
@@ -18,7 +18,6 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            self.require_operation_events(&receipt.events)?;
             let key = self.identity_key(OPERATION_SUFFIX, &receipt.operation)?;
             let (_, codec) = self.origin_receipt_capacity()?;
             let bytes = codec.encode(receipt)?;
@@ -49,40 +48,22 @@ impl JournalStore {
                 .as_ref()
                 .map(|record| {
                     let receipt: OriginOperationReceipt = codec.decode(&record.bytes)?;
+                    recovery.require_receipt(&receipt)?;
+                    if receipt.state == OperationReceiptState::Incomplete {
+                        if record.revision == storage_types::Revision::INITIAL {
+                            return Err(corrupt_record());
+                        }
+                        return Err(storage_types::StorageEnum::HistoryUnavailable.into());
+                    }
                     if record.revision != storage_types::Revision::INITIAL {
                         return Err(corrupt_record());
                     }
-                    recovery.require_receipt(&receipt)?;
-                    self.require_operation_events(&receipt.events)?;
                     Ok(receipt)
                 })
                 .transpose()
         }
         .await;
         settlement_guard.complete(result)
-    }
-
-    fn require_operation_events(
-        &self,
-        events: &[replication_types::event::identity::CanonicalEventId],
-    ) -> StorageResult<()> {
-        if events.is_empty() || events.len() > storage_types::MAX_TRANSACTION_MEMBERS {
-            return Err(corrupt_record());
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for event in events {
-            let replication_types::event::identity::CanonicalEventId::Origin(original) = event
-            else {
-                return Err(corrupt_record());
-            };
-            if !seen.insert(event)
-                || u64::from(original.position) == 0
-                || original.origin != self.origin(original.origin.journal_partition)?
-            {
-                return Err(corrupt_record());
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn bind_origin_receipt_capacity(

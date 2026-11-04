@@ -95,14 +95,13 @@ fn given_tombstone_write_when_constructed_then_report_cpu_and_allocations() {
 }
 
 #[test]
-fn given_stored_item_when_observed_for_write_then_image_and_ownership_metadata_are_preserved() {
+fn given_stored_item_when_observed_for_write_then_item_and_revision_metadata_are_preserved() {
     let image = format!(
         r#"{{"pk":{{"S":"key"}},"payload":{{"S":"{}"}}}}"#,
         "x".repeat(4096)
     );
     let row = crate::SqlRow::new(vec![
         crate::SqlValue::Text(image.clone()),
-        crate::SqlValue::Text("[]".to_owned()),
         crate::SqlValue::Integer(7),
         crate::SqlValue::Blob(ItemProvenance::LOCAL_BYTES.to_vec()),
         crate::SqlValue::Integer(42),
@@ -112,7 +111,6 @@ fn given_stored_item_when_observed_for_write_then_image_and_ownership_metadata_a
         storage_types::StoredWireItem {
             item: storage_types::WireItem::dynamo_json(image.as_bytes().to_vec()),
             indexers: Vec::new(),
-            source: None,
         },
     )
     .unwrap();
@@ -138,21 +136,18 @@ fn given_invalid_stored_metadata_when_observed_for_write_then_physical_errors_ar
         vec![],
         vec![
             crate::SqlValue::Text("{}".to_owned()),
-            crate::SqlValue::Text("[]".to_owned()),
             crate::SqlValue::Integer(-1),
             crate::SqlValue::Blob(ItemProvenance::LOCAL_BYTES.to_vec()),
             crate::SqlValue::Null,
         ],
         vec![
             crate::SqlValue::Text("{}".to_owned()),
-            crate::SqlValue::Text("[]".to_owned()),
             crate::SqlValue::Integer(1),
             crate::SqlValue::Blob(vec![]),
             crate::SqlValue::Null,
         ],
         vec![
             crate::SqlValue::Text("{}".to_owned()),
-            crate::SqlValue::Text("[]".to_owned()),
             crate::SqlValue::Integer(1),
             crate::SqlValue::Blob(ItemProvenance::LOCAL_BYTES.to_vec()),
             crate::SqlValue::Text("invalid".to_owned()),
@@ -164,7 +159,6 @@ fn given_invalid_stored_metadata_when_observed_for_write_then_physical_errors_ar
                 storage_types::StoredWireItem {
                     item: storage_types::WireItem::dynamo_json(b"{}".to_vec()),
                     indexers: Vec::new(),
-                    source: None
                 }
             )
             .is_err()

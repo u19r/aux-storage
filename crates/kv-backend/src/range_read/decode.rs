@@ -42,9 +42,8 @@ pub(super) fn range_evidence(
         .get(offset..)
         .ok_or_else(|| StorageError::internal("native range key is truncated"))?;
     let key = if let Some(index) = bound.index.as_ref() {
-        // Compact GSI partitions retain a hash, so the verified leaf supplies
-        // its preimage. The caller checks the entire ordered key against the
-        // root-fenced leaf, including its partition digest and table suffix.
+        // The image supplies the partition digest preimage. The caller checks
+        // the complete native ordered key, including the primary-key tie.
         let attributes = storage_types::AttributeMap::try_from(wire)?;
         ItemKey::from_key_schema_for_index(
             table.table_name.clone(),

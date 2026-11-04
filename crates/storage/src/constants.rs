@@ -2,7 +2,8 @@ pub(crate) const MAINTENANCE_DRIVER_CLAIMS: u32 = 8;
 pub(crate) const MAINTENANCE_DRIVER_CONCURRENCY: u16 = 4;
 pub(crate) const MAINTENANCE_DRIVER_ERROR_WAKE_MS: u64 = 1_000;
 pub(crate) const MAINTENANCE_DRIVER_FINISH_WINDOW_MS: u64 = 500;
-pub(crate) const MAINTENANCE_DRIVER_MAX_STORE_OPERATIONS: u32 = 64;
+// Each claim reserves its checked lifecycle journal and bounded discovery.
+pub(crate) const MAINTENANCE_DRIVER_MAX_STORE_OPERATIONS: u32 = MAINTENANCE_DRIVER_CLAIMS * 256;
 pub(crate) const MAINTENANCE_DRIVER_STOP_WINDOW_MS: u64 = 250;
 pub(crate) const MAINTENANCE_JOB_SCHEMA_VERSION: u16 = 1;
 pub(crate) const QUEUE_MESSAGE_CLEANUP_PAGE_LIMIT: u32 = 100;

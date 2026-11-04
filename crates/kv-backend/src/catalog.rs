@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use storage_provider::{
     CATALOG_READ_BYTES, CatalogAttempt, CatalogNamePage, CatalogStamp, CatalogStreamPage,
     CreateTableLayout, ListStreamsAttempt, ListTablesAttempt, TableMetadataCache,
-    TableNameReservation, TableReclaimPhase, TableReclaimTarget, name_locked_until,
+    TableReclaimPhase, TableReclaimTarget,
 };
 use storage_types::{
     BoundTableInfo, IndexName, StorageError, StorageResult, StoredTableInfo, TableHistoryId,
@@ -20,7 +20,7 @@ use crate::{
     KvAttempt, KvMutation, KvRange, ReadProtection,
     constants::{
         INITIAL_REVISION, LOOKUP_FAMILY, METADATA_FAMILY, TABLE_ID_ALLOCATOR_KEY,
-        TABLE_NAME_LOCK_FAMILY, TABLE_STREAM_FAMILY,
+        TABLE_STREAM_FAMILY,
     },
 };
 
@@ -34,6 +34,7 @@ pub struct KvTableIdentity {
     pub indexes: Vec<KvIndexIdentity>,
     pub index_id_high_water: u16,
     pub deleted: bool,
+    pub external_cleanup_required: bool,
 }
 
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
@@ -67,7 +68,7 @@ pub struct KvCatalogAttempt<'a, A> {
     pub(crate) protection: ReadProtection,
     identities: Vec<KvTableIdentity>,
     dynamo_mutations: Vec<crate::KvMutation>,
-    pub(crate) projection_tree: crate::gsi::TreeChanges,
+    pub(crate) projection_changes: crate::gsi::ProjectionChanges,
     pub(crate) dynamo_history: Option<crate::stream_history::KvSystemWriteState>,
     pub(crate) metadata_cache: Option<Arc<TableMetadataCache>>,
     pub(crate) prepared_writes: StorageResult<crate::write_preparation::KvPreparedWrites>,
@@ -80,7 +81,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
             protection,
             identities: Vec::new(),
             dynamo_mutations: Vec::new(),
-            projection_tree: Default::default(),
+            projection_changes: Default::default(),
             dynamo_history: None,
             metadata_cache: None,
             prepared_writes: Ok(Default::default()),
@@ -114,7 +115,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
         let catalog = operation.as_mut();
         let result = (|| {
             let mut changes = std::mem::take(&mut catalog.dynamo_mutations);
-            let projections = std::mem::take(&mut catalog.projection_tree).into_mutations()?;
+            let projections = std::mem::take(&mut catalog.projection_changes).into_mutations()?;
             // Keep allocation history and commit ordinals for every write in
             // this attempt. FoundationDB's staged sequence stamp is unreadable
             // until commit.
@@ -199,7 +200,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
     pub async fn read_table_layout(
         &mut self,
         table: &StoredTableInfo,
-    ) -> StorageResult<CreateTableLayout<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
+    ) -> StorageResult<CreateTableLayout<Option<Vec<u8>>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -209,40 +210,22 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                 .get_batch(
                     vec![
                         name_lookup_key(&table.table_name),
-                        name_lock_key(&table.table_name),
                         TABLE_ID_ALLOCATOR_KEY.to_vec(),
-                        crate::stream_write::counter::user_stream_sequence_key(
-                            &storage_types::StreamName::table_stream(&table.table_name),
-                        )?,
                     ],
                     ReadProtection::Conflict,
                 )
                 .await?;
-            if name_state.len() != 4 {
+            if name_state.len() != 2 {
                 return Err(StorageError::internal(
                     "KV name reservation read count is invalid",
                 ));
             }
             let mut name_state = name_state.into_iter();
             let active = name_state.next().flatten().is_some();
-            let locked_until = name_state
-                .next()
-                .flatten()
-                .as_deref()
-                .map(decode_name_lock)
-                .transpose()?;
             let allocator = name_state.next().flatten();
-            let stream_sequence = name_state.next().flatten();
-            let reservation = if active {
-                TableNameReservation::Active
-            } else if let Some(until) = locked_until {
-                TableNameReservation::LockedUntil(until)
-            } else {
-                TableNameReservation::Available
-            };
             Ok(CreateTableLayout {
-                reservation,
-                seed: (allocator, stream_sequence),
+                name_in_use: active,
+                seed: allocator,
             })
         }
         .await;
@@ -252,7 +235,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
     pub fn insert_table_layout(
         &mut self,
         table: &StoredTableInfo,
-        (allocator, stream_sequence): (Option<Vec<u8>>, Option<Vec<u8>>),
+        allocator: Option<Vec<u8>>,
     ) -> StorageResult<KvTableIdentity> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -285,23 +268,17 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                     key: metadata_key(table_id),
                     value: storage_serde::to_bytes(&record)?,
                 },
-            ];
-            if stream_sequence.is_none() {
-                changes.push(KvMutation::Put {
+                KvMutation::Put {
                     key: crate::stream_write::counter::user_stream_sequence_key(
-                        &storage_types::StreamName::table_stream(&table.table_name),
+                        &storage_types::TableHistoryId::from(table_id).append_stream_name(),
                     )?,
-                    value: 1_u64.to_be_bytes().to_vec(),
-                });
-            }
-            if table
-                .stream_specification
-                .as_ref()
-                .is_some_and(|spec| spec.stream_enabled)
-            {
+                    value: 1u64.to_be_bytes().to_vec(),
+                },
+            ];
+            if table.has_enabled_stream() {
                 changes.push(KvMutation::Put {
                     key: table_stream_key(&table.table_name),
-                    value: table.created_at.timestamp_millis().to_be_bytes().to_vec(),
+                    value: encode_stream_identity(identity.table_id, table.created_at),
                 });
             }
             catalog.attempt.stage(changes)?;
@@ -316,7 +293,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
     pub(crate) async fn tombstone_table(
         &mut self,
         table: &BoundTableInfo,
-        captured_at: TimestampMillis,
+        phase: TableReclaimPhase,
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -334,7 +311,6 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                 identity: identity.clone(),
                 table_info: table.info.as_ref().clone(),
             };
-            let locked_until = name_locked_until(captured_at);
             let mut changes = Vec::with_capacity(4);
             changes.push(KvMutation::Delete {
                 key: name_lookup_key(&table.info.table_name),
@@ -350,10 +326,6 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                 });
             }
             changes.push(KvMutation::Put {
-                key: name_lock_key(&table.info.table_name),
-                value: encode_name_lock(identity.table_id, locked_until),
-            });
-            changes.push(KvMutation::Put {
                 key: metadata_key(identity.table_id),
                 value: storage_serde::to_bytes(&record)?,
             });
@@ -362,8 +334,7 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                 value: storage_serde::to_bytes(&TableReclaimTarget {
                     history_id: table.history_id,
                     table_name: table.info.table_name.clone(),
-                    name_locked_until: locked_until,
-                    phase: TableReclaimPhase::MetadataCleanup,
+                    phase,
                     gsi_targets: Vec::new(),
                 })?,
             });
@@ -416,19 +387,12 @@ impl<'a, A: KvAttempt> KvCatalogAttempt<'a, A> {
                     value: storage_serde::to_bytes(&record)?,
                 },
             ];
-            let was_enabled = current
-                .info
-                .stream_specification
-                .as_ref()
-                .is_some_and(|spec| spec.stream_enabled);
-            let is_enabled = table
-                .stream_specification
-                .as_ref()
-                .is_some_and(|spec| spec.stream_enabled);
+            let was_enabled = current.info.has_enabled_stream();
+            let is_enabled = table.has_enabled_stream();
             match (was_enabled, is_enabled) {
                 (false, true) => changes.push(KvMutation::Put {
                     key: table_stream_key(&table.table_name),
-                    value: table.created_at.timestamp_millis().to_be_bytes().to_vec(),
+                    value: encode_stream_identity(identity.table_id, table.created_at),
                 }),
                 (true, false) => changes.push(KvMutation::Delete {
                     key: table_stream_key(&table.table_name),
@@ -474,6 +438,7 @@ impl KvTableIdentity {
             indexes,
             index_id_high_water,
             deleted: false,
+            external_cleanup_required: false,
         })
     }
 
@@ -517,7 +482,7 @@ impl KvTableIdentity {
 }
 
 impl<A: KvAttempt> CatalogAttempt for KvCatalogAttempt<'_, A> {
-    async fn advance_catalog_stamp(
+    async fn store_external_cleanup_barrier(
         &mut self,
         name: &TableName,
         expected: CatalogStamp,
@@ -551,6 +516,7 @@ impl<A: KvAttempt> CatalogAttempt for KvCatalogAttempt<'_, A> {
                 .and_then(NonZeroU64::new)
                 .ok_or_else(|| StorageError::internal("catalog revision exhausted"))?;
             record.identity.revision = revision;
+            record.identity.external_cleanup_required = true;
             catalog.attempt.stage(vec![
                 KvMutation::Put {
                     key: name_lookup_key(name),
@@ -742,7 +708,7 @@ impl<A: KvAttempt> ListStreamsAttempt for KvCatalogAttempt<'_, A> {
     async fn read_stream_entry(
         &mut self,
         name: &TableName,
-    ) -> StorageResult<Option<TimestampMillis>> {
+    ) -> StorageResult<Option<storage_types::TableStreamIdentity>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -751,15 +717,7 @@ impl<A: KvAttempt> ListStreamsAttempt for KvCatalogAttempt<'_, A> {
                 .attempt
                 .get(&table_stream_key(name), catalog.protection)
                 .await?
-                .map(|bytes| {
-                    let timestamp: [u8; 8] = bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| StorageError::internal("invalid stream catalog timestamp"))?;
-                    Ok(TimestampMillis::from_timestamp(i64::from_be_bytes(
-                        timestamp,
-                    )))
-                })
+                .map(|bytes| decode_stream_identity(&bytes))
                 .transpose()
         }
         .await;
@@ -806,14 +764,7 @@ impl<A: KvAttempt> ListStreamsAttempt for KvCatalogAttempt<'_, A> {
                         .ok_or_else(|| StorageError::internal("invalid stream catalog key"))?;
                     let name = std::str::from_utf8(name)
                         .map_err(|_| StorageError::internal("invalid stream catalog table name"))?;
-                    let timestamp: [u8; 8] =
-                        entry.value.as_slice().try_into().map_err(|_| {
-                            StorageError::internal("invalid stream catalog timestamp")
-                        })?;
-                    Ok((
-                        TableName::new(name),
-                        TimestampMillis::from_timestamp(i64::from_be_bytes(timestamp)),
-                    ))
+                    Ok((TableName::new(name), decode_stream_identity(&entry.value)?))
                 })
                 .collect::<StorageResult<Vec<_>>>()?;
             Ok(CatalogStreamPage {
@@ -846,36 +797,6 @@ fn table_stream_key(name: &TableName) -> Vec<u8> {
     let mut key = name_lookup_key(name);
     key[0] = TABLE_STREAM_FAMILY;
     key
-}
-
-pub(crate) fn name_lock_key(name: &TableName) -> Vec<u8> {
-    let mut key = name_lookup_key(name);
-    key[0] = TABLE_NAME_LOCK_FAMILY;
-    key
-}
-
-fn decode_name_lock(bytes: &[u8]) -> StorageResult<storage_types::TimestampMillis> {
-    let raw: [u8; 8] = bytes
-        .get(4..)
-        .ok_or_else(|| StorageError::internal("invalid KV name reservation width"))?
-        .try_into()
-        .map_err(|_| StorageError::internal("invalid KV name reservation width"))?;
-    let id: [u8; 4] = bytes[..4]
-        .try_into()
-        .map_err(|_| StorageError::internal("invalid KV name reservation ID"))?;
-    if u32::from_be_bytes(id) == 0 {
-        return Err(StorageError::internal("KV name reservation ID is zero"));
-    }
-    Ok(storage_types::TimestampMillis::from_timestamp(
-        i64::from_be_bytes(raw),
-    ))
-}
-
-pub(crate) fn encode_name_lock(table_id: u32, until: TimestampMillis) -> Vec<u8> {
-    let mut value = Vec::with_capacity(12);
-    value.extend_from_slice(&table_id.to_be_bytes());
-    value.extend_from_slice(&until.timestamp_millis().to_be_bytes());
-    value
 }
 
 pub(crate) fn metadata_key(table_id: u32) -> Vec<u8> {
@@ -942,6 +863,30 @@ pub(crate) fn verify_deleted_metadata(
     Ok(())
 }
 
+pub(crate) fn decode_table_history_state(
+    bytes: &[u8],
+    history: TableHistoryId,
+) -> StorageResult<storage_types::TableHistoryState> {
+    let record: StoredCatalogRecord = storage_serde::from_bytes(bytes)?;
+    if record.identity.table_id != table_id_from_history(history)?
+        || record.identity.table_name != record.table_info.table_name
+    {
+        return Err(StorageError::internal(
+            "KV history catalog identity differs from its key",
+        ));
+    }
+    Ok(if record.identity.deleted {
+        storage_types::TableHistoryState::Deleting
+    } else {
+        storage_types::TableHistoryState::Active(std::sync::Arc::new(
+            storage_types::TableHistorySchema::try_from((
+                record.table_info.table_name,
+                record.table_info.key_schema,
+            ))?,
+        ))
+    })
+}
+
 /// Decode one protected physical catalog record without publishing/cache
 /// rebinding.
 pub(crate) fn decode_index_incarnation(
@@ -971,4 +916,24 @@ pub(crate) fn decode_index_incarnation(
         ));
     }
     Ok(incarnation)
+}
+
+fn encode_stream_identity(table_id: u32, created_at: TimestampMillis) -> Vec<u8> {
+    let mut value = Vec::with_capacity(12);
+    value.extend_from_slice(&table_id.to_be_bytes());
+    value.extend_from_slice(&created_at.timestamp_millis().to_be_bytes());
+    value
+}
+
+fn decode_stream_identity(value: &[u8]) -> StorageResult<storage_types::TableStreamIdentity> {
+    let bytes: &[u8; 12] = value
+        .try_into()
+        .map_err(|_| StorageError::internal("invalid stream catalog identity"))?;
+    let [a, b, c, d, timestamp @ ..] = *bytes;
+    let table_id = u32::from_be_bytes([a, b, c, d]);
+    let timestamp = i64::from_be_bytes(timestamp);
+    Ok(storage_types::TableStreamIdentity {
+        history_id: table_id.into(),
+        created_at: TimestampMillis::from_timestamp(timestamp),
+    })
 }

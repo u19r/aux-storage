@@ -383,3 +383,28 @@ fn restore_entries(
         })
         .collect()
 }
+
+/// Native range heads retain chunk manifests. Prefix readers must not hydrate
+/// unrelated image chunks before inspecting bounded history metadata.
+pub(crate) async fn load_range_heads<A: KvAttempt + ?Sized>(
+    attempt: &A,
+    ranges: Vec<crate::KvRange>,
+    protection: ReadProtection,
+) -> StorageResult<Vec<KvRangePage>> {
+    #[cfg(feature = "fault-injection")]
+    if let Some(error) = attempt.fault_probe().and_then(|probe| {
+        probe.fail(crate::KvFaultCall {
+            operation: crate::KvFaultOperation::ScanBatch,
+        })
+    }) {
+        return Err(error);
+    }
+    let expected = ranges.len();
+    let pages = attempt.native_scan_batch(ranges, protection).await?;
+    if pages.len() != expected {
+        return Err(StorageError::internal(
+            "native KV range batch returned the wrong count",
+        ));
+    }
+    Ok(pages)
+}

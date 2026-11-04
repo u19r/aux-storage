@@ -18,14 +18,12 @@ fn build() -> GsiBuild<String> {
     .unwrap();
     GsiBuild {
         target: GsiBuildTarget {
+            history_id: 1u32.into(),
             table_name: TableName::new("table"),
             index_name: IndexName::new("index"),
             incarnation: TargetIncarnation::from([1; 16]),
         },
-        state: GsiState::Active(GsiActive {
-            cursor: checkpoint,
-            pending_high: None,
-        }),
+        state: GsiState::Active(GsiActive { cursor: checkpoint }),
     }
 }
 
@@ -45,10 +43,10 @@ fn given_gsi_transition_when_rendered_then_preserve_sql_and_bind_slots() {
             format!(
                 "UPDATE sys_gsi_builds SET phase = {prefix}1, state = {prefix}2 WHERE table_name \
                  = {prefix}3 AND index_name = {prefix}4 AND incarnation = {prefix}5 AND phase = \
-                 {prefix}6 AND state = {prefix}7"
+                 {prefix}6 AND state = {prefix}7 AND table_id = {prefix}8"
             )
         );
-        assert_eq!(binds.len(), 7);
+        assert_eq!(binds.len(), 8);
         assert!(matches!(&binds[2], crate::SqlValue::Text(value) if value == "table"));
         assert!(matches!(&binds[3], crate::SqlValue::Text(value) if value == "index"));
         assert!(matches!(&binds[4], crate::SqlValue::Blob(value) if value == &[1;16]));
@@ -111,66 +109,6 @@ fn report(label: &str, mut render: impl FnMut()) {
         "gsi_sql label={label} iterations=100000 cpu_ns={}",
         cpu.as_nanos()
     );
-}
-
-#[test]
-#[ignore = "performance report; run with --ignored --nocapture --test-threads=1"]
-fn given_gsi_history_delete_when_constructed_then_report_cpu_and_allocations() {
-    let build = build();
-    let history_id = uuid::Uuid::from_bytes([2; 16]).into();
-    let position =
-        SystemStreamPosition::try_new("root", "lineage", "00000000000000000001").unwrap();
-    for (engine, name) in [
-        (SqlEngine::Sqlite, "sqlite"),
-        (SqlEngine::Turso, "turso"),
-        (SqlEngine::Postgres, "postgres"),
-    ] {
-        report(&format!("{name}_history_delete"), || {
-            drop(black_box(super::write::delete_history_hold_statement(
-                black_box(engine),
-                history_id,
-                black_box(&build.target),
-                black_box(&position),
-            )));
-        });
-    }
-}
-
-#[test]
-fn given_gsi_history_delete_when_rendered_then_preserve_sql_and_bind_order() {
-    let build = build();
-    let history_id = uuid::Uuid::from_bytes([2; 16]).into();
-    let position =
-        SystemStreamPosition::try_new("root", "lineage", "00000000000000000001").unwrap();
-    for (engine, prefix) in [
-        (SqlEngine::Sqlite, "?"),
-        (SqlEngine::Turso, "?"),
-        (SqlEngine::Postgres, "$"),
-    ] {
-        let (sql, binds) = super::write::delete_history_hold_statement(
-            engine,
-            history_id,
-            &build.target,
-            &position,
-        )
-        .into_parts();
-        assert_eq!(
-            sql,
-            format!(
-                "DELETE FROM sys_gsi_history_holds WHERE table_name = {prefix}1 AND index_name = \
-                 {prefix}2 AND index_incarnation = {prefix}3 AND table_incarnation = {prefix}4 \
-                 AND lineage_id = {prefix}5"
-            )
-        );
-        assert_eq!(binds.len(), 5);
-        assert!(matches!(&binds[0], crate::SqlValue::Text(value) if value == "table"));
-        assert!(matches!(&binds[1], crate::SqlValue::Text(value) if value == "index"));
-        assert!(matches!(&binds[2], crate::SqlValue::Blob(value) if value == &[1;16]));
-        assert!(
-            matches!(&binds[3], crate::SqlValue::Text(value) if value == "02020202-0202-0202-0202-020202020202")
-        );
-        assert!(matches!(&binds[4], crate::SqlValue::Text(value) if value == "lineage"));
-    }
 }
 
 #[test]

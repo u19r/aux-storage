@@ -3,21 +3,15 @@
 use infrastructure_provider::physical_attempt::PhysicalRecordOperation;
 use storage_common::{partition::PartitionInfo, retry::retry_native_conflicts};
 use storage_types::{
-    SemanticDecision, StorageError, StorageResult, StreamItemId, StreamName, TableName,
-    TimestampMillis, UserStreamName,
+    SemanticDecision, StorageError, StorageResult, StreamItemId, StreamName, TimestampMillis,
+    UserStreamName,
 };
 
 use crate::{
-    Stream, StreamAppendAllocation, StreamAppendOperationId, StreamAttempt, StreamDataType,
-    StreamError, StreamPartitioningMode, StreamPort, StreamResult, StreamRowValue,
-    StreamValidationKind, TableAppendCapture, TableAppendRequest, constants::STREAM_WRITE_RETRY,
+    Stream, StreamAppendAllocation, StreamAttempt, StreamDataType, StreamError,
+    StreamPartitioningMode, StreamPort, StreamResult, StreamRowValue, StreamValidationKind,
+    constants::STREAM_WRITE_RETRY,
 };
-
-#[derive(Clone)]
-enum AppendTarget {
-    User(UserStreamName),
-    Table(StreamAppendOperationId, TableName),
-}
 
 /// Validated append payload with its request-time sample and timestamp.
 #[derive(Clone)]
@@ -85,139 +79,55 @@ enum UserStreamAppendRow {
     },
 }
 
-#[derive(Clone)]
-struct AppendInput {
-    target: AppendTarget,
-    append: UserStreamAppend,
-    item_id_allocation: crate::StreamItemIdAllocation,
-    request: Option<TableAppendRequest>,
-}
-
 pub(crate) async fn append_item<P: StreamPort>(
     port: &P,
     name: UserStreamName,
     item_data: &[u8],
     partition_key: Option<&str>,
 ) -> StreamResult<StreamItemId> {
-    append(port, AppendTarget::User(name), item_data, partition_key).await
-}
-
-pub(crate) async fn append_table_item<P: StreamPort>(
-    port: &P,
-    operation: StreamAppendOperationId,
-    table_name: TableName,
-    item_data: &[u8],
-) -> StreamResult<StreamItemId> {
-    append(
-        port,
-        AppendTarget::Table(operation, table_name),
-        item_data,
-        None,
-    )
-    .await
-}
-
-async fn append<P: StreamPort>(
-    port: &P,
-    target: AppendTarget,
-    item_data: &[u8],
-    partition_key: Option<&str>,
-) -> StreamResult<StreamItemId> {
-    UserStreamAppend::validate_data(item_data)?;
-    let input = prepare_append_input(port, target, item_data, partition_key);
-    let request = input.request.clone();
-    let capture = port.table_append_capture();
+    let input = UserStreamAppend::try_new(
+        item_data.to_vec(),
+        partition_key.map(str::to_owned),
+        port.now(),
+        rand::random(),
+    )?;
+    let allocation = port.item_id_allocation();
     let (staged, stamp) = retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
         let input = input.clone();
-        let capture = capture.clone();
+        let name = name.clone();
         port.with_committed_stream_attempt(move |attempt| {
-            Box::pin(async move { execute_append(attempt, &capture, input).await })
+            Box::pin(async move {
+                let stream = crate::stream_catalog::load_user_stream_in_attempt(attempt, &name)
+                    .await?
+                    .into_result()?;
+                accept_user_append_in_attempt(attempt, stream, input)
+                    .await?
+                    .into_result()?
+                    .append(allocation)
+                    .await
+            })
         })
     })
     .await
-    .map_err(|error| append_error(error, request.as_ref()))?;
+    .map_err(StreamError::from_storage_error)?;
     staged
         .resolve(stamp)
-        .map_err(|error| append_error(error, request.as_ref()))
+        .map_err(StreamError::from_storage_error)
 }
 
-async fn execute_append<A: StreamAttempt, C: TableAppendCapture<A>>(
+/// The catalog owner has protected this bound incarnation in the same attempt.
+pub async fn append_table_row_in_attempt<A: StreamAttempt>(
     attempt: &mut A,
-    capture: &C,
-    input: AppendInput,
+    table: &storage_types::BoundTableInfo,
+    append: UserStreamAppend,
+    allocation: crate::StreamItemIdAllocation,
 ) -> StorageResult<StreamAppendAllocation> {
-    let mut settlement =
-        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-    let attempt = settlement.as_mut();
-    let result = async {
-        if let Some(request) = &input.request
-            && let crate::TableAppendReconciliation::Durable(id) =
-                capture.reconcile(attempt, request).await?
-        {
-            return Ok(StreamAppendAllocation::AttemptAllocated(id));
-        }
-        let captured = match &input.request {
-            Some(request) => capture.capture(attempt, request, &input.append).await?,
-            None => None,
-        };
-        let staged = prepare_append(attempt, input).await?;
-        if let Some(captured) = captured {
-            capture.store_response(attempt, captured, staged).await?;
-        }
-        Ok(staged)
+    AcceptedUserAppend {
+        operation: PhysicalRecordOperation::new(attempt),
+        row: UserStreamAppendRow::Single(append.into_row(table.history_id.append_stream_name())),
     }
-    .await;
-    settlement.complete(result)
-}
-
-fn prepare_append_input<P: StreamPort>(
-    port: &P,
-    target: AppendTarget,
-    item_data: &[u8],
-    partition_key: Option<&str>,
-) -> AppendInput {
-    let request = match &target {
-        AppendTarget::Table(operation, table) => Some(TableAppendRequest::new(
-            *operation,
-            table.clone(),
-            item_data,
-        )),
-        AppendTarget::User(_) => None,
-    };
-    AppendInput {
-        request,
-        target,
-        append: UserStreamAppend {
-            data: item_data.to_vec(),
-            partition_key: partition_key.map(str::to_owned),
-            captured_at: port.now(),
-            sample_entropy: rand::random(),
-        },
-        item_id_allocation: port.item_id_allocation(),
-    }
-}
-
-async fn prepare_append<A: StreamAttempt>(
-    attempt: &mut A,
-    input: AppendInput,
-) -> StorageResult<StreamAppendAllocation> {
-    let accepted = match input.target {
-        AppendTarget::User(name) => {
-            let stream = crate::stream_catalog::load_user_stream_in_attempt(attempt, &name)
-                .await?
-                .into_result()?;
-            accept_user_append_in_attempt(attempt, stream, input.append)
-                .await?
-                .into_result()?
-        }
-        AppendTarget::Table(_, name) => AcceptedUserAppend {
-            operation: PhysicalRecordOperation::new(attempt),
-            row: UserStreamAppendRow::Single(
-                input.append.into_row(StreamName::table_stream(&name)),
-            ),
-        },
-    };
-    accepted.append(input.item_id_allocation).await
+    .append(allocation)
+    .await
 }
 
 pub async fn accept_user_append_in_attempt<'native, A: StreamAttempt>(
@@ -306,28 +216,4 @@ impl<A: StreamAttempt> AcceptedUserAppend<'_, A> {
         };
         operation.complete(result)
     }
-}
-
-fn append_error(error: StorageError, request: Option<&TableAppendRequest>) -> StreamError {
-    if error.is_commit_unknown()
-        && let Some(request) = request
-    {
-        return StreamError::from_storage_error(StorageError::sync_submission_ambiguous(
-            Some(request.operation().token()),
-            "table append commit outcome is unresolved",
-        ));
-    }
-    StreamError::from_storage_error(error)
-}
-
-pub(crate) async fn reconcile_table_append<P: StreamPort>(
-    port: &P,
-    request: TableAppendRequest,
-) -> StreamResult<crate::TableAppendReconciliation> {
-    let capture = port.table_append_capture();
-    port.with_stream_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-        Box::pin(async move { capture.reconcile(attempt, &request).await })
-    })
-    .await
-    .map_err(StreamError::from_storage_error)
 }

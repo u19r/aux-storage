@@ -13,9 +13,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::RangeRead,
-            |dynamo| async move {
-                record_storage_operation("transact_get_items", dynamo.transact_get_items(request))
-                    .await
+            |dynamo| {
+                record_storage_operation("transact_get_items", async move {
+                    dynamo.transact_get_items(request).await
+                })
             },
         )
         .await

@@ -6,7 +6,7 @@ use crate::routes::routes_tests::{
 };
 
 #[tokio::test]
-async fn handle_update_table_accepts_custom_stream_duration_fields() {
+async fn given_custom_table_duration_when_updated_then_policy_is_stored() {
     for_each_conformance_backend(|_backend, db| async move {
         handle_create_table(
             db.clone(),
@@ -29,8 +29,7 @@ async fn handle_update_table_accepts_custom_stream_duration_fields() {
             db.clone(),
             json!({
                 "TableName": "RouteUpdateDuration",
-                "AuxStreamDurationHours": 24,
-                "AuxDefaultItemStreamDurationHours": 48
+                "AuxStreamDurationHours": 24
             })
             .try_into()
             .expect("valid update table request"),
@@ -44,11 +43,7 @@ async fn handle_update_table_accepts_custom_stream_duration_fields() {
             .expect("table metadata");
         assert_eq!(
             table.table_stream_duration,
-            StreamRetentionDuration::FiniteHours(24)
-        );
-        assert_eq!(
-            table.default_item_stream_duration,
-            StreamRetentionDuration::FiniteHours(48)
+            StreamRetentionDuration::from_hours(24).unwrap()
         );
     })
     .await;

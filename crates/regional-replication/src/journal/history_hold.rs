@@ -128,7 +128,15 @@ impl JournalStore {
         origin: &OriginId,
         proposal: &ControlProposal,
     ) -> StorageResult<DurableRecordKey> {
-        self.source_hold_operation_key(origin, proposal.operation().id)
+        self.source_hold_operation_key(
+            proposal
+                .participant(&self.region)
+                .map_err(|_| corrupt_record())?
+                .proposed
+                .physical,
+            origin,
+            proposal.operation().id,
+        )
     }
 
     pub(in crate::journal) fn decode_source_hold(
@@ -145,7 +153,12 @@ impl JournalStore {
         if row.revision != expected {
             return Err(corrupt_record());
         }
-        if row.key != self.source_hold_operation_key(&hold.origin, hold.operation)?
+        if row.key
+            != self.source_hold_operation_key(
+                self.table_record_history(&row.key, SOURCE_HOLD_SUFFIX)?,
+                &hold.origin,
+                hold.operation,
+            )?
             || self.origin(hold.origin.journal_partition)? != hold.origin
             || u64::from(hold.low) != 0
         {
@@ -156,10 +169,13 @@ impl JournalStore {
 
     fn source_hold_operation_key(
         &self,
+        history: storage_types::TableHistoryId,
         origin: &OriginId,
         operation: replication_types::identity::resource::ControlOperationId,
     ) -> StorageResult<DurableRecordKey> {
-        let mut key: RecordAddress = self.identity_key(SOURCE_HOLD_SUFFIX, origin)?.into();
+        let mut key: RecordAddress = self
+            .table_identity_key(SOURCE_HOLD_SUFFIX, history, origin)?
+            .into();
         key.suffix
             .extend_from_slice(CanonicalDigest::of(operation.as_ref()).as_ref());
         key.try_into()

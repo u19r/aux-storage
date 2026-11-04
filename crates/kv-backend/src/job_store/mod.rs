@@ -1,7 +1,6 @@
 mod commit;
 mod limits;
 mod range;
-mod receipt;
 mod store;
 
 pub(super) use limits::point_allowance;

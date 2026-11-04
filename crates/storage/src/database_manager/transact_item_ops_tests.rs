@@ -47,7 +47,6 @@ async fn manager_batch_write_persists_through_shared_owner() {
                     ]))
                     .expect("valid item"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -96,7 +95,6 @@ async fn manager_transact_write_persists_through_shared_owner() {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             update: None,
             delete: None,

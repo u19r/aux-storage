@@ -6,8 +6,7 @@ use storage_types::{
 
 use crate::{
     routes::routes_tests::{
-        default_conformance_backends, for_each_conformance_backend, handle_batch_get_item,
-        handle_batch_write_item,
+        default_conformance_backends, handle_batch_get_item, handle_batch_write_item,
     },
     types::Response,
 };
@@ -146,46 +145,6 @@ async fn batch_write_duplicate_keys_reject_across_conformance_backends() {
             );
         }
     }
-}
-
-#[tokio::test]
-async fn batch_write_put_accepts_aux_item_stream_ttl_without_storing_attribute() {
-    for_each_conformance_backend(|_backend, db| async move {
-        create_batch_table(db.as_ref()).await;
-
-        let response = handle_batch_write_item(
-            db.clone(),
-            json!({
-                "RequestItems": {
-                    "BatchWriteRouteTable": [{
-                        "PutRequest": {
-                            "Item": {
-                                "pk": {"S": "aux-item"},
-                                "payload": {"S": "stored"}
-                            },
-                            "AuxItemStreamTtlHours": 96
-                        }
-                    }]
-                }
-            })
-            .try_into()
-            .expect("batch write request with aux ttl"),
-        )
-        .await
-        .expect("batch write with custom item stream ttl");
-        assert_empty_batch_write_response(&response, "default");
-
-        let item = batch_get_item(db, "aux-item", "default").await;
-        assert_eq!(
-            item.get("payload"),
-            Some(&AttributeValue::S("stored".to_string()))
-        );
-        assert!(
-            !item.contains_key("AuxItemStreamTtlHours"),
-            "aux item stream ttl is request metadata, not item data"
-        );
-    })
-    .await;
 }
 
 #[tokio::test]
@@ -408,41 +367,6 @@ async fn batch_write_key_validation_priority_matches_dynamodb() {
             );
         }
     }
-}
-
-async fn batch_get_item(
-    db: std::sync::Arc<storage::DatabaseManager>,
-    key: &str,
-    backend_name: &str,
-) -> storage_types::AttributeMap {
-    let response = handle_batch_get_item(
-        db,
-        json!({
-            "RequestItems": {
-                "BatchWriteRouteTable": {
-                    "Keys": [
-                        {"pk": {"S": key}}
-                    ]
-                }
-            }
-        })
-        .try_into()
-        .expect("batch get request"),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("{backend_name} batch get after batch write: {err:?}"));
-    let Response::BatchGetItem(mut response) = response else {
-        panic!("{backend_name} expected batch get response");
-    };
-    storage_types::AttributeMap::try_from(
-        response
-            .responses
-            .as_mut()
-            .and_then(|responses| responses.remove(&TableName::new("BatchWriteRouteTable")))
-            .and_then(|mut items| items.pop())
-            .unwrap_or_else(|| panic!("{backend_name} expected batch get item for {key}")),
-    )
-    .unwrap()
 }
 
 async fn create_batch_table(db: &storage::DatabaseManager) {

@@ -16,7 +16,7 @@ mod transaction;
 
 pub use handler::GsiBuildHandler;
 pub use models::{GsiBuildAdvance, GsiBuildRequest, GsiTransition};
-pub use port::{GsiCandidateObservation, GsiPort, GsiScanSource, GsiStreamSource};
+pub use port::{GsiPort, GsiScanSource};
 pub use repository::{
     GsiBuildRepository, GsiBuildTransaction, GsiCandidateRead, GsiLifecycleRepository,
 };

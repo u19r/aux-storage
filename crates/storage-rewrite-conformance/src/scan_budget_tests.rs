@@ -108,9 +108,14 @@ async fn given_escaped_and_binary_rows_when_scan_runs_then_logical_pages_remain_
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let escaped = json!({"S": "\"".repeat(300_000)});
+        let control = json!({"S": "\u{0001}".repeat(300_000)});
         let binary = json!({"B": general_purpose::STANDARD.encode(vec![0_u8; 300_000])});
 
-        for (partition, count, payload) in [("escaped", 2, escaped), ("binary", 3, binary)] {
+        for (partition, count, payload) in [
+            ("escaped", 2, escaped),
+            ("control", 2, control),
+            ("binary", 3, binary),
+        ] {
             let table = unique_table_name();
             store
                 .create_hash_range_table(table.clone(), KeyAttributeType::S)

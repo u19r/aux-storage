@@ -18,7 +18,7 @@ fn hash_range_key_part_length_prefix() {
     // Should have: 2 bytes prefix + 9 bytes data = 11 bytes
     assert_eq!(parts.len(), 11);
     let prefix = u16::from_be_bytes([parts[0], parts[1]]);
-    let length = (prefix >> 6) as usize;
+    let length = usize::from(prefix);
     assert_eq!(length, 9); // "test_hash" is 9 bytes
     assert_eq!(&parts[2..], b"test_hash");
 }
@@ -36,13 +36,13 @@ fn hash_range_key_part_with_range_key() {
 
     // Parse first part (hash key)
     let hash_prefix = u16::from_be_bytes([parts[0], parts[1]]);
-    let hash_length = (hash_prefix >> 6) as usize;
+    let hash_length = usize::from(hash_prefix);
     assert_eq!(hash_length, 8); // "hash_key" is 8 bytes
     assert_eq!(&parts[2..10], b"hash_key");
 
     // Parse second part (range key)
     let range_prefix = u16::from_be_bytes([parts[10], parts[11]]);
-    let range_length = (range_prefix >> 6) as usize;
+    let range_length = usize::from(range_prefix);
     assert_eq!(range_length, 9); // "range_key" is 9 bytes
     assert_eq!(&parts[12..], b"range_key");
 }
@@ -54,7 +54,7 @@ fn pagination_token_splits_into_key_parts() {
     let item_key = ItemKey::table_key(TableName::new("test"), hash_key, Some(range_key));
 
     let encoded = item_key.hash_range_key_part().expect("hash range key part");
-    let decoded_parts = split_next_token_to_keys(&encoded);
+    let decoded_parts = split_next_token_to_keys(&encoded).unwrap();
 
     assert_eq!(decoded_parts.len(), 2);
     assert_eq!(decoded_parts[0], b"test_hash");
@@ -100,7 +100,6 @@ fn round_trip_pagination_token() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -174,7 +173,6 @@ fn key_consistency_across_methods() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -191,18 +189,6 @@ fn key_consistency_across_methods() {
 
     // Both should produce identical pagination keys
     assert_eq!(pagination_key, schema_pagination_key);
-}
-
-#[test]
-fn version_and_flags() {
-    let hash_key = AttributeValue::S("test".to_string());
-    let item_key = ItemKey::table_key(TableName::new("test"), hash_key, None);
-
-    let parts = item_key.hash_range_key_part().expect("hash range key part");
-
-    let prefix = u16::from_be_bytes([parts[0], parts[1]]);
-    let version_and_flags = prefix & 0x3F; // Lower 6 bits
-    assert_eq!(version_and_flags, 0); // Version 00, flags 0000
 }
 
 #[cfg(feature = "rocksdb")]
@@ -304,6 +290,7 @@ fn gsi_round_trip_hash_only() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi_pk".to_string(),
@@ -318,7 +305,6 @@ fn gsi_round_trip_hash_only() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -407,6 +393,7 @@ fn gsi_round_trip_with_gsi_range() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -427,7 +414,6 @@ fn gsi_round_trip_with_gsi_range() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -523,6 +509,7 @@ fn gsi_round_trip_all_keys() {
             },
         ],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -543,7 +530,6 @@ fn gsi_round_trip_all_keys() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
 
@@ -626,6 +612,7 @@ fn gsi_invalid_token_parts() {
             attribute_type: KeyAttributeType::S,
         }],
         global_secondary_indexes: Some(vec![crate::GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("test_gsi"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi_pk".to_string(),
@@ -640,7 +627,6 @@ fn gsi_invalid_token_parts() {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     };
     let empty_token = URL_SAFE.encode([]);
@@ -654,7 +640,7 @@ fn gsi_invalid_token_parts() {
     for i in 0..5 {
         let data_str = format!("part{i}");
         let data = data_str.as_bytes();
-        ItemKey::add_length_prefixed_part(&mut parts, data);
+        ItemKey::append_length_prefixed_key(&mut parts, data).unwrap();
     }
     let invalid_token = URL_SAFE.encode(&parts);
     let result = ItemKey::item_key_from_next_page_token(
@@ -663,4 +649,25 @@ fn gsi_invalid_token_parts() {
         &Some(IndexName::new("test_gsi")),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn given_maximum_key_components_when_framed_then_the_entire_component_round_trips() {
+    let hash = "p".repeat(crate::MAX_PARTITION_KEY_BYTES);
+    let range = "r".repeat(crate::MAX_SORT_KEY_BYTES);
+    let key = ItemKey::table_key(
+        TableName::new("wide"),
+        AttributeValue::S(hash.clone()),
+        Some(AttributeValue::S(range.clone())),
+    );
+    let encoded = key.hash_range_key_part().unwrap();
+    let parts = split_next_token_to_keys(&encoded).unwrap();
+    assert_eq!(parts, [hash.into_bytes(), range.into_bytes()]);
+}
+
+#[test]
+fn given_truncated_token_framing_when_decoded_then_no_partial_key_is_returned() {
+    for token in [vec![0], vec![0, 4, b'a'], vec![0, 1, b'a', 0]] {
+        assert!(split_next_token_to_keys(&token).is_err());
+    }
 }

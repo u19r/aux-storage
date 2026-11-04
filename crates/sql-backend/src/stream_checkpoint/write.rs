@@ -1,4 +1,4 @@
-//! Atomic receipt issuance and minimum protected frontier on SQL.
+//! Atomic durable checkpoint receipt issuance on SQL.
 
 use storage_types::{StorageEnum, StorageResult, SystemStreamCheckpoint};
 use stream_provider::SystemStreamCheckpointIssue;
@@ -33,11 +33,5 @@ pub(crate) async fn write_checkpoint<A: SqlAttempt>(
         }
         .into());
     }
-    let statements = checkpoint
-        .frontier()
-        .iter()
-        .map(|position| sql_statements::protect_frontier(engine, checkpoint.scope(), position))
-        .collect::<StorageResult<Vec<_>>>()?;
-    attempt.execute_batch(statements).await?;
     Ok(())
 }

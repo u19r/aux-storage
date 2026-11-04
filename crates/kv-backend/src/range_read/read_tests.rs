@@ -26,6 +26,7 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
         attribute_type: KeyAttributeType::S,
     });
     let index = GlobalSecondaryIndex {
+        capture_for_build: false,
         index_name: IndexName::new("by-group"),
         key_schema: vec![KeySchemaElement {
             attribute_name: "gsi_pk".into(),
@@ -48,6 +49,7 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
         }],
         index_id_high_water: 1,
         deleted: false,
+        external_cleanup_required: false,
     };
     let plan = RangeReadPlan::try_from_scan(ScanTableRequest {
         table_name: table.table_name.clone(),
@@ -79,7 +81,7 @@ fn given_a_verified_gsi_image_when_physical_leaf_changes_then_complete_key_is_re
     .unwrap();
     let physical = physical_item_key(&identity, &table, &bound, &key).unwrap();
     let content = || {
-        RangeContent::Projection(Box::new(crate::gsi::HydratedProjection {
+        RangeContent::Projection(Box::new(crate::gsi::DecodedProjection {
             image: image.clone(),
             revision: 1_u64.try_into().unwrap(),
         }))

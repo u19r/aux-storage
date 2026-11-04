@@ -7,8 +7,7 @@ use storage_common::{TtlConfigRecord, TtlIndexWriteBatch};
 use storage_types::{
     BoundedVec, DeleteItemRequest, IndexerDeclaration, KeyAttributes, NonEmptyString, NonZeroVec,
     PutItemRequest, ReturnValuesOldNewUpdated, StorageError, StorageResult, StoredTableInfo,
-    StreamItemId, StreamName, StreamRetentionDuration, TableKey, TableName, UpdateItemRequest,
-    WireItem,
+    StreamItemId, StreamName, TableKey, TableName, UpdateItemRequest, WireItem,
 };
 use stream_provider::StreamItem;
 
@@ -38,7 +37,6 @@ pub struct StreamWriteIntent {
 pub struct TtlWriteIntent {
     pub config: Option<TtlConfigRecord>,
     pub context: TtlWriteContext,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     pub table: Arc<StoredTableInfo>,
 }
 
@@ -51,7 +49,6 @@ pub struct TablePutInput {
     pub table: Arc<StoredTableInfo>,
     pub stream: TableStreamContext,
     pub ttl_config: Option<TtlConfigRecord>,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 /// Foreground update input. Update semantics reuse the shared
@@ -70,7 +67,6 @@ impl TablePutInput {
         immediate_gsi_consistency: bool,
         ttl_config: Option<TtlConfigRecord>,
     ) -> Self {
-        let item_stream_ttl_hours = write.request().aux_item_stream_ttl_hours;
         Self {
             write,
             table,
@@ -83,7 +79,6 @@ impl TablePutInput {
                 gsi_lifecycle: None,
             },
             ttl_config,
-            item_stream_ttl_hours,
         }
     }
 }
@@ -100,7 +95,6 @@ impl TableUpdateInput {
         table: Arc<StoredTableInfo>,
         options: SingleUpdateOptions,
     ) -> Self {
-        let item_stream_ttl_hours = write.request().aux_item_stream_ttl_hours;
         let ttl_context = write.context().clone();
         Self {
             write,
@@ -117,7 +111,6 @@ impl TableUpdateInput {
                 index: 0,
                 ttl_config: options.ttl_config,
                 ttl_context,
-                item_stream_ttl_hours,
             },
         }
     }
@@ -130,7 +123,6 @@ pub struct TableDeleteInput {
     pub table: Arc<StoredTableInfo>,
     pub stream: TableStreamContext,
     pub ttl_config: Option<TtlConfigRecord>,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl TableDeleteInput {
@@ -140,7 +132,6 @@ impl TableDeleteInput {
         immediate_gsi_consistency: bool,
         ttl_config: Option<TtlConfigRecord>,
     ) -> Self {
-        let item_stream_ttl_hours = write.request().aux_item_stream_ttl_hours;
         Self {
             write,
             table,
@@ -153,7 +144,6 @@ impl TableDeleteInput {
                 gsi_lifecycle: None,
             },
             ttl_config,
-            item_stream_ttl_hours,
         }
     }
 }
@@ -267,7 +257,6 @@ pub struct FinishedTablePut {
     pub old_item: Option<WireItem>,
     pub new_indexers: IndexerDeclaration,
     pub ttl_writes: TtlIndexWriteBatch,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     pub ttl_context: TtlWriteContext,
     pub stream: TableStreamContext,
 }
@@ -284,7 +273,6 @@ pub struct FinishedTableUpdate {
     /// None inherits the stored declaration from the old item at stage time.
     pub new_indexers: Option<IndexerDeclaration>,
     pub ttl_writes: TtlIndexWriteBatch,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     pub ttl_context: TtlWriteContext,
     pub stream: TableStreamContext,
     pub return_values: Option<ReturnValuesOldNewUpdated>,
@@ -299,7 +287,6 @@ pub struct FinishedTableDelete {
     pub table_key: TableKey,
     pub old_item: Option<WireItem>,
     pub ttl_writes: TtlIndexWriteBatch,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     pub ttl_context: TtlWriteContext,
     pub stream: TableStreamContext,
 }

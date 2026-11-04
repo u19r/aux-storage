@@ -1,5 +1,5 @@
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
-use replication_types::{event::identity::CanonicalEventId, identity::resource::OperationIdentity};
+use replication_types::identity::resource::OperationIdentity;
 use serde::{Deserialize, Serialize};
 use storage_provider::{DynamoPort, ItemWriteCause};
 use storage_types::{AttemptMode, StorageResult};
@@ -32,7 +32,8 @@ pub(crate) struct OriginOperationReceipt<R = Box<serde_json::value::RawValue>> {
     pub operation: OperationIdentity,
     pub cause: OriginOperationKind,
     pub response: R,
-    pub events: Vec<CanonicalEventId>,
+    pub owners: Vec<super::response_scope::ReceiptDataOwner>,
+    pub state: super::response_scope::OperationReceiptState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

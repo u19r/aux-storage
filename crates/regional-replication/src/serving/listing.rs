@@ -8,7 +8,7 @@ use storage_provider::{
 };
 use storage_types::{
     AttemptMode, ListStreamsRequest, ListStreamsResponse, ListTablesRequest, ListTablesResponse,
-    StorageError, StorageResult, TableName, TimestampMillis,
+    StorageError, StorageResult, TableName, TableStreamIdentity,
 };
 
 use super::runtime::RegionalDynamo;
@@ -76,7 +76,7 @@ impl<A: DynamoAttempt + PhysicalRecordAttempt> ListStreamsAttempt for VisibleCat
     async fn read_stream_entry(
         &mut self,
         name: &TableName,
-    ) -> StorageResult<Option<TimestampMillis>> {
+    ) -> StorageResult<Option<TableStreamIdentity>> {
         let entry = self.attempt.read_stream_entry(name).await?;
         if entry.is_some() && !self.visible(name).await? {
             return Ok(None);
@@ -103,7 +103,7 @@ impl<A: DynamoAttempt + PhysicalRecordAttempt> ListStreamsAttempt for VisibleCat
             if page.entries.len() > remaining as usize || (page.more && page.entries.is_empty()) {
                 return Err(invalid_page());
             }
-            for (name, created_at) in page.entries {
+            for (name, identity) in page.entries {
                 if cursor
                     .as_ref()
                     .is_some_and(|previous| previous.as_ref() >= name.as_ref())
@@ -112,7 +112,7 @@ impl<A: DynamoAttempt + PhysicalRecordAttempt> ListStreamsAttempt for VisibleCat
                 }
                 cursor = Some(name.clone());
                 if self.visible(&name).await? {
-                    entries.push((name, created_at));
+                    entries.push((name, identity));
                 }
             }
             if !page.more || entries.len() == limit as usize {

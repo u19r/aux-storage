@@ -71,6 +71,7 @@ replication-types = { path = "../replication-types" }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 scheduled-bg-jobs = { workspace = true }
+scheduled-bg-jobs-conformance = { workspace = true }
 storage = { path = "../storage", default-features = false, features = ["test-support"] }
 storage-observability-test-support = { path = "../storage-observability-test-support" }
 tempfile = { workspace = true }

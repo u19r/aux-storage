@@ -23,7 +23,7 @@ impl WinnerAuthority {
         let images = self.images()?;
         let matches = match (images.new, observed.0) {
             (Some(expected), Some(actual)) => {
-                stream_provider::retained_image::require_materialized_image(expected, actual)?;
+                crate::image_equality::require_materialized_image(expected, actual)?;
                 true
             }
             (None, None) => true,
@@ -82,22 +82,35 @@ impl WinnerAuthority {
 /// A known winner requires exact key/provenance evidence; an optional baseline
 /// lookup preserves absence rather than synthesizing a winner or Genesis.
 pub(in crate::journal) enum RetainedAuthorityRequest<'expected> {
-    Winner(&'expected KeyAttributes, &'expected WinnerProvenance),
-    Baseline(&'expected replication_types::event::identity::VersionIdentity),
+    Winner(
+        storage_types::TableHistoryId,
+        &'expected KeyAttributes,
+        &'expected WinnerProvenance,
+    ),
+    Baseline(
+        storage_types::TableHistoryId,
+        &'expected replication_types::event::identity::VersionIdentity,
+    ),
 }
 
 impl JournalStore {
     pub(in crate::journal) async fn load_winner_authority<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        expected: (&KeyAttributes, &WinnerProvenance),
+        expected: (
+            storage_types::TableHistoryId,
+            &KeyAttributes,
+            &WinnerProvenance,
+        ),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<WinnerAuthority> {
         self.load_retained_authorities(
             attempt,
-            &[RetainedAuthorityRequest::Winner(expected.0, expected.1)],
+            &[RetainedAuthorityRequest::Winner(
+                expected.0, expected.1, expected.2,
+            )],
             codec,
         )
         .await?
@@ -110,7 +123,7 @@ impl JournalStore {
     /// hydration; each returned authority still binds its own caller's exact
     /// slot.
     pub(in crate::journal) async fn load_retained_authorities<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -150,19 +163,10 @@ impl JournalStore {
                 .flatten()
                 .map(|entry| entry.original().clone())
                 .collect::<Vec<_>>();
-            let manifests = originals
+            let mut bytes = originals
                 .iter()
-                .map(|row| self.decode_retained_manifest(row, codec))
-                .collect::<StorageResult<Vec<_>>>()?;
-            let maximum = manifests.iter().try_fold(0usize, |bytes, manifest| {
-                bytes
-                    .checked_add(manifest.original_length())
-                    .ok_or_else(corrupt_record)
-            })?;
-            let mut bytes = self
-                .load_retained_manifests(settlement.as_mut(), &originals, (manifests, maximum))
-                .await
-                .map_err(storage_types::StorageError::from)?
+                .map(|row| self.decode_original_bytes(row, codec))
+                .collect::<StorageResult<Vec<_>>>()?
                 .into_iter();
             let authorities = requests
                 .iter()
@@ -196,14 +200,20 @@ impl RetainedAuthorityRequest<'_> {
         journal: &JournalStore,
     ) -> StorageResult<Vec<infrastructure_provider::record::DurableRecordKey>> {
         match self {
-            Self::Winner(_, winner) => match &winner.event {
+            Self::Winner(history, _, winner) => match &winner.event {
                 Some(event) => Ok(vec![
-                    journal.identity_key(crate::constants::ACCEPTANCE_SUFFIX, event)?,
-                    journal.identity_key(crate::constants::EVENT_SUFFIX, event)?,
+                    journal.table_identity_key(
+                        crate::constants::ACCEPTANCE_SUFFIX,
+                        *history,
+                        event,
+                    )?,
+                    journal.table_identity_key(crate::constants::EVENT_SUFFIX, *history, event)?,
                 ]),
-                None => Ok(vec![journal.baseline_key(&winner.version)?]),
+                None => Ok(vec![journal.baseline_key(*history, &winner.version)?]),
             },
-            Self::Baseline(identity) => Ok(vec![journal.baseline_key(identity)?]),
+            Self::Baseline(history, identity) => {
+                Ok(vec![journal.baseline_key(*history, identity)?])
+            }
         }
     }
 
@@ -213,7 +223,7 @@ impl RetainedAuthorityRequest<'_> {
         rows: &mut impl Iterator<Item = Option<infrastructure_provider::record::DurableRecord>>,
     ) -> StorageResult<Option<WinnerAuthorityMetadata>> {
         let row = rows.next().ok_or_else(corrupt_record)?;
-        let Self::Winner(_, winner) = self else {
+        let Self::Winner(_, _, winner) = self else {
             return Ok(row.map(WinnerAuthorityMetadata::Baseline));
         };
         let row = row.ok_or_else(corrupt_record)?;
@@ -234,10 +244,10 @@ impl RetainedAuthorityRequest<'_> {
     fn require_authority(&self, authority: &WinnerAuthority) -> StorageResult<()> {
         let provenance = authority.provenance()?;
         match self {
-            Self::Winner(key, winner) if &provenance == *winner && authority.key()? == *key => {
+            Self::Winner(_, key, winner) if &provenance == *winner && authority.key()? == *key => {
                 Ok(())
             }
-            Self::Baseline(identity) if &provenance.version == *identity => Ok(()),
+            Self::Baseline(_, identity) if &provenance.version == *identity => Ok(()),
             _ => Err(corrupt_record()),
         }
     }
@@ -274,6 +284,11 @@ impl WinnerAuthorityMetadata {
                 original,
                 acceptance,
             } => {
+                if journal.decode_original_payload(&original, codec)?.history
+                    != acceptance.delivery.physical
+                {
+                    return Err(corrupt_record());
+                }
                 let event = journal.decode_retained_event(&original, &bytes, codec)?;
                 journal.require_acceptance_binding(
                     (&acceptance.receipt, &acceptance.delivery),

@@ -35,7 +35,7 @@ pub(in crate::journal) enum TrimOriginalRetention {
 
 impl JournalStore {
     pub(in crate::journal) async fn classify_public_trim_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -50,7 +50,8 @@ impl JournalStore {
             if event.lineage() != proposal.candidate.lineage {
                 return Ok(TrimOriginalRetention::Disjoint);
             }
-            let table = &proposal.participant(&self.region)?.state.name;
+            let state = &proposal.participant(&self.region)?.state;
+            let table = (state.physical, &state.name);
             let original = event.as_ref();
             let publication = self
                 .observe_retained_publication(
@@ -74,10 +75,7 @@ impl JournalStore {
 #[serde(deny_unknown_fields)]
 pub(in crate::journal) enum OriginalContinuation {
     Receiver(ReceiverScan),
-    Archive {
-        archive: ArchiveScan,
-        next: Option<u64>,
-    },
+    Archive(ArchiveScan),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,7 +101,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn scan_public_trim_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -121,8 +119,16 @@ impl JournalStore {
                 return Err(corrupt_record());
             };
             self.require_public_trim_original_scan(&original, proposal)?;
-            self.require_public_trim_original_parent(attempt, &original, encoding.1)
-                .await?;
+            if !self
+                .require_public_trim_original_parent(attempt, &original, encoding.1)
+                .await?
+            {
+                return self.resume_public_trim_original(
+                    scan,
+                    original.continuation,
+                    TrimOriginalRetention::Disjoint,
+                );
+            }
             let cut = proposal
                 .candidate
                 .sources
@@ -168,45 +174,49 @@ impl JournalStore {
     }
 
     async fn require_public_trim_original_parent<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         original: &OriginalScan,
         codec: &CanonicalJsonCodec,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<bool> {
         match &original.continuation {
             OriginalContinuation::Receiver(receiver) => {
                 self.require_public_trim_receiver_root(attempt, receiver)
                     .await?;
-                let (_, event) = self
+                let original_event = self
                     .load_receiver_original(
                         attempt,
                         (&receiver.receiver, receiver.after),
                         (codec, storage_types::ReadProtection::Snapshot),
                     )
                     .await?;
+                let Some((_, event)) = original_event else {
+                    return Ok(false);
+                };
                 if event.as_ref().id != original.witness.identity
                     || event.as_ref().digest != original.witness.digest
                 {
                     return Err(corrupt_record());
                 }
-                Ok(())
+                Ok(true)
             }
-            OriginalContinuation::Archive { archive, next } => {
+            OriginalContinuation::Archive(archive) => {
                 self.require_public_trim_archive_original(
                     attempt,
                     archive,
-                    (&original.witness.identity, original.witness.digest, *next),
+                    (&original.witness.identity, original.witness.digest),
                     codec,
                 )
-                .await
+                .await?;
+                Ok(true)
             }
         }
     }
 
     pub(in crate::journal) async fn verify_public_trim_original_publication<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -239,7 +249,15 @@ impl JournalStore {
                 origin: cut.origin.clone(),
             };
             let frame = self
-                .load_history_frame(attempt, (&selection, range), encoding)
+                .load_history_frame(
+                    attempt,
+                    (
+                        proposal.participant(&self.region)?.state.physical,
+                        &selection,
+                        range,
+                    ),
+                    encoding,
+                )
                 .await?;
             if through == cut.through && Some(frame.manifest().digest) != cut.terminal_manifest {
                 return Err(corrupt_record());
@@ -274,8 +292,8 @@ impl JournalStore {
             OriginalContinuation::Receiver(receiver) => {
                 self.require_public_trim_receiver_scan(receiver)
             }
-            OriginalContinuation::Archive { archive, next } => {
-                self.require_public_trim_archive_continuation(archive, *next)
+            OriginalContinuation::Archive(archive) => {
+                self.require_public_trim_archive_continuation(archive)
             }
         }
     }
@@ -290,8 +308,8 @@ impl JournalStore {
             OriginalContinuation::Receiver(receiver) => {
                 self.resume_public_trim_receiver(scan, receiver, retention)
             }
-            OriginalContinuation::Archive { archive, next } => {
-                self.resume_public_trim_archive(scan, (archive, next), retention)
+            OriginalContinuation::Archive(archive) => {
+                self.resume_public_trim_archive(scan, archive, retention)
             }
         }
     }

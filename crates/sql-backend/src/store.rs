@@ -116,10 +116,6 @@ impl<B: SqlBackend + 'static> DynamoPort for SqlStore<B> {
                         SqlCatalogAttempt::new(native, engine, mode.read_protection())
                             .with_metadata_cache(cache);
                     let result = operation(&mut attempt).await?;
-                    stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                        &mut attempt,
-                    )
-                    .await?;
                     Ok(result)
                 })
             })
@@ -143,10 +139,6 @@ impl<B: SqlBackend + 'static> DynamoPort for SqlStore<B> {
                 let mut attempt =
                     SqlCatalogAttempt::new(native, engine, storage_types::ReadProtection::Conflict);
                 let result = operation(&mut attempt).await?;
-                stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                    &mut attempt,
-                )
-                .await?;
                 Ok(result)
             })
         })
@@ -156,6 +148,7 @@ impl<B: SqlBackend + 'static> DynamoPort for SqlStore<B> {
         &self,
         request: UpdateTableRequest,
         captured_at: TimestampMillis,
+        bindings: storage_provider::RequestTableBindings,
     ) -> StorageResult<UpdateTableResponse> {
         let engine = self.backend.engine();
         self.backend
@@ -167,13 +160,9 @@ impl<B: SqlBackend + 'static> DynamoPort for SqlStore<B> {
                         storage_types::ReadProtection::Conflict,
                     );
                     let (_, response) = attempt
-                        .execute_table_update(&request, captured_at)
+                        .execute_table_update(&request, captured_at, &bindings)
                         .await?
                         .into_result()?;
-                    stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                        &mut attempt,
-                    )
-                    .await?;
                     Ok(response)
                 })
             })

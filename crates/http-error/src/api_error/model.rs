@@ -378,6 +378,11 @@ impl From<StorageError> for HttpApiError {
                 "The public history cursor has expired",
                 400,
             ),
+            StorageEnum::TrimmedDataAccess => Self::dynamodb_protocol_error(
+                "TrimmedDataAccessException",
+                variant.to_string(),
+                400,
+            ),
             StorageEnum::DeletionProtectionEnabled { message, .. } => {
                 Self::dynamodb_protocol_error("ValidationException", message.clone(), 400)
             }

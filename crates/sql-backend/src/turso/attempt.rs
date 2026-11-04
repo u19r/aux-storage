@@ -14,7 +14,6 @@ use crate::{AttemptMode, ReadProtection, SqlAttempt, SqlQueryPage, SqlStatement}
 /// One exclusive connection lease and its native transaction.
 pub struct TursoAttempt {
     settlement: storage_types::NativeAttemptSettlement,
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
     connection: OwnedMutexGuard<turso::Connection>,
     mode: AttemptMode,
     #[cfg(feature = "fault-injection")]
@@ -29,7 +28,6 @@ impl TursoAttempt {
     ) -> Self {
         let (mode, limits) = execution;
         Self {
-            ownership: Default::default(),
             settlement: storage_types::NativeAttemptSettlement::new(limits),
             connection,
             mode,
@@ -116,11 +114,6 @@ impl SqlAttempt for TursoAttempt {
     }
     fn require_settlement(&self) -> StorageResult<()> {
         self.settlement.require_open()
-    }
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
     }
 
     async fn query(

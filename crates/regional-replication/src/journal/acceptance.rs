@@ -16,7 +16,7 @@ impl JournalStore {
     /// Imports retain the original bytes and advance local causality, including
     /// losing events. They never allocate a local source position.
     pub(crate) async fn accept_import_event<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -52,41 +52,43 @@ impl JournalStore {
         settlement.complete(result)
     }
 
-    pub async fn load_acceptance<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    pub async fn load_acceptance<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
-        identity: &CanonicalEventId,
+        input: (storage_types::TableHistoryId, &CanonicalEventId),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<Option<StoredAcceptance>> {
-        self.load_acceptance_protected(attempt, identity, codec, ReadProtection::Snapshot)
+        self.load_acceptance_protected(attempt, input, codec, ReadProtection::Snapshot)
             .await
     }
 
     pub(in crate::journal) async fn load_acceptance_protected<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        identity: &CanonicalEventId,
+        input: (storage_types::TableHistoryId, &CanonicalEventId),
         codec: &CanonicalJsonCodec,
         protection: ReadProtection,
     ) -> StorageResult<Option<StoredAcceptance>> {
         Ok(self
-            .load_acceptance_with_delivery(attempt, identity, codec, protection)
+            .load_acceptance_with_delivery(attempt, input, codec, protection)
             .await?
             .map(|(accepted, _)| accepted))
     }
 
     pub(in crate::journal) async fn load_acceptance_with_delivery<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        identity: &CanonicalEventId,
+        input: (storage_types::TableHistoryId, &CanonicalEventId),
         codec: &CanonicalJsonCodec,
         protection: ReadProtection,
     ) -> StorageResult<Option<(StoredAcceptance, crate::history::view::CanonicalViewPointer)>> {
-        let identities = [identity];
+        let identities = [(input.1, input.0)];
         let selection = super::acceptance_batch::AcceptanceReadSelection::Identities(&identities);
         let mut accepted = self
             .load_acceptance_inventory(attempt, (&selection, protection), codec)
@@ -101,66 +103,6 @@ impl JournalStore {
         Ok(result)
     }
 
-    pub async fn store_acceptance<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
-        &self,
-        attempt: &mut A,
-        input: (
-            &CanonicalEvent,
-            &CanonicalAcceptanceReceipt,
-            Option<storage_types::TableHistoryId>,
-        ),
-    ) -> StorageResult<()> {
-        self.store_acceptance_batch(attempt, &[input]).await
-    }
-
-    pub(in crate::journal) async fn store_acceptance_batch<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
-    >(
-        &self,
-        attempt: &mut A,
-        input: &[(
-            &CanonicalEvent,
-            &CanonicalAcceptanceReceipt,
-            Option<storage_types::TableHistoryId>,
-        )],
-    ) -> StorageResult<()> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-        let attempt = settlement.as_mut();
-        let result = async {
-            if input.is_empty() {
-                return Ok(());
-            }
-            let acceptances = input
-                .iter()
-                .map(|(event, receipt, _)| (*event, *receipt))
-                .collect::<Vec<_>>();
-            require_acceptance_inputs(&acceptances)?;
-            let declarations = input
-                .iter()
-                .map(|(event, _, history)| (*event, *history))
-                .collect::<Vec<_>>();
-            let originals = self.prepare_original_batch(attempt, &declarations).await?;
-            let events = input.iter().map(|(event, _, _)| *event).collect::<Vec<_>>();
-            let deliveries = self.prepare_first_seen_batch(attempt, &events).await?;
-            if originals.len() != input.len() || deliveries.len() != input.len() {
-                return Err(corrupt_record());
-            }
-            let prepared = acceptances
-                .iter()
-                .zip(originals)
-                .zip(deliveries)
-                .map(|(((_, receipt), original), delivery)| {
-                    let (accepted, pointer) = delivery.accept(receipt)?;
-                    Ok((original, accepted, pointer))
-                })
-                .collect::<StorageResult<Vec<_>>>()?;
-            let changes = self.prepare_acceptance_records(prepared)?;
-            self.records.store(attempt, &changes).await
-        }
-        .await;
-        settlement.complete(result)
-    }
     pub(in crate::journal) fn prepare_acceptance_records(
         &self,
         input: Vec<(
@@ -172,11 +114,21 @@ impl JournalStore {
         let mut changes =
             Vec::with_capacity(input.len().checked_mul(3).ok_or_else(corrupt_record)?);
         for (original, accepted, pointer) in input {
-            if original.key() != &self.identity_key(EVENT_SUFFIX, &accepted.receipt.event)? {
+            if original.key()
+                != &self.table_identity_key(
+                    EVENT_SUFFIX,
+                    accepted.delivery.physical,
+                    &accepted.receipt.event,
+                )?
+            {
                 return Err(corrupt_record());
             }
             changes.push(self.records.prepare_acceptance(
-                self.identity_key(ACCEPTANCE_SUFFIX, &accepted.receipt.event)?,
+                self.table_identity_key(
+                    ACCEPTANCE_SUFFIX,
+                    accepted.delivery.physical,
+                    &accepted.receipt.event,
+                )?,
                 &accepted,
             )?);
             changes.push(original);
@@ -205,20 +157,4 @@ impl JournalStore {
         }
         Ok(())
     }
-}
-
-fn require_acceptance_inputs(
-    input: &[(&CanonicalEvent, &CanonicalAcceptanceReceipt)],
-) -> StorageResult<()> {
-    let mut identities = std::collections::BTreeSet::new();
-    for (event, receipt) in input {
-        let candidate = event.as_ref();
-        if receipt.event != candidate.id
-            || receipt.digest != candidate.digest
-            || !identities.insert(&candidate.id)
-        {
-            return Err(corrupt_record());
-        }
-    }
-    Ok(())
 }

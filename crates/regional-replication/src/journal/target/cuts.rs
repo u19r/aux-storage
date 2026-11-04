@@ -145,7 +145,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn require_import_binding<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -173,7 +173,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn record_joining_coverage<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -211,7 +211,7 @@ impl JournalStore {
     }
 
     async fn load_joining_cut<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -260,14 +260,19 @@ impl JournalStore {
             .verification
             .as_ref()
             .is_some_and(|progress| progress.history_frozen())
-            && self
-                .load_import_pages(attempt, import, codec, ImportPageScope::Selected)
+        {
+            let tables = self
+                .load_import_table_copies(attempt, import, ReadProtection::Shared)
+                .await?;
+            if self
+                .load_import_pages(attempt, (import, &tables), codec, ImportPageScope::Selected)
                 .await?
                 .is_none()
-        {
-            return Err(storage_types::StorageError::unsupported(
-                "hidden verification has frozen its accepted history",
-            ));
+            {
+                return Err(storage_types::StorageError::unsupported(
+                    "hidden verification has frozen its accepted history",
+                ));
+            }
         }
         let key = self.target_cut_key(
             operation,

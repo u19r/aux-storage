@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use storage_types::{IndexName, TableHistoryId, TableName, maintenance::TargetIncarnation};
+use storage_types::{TableHistoryId, maintenance::TargetIncarnation};
 
 use crate::SqlEngine;
 
@@ -18,30 +18,20 @@ pub trait SqlLayout: Copy + Send + Sync {
         qualified: impl FnOnce() -> String,
     ) -> Cow<'static, str>;
 
-    fn item_table_name(self, table: &TableName, history: TableHistoryId) -> String {
-        self.qualify_relation(self.engine().item_table_name(table, history))
+    fn item_table_name(self, history: TableHistoryId) -> String {
+        self.qualify_relation(self.engine().item_table_name(history))
     }
 
-    fn ttl_table_name(self, table: &TableName, history: TableHistoryId) -> String {
-        self.qualify_relation(self.engine().ttl_table_name(table, history))
+    fn ttl_table_name(self, history: TableHistoryId) -> String {
+        self.qualify_relation(self.engine().ttl_table_name(history))
     }
 
-    fn gsi_table_name(
-        self,
-        table: &TableName,
-        index: &IndexName,
-        incarnation: &TargetIncarnation,
-    ) -> String {
-        self.qualify_relation(self.engine().gsi_table_name(table, index, incarnation))
+    fn gsi_table_name(self, incarnation: &TargetIncarnation) -> String {
+        self.qualify_relation(self.engine().gsi_table_name(incarnation))
     }
 
-    fn gsi_read_index_name(
-        self,
-        table: &TableName,
-        index: &IndexName,
-        incarnation: &TargetIncarnation,
-    ) -> String {
-        self.qualify_relation(self.engine().gsi_read_index_name(table, index, incarnation))
+    fn gsi_read_index_name(self, incarnation: &TargetIncarnation) -> String {
+        self.qualify_relation(self.engine().gsi_read_index_name(incarnation))
     }
 }
 

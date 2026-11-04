@@ -154,7 +154,7 @@ async fn given_regional_latency_and_response_loss_when_original_pages_retry_then
     fixture::assert_item(&source, Some("partitioned")).await;
     fixture::assert_item(&destination, Some("lost-response")).await;
     proxy.enabled(true).await;
-    let scope = fixture::delivery_scope(&pending);
+    let scope = fixture::delivery_scope(&source, &pending).await;
     let receipt = client.deliver(Arc::clone(&pending)).await.unwrap();
     let final_progress = fixture::acknowledge(&source, pending, receipt).await;
     assert_eq!(

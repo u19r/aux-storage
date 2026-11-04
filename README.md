@@ -222,20 +222,10 @@ without a provider-owned snapshot context fail before any sequence step executes
 
 ## DynamoDB Stream Retention Extensions
 
-`aux-storage` supports non-DynamoDB extension fields for retained stream history on backends that
-implement custom stream duration:
-
-- `AuxStreamDurationHours` on `CreateTable` and `UpdateTable` sets table stream retention.
-- `AuxDefaultItemStreamDurationHours` on `CreateTable` and `UpdateTable` sets the table default for
-  item stream retention.
-- `AuxItemStreamTtlHours` on `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem` put/delete
-  requests, and `TransactWriteItems` put/update/delete members sets item-specific retention
-  metadata.
-
-Omitting these fields keeps the default 72-hour retention. Finite values are hours up to 61,320
-(`24 * 365 * 7`); `-1` means forever. Item stream rows are physically retained for at least the
-table stream retention, so an item TTL shorter than the table duration does not delete item stream
-rows while table stream pointers may still reference them.
+`AuxStreamDurationHours` on `CreateTable` and `UpdateTable` sets retention for the table stream
+and its item history. Omission uses the default 72 hours; `-1` keeps history forever.
+Items have no independent history duration. Table cleanup preserves the versions required by
+retained DynamoDB stream records. DynamoDB live-item TTL remains independent of history retention.
 
 See [CONFIGURATION.md](CONFIGURATION.md#custom-stream-duration-extension) for request examples and
 [OBSERVABILITY.md](OBSERVABILITY.md#custom-stream-duration) for trim backlog guidance.

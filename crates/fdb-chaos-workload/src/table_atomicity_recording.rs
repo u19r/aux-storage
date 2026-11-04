@@ -1,4 +1,32 @@
-use crate::{imports::*, table_atomicity::*};
+use crate::{common::storage_error_detail, imports::*, table_atomicity::*};
+
+pub(crate) struct FailedOperation {
+    pub started_at_sim_us: u64,
+    pub sequence: u64,
+    pub kind: OperationKind,
+    pub key: String,
+    pub value: Option<String>,
+    pub error: StorageError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureDisposition {
+    KnownAborted,
+    Unknown,
+    Unexpected,
+}
+
+impl From<&StorageError> for FailureDisposition {
+    fn from(error: &StorageError) -> Self {
+        if error.is_commit_unknown() {
+            return Self::Unknown;
+        }
+        match error.recursive_context(Vec::new()).0 {
+            StorageEnum::TransactionConflict { .. } => Self::KnownAborted,
+            _ => Self::Unexpected,
+        }
+    }
+}
 
 impl TableAtomicityWorkload {
     pub(crate) fn trace_check_progress(
@@ -46,7 +74,6 @@ impl TableAtomicityWorkload {
         self.model.apply(&event);
         self.possible_model.apply(&event);
         self.apply_gsi_model(&event);
-        self.apply_trim_model(&event);
         self.history.push(event);
     }
 
@@ -78,28 +105,6 @@ impl TableAtomicityWorkload {
                 {
                     self.gsi_seen_partitions.insert(partition.clone());
                     self.gsi_unclassified_partitions.insert(partition);
-                }
-            }
-            OperationOutcome::ConditionFailed { .. } | OperationOutcome::Failed { .. } => {}
-        }
-    }
-
-    pub(crate) fn apply_trim_model(&mut self, event: &HistoryEvent) {
-        match &event.outcome {
-            OperationOutcome::Committed => match event.kind {
-                OperationKind::Put
-                | OperationKind::PutIfAbsent
-                | OperationKind::Update
-                | OperationKind::TransactWrite => {
-                    if let Some(scope) = self.item_trim_scope(&event.key) {
-                        self.trim_model.expect_scope(scope);
-                    }
-                }
-                OperationKind::Delete | OperationKind::Read => {}
-            },
-            OperationOutcome::Unknown { .. } => {
-                if let Some(scope) = self.item_trim_scope(&event.key) {
-                    self.trim_model.unclassify(scope);
                 }
             }
             OperationOutcome::ConditionFailed { .. } | OperationOutcome::Failed { .. } => {}
@@ -163,30 +168,36 @@ impl TableAtomicityWorkload {
         self.client_id < self.active_client_count
     }
 
-    pub(crate) fn record_failure(
-        &mut self,
-        started_at_sim_us: u64,
-        sequence: u64,
-        kind: OperationKind,
-        key: String,
-        value: Option<String>,
-        error: String,
-    ) {
-        let outcome = classify_operation_error(&error);
-        if matches!(outcome, OperationOutcome::Unknown { .. }) {
-            self.trace_unknown_commit(sequence, &kind, &error);
-        } else {
+    pub(crate) fn record_failure(&mut self, operation: FailedOperation) {
+        let disposition = FailureDisposition::from(&operation.error);
+        let error = storage_error_detail(&operation.error);
+        if disposition == FailureDisposition::Unknown {
+            self.trace_unknown_commit(operation.sequence, &operation.kind, &error);
+        } else if disposition == FailureDisposition::Unexpected {
             self.error_count += 1;
             self.anomalies.push(Anomaly {
                 kind: AnomalyKind::OperationFailed,
                 client_id: self.client_id,
-                key: key.clone(),
+                key: operation.key.clone(),
                 expected: None,
                 actual: None,
                 detail: error.clone(),
             });
         }
-        let event = self.history_event(started_at_sim_us, sequence, kind, key, value, outcome);
+        let outcome = match disposition {
+            FailureDisposition::Unknown => OperationOutcome::Unknown { error },
+            FailureDisposition::KnownAborted | FailureDisposition::Unexpected => {
+                OperationOutcome::Failed { error }
+            }
+        };
+        let event = self.history_event(
+            operation.started_at_sim_us,
+            operation.sequence,
+            operation.kind,
+            operation.key,
+            operation.value,
+            outcome,
+        );
         self.record(event);
     }
 

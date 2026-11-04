@@ -3,9 +3,7 @@
 use std::future::Future;
 
 use storage_backfill::GsiBuild;
-use storage_provider::{
-    CreateTableAttempt, CreateTableLayout, StreamTrimStateWrite, table_retention_scope_id,
-};
+use storage_provider::{CreateTableAttempt, CreateTableLayout, StreamTrimStateWrite};
 use storage_types::{
     IndexName, StorageResult, StoredTableInfo, SystemStreamCheckpoint, TableHistoryId,
     maintenance::TargetIncarnation,
@@ -19,7 +17,7 @@ use crate::{
 
 impl<A: SqlAttempt, L: SqlLayout> CreateTableAttempt for SqlCatalogAttempt<'_, A, L> {
     type Identity = TableHistoryId;
-    type LayoutSeed = bool;
+    type LayoutSeed = ();
 
     fn read_layout(
         &mut self,
@@ -31,15 +29,15 @@ impl<A: SqlAttempt, L: SqlLayout> CreateTableAttempt for SqlCatalogAttempt<'_, A
     async fn insert_layout(
         &mut self,
         table: &StoredTableInfo,
-        seed: Self::LayoutSeed,
+        _: Self::LayoutSeed,
     ) -> StorageResult<Option<Self::Identity>> {
         let history_id = TableHistoryId::from(uuid::Uuid::now_v7());
-        let inserted = self.insert_table_layout(table, history_id, seed).await?;
+        let inserted = self.insert_table_layout(table, history_id).await?;
         Ok(inserted.then_some(history_id))
     }
 
-    fn retention_scope_id(&self, _: &StoredTableInfo, identity: &Self::Identity) -> String {
-        table_retention_scope_id(*identity)
+    fn table_history_id(&self, identity: &Self::Identity) -> TableHistoryId {
+        *identity
     }
 
     fn write_retention(
@@ -66,9 +64,9 @@ impl<A: SqlAttempt, L: SqlLayout> CreateTableAttempt for SqlCatalogAttempt<'_, A
 
     fn register_gsis(
         &mut self,
-        identity: &Self::Identity,
+        _identity: &Self::Identity,
         builds: Vec<GsiBuild<()>>,
     ) -> impl Future<Output = StorageResult<()>> + Send {
-        register_gsi_builds(self.attempt, self.engine, *identity, builds)
+        register_gsi_builds(self.attempt, self.engine, builds)
     }
 }

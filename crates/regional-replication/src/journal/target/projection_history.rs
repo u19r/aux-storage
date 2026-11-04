@@ -31,7 +31,8 @@ impl JournalStore {
     }
 
     pub(super) async fn advance_projection_history<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + GsiProjectionMetadataAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+            + GsiProjectionMetadataAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -52,7 +53,7 @@ impl JournalStore {
                     let page = self
                         .load_baseline_page(
                             attempt,
-                            (root.state.configuration.lineage, after),
+                            (root.state.physical, root.state.configuration.lineage, after),
                             (input.1, budget),
                         )
                         .await?;
@@ -83,7 +84,11 @@ impl JournalStore {
                         self.require_reconstruction_link(attempt, root, &retained)
                             .await?;
                         let accepted = self
-                            .load_acceptance(attempt, &retained.link.event, input.1)
+                            .load_acceptance(
+                                attempt,
+                                (root.state.physical, &retained.link.event),
+                                input.1,
+                            )
                             .await?
                             .ok_or_else(corrupt_record)?;
                         if accepted.receipt.digest != retained.link.digest {

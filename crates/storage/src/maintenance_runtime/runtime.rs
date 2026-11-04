@@ -24,7 +24,8 @@ use crate::{
 };
 
 pub(crate) struct MaintenanceRuntime {
-    runtime: Arc<JobRuntime<ScheduledJobStore>>,
+    runtime: JobRuntime<ScheduledJobStore>,
+    seed_retries: usize,
 }
 
 pub(crate) struct SeededMaintenanceRuntime {
@@ -71,7 +72,7 @@ impl MaintenanceRuntime {
         repositories: MaintenanceRepositories,
         table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
         intervals: DatabaseJobIntervals,
-    ) -> StorageResult<Arc<Self>> {
+    ) -> StorageResult<Self> {
         let namespace = Self::namespace(destination_namespace)?;
         let catalog = MaintenanceJobCatalog::try_new(
             repositories,
@@ -79,6 +80,9 @@ impl MaintenanceRuntime {
             intervals,
             Self::wall_now(),
         )?;
+        let seed_retries = catalog
+            .manifest()
+            .map_or(0, |manifest| manifest.seed_ids().len());
         let owner = OwnerId::generate()
             .map_err(|_| StorageError::internal("maintenance owner generation failed"))?;
         let budget = Self::drive_profile(job_store.capabilities().max_transaction_duration())?;
@@ -88,19 +92,32 @@ impl MaintenanceRuntime {
             JobRuntime::local(job_store, catalog, budget, namespace, owner)
         }
         .map_err(|_| StorageError::validation("invalid maintenance runtime"))?;
-        Ok(Arc::new(Self {
-            runtime: Arc::new(runtime),
-        }))
+        Ok(Self {
+            runtime,
+            seed_retries,
+        })
     }
 
-    pub(crate) async fn initialize_seeds(
-        self: Arc<Self>,
-    ) -> StorageResult<SeededMaintenanceRuntime> {
-        self.runtime
-            .ensure_seeds()
-            .await
-            .map_err(Self::map_seed_error)?;
-        Ok(SeededMaintenanceRuntime { runtime: self })
+    pub(crate) async fn initialize_seeds(mut self) -> StorageResult<SeededMaintenanceRuntime> {
+        loop {
+            match self.runtime.ensure_seeds().await {
+                Ok(_) => {
+                    return Ok(SeededMaintenanceRuntime {
+                        runtime: Arc::new(self),
+                    });
+                }
+                Err(
+                    scheduled_bg_jobs::JobSystemError::UnknownCommit
+                    | scheduled_bg_jobs::JobSystemError::CatalogConflict,
+                ) if self.seed_retries > 0 => {
+                    // Stable seed identities let the scheduler resolve the
+                    // prior result from fresh observations without taking over
+                    // a peer's live journal command or repeating its handler.
+                    self.seed_retries -= 1;
+                }
+                Err(error) => return Err(Self::map_seed_error(error)),
+            }
+        }
     }
 
     async fn drive(&self) {

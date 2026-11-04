@@ -93,9 +93,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             "default",
             crate::admission::AdmissionClass::RangeRead,
-            |dynamo| async move {
-                record_storage_operation("query_source_page", dynamo.query_source_page(request))
-                    .await
+            |dynamo| {
+                record_storage_operation("query_source_page", async move {
+                    dynamo.query_source_page(request).await
+                })
             },
         )
         .await
@@ -108,8 +109,11 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             "default",
             crate::admission::AdmissionClass::RangeRead,
-            |dynamo| async move {
-                record_storage_operation("query_table", dynamo.query_page(request)).await
+            |dynamo| {
+                record_storage_operation(
+                    "query_table",
+                    async move { dynamo.query_page(request).await },
+                )
             },
         )
         .await

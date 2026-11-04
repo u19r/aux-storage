@@ -27,7 +27,14 @@ where
     P: DynamoPort + 'static,
     for<'native> P::Attempt<'native>: ExpirationPort,
 {
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        scheduled_bg_jobs::CatalogManifest::try_new(
+            scheduled_bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![JobId::from([3; 16])],
+            Vec::new(),
+        )
+        .expect("complete fixture catalog manifest"),
+    );
     let now = Timestamp::from_millis(1_800_000_000_000);
     catalog.register_seeded(
         JobSpec::bytes(

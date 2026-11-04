@@ -2,14 +2,12 @@
 
 use async_trait::async_trait;
 use storage_types::{
-    AttemptMode, DurationSeconds, StreamItemId, StreamName, SystemStreamScope, TableName,
-    UserStreamName,
+    AttemptMode, DurationSeconds, StreamItemId, StreamName, SystemStreamScope, UserStreamName,
 };
 
 use crate::{
-    BootstrapCursorName, CursorName, CursorPage, CursorPosition, ProtectedCursorPage,
-    ProtectedCursorReadRequest, ReadDirection, Stream, StreamAttempt, StreamCursor, StreamError,
-    StreamPage, StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
+    CursorName, CursorPage, CursorPosition, ReadDirection, Stream, StreamAttempt, StreamCursor,
+    StreamError, StreamPage, StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
     SystemStreamHistory, SystemStreamLineage, SystemStreamPage, SystemStreamPageRequest,
     SystemStreamSplitRequest, SystemStreamSplitResult,
 };
@@ -34,20 +32,6 @@ pub trait StreamOperations: Send + Sync {
         partition_key: Option<&str>,
     ) -> StreamResult<StreamItemId>;
 
-    async fn append_table_item(
-        &self,
-        operation: crate::StreamAppendOperationId,
-        table_name: TableName,
-        item_data: &[u8],
-    ) -> StreamResult<StreamItemId>;
-
-    async fn reconcile_table_append(
-        &self,
-        operation: crate::StreamAppendOperationId,
-        table: TableName,
-        item_data: &[u8],
-    ) -> StreamResult<crate::TableAppendReconciliation>;
-
     async fn create_cursor(
         &self,
         stream: StreamRowKind,
@@ -66,30 +50,6 @@ pub trait StreamOperations: Send + Sync {
         stream: StreamRowKind,
         cursor_name: CursorName,
     ) -> StreamResult<()>;
-
-    async fn create_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-        position: CursorPosition,
-    ) -> StreamResult<StreamCursor>;
-
-    async fn get_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-    ) -> StreamResult<Option<StreamCursor>>;
-
-    async fn delete_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-    ) -> StreamResult<()>;
-
-    async fn read_from_protected_cursor(
-        &self,
-        request: ProtectedCursorReadRequest,
-    ) -> StreamResult<ProtectedCursorPage>;
 
     async fn advance_cursor(
         &self,
@@ -183,29 +143,6 @@ impl<P: StreamPort> StreamOperations for P {
         crate::stream_append::append_item(self, name, item_data, partition_key).await
     }
 
-    async fn append_table_item(
-        &self,
-        operation: crate::StreamAppendOperationId,
-        table_name: TableName,
-        item_data: &[u8],
-    ) -> StreamResult<StreamItemId> {
-        crate::stream_append::append_table_item(self, operation, table_name, item_data).await
-    }
-
-    async fn reconcile_table_append(
-        &self,
-        operation: crate::StreamAppendOperationId,
-        table: TableName,
-        item_data: &[u8],
-    ) -> StreamResult<crate::TableAppendReconciliation> {
-        crate::UserStreamAppend::validate_data(item_data)?;
-        crate::stream_append::reconcile_table_append(
-            self,
-            crate::TableAppendRequest::new(operation, table, item_data),
-        )
-        .await
-    }
-
     async fn create_cursor(
         &self,
         stream: StreamRowKind,
@@ -229,40 +166,6 @@ impl<P: StreamPort> StreamOperations for P {
         cursor_name: CursorName,
     ) -> StreamResult<()> {
         crate::stream_cursor::delete_cursor(self, stream, cursor_name).await
-    }
-
-    async fn create_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-        position: CursorPosition,
-    ) -> StreamResult<StreamCursor> {
-        crate::stream_hold::create_hold(self, stream_name, cursor_name, position).await
-    }
-
-    async fn get_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-    ) -> StreamResult<Option<StreamCursor>> {
-        let stream = crate::stream_hold::system_stream(stream_name)?;
-        crate::stream_cursor::load_cursor(self, stream, cursor_name.cursor_name().clone()).await
-    }
-
-    async fn delete_protected_cursor(
-        &self,
-        stream_name: StreamName,
-        cursor_name: BootstrapCursorName,
-    ) -> StreamResult<()> {
-        let stream = crate::stream_hold::system_stream(stream_name)?;
-        crate::stream_cursor::remove_cursor(self, stream, cursor_name.cursor_name().clone()).await
-    }
-
-    async fn read_from_protected_cursor(
-        &self,
-        request: ProtectedCursorReadRequest,
-    ) -> StreamResult<ProtectedCursorPage> {
-        crate::stream_hold::read_hold(self, request).await
     }
 
     async fn advance_cursor(

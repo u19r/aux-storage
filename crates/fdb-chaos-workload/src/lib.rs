@@ -12,6 +12,7 @@ mod pubsub_delivery_runtime;
 mod pubsub_snapshot;
 mod queue_visibility;
 mod read_sequence_dag;
+mod simulation_clock;
 mod table_atomicity;
 mod table_atomicity_artifacts;
 mod table_atomicity_check_phase;
@@ -21,5 +22,9 @@ mod table_atomicity_invariants;
 mod table_atomicity_keys;
 mod table_atomicity_phases;
 mod table_atomicity_recording;
+#[cfg(test)]
+mod table_atomicity_recording_tests;
 mod table_atomicity_runtime;
 mod table_stream_audit;
+#[cfg(test)]
+mod table_stream_audit_tests;

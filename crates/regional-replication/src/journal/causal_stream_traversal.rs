@@ -16,7 +16,7 @@ use crate::{history::causal_stream::CanonicalCausalStreamEvent, native_record::c
 
 impl JournalStore {
     pub(super) async fn advance_causal_step<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -31,7 +31,7 @@ impl JournalStore {
                 return self.advance_causal_root(attempt, scope, stream).await;
             }
             let (row, frame) = self
-                .load_causal_stack(attempt, (stream.operation, stream.depth))
+                .load_causal_stack(attempt, ((stream.physical, stream.operation), stream.depth))
                 .await?;
             let event = self
                 .load_causal_stream_event(attempt, scope, &frame.event)
@@ -39,7 +39,11 @@ impl JournalStore {
             let visit = self
                 .load_causal_visit(
                     attempt,
-                    (stream.operation, &event.as_ref().id, event.as_ref().digest),
+                    (
+                        (stream.physical, stream.operation),
+                        &event.as_ref().id,
+                        event.as_ref().digest,
+                    ),
                 )
                 .await?
                 .ok_or_else(corrupt_record)?;
@@ -66,7 +70,9 @@ impl JournalStore {
         .await;
         settlement.complete(result)
     }
-    async fn advance_causal_root<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn advance_causal_root<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         scope: &CausalStreamScope<'_>,
@@ -80,7 +86,7 @@ impl JournalStore {
         let root = self
             .load_view_record(
                 attempt,
-                (&scope.request.view, through, &scope.receiver_authority),
+                (&scope.request.view, through, &scope.receiver_selection),
                 (scope.limits, scope.codec),
             )
             .await?;
@@ -94,7 +100,11 @@ impl JournalStore {
         let visited = self
             .load_causal_visit(
                 attempt,
-                (stream.operation, &event.as_ref().id, event.as_ref().digest),
+                (
+                    (stream.physical, stream.operation),
+                    &event.as_ref().id,
+                    event.as_ref().digest,
+                ),
             )
             .await?;
         if let Some((_, visit)) = visited {
@@ -122,7 +132,7 @@ impl JournalStore {
             .load_causal_visit(
                 attempt,
                 (
-                    stream.operation,
+                    (stream.physical, stream.operation),
                     &parent.as_ref().id,
                     parent.as_ref().digest,
                 ),

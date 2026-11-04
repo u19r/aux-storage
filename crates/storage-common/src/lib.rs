@@ -62,7 +62,7 @@ pub use tracing_utils::{record_limit, record_result, start_op_span};
 pub use ttl::{
     PreparedTtlPut, TtlConfigActivation, TtlConfigRecord, TtlIndexKey, TtlIndexWrite,
     TtlIndexWriteBatch, TtlMaintenanceCursor, TtlPolicyGeneration, TtlSweepPageCommand,
-    TtlSweepPageInput, TtlSweepPageResult, TtlSweepRequest, ttl_tracking_enabled,
+    TtlSweepPageInput, TtlSweepPageResult, TtlSweepPolicy, TtlSweepRequest, ttl_tracking_enabled,
 };
 
 #[cfg(test)]

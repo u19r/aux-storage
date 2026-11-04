@@ -20,9 +20,9 @@ use crate::{
 
 impl JournalStore {
     pub(crate) async fn execute_control<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + storage_provider::UpdateTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

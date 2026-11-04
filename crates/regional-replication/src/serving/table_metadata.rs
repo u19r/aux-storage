@@ -10,7 +10,7 @@ use replication_types::{
 };
 use storage_common::retry::retry_native_conflicts;
 use storage_provider::{
-    DYNAMO_WRITE_RETRY, DynamoPort, TableUpdateTransaction, resolve_table_in_attempt,
+    DYNAMO_WRITE_RETRY, DynamoPort, RequestTableBindings, TableUpdateTransaction,
 };
 use storage_types::{
     ReadProtection, StorageError, StorageResult, TableDescription, TableStatus, UpdateTableRequest,
@@ -34,8 +34,10 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
         let requested_at = self.port.now();
         let request = Arc::new(request);
         let cache = self.port.metadata_cache();
+        let bindings = RequestTableBindings::default();
         let response = retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
             let observed_at = self.port.now();
+            let bindings = bindings.clone();
             let request = Arc::clone(&request);
             let cache = Arc::clone(&cache);
             let journal = Arc::clone(&self.journal);
@@ -44,9 +46,9 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                 self.port
                     .with_dynamo_schema_attempt(move |attempt| {
                         Box::pin(async move {
-                            let (table, _) =
-                                resolve_table_in_attempt(attempt, &cache, &request.table_name)
-                                    .await?;
+                            let (table, _) = bindings
+                                .resolve_table(attempt, &cache, &request.table_name)
+                                .await?;
                             let state = journal.load_capture_state(attempt, &table).await?;
                             let Some(state) = state.as_ref().filter(|state| {
                                 matches!(
@@ -56,7 +58,7 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                             }) else {
                                 journal.require_local_metadata(attempt, &table).await?;
                                 return Ok(attempt
-                                    .execute_table_update(&request, requested_at)
+                                    .execute_table_update(&request, requested_at, &bindings)
                                     .await?
                                     .into_result()?
                                     .1);
@@ -100,8 +102,11 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                                 .accept_pending_control(attempt, &proposal, observed_at)
                                 .await?
                                 .ok_or_else(corrupt_record)?;
-                            let mut description = TableDescription::from_stored_table_info(
-                                preview.into_parts().0.next_table,
+                            let mut description = TableDescription::from_bound_table_info(
+                                storage_types::BoundTableInfo {
+                                    history_id: table.history_id,
+                                    info: Arc::new(preview.into_parts().0.next_table),
+                                },
                                 TableStatus::Active,
                             );
                             journal.project_control_description(

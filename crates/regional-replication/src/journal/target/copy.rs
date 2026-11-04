@@ -41,7 +41,7 @@ impl JournalStore {
             if let Some(receipt) = self
                 .load_baseline_page_receipt(
                     attempt,
-                    (request, page.sequence),
+                    (&record, page.sequence),
                     ReadProtection::Conflict,
                 )
                 .await?
@@ -85,7 +85,7 @@ impl JournalStore {
                 complete: page.complete,
             };
             let root_key = self.identity_key(TARGET_BOOTSTRAP_SUFFIX, &request.operation.id)?;
-            let receipt_key = self.baseline_page_key(request, page.sequence)?;
+            let receipt_key = self.baseline_page_key(&record, page.sequence)?;
             let changes = [
                 self.records
                     .prepare(root_key, Some(row.revision), &record)?,
@@ -124,7 +124,7 @@ impl JournalStore {
             let content = baseline_page_content(input.0.content(), input.1)?;
             self.load_baseline_page_receipt(
                 attempt,
-                (request, input.1.sequence),
+                (&record, input.1.sequence),
                 ReadProtection::Snapshot,
             )
             .await?
@@ -231,16 +231,20 @@ impl JournalStore {
 
     fn baseline_page_key(
         &self,
-        request: &HiddenTargetRequest,
+        record: &TargetRecord,
         sequence: u64,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(BASELINE_COPY_SUFFIX, &(request.operation.id, sequence))
+        self.table_identity_key(
+            BASELINE_COPY_SUFFIX,
+            record.state.physical,
+            &(record.request.operation.id, sequence),
+        )
     }
 
     async fn load_baseline_page_receipt<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        input: (&HiddenTargetRequest, u64),
+        input: (&TargetRecord, u64),
         protection: ReadProtection,
     ) -> StorageResult<Option<BaselinePageReceipt>> {
         let key = self.baseline_page_key(input.0, input.1)?;

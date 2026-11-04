@@ -35,7 +35,6 @@ pub struct OriginCaptureInput<'accepted> {
 pub struct CapturedOriginMutation {
     pub ordinal: replication_types::identity::origin::MutationOrdinal,
     pub provenance: ItemProvenance,
-    pub event: CanonicalEventId,
 }
 
 /// Batch members can be left unprocessed before any publication or item effect.
@@ -73,7 +72,7 @@ pub(crate) fn select_batch_mutations(
 /// Capture all selected global members before applying shared accepted effects.
 /// The caller still owns native settlement and its customer response receipt.
 pub async fn capture_origin_mutations<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,
@@ -144,7 +143,9 @@ struct OriginCaptureBatch {
 }
 
 impl OriginCaptureBatch {
-    async fn retain_mutations<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn retain_mutations<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         mut self,
         journal: &JournalStore,
         attempt: &mut A,
@@ -172,11 +173,7 @@ impl OriginCaptureBatch {
             let link = self.record_mutation(mutation, (&event, receipt.clone()), codec)?;
             accepted.include(
                 journal,
-                (
-                    (&event).into(),
-                    &receipt,
-                    Some(mutation.table.state().physical),
-                ),
+                ((&event).into(), &receipt, mutation.table.state().physical),
                 (&origin, &link),
             )?;
         }
@@ -212,7 +209,6 @@ impl OriginCaptureBatch {
         let provenance = event.winner();
         self.captured.push(CapturedOriginMutation {
             ordinal: mutation.ordinal,
-            event: receipt.event.clone(),
             provenance: codec
                 .encode_winner_provenance(provenance)
                 .map_err(RegionalApplicationError::from_local_encoding)?,
@@ -236,7 +232,7 @@ impl OriginCaptureBatch {
 
 async fn prepare_mutations<
     'accepted,
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,

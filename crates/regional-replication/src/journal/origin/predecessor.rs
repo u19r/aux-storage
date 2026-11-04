@@ -57,7 +57,7 @@ enum OriginPredecessorPlan {
 
 impl JournalStore {
     pub(super) async fn observe_origin_predecessor<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -71,7 +71,7 @@ impl JournalStore {
     }
 
     pub(super) async fn observe_origin_predecessors<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -89,12 +89,14 @@ impl JournalStore {
                 .iter()
                 .zip(inputs)
                 .filter_map(|(plan, input)| match plan {
-                    OriginPredecessorPlan::Known(winner) => {
-                        Some(RetainedAuthorityRequest::Winner(input.1.key, winner))
-                    }
-                    OriginPredecessorPlan::ExistingBaseline(identity) => {
-                        Some(RetainedAuthorityRequest::Baseline(identity))
-                    }
+                    OriginPredecessorPlan::Known(winner) => Some(RetainedAuthorityRequest::Winner(
+                        input.0.state().physical,
+                        input.1.key,
+                        winner,
+                    )),
+                    OriginPredecessorPlan::ExistingBaseline(identity) => Some(
+                        RetainedAuthorityRequest::Baseline(input.0.state().physical, identity),
+                    ),
                     OriginPredecessorPlan::Missing | OriginPredecessorPlan::Capture => None,
                 })
                 .collect::<Vec<_>>();
@@ -173,7 +175,7 @@ impl JournalStore {
     }
 
     async fn capture_origin_predecessor<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -182,13 +184,7 @@ impl JournalStore {
     ) -> StorageResult<OriginPredecessor> {
         let (table, view, key) = input;
         let configuration = &table.state().configuration;
-        let exact = self
-            .load_baseline_image(
-                attempt,
-                (view.physical.history_id, view.images.old, view.source),
-                codec,
-            )
-            .await?;
+        let exact = self.prepare_baseline_image(view.images.old, codec)?;
         let baseline = BaselineItem {
             source_table: configuration.table,
             lineage: configuration.lineage,
@@ -197,7 +193,7 @@ impl JournalStore {
             canonical_key: key.clone(),
             images: SourceImagesRef {
                 old: None,
-                new: exact.as_ref(),
+                new: exact,
                 old_indexers: None,
                 new_indexers: view.images.old_indexers,
             },

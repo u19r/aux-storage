@@ -7,9 +7,8 @@ use serde_json::json;
 use storage_observability_test_support::observation::observe;
 use storage_types::{
     AttributeValue, CreateTableRequest, GetItemRequest, KeyAttributeType, PutItemRequest,
-    StreamName, UpdateItemRequest,
+    UpdateItemRequest,
 };
-use stream_provider::StreamRowKind;
 
 use crate::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
@@ -118,10 +117,9 @@ async fn given_versioned_item_when_conditional_updates_run_then_only_matching_ed
         .expect("valid seed PutItem");
         store.operations.put_item(put).await.expect("seed versioned item");
 
-        let system_stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(system_stream.clone(), None, 10)
+        let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.expect("read CDC before update");
-        assert_eq!(before.items.len(), 1);
+        assert_eq!(before.len(), 1);
 
         let update_request = |expected_version: &str| {
             UpdateItemRequest::try_from(json!({
@@ -157,10 +155,10 @@ async fn given_versioned_item_when_conditional_updates_run_then_only_matching_ed
         let unchanged = store.operations.get_item(unchanged).await.expect("read unchanged item");
         assert_eq!(serde_json::to_value(unchanged).expect("serialize unchanged item"),
             json!({"Item": original}));
-        let after_rejection = store.stream_operations.read_forward(system_stream.clone(), None, 10)
+        let after_rejection = super::cdc_stream_tests::system_records(&store, 10)
             .await.expect("read CDC after rejected update");
-        assert_eq!(after_rejection.items.len(), 1);
-        assert_eq!(after_rejection.items[0].id, before.items[0].id);
+        assert_eq!(after_rejection.len(), 1);
+        assert_eq!(after_rejection[0].sequence_number, before[0].sequence_number);
 
         let accepted = observe(store.operations.update_item(update_request("0"))).await;
         accepted.assert_no_warning_or_error();
@@ -182,11 +180,11 @@ async fn given_versioned_item_when_conditional_updates_run_then_only_matching_ed
         let read = store.operations.get_item(read).await.expect("read updated item");
         assert_eq!(serde_json::to_value(read).expect("serialize updated item"),
             json!({"Item": updated}));
-        let after_commit = store.stream_operations.read_forward(system_stream, None, 10)
+        let after_commit = super::cdc_stream_tests::system_records(&store, 10)
             .await.expect("read CDC after accepted update");
-        assert_eq!(after_commit.items.len(), 2);
-        assert_eq!(after_commit.items[0].id, before.items[0].id);
-        assert_ne!(after_commit.items[1].id, before.items[0].id);
+        assert_eq!(after_commit.len(), 2);
+        assert_eq!(after_commit[0].sequence_number, before[0].sequence_number);
+        assert_ne!(after_commit[1].sequence_number, before[0].sequence_number);
     })
     .catch_unwind()
     .await;
@@ -228,7 +226,7 @@ async fn given_missing_table_when_update_item_runs_then_resource_not_found_respo
 }
 
 #[tokio::test]
-async fn given_concurrent_updates_when_key_overlaps_then_every_increment_and_image_is_retained() {
+async fn given_concurrent_updates_when_outcomes_vary_then_acknowledged_images_are_retained() {
     let store = TestStore::new().await;
     let table = unique_table_name();
     let mut create = crate::test_support::hash_table_request(table.clone());
@@ -237,30 +235,130 @@ async fn given_concurrent_updates_when_key_overlaps_then_every_increment_and_ima
         stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
     });
     store.operations.create_table(create).await.unwrap();
-    let writes = (0..32).map(|_| {
+    let writes = (0..32).map(|operation| {
         let request = UpdateItemRequest::try_from(json!({
-            "TableName": table.to_string(),
-            "Key": {"pk": {"S": "one"}},
-            "UpdateExpression": "ADD #count :one",
-            "ExpressionAttributeNames": {"#count": "count"},
-            "ExpressionAttributeValues": {":one": {"N": "1"}},
+            "TableName": table.to_string(), "Key": {"pk": {"S": "one"}},
+            "UpdateExpression": "SET #operation = :operation ADD #count :one",
+            "ExpressionAttributeNames": {"#operation": "operation", "#count": "count"},
+            "ExpressionAttributeValues": {":operation": {"N": operation.to_string()}, ":one": {"N": "1"}},
             "ReturnValues": "ALL_NEW"
-        }))
-        .unwrap();
-        store.operations.update_item(request)
+        })).unwrap();
+        let operations = &store.operations;
+        async move { (operation, operations.update_item(request).await) }
     });
-    for result in futures::future::join_all(writes).await {
-        result.expect("ordinary concurrent update must commit");
+    let mut acknowledged = std::collections::HashMap::new();
+    let mut unknown = std::collections::HashSet::new();
+    let mut rejected = 0;
+    for (operation, result) in futures::future::join_all(writes).await {
+        match result {
+            Ok(response) => {
+                let attributes = response.attributes.expect("ALL_NEW attributes");
+                assert_eq!(
+                    attributes.get("operation"),
+                    Some(&AttributeValue::N(operation.to_string())),
+                    "response must belong to its caller"
+                );
+                let Some(AttributeValue::N(count)) = attributes.get("count") else {
+                    panic!("acknowledged counter must be numeric");
+                };
+                let count = count.parse::<usize>().unwrap();
+                assert!(count > 0, "acknowledged increments are positive");
+                assert!(
+                    !acknowledged.values().any(|previous| *previous == count),
+                    "each acknowledgment advances the counter"
+                );
+                acknowledged.insert(operation, count);
+            }
+            Err(error)
+                if error.native_attempt_rejection()
+                    == Some(storage_types::NativeAttemptRejection::Conflict) =>
+            {
+                rejected += 1
+            }
+            Err(error) if error.is_commit_unknown() => {
+                unknown.insert(operation);
+            }
+            Err(error) => panic!("unexpected concurrent update failure: {:?}", error.as_ref()),
+        }
     }
+    // Read primary state before history: an unknown commit can settle between
+    // reads. Its possible effect must remain bounded, never retried blindly.
+    let mut request = GetItemRequest::new(
+        table.clone(),
+        [("pk".to_owned(), AttributeValue::S("one".to_owned()))],
+    );
+    request.consistent_read = Some(true);
+    let item = serde_json::to_value(store.operations.get_item(request).await.unwrap()).unwrap();
+    let current = item
+        .get("Item")
+        .filter(|item| !item.is_null())
+        .map_or(0, |item| {
+            item["count"]["N"]
+                .as_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        });
+    assert!(
+        current >= acknowledged.len(),
+        "acknowledged increments cannot be lost"
+    );
+    assert!(
+        acknowledged.values().all(|count| *count <= current),
+        "acknowledged images cannot exceed current state"
+    );
     let records = crate::image_retention_tests::table_records(&store, &table)
         .await
         .unwrap();
-    assert_eq!(records.len(), 32);
-    for count in 1..=32 {
+    assert!(
+        records.len() >= current,
+        "primary writes must have their history images"
+    );
+    assert!(
+        records.len() <= acknowledged.len() + unknown.len(),
+        "known-aborted writes cannot publish images"
+    );
+    eprintln!(
+        "concurrent_updates: acknowledged={} rejected={rejected} unknown={} primary={current} \
+         images={}",
+        acknowledged.len(),
+        unknown.len(),
+        records.len()
+    );
+    let mut observed_operations = std::collections::HashSet::new();
+    for record in &records {
+        let image = record.item.as_ref().unwrap();
+        let Some(AttributeValue::N(operation)) = image.get("operation") else {
+            panic!("each image must identify its operation");
+        };
+        let operation = operation.parse::<usize>().unwrap();
+        assert!(
+            acknowledged.contains_key(&operation) || unknown.contains(&operation),
+            "known-aborted operations cannot publish"
+        );
+        assert!(
+            observed_operations.insert(operation),
+            "a request cannot increment twice"
+        );
+        if let Some(count) = acknowledged.get(&operation) {
+            assert_eq!(
+                image.get("count"),
+                Some(&AttributeValue::N(count.to_string())),
+                "acknowledged image must match its response"
+            );
+        }
+    }
+    assert!(
+        acknowledged
+            .keys()
+            .all(|operation| observed_operations.contains(operation)),
+        "every acknowledgment must have its own image"
+    );
+    for count in 1..=records.len() {
         let matches = records
             .iter()
             .filter(|record| {
-                record.new_image.as_ref().unwrap().get("count")
+                record.item.as_ref().unwrap().get("count")
                     == Some(&AttributeValue::N(count.to_string()))
             })
             .count();
@@ -269,17 +367,5 @@ async fn given_concurrent_updates_when_key_overlaps_then_every_increment_and_ima
             "every increment must appear once in stream history"
         );
     }
-    let item = store
-        .operations
-        .get_item(storage_types::GetItemRequest::new(
-            table,
-            [("pk".to_owned(), AttributeValue::S("one".to_owned()))],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(item).unwrap()["Item"]["count"],
-        json!({"N": "32"})
-    );
     store.finish().await;
 }

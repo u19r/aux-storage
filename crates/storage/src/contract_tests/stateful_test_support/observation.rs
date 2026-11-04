@@ -81,7 +81,7 @@ impl StatefulTestBackend {
         let effect_count = stream
             .records()
             .iter()
-            .filter(|record| record.old_image.is_some() && record.new_image.is_none())
+            .filter(|record| record.item.is_none())
             .count() as u64;
         Ok(StatefulObservation {
             active,

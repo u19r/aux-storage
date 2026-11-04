@@ -8,8 +8,7 @@ pub(crate) use std::{
 pub(crate) use fdb_chaos_model::{
     Anomaly, AnomalyKind, AnomalyReport, GsiEntry, GsiIndexModel, HistoryEvent, OperationHistory,
     OperationKind, OperationOutcome, PossibleTableModel, SharedKeyAudit, SharedKeyRead, TableModel,
-    TrimProviderSnapshot, TrimScopeExpectation, TrimScopeKind, TrimScopeReport, TrimStateModel,
-    classify_operation_error,
+    TrimProviderSnapshot, TrimScopeReport,
 };
 pub(crate) use foundationdb_simulation::{
     Metric, Metrics, RustWorkload, RustWorkloadFactory, Severity, SimDatabase, WorkloadContext,
@@ -25,11 +24,9 @@ pub(crate) use queue::{
     ChangeMessageVisibilityRequest, CreateQueueRequest, DeleteMessageRequest, GetQueueUrlRequest,
     QueueManager, ReceiptHandle, ReceiveMessageRequest, SendMessageRequest,
 };
-pub(crate) use storage::{
-    DatabaseManager, DeleteItemInput, PutItemInput, QueryIndexInput, UpdateItemInput,
-};
 pub(crate) use storage_provider::{
-    StreamDurationTrimConfig, StreamDurationTrimWorker, StreamRetentionRepository,
+    DynamoOperations as _, StreamDurationTrimConfig, StreamDurationTrimWorker,
+    StreamRetentionRepository,
 };
 pub(crate) use storage_types::{
     AttributeDefinition, AttributeValue, BatchGetItemRequest, BillingMode,
@@ -38,7 +35,7 @@ pub(crate) use storage_types::{
     QueryRequest, QueryTableRequest, ReadSequenceFromInput, ReadSequenceInputCardinality,
     ReadSequenceNode, ReadSequenceNodeId, ReadSequenceNodeInput, ReadSequenceNodeOperation,
     ReadSequenceOnMissing, ReadSequenceRequest, ReadSequenceSelector, StorageEnum, StorageError,
-    StreamName, StreamRetentionDuration, StreamSpecification, StreamViewType, TableName,
-    TimestampMillis, TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem,
+    StreamRetentionDuration, StreamSpecification, StreamViewType, TableName, TimestampMillis,
+    TransactPutRequest, TransactWriteItem, TransactWriteItemsRequest, WireItem,
     context::WrappedError as _, plan_read_sequence, read_sequence_input_marker,
 };

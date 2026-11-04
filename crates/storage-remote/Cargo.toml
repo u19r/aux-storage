@@ -39,6 +39,7 @@ httpmock = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 storage-observability-test-support = { path = "../storage-observability-test-support" }
 tokio = { workspace = true, features = ["macros", "test-util"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

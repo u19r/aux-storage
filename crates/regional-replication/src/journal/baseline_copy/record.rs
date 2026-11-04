@@ -66,8 +66,14 @@ impl JournalStore {
         &self,
         scope: &BaselineCopyScope,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(
+        self.table_identity_key(
             SOURCE_COPY_SUFFIX,
+            scope
+                .proposal
+                .participant(&self.region)
+                .map_err(|_| corrupt_record())?
+                .proposed
+                .physical,
             &(scope.proposal.operation().id, &scope.destination.region),
         )
     }
@@ -169,8 +175,14 @@ impl JournalStore {
         scope: &BaselineCopyScope,
         sequence: u64,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(
+        self.table_identity_key(
             crate::constants::SOURCE_COPY_PAGE_SUFFIX,
+            scope
+                .proposal
+                .participant(&self.region)
+                .map_err(|_| corrupt_record())?
+                .proposed
+                .physical,
             &(
                 scope.proposal.operation().id,
                 &scope.destination.region,

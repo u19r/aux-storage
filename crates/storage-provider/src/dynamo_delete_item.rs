@@ -10,9 +10,8 @@ use storage_backfill::{GsiProjectionLifecycle, GsiProjectionWriteBatch};
 use storage_common::{TtlConfigRecord, TtlIndexWriteBatch};
 use storage_types::{
     AllOld, BoundTableInfo, DeleteItemRequest, DeleteItemResponse, DynamoRequestValidate as _,
-    ItemProvenance, ItemRevision, KeyAttributes, StorageError, StorageResult,
-    StreamRetentionDuration, TableName, return_values_on_condition_check_failure_all_old,
-    validate_transact_key,
+    ItemProvenance, ItemRevision, KeyAttributes, StorageError, StorageResult, TableName,
+    return_values_on_condition_check_failure_all_old, validate_transact_key,
 };
 
 use crate::{
@@ -41,7 +40,6 @@ pub struct DeleteItemShape {
     condition: Option<UncheckedCondition>,
     return_old: bool,
     return_old_on_condition_failure: bool,
-    item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl DeleteItemShape {
@@ -71,7 +69,6 @@ impl DeleteItemShape {
             return_old_on_condition_failure: return_values_on_condition_check_failure_all_old(
                 request.return_values_on_condition_check_failure.as_ref(),
             ),
-            item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
         })
     }
 
@@ -89,31 +86,26 @@ impl DeleteItemShape {
         }
         validate_transact_key(&table.info, &self.key)?;
         self.key.normalize_numbers_for_write();
-        let route = stream_provider::DynamoMutationRoute::try_new(
-            &table.info.table_name,
-            &table.info.key_schema,
-            &self.key,
-        )?;
+        let history_route =
+            crate::dynamo_write_execution::prepare_history_route(&table, &self.key)?;
         Ok(BoundDeleteItem {
-            route,
+            history_route,
             table,
             key: self.key,
             condition: self.condition,
             return_old: self.return_old,
             return_old_on_condition_failure: self.return_old_on_condition_failure,
-            item_stream_ttl_hours: self.item_stream_ttl_hours,
         })
     }
 }
 
 pub struct BoundDeleteItem {
-    route: stream_provider::DynamoMutationRoute,
+    history_route: Option<stream_provider::DynamoMutationRoute>,
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
     condition: Option<UncheckedCondition>,
     return_old: bool,
     return_old_on_condition_failure: bool,
-    item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl BoundDeleteItem {
@@ -123,19 +115,14 @@ impl BoundDeleteItem {
     ) -> StorageResult<Self> {
         validate_transact_key(&table.info, &key)?;
         key.normalize_numbers_for_write();
-        let route = stream_provider::DynamoMutationRoute::try_new(
-            &table.info.table_name,
-            &table.info.key_schema,
-            &key,
-        )?;
+        let history_route = crate::dynamo_write_execution::prepare_history_route(&table, &key)?;
         Ok(Self {
-            route,
+            history_route,
             table,
             key,
             condition: None,
             return_old: false,
             return_old_on_condition_failure: false,
-            item_stream_ttl_hours: None,
         })
     }
 
@@ -153,14 +140,13 @@ impl BoundDeleteItem {
             return Ok(SemanticDecision::Rejected(error));
         }
         Ok(SemanticDecision::Accepted(AcceptedDeleteItem {
-            route: self.route,
+            history_route: self.history_route,
             table: self.table,
             key: self.key,
             old_item: old.item,
             old_indexers: old.indexers,
             old_revision: old.revision,
             old_provenance: old.provenance,
-            item_stream_ttl_hours: self.item_stream_ttl_hours,
             gsi_lifecycle: lifecycle,
             return_old: self.return_old,
         }))
@@ -170,14 +156,13 @@ impl BoundDeleteItem {
 /// Accepted logical deletion. The caller must stage every physical effect on
 /// the same attempt before it can return this response.
 pub struct AcceptedDeleteItem {
-    pub(crate) route: stream_provider::DynamoMutationRoute,
+    pub(crate) history_route: Option<stream_provider::DynamoMutationRoute>,
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
     pub old_item: Option<storage_types::VerifiedWireItem>,
     pub old_indexers: Vec<String>,
     pub old_revision: Option<ItemRevision>,
     pub old_provenance: Option<ItemProvenance>,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     gsi_lifecycle: GsiProjectionLifecycle,
     return_old: bool,
 }

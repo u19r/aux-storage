@@ -105,11 +105,13 @@ where for<'native> P::Attempt<'native>: ExpirationPort
         &self,
         request: ExpirationRequest,
     ) -> StorageResult<StepResult<()>> {
+        let bindings = crate::RequestTableBindings::default();
         retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
+            let bindings = bindings.clone();
             let request = request.clone();
             self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
                 Box::pin(async move {
-                    ExpirationAttempt::new(attempt)
+                    ExpirationAttempt::new(attempt, bindings)
                         .advance_expiration(&request)
                         .await
                 })

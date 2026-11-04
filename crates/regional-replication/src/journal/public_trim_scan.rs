@@ -102,7 +102,7 @@ impl SourceScanRecord {
 
 impl JournalStore {
     pub(in crate::journal) async fn advance_public_trim_source_scan<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -226,7 +226,7 @@ impl JournalStore {
     }
 
     async fn advance_public_trim_scan_phase<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -377,7 +377,7 @@ impl JournalStore {
     }
 
     async fn scan_public_trim_publication<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -410,7 +410,15 @@ impl JournalStore {
             origin: cut.origin.clone(),
         };
         let frame = self
-            .load_history_frame(attempt, (&selection, range), encoding)
+            .load_history_frame(
+                attempt,
+                (
+                    proposal.participant(&self.region)?.state.physical,
+                    &selection,
+                    range,
+                ),
+                encoding,
+            )
             .await?;
         if through == cut.through && Some(frame.manifest().digest) != cut.terminal_manifest {
             return Err(corrupt_record());

@@ -55,8 +55,14 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 ADOPTED_TRANSFER_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let row = self
@@ -110,8 +116,14 @@ impl JournalStore {
         let attempt = settlement.as_mut();
         let result = async {
             let (row, definition, cursor) = input;
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 ADOPTED_TRANSFER_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let record = OriginalTraversalRecord {

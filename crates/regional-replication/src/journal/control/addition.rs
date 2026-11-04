@@ -14,7 +14,7 @@ impl JournalStore {
     pub(super) async fn require_addition_before<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

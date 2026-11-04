@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeMap, AttributeValue, KeyAttributes, ReturnConsumedCapacity, StreamRetentionDuration,
-    TableName, VecMap, WireItem,
+    AttributeMap, AttributeValue, KeyAttributes, ReturnConsumedCapacity, TableName, VecMap,
+    WireItem,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -40,13 +40,6 @@ pub struct PutRequest {
     /// attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexers: Option<Vec<String>>,
-
-    /// Aux-storage extension: item stream retention duration in hours.
-    #[serde(
-        rename = "AuxItemStreamTtlHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -76,26 +69,12 @@ pub struct TransactPutRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
-
-    /// Aux-storage extension: item stream retention duration in hours.
-    #[serde(
-        rename = "AuxItemStreamTtlHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct DeleteRequest {
     pub key: KeyAttributes,
-
-    /// Aux-storage extension: item stream retention duration in hours.
-    #[serde(
-        rename = "AuxItemStreamTtlHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -118,13 +97,6 @@ pub struct TransactDeleteRequest {
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
-
-    /// Aux-storage extension: item stream retention duration in hours.
-    #[serde(
-        rename = "AuxItemStreamTtlHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

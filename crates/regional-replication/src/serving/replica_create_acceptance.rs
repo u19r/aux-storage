@@ -21,6 +21,7 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
+            storage_provider::require_enabled_table_stream(table)?;
             let current = self.load_capture_state(attempt, table).await?;
             if let Some(state) = current.as_ref().filter(|state| {
                 matches!(

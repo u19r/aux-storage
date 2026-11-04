@@ -23,16 +23,20 @@ pub(crate) fn runtime(
         Arc::clone(&source),
         fixture::journal(1),
         fixture::codec(),
-        crate::transport::TcpTransport::try_new(configuration).unwrap(),
+        crate::transport::TcpTransport::try_new(Arc::clone(&configuration)).unwrap(),
     )
     .unwrap();
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        crate::job_recovery::configured_controller_manifest(configuration.as_ref().as_ref())
+            .unwrap(),
+    );
     handler.register(&mut catalog, now).unwrap();
     let budget = DriveBudget::try_from(DriveBudgetInput {
         queues: QueueSelection::all(),
         max_claims: 1,
         max_concurrency: 1,
-        max_store_operations: 128,
+        // Reserve checked journal admission and settlement for one claim.
+        max_store_operations: 256,
         stop_claiming_after: Duration::from_secs(1),
         finish_after: Duration::from_secs(2),
     })

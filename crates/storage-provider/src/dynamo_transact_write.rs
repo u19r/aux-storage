@@ -359,6 +359,7 @@ impl BoundTransactWrite {
         attempt: &mut A,
         cache: &TableMetadataCache,
         tables: &crate::dynamo_write_preparation::PreparedWriteTables,
+        bindings: &crate::RequestTableBindings,
         times: (TimestampMillis, std::sync::Arc<dyn storage_types::Clock>),
     ) -> StorageResult<TransactWriteItemsResponse> {
         let (captured_at, clock) = times;
@@ -378,7 +379,7 @@ impl BoundTransactWrite {
         {
             return Ok(response);
         }
-        tables.confirm(attempt, cache).await?;
+        tables.confirm(attempt, cache, bindings).await?;
         Self {
             members,
             receipt: Ok(receipt),
@@ -584,7 +585,6 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                 request.expression_attribute_values = put.expression_attribute_values;
                 request.return_values_on_condition_check_failure =
                     put.return_values_on_condition_check_failure;
-                request.aux_item_stream_ttl_hours = put.aux_item_stream_ttl_hours;
                 PutItemShape::from_validated_request(request).map(Self::Put)
             }
             (None, Some(update), None, None) => {
@@ -604,7 +604,6 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                     return_item_collection_metrics: None,
                     return_values_on_condition_check_failure: update
                         .return_values_on_condition_check_failure,
-                    aux_item_stream_ttl_hours: update.aux_item_stream_ttl_hours,
                 })
                 .map(Self::Update)
             }
@@ -615,7 +614,6 @@ impl TryFrom<TransactWriteItem> for MemberShape {
                 request.expression_attribute_values = delete.expression_attribute_values;
                 request.return_values_on_condition_check_failure =
                     delete.return_values_on_condition_check_failure;
-                request.aux_item_stream_ttl_hours = delete.aux_item_stream_ttl_hours;
                 DeleteItemShape::from_validated_request(request).map(Self::Delete)
             }
             (None, None, None, Some(check)) => condition_check_shape(check).map(Self::Check),

@@ -8,7 +8,7 @@ use scheduled_bg_jobs::store::CommitOutcome;
 use storage_types::{StorageError, StorageResult};
 
 use super::{
-    CommitExecution, JobCommitError,
+    JobCommitError,
     settlement::{NativeJobWait, wait_native_job},
 };
 use crate::RawOrderedJobStoreError;
@@ -25,8 +25,8 @@ impl ContractErrorSlot {
 
     pub fn preserve(
         &self,
-        result: Result<CommitExecution, JobCommitError>,
-    ) -> StorageResult<CommitExecution> {
+        result: Result<CommitOutcome, JobCommitError>,
+    ) -> StorageResult<CommitOutcome> {
         match result {
             Ok(execution) => Ok(execution),
             Err(JobCommitError::Storage(error)) => Err(error),
@@ -58,7 +58,7 @@ pub async fn run_native_job_attempt<F, Fut>(
 ) -> Result<CommitOutcome, RawOrderedJobStoreError>
 where
     F: FnOnce(ContractErrorSlot) -> Fut + Send + 'static,
-    Fut: Future<Output = StorageResult<CommitExecution>> + Send + 'static,
+    Fut: Future<Output = StorageResult<CommitOutcome>> + Send + 'static,
 {
     let slot = ContractErrorSlot::new();
     let native_slot = slot.clone();
@@ -84,7 +84,7 @@ where
         return Err(error);
     }
     match result {
-        Ok(CommitExecution::Replay(outcome) | CommitExecution::Write(outcome)) => Ok(outcome),
+        Ok(outcome) => Ok(outcome),
         Err(error) => Err(error.into()),
     }
 }

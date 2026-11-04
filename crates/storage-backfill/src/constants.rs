@@ -1,5 +1,3 @@
-//! Persisted cursor prefixes protected during backfill.
-
-pub(crate) const PEER_SESSION_PREFIX: &str = "peer#";
-pub(crate) const BOOTSTRAP_SESSION_PREFIX: &str = "bootstrap#";
-pub(crate) const CATCHUP_SESSION_PREFIX: &str = "catchup#";
+/// Keep exact source images below the native transaction envelope.
+pub(crate) const GSI_HISTORY_READ_BYTES: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::MIN.saturating_add(8 * 1024 * 1024 - 1);

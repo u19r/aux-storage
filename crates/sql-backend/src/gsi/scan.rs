@@ -76,7 +76,7 @@ async fn decode_scan_page<A: SqlAttempt, L: SqlLayout>(
         })
         .collect::<StorageResult<Vec<_>>>()?;
     let hydrated =
-        crate::item_read::hydrate_item_images(catalog, requests, CATALOG_READ_BYTES.get()).await?;
+        crate::item_read::decode_item_images(catalog, requests, CATALOG_READ_BYTES.get())?;
     let more = page.more;
     let mut items = Vec::with_capacity(page.rows.len().min(count));
     let mut next = None;
@@ -100,28 +100,22 @@ fn decode_scan_row(
     stored: StoredWireItem,
 ) -> StorageResult<(GsiScannedSourceItem, KeyAttributes)> {
     let mut values = row.into_values();
-    if values.len() != 3 + table.key_schema.len() {
+    if values.len() != 2 + table.key_schema.len() {
         return Err(StorageError::internal(
             "SQL GSI source row has invalid width",
         ));
     }
-    let physical = decode_source_key(engine, table, &values[3..])?;
-    let [_descriptor, revision, indexers]: [SqlValue; 3] = values
-        .drain(..3)
+    let physical = decode_source_key(engine, table, &values[2..])?;
+    let [_value, revision]: [SqlValue; 2] = values
+        .drain(..2)
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| StorageError::internal("SQL GSI source row is truncated"))?;
-    let (SqlValue::Integer(revision), SqlValue::Text(indexers)) = (revision, indexers) else {
+    let SqlValue::Integer(revision) = revision else {
         return Err(StorageError::internal(
             "SQL GSI source row has invalid types",
         ));
     };
-    let indexers: Vec<String> = serde_json::from_str(&indexers)?;
-    if indexers != stored.indexers {
-        return Err(StorageError::internal(
-            "SQL GSI source indexers differ from retained content",
-        ));
-    }
     if !stored.item.has_verified_keys(&physical)? {
         return Err(StorageError::internal(
             "SQL GSI source content differs from physical key",

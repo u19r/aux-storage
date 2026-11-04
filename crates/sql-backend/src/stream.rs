@@ -30,10 +30,9 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
 
     async fn load_append_receipt(
         &mut self,
-        operation: stream_provider::StreamAppendOperationId,
+        key: stream_provider::TableAppendReceiptKey,
     ) -> StorageResult<Option<stream_provider::StreamAppendReceipt>> {
-        stream_write::load_append_receipt(self.attempt, self.engine, self.protection, operation)
-            .await
+        stream_write::load_append_receipt(self.attempt, self.engine, self.protection, key).await
     }
 
     fn read_stream_record(
@@ -87,30 +86,6 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = stream_read::read_user_item_through(catalog, stream, id, through).await;
-        settlement.complete(result)
-    }
-
-    fn read_system_page_start(
-        &mut self,
-        token: Option<&storage_types::SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(
-            stream_provider::SystemStreamHistory,
-            Option<stream_provider::SystemStreamCheckpointReceipt>,
-        )>,
-    > + Send {
-        stream_checkpoint::read_page_start(self.attempt, self.engine, token)
-    }
-
-    async fn read_system_history_pages(
-        &mut self,
-        reads: &[stream_provider::SystemStreamHistoryRead],
-    ) -> StorageResult<Vec<SystemStreamHistoryReadPage>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result =
-            stream_read::read_system_history_pages(catalog.attempt, catalog.engine, reads).await;
         settlement.complete(result)
     }
 
@@ -200,27 +175,7 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
     }
 }
 
-impl<A: SqlAttempt, L: SqlLayout> DynamoTableStreamAttempt for SqlCatalogAttempt<'_, A, L> {
-    async fn read_item_history_pages(
-        &mut self,
-        reads: &[(
-            storage_types::ItemHistoryAddress,
-            stream_provider::StreamReadRequest,
-        )],
-    ) -> StorageResult<Vec<stream_provider::StreamRowPage>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = stream_read::read_item_history_pages(
-            catalog.attempt,
-            catalog.engine,
-            catalog.protection,
-            reads,
-        )
-        .await;
-        settlement.complete(result)
-    }
-}
+impl<A: SqlAttempt, L: SqlLayout> DynamoTableStreamAttempt for SqlCatalogAttempt<'_, A, L> {}
 
 impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
     type Attempt<'native>
@@ -255,10 +210,6 @@ impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
             Box::pin(async move {
                 let mut attempt = SqlCatalogAttempt::new(native, engine, mode.read_protection());
                 let result = operation(&mut attempt).await?;
-                stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                    &mut attempt,
-                )
-                .await?;
                 Ok(result)
             })
         })
@@ -287,10 +238,6 @@ impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
                         storage_types::ReadProtection::Conflict,
                     );
                     let result = operation(&mut attempt).await?;
-                    stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                        &mut attempt,
-                    )
-                    .await?;
                     Ok(result)
                 })
             },
@@ -298,79 +245,46 @@ impl<B: SqlBackend + 'static> StreamPort for SqlStore<B> {
     }
 }
 
-impl<A: SqlAttempt, L: SqlLayout> stream_provider::DynamoStreamEffectAttempt
+impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
     for SqlCatalogAttempt<'_, A, L>
 {
-    async fn load_stream_effects(
+    async fn load_system_retired_frontiers(
         &mut self,
-        effects: &[storage_types::SystemStreamEffectDigest],
-    ) -> StorageResult<Vec<Option<stream_provider::DynamoStreamEffectRow>>> {
+        origins: &[storage_types::SystemStreamPosition],
+    ) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result = stream_read::load_stream_effects(
+        let result = crate::stream_allocation::load_retired_offsets(
             catalog.attempt,
             catalog.engine,
-            catalog.protection,
-            effects,
+            origins,
         )
         .await;
         settlement.complete(result)
     }
 
-    async fn load_stream_records(
+    fn read_system_page_start(
         &mut self,
-        positions: &[storage_types::SystemStreamPosition],
-    ) -> StorageResult<
-        Vec<
-            Option<
-                stream_provider::retained_image::verified_system_stream::VerifiedSystemStreamRecord,
-            >,
-        >,
-    > {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = stream_read::load_stream_records(
-            catalog.attempt,
-            catalog.engine,
-            catalog.protection,
-            positions,
-        )
-        .await;
-        settlement.complete(result)
-    }
-    async fn load_stream_items(
-        &mut self,
-        addresses: &[(&storage_types::StreamName, storage_types::StreamItemId)],
-    ) -> StorageResult<Vec<Option<stream_provider::StreamItem>>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result = stream_read::load_stream_items(
-            catalog.attempt,
-            catalog.engine,
-            catalog.protection,
-            addresses,
-        )
-        .await;
-        settlement.complete(result)
+        token: Option<&storage_types::SystemStreamCheckpointToken>,
+    ) -> impl Future<
+        Output = StorageResult<(
+            stream_provider::SystemStreamHistory,
+            Option<stream_provider::SystemStreamCheckpointReceipt>,
+        )>,
+    > + Send {
+        stream_checkpoint::read_page_start(self.attempt, self.engine, token)
     }
 
-    async fn load_stream_references(
+    async fn read_system_history_pages(
         &mut self,
-        addresses: &[(&storage_types::StreamName, storage_types::StreamItemId)],
-    ) -> StorageResult<Vec<Option<stream_provider::StreamPointerReference>>> {
+        reads: &[stream_provider::SystemStreamHistoryRead],
+    ) -> StorageResult<Vec<SystemStreamHistoryReadPage>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result = stream_read::load_stream_references(
-            catalog.attempt,
-            catalog.engine,
-            catalog.protection,
-            addresses,
-        )
-        .await;
+        let result =
+            stream_read::read_system_history_pages(catalog.attempt, catalog.engine, reads).await;
         settlement.complete(result)
     }
 }

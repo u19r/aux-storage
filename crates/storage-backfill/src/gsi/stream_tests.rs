@@ -1,13 +1,9 @@
 use std::num::NonZeroU64;
 
-use storage_types::{
-    KeyAttributes, StreamItemId, SystemStreamPosition, SystemStreamScope,
-    SystemStreamSourceTableName,
-};
+use storage_types::{SystemStreamPosition, SystemStreamScope};
 use stream_provider::{
     SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamHistoryReadPage,
     SystemStreamHistoryRecord, SystemStreamLineage, SystemStreamLineageCatalog,
-    SystemStreamStoredRecord,
 };
 
 use super::GsiStreamPageAssembly;
@@ -44,19 +40,30 @@ fn given_sparse_lineages_when_first_is_empty_then_later_records_are_consumed() {
         )
         .unwrap();
     assert_eq!(plan.as_ref().len(), 2);
-    let row = SystemStreamStoredRecord {
-        source_table_name: SystemStreamSourceTableName::try_new("test").unwrap(),
-        keys: KeyAttributes::default(),
-        old_image: None,
-        new_image: None,
-        position: position("b", 10),
-    };
+    let metadata = storage_types::ItemHistoryMetadata::try_new(
+        storage_types::ItemHistoryAddress {
+            history_id: 1_u32.into(),
+            stream_name: storage_types::StreamName::from("test/stream-item/1"),
+        },
+        storage_types::ItemStreamVersion::new(1),
+        None,
+        storage_types::ItemHistoryPublication::Event {
+            kind: storage_types::ItemHistoryKind::Image,
+            source_scope: SystemStreamScope::try_new("sparse", 1).unwrap(),
+            table_position: position("b", 10),
+            created_at: storage_types::TimestampMillis::from_timestamp(0),
+        },
+    )
+    .unwrap();
+    let row = storage_types::SystemHistoryRecord::try_from(
+        storage_types::ItemHistoryPointer::try_new(metadata, 100, None).unwrap(),
+    )
+    .unwrap();
     let pages = vec![
         SystemStreamHistoryReadPage {
             retired_through: None,
             records: vec![],
             observations: vec![],
-            pointers: vec![],
             more: false,
         },
         SystemStreamHistoryReadPage {
@@ -64,13 +71,10 @@ fn given_sparse_lineages_when_first_is_empty_then_later_records_are_consumed() {
             records: vec![row],
             observations: vec![SystemStreamHistoryRecord {
                 position: position("b", 10),
-                expected_pointer: StreamItemId::default(),
-                actual_pointer: Some(StreamItemId::default()),
             }],
-            pointers: vec![None],
             more: false,
         },
     ];
-    let mut assembly = GsiStreamPageAssembly::new(&plan);
+    let mut assembly = GsiStreamPageAssembly::new(&plan, 2_u32.into());
     assert!(!assembly.push_pages(plan.as_ref(), pages).unwrap());
 }

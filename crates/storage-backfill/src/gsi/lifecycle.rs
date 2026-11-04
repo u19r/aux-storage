@@ -1,7 +1,6 @@
 use storage_common::TtlIndexWrite;
 use storage_types::{
-    BoundTableInfo, StorageEnum, StorageError, StorageResult, StoredTableInfo,
-    SystemStreamPosition, SystemStreamScope, WireItem,
+    BoundTableInfo, StorageEnum, StorageError, StorageResult, StoredTableInfo, WireItem,
 };
 
 use super::{
@@ -12,7 +11,8 @@ use super::{
 
 impl GsiBuildTarget {
     pub fn validate_table(&self, table: &BoundTableInfo) -> StorageResult<()> {
-        if table.info.table_name != self.table_name
+        if table.history_id != self.history_id
+            || table.info.table_name != self.table_name
             || !table
                 .info
                 .global_secondary_indexes
@@ -109,67 +109,13 @@ impl<Build: Into<GsiBuildStatus>> TryFrom<Vec<Build>> for GsiProjectionLifecycle
 }
 
 impl<Cursor> GsiBuild<Cursor> {
-    pub fn validate_candidate_holds(
-        &self,
-        observed: Option<&Self>,
-        holds: &[(SystemStreamScope, SystemStreamPosition)],
-    ) -> StorageResult<()>
-    where
-        Cursor: PartialEq,
-    {
+    pub fn validate_candidate(&self, observed: Option<&Self>) -> StorageResult<()>
+    where Cursor: PartialEq {
         if observed != Some(self) {
             return Err(StorageEnum::TransactionConflict {
                 message: "GSI build changed during candidate validation".to_owned(),
             }
             .into());
-        }
-        let checkpoint = self.state.required_stream_history();
-        if holds.len() != checkpoint.frontier().len() {
-            return Err(StorageError::internal(
-                "GSI private retention hold does not match its build state",
-            ));
-        }
-        for (scope, position) in holds {
-            self.validate_private_hold(scope, position)?;
-        }
-        for required in checkpoint.frontier() {
-            if !holds.iter().any(|(_, position)| {
-                position.shard_id() == required.shard_id()
-                    && position.lineage_id() == required.lineage_id()
-                    && position.offset().compare_order(required.offset())
-                        == Ok(std::cmp::Ordering::Equal)
-            }) {
-                return Err(StorageError::internal(
-                    "GSI private retention hold does not match its build state",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// A physical hold is authority only when the referenced build still
-    /// requires this exact consumed position in the same stream generation.
-    pub fn validate_private_hold(
-        &self,
-        scope: &SystemStreamScope,
-        position: &SystemStreamPosition,
-    ) -> StorageResult<()> {
-        let checkpoint = self.state.required_stream_history();
-        let _offset = position
-            .offset()
-            .order()
-            .map_err(|_| StorageError::internal("GSI private retention hold offset is invalid"))?;
-        if checkpoint.scope() != scope
-            || !checkpoint.frontier().iter().any(|required| {
-                required.shard_id() == position.shard_id()
-                    && required.lineage_id() == position.lineage_id()
-                    && required.offset().compare_order(position.offset())
-                        == Ok(std::cmp::Ordering::Equal)
-            })
-        {
-            return Err(StorageError::internal(
-                "GSI private retention hold does not match its build state",
-            ));
         }
         Ok(())
     }

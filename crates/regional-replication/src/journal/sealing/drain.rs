@@ -33,6 +33,7 @@ impl JournalStore {
                     .ok_or_else(corrupt_record)?
                     .clone();
                 let scope = DeliveryScope {
+                    physical: before.physical,
                     origin: cut.origin.clone(),
                     table: before.configuration.table,
                     local_table: before.configuration.table,

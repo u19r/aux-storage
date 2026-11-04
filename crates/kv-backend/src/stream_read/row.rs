@@ -1,10 +1,7 @@
 //! Decode and verify KV stream rows after physical reads.
 
-use storage_types::{StorageEnum, StorageError, StorageResult, StreamItemId};
-use stream_provider::{
-    StreamItem, SystemStreamHistoryRecord, decode_stream_item_row,
-    retained_image::system_stream::RetainedSystemStreamRecord,
-};
+use storage_types::{StorageError, StorageResult, StreamItemId};
+use stream_provider::{StreamItem, SystemStreamHistoryRecord, decode_stream_item_row};
 
 use crate::KvEntry;
 
@@ -13,38 +10,31 @@ pub(crate) fn decode_stream_row(prefix: &[u8], entry: KvEntry) -> StorageResult<
     decode_stream_item_row(id, &entry.value)
 }
 
-pub(crate) fn decode_stored_stream_row(
+pub(crate) fn decode_materialized_row(
     prefix: &[u8],
     entry: KvEntry,
-) -> StorageResult<stream_provider::retained_image::stream_row::StoredStreamRow> {
+) -> StorageResult<stream_provider::StreamItem> {
     let id = decode_stream_key(prefix, &entry.key)?;
-    stream_provider::retained_image::stream_row::StoredStreamRow::decode(
-        id,
-        &entry.value,
-        crate::constants::STREAM_READ_BYTES.get(),
-    )
+    stream_provider::decode_materialized_stream_row(id, &entry.value)
 }
 
-fn decode_stream_key(prefix: &[u8], key: &[u8]) -> StorageResult<StreamItemId> {
+pub(super) fn decode_stream_key(prefix: &[u8], key: &[u8]) -> StorageResult<StreamItemId> {
     let id = key
         .strip_prefix(prefix)
         .ok_or_else(|| StorageError::internal("KV stream row has another prefix"))?;
     StreamItemId::try_from(id).map_err(|_| StorageError::internal("KV stream row has invalid ID"))
 }
 
-/// Decode logical history against its physical pointer observation.
+/// Decode the logical position from its native source key.
 pub(super) fn decode_history_row(
     entry: KvEntry,
-) -> StorageResult<(RetainedSystemStreamRecord, SystemStreamHistoryRecord)> {
-    let row: crate::stream_write::record::KvSystemStreamRecord =
-        crate::stream_write::record::KvSystemStreamRecord::decode(&entry.key, &entry.value)?;
-    if crate::stream_write::key_layout::record_key(&row.record.position)? != entry.key {
-        return Err(StorageEnum::HistoryUnavailable.into());
-    }
+) -> StorageResult<(
+    storage_types::SystemHistoryRecord,
+    SystemStreamHistoryRecord,
+)> {
+    let record = crate::stream_write::record::decode_record(&entry.key, &entry.value)?;
     let observation = SystemStreamHistoryRecord {
-        position: row.record.position.clone(),
-        expected_pointer: row.pointer_item_id,
-        actual_pointer: None,
+        position: record.position().clone(),
     };
-    Ok((row.record, observation))
+    Ok((record, observation))
 }

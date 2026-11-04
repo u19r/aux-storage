@@ -22,11 +22,7 @@ fn stored_table_info_defaults_stream_duration_metadata_when_omitted() {
 
     assert_eq!(
         table_info.table_stream_duration,
-        StreamRetentionDuration::FiniteHours(72)
-    );
-    assert_eq!(
-        table_info.default_item_stream_duration,
-        StreamRetentionDuration::FiniteHours(72)
+        StreamRetentionDuration::from_hours(72).unwrap()
     );
 }
 
@@ -44,7 +40,6 @@ fn stored_table_info_serializes_finite_and_forever_stream_duration_metadata() {
         "max_indexers": 0,
         "stream_specification": null,
         "table_stream_duration": 24,
-        "default_item_stream_duration": -1
     });
 
     let table_info: StoredTableInfo =
@@ -53,12 +48,7 @@ fn stored_table_info_serializes_finite_and_forever_stream_duration_metadata() {
 
     assert_eq!(
         table_info.table_stream_duration,
-        StreamRetentionDuration::FiniteHours(24)
-    );
-    assert_eq!(
-        table_info.default_item_stream_duration,
-        StreamRetentionDuration::Forever
+        StreamRetentionDuration::from_hours(24).unwrap()
     );
     assert_eq!(encoded["table_stream_duration"], json!(24));
-    assert_eq!(encoded["default_item_stream_duration"], json!(-1));
 }

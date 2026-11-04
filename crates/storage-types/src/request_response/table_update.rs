@@ -64,19 +64,14 @@ pub struct UpdateTableRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_specification: Option<StreamSpecification>,
 
-    /// Aux-storage extension: table stream retention duration in hours.
+    /// Aux-storage table history duration: 24 through 61320 hours, or -1 for
+    /// forever. This also governs item stream history. Omission preserves the
+    /// current duration.
     #[serde(
         rename = "AuxStreamDurationHours",
         skip_serializing_if = "Option::is_none"
     )]
     pub aux_stream_duration_hours: Option<StreamRetentionDuration>,
-
-    /// Aux-storage extension: default item stream retention duration in hours.
-    #[serde(
-        rename = "AuxDefaultItemStreamDurationHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_default_item_stream_duration_hours: Option<StreamRetentionDuration>,
 
     /// Unused. Accepted for `DynamoDB` compatibility but currently ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,7 +96,6 @@ impl UpdateTableRequest {
             sse_specification: None,
             stream_specification: None,
             aux_stream_duration_hours: None,
-            aux_default_item_stream_duration_hours: None,
             table_class: None,
         }
     }

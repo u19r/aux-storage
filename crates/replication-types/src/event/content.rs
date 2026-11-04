@@ -311,7 +311,7 @@ impl CanonicalEvent {
             .ok_or(ReplicationProtocolError::InvalidScope {
                 context: "content.try_expiration_child",
             })?;
-        let identity = victim.version.clone().expiration_id();
+        let identity = victim.version.expiration_id()?;
         Ok((
             identity,
             AcceptedItemEvent {

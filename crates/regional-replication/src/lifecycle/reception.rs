@@ -84,10 +84,10 @@ where
                         storage_provider::native_admission::NativeWork::Recovery,
                     ),
                     crate::journal::NativeAttempt::Items(AttemptMode::ReadWrite),
-                    move |attempt, now| {
-                        Box::pin(async move {
-                            journal.retire_removed_table(attempt, &proposal, now).await
-                        })
+                    move |attempt, _| {
+                        Box::pin(
+                            async move { journal.retire_removed_table(attempt, &proposal).await },
+                        )
                     },
                 )
                 .await

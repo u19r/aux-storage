@@ -194,7 +194,7 @@ impl JournalStore {
     pub(in crate::journal) async fn require_verified_control_target<
         A: PhysicalRecordAttempt
             + storage_provider::DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

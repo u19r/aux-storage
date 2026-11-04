@@ -15,6 +15,23 @@ use crate::{
 };
 
 impl<A: SqlAttempt, L: SqlLayout> GetItemAttempt for SqlCatalogAttempt<'_, A, L> {
+    async fn read_primary_live_revisions(
+        &mut self,
+        reads: &[(&BoundTableInfo, &KeyAttributes)],
+    ) -> StorageResult<Vec<Option<storage_types::ItemRevision>>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let result = async {
+            load_primary_rows(operation.as_mut(), reads, "__aux_revision")
+                .await?
+                .into_iter()
+                .map(|row| row.map(decode_live_revision).transpose())
+                .collect()
+        }
+        .await;
+        operation.complete(result)
+    }
+
     async fn read_primary_item(
         &mut self,
         table: &BoundTableInfo,
@@ -42,7 +59,7 @@ impl<A: SqlAttempt, L: SqlLayout> GetItemAttempt for SqlCatalogAttempt<'_, A, L>
             results
                 .try_reserve_exact(reads.len())
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            let rows = load_primary_rows(catalog, reads).await?;
+            let rows = load_primary_rows(catalog, reads, "item_value").await?;
             for ((table, _), row) in reads.iter().zip(&rows) {
                 requests.push((
                     *table,
@@ -54,9 +71,9 @@ impl<A: SqlAttempt, L: SqlLayout> GetItemAttempt for SqlCatalogAttempt<'_, A, L>
             }
             let bound = reads
                 .len()
-                .checked_mul(CATALOG_READ_BYTES.get())
+                .checked_mul(storage_types::MaterializedItemRecord::encoded_length_bound())
                 .ok_or_else(|| StorageError::internal("Primary batch bound overflow"))?;
-            let hydrated = hydrate_item_images(catalog, requests, bound).await?;
+            let hydrated = decode_item_images(catalog, requests, bound)?;
             if hydrated.len() != reads.len() {
                 return Err(StorageError::internal(
                     "SQL primary hydration count differs",
@@ -79,14 +96,28 @@ impl<A: SqlAttempt, L: SqlLayout> GetItemAttempt for SqlCatalogAttempt<'_, A, L>
     }
 }
 
+fn decode_live_revision(row: crate::SqlRow) -> StorageResult<storage_types::ItemRevision> {
+    let [value]: [crate::SqlValue; 1] = row
+        .into_values()
+        .try_into()
+        .map_err(|_| StorageError::internal("SQL live revision row has invalid width"))?;
+    let crate::SqlValue::Integer(revision) = value else {
+        return Err(StorageError::internal(
+            "SQL live revision row has invalid type",
+        ));
+    };
+    storage_types::ItemRevision::try_from(revision)
+}
+
 async fn load_primary_rows<A: SqlAttempt, L: SqlLayout>(
     catalog: &mut SqlCatalogAttempt<'_, A, L>,
     reads: &[(&BoundTableInfo, &KeyAttributes)],
+    columns: &str,
 ) -> StorageResult<Vec<Option<crate::SqlRow>>> {
     let is_locked = catalog.engine.engine() == SqlEngine::Postgres
         && catalog.protection != crate::ReadProtection::Snapshot
         && !reads.is_empty();
-    let statements = primary_read_statements(catalog.engine, reads, is_locked)?;
+    let statements = primary_read_statements(catalog.engine, reads, is_locked, columns)?;
     let expected = statements.len();
     let mut protected = Vec::new();
     let mut rows = Vec::new();
@@ -130,6 +161,7 @@ fn primary_read_statements(
     engine: impl SqlLayout,
     reads: &[(&BoundTableInfo, &KeyAttributes)],
     is_locked: bool,
+    columns: &str,
 ) -> StorageResult<Vec<SqlStatement>> {
     let count = reads
         .len()
@@ -145,7 +177,7 @@ fn primary_read_statements(
         )?);
     }
     for (table, key) in reads {
-        statements.push(point_read_statement(engine, table, key, "item_descriptor")?);
+        statements.push(point_read_statement(engine, table, key, columns)?);
     }
     Ok(statements)
 }
@@ -159,8 +191,8 @@ fn decode_point_page(page: SqlQueryPage) -> StorageResult<Option<crate::SqlRow>>
     Ok(page.rows.into_iter().next())
 }
 
-pub(crate) async fn hydrate_item_images<A: SqlAttempt, L: SqlLayout>(
-    attempt: &mut SqlCatalogAttempt<'_, A, L>,
+pub(crate) fn decode_item_images<A: SqlAttempt, L: SqlLayout>(
+    catalog: &SqlCatalogAttempt<'_, A, L>,
     reads: Vec<(
         &BoundTableInfo,
         Option<&SqlValue>,
@@ -168,83 +200,52 @@ pub(crate) async fn hydrate_item_images<A: SqlAttempt, L: SqlLayout>(
     )>,
     maximum: usize,
 ) -> StorageResult<Vec<Option<storage_types::StoredWireItem>>> {
-    let mut settlement =
-        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-    let attempt = settlement.as_mut();
-    let result = async {
-        let count = reads.iter().filter(|(_, value, _)| value.is_some()).count();
-        let mut present = Vec::new();
-        let mut records = Vec::new();
-        let mut results = Vec::new();
-        present
-            .try_reserve_exact(reads.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        records
-            .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        results
-            .try_reserve_exact(reads.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        for (table, value, capacity) in reads {
-            present.push(value.is_some());
-            if let Some(value) = value {
-                records.push((
-                    table,
-                    decode_item_descriptor(table, value, maximum)?,
-                    capacity,
-                ));
-            }
-        }
-        if records.is_empty() {
-            results.extend(present.into_iter().map(|_| None));
-            return Ok(results);
-        }
-        let hydrated =
-            stream_provider::retained_image::RetainedItemRecord::hydrate(attempt, records, maximum)
-                .await?;
-        #[cfg(feature = "fault-injection")]
-        let hydrated = match attempt.attempt.fault_probe() {
-            Some(probe) => hydrated
-                .into_iter()
-                .map(|mut item| {
-                    item.item = probe.alter_item_image(attempt.protection, item.item);
-                    item
-                })
-                .collect::<Vec<_>>(),
-            None => hydrated,
-        };
-        let mut items = hydrated.into_iter();
-        for present in present {
-            results.push(if present {
-                Some(
-                    items.next().ok_or_else(|| {
-                        StorageError::internal("Missing primary hydration result")
-                    })?,
-                )
-            } else {
-                None
-            });
-        }
-        if items.next().is_some() {
-            return Err(StorageError::internal("Extra primary hydration result"));
-        }
-        Ok(results)
+    if reads.is_empty() {
+        return Ok(Vec::new());
     }
-    .await;
-    settlement.complete(result)
+    let mut budget = storage_types::PageByteBudget::try_new(maximum)?;
+    reads
+        .into_iter()
+        .map(|(table, value, capacity)| {
+            value
+                .map(|value| {
+                    let record = decode_item_value(table, value)?;
+                    if !budget.admit(record.decoded_bytes()) {
+                        return Err(
+                            storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
+                        );
+                    }
+                    let item = record.into_stored(capacity)?;
+                    #[cfg(feature = "fault-injection")]
+                    let item = if let Some(probe) = catalog.attempt.fault_probe() {
+                        storage_types::StoredWireItem {
+                            item: probe.alter_item_image(catalog.protection, item.item),
+                            indexers: item.indexers,
+                        }
+                    } else {
+                        item
+                    };
+                    #[cfg(not(feature = "fault-injection"))]
+                    let _ = catalog;
+                    Ok(item)
+                })
+                .transpose()
+        })
+        .collect()
 }
 
-pub(crate) fn decode_item_descriptor(
+pub(crate) fn decode_item_value<'a>(
     table: &BoundTableInfo,
-    value: &SqlValue,
-    maximum: usize,
-) -> StorageResult<stream_provider::retained_image::RetainedItemRecord> {
+    value: &'a SqlValue,
+) -> StorageResult<storage_types::MaterializedItemRecord<'a>> {
     let SqlValue::Blob(value) = value else {
-        return Err(StorageError::internal(
-            "SQL primary descriptor has invalid type",
-        ));
+        return Err(StorageError::internal("SQL primary value has invalid type"));
     };
-    stream_provider::retained_image::RetainedItemRecord::decode(value, table.history_id, maximum)
+    storage_types::MaterializedItemRecord::decode(
+        value,
+        table.history_id,
+        storage_types::MaterializedItemRecord::encoded_length_bound(),
+    )
 }
 
 pub(crate) fn select_image_prefix(
@@ -253,11 +254,11 @@ pub(crate) fn select_image_prefix(
     offset: usize,
     maximum: usize,
 ) -> StorageResult<()> {
-    let mut budget = stream_provider::retained_image::RetainedImagePageBudget::try_new(maximum)?;
+    let mut budget = storage_types::PageByteBudget::try_new(maximum)?;
     let mut count = 0;
     for row in &page.rows {
-        let record = decode_item_descriptor(table, row.value(ColumnIndex::new(offset))?, maximum)?;
-        if !budget.admit(record.read_work_bytes(maximum)?)? {
+        let record = decode_item_value(table, row.value(ColumnIndex::new(offset))?)?;
+        if !budget.admit(record.decoded_bytes()) {
             break;
         }
         count += 1;
@@ -276,7 +277,7 @@ pub(crate) fn point_read_statement(
     columns: &str,
 ) -> StorageResult<SqlStatement> {
     let (predicate, binds) = primary_key_predicate(engine, table, key)?;
-    let physical = engine.item_table_name(&table.info.table_name, table.history_id);
+    let physical = engine.item_table_name(table.history_id);
     Ok(SqlStatement::new(
         format!("SELECT {columns} FROM \"{physical}\" WHERE {predicate} LIMIT 1"),
         binds,

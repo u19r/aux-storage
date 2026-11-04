@@ -10,7 +10,7 @@ pub(super) fn expiration_index_page(
     read: &TtlIndexRead,
     history_id: TableHistoryId,
 ) -> StorageResult<SqlStatement> {
-    let physical = engine.ttl_table_name(&read.table_name, history_id);
+    let physical = engine.ttl_table_name(history_id);
     let cursor = read
         .cursor
         .as_ref()

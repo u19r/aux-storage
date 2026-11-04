@@ -22,9 +22,7 @@ pub use background_lease::{
 };
 pub use constants::ARTIFACT_SCHEMA_VERSION;
 pub use gsi::{GsiEntry, GsiIndexModel};
-pub use history::{
-    HistoryEvent, OperationHistory, OperationKind, OperationOutcome, classify_operation_error,
-};
+pub use history::{HistoryEvent, OperationHistory, OperationKind, OperationOutcome};
 pub use pubsub::{
     PublishAttempt, PublishAuditPhase, PublishDeliveryAudit, PublishIntentAudit, PublishOutcome,
     check_publish_attempts, check_publish_progress,
@@ -34,7 +32,4 @@ pub use shared_key::{
 };
 pub use simulation_metadata::{SimulationRunMetadata, SimulationRunMetadataInput};
 pub use table::{PossibleTableModel, TableModel};
-pub use trim::{
-    TrimProviderSnapshot, TrimScopeExpectation, TrimScopeKind, TrimScopeReport, TrimStateModel,
-    check_aggregate_trim_scopes,
-};
+pub use trim::{TrimProviderSnapshot, TrimScopeReport, check_aggregate_trim_scopes};

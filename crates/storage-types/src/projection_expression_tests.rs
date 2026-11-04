@@ -197,6 +197,7 @@ fn include_projection_table() -> StoredTableInfo {
             key_type: KeyType::Hash,
         }],
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("gsi1"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "gsi1pk".to_string(),
@@ -211,7 +212,6 @@ fn include_projection_table() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::default(),
-        default_item_stream_duration: StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

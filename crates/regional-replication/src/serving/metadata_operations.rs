@@ -11,13 +11,9 @@ impl LocalCatalogOperation for DeleteTableRequest {
     async fn execute<A: DynamoAttempt>(
         self,
         attempt: &mut A,
-        context: (
-            &storage_provider::TableMetadataCache,
-            storage_types::TimestampMillis,
-        ),
+        table: &storage_types::BoundTableInfo,
+        _now: storage_types::TimestampMillis,
     ) -> StorageResult<Self::Response> {
-        delete_table_in_attempt(attempt, context.0, &self, context.1)
-            .await?
-            .into_result()
+        delete_table_in_attempt(attempt, table).await?.into_result()
     }
 }

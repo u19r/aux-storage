@@ -22,6 +22,16 @@ async fn seed_table(fixture: &TestStore, table: &str, rows: &[(&str, &str)]) -> 
 }
 
 pub(super) async fn create_index(fixture: &TestStore, table: &str) -> anyhow::Result<()> {
+    let name = TableName::new(table);
+    if !fixture
+        .operations
+        .get_table_info(name.clone())
+        .await?
+        .has_enabled_stream()
+    {
+        super::table_stream_eligibility_tests::set_stream(fixture, &name, true).await?;
+        super::table_stream_eligibility_tests::finish_initialization(fixture, &name).await?;
+    }
     let indexes = table_request(table).global_secondary_indexes.unwrap();
     let request: UpdateTableRequest = serde_json::from_value(json!({
         "TableName": table,
@@ -205,9 +215,11 @@ async fn given_index_deleted_and_recreated_when_backfilled_then_new_index_serves
         create_index(&fixture, "gsi_recreate").await?;
         finish_backfill(&fixture, 8).await?;
         anyhow::ensure!(group_keys(&fixture, "gsi_recreate", "x").await? == ["A"]);
-        fixture.operations.update_table(serde_json::from_value(json!({
+        let deleted = fixture.operations.update_table(serde_json::from_value(json!({
             "TableName": "gsi_recreate", "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "by_group"}}]
         }))?).await?;
+        anyhow::ensure!(deleted.table_description.stream_specification.is_some_and(|spec| spec.stream_enabled),
+            "removing the last GSI changed the explicit stream setting");
         fixture.advance_time(std::time::Duration::from_secs(30));
         create_index(&fixture, "gsi_recreate").await?;
         finish_backfill(&fixture, 1).await?;
@@ -241,7 +253,7 @@ pub(super) async fn put_replay_item(
         .operations
         .put_item(
             storage_types::PutItemRequest::try_from(json!({
-                "TableName": "revision_replay", "Item": item, "AuxItemStreamTtlHours": 1
+                "TableName": "revision_replay", "Item": item
             }))
             .map_err(anyhow::Error::msg)?,
         )
@@ -269,8 +281,8 @@ async fn given_replayed_gsi_history_when_foreground_moves_and_deletes_then_index
                 group_keys(&fixture, "revision_replay", "old").await? == ["delete", "move"]
             );
             anyhow::ensure!(
-                finish_backfill(&fixture, 8).await? > 0,
-                "worker did not consume put history"
+                finish_backfill(&fixture, 8).await? == 0,
+                "active index scheduled duplicate put replay"
             );
             put_replay_item(&fixture, "move", "new", false).await?;
             fixture
@@ -291,8 +303,8 @@ async fn given_replayed_gsi_history_when_foreground_moves_and_deletes_then_index
             );
             anyhow::ensure!(group_keys(&fixture, "revision_replay", "new").await? == ["move"]);
             anyhow::ensure!(
-                finish_backfill(&fixture, 8).await? > 0,
-                "worker did not consume mutation history"
+                finish_backfill(&fixture, 8).await? == 0,
+                "active index scheduled duplicate mutation replay"
             );
             anyhow::ensure!(
                 group_keys(&fixture, "revision_replay", "old")
@@ -323,8 +335,8 @@ async fn given_retained_gsi_history_when_table_is_recreated_then_index_ignores_o
         put_replay_item(&fixture, "embedded", "old", false).await?;
         put_replay_item(&fixture, "referenced", "old", true).await?;
         anyhow::ensure!(
-            finish_backfill(&fixture, 8).await? > 0,
-            "old incarnation history was not consumed"
+            finish_backfill(&fixture, 8).await? == 0,
+            "active index scheduled old incarnation replay"
         );
         anyhow::ensure!(
             group_keys(&fixture, "revision_replay", "old").await? == ["embedded", "referenced"]
@@ -350,8 +362,8 @@ async fn given_retained_gsi_history_when_table_is_recreated_then_index_ignores_o
         );
         put_replay_item(&fixture, "new", "new", false).await?;
         anyhow::ensure!(
-            finish_backfill(&fixture, 8).await? > 0,
-            "new incarnation history was not consumed"
+            finish_backfill(&fixture, 8).await? == 0,
+            "active replacement index scheduled duplicate replay"
         );
         anyhow::ensure!(
             group_keys(&fixture, "revision_replay", "old")

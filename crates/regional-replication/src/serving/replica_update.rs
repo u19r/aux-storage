@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
 use storage_common::retry::retry_native_conflicts;
-use storage_provider::{DYNAMO_WRITE_RETRY, DynamoPort, resolve_table_in_attempt};
+use storage_provider::{DYNAMO_WRITE_RETRY, DynamoPort, RequestTableBindings};
 use storage_types::{AttemptMode, StorageResult, UpdateTableRequest, UpdateTableResponse};
 
 use super::runtime::RegionalDynamo;
@@ -26,8 +26,10 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
             )?,
         );
         let cache = self.port.metadata_cache();
+        let bindings = RequestTableBindings::default();
         retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
             let request = Arc::clone(&request);
+            let bindings = bindings.clone();
             let cache = Arc::clone(&cache);
             let journal = Arc::clone(&self.journal);
             let configuration = Arc::clone(&self.configuration);
@@ -35,8 +37,9 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                 self.port
                     .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
                         Box::pin(async move {
-                            let (table, _) =
-                                resolve_table_in_attempt(attempt, &cache, &request.table).await?;
+                            let (table, _) = bindings
+                                .resolve_table(attempt, &cache, &request.table)
+                                .await?;
                             journal
                                 .accept_replica_create(attempt, &table, &request, &configuration)
                                 .await

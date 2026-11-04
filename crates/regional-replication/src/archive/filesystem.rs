@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// One configured durable filesystem. Object addresses never come from peers.
 pub(crate) struct CanonicalArchive {
-    root: PathBuf,
+    pub(super) root: PathBuf,
     identity: [u8; 16],
     physical_identity: [u8; 16],
     maximum_object_bytes: NonZeroUsize,
@@ -89,12 +89,13 @@ impl CanonicalArchive {
 
     pub(crate) async fn fetch_object(
         &self,
+        history: storage_types::TableHistoryId,
         digest: CanonicalDigest,
         length: usize,
     ) -> StorageResult<Arc<[u8]>> {
         self.require_object_length(length)?;
         let ArchiveFile { mut file, metadata } =
-            ArchiveFile::load(&self.object_path(digest)).await?;
+            ArchiveFile::load(&self.object_path(history, digest)).await?;
         if usize::try_from(metadata.len()).ok() != Some(length) {
             return Err(crate::native_record::corrupt_record());
         }
@@ -119,6 +120,7 @@ impl CanonicalArchive {
 
     pub(crate) async fn publish_object(
         &self,
+        history: storage_types::TableHistoryId,
         digest: CanonicalDigest,
         bytes: &[u8],
     ) -> StorageResult<super::manifest::VerifiedObject> {
@@ -126,23 +128,37 @@ impl CanonicalArchive {
         digest
             .verify(bytes)
             .map_err(|_| crate::native_record::corrupt_record())?;
-        publish_file(&self.root, &self.object_path(digest), bytes).await?;
-        self.fetch_object(digest, bytes.len()).await?;
+        let lease = self.admit_table_publication(history).await?;
+        publish_file(&lease.path, &self.object_path(history, digest), bytes).await?;
+        self.fetch_object(history, digest, bytes.len()).await?;
         Ok(super::manifest::VerifiedObject::new(
             self.identity,
+            history,
             digest,
             bytes.len(),
         ))
     }
 
-    fn object_path(&self, digest: CanonicalDigest) -> PathBuf {
+    fn object_path(
+        &self,
+        history: storage_types::TableHistoryId,
+        digest: CanonicalDigest,
+    ) -> PathBuf {
         let digits = crate::constants::ARCHIVE_HEX_DIGITS;
         let mut name = String::with_capacity(64);
         for byte in digest.as_ref() {
             name.push(char::from(digits[(byte >> 4) as usize]));
             name.push(char::from(digits[(byte & 15) as usize]));
         }
-        self.root.join(name)
+        self.object_namespace(history).join(name)
+    }
+
+    pub(super) fn object_namespace(&self, history: storage_types::TableHistoryId) -> PathBuf {
+        self.root.join(format!(
+            "{}{}",
+            crate::constants::ARCHIVE_TABLE_PREFIX,
+            uuid::Uuid::from_bytes(*history.as_ref()).simple()
+        ))
     }
 
     pub(super) fn require_object_length(&self, length: usize) -> StorageResult<()> {
@@ -161,18 +177,8 @@ async fn prepare_archive_namespace(
         "native-{}",
         uuid::Uuid::from_bytes(physical_identity).simple()
     ));
-    match tokio::fs::create_dir(&namespace).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(archive_io(error)),
-    }
+    prepare_namespace_directory(&namespace).await?;
     sync_directory(root).await?;
-    let metadata = tokio::fs::symlink_metadata(&namespace)
-        .await
-        .map_err(archive_io)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(crate::native_record::corrupt_record());
-    }
     let resolved = tokio::fs::canonicalize(&namespace)
         .await
         .map_err(archive_io)?;
@@ -180,6 +186,21 @@ async fn prepare_archive_namespace(
         return Err(crate::native_record::corrupt_record());
     }
     Ok(resolved)
+}
+
+pub(super) async fn prepare_namespace_directory(namespace: &Path) -> StorageResult<()> {
+    match tokio::fs::create_dir(namespace).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(archive_io(error)),
+    }
+    let metadata = tokio::fs::symlink_metadata(namespace)
+        .await
+        .map_err(archive_io)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(crate::native_record::corrupt_record());
+    }
+    Ok(())
 }
 
 async fn publish_file(root: &Path, destination: &Path, bytes: &[u8]) -> StorageResult<()> {
@@ -252,7 +273,7 @@ impl ArchiveFile {
     }
 }
 
-async fn sync_directory(path: &Path) -> StorageResult<()> {
+pub(super) async fn sync_directory(path: &Path) -> StorageResult<()> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .map_err(archive_io)?;
@@ -275,6 +296,6 @@ async fn sync_directory(path: &Path) -> StorageResult<()> {
     directory.sync_all().await.map_err(archive_io)
 }
 
-fn archive_io(_: std::io::Error) -> StorageError {
+pub(super) fn archive_io(_: std::io::Error) -> StorageError {
     storage_types::StorageEnum::HistoryUnavailable.into()
 }

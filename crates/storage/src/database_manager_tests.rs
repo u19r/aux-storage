@@ -647,9 +647,21 @@ async fn get_stream_records_for_table_name_uses_stream_record_sequence() {
         .expect("read stream records");
 
     assert_eq!(response.records().len(), 1);
+    let cursor = response.records()[0]
+        .cursor
+        .as_deref()
+        .unwrap()
+        .parse::<storage_types::TableStreamCheckpoint>()
+        .unwrap();
     assert_eq!(
-        response.records()[0].cursor.as_deref(),
-        Some(response.records()[0].sequence_number.as_str())
+        cursor.history_id(),
+        response.table_frontier().unwrap().table_history_id
+    );
+    assert_eq!(
+        storage_types::TableStreamSequence::try_from(cursor.positions()[0].offset())
+            .unwrap()
+            .to_string(),
+        response.records()[0].sequence_number
     );
     assert_eq!(
         response.records()[0].keys.get("pk"),
@@ -657,7 +669,7 @@ async fn get_stream_records_for_table_name_uses_stream_record_sequence() {
     );
     assert_eq!(
         response.records()[0]
-            .new_image
+            .item
             .as_ref()
             .and_then(|item| item.get("payload")),
         Some(&AttributeValue::S("customer-value".to_string()))
@@ -734,7 +746,6 @@ async fn default_batch_write_item_persists_exact_customer_attributes() {
                     ]))
                     .expect("encode item"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -793,7 +804,6 @@ async fn batch_write_rejects_invalid_indexer_declaration_before_writing() {
                         ]))
                         .expect("encode item"),
                         indexers: Some(vec!["customer_id".to_string()]),
-                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 }],
@@ -894,7 +904,6 @@ async fn default_batch_write_item_preserves_timestamp_payloads() {
                 put_request: Some(PutRequest {
                     item: WireItem::try_from(item).expect("encode item"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -1095,7 +1104,6 @@ async fn custom_gsi_query_projection_returns_only_projected_selected_attributes(
                     ]))
                     .expect("encode item"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -1508,7 +1516,6 @@ async fn given_explicit_timestamp_when_transaction_put_and_update_then_caller_cl
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -1545,7 +1552,6 @@ async fn given_explicit_timestamp_when_transaction_put_and_update_then_caller_cl
                     ),
                 ])),
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -1751,7 +1757,6 @@ async fn batch_write_item_stamps_updated_at() {
                     ]))
                     .expect("encode item"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -1822,7 +1827,6 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 update: None,
                 delete: None,
@@ -1843,7 +1847,6 @@ async fn transact_write_items_stamps_updated_at_for_put_and_update() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete: None,
                 condition_check: None,
@@ -1919,7 +1922,6 @@ async fn transact_write_items_encode_stamps_updated_at_for_put_and_update() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 update: None,
                 delete: None,
@@ -1940,7 +1942,6 @@ async fn transact_write_items_encode_stamps_updated_at_for_put_and_update() {
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete: None,
                 condition_check: None,
@@ -1993,7 +1994,6 @@ async fn default_transact_write_items_encode_preserves_timestamp_payloads() {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             update: None,
             delete: None,
@@ -2034,7 +2034,6 @@ async fn batch_write_item_encode_stamps_updated_at() {
             vec![EncodeWriteRequest {
                 put_request: Some(EncodePutRequest {
                     item: storage_types::WireEntity::unindexed(put_item),
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],
@@ -2099,7 +2098,6 @@ async fn transact_write_items_encode_preserves_add_clause_before_set_when_stampi
                     ),
                 ])),
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             delete: None,
             condition_check: None,

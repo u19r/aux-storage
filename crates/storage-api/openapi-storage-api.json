@@ -133,8 +133,8 @@
             }
           }
         },
-        "x-aux-audience": "internal_private",
-        "x-aux-internal": true
+        "x-aux-internal": true,
+        "x-aux-audience": "internal_private"
       }
     }
   },

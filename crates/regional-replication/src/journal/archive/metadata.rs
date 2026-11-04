@@ -11,7 +11,7 @@ use crate::{
 };
 
 impl JournalStore {
-    pub(super) async fn load_archive_dependency_metadata<A: PhysicalRecordAttempt>(
+    pub(super) async fn load_archive_original_record<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
         key: &DurableRecordKey,
@@ -46,23 +46,6 @@ impl JournalStore {
         }
         .await;
         settlement_guard.complete(result)
-    }
-
-    pub(super) fn archive_metadata_pointer(
-        &self,
-        record: &DurableRecord,
-    ) -> StorageResult<ArchivePointer> {
-        let digest = replication_types::protocol::CanonicalDigest::of(&record.bytes);
-        let pointer = ArchivePointer {
-            key: record.key.clone(),
-            revision: record.revision,
-            manifest: digest,
-            metadata_length: record.bytes.len(),
-            content: digest,
-            length: record.bytes.len(),
-        };
-        self.archive_record_size(&pointer)?;
-        Ok(pointer)
     }
 
     pub(in crate::journal) async fn load_immutable_waves<A: PhysicalRecordAttempt>(
@@ -141,12 +124,6 @@ impl JournalStore {
                 .await;
                 for result in results {
                     let (slot, record) = result?;
-                    if ArchiveKind::from_key(&record.key)
-                        .is_some_and(ArchiveKind::has_publication_coverage)
-                    {
-                        self.require_archive_publication_coverage(attempt, &record, protection)
-                            .await?;
-                    }
                     rows[slot] = Some(record);
                 }
             }
@@ -163,7 +140,7 @@ impl JournalStore {
         self.archive_record_size(pointer)?;
         let archive = self.archive.get().ok_or_else(corrupt_record)?;
         let bytes = archive
-            .fetch_object(pointer.manifest, pointer.metadata_length)
+            .fetch_object(pointer.history, pointer.manifest, pointer.metadata_length)
             .await?;
         let record = DurableRecord {
             key: pointer.key.clone(),
@@ -172,6 +149,17 @@ impl JournalStore {
         };
         pointer.require_record(&record)?;
         self.records.limits.validate_record(&record)?;
+        let payload: super::super::original_payload::OriginalPayload<'_> =
+            self.records.decode(&record)?;
+        if pointer.history != payload.history || payload.original_bytes()?.len() != pointer.length {
+            return Err(corrupt_record());
+        }
+        let original = archive
+            .fetch_object(pointer.history, pointer.content, pointer.length)
+            .await?;
+        if original.as_ref() != payload.original_bytes()? {
+            return Err(corrupt_record());
+        }
         Ok(record)
     }
 
@@ -179,13 +167,10 @@ impl JournalStore {
         &self,
         pointer: &ArchivePointer,
     ) -> StorageResult<usize> {
-        let kind = ArchiveKind::from_key(&pointer.key).ok_or_else(corrupt_record)?;
+        ArchiveKind::from_key(&pointer.key).ok_or_else(corrupt_record)?;
         if pointer.revision != Revision::INITIAL
             || pointer.length == 0
             || (pointer.content == pointer.manifest && pointer.length != pointer.metadata_length)
-            || (!kind.is_payload()
-                && (pointer.content != pointer.manifest
-                    || pointer.length != pointer.metadata_length))
             || self.record_key(pointer.key.as_ref().suffix.clone())? != pointer.key
             || pointer.metadata_length == 0
             || pointer.metadata_length > self.records.limits.max_record_bytes().get()

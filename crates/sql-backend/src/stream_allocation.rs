@@ -76,8 +76,8 @@ pub(crate) async fn store_retired_offsets<A: SqlAttempt>(
                 crate::sql_template::sql_template!(
                     engine,
                     "UPDATE "["sys_system_stream_sequences"],
-                    " SET retired_offset = GREATEST(retired_offset, $1) WHERE scope_key = \
-                     'system' AND shard_id = $2"
+                    " SET retired_offset = CASE WHEN retired_offset < $1 THEN $1 ELSE \
+                     retired_offset END WHERE scope_key = 'system' AND shard_id = $2"
                 ),
                 vec![SqlValue::Integer(offset), SqlValue::Text(shard.to_owned())],
             )
@@ -97,18 +97,18 @@ pub(crate) async fn store_retired_offsets<A: SqlAttempt>(
 pub(crate) async fn load_retired_offsets<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl crate::SqlLayout,
-    reads: &[stream_provider::SystemStreamHistoryRead],
+    origins: &[storage_types::SystemStreamPosition],
 ) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
-    let statements = reads
+    let statements = origins
         .iter()
-        .map(|read| {
+        .map(|origin| {
             SqlStatement::new(
                 crate::sql_template::sql_template!(
                     engine,
                     "SELECT retired_offset FROM "["sys_system_stream_sequences"],
                     " WHERE scope_key = 'system' AND shard_id = $1"
                 ),
-                vec![SqlValue::Text(read.after.shard_id().as_str().to_owned())],
+                vec![SqlValue::Text(origin.shard_id().as_str().to_owned())],
             )
         })
         .collect();
@@ -119,13 +119,13 @@ pub(crate) async fn load_retired_offsets<A: SqlAttempt>(
             storage_provider::SYSTEM_STREAM_SNAPSHOT_BYTES,
         )
         .await?;
-    if pages.len() != reads.len() {
+    if pages.len() != origins.len() {
         return Err(invalid_allocation());
     }
     pages
         .into_iter()
-        .zip(reads)
-        .map(|(page, read)| {
+        .zip(origins)
+        .map(|(page, origin)| {
             if page.more || page.rows.len() != 1 {
                 return Err(invalid_allocation());
             }
@@ -134,8 +134,8 @@ pub(crate) async fn load_retired_offsets<A: SqlAttempt>(
                 return Ok(None);
             }
             storage_types::SystemStreamPosition::try_new(
-                read.after.shard_id().as_str(),
-                read.after.lineage_id().as_str(),
+                origin.shard_id().as_str(),
+                origin.lineage_id().as_str(),
                 format!("{offset:020}"),
             )
             .map(Some)

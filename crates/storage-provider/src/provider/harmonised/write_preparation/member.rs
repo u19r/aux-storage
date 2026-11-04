@@ -52,7 +52,6 @@ impl TableWriteMember {
             } => {
                 let request = PutItemRequest {
                     indexers: put.indexers.clone(),
-                    aux_item_stream_ttl_hours: put.aux_item_stream_ttl_hours,
                     ..PutItemRequest::new(table.clone(), put.item.clone())
                 };
                 Ok(Self::Put(PhysicalWrite::try_new(
@@ -68,7 +67,6 @@ impl TableWriteMember {
                 ..
             } => {
                 let request = DeleteItemRequest {
-                    aux_item_stream_ttl_hours: delete.aux_item_stream_ttl_hours,
                     ..DeleteItemRequest::new(table.clone(), delete.key.clone())
                 };
                 Ok(Self::Delete(PhysicalWrite::try_new(
@@ -109,7 +107,6 @@ impl TableWriteMember {
                     return_values_on_condition_check_failure: request
                         .return_values_on_condition_check_failure
                         .clone(),
-                    aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
                     ..PutItemRequest::new(table.clone(), request.item.clone())
                 };
                 Ok(Self::Put(PhysicalWrite::try_new(
@@ -141,7 +138,6 @@ impl TableWriteMember {
                     return_values_on_condition_check_failure: request
                         .return_values_on_condition_check_failure
                         .clone(),
-                    aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
                     table_name: table.clone(),
                 };
                 Ok(Self::Update(PhysicalWrite::try_new(
@@ -170,7 +166,6 @@ impl TableWriteMember {
                     return_values_on_condition_check_failure: request
                         .return_values_on_condition_check_failure
                         .clone(),
-                    aux_item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
                     table_name: table.clone(),
                 };
                 Ok(Self::Delete(PhysicalWrite::try_new(

@@ -29,29 +29,13 @@ enum CommitBehavior {
     Committed,
     Unknown,
     BackendFailure,
-    Replay(Arc<Mutex<ReplayState>>),
 }
 
 struct RecordingState {
     values: BTreeMap<StoreKey, Bytes>,
     get_calls: usize,
     get_many_calls: usize,
-}
-
-struct ReplayState {
-    transaction: Option<StoreTransaction>,
-    outcome: CommitOutcome,
-    applications: usize,
-}
-
-impl Default for ReplayState {
-    fn default() -> Self {
-        Self {
-            transaction: None,
-            outcome: CommitOutcome::Committed,
-            applications: 0,
-        }
-    }
+    transactions: Vec<StoreTransaction>,
 }
 
 impl RecordingRaw {
@@ -75,27 +59,8 @@ impl RecordingRaw {
                 values: BTreeMap::new(),
                 get_calls: 0,
                 get_many_calls: 0,
+                transactions: Vec::new(),
             })),
-        }
-    }
-
-    fn replaying() -> Self {
-        Self::replaying_with(CommitOutcome::Committed)
-    }
-
-    fn replaying_with(outcome: CommitOutcome) -> Self {
-        let mut raw = Self::new();
-        raw.commit_behavior = CommitBehavior::Replay(Arc::new(Mutex::new(ReplayState {
-            outcome,
-            ..ReplayState::default()
-        })));
-        raw
-    }
-
-    fn replay_state(&self) -> Arc<Mutex<ReplayState>> {
-        match &self.commit_behavior {
-            CommitBehavior::Replay(state) => Arc::clone(state),
-            _ => panic!("replaying test raw"),
         }
     }
 
@@ -116,29 +81,6 @@ impl RecordingRaw {
             StoreKey::try_from(key).expect("test key"),
             Bytes::copy_from_slice(value),
         );
-    }
-
-    fn value(&self, key: &[u8]) -> Option<Bytes> {
-        self.state
-            .lock()
-            .expect("state lock")
-            .values
-            .get(&StoreKey::try_from(key).expect("test key"))
-            .cloned()
-    }
-
-    fn apply_mutations(&self, transaction: &StoreTransaction) {
-        let mut state = self.state.lock().expect("state lock");
-        for mutation in transaction.mutations() {
-            match mutation {
-                Mutation::Put(key, value) => {
-                    state.values.insert(key.clone(), value.clone());
-                }
-                Mutation::Delete(key) => {
-                    state.values.remove(key);
-                }
-            }
-        }
     }
 }
 
@@ -188,33 +130,21 @@ impl RawOrderedJobStore for RecordingRaw {
             .map_err(|_| RawOrderedJobStoreError::Backend(StorageError::internal("test page")))
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {
+        self.state
+            .lock()
+            .unwrap()
+            .transactions
+            .push(transaction.clone());
         match &self.commit_behavior {
             CommitBehavior::Committed => Ok(CommitOutcome::Committed),
             CommitBehavior::Unknown => Ok(CommitOutcome::Unknown),
             CommitBehavior::BackendFailure => Err(RawOrderedJobStoreError::Backend(
                 StorageError::internal("secret-key commit backend detail"),
             )),
-            CommitBehavior::Replay(state) => {
-                let mut state = state.lock().expect("state lock");
-                match state.transaction.as_ref() {
-                    Some(recorded) if recorded == transaction => Ok(state.outcome),
-                    Some(_) => Err(RawOrderedJobStoreError::OperationReuseMismatch),
-                    None => {
-                        state.transaction = Some(transaction.clone());
-                        state.applications += 1;
-                        let outcome = state.outcome;
-                        drop(state);
-                        if outcome == CommitOutcome::Committed {
-                            self.apply_mutations(transaction);
-                        }
-                        Ok(outcome)
-                    }
-                }
-            }
         }
     }
 }
@@ -332,10 +262,6 @@ fn given_raw_corruption_when_mapping_then_adapter_preserves_corrupt_category_and
 fn given_each_raw_error_variant_when_mapping_then_adapter_uses_fixed_categories() {
     let cases = [
         (
-            RawOrderedJobStoreError::OperationReuseMismatch,
-            ScheduledJobStoreError::OperationReuseMismatch,
-        ),
-        (
             RawOrderedJobStoreError::Timeout,
             ScheduledJobStoreError::Backend(StoreFailure::Timeout),
         ),
@@ -382,90 +308,23 @@ fn given_mapped_backend_error_when_formatting_then_source_preserves_only_the_red
     assert_eq!(format!("{error:?}"), "Backend(Permanent)");
 }
 
-#[test]
-fn given_operation_reuse_mismatch_when_formatting_then_error_is_fixed_and_redacted() {
-    let raw = RawOrderedJobStoreError::OperationReuseMismatch;
-    let adapter = ScheduledJobStoreError::from(raw);
-
-    assert_eq!(
-        adapter.to_string(),
-        "commit operation ID was reused with different content"
-    );
-    assert_eq!(format!("{adapter:?}"), "OperationReuseMismatch");
-
-    let raw = RawOrderedJobStoreError::OperationReuseMismatch;
-    assert_eq!(
-        raw.to_string(),
-        "commit operation ID was reused with different content"
-    );
-    assert_eq!(format!("{raw:?}"), "OperationReuseMismatch");
-}
-
 #[tokio::test]
-async fn given_same_operation_and_transaction_when_retried_then_established_outcome_is_replayed() {
-    let raw = Arc::new(RecordingRaw::replaying());
-    let state = raw.replay_state();
-    let store = ScheduledJobStore::new(raw.clone());
-    let transaction = transaction(7, b"replay", b"value");
-
-    assert_eq!(
-        store.commit(&transaction).await.expect("first commit"),
-        CommitOutcome::Committed
-    );
-    assert_eq!(
-        store.commit(&transaction).await.expect("replayed commit"),
-        CommitOutcome::Committed
-    );
-    let state = state.lock().expect("state lock");
-    assert_eq!(state.transaction.as_ref(), Some(&transaction));
-    assert_eq!(state.applications, 1);
-    drop(state);
-    assert_eq!(raw.value(b"replay"), Some(Bytes::from_static(b"value")));
-}
-
-#[tokio::test]
-async fn given_prior_conflict_when_same_transaction_is_retried_then_conflict_is_replayed() {
-    let raw = Arc::new(RecordingRaw::replaying_with(CommitOutcome::Conflict));
-    let state = raw.replay_state();
-    let store = ScheduledJobStore::new(raw.clone());
-    let transaction = transaction(10, b"conflict", b"value");
-
-    assert_eq!(
-        store.commit(&transaction).await.expect("first conflict"),
-        CommitOutcome::Conflict
-    );
-    assert_eq!(
-        store.commit(&transaction).await.expect("replayed conflict"),
-        CommitOutcome::Conflict
-    );
-    assert_eq!(state.lock().expect("state lock").applications, 1);
-    assert_eq!(raw.value(b"conflict"), None);
-}
-
-#[tokio::test]
-async fn given_reused_operation_with_different_transaction_when_committing_then_adapter_is_redacted_and_no_effect_is_applied()
+async fn given_native_attempts_with_one_identity_when_retried_then_the_adapter_forwards_each_exact_request()
  {
-    let raw = Arc::new(RecordingRaw::replaying());
-    let state = raw.replay_state();
-    raw.insert(b"second", b"original");
+    let raw = Arc::new(RecordingRaw::new());
     let store = ScheduledJobStore::new(raw.clone());
-    let first = transaction(8, b"first", b"value");
-    let mismatch = transaction(8, b"second", b"value");
-
-    store.commit(&first).await.expect("first commit");
-    let error = store
-        .commit(&mismatch)
-        .await
-        .expect_err("operation reuse mismatch");
-
+    let first = transaction(7, b"forwarded", b"first");
+    let changed = transaction(7, b"forwarded", b"changed");
+    for input in [&first, &changed, &first] {
+        assert_eq!(
+            store.transact(input).await.unwrap(),
+            CommitOutcome::Committed
+        );
+    }
     assert_eq!(
-        error.to_string(),
-        "commit operation ID was reused with different content"
+        raw.state.lock().unwrap().transactions,
+        vec![first.clone(), changed, first]
     );
-    assert!(!format!("{error:?}").contains("second"));
-    assert_eq!(state.lock().expect("state lock").applications, 1);
-    assert_eq!(raw.value(b"first"), Some(Bytes::from_static(b"value")));
-    assert_eq!(raw.value(b"second"), Some(Bytes::from_static(b"original")));
 }
 
 #[tokio::test]
@@ -474,7 +333,7 @@ async fn given_raw_unknown_commit_outcome_when_committing_then_adapter_preserves
     let transaction = transaction(9, b"unknown", b"value");
 
     assert_eq!(
-        scheduled_bg_jobs::store::JobStore::commit(&store, &transaction)
+        scheduled_bg_jobs::store::JobStore::transact(&store, &transaction)
             .await
             .expect("unknown commit"),
         CommitOutcome::Unknown
@@ -487,7 +346,7 @@ async fn given_known_backend_commit_error_when_committing_then_unknown_is_not_in
     let transaction = transaction(11, b"known-error", b"value");
 
     let error = store
-        .commit(&transaction)
+        .transact(&transaction)
         .await
         .expect_err("known backend error");
     assert_eq!(
@@ -593,7 +452,7 @@ impl RawOrderedJobStore for FailingRaw {
         })
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         _transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {
@@ -648,7 +507,7 @@ impl RawOrderedJobStore for OutOfBoundsRangeRaw {
         .map_err(|_| RawOrderedJobStoreError::Backend(StorageError::internal("test page")))
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         _transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {

@@ -30,6 +30,8 @@ use crate::{
 
 pub struct QueueManager {
     storage: Arc<dyn QueueOperations>,
+    #[cfg(test)]
+    empty_receive_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for QueueManager {
@@ -42,7 +44,11 @@ impl std::fmt::Debug for QueueManager {
 
 impl QueueManager {
     pub fn new(storage: Arc<dyn QueueOperations>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            #[cfg(test)]
+            empty_receive_signal: None,
+        }
     }
 
     /// Return and clear pressure signals from the queue backend so the
@@ -506,6 +512,11 @@ impl QueueManager {
                 return Ok(messages);
             }
 
+            #[cfg(test)]
+            if let Some(signal) = &self.empty_receive_signal {
+                signal.notify_one();
+            }
+
             tokio::time::sleep(remaining_wait_time(deadline).min(EMPTY_RECEIVE_POLL_INTERVAL))
                 .await;
             provider_wait_time_seconds = 0;
@@ -630,3 +641,6 @@ mod batch_error_tests;
 
 #[cfg(test)]
 mod attribute_projection_tests;
+
+#[cfg(test)]
+mod receive_tests;

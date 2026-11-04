@@ -66,6 +66,7 @@ fn range_table_info_with_keys_only_gsi() -> StoredTableInfo {
         ],
         max_indexers: MaxIndexers::default(),
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("by_gsi"),
             key_schema: vec![
                 KeySchemaElement {
@@ -86,7 +87,6 @@ fn range_table_info_with_keys_only_gsi() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: Default::default(),
-        default_item_stream_duration: Default::default(),
         deletion_protection_enabled: false,
     }
 }

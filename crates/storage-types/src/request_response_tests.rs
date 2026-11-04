@@ -162,17 +162,26 @@ fn measure_key_schema_allocations(
 fn enabled_table_stream_metadata_uses_creation_time_and_table_identity() {
     let (arn, label) = latest_stream_metadata(
         &TableName::new("orders"),
-        TimestampMillis::from_timestamp(1_700_000_000_123),
+        crate::TableStreamIdentity {
+            history_id: 1_u32.into(),
+            created_at: TimestampMillis::from_timestamp(1_700_000_000_123),
+        },
         Some(&StreamSpecification {
             stream_enabled: true,
             stream_view_type: Some(StreamViewType::NewAndOldImages),
         }),
     );
 
-    assert_eq!(label.as_deref(), Some("2023-11-14T22:13:20.123"));
+    assert_eq!(
+        label.as_deref(),
+        Some("2023-11-14T22:13:20.123-00000000000000000000000000000001")
+    );
     assert_eq!(
         arn.as_deref(),
-        Some("arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2023-11-14T22:13:20.123")
+        Some(
+            "arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2023-11-14T22:13:20.\
+             123-00000000000000000000000000000001"
+        )
     );
 }
 
@@ -181,7 +190,10 @@ fn disabled_or_missing_table_stream_metadata_is_absent() {
     assert_eq!(
         latest_stream_metadata(
             &TableName::new("orders"),
-            TimestampMillis::from_timestamp(1),
+            crate::TableStreamIdentity {
+                history_id: 1_u32.into(),
+                created_at: TimestampMillis::from_timestamp(1)
+            },
             None
         ),
         (None, None)
@@ -189,7 +201,10 @@ fn disabled_or_missing_table_stream_metadata_is_absent() {
     assert_eq!(
         latest_stream_metadata(
             &TableName::new("orders"),
-            TimestampMillis::from_timestamp(1),
+            crate::TableStreamIdentity {
+                history_id: 1_u32.into(),
+                created_at: TimestampMillis::from_timestamp(1)
+            },
             Some(&StreamSpecification {
                 stream_enabled: false,
                 stream_view_type: None,
@@ -204,6 +219,7 @@ fn describe_table_response_deserializes_fractional_creation_datetime_tests() {
     let payload = json!({
         "Table": {
             "TableName": "sys",
+            "TableId": "00000000-0000-0000-0000-000000000001",
             "TableStatus": "ACTIVE",
             "CreationDateTime": 1_771_945_767.554,
             "AttributeDefinitions": [
@@ -231,6 +247,7 @@ fn standard_dynamodb_table_description_defaults_absent_max_indexers() {
     let payload = json!({
         "Table": {
             "TableName": "standard",
+            "TableId": "00000000-0000-0000-0000-000000000001",
             "TableStatus": "ACTIVE",
             "CreationDateTime": 1_771_945_767.554,
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
@@ -343,8 +360,7 @@ fn stream_response_fixture() -> GetStreamRecordsResponse {
             source_table_name: Some(TableName::new("orders")),
             keys: crate::KeyAttributes::default(),
             sequence_number: format!("sequence-{index}"),
-            old_image: None,
-            new_image: None,
+            item: None,
             system_position: None,
         })
         .collect();
@@ -352,11 +368,7 @@ fn stream_response_fixture() -> GetStreamRecordsResponse {
         TableName::new("orders"),
         records,
         None,
-        TableStreamFrontier {
-            table_history_id: 1u32.into(),
-            oldest: None,
-            head: None,
-        },
+        table_frontier_fixture(None, None),
     )
 }
 
@@ -468,8 +480,7 @@ fn system_stream_response_uses_scope_checkpoint_and_record_position_fields() {
         source_table_name: Some(TableName::new("orders")),
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: Some(position),
     };
     let checkpoint =
@@ -526,10 +537,6 @@ fn prepare_table_metadata_at_encodes_catalog_columns() {
         metadata.table_stream_duration,
         crate::StreamRetentionDuration::default()
     );
-    assert_eq!(
-        metadata.default_item_stream_duration,
-        metadata.table_stream_duration
-    );
 }
 
 #[test]
@@ -560,8 +567,7 @@ fn system_stream_response_preserves_each_logical_source_table_in_a_multi_table_p
             source_table_name: Some(TableName::new(table_name)),
             keys: crate::KeyAttributes::default(),
             sequence_number: format!("sequence-{index}"),
-            old_image: None,
-            new_image: None,
+            item: None,
             system_position: Some(
                 SystemStreamPosition::try_new(
                     shard_id,
@@ -611,8 +617,7 @@ fn system_stream_response_rejects_records_without_logical_position() {
         source_table_name: Some(TableName::new("physical-table")),
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: None,
     };
     let error = GetStreamRecordsResponse::system_stream(
@@ -634,8 +639,7 @@ fn system_stream_response_rejects_records_without_logical_source_table() {
         source_table_name: None,
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: Some(
             SystemStreamPosition::try_new("shard-a", "lineage-a", "offset-a").unwrap(),
         ),
@@ -659,8 +663,7 @@ fn system_stream_response_rejects_non_logical_source_table_name() {
         source_table_name: Some(TableName::new("arn:aws:dynamodb:table/orders")),
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: Some(
             SystemStreamPosition::try_new("shard-a", "lineage-a", "offset-a").unwrap(),
         ),
@@ -687,6 +690,7 @@ fn system_stream_response_deserialization_rejects_invalid_logical_source_table_n
         },
         "Records": [{
             "SourceTableName": "arn:aws:dynamodb:table/orders",
+            "Item": null,
             "Keys": {},
             "SequenceNumber": "opaque-sequence",
             "SystemPosition": {
@@ -708,8 +712,7 @@ fn system_stream_response_rejects_physical_pointer_without_position() {
         source_table_name: None,
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: None,
     };
     let error = GetStreamRecordsResponse::system_stream(
@@ -731,8 +734,7 @@ fn ordinary_stream_response_rejects_logical_system_position() {
         source_table_name: None,
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: Some(
             SystemStreamPosition::try_new("shard-a", "lineage-a", "offset-a").unwrap(),
         ),
@@ -741,11 +743,7 @@ fn ordinary_stream_response_rejects_logical_system_position() {
         TableName::new("ordinary"),
         vec![record],
         None,
-        TableStreamFrontier {
-            table_history_id: 1u32.into(),
-            oldest: None,
-            head: None,
-        },
+        table_frontier_fixture(None, None),
     );
 
     assert_eq!(
@@ -769,22 +767,19 @@ fn given_table_response_without_frontier_when_decoded_then_it_is_rejected() {
 }
 
 #[test]
-fn given_retained_table_range_when_checkpoint_is_checked_then_gap_and_recreation_fail_closed() {
-    let before: crate::StreamItemId = "000000000000000000000000".parse().unwrap();
-    let oldest: crate::StreamItemId = "000000000000000000000001".parse().unwrap();
-    let head: crate::StreamItemId = "000000000000000000000003".parse().unwrap();
-    let after: crate::StreamItemId = "000000000000000000000004".parse().unwrap();
-    let history_id = 1u32.into();
-    let frontier = TableStreamFrontier {
-        table_history_id: history_id,
-        oldest: Some(oldest),
-        head: Some(head),
-    };
-    assert!(frontier.can_resume_from(history_id, oldest));
-    assert!(frontier.can_resume_from(history_id, head));
-    assert!(!frontier.can_resume_from(history_id, before));
-    assert!(!frontier.can_resume_from(history_id, after));
-    assert!(!frontier.can_resume_from(2u32.into(), head));
+fn given_independent_table_lanes_when_serialized_then_no_global_order_is_imposed() {
+    let mut frontier = table_frontier_fixture(
+        Some(crate::StreamItemId::from(crate::ItemStreamVersion::new(1))),
+        Some(crate::StreamItemId::from(crate::ItemStreamVersion::new(3))),
+    );
+    let mut second = frontier.lanes[0].clone();
+    second.shard_id = crate::SystemStreamShardId::try_new("shard-b").unwrap();
+    second.lineage_id = crate::SystemStreamLineageId::try_new("lineage-b").unwrap();
+    second.oldest = Some(crate::TableStreamSequence::from(crate::StreamItemId::from(
+        crate::ItemStreamVersion::new(100),
+    )));
+    second.head = second.oldest;
+    frontier.lanes.push(second);
     let response =
         GetStreamRecordsResponse::table(TableName::new("ordinary"), vec![], None, frontier);
     assert!(serde_json::to_value(response).is_ok());
@@ -799,11 +794,7 @@ fn given_inverted_or_partial_table_range_when_serialized_then_it_is_rejected() {
             TableName::new("ordinary"),
             vec![],
             None,
-            TableStreamFrontier {
-                table_history_id: 1u32.into(),
-                oldest,
-                head,
-            },
+            table_frontier_fixture(oldest, head),
         );
         assert_eq!(
             response.validate(),
@@ -821,12 +812,8 @@ fn given_table_frontier_on_system_response_when_decoded_then_it_is_rejected() {
     )
     .expect("system response");
     let mut encoded = serde_json::to_value(response).expect("wire response");
-    encoded["TableFrontier"] = serde_json::to_value(TableStreamFrontier {
-        table_history_id: 1u32.into(),
-        oldest: None,
-        head: None,
-    })
-    .expect("frontier");
+    encoded["TableFrontier"] =
+        serde_json::to_value(table_frontier_fixture(None, None)).expect("frontier");
     let error = serde_json::from_value::<GetStreamRecordsResponse>(encoded)
         .expect_err("system stream cannot carry a table frontier");
     assert!(
@@ -874,19 +861,14 @@ fn ordinary_stream_response_preserves_reviewed_source_table_name_wire_field() {
         source_table_name: Some(TableName::new("orders.v2-prod")),
         keys: crate::KeyAttributes::default(),
         sequence_number: "opaque-sequence".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: None,
     };
     let response = GetStreamRecordsResponse::table(
         TableName::new("orders.v2-prod"),
         vec![record],
         Some("cursor-1".to_string()),
-        TableStreamFrontier {
-            table_history_id: 1u32.into(),
-            oldest: None,
-            head: None,
-        },
+        table_frontier_fixture(None, None),
     );
 
     let encoded = serde_json::to_value(&response).unwrap();
@@ -917,6 +899,7 @@ fn system_stream_response_accepts_valid_logical_source_table_name_wire() {
         },
         "Records": [{
             "SourceTableName": "orders.v2-prod",
+            "Item": null,
             "Keys": {},
             "SequenceNumber": "opaque-sequence",
             "SystemPosition": {
@@ -956,4 +939,86 @@ fn given_absent_optional_wire_fields_when_decoding_responses_then_items_are_none
         serde_json::json!({})
     );
     assert!(serde_json::from_str::<crate::GetItemResponse>(r#"{"Item":[]}"#).is_err());
+}
+
+#[test]
+fn given_same_name_and_clock_when_table_id_changes_then_stream_identity_changes() {
+    let name = TableName::new("orders");
+    let created_at = TimestampMillis::from_timestamp(1_700_000_000_123);
+    let before = crate::stream_identity(
+        &name,
+        crate::TableStreamIdentity {
+            history_id: 1_u32.into(),
+            created_at,
+        },
+    );
+    let after = crate::stream_identity(
+        &name,
+        crate::TableStreamIdentity {
+            history_id: 2_u32.into(),
+            created_at,
+        },
+    );
+    assert_ne!(before, after);
+}
+
+#[test]
+fn given_bound_table_stream_request_when_encoded_then_identity_survives_wire_round_trip() {
+    let target = crate::TableHistoryTarget {
+        table_name: TableName::new("orders"),
+        history_id: 7_u32.into(),
+    };
+    let request =
+        crate::GetStreamRecordsRequest::table_at_incarnation(target.clone(), None, Some(10));
+    let value = serde_json::to_value(request).unwrap();
+    let decoded: crate::GetStreamRecordsRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.table_history_id(), Some(target.history_id));
+    assert!(
+        serde_json::from_value::<crate::GetStreamRecordsRequest>(
+            serde_json::json!({"SystemStream": true, "TableHistoryId": target.history_id})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn given_table_checkpoint_when_encoded_then_only_canonical_id_bound_tokens_parse() {
+    let checkpoint = crate::TableStreamCheckpoint::try_new(
+        7_u32.into(),
+        SystemStreamScope::try_new("source", 1).unwrap(),
+        vec![SystemStreamPosition::try_new("shard-a", "lineage-a", "3").unwrap()],
+        crate::TableStreamReadProgress {
+            next_lane: 0,
+            initial_visibility_cutoff: None,
+        },
+    )
+    .unwrap();
+    let encoded = checkpoint.to_string();
+    assert_eq!(
+        encoded.parse::<crate::TableStreamCheckpoint>().unwrap(),
+        checkpoint
+    );
+    for invalid in [
+        "000000000000000000000003".to_string(),
+        format!("{encoded}:extra"),
+        "table1.e30".to_string(),
+    ] {
+        assert!(invalid.parse::<crate::TableStreamCheckpoint>().is_err());
+    }
+}
+
+fn table_frontier_fixture(
+    oldest: Option<crate::StreamItemId>,
+    head: Option<crate::StreamItemId>,
+) -> TableStreamFrontier {
+    TableStreamFrontier {
+        table_history_id: 1_u32.into(),
+        source_scope: SystemStreamScope::try_new("source", 1).unwrap(),
+        lanes: vec![crate::TableStreamLaneFrontier {
+            shard_id: crate::SystemStreamShardId::try_new("shard-a").unwrap(),
+            lineage_id: crate::SystemStreamLineageId::try_new("lineage-a").unwrap(),
+            oldest: oldest.map(Into::into),
+            head: head.map(Into::into),
+        }],
+    }
 }

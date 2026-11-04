@@ -38,31 +38,43 @@ impl JournalStore {
                     },
                 ));
             };
-            let record: AdditionRecord = self.records.decode(&row)?;
-            if record.content != plan.content()? || record.plan.content()? != record.content {
+            let record = self.decode_addition_record(&row)?;
+            if record.content != plan.content()? {
                 return Err(corrupt_record());
-            }
-            match (&record.reservation, &record.proposal) {
-                (Some(state), Some(proposal)) => {
-                    plan.require_reservation(plan.operation.id, plan.target.content()?, state)?;
-                    if &plan.bind_reserved_state(state.clone())? != proposal
-                        || record.phase == AdditionPhase::Reserving
-                    {
-                        return Err(corrupt_record());
-                    }
-                }
-                (None, None)
-                    if matches!(
-                        record.phase,
-                        AdditionPhase::Reserving
-                            | AdditionPhase::Cancelling
-                            | AdditionPhase::Cancelled
-                    ) => {}
-                _ => return Err(corrupt_record()),
             }
             Ok((Some(row), record))
         }
         .await;
         settlement.complete(result)
+    }
+    pub(in crate::journal) fn decode_addition_record(
+        &self,
+        row: &DurableRecord,
+    ) -> StorageResult<AdditionRecord> {
+        let record: AdditionRecord = self.records.decode(row)?;
+        record.plan.validate()?;
+        let plan = &record.plan;
+        if row.key != self.identity_key(ADDITION_OPERATION_SUFFIX, &plan.operation.id)?
+            || plan.content()? != record.content
+        {
+            return Err(corrupt_record());
+        }
+        match (&record.reservation, &record.proposal) {
+            (Some(state), Some(proposal)) => {
+                plan.require_reservation(plan.operation.id, plan.target.content()?, state)?;
+                if &plan.bind_reserved_state(state.clone())? != proposal
+                    || record.phase == AdditionPhase::Reserving
+                {
+                    return Err(corrupt_record());
+                }
+            }
+            (None, None)
+                if matches!(
+                    record.phase,
+                    AdditionPhase::Reserving | AdditionPhase::Cancelling | AdditionPhase::Cancelled
+                ) => {}
+            _ => return Err(corrupt_record()),
+        }
+        Ok(record)
     }
 }

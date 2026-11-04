@@ -16,28 +16,6 @@ pub(crate) async fn initialize_stream_rows<A: SqlAttempt>(
     for statement in sql_statements::schema(engine) {
         attempt.execute(statement).await?;
     }
-    let page = attempt
-        .query(
-            crate::SqlStatement::new(
-                format!(
-                    "SELECT read_work_format FROM {} LIMIT 1",
-                    engine.relation_name("sys_dynamo_stream_records")
-                ),
-                vec![],
-            ),
-            ReadProtection::Conflict,
-            STREAM_READ_BYTES,
-        )
-        .await?;
-    for row in page.rows {
-        if !matches!(row.value(ColumnIndex::new(0))?, SqlValue::Integer(version)
-            if *version == i64::from(stream_provider::retained_image::system_stream::RETAINED_SYSTEM_STREAM_RECORD_FORMAT))
-        {
-            return Err(StorageError::internal(
-                "Obsolete SystemStream record format",
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -45,23 +23,12 @@ pub(crate) fn dynamo_stream_statements(
     engine: impl SqlLayout,
     plan: DynamoStreamWritePlan,
 ) -> StorageResult<Vec<crate::SqlStatement>> {
-    let DynamoStreamWritePlan {
-        rows,
-        pointer_references,
-        record,
-        receipt,
-    } = plan;
+    let DynamoStreamWritePlan { rows, record } = plan;
     let mut statements = rows
         .into_iter()
         .map(|row| sql_statements::item(engine, row))
         .collect::<StorageResult<Vec<_>>>()?;
-    statements.extend(
-        pointer_references
-            .into_iter()
-            .map(|reference| sql_statements::pointer_reference(engine, reference)),
-    );
-    statements.push(sql_statements::record(engine, record, &receipt)?);
-    statements.push(sql_statements::effect(engine, &receipt)?);
+    statements.push(sql_statements::record(engine, record)?);
     Ok(statements)
 }
 

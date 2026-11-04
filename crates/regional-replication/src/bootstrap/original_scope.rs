@@ -58,6 +58,7 @@ impl AdoptedOriginalScope {
             .require_partition(self.cut.origin.journal_partition)
             .map_err(|_| corrupt_record())?;
         Ok(DeliveryScope {
+            physical: before.physical,
             origin: self.cut.origin.clone(),
             table: self.source.table,
             local_table: before.configuration.table,

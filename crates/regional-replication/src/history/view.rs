@@ -73,6 +73,7 @@ impl DeliveryPosition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalViewPointer {
+    pub physical: storage_types::TableHistoryId,
     pub receiver: OriginId,
     pub position: DeliveryPosition,
     pub lineage: TableLineage,

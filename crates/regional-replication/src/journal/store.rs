@@ -69,6 +69,64 @@ impl JournalStore {
 }
 
 impl JournalStore {
+    /// Cleanup reuses the normal typed codecs and CAS protocols for the
+    /// selected generation; it never publishes that context to customer work.
+    pub(super) async fn load_reclaim_generation<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
+        &self,
+        attempt: &mut A,
+        generation: replication_types::identity::origin::JournalGeneration,
+    ) -> StorageResult<Self> {
+        if u64::from(generation) == 0 {
+            return Err(crate::native_record::corrupt_record());
+        }
+        let mut key: infrastructure_provider::record::RecordAddress = self
+            .record_key(crate::constants::ORIGIN_LAYOUT_SUFFIX.to_vec())?
+            .into();
+        key.generation = generation.into();
+        let row = self
+            .records
+            .load(
+                attempt,
+                &[key.try_into()?],
+                storage_types::ReadProtection::Shared,
+            )
+            .await?
+            .pop()
+            .flatten()
+            .ok_or_else(crate::native_record::corrupt_record)?;
+        let layout: super::initialization::LayoutState = self.records.decode(&row)?;
+        if layout.version != crate::constants::REGIONAL_LAYOUT_VERSION
+            || layout.tenant != self.tenant
+            || layout.initialized > u32::from(layout.partitions)
+        {
+            return Err(crate::native_record::corrupt_record());
+        }
+        Ok(self.reclaim_generation(generation, layout.partitions))
+    }
+
+    fn reclaim_generation(
+        &self,
+        generation: replication_types::identity::origin::JournalGeneration,
+        partitions: JournalPartitionCount,
+    ) -> Self {
+        Self {
+            region: self.region.clone(),
+            tenant: self.tenant,
+            group: self.group,
+            generation,
+            partitions,
+            records: self.records.clone(),
+            source_byte_allowances: self.source_byte_allowances.clone(),
+            retention_time: crate::trim::time::state::RetentionTimeState::default(),
+            clock_alert_ms: self.clock_alert_ms,
+            time_trust: self.time_trust.clone(),
+            archive: self.archive.clone(),
+            native_admission: std::sync::Arc::clone(&self.native_admission),
+        }
+    }
+
     pub(crate) async fn with_admitted_attempt<P, R, F>(
         self: std::sync::Arc<Self>,
         input: (&P, storage_provider::native_admission::NativeWork),

@@ -16,14 +16,14 @@ impl JournalStore {
     pub(in crate::journal) async fn load_expected_winners<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         after: Option<DurableRecordKey>,
     ) -> StorageResult<ExpectedWinnersPage> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let first = self.identity_key(EXPECTED_WINNER_SUFFIX, &operation)?;
+            let first = self.table_identity_key(EXPECTED_WINNER_SUFFIX, scope.0, &scope.1)?;
             let request = infrastructure_provider::page::RecordPageRequest {
                 range: self.record_prefix_range(&first)?,
                 after,
@@ -34,7 +34,7 @@ impl JournalStore {
             let winners = page
                 .records
                 .iter()
-                .map(|row| self.decode_expected_winner(row, operation))
+                .map(|row| self.decode_expected_winner(row, scope))
                 .collect::<StorageResult<Vec<_>>>()?;
             Ok(ExpectedWinnersPage {
                 winners,
@@ -48,21 +48,21 @@ impl JournalStore {
     pub(in crate::journal) async fn load_expected_winner<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         key: &replication_types::event::identity::CanonicalItemKey,
     ) -> StorageResult<Option<ExpectedWinner>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let address = self.expected_winner_key(operation, key)?;
+            let address = self.expected_winner_key(scope, key)?;
             let rows = self
                 .records
                 .load(attempt, &[address], ReadProtection::Snapshot)
                 .await?;
             let expected = rows[0]
                 .as_ref()
-                .map(|row| self.decode_expected_winner(row, operation))
+                .map(|row| self.decode_expected_winner(row, scope))
                 .transpose()?;
             if expected
                 .as_ref()
@@ -79,15 +79,15 @@ impl JournalStore {
     pub(super) fn decode_expected_winner(
         &self,
         row: &infrastructure_provider::record::DurableRecord,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
     ) -> StorageResult<ExpectedWinner> {
         let expected: ExpectedWinner = self.records.decode(row)?;
         expected
             .provenance
             .validate()
             .map_err(|_| corrupt_record())?;
-        if expected.operation != operation
-            || self.expected_winner_key(operation, &expected.provenance.key)? != row.key
+        if expected.operation != scope.1
+            || self.expected_winner_key(scope, &expected.provenance.key)? != row.key
         {
             return Err(corrupt_record());
         }

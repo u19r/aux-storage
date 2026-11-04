@@ -17,14 +17,19 @@ use crate::{
 };
 
 pub(in crate::journal) enum AcceptanceReadSelection<'input> {
-    Identities(&'input [&'input CanonicalEventId]),
+    Identities(&'input [(&'input CanonicalEventId, storage_types::TableHistoryId)]),
     SourceProof {
-        identities: &'input [&'input CanonicalEventId],
+        identities: &'input [(&'input CanonicalEventId, storage_types::TableHistoryId)],
         maximum: usize,
     },
-    Replays(&'input [&'input CanonicalEvent]),
+    Replays(&'input [(&'input CanonicalEvent, storage_types::TableHistoryId)]),
     Frame {
         links: &'input [CanonicalEventLink],
+        tables: &'input [(
+            replication_types::identity::resource::TableIdentity,
+            replication_types::identity::resource::TableLineage,
+            storage_types::TableHistoryId,
+        )],
         maximum: usize,
     },
 }
@@ -46,15 +51,41 @@ impl AcceptanceReadSelection<'_> {
             Self::Identities(ids)
             | Self::SourceProof {
                 identities: ids, ..
-            } => ids.get(slot).copied(),
-            Self::Replays(events) => events.get(slot).map(|event| &event.as_ref().id),
+            } => ids.get(slot).map(|(id, _)| *id),
+            Self::Replays(events) => events.get(slot).map(|(event, _)| &event.as_ref().id),
             Self::Frame { links, .. } => links.get(slot).map(|link| &link.event),
         }
         .ok_or_else(corrupt_record)
     }
 
+    fn physical(&self, slot: usize) -> StorageResult<storage_types::TableHistoryId> {
+        match self {
+            Self::Identities(ids)
+            | Self::SourceProof {
+                identities: ids, ..
+            } => ids
+                .get(slot)
+                .map(|(_, physical)| *physical)
+                .ok_or_else(corrupt_record),
+            Self::Replays(events) => events
+                .get(slot)
+                .map(|(_, physical)| *physical)
+                .ok_or_else(corrupt_record),
+            Self::Frame { links, tables, .. } => {
+                let link = links.get(slot).ok_or_else(corrupt_record)?;
+                tables
+                    .iter()
+                    .find(|table| table.0 == link.table && table.1 == link.lineage)
+                    .map(|table| table.2)
+                    .ok_or_else(corrupt_record)
+            }
+        }
+    }
+
     fn require_receipt(&self, slot: usize, receipt: &NativeAcceptanceRecord) -> StorageResult<()> {
-        if &receipt.receipt.event != self.identity(slot)? {
+        if receipt.delivery.physical != self.physical(slot)?
+            || &receipt.receipt.event != self.identity(slot)?
+        {
             return Err(corrupt_record());
         }
         if let Self::Frame { links, .. } = self {
@@ -89,7 +120,7 @@ impl AcceptanceReadSelection<'_> {
         let Self::Replays(events) = self else {
             return Ok(());
         };
-        let event = events.get(slot).ok_or_else(corrupt_record)?;
+        let (event, _) = events.get(slot).ok_or_else(corrupt_record)?;
         journal.require_acceptance_binding(
             (&receipt.receipt, &receipt.delivery),
             (&event.as_ref().id, event),
@@ -111,10 +142,10 @@ impl AcceptanceReadSelection<'_> {
         let Self::Replays(events) = self else {
             return journal.decode_retained_event(row, bytes, codec);
         };
-        let event = events.get(slot).ok_or_else(corrupt_record)?;
+        let (event, history) = events.get(slot).ok_or_else(corrupt_record)?;
         if event.as_ref().bytes.as_ref() != bytes
             || row.revision != storage_types::Revision::INITIAL
-            || row.key != journal.identity_key(EVENT_SUFFIX, &event.as_ref().id)?
+            || row.key != journal.table_identity_key(EVENT_SUFFIX, *history, &event.as_ref().id)?
         {
             return Err(corrupt_record());
         }
@@ -124,15 +155,23 @@ impl AcceptanceReadSelection<'_> {
 
 impl JournalStore {
     pub(crate) async fn select_frame_acceptances<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        links: &[CanonicalEventLink],
+        selected: (
+            &[CanonicalEventLink],
+            &[(
+                replication_types::identity::resource::TableIdentity,
+                replication_types::identity::resource::TableLineage,
+                storage_types::TableHistoryId,
+            )],
+        ),
         input: (&CanonicalJsonCodec, usize),
     ) -> Result<Option<Vec<StoredAcceptance>>, DeliveryError> {
         let selection = AcceptanceReadSelection::Frame {
-            links,
+            links: selected.0,
+            tables: selected.1,
             maximum: input.1,
         };
         let Some(accepted) = self
@@ -154,7 +193,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn load_acceptance_inventory<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -177,12 +216,12 @@ impl JournalStore {
             let AcceptanceInventory {
                 receipts,
                 originals,
-                manifests,
-                maximum,
+                ..
             } = prepared;
-            let bytes = self
-                .load_retained_manifests(attempt, &originals, (manifests, maximum))
-                .await?;
+            let bytes = originals
+                .iter()
+                .map(|row| self.decode_original_bytes(row, codec))
+                .collect::<StorageResult<Vec<_>>>()?;
             if bytes.len() != originals.len() {
                 return Err(corrupt_record().into());
             }
@@ -216,7 +255,7 @@ impl JournalStore {
     }
 
     async fn load_acceptance_metadata<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -238,8 +277,12 @@ impl JournalStore {
         let mut prepared = AcceptanceInventory::try_new(input.0.len())?;
         for slot in 0..input.0.len() {
             let identity = input.0.identity(slot)?;
-            keys.push(self.identity_key(ACCEPTANCE_SUFFIX, identity)?);
-            keys.push(self.identity_key(EVENT_SUFFIX, identity)?);
+            keys.push(self.table_identity_key(
+                ACCEPTANCE_SUFFIX,
+                input.0.physical(slot)?,
+                identity,
+            )?);
+            keys.push(self.table_identity_key(EVENT_SUFFIX, input.0.physical(slot)?, identity)?);
         }
         for wave in self.records.read_waves(&keys, |key| key)? {
             let rows = self
@@ -268,7 +311,6 @@ impl JournalStore {
 struct AcceptanceInventory {
     receipts: Vec<Option<NativeAcceptanceRecord>>,
     originals: Vec<DurableRecord>,
-    manifests: Vec<stream_provider::retained_image::RetainedImageManifest>,
     maximum: usize,
 }
 
@@ -277,7 +319,6 @@ impl AcceptanceInventory {
         let mut prepared = Self {
             receipts: Vec::new(),
             originals: Vec::new(),
-            manifests: Vec::new(),
             maximum: 0,
         };
         prepared
@@ -286,10 +327,6 @@ impl AcceptanceInventory {
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
         prepared
             .originals
-            .try_reserve_exact(count)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        prepared
-            .manifests
             .try_reserve_exact(count)
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
         Ok(prepared)
@@ -320,21 +357,21 @@ impl AcceptanceInventory {
                 }
             }
             (Some(receipt), Some(row)) => {
-                let manifest = journal.decode_retained_manifest(&row, input.1)?;
-                input.0.require_replay_metadata(
-                    journal,
-                    slot / 2,
-                    receipt,
-                    manifest.original_length(),
-                )?;
+                let payload = journal.decode_original_payload(&row, input.1)?;
+                if payload.history != receipt.delivery.physical {
+                    return Err(corrupt_record().into());
+                }
+                let length = payload.original_bytes()?.len();
+                input
+                    .0
+                    .require_replay_metadata(journal, slot / 2, receipt, length)?;
                 self.maximum = self
                     .maximum
-                    .checked_add(manifest.original_length())
+                    .checked_add(length)
                     .ok_or_else(corrupt_record)?;
                 if !input.0.require_original_total(self.maximum)? {
                     return Ok(false);
                 }
-                self.manifests.push(manifest);
                 self.originals.push(row);
             }
             _ => return Err(corrupt_record().into()),

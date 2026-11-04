@@ -1,6 +1,6 @@
 //! Retention keys are independent of live table-name bindings.
 
-use storage_provider::{StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeKind};
+use storage_provider::{StreamTrimDueMarker, StreamTrimScope};
 use storage_types::{StorageError, StorageResult, TimestampMillis, storage_serde};
 
 use crate::{
@@ -19,7 +19,7 @@ pub(super) fn due_key(marker: &StreamTrimDueMarker) -> Vec<u8> {
     let scope = scope_key(&marker.scope);
     let mut key = Vec::with_capacity(1 + 8 + scope.len() + 8);
     key.push(TRIM_DUE_FAMILY);
-    key.extend_from_slice(&ordered_timestamp(*marker.due_bucket));
+    key.extend_from_slice(&ordered_timestamp(*marker.due_at));
     key.extend_from_slice(&scope);
     key.extend_from_slice(&marker.policy_version.to_be_bytes());
     key
@@ -50,10 +50,6 @@ pub(super) fn decode_due_marker(key: &[u8], bytes: &[u8]) -> StorageResult<Strea
 
 fn scope_key(scope: &StreamTrimScope) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + scope.scope_id.len());
-    key.push(match scope.kind {
-        StreamTrimScopeKind::Table => b't',
-        StreamTrimScopeKind::Item => b'i',
-    });
     key.extend_from_slice(scope.scope_id.as_bytes());
     key
 }

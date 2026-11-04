@@ -82,20 +82,12 @@ async fn given_mixed_item_writers_when_targets_overlap_then_increments_and_image
             let matching = records
                 .iter()
                 .filter(|record| {
-                    let image = record.new_image.as_ref().unwrap();
+                    let image = record.item.as_ref().unwrap();
                     image.get("pk") == Some(&AttributeValue::S(key.to_owned()))
                         && image.get("count") == Some(&AttributeValue::N(count.to_string()))
                 })
                 .collect::<Vec<_>>();
             assert_eq!(matching.len(), 1, "one record for {key} increment {count}");
-            if count == 1 {
-                assert!(matching[0].old_image.is_none());
-            } else {
-                assert_eq!(
-                    matching[0].old_image.as_ref().unwrap().get("count"),
-                    Some(&AttributeValue::N((count - 1).to_string()))
-                );
-            }
         }
     }
     store.finish().await;
@@ -145,7 +137,7 @@ async fn given_missing_item_when_ordinary_and_transactional_conditions_race_then
         .await
         .unwrap();
     assert_eq!(records.len(), 1, "failed condition has no stream effects");
-    assert!(records[0].old_image.is_none());
+    assert!(records[0].item.is_some());
     let item = store
         .operations
         .get_item(GetItemRequest::new(

@@ -96,19 +96,16 @@ async fn given_a_recreated_table_when_transact_get_runs_then_only_the_new_incarn
             })
             .await
             .unwrap();
-        let rejected = observe(
+        let recreated = observe(
             store
                 .operations
                 .create_table(super::test_support::hash_table_request(table.clone())),
         )
         .await;
-        rejected.assert_no_warning_or_error();
-        assert!(
-            rejected.result.is_err(),
-            "deleted table name remains reserved"
-        );
-        store.advance_time(std::time::Duration::from_secs(31));
-        store.create_hash_table(table.clone()).await;
+        recreated.assert_no_warning_or_error();
+        recreated
+            .result
+            .expect("a fresh table ID can immediately reuse the name");
         let request = TransactGetItemsRequest::try_from(read.clone()).unwrap();
         let observed = observe(store.operations.transact_get_items(request)).await;
         observed.assert_no_warning_or_error();

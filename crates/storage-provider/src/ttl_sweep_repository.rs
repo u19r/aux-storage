@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use storage_common::{TtlConfigRecord, TtlSweepPageCommand, TtlSweepPageResult, TtlSweepRequest};
+use storage_common::{TtlSweepPageCommand, TtlSweepPageResult, TtlSweepPolicy, TtlSweepRequest};
 use storage_types::{StorageResult, TableName};
 
 use crate::{
@@ -17,7 +17,7 @@ pub trait TtlSweepRepository: Send + Sync {
     async fn read_ttl_sweep_policy(
         &self,
         table_name: &TableName,
-    ) -> StorageResult<Option<TtlConfigRecord>>;
+    ) -> StorageResult<Option<TtlSweepPolicy>>;
 
     async fn execute_ttl_sweep_page(
         &self,
@@ -27,21 +27,7 @@ pub trait TtlSweepRepository: Send + Sync {
     async fn execute_ttl_sweep_request(
         &self,
         request: TtlSweepRequest,
-    ) -> StorageResult<TtlSweepPageResult> {
-        let policy = self
-            .read_ttl_sweep_policy(&request.table_name)
-            .await?
-            .ok_or_else(|| {
-                storage_types::StorageError::validation("ttl sweep requires an enabled ttl policy")
-            })?;
-        let command = TtlSweepPageCommand::try_new(
-            request.table_name,
-            request.input,
-            policy.policy_generation,
-            storage_types::TimestampMillis::now(),
-        )?;
-        self.execute_ttl_sweep_page(command).await
-    }
+    ) -> StorageResult<TtlSweepPageResult>;
 }
 
 #[async_trait]
@@ -51,13 +37,18 @@ where for<'native> P::Attempt<'native>: ExpirationPort
     async fn read_ttl_sweep_policy(
         &self,
         table_name: &TableName,
-    ) -> StorageResult<Option<TtlConfigRecord>> {
+    ) -> StorageResult<Option<TtlSweepPolicy>> {
         let table_name = table_name.clone();
         self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
-                read_direct_expiration_policy_in_attempt(attempt, &table_name)
+                read_direct_expiration_policy_in_attempt(attempt, &table_name, &Default::default())
                     .await
-                    .map(|policy| policy.map(|(config, _)| config))
+                    .map(|policy| {
+                        policy.map(|(config, table)| TtlSweepPolicy {
+                            target: table.as_ref().into(),
+                            config,
+                        })
+                    })
             })
         })
         .await
@@ -71,7 +62,7 @@ where for<'native> P::Attempt<'native>: ExpirationPort
             let command = command.clone();
             self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
                 Box::pin(async move {
-                    ExpirationAttempt::new(attempt)
+                    ExpirationAttempt::new(attempt, Default::default())
                         .execute_direct_expiration(&command)
                         .await
                 })
@@ -84,11 +75,13 @@ where for<'native> P::Attempt<'native>: ExpirationPort
         &self,
         request: TtlSweepRequest,
     ) -> StorageResult<TtlSweepPageResult> {
+        let bindings = crate::RequestTableBindings::default();
         storage_common::retry::retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
             let request = request.clone();
+            let bindings = bindings.clone();
             self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
                 Box::pin(async move {
-                    ExpirationAttempt::new(attempt)
+                    ExpirationAttempt::new(attempt, bindings)
                         .execute_direct_request(&request)
                         .await
                 })

@@ -1,4 +1,5 @@
 mod capture;
+mod reclaim;
 mod record;
 mod recovery;
 mod scope;

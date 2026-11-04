@@ -3,14 +3,14 @@ use std::sync::Arc;
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
 use regional_replication::runtime::BoundRegionalServices;
 use storage_provider::{
-    DynamoPort, StreamRetentionRepository, SystemStreamTrimRepository, TableReclaimRepository,
+    DynamoPort, StorageStreamOperations, StreamRetentionRepository, SystemStreamTrimRepository,
+    TableReclaimRepository,
     maintenance::{
         ExpirationRepository, GsiBuildRepository, GsiLifecycleRepository,
         PartitionReconciliationSource,
     },
 };
 use storage_types::{StorageError, StorageResult};
-use stream_provider::StreamOperations;
 
 use super::StorageProviderBundle;
 
@@ -28,7 +28,7 @@ impl StorageProviderBundle {
             + queue_provider::QueuePort
             + infrastructure_provider::physical_store::PhysicalRecordStore
             + bg_job_store::ScheduledJobStoreSource
-            + StreamOperations
+            + StorageStreamOperations
             + stream_provider::StreamPort
             + queue_provider::QueueOperations
             + queue_provider::QueueMessageCleanupRepository
@@ -47,7 +47,7 @@ impl StorageProviderBundle {
             PhysicalRecordAttempt
                 + storage_provider::maintenance::ExpirationPort
                 + storage_provider::maintenance::GsiPort
-                + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>
+                + storage_provider::TableUpdateTransaction
                 + storage_provider::PrimaryStateScanAttempt
                 + storage_provider::ItemTombstoneScanAttempt
                 + storage_provider::GsiProjectionScanAttempt
@@ -56,7 +56,7 @@ impl StorageProviderBundle {
                 + storage_provider::maintenance::StreamRetentionPort
                 + storage_provider::TableReclaimAttempt,
         for<'native> <S as stream_provider::StreamPort>::Attempt<'native>:
-            stream_provider::retained_image::RetainedOwnershipAttempt
+            infrastructure_provider::physical_attempt::PhysicalRecordAttempt
                 + storage_provider::CatalogAttempt,
     {
         let runtime =
@@ -79,7 +79,7 @@ impl StorageProviderBundle {
             + DynamoPort
             + queue_provider::QueuePort
             + bg_job_store::ScheduledJobStoreSource
-            + StreamOperations
+            + StorageStreamOperations
             + stream_provider::StreamPort
             + queue_provider::QueueOperations
             + queue_provider::QueueMessageCleanupRepository
@@ -98,7 +98,7 @@ impl StorageProviderBundle {
             PhysicalRecordAttempt
                 + storage_provider::maintenance::ExpirationPort
                 + storage_provider::maintenance::GsiPort
-                + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>
+                + storage_provider::TableUpdateTransaction
                 + storage_provider::PrimaryStateScanAttempt
                 + storage_provider::ItemTombstoneScanAttempt
                 + storage_provider::GsiProjectionScanAttempt
@@ -107,7 +107,7 @@ impl StorageProviderBundle {
                 + storage_provider::maintenance::StreamRetentionPort
                 + storage_provider::TableReclaimAttempt,
         for<'native> <S as stream_provider::StreamPort>::Attempt<'native>:
-            stream_provider::retained_image::RetainedOwnershipAttempt
+            infrastructure_provider::physical_attempt::PhysicalRecordAttempt
                 + storage_provider::CatalogAttempt,
     {
         let runtime = services.runtime();

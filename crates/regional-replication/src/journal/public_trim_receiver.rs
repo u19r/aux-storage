@@ -19,7 +19,7 @@ use crate::{
 
 impl JournalStore {
     pub(in crate::journal) async fn scan_public_trim_receiver<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -47,13 +47,22 @@ impl JournalStore {
                 );
             }
             let position = receiver.after.checked_next()?;
-            let (pointer, event) = self
+            let original = self
                 .load_receiver_original(
                     attempt,
                     (&receiver.receiver, position),
                     (encoding.1, ReadProtection::Snapshot),
                 )
                 .await?;
+            let Some((pointer, event)) = original else {
+                scan.vector = self.records.content_digest(&(scan.vector, position))?;
+                receiver.after = position;
+                return self.resume_public_trim_receiver(
+                    scan,
+                    receiver,
+                    TrimOriginalRetention::Disjoint,
+                );
+            };
             let retention = self
                 .classify_public_trim_original(attempt, proposal, &event, encoding)
                 .await?;

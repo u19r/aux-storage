@@ -41,8 +41,14 @@ impl JournalStore {
         let attempt = settlement_guard.as_mut();
         let result = async {
             scope.validate()?;
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 SOURCE_TRANSFER_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let rows = self
@@ -70,8 +76,14 @@ impl JournalStore {
         let attempt = settlement_guard.as_mut();
         let result = async {
             scope.validate()?;
-            let key = self.identity_key(
+            let key = self.table_identity_key(
                 SOURCE_TRANSFER_SUFFIX,
+                scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 &(scope.proposal.operation().id, &scope.destination.region),
             )?;
             let rows = self

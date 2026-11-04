@@ -100,31 +100,15 @@ pub trait StorageApiManager: Send + Sync {
         request: SystemStreamTrimPageRequest,
     ) -> Result<SystemStreamTrimPageResult, HttpApiError>;
     async fn list_streams(&self, request: ListStreamsRequest) -> Result<Response, HttpApiError>;
-    async fn latest_table_stream_pointer(
-        &self,
-        table_name: storage_types::TableName,
-    ) -> Result<Option<storage_types::StreamItemId>, HttpApiError>;
     async fn describe_stream(
         &self,
         request: DescribeStreamRequest,
-    ) -> Result<Response, HttpApiError> {
-        crate::dynamodb_streams::DynamoStreamReader { manager: self }
-            .describe_stream(request)
-            .await
-    }
+    ) -> Result<Response, HttpApiError>;
     async fn get_shard_iterator(
         &self,
         request: GetShardIteratorRequest,
-    ) -> Result<Response, HttpApiError> {
-        crate::dynamodb_streams::DynamoStreamReader { manager: self }
-            .get_shard_iterator(request)
-            .await
-    }
-    async fn get_records(&self, request: GetRecordsRequest) -> Result<Response, HttpApiError> {
-        crate::dynamodb_streams::DynamoStreamReader { manager: self }
-            .get_records(request)
-            .await
-    }
+    ) -> Result<Response, HttpApiError>;
+    async fn get_records(&self, request: GetRecordsRequest) -> Result<Response, HttpApiError>;
     async fn clear_all_tables(&self, payload: serde_json::Value) -> Result<Response, HttpApiError>;
     async fn append_table_stream_record(
         &self,
@@ -414,15 +398,37 @@ impl StorageApiManager for StorageApiManagerImpl {
             .map_err(Into::into)
     }
 
-    async fn latest_table_stream_pointer(
+    async fn describe_stream(
         &self,
-        table_name: storage_types::TableName,
-    ) -> Result<Option<storage_types::StreamItemId>, HttpApiError> {
+        request: DescribeStreamRequest,
+    ) -> Result<Response, HttpApiError> {
         self.db
             .run_dynamo_admitted("default", AdmissionClass::RangeRead, |dynamo| async move {
-                dynamo.latest_table_stream_pointer(table_name).await
+                dynamo.describe_stream(request).await
             })
             .await
+            .map(Response::DescribeStream)
+            .map_err(Into::into)
+    }
+    async fn get_shard_iterator(
+        &self,
+        request: GetShardIteratorRequest,
+    ) -> Result<Response, HttpApiError> {
+        self.db
+            .run_dynamo_admitted("default", AdmissionClass::RangeRead, |dynamo| async move {
+                dynamo.get_shard_iterator(request).await
+            })
+            .await
+            .map(Response::GetShardIterator)
+            .map_err(Into::into)
+    }
+    async fn get_records(&self, request: GetRecordsRequest) -> Result<Response, HttpApiError> {
+        self.db
+            .run_dynamo_admitted("default", AdmissionClass::RangeRead, |dynamo| async move {
+                dynamo.get_records(request).await
+            })
+            .await
+            .map(Response::GetRecords)
             .map_err(Into::into)
     }
 

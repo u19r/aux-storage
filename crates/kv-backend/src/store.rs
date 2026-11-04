@@ -33,8 +33,17 @@ impl<B> Clone for KvStore<B> {
 impl<B: KvBackend> KvStore<B> {
     /// Publish a store only after every current KV format is atomically ready.
     pub async fn initialize_format(backend: B) -> StorageResult<Self> {
+        Self::initialize_format_with_clock(backend, Arc::new(SystemClock)).await
+    }
+
+    /// Initialization and published operations share the selected time owner.
+    /// Native simulation supplies its executor-compatible retry clock here.
+    pub async fn initialize_format_with_clock(
+        backend: B,
+        clock: Arc<dyn Clock>,
+    ) -> StorageResult<Self> {
         storage_common::retry::retry_native_conflicts(
-            &SystemClock,
+            clock.as_ref(),
             storage_provider::DYNAMO_WRITE_RETRY,
             || {
                 backend.with_attempt(AttemptMode::ReadWrite, |attempt| {
@@ -51,7 +60,7 @@ impl<B: KvBackend> KvStore<B> {
         Ok(Self {
             backend: Arc::new(backend),
             metadata_cache: Arc::new(TableMetadataCache::new()),
-            clock: Arc::new(SystemClock),
+            clock,
         })
     }
 
@@ -115,10 +124,6 @@ impl<B: KvBackend + 'static> DynamoPort for KvStore<B> {
                 let mut attempt = KvCatalogAttempt::new(native, mode.read_protection())
                     .with_metadata_cache(cache);
                 let result = operation(&mut attempt).await?;
-                stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                    &mut attempt,
-                )
-                .await?;
                 Ok(result)
             })
         })
@@ -141,11 +146,11 @@ impl<B: KvBackend + 'static> DynamoPort for KvStore<B> {
             self.backend
                 .with_versionstamped_attempt(move |native| {
                     Box::pin(async move {
-                        let mut attempt = KvCatalogAttempt::new(native, storage_types::ReadProtection::Conflict)
-                            .with_metadata_cache(cache);
+                        let mut attempt =
+                            KvCatalogAttempt::new(native, storage_types::ReadProtection::Conflict)
+                                .with_metadata_cache(cache);
                         let result = operation(&mut attempt).await?;
-                    stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(&mut attempt).await?;
-                    Ok(result)
+                        Ok(result)
                     })
                 })
                 .await
@@ -160,6 +165,7 @@ impl<B: KvBackend + 'static> DynamoPort for KvStore<B> {
         &self,
         request: UpdateTableRequest,
         captured_at: TimestampMillis,
+        bindings: storage_provider::RequestTableBindings,
     ) -> StorageResult<UpdateTableResponse> {
         self.backend
             .with_attempt(AttemptMode::ReadWrite, move |native| {
@@ -167,13 +173,9 @@ impl<B: KvBackend + 'static> DynamoPort for KvStore<B> {
                     let mut attempt =
                         KvCatalogAttempt::new(native, storage_types::ReadProtection::Conflict);
                     let (_, response) = attempt
-                        .execute_table_update(&request, captured_at)
+                        .execute_table_update(&request, captured_at, &bindings)
                         .await?
                         .into_result()?;
-                    stream_provider::retained_image::RetainedOwnershipAttempt::finalize_ownership(
-                        &mut attempt,
-                    )
-                    .await?;
                     Ok(response)
                 })
             })

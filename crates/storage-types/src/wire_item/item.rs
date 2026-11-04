@@ -890,9 +890,9 @@ impl WireItem {
             Some(hash.as_bytes()),
             range.map(str::as_bytes),
         ]));
-        ItemKey::add_length_prefixed_part(&mut parts, hash.as_bytes());
+        ItemKey::append_length_prefixed_key(&mut parts, hash.as_bytes())?;
         if let Some(range) = range {
-            ItemKey::add_length_prefixed_part(&mut parts, range.as_bytes());
+            ItemKey::append_length_prefixed_key(&mut parts, range.as_bytes())?;
         }
 
         Ok(Some((ttl, URL_SAFE.encode(&parts))))

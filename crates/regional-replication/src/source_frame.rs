@@ -25,10 +25,13 @@ pub struct SourceFrameRequest {
     pub origin: OriginId,
     pub range: ClosedSourceInterval,
     pub membership: MembershipRevision,
-    pub tables: Vec<(TableIdentity, TableLineage)>,
+    /// Publishing table and lineage plus the serving database's physical copy.
+    pub tables: Vec<(TableIdentity, TableLineage, storage_types::TableHistoryId)>,
 }
 
-pub async fn load_source_frame<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+pub async fn load_source_frame<
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+>(
     journal: &JournalStore,
     attempt: &mut A,
     input: (&SourceFrameRequest, &WorkLimits),
@@ -48,7 +51,7 @@ pub async fn load_source_frame<A: stream_provider::retained_image::RetainedOwner
 /// An oversized candidate is a successful selection decision before hydration.
 /// Native or identity failures still reject this complete attempt.
 pub(crate) async fn select_source_frame<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,
@@ -85,7 +88,11 @@ pub(crate) async fn select_source_frame<
             return Ok(None);
         };
         let Some(accepted) = journal
-            .select_frame_acceptances(attempt, &manifest.links, (codec, remaining))
+            .select_frame_acceptances(
+                attempt,
+                (&manifest.links, &request.tables),
+                (codec, remaining),
+            )
             .await?
         else {
             return Ok(None);
@@ -157,7 +164,10 @@ impl SourceManifestSelection {
     pub(crate) fn append_local_position(
         &mut self,
         position: crate::journal::SealedSourcePosition,
-        input: (&[(TableIdentity, TableLineage)], &CanonicalJsonCodec),
+        input: (
+            &[(TableIdentity, TableLineage, storage_types::TableHistoryId)],
+            &CanonicalJsonCodec,
+        ),
     ) -> Result<bool, DeliveryError> {
         let (tables, codec) = input;
         let empty = position.source.events.is_empty();
@@ -165,7 +175,11 @@ impl SourceManifestSelection {
             .source
             .events
             .into_iter()
-            .filter(|link| tables.binary_search(&(link.table, link.lineage)).is_ok())
+            .filter(|link| {
+                tables
+                    .binary_search_by(|table| (table.0, table.1).cmp(&(link.table, link.lineage)))
+                    .is_ok()
+            })
             .collect::<Vec<_>>();
         let coverage = if links.is_empty() {
             PositionCoverage::Excluded {
@@ -195,7 +209,13 @@ fn is_selection_bounded(
     request: &SourceFrameRequest,
     limits: &WorkLimits,
 ) -> Result<bool, DeliveryError> {
-    if request.tables.is_empty() || request.tables.windows(2).any(|w| w[0].0 >= w[1].0) {
+    if request.tables.is_empty()
+        || request
+            .tables
+            .iter()
+            .any(|table| table.2.as_ref() == &[0; 16])
+        || request.tables.windows(2).any(|w| w[0].0 >= w[1].0)
+    {
         return Err(ReplicationProtocolError::InvalidScope {
             context: "source frame table selection",
         }

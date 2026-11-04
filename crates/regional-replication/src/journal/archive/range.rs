@@ -64,18 +64,6 @@ impl JournalStore {
             }
             // The whole selected prefix is admitted before any archive object
             // I/O.
-            let archived_publications = selected
-                .iter()
-                .filter_map(|candidate| match candidate {
-                    ArchiveRecordCandidate::Archived(pointer)
-                        if crate::archive::ArchiveKind::from_key(&pointer.key)
-                            .is_some_and(crate::archive::ArchiveKind::has_publication_coverage) =>
-                    {
-                        Some(pointer.key.clone())
-                    }
-                    _ => None,
-                })
-                .collect::<std::collections::BTreeSet<_>>();
             let results =
                 futures::future::join_all(selected.into_iter().map(|candidate| async move {
                     match candidate {
@@ -87,13 +75,6 @@ impl JournalStore {
                 }))
                 .await;
             let records = results.into_iter().collect::<StorageResult<Vec<_>>>()?;
-            for record in records
-                .iter()
-                .filter(|record| archived_publications.contains(&record.key))
-            {
-                self.require_archive_publication_coverage(attempt, record, request.protection)
-                    .await?;
-            }
             RecordPage::try_new(
                 records.into_iter().map(Ok),
                 more,

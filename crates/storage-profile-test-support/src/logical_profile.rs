@@ -76,7 +76,6 @@ pub fn logical_profile_batches(
                         item: storage_types::WireItem::try_from(&logical_profile_item(index))
                             .expect("generated logical profile item must encode"),
                         indexers: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 })

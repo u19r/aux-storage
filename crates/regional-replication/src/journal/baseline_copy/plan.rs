@@ -26,7 +26,7 @@ pub(crate) struct PlannedBaselineCopy {
 
 impl JournalStore {
     pub(crate) async fn plan_baseline_copy<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + storage_provider::CatalogAttempt,
     >(
         &self,
@@ -58,7 +58,16 @@ impl JournalStore {
             let page = self
                 .load_baseline_page(
                     attempt,
-                    (scope.proposal.operation().lineage, before.after.clone()),
+                    (
+                        scope
+                            .proposal
+                            .participant(&self.region)
+                            .map_err(|_| corrupt_record())?
+                            .proposed
+                            .physical,
+                        scope.proposal.operation().lineage,
+                        before.after.clone(),
+                    ),
                     (input.0, budget),
                 )
                 .await?;

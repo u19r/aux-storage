@@ -28,6 +28,19 @@ impl IndexerDeclaration {
         Ok(())
     }
 
+    pub fn require_values(&self, item: &crate::WireItem) -> StorageResult<()> {
+        let fields = self.names().iter().map(String::as_str).collect::<Vec<_>>();
+        if item
+            .select_attribute_values(&fields)?
+            .into_iter()
+            .flatten()
+            .any(|value| !matches!(value, crate::AttributeValue::S(value) if !value.is_empty()))
+        {
+            return Err(StorageError::internal("Invalid stored indexer value"));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn names(&self) -> &[String] {
         &self.0

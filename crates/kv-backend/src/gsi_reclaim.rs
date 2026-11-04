@@ -9,9 +9,7 @@ use storage_types::{
 use crate::{
     KvAttempt,
     catalog::{KvCatalogAttempt, decode_index_incarnation, metadata_key, table_id_from_history},
-    constants::{
-        GSI_AUTHORITY_FAMILY, GSI_BRANCH_FAMILY, GSI_PROJECTION_FAMILY, GSI_TOMBSTONE_FAMILY,
-    },
+    constants::{GSI_PROJECTION_FAMILY, GSI_TOMBSTONE_FAMILY},
 };
 
 impl<A: KvAttempt> GsiReclaimAttempt for KvCatalogAttempt<'_, A> {
@@ -45,18 +43,13 @@ impl<A: KvAttempt> GsiReclaimAttempt for KvCatalogAttempt<'_, A> {
                 "KV retired index scope differs from table history",
             ));
         }
-        let prefixes = [
-            GSI_PROJECTION_FAMILY,
-            GSI_AUTHORITY_FAMILY,
-            GSI_BRANCH_FAMILY,
-            GSI_TOMBSTONE_FAMILY,
-        ]
-        .map(|family| {
-            let mut prefix = vec![family];
-            prefix.extend_from_slice(scope);
-            prefix
-        })
-        .to_vec();
+        let prefixes = [GSI_PROJECTION_FAMILY, GSI_TOMBSTONE_FAMILY]
+            .map(|family| {
+                let mut prefix = vec![family];
+                prefix.extend_from_slice(scope);
+                prefix
+            })
+            .to_vec();
         crate::table_reclaim::delete_family_pages(self.attempt, prefixes).await
     }
 }

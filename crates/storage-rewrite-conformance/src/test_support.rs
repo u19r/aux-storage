@@ -12,8 +12,8 @@ use std::{
 use bg_job_store::ScheduledJobStoreSource as _;
 use queue_provider::QueueOperations;
 use storage_provider::{
-    DynamoOperations, StreamRetentionRepository, SystemStreamTrimRepository,
-    TableReclaimRepository,
+    DynamoOperations, StorageStreamOperations, StreamRetentionRepository,
+    SystemStreamTrimRepository, TableReclaimRepository,
     maintenance::{ExpirationRepository, GsiBuildRepository},
 };
 use storage_types::{
@@ -21,7 +21,6 @@ use storage_types::{
     KeySchemaElement, KeyType, StorageError, TableName, TimestampMillis,
     context::WrappedError as _,
 };
-use stream_provider::StreamOperations;
 
 struct TestClock {
     millis: AtomicI64,
@@ -160,10 +159,12 @@ fn isolated_postgres_dsn(dsn: &str, schema: &str) -> String {
 pub(crate) struct TestStore {
     pub(crate) operations: Arc<dyn DynamoOperations>,
     pub(crate) scheduled_job_store: bg_job_store::ScheduledJobStore,
+    pub(crate) stream_initialization_repository:
+        Arc<dyn storage_provider::TableStreamInitializationRepository>,
     pub(crate) gsi_build_repository: Arc<dyn GsiBuildRepository>,
     pub(crate) expiration_repository: Arc<dyn ExpirationRepository>,
     pub(crate) ttl_sweep_repository: Arc<dyn storage_provider::TtlSweepRepository>,
-    pub(crate) stream_operations: Arc<dyn StreamOperations>,
+    pub(crate) stream_operations: Arc<dyn StorageStreamOperations>,
     pub(crate) queue_operations: Arc<dyn QueueOperations>,
     pub(crate) pubsub_provider: Arc<dyn pubsub_provider::PubsubProvider>,
     pub(crate) stream_retention_repository: Arc<dyn StreamRetentionRepository>,
@@ -242,6 +243,44 @@ impl TestStore {
         .await
     }
 
+    #[cfg(feature = "foundationdb")]
+    pub(crate) fn foundationdb_process_scope(&self) -> (String, String) {
+        match &self.location {
+            DatabaseLocation::FoundationDb {
+                cluster_file,
+                prefix,
+            } => (cluster_file.clone(), prefix.clone()),
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "turso",
+                feature = "postgres",
+                feature = "rocksdb"
+            ))]
+            _ => panic!("process proof requires a FoundationDB fixture"),
+        }
+    }
+
+    #[cfg(feature = "foundationdb")]
+    pub(crate) async fn open_foundationdb_process_scope(
+        cluster_file: String,
+        prefix: String,
+        probe: Arc<dyn kv_backend::KvFaultProbe>,
+    ) -> Self {
+        Self::open_location(
+            DatabaseLocation::FoundationDb {
+                cluster_file,
+                prefix,
+            },
+            None,
+            Arc::new(TestClock::new()),
+            FaultProbes {
+                kv: Some(probe),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     #[cfg(feature = "postgres")]
     pub(crate) fn postgres_dsn(&self) -> String {
         match &self.location {
@@ -265,10 +304,11 @@ impl TestStore {
     ) -> Self
     where
         S: DynamoOperations
+            + storage_provider::TableStreamInitializationRepository
             + GsiBuildRepository
             + ExpirationRepository
             + storage_provider::TtlSweepRepository
-            + StreamOperations
+            + StorageStreamOperations
             + StreamRetentionRepository
             + SystemStreamTrimRepository
             + TableReclaimRepository
@@ -280,6 +320,7 @@ impl TestStore {
         Self {
             operations: store.clone(),
             scheduled_job_store,
+            stream_initialization_repository: store.clone(),
             gsi_build_repository: store.clone(),
             expiration_repository: store.clone(),
             ttl_sweep_repository: store.clone(),
@@ -405,6 +446,7 @@ impl TestStore {
         let Self {
             operations,
             scheduled_job_store,
+            stream_initialization_repository,
             gsi_build_repository,
             expiration_repository,
             ttl_sweep_repository,
@@ -420,6 +462,7 @@ impl TestStore {
         } = self;
         drop(operations);
         drop(scheduled_job_store);
+        drop(stream_initialization_repository);
         drop(gsi_build_repository);
         drop(expiration_repository);
         drop(ttl_sweep_repository);

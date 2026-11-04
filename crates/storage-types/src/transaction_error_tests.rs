@@ -221,7 +221,6 @@ fn number_table_info() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

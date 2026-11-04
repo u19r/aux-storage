@@ -23,7 +23,7 @@ use crate::{
 
 impl JournalStore {
     pub(in crate::journal) async fn advance_reenable_inventory<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -126,7 +126,7 @@ impl JournalStore {
     }
 
     async fn select_inventory_lineage<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -197,7 +197,9 @@ impl JournalStore {
         Ok(())
     }
 
-    async fn capture_survivor_cut<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn capture_survivor_cut<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         root: &mut InventoryRecord,
@@ -271,7 +273,9 @@ impl JournalStore {
         Ok(())
     }
 
-    async fn capture_retired_cut<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn capture_retired_cut<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         root: &mut InventoryRecord,
@@ -346,7 +350,9 @@ impl JournalStore {
         })
     }
 
-    async fn store_inventory_cut<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn store_inventory_cut<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         root: &mut InventoryRecord,
@@ -379,7 +385,7 @@ impl JournalStore {
         let terminal_manifest = self
             .load_history_terminal_manifest(
                 attempt,
-                (&selection, through),
+                (state.physical, &selection, through),
                 (encoding.1, encoding.0),
             )
             .await?;

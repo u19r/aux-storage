@@ -39,7 +39,7 @@ pub(super) struct TrimOperationObservation {
 
 impl JournalStore {
     pub(crate) async fn execute_trim_operation<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -68,7 +68,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn execute_public_trim<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -288,7 +288,7 @@ impl JournalStore {
     }
 
     async fn advance_public_trim_operation<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -356,7 +356,7 @@ impl JournalStore {
     }
 
     async fn prepare_public_trim<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -405,7 +405,7 @@ impl JournalStore {
     }
 
     pub(super) async fn require_public_trim_scope<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,

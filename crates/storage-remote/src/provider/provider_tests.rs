@@ -351,7 +351,6 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
             )]))
             .expect("valid item"),
             indexers: None,
-            aux_item_stream_ttl_hours: None,
         }),
         delete_request: None,
     });
@@ -360,7 +359,6 @@ fn write_cost_tally_tracks_batch_puts_and_deletes() {
         delete_request: Some(storage_types::DeleteRequest {
             key: HashMap::from([("pk".to_string(), AttributeValue::S("tenant#2".to_string()))])
                 .into(),
-            aux_item_stream_ttl_hours: None,
         }),
     });
 
@@ -386,7 +384,6 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         update: Some(storage_types::TransactUpdateRequest {
             table_name: TableName::new("tenant_t1"),
@@ -402,7 +399,6 @@ fn write_cost_tally_tracks_transact_item_kinds() {
                 HashMap::from([(":v".to_string(), AttributeValue::S("next".to_string()))]).into(),
             ),
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         delete: Some(storage_types::TransactDeleteRequest {
             table_name: TableName::new("tenant_t1"),
@@ -412,7 +408,6 @@ fn write_cost_tally_tracks_transact_item_kinds() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         condition_check: Some(storage_types::TransactConditionCheckRequest {
             table_name: TableName::new("tenant_t1"),

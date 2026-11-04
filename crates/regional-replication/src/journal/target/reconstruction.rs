@@ -10,7 +10,7 @@ use crate::{
 
 impl JournalStore {
     pub(super) async fn advance_target_reconstruction<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -39,7 +39,11 @@ impl JournalStore {
                     let page = self
                         .load_baseline_page(
                             attempt,
-                            (root.state.configuration.lineage, after.clone()),
+                            (
+                                root.state.physical,
+                                root.state.configuration.lineage,
+                                after.clone(),
+                            ),
                             (codec, budget),
                         )
                         .await?;
@@ -52,7 +56,7 @@ impl JournalStore {
                         let authority = WinnerAuthority::Baseline(Box::new(baseline));
                         self.fold_expected_winner(
                             attempt,
-                            root.request.operation.id,
+                            (root.state.physical, root.request.operation.id),
                             (authority.key()?, authority.provenance()?),
                         )
                         .await?;
@@ -75,7 +79,11 @@ impl JournalStore {
                         self.require_reconstruction_link(attempt, root, &retained)
                             .await?;
                         let accepted = self
-                            .load_acceptance(attempt, &retained.link.event, codec)
+                            .load_acceptance(
+                                attempt,
+                                (root.state.physical, &retained.link.event),
+                                codec,
+                            )
                             .await?
                             .ok_or_else(corrupt_record)?;
                         if accepted.receipt.digest != retained.link.digest {
@@ -92,7 +100,7 @@ impl JournalStore {
                         if let Some(authority) = WinnerAuthority::from_event(accepted.event) {
                             self.fold_expected_winner(
                                 attempt,
-                                root.request.operation.id,
+                                (root.state.physical, root.request.operation.id),
                                 (authority.key()?, authority.provenance()?),
                             )
                             .await?;

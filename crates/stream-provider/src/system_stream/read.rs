@@ -7,8 +7,8 @@ use storage_types::{
 };
 
 use super::{
-    SystemStreamCheckpointIssue, SystemStreamCheckpointLookup, SystemStreamHistoryObservation,
-    SystemStreamHistoryPage, SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamPagePlan,
+    SystemStreamCheckpointIssue, SystemStreamCheckpointIssueInput, SystemStreamCheckpointLookup,
+    SystemStreamHistoryPage, SystemStreamIssuedCheckpoint, SystemStreamPage,
     SystemStreamPageRequest, page_preparation::PreparedSystemStreamPage,
 };
 use crate::{
@@ -25,8 +25,8 @@ pub(crate) async fn get_system_stream_page<P: StreamPort>(
     port: &P,
     request: SystemStreamPageRequest,
 ) -> StreamResult<SystemStreamPage> {
-    let prepared =
-        PreparedSystemStreamPage::prepare(request).map_err(StreamError::from_storage_error)?;
+    let prepared = PreparedSystemStreamPage::prepare(request, port.now())
+        .map_err(StreamError::from_storage_error)?;
     retry_native_conflicts(port, STREAM_WRITE_RETRY, || {
         let prepared = prepared.clone();
         port.with_stream_attempt(AttemptMode::ReadWrite, move |attempt| {
@@ -53,7 +53,7 @@ async fn read_page_in_attempt<A: StreamAttempt>(
     history
         .validate_scope(request.source_scope())
         .map_err(contract_error)?;
-    let input = match request.checkpoint() {
+    let (input, initial_visibility_cutoff) = match request.checkpoint() {
         Some(token) => {
             let receipt = receipt
                 .ok_or(SystemStreamContractError::UnknownCheckpoint)
@@ -69,121 +69,91 @@ async fn read_page_in_attempt<A: StreamAttempt>(
             checkpoint
                 .validate_scope(&receipt.scope)
                 .map_err(contract_error)?;
-            checkpoint
+            (checkpoint, receipt.initial_visibility_cutoff)
         }
-        None => history.initial_checkpoint().map_err(contract_error)?,
+        None => {
+            let origins = history.retirement_origins().map_err(contract_error)?;
+            let retired = attempt.load_system_retired_frontiers(&origins).await?;
+            if retired.len() != origins.len() {
+                return Err(StorageError::internal("Source retirement count differs"));
+            }
+            let checkpoint = history
+                .retained_checkpoint(&retired.into_iter().flatten().collect::<Vec<_>>())
+                .map_err(contract_error)?;
+            (
+                checkpoint,
+                prepared.issued_at - crate::constants::SYSTEM_HISTORY_WINDOW_MILLIS,
+            )
+        }
     };
     let high = history.capture_high().map_err(contract_error)?;
     let plan = history
         .plan_page(&input, &high, request.limit())
         .map_err(contract_error)?;
-    let (candidates, verified) = read_verified_records(attempt, &plan).await?;
-    let page = SystemStreamPagePlan::try_new(
-        plan.expanded_checkpoint(),
-        candidates,
-        verified != high,
-        request.limit(),
-    )?;
-    let next = if page.has_more {
-        SystemStreamCheckpoint::try_new(request.source_scope().clone(), page.next_frontier)
-            .map_err(contract_error)?
-    } else {
-        verified
-    };
-    let token = issue_checkpoint(attempt, &prepared, &input, &next).await?;
-    let issued = SystemStreamIssuedCheckpoint::new(token, next).map_err(contract_error)?;
-    SystemStreamPage::new(
-        request.source_scope().clone(),
-        page.records,
-        issued,
-        !page.has_more,
+    let (records, next) =
+        read_verified_records(attempt, &plan, &prepared, initial_visibility_cutoff)
+            .await
+            .inspect_err(|error| {
+                if matches!(error.as_ref(), StorageEnum::HistoryUnavailable) {
+                    tracing::error!(
+                        error_code = "HistoryUnavailable",
+                        diagnostic =
+                            "required history references or source progress are unavailable",
+                        failure_site = "system_stream.read.references",
+                        message = "required logical history could not be verified"
+                    );
+                }
+            })?;
+    let has_more = next != high;
+    let token = issue_checkpoint(
+        attempt,
+        &prepared,
+        (&input, initial_visibility_cutoff),
+        &next,
     )
-    .map_err(contract_error)
+    .await?;
+    let issued = SystemStreamIssuedCheckpoint::new(token, next).map_err(contract_error)?;
+    SystemStreamPage::new(request.source_scope().clone(), records, issued, !has_more)
+        .map_err(contract_error)
 }
 
 async fn read_verified_records<A: StreamAttempt>(
     attempt: &mut A,
     plan: &SystemStreamHistoryPage,
+    prepared: &PreparedSystemStreamPage,
+    initial_visibility_cutoff: storage_types::TimestampMillis,
 ) -> StorageResult<(Vec<StreamRecord>, SystemStreamCheckpoint)> {
-    let mut records = Vec::new();
-    let mut observations = Vec::new();
-    let mut more = Vec::new();
-    let mut encoded_bytes = 0usize;
-    'pages: for reads in plan.as_ref().chunks(SYSTEM_STREAM_HISTORY_READ_BATCH) {
+    let mut assembly =
+        super::snapshot_page::SystemSnapshotPage::new(plan, prepared, initial_visibility_cutoff);
+    for reads in plan.as_ref().chunks(SYSTEM_STREAM_HISTORY_READ_BATCH) {
         let pages = attempt.read_system_history_pages(reads).await?;
-        if pages.len() != reads.len() {
-            return Err(history_unavailable(
-                "backend returned a different number of history pages than requested",
-                "system_stream.read.page_count",
-            ));
-        }
-        for (read, result) in reads.iter().zip(pages) {
-            let crate::SystemStreamHistoryReadPage {
-                retired_through,
-                records: page_records,
-                observations: page_observations,
-                pointers: _,
-                more: page_more,
-            } = result;
-            if page_records.len() != page_observations.len() {
-                return Err(history_unavailable(
-                    "history records and pointer observations have different lengths",
-                    "system_stream.read.observation_count",
-                ));
-            }
-            let short = page_observations.len() < read.limit as usize;
-            for (record, observation) in page_records.into_iter().zip(&page_observations) {
-                if record.position != observation.position {
-                    return Err(history_unavailable(
-                        "history record position differs from its pointer observation",
-                        "system_stream.read.observation_position",
-                    ));
-                }
-                let record = record.into_stream_record()?;
-                encoded_bytes = encoded_bytes.saturating_add(serde_json::to_vec(&record)?.len());
-                records.push(record);
-            }
-            more.push(page_more);
-            observations.push(SystemStreamHistoryObservation {
-                retired_through,
-                read,
-                records: page_observations,
-            });
-            if short
-                && (read.ordering == super::SystemStreamHistoryOrdering::Contiguous || page_more)
-                || encoded_bytes >= storage_types::STREAM_RECORDS_MAX_ENCODED_BYTES as usize
-            {
-                break 'pages;
-            }
+        if assembly.include_pages(attempt, reads, pages).await? {
+            break;
         }
     }
-    let checkpoint = plan.finish_bounded(&observations, &more).map_err(|_| {
-        history_unavailable(
-            "history page is not contiguous or its pointer evidence differs",
-            "system_stream.read.finish_bounded",
-        )
-    })?;
-    Ok((records, checkpoint))
+    assembly.finish()
 }
 
 async fn issue_checkpoint<A: StreamAttempt>(
     attempt: &mut A,
     prepared: &PreparedSystemStreamPage,
-    input: &SystemStreamCheckpoint,
+    input: (&SystemStreamCheckpoint, storage_types::TimestampMillis),
     next: &SystemStreamCheckpoint,
 ) -> StorageResult<SystemStreamCheckpointToken> {
+    let (input, initial_visibility_cutoff) = input;
     let token = prepared.request.checkpoint();
     if let Some(token) = token.filter(|_| input == next) {
         return Ok(token.clone());
     }
-    let issue = SystemStreamCheckpointIssue::try_new(
-        token,
-        input,
-        prepared.request.limit(),
-        next,
-        prepared.issued_token.clone(),
-        prepared.issued_at,
-    )?;
+    let issue = SystemStreamCheckpointIssue::try_from(SystemStreamCheckpointIssueInput {
+        input_token: token,
+        input_checkpoint: input,
+        result_checkpoint: next,
+        limit: prepared.request.limit(),
+        issued_token: prepared.issued_token.clone(),
+        issued_at: prepared.issued_at,
+        initial_visibility_cutoff,
+    })?;
     if let Some(receipt) = attempt
         .read_stream(StreamReadKind::System(SystemStreamReadKind::Checkpoint(
             SystemStreamCheckpointLookup::Operation(&issue.operation_key),

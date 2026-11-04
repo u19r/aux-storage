@@ -17,7 +17,6 @@ pub struct TableMetadataChange {
     pub max_indexers: Option<MaxIndexers>,
     pub deletion_protection: Option<bool>,
     pub stream_duration: Option<StreamRetentionDuration>,
-    pub default_item_duration: Option<StreamRetentionDuration>,
 }
 
 impl From<&UpdateTableRequest> for TableMetadataChange {
@@ -29,7 +28,6 @@ impl From<&UpdateTableRequest> for TableMetadataChange {
             max_indexers: request.max_indexers,
             deletion_protection: request.deletion_protection_enabled,
             stream_duration: request.aux_stream_duration_hours,
-            default_item_duration: request.aux_default_item_stream_duration_hours,
         }
     }
 }
@@ -61,7 +59,6 @@ impl TableMetadataChange {
             stream_specification: self.stream.as_ref().map(|stream| stream.0.clone()),
             deletion_protection_enabled: self.deletion_protection,
             aux_stream_duration_hours: self.stream_duration,
-            aux_default_item_stream_duration_hours: self.default_item_duration,
             ..UpdateTableRequest::new(table_name)
         }
     }

@@ -66,6 +66,61 @@ impl JournalStore {
         self.record_key(suffix)
     }
 
+    /// Keep each physical table's immutable copies contiguous within a family.
+    pub(super) fn table_identity_key<T: Serialize>(
+        &self,
+        prefix: &[u8],
+        history: storage_types::TableHistoryId,
+        identity: &T,
+    ) -> StorageResult<DurableRecordKey> {
+        let digest = CanonicalDigest::of_json(identity).map_err(|_| corrupt_record())?;
+        let mut suffix = Vec::with_capacity(prefix.len() + 16 + 32);
+        suffix.extend_from_slice(prefix);
+        suffix.extend_from_slice(history.as_ref());
+        suffix.extend_from_slice(digest.as_ref());
+        self.record_key(suffix)
+    }
+
+    pub(in crate::journal) fn select_original_history(
+        &self,
+        tables: &[(
+            replication_types::identity::resource::TableIdentity,
+            replication_types::identity::resource::TableLineage,
+            storage_types::TableHistoryId,
+        )],
+        source: (
+            replication_types::identity::resource::TableIdentity,
+            replication_types::identity::resource::TableLineage,
+        ),
+    ) -> StorageResult<storage_types::TableHistoryId> {
+        tables
+            .iter()
+            .find(|table| (table.0, table.1) == source)
+            .map(|table| table.2)
+            .ok_or_else(corrupt_record)
+    }
+
+    pub(in crate::journal) fn table_record_history(
+        &self,
+        key: &DurableRecordKey,
+        prefix: &[u8],
+    ) -> StorageResult<storage_types::TableHistoryId> {
+        let suffix = key
+            .as_ref()
+            .suffix
+            .strip_prefix(prefix)
+            .ok_or_else(corrupt_record)?;
+        let bytes: [u8; 16] = suffix
+            .get(..16)
+            .ok_or_else(corrupt_record)?
+            .try_into()
+            .map_err(|_| corrupt_record())?;
+        if bytes == [0; 16] {
+            return Err(corrupt_record());
+        }
+        Ok(storage_types::TableHistoryId::from(bytes))
+    }
+
     pub(super) fn source_key(
         &self,
         origin: &OriginId,

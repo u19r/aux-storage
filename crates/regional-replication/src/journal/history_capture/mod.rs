@@ -116,14 +116,66 @@ impl JournalStore {
         let Some(row) = rows.pop().flatten() else {
             return Ok(None);
         };
-        let record: HistoryCaptureRecord = self.records.decode(&row)?;
-        if row.key != key || record.request.content()? != request.content()? {
+        let record = self.decode_history_capture(&row)?;
+        if record.request.content()? != request.content()? {
             return Err(corrupt_record());
         }
-        record.require_local(&self.region, self.partitions)?;
         self.require_adoption_inventory(attempt, &record, protection)
             .await?;
         Ok(Some((row, record)))
+    }
+
+    fn decode_history_capture(&self, row: &DurableRecord) -> StorageResult<HistoryCaptureRecord> {
+        let record: HistoryCaptureRecord = self.records.decode(row)?;
+        record.require_local(&self.region, self.partitions)?;
+        if row.key
+            != self.identity_key(
+                HISTORY_CAPTURE_SUFFIX,
+                &record.request.proposal.operation().id,
+            )?
+        {
+            return Err(corrupt_record());
+        }
+        Ok(record)
+    }
+
+    pub(super) async fn reclaim_history_capture<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        row: &DurableRecord,
+        history: storage_types::TableHistoryId,
+    ) -> StorageResult<()> {
+        let mut record = self.decode_history_capture(row)?;
+        let source = replication_provider::control::borrow_addition_source(
+            &record.request.proposal,
+            &self.region,
+        )
+        .map_err(|_| corrupt_record())?;
+        if source.physical != history {
+            return Ok(());
+        }
+        self.require_adoption_inventory(attempt, &record, ReadProtection::Conflict)
+            .await?;
+        let has_inventory = record.retained.is_some()
+            && !matches!(
+                record.phase,
+                record::HistoryCapturePhase::Admitting { .. }
+                    | record::HistoryCapturePhase::Released
+                    | record::HistoryCapturePhase::Cancelled
+            );
+        if has_inventory {
+            record.phase = record::HistoryCapturePhase::Cancelled;
+            self.settle_adoption_inventory(attempt, &record).await?;
+        }
+        self.records
+            .store(
+                attempt,
+                &[infrastructure_provider::record::RecordChange::Delete {
+                    key: row.key.clone(),
+                    expected: row.revision,
+                }],
+            )
+            .await
     }
 
     async fn store_history_capture<A: PhysicalRecordAttempt>(

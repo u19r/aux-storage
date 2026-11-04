@@ -21,12 +21,12 @@ use crate::{
 
 impl JournalStore {
     pub(in crate::journal) async fn require_retained_publication<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         input: (
-            &storage_types::TableName,
+            (storage_types::TableHistoryId, &storage_types::TableName),
             &CanonicalTableCut,
             &CanonicalEventId,
             CanonicalDigest,
@@ -54,12 +54,12 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn observe_retained_publication<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         input: (
-            &storage_types::TableName,
+            (storage_types::TableHistoryId, &storage_types::TableName),
             &CanonicalTableCut,
             &CanonicalEventId,
             CanonicalDigest,
@@ -73,7 +73,7 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let (table, vector, identity, digest) = input;
+            let ((physical, table), vector, identity, digest) = input;
             let Some((component, publication)) = self
                 .load_retained_publication_lookup(attempt, vector, (identity, digest))
                 .await?
@@ -97,7 +97,7 @@ impl JournalStore {
                 origin: cut.origin.clone(),
             };
             let frame = self
-                .load_history_frame(attempt, (&selection, range), encoding)
+                .load_history_frame(attempt, (physical, &selection, range), encoding)
                 .await?;
             if frame.manifest().origin != publication.origin
                 || !frame.manifest().links.contains(&publication.link)
@@ -111,13 +111,14 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn require_original_floor_visibility<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         inventory: (
             &crate::history::source_floor::SourcePublicationFloors,
             replication_types::configuration::membership::MembershipRevision,
+            storage_types::TableHistoryId,
         ),
         event: (&CanonicalEventId, CanonicalDigest),
         encoding: (
@@ -143,7 +144,11 @@ impl JournalStore {
                 origin: publication.origin.clone(),
                 range,
                 membership: inventory.1,
-                tables: vec![(publication.link.table, publication.link.lineage)],
+                tables: vec![(
+                    publication.link.table,
+                    publication.link.lineage,
+                    inventory.2,
+                )],
             };
             let frame = crate::source_frame::load_source_frame(
                 self,

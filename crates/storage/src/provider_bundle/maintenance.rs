@@ -47,7 +47,8 @@ impl<
         + storage_provider::maintenance::PartitionReconciliationSource,
 > MaintenanceProviderSource for NativeMaintenanceSource<P>
 where for<'native> <P as DynamoPort>::Attempt<'native>:
-        storage_provider::maintenance::ExpirationPort
+        storage_provider::PrimaryStateScanAttempt
+            + storage_provider::maintenance::ExpirationPort
             + storage_provider::maintenance::GsiPort
             + storage_provider::maintenance::StreamRetentionPort
             + storage_provider::TableReclaimAttempt
@@ -69,6 +70,7 @@ where for<'native> <P as DynamoPort>::Attempt<'native>:
             MaintenanceRepositories {
                 job_catalog: catalog,
                 expiration_repository: port.clone(),
+                stream_initialization_repository: port.clone(),
                 gsi_build_repository: port.clone(),
                 partition_reconciliation_repository: partition,
                 queue_message_cleanup_repository: Some(port.clone()),
@@ -179,11 +181,12 @@ impl<P: DynamoPort> DynamoPort for NativeMaintenancePort<P> {
         &self,
         request: storage_types::UpdateTableRequest,
         captured_at: TimestampMillis,
+        bindings: storage_provider::RequestTableBindings,
     ) -> impl Future<Output = StorageResult<storage_types::UpdateTableResponse>> + Send {
         let port = Arc::clone(&self.port);
         self.binding
             .settle(NativeWork::Background, move || async move {
-                port.update_table_once(request, captured_at).await
+                port.update_table_once(request, captured_at, bindings).await
             })
     }
 }

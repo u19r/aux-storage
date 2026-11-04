@@ -3,9 +3,7 @@
 use std::future::Future;
 
 use storage_backfill::GsiBuild;
-use storage_provider::{
-    CreateTableAttempt, CreateTableLayout, StreamTrimStateWrite, table_retention_scope_id,
-};
+use storage_provider::{CreateTableAttempt, CreateTableLayout, StreamTrimStateWrite};
 use storage_types::{
     IndexName, StorageError, StorageResult, StoredTableInfo, SystemStreamCheckpoint,
     maintenance::TargetIncarnation,
@@ -21,7 +19,7 @@ use crate::{
 
 impl<A: KvAttempt> CreateTableAttempt for KvCatalogAttempt<'_, A> {
     type Identity = KvTableIdentity;
-    type LayoutSeed = (Option<Vec<u8>>, Option<Vec<u8>>);
+    type LayoutSeed = Option<Vec<u8>>;
 
     fn read_layout(
         &mut self,
@@ -38,8 +36,8 @@ impl<A: KvAttempt> CreateTableAttempt for KvCatalogAttempt<'_, A> {
         self.insert_table_layout(table, seed).map(Some)
     }
 
-    fn retention_scope_id(&self, _: &StoredTableInfo, identity: &Self::Identity) -> String {
-        table_retention_scope_id(identity.table_id.into())
+    fn table_history_id(&self, identity: &Self::Identity) -> storage_types::TableHistoryId {
+        identity.table_id.into()
     }
 
     fn write_retention(

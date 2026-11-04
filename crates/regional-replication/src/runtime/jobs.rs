@@ -127,7 +127,11 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
             .map(|job| job.register(&mut staged, now))
             .transpose()
             .map_err(invalid_catalog)?;
-        *catalog = staged;
+        let configured = self.transport.configuration();
+        let manifest =
+            crate::job_recovery::configured_controller_manifest(configured.as_ref().as_ref())
+                .map_err(|_| StorageError::validation("invalid regional controller manifest"))?;
+        *catalog = staged.with_manifest(manifest);
         Ok(RegionalJobHandles {
             enable,
             addition,

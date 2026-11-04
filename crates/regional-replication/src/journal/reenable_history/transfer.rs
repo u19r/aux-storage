@@ -37,6 +37,12 @@ impl JournalStore {
             scope.require_definition(&definition)?;
             let cut = &page.cut.cut;
             let delivery = DeliveryScope {
+                physical: scope
+                    .proposal
+                    .participant(&self.region)
+                    .map_err(|_| corrupt_record())?
+                    .proposed
+                    .physical,
                 origin: cut.origin.clone(),
                 table: cut.source.table,
                 local_table: scope.proposal.operation().table,
@@ -80,7 +86,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn plan_reenable_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -140,7 +146,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn record_reenable_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,

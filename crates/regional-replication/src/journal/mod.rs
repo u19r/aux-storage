@@ -13,12 +13,15 @@ pub(crate) use initialization::PartitionQualificationCursor;
 mod control;
 mod delivery;
 mod import_originals;
-mod import_page;
+pub(crate) mod import_page;
 pub(crate) mod native_binding;
 mod pending_recovery;
 pub(crate) use import_originals::{PreparedImportEvents, PreparedImportOriginal};
 mod import_manifest;
 mod operation;
+mod operation_reclaim;
+#[cfg(test)]
+mod operation_reclaim_tests;
 pub mod origin;
 mod partition;
 #[cfg(test)]
@@ -77,18 +80,33 @@ mod causal_read;
 mod checkpoint_state;
 mod control_slot;
 mod history_checkpoint;
+mod history_receiver;
 mod history_retention;
 mod history_source_cut;
 mod history_table_cut;
 mod history_view;
+mod table_catalog_reclaim;
+mod table_metadata_reclaim;
+mod table_owned_reclaim;
+mod table_reclaim;
+#[cfg(test)]
+pub(crate) mod table_reclaim_test_support;
+#[cfg(test)]
+mod table_reclaim_tests;
+mod table_workflow_reclaim;
+pub(crate) use table_reclaim::TableReclaimWork;
 mod hold_discovery;
-mod original_batch;
 mod original_bytes;
-mod original_owner;
+#[cfg(test)]
+mod original_bytes_tests;
+mod original_payload;
 mod portable_checkpoint;
 mod publication_lookup;
 mod reader_expiry;
 mod reader_hold;
+mod reader_reclaim;
+#[cfg(test)]
+mod reader_reclaim_tests;
 
 mod causal_ancestry;
 mod causal_scope;

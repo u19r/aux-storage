@@ -34,6 +34,16 @@ pub trait PhysicalRecordAttempt: Send {
         protection: ReadProtection,
     ) -> impl Future<Output = StorageResult<bool>> + Send;
 
+    /// Find the first existing generation at or above `minimum` for this
+    /// key's namespace/resource. Its generation and suffix do not select the
+    /// read. Observe only native keys, without reading record values/chunks.
+    fn find_record_generation(
+        &mut self,
+        resource_of: &DurableRecordKey,
+        minimum: u64,
+        protection: ReadProtection,
+    ) -> impl Future<Output = StorageResult<Option<u64>>> + Send;
+
     /// Shared protects stable existing rows; Conflict protects an update
     /// decision. Observing a missing row does not establish a writer
     /// takeover barrier.

@@ -17,15 +17,9 @@ pub(crate) struct PrimaryItemEnvelope<'a> {
 impl<'a> PrimaryItemEnvelope<'a> {
     pub fn decode(bytes: &'a [u8]) -> StorageResult<Self> {
         let header = bytes
-            .get(..PRIMARY_ITEM_HEADER_BYTES)
+            .get(..PRIMARY_ITEM_HEADER_BYTES.get())
             .ok_or_else(|| StorageError::internal("KV primary item header is truncated"))?;
-        if header[0] != PRIMARY_ITEM_FORMAT {
-            return Err(StorageError::internal("KV primary item format is invalid"));
-        }
-        let revision_bytes: [u8; 8] = header[1..9]
-            .try_into()
-            .map_err(|_| StorageError::internal("KV primary revision is invalid"))?;
-        let revision = ItemRevision::try_from(u64::from_be_bytes(revision_bytes))?;
+        let revision = decode_primary_revision(header)?;
         let ttl_bytes: [u8; 8] = header[10..18]
             .try_into()
             .map_err(|_| StorageError::internal("KV primary TTL epoch is invalid"))?;
@@ -45,10 +39,11 @@ impl<'a> PrimaryItemEnvelope<'a> {
         let provenance_len = usize::try_from(u32::from_be_bytes(provenance_len_bytes))
             .map_err(|_| StorageError::internal("KV primary provenance length is too large"))?;
         let image_start = PRIMARY_ITEM_HEADER_BYTES
+            .get()
             .checked_add(provenance_len)
             .ok_or_else(|| StorageError::internal("KV primary item length overflowed"))?;
         let provenance = bytes
-            .get(PRIMARY_ITEM_HEADER_BYTES..image_start)
+            .get(PRIMARY_ITEM_HEADER_BYTES.get()..image_start)
             .ok_or_else(|| StorageError::internal("KV primary item provenance is truncated"))?;
         let image = bytes
             .get(image_start..)
@@ -67,6 +62,21 @@ impl<'a> PrimaryItemEnvelope<'a> {
     }
 }
 
+/// Revision-only reads verify the native authority prefix without decoding an
+/// image.
+pub(crate) fn decode_primary_revision(bytes: &[u8]) -> StorageResult<ItemRevision> {
+    let header = bytes
+        .get(..PRIMARY_ITEM_HEADER_BYTES.get())
+        .ok_or_else(|| StorageError::internal("KV primary item header is truncated"))?;
+    if header[0] != PRIMARY_ITEM_FORMAT {
+        return Err(StorageError::internal("KV primary item format is invalid"));
+    }
+    let revision = header[1..9]
+        .try_into()
+        .map_err(|_| StorageError::internal("KV primary revision is invalid"))?;
+    ItemRevision::try_from(u64::from_be_bytes(revision))
+}
+
 pub(crate) fn encode_primary_item(
     image: &[u8],
     effects: &ItemPrimaryEffects,
@@ -75,6 +85,7 @@ pub(crate) fn encode_primary_item(
     let length = u32::try_from(provenance.len())
         .map_err(|_| StorageError::internal("KV primary item provenance is too large"))?;
     let size = PRIMARY_ITEM_HEADER_BYTES
+        .get()
         .checked_add(provenance.len())
         .and_then(|bytes| bytes.checked_add(image.len()))
         .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;

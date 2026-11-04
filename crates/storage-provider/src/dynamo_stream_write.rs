@@ -3,10 +3,13 @@
 use std::future::Future;
 
 use storage_backfill::GsiProjectionWriteBatch;
-use storage_types::{BoundTableInfo, StorageResult, SystemStreamPosition};
+use storage_types::{
+    BoundTableInfo, ItemHistoryEntry, ItemHistoryReference, StorageResult, SystemStreamPosition,
+    SystemStreamScope,
+};
 use stream_provider::{DynamoStreamWriteInput, DynamoStreamWritePlan, LogicalSystemStreamMutation};
 
-use crate::{ItemPrimaryEffects, StreamTrimStateWrite};
+use crate::ItemPrimaryEffects;
 
 /// Prepare stream effects on the operation's native attempt. `stage_*` methods
 /// only append local effects and cannot await database work. The family flush
@@ -15,8 +18,15 @@ use crate::{ItemPrimaryEffects, StreamTrimStateWrite};
 /// The shared executor chooses the routing key and logical record, while the
 /// family lowerer protects the sequence and encodes physical rows.
 pub trait DynamoStreamWriteAttempt:
-    stream_provider::retained_image::RetainedOwnershipAttempt + Sized
+    stream_provider::ItemHistoryReadAttempt + crate::TableHistoryRetentionAttempt + Sized
 {
+    /// Exact history effects join the primary/GSI/TTL batch.
+    fn stage_item_history(
+        &mut self,
+        entry: Option<ItemHistoryEntry>,
+        delete: Option<ItemHistoryReference>,
+    ) -> StorageResult<()>;
+
     /// Prepare image dependencies and projections without inventing a stream
     /// event.
     fn prepare_gsi_writes(
@@ -26,21 +36,12 @@ pub trait DynamoStreamWriteAttempt:
         writes: GsiProjectionWriteBatch,
     ) -> impl Future<Output = StorageResult<()>> + Send;
 
-    fn prepare_gsi_and_stream(
+    fn reserve_stream_position(
         &mut self,
-        table: &BoundTableInfo,
-        effects: &ItemPrimaryEffects,
-        writes: GsiProjectionWriteBatch,
         routing_key: &[u8],
-    ) -> impl Future<Output = StorageResult<SystemStreamPosition>> + Send;
+    ) -> impl Future<Output = StorageResult<(SystemStreamScope, SystemStreamPosition)>> + Send;
 
     fn stage_stream_write(&mut self, plan: DynamoStreamWritePlan) -> StorageResult<()>;
-
-    fn stage_item_stream_retention(
-        &mut self,
-        table: &BoundTableInfo,
-        write: StreamTrimStateWrite,
-    ) -> StorageResult<()>;
 
     /// Submit the prepared physical effects after all protected reads finish.
     fn flush_dynamo_write(&mut self) -> impl Future<Output = StorageResult<()>> + Send;
@@ -49,22 +50,19 @@ pub trait DynamoStreamWriteAttempt:
         &mut self,
         table: &BoundTableInfo,
         mutation: LogicalSystemStreamMutation,
-        position: SystemStreamPosition,
+        publication: (SystemStreamScope, SystemStreamPosition),
     ) -> impl Future<Output = StorageResult<()>> + Send {
         async move {
             let mut settlement =
                 infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
             let attempt = settlement.as_mut();
             let result = async {
-                let plan = DynamoStreamWritePlan::prepare(
-                    attempt,
-                    DynamoStreamWriteInput {
-                        table,
-                        mutation,
-                        position,
-                    },
-                )
-                .await?;
+                let plan = DynamoStreamWritePlan::try_from(DynamoStreamWriteInput {
+                    table,
+                    mutation,
+                    source_scope: publication.0,
+                    position: publication.1,
+                })?;
                 attempt.stage_stream_write(plan)
             }
             .await;

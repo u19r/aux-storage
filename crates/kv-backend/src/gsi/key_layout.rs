@@ -1,22 +1,19 @@
-//! One KV key layout for GSI build records and private history holds.
+//! KV key layouts for GSI build records and materialized projections.
 
 use sha2::{Digest as _, Sha256};
 use storage_types::{
-    BoundTableInfo, IndexName, ItemKey, StorageError, StorageResult, SystemStreamCheckpoint,
-    SystemStreamPosition, SystemStreamScope,
+    AttributeMap, BoundTableInfo, IndexName, ItemKey, StorageError, StorageResult, WireItem,
 };
 
 use crate::{
     catalog::{KvIndexKind, KvTableIdentity},
     constants::{
-        GSI_AUTHORITY_FAMILY, GSI_BUILD_FAMILY, GSI_HOLD_FAMILY, GSI_NAME_LOCK_FAMILY,
-        GSI_PROJECTION_FAMILY, GSI_RUNNABLE_FAMILY, GSI_TOMBSTONE_FAMILY,
+        GSI_BUILD_FAMILY, GSI_NAME_LOCK_FAMILY, GSI_PROJECTION_FAMILY, GSI_RUNNABLE_FAMILY,
+        GSI_TOMBSTONE_FAMILY,
     },
 };
 
 pub(super) struct ProjectionKeys {
-    pub scope: [u8; 6],
-    pub word: Vec<u8>,
     pub live: Vec<u8>,
     pub tombstone: Vec<u8>,
 }
@@ -39,17 +36,14 @@ impl ProjectionKeys {
             key.extend_from_slice(suffix);
             Ok(key)
         };
-        let digest = projection_address(&suffix);
         Ok(Self {
-            scope: index_incarnation(table_id, index_id),
-            word: suffix,
-            live: physical(GSI_AUTHORITY_FAMILY, &digest)?,
-            tombstone: physical(GSI_TOMBSTONE_FAMILY, &digest)?,
+            live: physical(GSI_PROJECTION_FAMILY, &suffix)?,
+            tombstone: physical(GSI_TOMBSTONE_FAMILY, &suffix)?,
         })
     }
 }
 
-pub(crate) fn projection_address(suffix: &[u8]) -> [u8; 32] {
+fn hash_partition(suffix: &[u8]) -> [u8; 32] {
     Sha256::digest(suffix).into()
 }
 
@@ -81,8 +75,7 @@ pub(crate) fn ordered_projection_key(
     index_id: u16,
     key: &ItemKey,
 ) -> StorageResult<Vec<u8>> {
-    // A logical comparison/cursor key; only its partition prefix is stored
-    // natively.
+    // Native order and public continuation evidence use the same complete key.
     Ok([
         vec![GSI_PROJECTION_FAMILY],
         index_incarnation(identity.table_id, index_id).to_vec(),
@@ -93,9 +86,9 @@ pub(crate) fn ordered_projection_key(
 
 pub(crate) fn ordered_projection_suffix(key: &ItemKey) -> StorageResult<Vec<u8>> {
     let word = compact_partition(key, key.sorted_storage_suffix()?)?;
-    if word.len() > crate::constants::GSI_TREE_MAX_WORD_BYTES {
+    if word.len() > crate::constants::GSI_PROJECTION_SUFFIX_MAX_BYTES {
         return Err(StorageError::internal(
-            "GSI comparison word exceeds its layout",
+            "GSI ordered suffix exceeds its layout",
         ));
     }
     Ok(word)
@@ -126,7 +119,7 @@ fn compact_partition(key: &ItemKey, encoded: Vec<u8>) -> StorageResult<Vec<u8>> 
     suffix
         .try_reserve_exact(count)
         .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    suffix.extend_from_slice(&projection_address(&partition));
+    suffix.extend_from_slice(&hash_partition(&partition));
     suffix.extend_from_slice(tail);
     Ok(suffix)
 }
@@ -161,67 +154,34 @@ pub(super) fn gsi_runnable_key(table_id: u32, index_id: u16) -> Vec<u8> {
     key
 }
 
-pub(super) fn hold_key(
-    checkpoint: &SystemStreamCheckpoint,
-    position: &SystemStreamPosition,
-    incarnation: &[u8],
-) -> StorageResult<Vec<u8>> {
-    let scope = checkpoint.scope();
-    let mut key = hold_prefix(scope, position)?;
-    let offset = position
-        .offset()
-        .order()
-        .map_err(|_| StorageError::internal("GSI hold offset is invalid"))?;
-    let count = position
-        .offset()
-        .versionstamp()
-        .map_or(8, |stamp| stamp.len())
-        .checked_add(incarnation.len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    key.try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    if let Some(stamp) = position.offset().versionstamp() {
-        key.extend_from_slice(&stamp);
-    } else {
-        key.extend_from_slice(&offset.to_be_bytes());
+pub(super) fn require_projection_key(
+    table: &BoundTableInfo,
+    index: &IndexName,
+    physical: &[u8],
+    image: &WireItem,
+) -> StorageResult<()> {
+    let definition = table
+        .global_secondary_indexes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|definition| &definition.index_name == index)
+        .ok_or_else(|| StorageError::internal("KV projection index is absent"))?;
+    let attributes = AttributeMap::try_from(image)?;
+    let key = ItemKey::from_key_schema_for_index(
+        table.table_name.clone(),
+        &table.key_schema,
+        index,
+        &definition.key_schema,
+        &attributes,
+    )?
+    .ok_or_else(|| StorageError::internal("KV projection image lacks its key"))?;
+    if physical.get(crate::constants::GSI_PROJECTION_KEY_PREFIX_BYTES..)
+        != Some(ordered_projection_suffix(&key)?.as_slice())
+    {
+        return Err(StorageError::internal(
+            "KV projection image differs from its physical key",
+        ));
     }
-    key.extend_from_slice(incarnation);
-    Ok(key)
-}
-
-/// Prefix for one lineage's ordered private holds in one source generation.
-/// A single range read can observe the minimum consumed offset regardless of
-/// the number of GSI builds in other scopes or generations.
-pub(crate) fn hold_prefix(
-    scope: &SystemStreamScope,
-    position: &SystemStreamPosition,
-) -> StorageResult<Vec<u8>> {
-    let count = [
-        scope.scope_id().as_str().len(),
-        position.shard_id().as_str().len(),
-        position.lineage_id().as_str().len(),
-    ]
-    .into_iter()
-    .try_fold(
-        1usize + scope.generation().to_be_bytes().len() + 6,
-        |count, length| count.checked_add(length),
-    )
-    .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut key = Vec::new();
-    key.try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    key.push(GSI_HOLD_FAMILY);
-    append_segment(&mut key, scope.scope_id().as_str().as_bytes())?;
-    key.extend_from_slice(&scope.generation().to_be_bytes());
-    append_segment(&mut key, position.shard_id().as_str().as_bytes())?;
-    append_segment(&mut key, position.lineage_id().as_str().as_bytes())?;
-    Ok(key)
-}
-
-fn append_segment(key: &mut Vec<u8>, part: &[u8]) -> StorageResult<()> {
-    let len = u16::try_from(part.len())
-        .map_err(|_| StorageError::internal("GSI hold identifier is too long"))?;
-    key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(part);
     Ok(())
 }

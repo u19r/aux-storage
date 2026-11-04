@@ -247,12 +247,19 @@ impl<'de> Deserialize<'de> for TtlSweepPageInput {
     }
 }
 
+/// A policy observation and its protected immutable table identity.
+#[derive(Clone)]
+pub struct TtlSweepPolicy {
+    pub target: storage_types::TableHistoryTarget,
+    pub config: TtlConfigRecord,
+}
+
 /// One deterministic semantic TTL sweep command. The expected generation is
 /// mandatory so a stale scheduler command cannot apply under a new policy.
 #[derive(Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtlSweepPageCommand {
-    pub table_name: TableName,
+    pub target: storage_types::TableHistoryTarget,
     pub input: TtlSweepPageInput,
     pub expected_policy_generation: TtlPolicyGeneration,
     pub captured_at: TimestampMillis,
@@ -264,41 +271,45 @@ impl<'de> Deserialize<'de> for TtlSweepPageCommand {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            table_name: TableName,
+            target: storage_types::TableHistoryTarget,
             input: TtlSweepPageInput,
             expected_policy_generation: TtlPolicyGeneration,
             captured_at: TimestampMillis,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.table_name,
-            wire.input,
-            wire.expected_policy_generation,
-            wire.captured_at,
-        )
-        .map_err(D::Error::custom)
+        Self::require_capture(wire.captured_at).map_err(D::Error::custom)?;
+        Ok(Self {
+            target: wire.target,
+            input: wire.input,
+            expected_policy_generation: wire.expected_policy_generation,
+            captured_at: wire.captured_at,
+        })
     }
 }
 
 impl TtlSweepPageCommand {
     pub fn try_new(
-        table_name: TableName,
+        policy: TtlSweepPolicy,
         input: TtlSweepPageInput,
-        expected_policy_generation: TtlPolicyGeneration,
         captured_at: TimestampMillis,
     ) -> StorageResult<Self> {
+        Self::require_capture(captured_at)?;
+        Ok(Self {
+            target: policy.target,
+            input,
+            expected_policy_generation: policy.config.policy_generation,
+            captured_at,
+        })
+    }
+
+    fn require_capture(captured_at: TimestampMillis) -> StorageResult<()> {
         if captured_at.timestamp_millis() <= 0 {
             return Err(StorageError::validation(
                 "ttl maintenance captured time must be positive",
             ));
         }
-        Ok(Self {
-            table_name,
-            input,
-            expected_policy_generation,
-            captured_at,
-        })
+        Ok(())
     }
 }
 

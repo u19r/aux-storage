@@ -5,7 +5,7 @@ use std::{
 };
 
 use replication_types::protocol::{CanonicalBytes, CanonicalDigest};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     bounded_json::{BoundedJsonCounter, BoundedJsonWriter},
@@ -16,6 +16,7 @@ use crate::{
 /// Bounded envelope for native protected records, not a wire event codec.
 /// Deserialization creates observations only; capability types deliberately do
 /// not implement Deserialize.
+#[derive(Clone)]
 pub struct RecordCodec {
     limit: NonZeroUsize,
 }
@@ -78,7 +79,10 @@ impl RecordCodec {
         bytes[6..DURABLE_HEADER_BYTES].copy_from_slice(digest.as_ref());
         CanonicalBytes::try_new(Arc::from(bytes), self.limit).map_err(|_| RecordError::TooLarge)
     }
-    pub fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, RecordError> {
+    pub fn decode<'record, T: Deserialize<'record>>(
+        &self,
+        bytes: &'record [u8],
+    ) -> Result<T, RecordError> {
         if bytes.len() > self.limit.get() {
             return Err(RecordError::TooLarge);
         }

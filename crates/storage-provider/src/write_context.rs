@@ -1,8 +1,7 @@
 use storage_backfill::GsiProjectionLifecycle;
 use storage_common::TtlConfigRecord;
 use storage_types::{
-    ItemStreamVersion, StorageError, StorageResult, StreamItemId, StreamRetentionDuration,
-    TableName, TimestampMillis,
+    ItemStreamVersion, StorageError, StorageResult, StreamItemId, TableName, TimestampMillis,
 };
 
 mod operation_contexts;
@@ -130,5 +129,4 @@ pub struct TableUpdateContext {
     pub index: usize,
     pub ttl_config: Option<TtlConfigRecord>,
     pub ttl_context: TtlWriteContext,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }

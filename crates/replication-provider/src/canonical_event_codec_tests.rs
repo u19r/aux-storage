@@ -62,6 +62,77 @@ fn given_equivalent_numeric_images_when_original_events_roundtrip_then_bytes_and
     ));
 }
 
+#[test]
+fn given_baseline_expiration_when_encoded_then_shared_identity_is_opaque_and_victim_binding_is_verified()
+ {
+    let baseline = expiration_baseline("sensitive-baseline-key");
+    let (identity, child) = baseline.expiration_child().unwrap();
+    let semantics = crate::constants::CANONICAL_EVENT_SEMANTIC_VERSION.into();
+    let bytes = codec()
+        .encode_item_event(semantics, &identity, &child)
+        .unwrap();
+    let decoded = codec().decode_event(bytes.as_ref()).unwrap();
+    assert_eq!(decoded.as_ref().id, identity);
+    assert_eq!(baseline.expiration_child().unwrap().0, identity);
+
+    let encoded_identity = serde_json::to_value(&identity).unwrap();
+    let fields = encoded_identity["Expiration"].as_object().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert!(fields.contains_key("lineage") && fields.contains_key("victim_digest"));
+    let CanonicalPayload::Item(item) = &decoded.as_ref().payload else {
+        panic!("expected expiration item");
+    };
+    let mut forged: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+    let other = expiration_baseline("another-sensitive-key")
+        .expiration_child()
+        .unwrap()
+        .0;
+    assert_ne!(identity, other);
+    forged["id"] = serde_json::to_value(&other).unwrap();
+    assert!(
+        codec()
+            .decode_event(&serde_json::to_vec(&forged).unwrap())
+            .is_err()
+    );
+    assert!(
+        codec()
+            .encode_event(semantics, &other, &decoded.as_ref().payload)
+            .is_err()
+    );
+    let mut provenance = baseline.provenance(decoded.as_ref().digest);
+    provenance.event = Some(identity);
+    provenance.order = item.order.clone();
+    provenance.validate().unwrap();
+    let native = codec().encode_winner_provenance(&provenance).unwrap();
+    assert_eq!(
+        codec()
+            .decode_winner_provenance(native.as_bytes(), &provenance.key)
+            .unwrap(),
+        provenance
+    );
+    provenance.event = Some(other);
+    assert!(provenance.validate().is_err());
+}
+
+fn expiration_baseline(value: &str) -> replication_types::event::baseline::BaselineItem {
+    let key = KeyAttributes::from_iter([("pk".into(), AttributeValue::S(value.into()))]);
+    replication_types::event::baseline::BaselineItem {
+        source_table: [1; 16].try_into().unwrap(),
+        lineage: [2; 16].try_into().unwrap(),
+        schema: 1.into(),
+        canonical_key: codec().encode_key(&key).unwrap(),
+        key,
+        images: SourceImages {
+            old: None,
+            new: Some(WireItem::dynamo_json(
+                serde_json::to_vec(&serde_json::json!({"pk":{"S":value}})).unwrap(),
+            )),
+            old_indexers: None,
+            new_indexers: Some(Vec::new()),
+        },
+    }
+}
+
 fn assert_images_rejected(old: Option<WireItem>, new: Option<WireItem>) {
     let result = candidate(old, new);
     assert!(matches!(

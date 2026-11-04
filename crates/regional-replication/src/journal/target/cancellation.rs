@@ -1,7 +1,7 @@
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
 use replication_types::configuration::installed::RegionalTablePhase;
 use storage_provider::DynamoAttempt;
-use storage_types::{ReadProtection, StorageResult, TimestampMillis};
+use storage_types::{ReadProtection, StorageResult};
 
 use crate::{
     bootstrap::HiddenTargetRequest,
@@ -56,7 +56,6 @@ impl JournalStore {
         &self,
         attempt: &mut A,
         request: &HiddenTargetRequest,
-        now: TimestampMillis,
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -131,7 +130,7 @@ impl JournalStore {
             removed.phase = RegionalTablePhase::Removed;
             self.persist_table_state(attempt, (observed, removed))
                 .await?;
-            attempt.delete_table_layout(&table, now).await?;
+            storage_provider::retire_table_in_attempt(attempt, &table).await?;
             record.cancelled = true;
             let root_key = self.identity_key(TARGET_BOOTSTRAP_SUFFIX, &request.operation.id)?;
             let changes = [

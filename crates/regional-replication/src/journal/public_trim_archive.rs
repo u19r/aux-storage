@@ -12,7 +12,7 @@ use storage_types::StorageResult;
 
 use super::{
     JournalStore,
-    archive::ArchiveTrimPage,
+    archive::ArchiveOriginal,
     public_trim_original::{OriginalContinuation, TrimOriginalRetention},
     public_trim_scan::{SourceScanPhase, SourceScanRecord},
     reader_hold::RetentionHoldReference,
@@ -26,10 +26,7 @@ use crate::{
 pub(in crate::journal) struct ArchiveScan {
     hold: ArchiveHold,
     next: Option<DurableRecordKey>,
-    ordinal: u64,
     scope: Option<CanonicalDigest>,
-    has_overlap: bool,
-    has_unresolved: bool,
 }
 
 impl JournalStore {
@@ -53,10 +50,7 @@ impl JournalStore {
             scan.phase = SourceScanPhase::Archive(ArchiveScan {
                 hold,
                 next,
-                ordinal: 0,
                 scope: None,
-                has_overlap: false,
-                has_unresolved: false,
             });
             Ok(true)
         }
@@ -65,7 +59,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn scan_public_trim_archive<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -84,10 +78,10 @@ impl JournalStore {
             };
             self.require_public_trim_archive_scan(&archive)?;
             let page = self
-                .load_archive_trim_page(attempt, (&archive.hold, archive.ordinal), encoding.1)
+                .load_archive_trim_page(attempt, &archive.hold, encoding.1)
                 .await?;
-            let (scope, next, original, retention) = match page {
-                ArchiveTrimPage::Original { event, scope, next } => {
+            let (scope, original, retention) = match page {
+                ArchiveOriginal::Event { event, scope } => {
                     let retention = self
                         .classify_public_trim_original(attempt, proposal, &event, encoding)
                         .await?;
@@ -99,49 +93,29 @@ impl JournalStore {
                     ))?;
                     (
                         scope,
-                        next,
                         Some((original.id.clone(), original.digest)),
                         retention,
                     )
                 }
-                ArchiveTrimPage::Independent { scope } => {
-                    (scope, None, None, TrimOriginalRetention::Disjoint)
-                }
-                ArchiveTrimPage::Manifest { manifest, scope } => {
-                    let overlaps = proposal.candidate.overlaps_manifest(&manifest);
-                    (
-                        scope,
-                        None,
-                        None,
-                        if overlaps {
-                            TrimOriginalRetention::Overlap
-                        } else {
-                            TrimOriginalRetention::Disjoint
-                        },
-                    )
+                ArchiveOriginal::Baseline { scope } => {
+                    (scope, None, TrimOriginalRetention::Disjoint)
                 }
             };
             if archive.scope.is_some_and(|expected| expected != scope) {
                 return Err(corrupt_record());
             }
             archive.scope = Some(scope);
-            scan.vector = self
-                .records
-                .content_digest(&(scan.vector, scope, archive.ordinal))?;
+            scan.vector = self.records.content_digest(&(scan.vector, scope))?;
             if matches!(retention, TrimOriginalRetention::Unresolved)
                 && let Some((identity, digest)) = original
             {
                 return self.prepare_public_trim_original(
                     proposal,
                     scan,
-                    (
-                        OriginalContinuation::Archive { archive, next },
-                        identity,
-                        digest,
-                    ),
+                    (OriginalContinuation::Archive(archive), identity, digest),
                 );
             }
-            self.resume_public_trim_archive(scan, (archive, next), retention)
+            self.resume_public_trim_archive(scan, archive, retention)
         }
         .await;
         settlement_guard.complete(result)
@@ -150,24 +124,16 @@ impl JournalStore {
     pub(in crate::journal) fn resume_public_trim_archive(
         &self,
         scan: &mut SourceScanRecord,
-        progress: (ArchiveScan, Option<u64>),
+        mut archive: ArchiveScan,
         retention: TrimOriginalRetention,
     ) -> StorageResult<()> {
-        let (mut archive, next) = progress;
-        archive.has_overlap |= matches!(retention, TrimOriginalRetention::Overlap);
-        archive.has_unresolved |= matches!(retention, TrimOriginalRetention::Unresolved);
-        if let Some(next) = next {
-            archive.ordinal = next;
-            scan.phase = SourceScanPhase::Archive(archive);
-            return Ok(());
-        }
-        if archive.has_overlap {
+        if matches!(retention, TrimOriginalRetention::Overlap) {
             scan.overlapping_holds = scan
                 .overlapping_holds
                 .checked_add(1)
                 .ok_or_else(corrupt_record)?;
         }
-        if archive.has_unresolved {
+        if matches!(retention, TrimOriginalRetention::Unresolved) {
             scan.unresolved_holds = scan
                 .unresolved_holds
                 .checked_add(1)
@@ -181,7 +147,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn require_public_trim_archive_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -189,7 +155,6 @@ impl JournalStore {
         original: (
             &replication_types::event::identity::CanonicalEventId,
             CanonicalDigest,
-            Option<u64>,
         ),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<()> {
@@ -197,15 +162,14 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement_guard.as_mut();
         let result = async {
-            let ArchiveTrimPage::Original { event, scope, next } = self
-                .load_archive_trim_page(attempt, (&archive.hold, archive.ordinal), codec)
+            let ArchiveOriginal::Event { event, scope } = self
+                .load_archive_trim_page(attempt, &archive.hold, codec)
                 .await?
             else {
                 return Err(corrupt_record());
             };
             if &event.as_ref().id != original.0
                 || event.as_ref().digest != original.1
-                || next != original.2
                 || archive.scope != Some(scope)
             {
                 return Err(corrupt_record());
@@ -219,12 +183,9 @@ impl JournalStore {
     pub(in crate::journal) fn require_public_trim_archive_continuation(
         &self,
         archive: &ArchiveScan,
-        next: Option<u64>,
     ) -> StorageResult<()> {
         self.require_public_trim_archive_scan(archive)?;
-        if archive.scope.is_none()
-            || next.is_some_and(|next| archive.ordinal.checked_add(1) != Some(next))
-        {
+        if archive.scope.is_none() {
             return Err(corrupt_record());
         }
         Ok(())
@@ -235,12 +196,6 @@ impl JournalStore {
         archive: &ArchiveScan,
     ) -> StorageResult<()> {
         self.require_archive_hold(&archive.hold)?;
-        if archive.ordinal > 0 && archive.scope.is_none() {
-            return Err(corrupt_record());
-        }
-        if archive.scope.is_none() && (archive.has_overlap || archive.has_unresolved) {
-            return Err(corrupt_record());
-        }
         if let Some(next) = &archive.next {
             let first = self.record_key(crate::constants::READER_HOLD_SUFFIX.to_vec())?;
             if !self.record_prefix_range(&first)?.contains(next)

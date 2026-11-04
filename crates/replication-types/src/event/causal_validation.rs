@@ -47,21 +47,19 @@ impl<I> AcceptedItemEvent<I> {
     ) -> Result<(), ReplicationProtocolError> {
         match identity {
             CanonicalEventId::Origin(id) => self.require_mutation_identity(id),
-            CanonicalEventId::Expiration { lineage, victim } => {
-                self.require_expiration_identity((*lineage, victim))
+            CanonicalEventId::Expiration { .. } => {
+                if identity != &self.version.expiration_id()? {
+                    return Err(invalid_identity());
+                }
+                self.require_expiration_identity()
             }
             _ => Err(invalid_identity()),
         }
     }
 
-    fn require_expiration_identity(
-        &self,
-        identity: (crate::identity::resource::TableLineage, &VersionIdentity),
-    ) -> Result<(), ReplicationProtocolError> {
-        let (lineage, victim) = identity;
-        if lineage != self.lineage
-            || victim != &self.version
-            || self.predecessor.as_ref() != Some(victim)
+    fn require_expiration_identity(&self) -> Result<(), ReplicationProtocolError> {
+        if self.version.lineage() != self.lineage
+            || self.predecessor.as_ref() != Some(&self.version)
             || self.cause != MutationCause::Expiration
         {
             return Err(invalid_identity());
@@ -147,17 +145,17 @@ impl<I> AcceptedItemEvent<I> {
     }
 
     fn require_predecessor_parent(&self) -> Result<(), ReplicationProtocolError> {
-        if matches!(&self.predecessor, Some(VersionIdentity::Mutation(_)))
-            && !self
-                .parents
-                .iter()
-                .any(|parent| self.is_predecessor_parent(parent))
-        {
-            return Err(ReplicationProtocolError::IdentityContentMismatch {
-                context: "missing item predecessor dependency",
-            });
+        if !matches!(&self.predecessor, Some(VersionIdentity::Mutation(_))) {
+            return Ok(());
         }
-        Ok(())
+        for parent in &self.parents {
+            if self.is_predecessor_parent(parent)? {
+                return Ok(());
+            }
+        }
+        Err(ReplicationProtocolError::IdentityContentMismatch {
+            context: "missing item predecessor dependency",
+        })
     }
 
     fn require_parent_scope(
@@ -168,7 +166,7 @@ impl<I> AcceptedItemEvent<I> {
             .observations
             .iter()
             .any(|observed| observed.event.as_ref() == Some(parent))
-            || self.is_predecessor_parent(parent)
+            || self.is_predecessor_parent(parent)?
             || matches!(parent, CanonicalEventId::Control { lineage, .. } if *lineage == self.lineage)
         {
             return Ok(());
@@ -178,14 +176,19 @@ impl<I> AcceptedItemEvent<I> {
         })
     }
 
-    fn is_predecessor_parent(&self, parent: &CanonicalEventId) -> bool {
-        match (parent, &self.predecessor) {
+    fn is_predecessor_parent(
+        &self,
+        parent: &CanonicalEventId,
+    ) -> Result<bool, ReplicationProtocolError> {
+        Ok(match (parent, &self.predecessor) {
             (CanonicalEventId::Origin(parent), Some(VersionIdentity::Mutation(version))) => {
                 parent == version
             }
-            (CanonicalEventId::Expiration { victim, .. }, Some(version)) => victim == version,
+            (CanonicalEventId::Expiration { .. }, Some(version)) => {
+                &version.expiration_id()? == parent
+            }
             _ => false,
-        }
+        })
     }
 
     fn require_observations(&self) -> Result<(), ReplicationProtocolError> {

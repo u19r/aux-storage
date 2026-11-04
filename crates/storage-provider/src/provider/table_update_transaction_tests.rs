@@ -1,16 +1,17 @@
 use storage_types::{
-    IndexName, MaxIndexers, SemanticDecision, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, TableName, TableStatus, TimestampMillis, UpdateTableRequest,
+    BoundTableInfo, IndexName, MaxIndexers, SemanticDecision, StorageError, StorageResult,
+    StoredTableInfo, StreamRetentionDuration, TableName, TableStatus, TimestampMillis,
+    UpdateTableRequest,
 };
 
 use super::{
     GsiReadinessSnapshot,
     table_update_transaction::{TableUpdateChange, TableUpdateRetention, TableUpdateTransaction},
 };
-use crate::{StreamTrimScope, StreamTrimState, plan_table_stream_duration};
+use crate::{StreamTrimState, plan_table_stream_duration};
 
 struct ObservedUpdate {
-    table: StoredTableInfo,
+    table: BoundTableInfo,
     retention: Option<StreamTrimState>,
     calls: Vec<&'static str>,
     fail_persist: bool,
@@ -21,22 +22,33 @@ struct ObservedUpdate {
 impl ObservedUpdate {
     fn new() -> Self {
         Self {
-            table: StoredTableInfo {
-                table_name: TableName::new("table-update"),
-                table_status: TableStatus::Active,
-                created_at: TimestampMillis::from_timestamp(0),
-                attribute_definitions: vec![],
-                key_schema: vec![],
-                max_indexers: MaxIndexers::try_new(2).unwrap(),
-                global_secondary_indexes: None,
-                table_size_bytes: 0,
-                item_count: 0,
-                stream_specification: None,
-                table_stream_duration: StreamRetentionDuration::FiniteHours(1),
-                default_item_stream_duration: StreamRetentionDuration::Forever,
-                deletion_protection_enabled: false,
+            table: BoundTableInfo {
+                history_id: 1_u32.into(),
+                info: std::sync::Arc::new(StoredTableInfo {
+                    table_name: TableName::new("table-update"),
+                    table_status: TableStatus::Active,
+                    created_at: TimestampMillis::from_timestamp(0),
+                    attribute_definitions: vec![],
+                    key_schema: vec![],
+                    max_indexers: MaxIndexers::try_new(2).unwrap(),
+                    global_secondary_indexes: None,
+                    table_size_bytes: 0,
+                    item_count: 0,
+                    stream_specification: None,
+                    table_stream_duration: StreamRetentionDuration::from_hours(24).unwrap(),
+                    deletion_protection_enabled: false,
+                }),
             },
-            retention: None,
+            retention: Some(
+                plan_table_stream_duration(
+                    crate::retention_test_support::scope("table-update"),
+                    crate::retention_test_support::frontier(1),
+                    StreamRetentionDuration::from_hours(24).unwrap(),
+                    TimestampMillis::from_timestamp(0),
+                )
+                .unwrap()
+                .state,
+            ),
             calls: Vec::new(),
             fail_persist: false,
             rejected: false,
@@ -54,30 +66,28 @@ impl ObservedUpdate {
 }
 
 impl TableUpdateTransaction for ObservedUpdate {
-    type Catalog = StoredTableInfo;
-
     async fn observe_table_update(
         &mut self,
         _: &TableName,
-    ) -> StorageResult<Option<StoredTableInfo>> {
+    ) -> StorageResult<Option<BoundTableInfo>> {
         self.calls.push("metadata");
         Ok(Some(self.table.clone()))
     }
 
     async fn observe_table_retention(
         &mut self,
-        catalog: &StoredTableInfo,
+        catalog: &BoundTableInfo,
     ) -> StorageResult<TableUpdateRetention> {
         self.calls.push("retention");
         Ok(TableUpdateRetention {
-            scope: StreamTrimScope::table("table-scope", catalog.table_name.clone()),
+            scope: crate::retention_test_support::scope(catalog.table_name.as_ref()),
             state: self.retention.clone(),
         })
     }
 
     async fn load_index_name_lock(
         &mut self,
-        _: &StoredTableInfo,
+        _: &BoundTableInfo,
         _: &IndexName,
     ) -> StorageResult<Option<TimestampMillis>> {
         self.calls.push("name-lock");
@@ -86,15 +96,15 @@ impl TableUpdateTransaction for ObservedUpdate {
 
     async fn persist_table_update(
         &mut self,
-        _: StoredTableInfo,
+        _: BoundTableInfo,
         change: TableUpdateChange,
-    ) -> StorageResult<StoredTableInfo> {
+    ) -> StorageResult<BoundTableInfo> {
         self.calls.push("persist");
         if self.fail_persist {
             return Err(StorageError::internal("injected persistence failure"));
         }
         let (table, retention, _) = change.into_parts();
-        self.table = table.next_table;
+        self.table.info = std::sync::Arc::new(table.next_table);
         if let Some(write) = retention {
             self.retention = Some(write.state);
         }
@@ -103,7 +113,7 @@ impl TableUpdateTransaction for ObservedUpdate {
 
     async fn observe_table_update_readiness(
         &mut self,
-        _: &StoredTableInfo,
+        _: &BoundTableInfo,
     ) -> StorageResult<GsiReadinessSnapshot> {
         self.calls.push("readiness");
         Ok(GsiReadinessSnapshot::from(std::mem::take(
@@ -116,10 +126,14 @@ impl TableUpdateTransaction for ObservedUpdate {
 async fn given_inactive_table_when_settings_change_then_reject_before_effects() {
     let mut operation = ObservedUpdate::new();
     operation.table.table_status = TableStatus::Updating;
-    let request = operation.request(Some(7));
+    let request = operation.request(Some(48));
     assert!(matches!(
         operation
-            .execute_table_update(&request, TimestampMillis::now())
+            .execute_table_update(
+                &request,
+                TimestampMillis::now(),
+                &crate::RequestTableBindings::default()
+            )
             .await,
         Ok(SemanticDecision::Rejected(_))
     ));
@@ -129,11 +143,15 @@ async fn given_inactive_table_when_settings_change_then_reject_before_effects() 
 #[tokio::test]
 async fn given_lower_capacity_when_retention_changes_then_reject_before_effects() {
     let mut operation = ObservedUpdate::new();
-    let mut request = operation.request(Some(7));
+    let mut request = operation.request(Some(48));
     request.max_indexers = Some(MaxIndexers::try_new(1).unwrap());
     assert!(matches!(
         operation
-            .execute_table_update(&request, TimestampMillis::now())
+            .execute_table_update(
+                &request,
+                TimestampMillis::now(),
+                &crate::RequestTableBindings::default()
+            )
             .await,
         Ok(SemanticDecision::Rejected(_))
     ));
@@ -145,7 +163,11 @@ async fn given_no_duration_request_when_settings_change_then_retention_is_not_ob
     let mut operation = ObservedUpdate::new();
     let request = operation.request(None);
     let (_, response) = operation
-        .execute_table_update(&request, TimestampMillis::now())
+        .execute_table_update(
+            &request,
+            TimestampMillis::now(),
+            &crate::RequestTableBindings::default(),
+        )
         .await
         .and_then(|decision| decision.into_result())
         .unwrap();
@@ -157,18 +179,30 @@ async fn given_no_duration_request_when_settings_change_then_retention_is_not_ob
 #[tokio::test]
 async fn given_repeated_duration_when_updated_then_generation_advances_with_captured_time() {
     let mut operation = ObservedUpdate::new();
-    let request = operation.request(Some(1));
+    let request = operation.request(Some(24));
     let captured = TimestampMillis::from_timestamp(17_000);
-    for generation in 1..=3 {
+    let frontier = &mut operation.retention.as_mut().unwrap().frontier;
+    frontier.lineages[0].retired_through =
+        Some(storage_types::SystemStreamOffset::try_new("12").unwrap());
+    frontier.lineages[0].cleaned_through =
+        Some(storage_types::SystemStreamOffset::try_new("9").unwrap());
+    let original = frontier.clone();
+    for generation in 2..=4 {
         operation
-            .execute_table_update(&request, captured)
+            .execute_table_update(&request, captured, &crate::RequestTableBindings::default())
             .await
             .and_then(|decision| decision.into_result())
             .unwrap();
         let state = operation.retention.as_ref().unwrap();
         assert_eq!(state.policy_version, generation);
+        assert_eq!(state.frontier.table_policy_version.get(), generation);
+        assert_eq!(state.frontier.source_scope, original.source_scope);
+        assert_eq!(state.frontier.lineages, original.lineages);
         assert_eq!(state.updated_at, captured);
-        assert_eq!(state.retention, StreamRetentionDuration::FiniteHours(1));
+        assert_eq!(
+            state.retention,
+            StreamRetentionDuration::from_hours(24).unwrap()
+        );
     }
 }
 
@@ -177,19 +211,22 @@ async fn given_generation_overflow_when_updated_then_no_effects_are_persisted() 
     let mut operation = ObservedUpdate::new();
     operation.retention = Some(
         plan_table_stream_duration(
-            operation.table.table_name.clone(),
-            "table-scope",
-            u64::MAX,
-            StreamRetentionDuration::FiniteHours(1),
-            StreamRetentionDuration::Forever,
+            crate::retention_test_support::scope("table-update"),
+            crate::retention_test_support::frontier(u64::MAX),
+            StreamRetentionDuration::from_hours(24).unwrap(),
             TimestampMillis::from_timestamp(0),
         )
-        .trim_state,
+        .unwrap()
+        .state,
     );
-    let request = operation.request(Some(7));
+    let request = operation.request(Some(48));
     assert!(
         operation
-            .execute_table_update(&request, TimestampMillis::now())
+            .execute_table_update(
+                &request,
+                TimestampMillis::now(),
+                &crate::RequestTableBindings::default()
+            )
             .await
             .is_err()
     );
@@ -201,10 +238,14 @@ async fn given_generation_overflow_when_updated_then_no_effects_are_persisted() 
 async fn given_persistence_failure_when_updated_then_no_response_observation_follows() {
     let mut operation = ObservedUpdate::new();
     operation.fail_persist = true;
-    let request = operation.request(Some(7));
+    let request = operation.request(Some(48));
     assert!(
         operation
-            .execute_table_update(&request, TimestampMillis::now())
+            .execute_table_update(
+                &request,
+                TimestampMillis::now(),
+                &crate::RequestTableBindings::default()
+            )
             .await
             .is_err()
     );
@@ -239,7 +280,11 @@ async fn given_unordered_readiness_when_updated_then_response_matches_index_iden
     ];
     let request = operation.request(None);
     let (_, response) = operation
-        .execute_table_update(&request, TimestampMillis::now())
+        .execute_table_update(
+            &request,
+            TimestampMillis::now(),
+            &crate::RequestTableBindings::default(),
+        )
         .await
         .and_then(|decision| decision.into_result())
         .unwrap();
@@ -266,7 +311,11 @@ async fn given_missing_readiness_when_updated_then_no_success_response_is_return
     let request = operation.request(None);
     assert!(
         operation
-            .execute_table_update(&request, TimestampMillis::now())
+            .execute_table_update(
+                &request,
+                TimestampMillis::now(),
+                &crate::RequestTableBindings::default()
+            )
             .await
             .is_err()
     );
@@ -279,12 +328,16 @@ async fn given_replica_update_with_settings_when_executed_then_reject_before_eff
     let request = serde_json::from_value(serde_json::json!({
         "TableName": operation.table.table_name,
         "DeletionProtectionEnabled": true,
-        "AuxStreamDurationHours": 7,
+        "AuxStreamDurationHours": 48,
         "ReplicaUpdates": [{"Create": {"RegionName": "us-east-2"}}]
     }))
     .unwrap();
     let error = operation
-        .execute_table_update(&request, TimestampMillis::now())
+        .execute_table_update(
+            &request,
+            TimestampMillis::now(),
+            &crate::RequestTableBindings::default(),
+        )
         .await
         .and_then(|decision| decision.into_result())
         .unwrap_err();
@@ -294,7 +347,7 @@ async fn given_replica_update_with_settings_when_executed_then_reject_before_eff
     );
     assert!(operation.calls.is_empty());
     assert!(!operation.table.deletion_protection_enabled);
-    assert!(operation.retention.is_none());
+    assert_eq!(operation.retention.as_ref().unwrap().policy_version, 1);
 }
 
 // These deterministic policy fixtures do not model native durability.
@@ -313,6 +366,14 @@ impl infrastructure_provider::physical_attempt::PhysicalRecordAttempt for Observ
         _: &str,
         _: storage_types::ReadProtection,
     ) -> StorageResult<bool> {
+        panic!("policy model must not access protected physical records")
+    }
+    async fn find_record_generation(
+        &mut self,
+        _: &infrastructure_provider::record::DurableRecordKey,
+        _: u64,
+        _: storage_types::ReadProtection,
+    ) -> StorageResult<Option<u64>> {
         panic!("policy model must not access protected physical records")
     }
     async fn load_records(
@@ -336,4 +397,32 @@ impl infrastructure_provider::physical_attempt::PhysicalRecordAttempt for Observ
     ) -> StorageResult<infrastructure_provider::record::ConditionalWriteResult> {
         panic!("policy model must not access protected physical records")
     }
+}
+
+#[tokio::test]
+async fn given_update_abort_when_name_is_recreated_then_retry_stops_before_effects() {
+    let mut operation = ObservedUpdate::new();
+    let request = operation.request(Some(48));
+    let bindings = crate::RequestTableBindings::default();
+    operation.fail_persist = true;
+    assert!(
+        operation
+            .execute_table_update(&request, TimestampMillis::now(), &bindings)
+            .await
+            .is_err()
+    );
+    assert!(operation.calls.contains(&"persist"));
+    operation.calls.clear();
+    operation.fail_persist = false;
+    operation.table.history_id = 2_u32.into();
+    let error = operation
+        .execute_table_update(&request, TimestampMillis::now(), &bindings.clone())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(
+        storage_types::context::WrappedError::to_enum(&error),
+        storage_types::StorageEnum::TableNotFound { .. }
+    ));
+    assert_eq!(operation.calls, ["metadata"]);
 }

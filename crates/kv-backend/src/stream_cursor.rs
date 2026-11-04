@@ -1,14 +1,10 @@
 //! One ordered cursor key layout shared by RocksDB and FoundationDB.
 
-use std::num::NonZeroU32;
-
 use storage_types::{StorageError, StorageResult, StreamItemId, StreamName, storage_serde};
-use stream_provider::{CursorName, MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS, StreamCursor};
+use stream_provider::{CursorName, StreamCursor};
 
 use crate::{
-    KvAttempt, KvMutation, KvRange, ReadProtection,
-    constants::{STREAM_CURSOR_PREFIX, STREAM_READ_BYTES},
-    range::prefix_upper_bound,
+    KvAttempt, KvMutation, ReadProtection, constants::STREAM_CURSOR_PREFIX,
     stream_write::key_layout::append_segment,
 };
 
@@ -29,47 +25,6 @@ pub(crate) async fn read_cursor<A: KvAttempt>(
             Ok(cursor)
         })
         .transpose()
-}
-
-pub(crate) async fn list_system_cursors<A: KvAttempt>(
-    native: &mut A,
-    protection: ReadProtection,
-) -> StorageResult<Vec<StreamCursor>> {
-    let stream_name = StreamName::system_table_stream();
-    let prefix = cursor_stream_prefix(&stream_name)?;
-    let end = prefix_upper_bound(&prefix)
-        .ok_or_else(|| StorageError::internal("KV System cursor prefix has no upper bound"))?;
-    let page = native
-        .scan(
-            KvRange {
-                entry_bounds: None,
-                begin: prefix,
-                end,
-                reverse: false,
-                limit: NonZeroU32::new(MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS + 1)
-                    .ok_or_else(|| StorageError::internal("System cursor scan bound is zero"))?,
-                max_bytes: STREAM_READ_BYTES,
-            },
-            protection,
-        )
-        .await?;
-    if page.more || page.entries.len() > MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS as usize {
-        return Err(StorageError::unsupported(
-            "System cursor scan exceeds its bound",
-        ));
-    }
-    page.entries
-        .into_iter()
-        .map(|entry| {
-            let cursor: StreamCursor = storage_serde::from_bytes(&entry.value)?;
-            if cursor.stream_name != stream_name
-                || cursor_key(&cursor.stream_name, &cursor.name)? != entry.key
-            {
-                return Err(StorageError::internal("KV System cursor identity differs"));
-            }
-            Ok(cursor)
-        })
-        .collect()
 }
 
 pub(crate) async fn write_cursor<A: KvAttempt>(
@@ -102,7 +57,7 @@ fn cursor_key(stream_name: &StreamName, cursor_name: &CursorName) -> StorageResu
     Ok(key)
 }
 
-fn cursor_stream_prefix(stream_name: &StreamName) -> StorageResult<Vec<u8>> {
+pub(crate) fn cursor_stream_prefix(stream_name: &StreamName) -> StorageResult<Vec<u8>> {
     let mut key = STREAM_CURSOR_PREFIX.to_vec();
     append_segment(&mut key, stream_name.as_ref())?;
     Ok(key)

@@ -150,7 +150,10 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
 
-    fn reader_expiry_key(&self, entry: ReaderExpiryEntry) -> StorageResult<DurableRecordKey> {
+    pub(super) fn reader_expiry_key(
+        &self,
+        entry: ReaderExpiryEntry,
+    ) -> StorageResult<DurableRecordKey> {
         let mut suffix = crate::constants::READER_EXPIRY_SUFFIX.to_vec();
         suffix.extend_from_slice(&(entry.deadline.timestamp_millis() ^ i64::MIN).to_be_bytes());
         suffix.push(match entry.reference.kind {

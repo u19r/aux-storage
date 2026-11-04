@@ -17,8 +17,10 @@ impl DatabaseManager {
         if self.single_table_mode_enabled() {
             stamp_batch_write_request(&mut request)?;
         }
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("batch_write_item", dynamo.batch_write_item(request)).await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation("batch_write_item", async move {
+                dynamo.batch_write_item(request).await
+            })
         })
         .await
     }

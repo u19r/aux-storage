@@ -1,8 +1,7 @@
 //! SQL checkpoint lookup within the caller's coherent native attempt.
 
 use storage_types::{
-    ReadProtection, StorageError, StorageResult, SystemStreamCheckpointToken, SystemStreamPosition,
-    storage_serde,
+    ReadProtection, StorageError, StorageResult, SystemStreamCheckpointToken, storage_serde,
 };
 use stream_provider::{
     SystemStreamCheckpointLookup, SystemStreamCheckpointReceipt, SystemStreamHistory,
@@ -67,47 +66,6 @@ pub(crate) async fn read_receipt<A: SqlAttempt>(
         SystemStreamCheckpointLookup::Operation(key) => sql_statements::by_operation(engine, key),
     };
     load_receipt(attempt, statement).await
-}
-
-pub(crate) fn decode_protected_frontiers(
-    page: SqlQueryPage,
-) -> StorageResult<Vec<SystemStreamPosition>> {
-    if page.more || page.rows.len() > storage_types::SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES {
-        return Err(StorageError::internal(
-            "SQL SystemStream frontier exceeds its bound",
-        ));
-    }
-    page.rows
-        .into_iter()
-        .map(|row| {
-            let [shard, lineage, order, offset]: [SqlValue; 4] = row
-                .into_values()
-                .try_into()
-                .map_err(|_| invalid_frontier())?;
-            let (
-                SqlValue::Text(shard),
-                SqlValue::Text(lineage),
-                SqlValue::Blob(order),
-                SqlValue::Text(offset),
-            ) = (shard, lineage, order, offset)
-            else {
-                return Err(invalid_frontier());
-            };
-            let order: [u8; 8] = order.try_into().map_err(|_| invalid_frontier())?;
-            let position = SystemStreamPosition::try_new(shard, lineage, offset)
-                .map_err(|_| invalid_frontier())?;
-            if position.offset().order().map_err(|_| invalid_frontier())?
-                != u64::from_be_bytes(order)
-            {
-                return Err(invalid_frontier());
-            }
-            Ok(position)
-        })
-        .collect()
-}
-
-fn invalid_frontier() -> StorageError {
-    StorageError::internal("SQL SystemStream protected frontier is invalid")
 }
 
 async fn load_receipt<A: SqlAttempt>(

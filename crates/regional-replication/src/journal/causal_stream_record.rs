@@ -21,6 +21,7 @@ use crate::{
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CausalStreamRecord {
+    pub(super) physical: storage_types::TableHistoryId,
     pub operation: CanonicalCausalStreamId,
     pub scope: CanonicalViewCursor,
     pub portable: CanonicalCheckpointId,
@@ -38,6 +39,7 @@ impl CausalStreamRecord {
         bounds: &super::history_checkpoint::ReceiverCheckpointBounds,
     ) -> StorageResult<Self> {
         Ok(Self {
+            physical: bounds.physical,
             operation: request.causal_stream,
             scope: bounds.scope.clone(),
             portable: request.portable_checkpoint,
@@ -55,7 +57,8 @@ impl CausalStreamRecord {
         request: &CanonicalCausalStreamRequest,
         bounds: &super::history_checkpoint::ReceiverCheckpointBounds,
     ) -> StorageResult<()> {
-        if self.operation != request.causal_stream
+        if self.physical != bounds.physical
+            || self.operation != request.causal_stream
             || self.scope != bounds.scope
             || self.portable != request.portable_checkpoint
             || self.head != bounds.high
@@ -103,22 +106,34 @@ pub(super) struct CausalVisit {
 impl JournalStore {
     pub(super) fn causal_stack_key(
         &self,
-        stream: CanonicalCausalStreamId,
+        stream: (storage_types::TableHistoryId, CanonicalCausalStreamId),
         depth: u64,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(crate::constants::CAUSAL_STACK_SUFFIX, &(stream, depth))
+        self.table_identity_key(
+            crate::constants::CAUSAL_STACK_SUFFIX,
+            stream.0,
+            &(stream.1, depth),
+        )
     }
     pub(super) fn causal_visit_key(
         &self,
-        stream: CanonicalCausalStreamId,
+        stream: (storage_types::TableHistoryId, CanonicalCausalStreamId),
         event: &CanonicalEventId,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(crate::constants::CAUSAL_VISITED_SUFFIX, &(stream, event))
+        self.table_identity_key(
+            crate::constants::CAUSAL_VISITED_SUFFIX,
+            stream.0,
+            &(stream.1, event),
+        )
     }
     pub(super) async fn load_causal_visit<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        scope: (CanonicalCausalStreamId, &CanonicalEventId, CanonicalDigest),
+        scope: (
+            (storage_types::TableHistoryId, CanonicalCausalStreamId),
+            &CanonicalEventId,
+            CanonicalDigest,
+        ),
     ) -> StorageResult<Option<(DurableRecord, CausalVisit)>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -140,7 +155,7 @@ impl JournalStore {
             };
             let visit: CausalVisit = self.records.decode(&row)?;
             if row.key != key
-                || visit.operation != scope.0
+                || visit.operation != scope.0.1
                 || visit.event != *scope.1
                 || visit.digest != scope.2
             {
@@ -154,7 +169,10 @@ impl JournalStore {
     pub(super) async fn load_causal_stack<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        scope: (CanonicalCausalStreamId, u64),
+        scope: (
+            (storage_types::TableHistoryId, CanonicalCausalStreamId),
+            u64,
+        ),
     ) -> StorageResult<(DurableRecord, CausalStackFrame)> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -175,7 +193,7 @@ impl JournalStore {
             let frame: CausalStackFrame = self.records.decode(&row)?;
             if scope.1 == 0
                 || row.key != key
-                || frame.operation != scope.0
+                || frame.operation != scope.0.1
                 || frame.depth != scope.1
             {
                 return Err(corrupt_record());
@@ -205,12 +223,12 @@ impl JournalStore {
         };
         Ok([
             self.records.prepare(
-                self.causal_visit_key(stream.operation, &visit.event)?,
+                self.causal_visit_key((stream.physical, stream.operation), &visit.event)?,
                 None,
                 &visit,
             )?,
             self.records.prepare(
-                self.causal_stack_key(stream.operation, depth)?,
+                self.causal_stack_key((stream.physical, stream.operation), depth)?,
                 None,
                 &frame,
             )?,

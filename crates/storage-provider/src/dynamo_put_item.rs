@@ -10,14 +10,13 @@ use storage_common::{TtlConfigRecord, TtlIndexWrite, TtlIndexWriteBatch};
 use storage_types::{
     AllOld, AttributeMap, BoundTableInfo, IndexerDeclaration, ItemProvenance, ItemRevision,
     KeyAttributes, LogicalItemSize, PutItemRequest, StorageEnum, StorageError, StorageResult,
-    StoredWireItem, StreamRetentionDuration, TableName, WireItem,
-    return_values_on_condition_check_failure_all_old, validate_transact_put_item_key,
+    StoredWireItem, TableName, WireItem, return_values_on_condition_check_failure_all_old,
+    validate_transact_put_item_key,
 };
 
 use crate::{
     DescribeTimeToLiveAttempt, DynamoStreamWriteAttempt, ItemPrimaryEffects, SemanticDecision,
-    StreamTrimScope, StreamTrimState, TableMetadataCache, TtlPolicyLookup, UncheckedCondition,
-    key_attributes_from_item,
+    TableMetadataCache, TtlPolicyLookup, UncheckedCondition, key_attributes_from_item,
 };
 
 /// The native write attempt returns one durable state, including a deleted
@@ -173,15 +172,18 @@ impl ObservedWrite {
 
 /// The family lowerer protects the item and its revision authority inside
 /// the write attempt already opened by its driver.
+#[derive(Clone, Copy)]
+pub struct ItemWritePrerequisites {
+    pub needs_ttl: bool,
+    pub needs_history: bool,
+}
+
 pub trait ItemWriteObservationAttempt: DescribeTimeToLiveAttempt {
-    /// Observe independent TTL policy and retention state in one native read
-    /// wave where the driver supports batched reads.
+    /// Observe live-item TTL policy and stream routing in one native read wave.
     fn prepare_item_write(
         &mut self,
         table: &BoundTableInfo,
-        retention_scope: Option<&StreamTrimScope>,
-    ) -> impl Future<Output = StorageResult<(Option<TtlConfigRecord>, Option<StreamTrimState>)>> + Send
-    {
+    ) -> impl Future<Output = StorageResult<Option<TtlConfigRecord>>> + Send {
         async move {
             let ttl_lookup = self
                 .item_write_cache()
@@ -189,8 +191,14 @@ pub trait ItemWriteObservationAttempt: DescribeTimeToLiveAttempt {
                     cache.lookup_ttl_policy(table)
                 });
             let needs_ttl = matches!(ttl_lookup, TtlPolicyLookup::Miss(_));
-            let (loaded_ttl, retention) = self
-                .read_item_write_prerequisites(table, retention_scope, needs_ttl)
+            let loaded_ttl = self
+                .read_item_write_prerequisites(
+                    table,
+                    ItemWritePrerequisites {
+                        needs_ttl,
+                        needs_history: table.info.requires_stream_entry(),
+                    },
+                )
                 .await?;
             let ttl = match ttl_lookup {
                 TtlPolicyLookup::Hit(config) => config,
@@ -201,7 +209,7 @@ pub trait ItemWriteObservationAttempt: DescribeTimeToLiveAttempt {
                     loaded_ttl
                 }
             };
-            Ok((ttl, retention))
+            Ok(ttl)
         }
     }
 
@@ -210,9 +218,8 @@ pub trait ItemWriteObservationAttempt: DescribeTimeToLiveAttempt {
     fn read_item_write_prerequisites(
         &mut self,
         table: &BoundTableInfo,
-        retention_scope: Option<&StreamTrimScope>,
-        needs_ttl: bool,
-    ) -> impl Future<Output = StorageResult<(Option<TtlConfigRecord>, Option<StreamTrimState>)>> + Send;
+        prerequisites: ItemWritePrerequisites,
+    ) -> impl Future<Output = StorageResult<Option<TtlConfigRecord>>> + Send;
 
     /// Observe the item and mutable GSI state under the same native attempt.
     /// The family batches their physical reads into one driver request. The
@@ -285,7 +292,6 @@ pub struct PutItemShape {
     condition: Option<UncheckedCondition>,
     return_old: bool,
     return_old_on_condition_failure: bool,
-    item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl PutItemShape {
@@ -319,7 +325,6 @@ impl PutItemShape {
             return_old_on_condition_failure: return_values_on_condition_check_failure_all_old(
                 request.return_values_on_condition_check_failure.as_ref(),
             ),
-            item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
         })
     }
 
@@ -344,18 +349,12 @@ impl PutItemShape {
         storage_types::IndexedWireItem::validate_logical_item(&attributes, &declaration)?;
         let prepared_gsi =
             storage_backfill::PreparedGsiPut::try_new(&table.info, &self.item, &declaration)?;
-        let route = stream_provider::DynamoMutationRoute::try_new(
-            &table.info.table_name,
-            &table.info.key_schema,
-            &key,
-        )?;
-        let stream_image =
-            stream_provider::PreparedStreamImage::try_new(&route, self.item.clone())?;
+        let history =
+            crate::dynamo_write_execution::PreparedItemHistory::try_new(&table, &key, &self.item)?;
         let ttl = storage_common::PreparedTtlPut::try_new(&table.info, ttl_config, &self.item)?;
         Ok(BoundPutItem {
+            history,
             ttl,
-            stream_image,
-            route,
             prepared_gsi,
             table,
             key,
@@ -365,7 +364,6 @@ impl PutItemShape {
             condition: self.condition,
             return_old: self.return_old,
             return_old_on_condition_failure: self.return_old_on_condition_failure,
-            item_stream_ttl_hours: self.item_stream_ttl_hours,
         })
     }
 }
@@ -373,9 +371,8 @@ impl PutItemShape {
 /// Validated logical PutItem. A family lowerer protects and reads its current
 /// item before this value evaluates the condition.
 pub struct BoundPutItem {
+    history: Option<crate::dynamo_write_execution::PreparedItemHistory>,
     ttl: storage_common::PreparedTtlPut,
-    stream_image: stream_provider::PreparedStreamImage,
-    route: stream_provider::DynamoMutationRoute,
     prepared_gsi: storage_backfill::PreparedGsiPut,
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
@@ -385,7 +382,6 @@ pub struct BoundPutItem {
     condition: Option<UncheckedCondition>,
     return_old: bool,
     return_old_on_condition_failure: bool,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl BoundPutItem {
@@ -410,9 +406,8 @@ impl BoundPutItem {
         }
         Ok(SemanticDecision::Accepted((
             AcceptedUpsert {
+                history: self.history,
                 ttl: UpsertTtlPreparation::NewItem(self.ttl),
-                stream_image: self.stream_image,
-                route: self.route,
                 table: self.table,
                 key: self.key,
                 new_item: self.new_item,
@@ -423,7 +418,6 @@ impl BoundPutItem {
                 old_revision: old.revision,
                 old_provenance: old.provenance,
                 old_ttl_epoch: old.ttl_epoch,
-                item_stream_ttl_hours: self.item_stream_ttl_hours,
                 gsi_lifecycle: lifecycle,
                 prepared_gsi: self.prepared_gsi,
             },
@@ -440,9 +434,8 @@ pub(crate) enum UpsertTtlPreparation {
 }
 
 pub struct AcceptedUpsert {
+    pub(crate) history: Option<crate::dynamo_write_execution::PreparedItemHistory>,
     pub(crate) ttl: UpsertTtlPreparation,
-    pub(crate) stream_image: stream_provider::PreparedStreamImage,
-    pub(crate) route: stream_provider::DynamoMutationRoute,
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
     pub new_item: WireItem,
@@ -453,7 +446,6 @@ pub struct AcceptedUpsert {
     pub old_revision: Option<ItemRevision>,
     pub old_provenance: Option<ItemProvenance>,
     pub old_ttl_epoch: Option<i64>,
-    pub item_stream_ttl_hours: Option<StreamRetentionDuration>,
     pub(crate) gsi_lifecycle: GsiProjectionLifecycle,
     pub(crate) prepared_gsi: storage_backfill::PreparedGsiPut,
 }

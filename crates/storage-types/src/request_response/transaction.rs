@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeMap, KeyAttributes, ReturnConsumedCapacity, StreamRetentionDuration, TableName,
-    TransactDeleteRequest, TransactPutRequest,
+    AttributeMap, KeyAttributes, ReturnConsumedCapacity, TableName, TransactDeleteRequest,
+    TransactPutRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
@@ -63,13 +63,6 @@ pub struct TransactUpdateRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_values_on_condition_check_failure: Option<String>,
-
-    /// Aux-storage extension: item stream retention duration in hours.
-    #[serde(
-        rename = "AuxItemStreamTtlHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

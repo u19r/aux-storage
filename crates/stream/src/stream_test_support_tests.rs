@@ -156,12 +156,14 @@ fn rocksdb_config(temporary_directory: &TempDir) -> StorageConfig {
     feature = "foundationdb"
 ))]
 fn foundationdb_config(temporary_directory: &TempDir) -> StorageConfig {
+    let cluster_file = std::env::var("FDB_CLUSTER_FILE")
+        .expect("FoundationDB stream tests require an owned FDB_CLUSTER_FILE");
     let prefix = format!("stream-tests/{}/", directory_token(temporary_directory));
     config_for_path(
         StorageBackend::FoundationDb,
-        std::path::PathBuf::from("/usr/local/etc/foundationdb/fdb.cluster"),
+        std::path::PathBuf::from(&cluster_file),
         Some(FoundationDbSettings {
-            cluster_file: Some("/usr/local/etc/foundationdb/fdb.cluster".to_string()),
+            cluster_file: Some(cluster_file),
             subspace_prefix: Some(prefix),
             ..FoundationDbSettings::default()
         }),

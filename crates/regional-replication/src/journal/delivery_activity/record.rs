@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub(in crate::journal) struct DeliveryActivity {
     pub table: TableIdentity,
+    pub physical: storage_types::TableHistoryId,
     pub lineage: TableLineage,
     pub source_table: TableIdentity,
     pub origin: OriginId,

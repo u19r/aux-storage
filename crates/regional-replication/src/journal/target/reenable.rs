@@ -311,7 +311,7 @@ impl JournalStore {
     }
 
     pub(super) async fn verify_target_retained_history<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -385,7 +385,7 @@ impl JournalStore {
             let terminal = self
                 .load_history_terminal_manifest(
                     attempt,
-                    (&selection, selected.through),
+                    (root.state.physical, &selection, selected.through),
                     (encoding.1, encoding.0),
                 )
                 .await?;

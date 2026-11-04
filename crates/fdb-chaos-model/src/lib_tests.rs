@@ -4,8 +4,8 @@ use crate::{
     ARTIFACT_SCHEMA_VERSION, BackgroundLeaseEvent, GsiEntry, GsiIndexModel, HistoryEvent,
     OperationHistory, OperationKind, OperationOutcome, PossibleTableModel, SharedKeyAudit,
     SharedKeyRead, SimulationRunMetadata, SimulationRunMetadataInput, TableModel,
-    TrimProviderSnapshot, TrimScopeExpectation, TrimScopeReport, TrimStateModel,
-    check_aggregate_trim_scopes, check_background_lease_events, check_shared_key_audits,
+    TrimProviderSnapshot, TrimScopeReport, check_aggregate_trim_scopes,
+    check_background_lease_events, check_shared_key_audits,
 };
 
 #[test]
@@ -148,18 +148,6 @@ fn operation_history_exports_json_lines() {
 }
 
 #[test]
-fn operation_error_classifier_preserves_unknown_commits() {
-    assert!(matches!(
-        crate::classify_operation_error("commit_unknown_result"),
-        OperationOutcome::Unknown { .. }
-    ));
-    assert!(matches!(
-        crate::classify_operation_error("not_committed"),
-        OperationOutcome::Failed { .. }
-    ));
-}
-
-#[test]
 fn possible_table_model_branches_unknown_writes() {
     let mut model = PossibleTableModel::default();
     model.apply(&HistoryEvent::new(
@@ -262,78 +250,26 @@ fn gsi_index_model_rewrites_membership_exactly() {
 }
 
 #[test]
-fn trim_state_model_separates_classified_and_unclassified_scopes() {
-    let mut model = TrimStateModel::default();
-    let table = TrimScopeExpectation::table("orders".to_string());
-    let item = TrimScopeExpectation::item("orders#1".to_string());
-    model.expect_scope(table.clone());
-    model.expect_scope(item.clone());
-    model.unclassify(item);
-
-    assert_eq!(model.classified_scopes(), vec![table]);
-    assert_eq!(model.unclassified_count(), 1);
-}
-
-#[test]
-fn aggregate_trim_checker_accepts_merged_client_scope_exactness() {
-    let report_0 = TrimScopeReport::new(
-        0,
-        vec![
-            TrimScopeExpectation::table("orders".to_string()),
-            TrimScopeExpectation::item("scope-a".to_string()),
-        ],
-        vec![],
-    );
-    let report_1 = TrimScopeReport::new(
-        1,
-        vec![
-            TrimScopeExpectation::table("orders".to_string()),
-            TrimScopeExpectation::item("scope-b".to_string()),
-        ],
-        vec![],
-    );
-    let snapshot = TrimProviderSnapshot::new(
-        0,
-        vec!["kv-table-id:1".to_string()],
-        vec!["scope-a".to_string(), "scope-b".to_string()],
-    );
-
-    let check = check_aggregate_trim_scopes(&[report_0, report_1], &snapshot);
-
+fn given_shared_table_when_clients_report_then_one_exact_scope_is_required() {
+    let reports = [
+        TrimScopeReport::new(0, vec!["table:1".into()]),
+        TrimScopeReport::new(1, vec!["table:1".into()]),
+    ];
+    let snapshot = TrimProviderSnapshot::new(0, vec!["table:1".into()]);
+    let check = check_aggregate_trim_scopes(&reports, &snapshot);
     assert_eq!(check.checked_client_count, 2);
     assert_eq!(check.expected_table_scope_count, 1);
     assert_eq!(check.actual_table_scope_count, 1);
-    assert_eq!(check.expected_item_scope_count, 2);
-    assert_eq!(check.actual_item_scope_count, 2);
     assert_eq!(check.anomaly_count, 0);
 }
 
 #[test]
-fn aggregate_trim_checker_reports_missing_and_unexpected_item_scopes() {
-    let report = TrimScopeReport::new(
-        0,
-        vec![
-            TrimScopeExpectation::table("orders".to_string()),
-            TrimScopeExpectation::item("scope-a".to_string()),
-        ],
-        vec![TrimScopeExpectation::item("scope-unclassified".to_string())],
-    );
-    let snapshot = TrimProviderSnapshot::new(
-        0,
-        vec!["kv-table-id:1".to_string()],
-        vec![
-            "scope-unclassified".to_string(),
-            "scope-unexpected".to_string(),
-        ],
-    );
-
-    let check = check_aggregate_trim_scopes(&[report], &snapshot);
-
+fn given_replacement_id_when_scope_counts_match_then_identity_mismatch_is_reported() {
+    let reports = [TrimScopeReport::new(0, vec!["table:1".into()])];
+    let snapshot = TrimProviderSnapshot::new(0, vec!["table:2".into()]);
+    let check = check_aggregate_trim_scopes(&reports, &snapshot);
     assert_eq!(check.anomaly_count, 1);
-    assert_eq!(check.unclassified_item_scope_count, 1);
-    assert_eq!(check.anomalies[0].key, "stream-trim/item-scopes");
-    assert!(check.anomalies[0].detail.contains("missing_count=1"));
-    assert!(check.anomalies[0].detail.contains("unexpected_count=1"));
+    assert_eq!(check.anomalies[0].key, "stream-trim/table-scopes");
 }
 
 #[test]

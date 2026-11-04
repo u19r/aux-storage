@@ -47,7 +47,6 @@ struct Contract {
     phase: String,
     cursor: u64,
     high: u64,
-    pending: bool,
     scan: u64,
     hold: i64,
     rows: BTreeMap<i64, Row>,
@@ -93,7 +92,6 @@ impl Default for GsiDriver {
                 phase: "absent".into(),
                 cursor: 0,
                 high: 0,
-                pending: false,
                 scan: 0,
                 hold: -1,
                 before_rows: rows.clone(),
@@ -130,32 +128,19 @@ impl State<GsiDriver> for ModelState {
             state.phase,
             state.cursor,
             state.high,
-            state.pending,
             state.scan,
             state.hold,
         ) = match &driver.build {
-            None => ("absent".into(), 0, 0, false, 0, -1),
+            None => ("absent".into(), 0, 0, 0, -1),
             Some(build) => {
                 let retained = offset(build.state.required_stream_history());
-                let (phase, high, pending, scan) = match &build.state {
-                    GsiState::Scanning(s) => ("scanning", 0, false, s.after.unwrap_or(0)),
-                    GsiState::CatchingUp(s) => ("catching_up", offset(&s.high), false, 0),
-                    GsiState::Active(s) => (
-                        "active",
-                        s.pending_high.as_ref().map(offset).unwrap_or(retained),
-                        s.pending_high.is_some(),
-                        0,
-                    ),
-                    GsiState::Blocked(_) => ("blocked", 0, false, 0),
+                let (phase, high, scan) = match &build.state {
+                    GsiState::Scanning(s) => ("scanning", 0, s.after.unwrap_or(0)),
+                    GsiState::CatchingUp(s) => ("catching_up", offset(&s.high), 0),
+                    GsiState::Active(_) => ("active", retained, 0),
+                    GsiState::Blocked(_) => ("blocked", 0, 0),
                 };
-                (
-                    phase.into(),
-                    retained,
-                    high,
-                    pending,
-                    scan,
-                    i64::try_from(retained)?,
-                )
+                (phase.into(), retained, high, scan, i64::try_from(retained)?)
             }
         };
         Ok(Self { state })
@@ -309,11 +294,7 @@ impl GsiDriver {
 
     fn read_stream(&mut self, limit: u64) -> Result {
         self.begin("stream");
-        let high = if self.state.phase == "catching_up" || self.state.pending {
-            self.state.high
-        } else {
-            self.state.history.len() as u64
-        };
+        let high = self.state.high;
         let through = (self.state.cursor + limit).min(high);
         for effect in &self.state.history[self.state.cursor as usize..through as usize] {
             if effect.before >= 0 && effect.before != effect.after {
@@ -331,13 +312,8 @@ impl GsiDriver {
                 });
             }
         }
-        let mut reads = vec![];
-        if self.state.phase == "active" && !self.state.pending {
-            reads.push(Read::Tail);
-        }
-        reads.push(Read::Stream(self.state.cursor, high));
+        let reads = vec![Read::Stream(self.state.cursor, high)];
         let mut port = Observations::new(reads);
-        port.tail = self.state.history.len() as u64;
         let end = if through < high {
             GsiStreamPageEnd::Continue(checkpoint(through))
         } else {

@@ -24,6 +24,27 @@ pub(crate) fn derive_controller_seed(
     ))
 }
 
+/// Generation changes membership while the host namespace stays stable so
+/// accepted old journal input remains recoverable. Overflow fails closed.
+pub(crate) fn configured_controller_manifest(
+    configured: &replication_provider::runtime_configuration::deployment::DeploymentConfiguration,
+) -> Result<scheduled_bg_jobs::CatalogManifest, TransportError> {
+    let revision = u64::from(configured.journal_generation)
+        .checked_add(crate::constants::REGIONAL_CATALOG_REVISION_BASE)
+        .and_then(std::num::NonZeroU64::new)
+        .ok_or(TransportError::Configuration)?;
+    let seeds = crate::constants::REGIONAL_CONTROLLER_JOB_KINDS
+        .into_iter()
+        .map(|kind| derive_controller_seed(kind, configured))
+        .collect::<Result<Vec<_>, _>>()?;
+    scheduled_bg_jobs::CatalogManifest::try_new(
+        scheduled_bg_jobs::CatalogRevision::from(revision),
+        seeds,
+        Vec::new(),
+    )
+    .map_err(|_| TransportError::Configuration)
+}
+
 pub(crate) fn require_unit_payload(
     payload: &[u8],
 ) -> Result<(), scheduled_bg_jobs::ValidationError> {

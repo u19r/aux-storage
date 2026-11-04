@@ -24,11 +24,15 @@ pubsub = { path = "../pubsub", default-features = false, features = ["foundation
 pubsub-provider = { path = "../pubsub-provider" }
 queue = { path = "../queue", default-features = false, features = ["foundationdb"] }
 serde_json = { workspace = true }
-storage = { path = "../storage", default-features = false, features = ["foundationdb"] }
 storage-common = { path = "../storage-common" }
 storage-provider = { path = "../storage-provider" }
 storage-types = { path = "../storage-types" }
 stream-provider = { path = "../stream-provider" }
+
+[dev-dependencies]
+kv-backend = { path = "../kv-backend", default-features = false, features = ["rocksdb", "fault-injection"] }
+tempfile = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

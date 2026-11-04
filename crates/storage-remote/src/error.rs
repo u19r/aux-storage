@@ -100,6 +100,7 @@ pub fn classify_error_response(
         Some("IdempotentParameterMismatchException") => {
             (StorageError::idempotent_parameter_mismatch(), false)
         }
+        Some("TrimmedDataAccessException") => (StorageEnum::TrimmedDataAccess.into(), false),
         Some("NotLeaderException") => (
             StorageError::from(StorageEnum::AwsService {
                 code: Some("NotLeaderException".to_string()),

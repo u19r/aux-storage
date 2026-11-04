@@ -10,12 +10,10 @@ use storage_types::{
 use stream_provider::{
     DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamHistory,
     SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
-    SystemStreamTrimPageRequest,
 };
 
 use crate::{
     ColumnIndex, ReadProtection, SqlAttempt, SqlEngine, SqlLayout, SqlRow, SqlStatement, SqlValue,
-    gsi,
 };
 
 /// Install the existing scope, lineage, and sequence authority layout. A
@@ -249,25 +247,6 @@ pub(crate) async fn read_history<A: SqlAttempt>(
     decode_history_page(page, engine)
 }
 
-/// Keep catalog, checkpoint, and private hold observations in the caller's
-/// protected attempt. The shared history model owns all trim decisions.
-pub(crate) async fn load_trim_boundaries<A: SqlAttempt>(
-    attempt: &mut A,
-    engine: impl SqlLayout,
-    request: &SystemStreamTrimPageRequest,
-) -> StorageResult<Vec<SystemStreamPosition>> {
-    let history = read_history(attempt, engine).await?;
-    history
-        .validate_scope(request.scope())
-        .map_err(|_| unavailable())?;
-    let lineages = history.trim_hold_probes().map_err(|_| unavailable())?;
-    let (frontiers, minima) =
-        gsi::load_trim_protection_rows(attempt, engine, request.scope(), &lineages).await?;
-    history
-        .trim_boundaries(request, &frontiers, &minima)
-        .map_err(|_| unavailable())
-}
-
 pub(crate) enum HistoryRead {
     Writer,
     Reader,
@@ -286,7 +265,7 @@ pub(crate) fn history_statement(engine: impl SqlLayout, read: HistoryRead) -> Sq
         } else if engine.engine() == SqlEngine::Postgres {
             (
                 "CASE WHEN l.sealed THEN q.next_offset ELSE GREATEST(q.next_offset, \
-                 COALESCE(tail.offset, l.initial_sequence - 1) + 1) END",
+                 q.retired_offset + 1, COALESCE(tail.offset, l.initial_sequence - 1) + 1) END",
                 ", pg_snapshot_xmin(pg_current_snapshot())::text::bigint, \
                  COALESCE(pg_current_xact_id_if_assigned()::text::bigint, 0)",
                 crate::sql_template::sql_template!(

@@ -25,16 +25,26 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub(in crate::journal) struct FragmentHoldReference {
     pub local: TableIdentity,
+    pub physical: storage_types::TableHistoryId,
     pub page: TablePageId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentObligation {
+    reference: FragmentHoldReference,
+    binding: RegionalTableBinding,
 }
 
 impl FragmentHoldReference {
     fn try_from_import(
         import: &RegionalImport,
         binding: &RegionalTableBinding,
+        physical: storage_types::TableHistoryId,
     ) -> StorageResult<Self> {
         Ok(Self {
             local: binding.local_table,
+            physical,
             page: ImportPageScope::Complete
                 .page_id(import, binding)
                 .map_err(|_| corrupt_record())?,
@@ -49,13 +59,79 @@ impl FragmentHoldReference {
 }
 
 impl JournalStore {
+    fn prepare_fragment_references(
+        &self,
+        input: (
+            &RegionalImport,
+            &[(
+                TableIdentity,
+                replication_types::identity::resource::TableLineage,
+                storage_types::TableHistoryId,
+            )],
+        ),
+    ) -> StorageResult<Vec<FragmentHoldReference>> {
+        let (import, tables) = input;
+        import
+            .bindings()
+            .iter()
+            .map(|binding| {
+                let physical =
+                    self.select_original_history(tables, (binding.source_table, binding.lineage))?;
+                FragmentHoldReference::try_from_import(import, binding, physical)
+            })
+            .collect()
+    }
+
+    pub(super) async fn prepare_table_fragment_hold_removals<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        history: storage_types::TableHistoryId,
+        rows: &[DurableRecord],
+    ) -> StorageResult<Vec<RecordChange>> {
+        let mut changes = Vec::with_capacity(rows.len());
+        let mut lineages = BTreeSet::new();
+        for row in rows {
+            let obligation: FragmentObligation = self.records.decode(row)?;
+            let reference = &obligation.reference;
+            self.decode_fragment_obligation(row, reference)?;
+            if reference.physical != history {
+                return Err(corrupt_record());
+            }
+            let key = self.fragment_hold_key(reference)?;
+            let hold = self
+                .records
+                .load(
+                    attempt,
+                    std::slice::from_ref(&key),
+                    ReadProtection::Conflict,
+                )
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(corrupt_record)?;
+            if self.decode_retention_hold(&hold)?
+                != RetentionHoldReference::ImportFragment(reference.clone())
+            {
+                return Err(corrupt_record());
+            }
+            changes.push(RecordChange::Delete {
+                key,
+                expected: hold.revision,
+            });
+            lineages.insert(reference.page.lineage);
+        }
+        self.retain_history_epochs(attempt, &lineages).await?;
+        Ok(changes)
+    }
+
     fn fragment_obligation_key(
         &self,
         reference: &FragmentHoldReference,
     ) -> StorageResult<DurableRecordKey> {
         reference.require_complete_page()?;
-        self.identity_key(
+        self.table_identity_key(
             IMPORT_FRAGMENT_PENDING_SUFFIX,
+            reference.physical,
             &(reference.local, &reference.page),
         )
     }
@@ -80,8 +156,10 @@ impl JournalStore {
         row: &DurableRecord,
         reference: &FragmentHoldReference,
     ) -> StorageResult<RegionalTableBinding> {
-        let binding: RegionalTableBinding = self.records.decode(row)?;
-        if row.revision != Revision::INITIAL
+        let obligation: FragmentObligation = self.records.decode(row)?;
+        let binding = obligation.binding;
+        if obligation.reference != *reference
+            || row.revision != Revision::INITIAL
             || row.key != self.fragment_obligation_key(reference)?
             || binding.local_table != reference.local
             || binding.source_table != reference.page.table
@@ -97,17 +175,21 @@ impl JournalStore {
     pub(in crate::journal) async fn retain_fragment_obligations<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(
+                TableIdentity,
+                replication_types::identity::resource::TableLineage,
+                storage_types::TableHistoryId,
+            )],
+        ),
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let references = import
-                .bindings()
-                .iter()
-                .map(|binding| FragmentHoldReference::try_from_import(import, binding))
-                .collect::<StorageResult<Vec<_>>>()?;
+            let (import, tables) = input;
+            let references = self.prepare_fragment_references((import, tables))?;
             let observed = self
                 .load_fragment_obligations(attempt, &references, import.bindings())
                 .await?;
@@ -124,7 +206,10 @@ impl JournalStore {
                 changes.push(self.records.prepare(
                     self.fragment_obligation_key(reference)?,
                     None,
-                    binding,
+                    &FragmentObligation {
+                        reference: reference.clone(),
+                        binding: binding.clone(),
+                    },
                 )?);
                 changes.push(self.records.prepare(
                     self.fragment_hold_key(reference)?,
@@ -159,17 +244,21 @@ impl JournalStore {
     pub(in crate::journal) async fn finish_fragment_obligations<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(
+                TableIdentity,
+                replication_types::identity::resource::TableLineage,
+                storage_types::TableHistoryId,
+            )],
+        ),
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let references = import
-                .bindings()
-                .iter()
-                .map(|binding| FragmentHoldReference::try_from_import(import, binding))
-                .collect::<StorageResult<Vec<_>>>()?;
+            let (import, tables) = input;
+            let references = self.prepare_fragment_references((import, tables))?;
             let observed = self
                 .load_fragment_obligations(attempt, &references, import.bindings())
                 .await?;

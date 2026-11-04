@@ -33,7 +33,8 @@ fn base_args(storage: Option<PubsubStorageArg>) -> Args {
 
 #[tokio::test]
 async fn given_standalone_runtime_when_subscribing_queue_then_protocol_is_available() {
-    let backends = standalone_fixture_backends();
+    let directory = tempfile::tempdir().expect("standalone pubsub fixture directory");
+    let backends = standalone_fixture_backends(directory.path());
     let providers = create_pubsub_runtime_providers(&backends)
         .await
         .expect("standalone providers should initialize");
@@ -59,85 +60,53 @@ async fn given_standalone_runtime_when_subscribing_queue_then_protocol_is_availa
     assert!(!subscription.subscription_arn.is_empty());
 }
 
-#[cfg(all(feature = "turso", not(feature = "sqlite")))]
-fn standalone_fixture_backends() -> Backends {
-    Backends {
+fn standalone_fixture_backends(directory: &std::path::Path) -> Backends {
+    let mut backends = Backends {
         sqlite: None,
-        turso: Some(TursoBackendConfig {
-            db_path: ":memory:".to_string(),
-            ..TursoBackendConfig::default()
-        }),
+        turso: None,
         postgres: None,
         rocksdb: None,
         foundationdb: None,
         remote: None,
-    }
-}
-
-#[cfg(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-))]
-fn standalone_fixture_backends() -> Backends {
-    let dsn = std::env::var("TEST_POSTGRES_DSN")
-        .expect("TEST_POSTGRES_DSN is required for PostgreSQL pubsub fixture");
-    Backends {
-        sqlite: None,
-        turso: None,
-        postgres: Some(PostgresBackendConfig {
-            dsn,
+    };
+    if cfg!(feature = "sqlite") {
+        backends.sqlite = Some(SqliteBackendConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        });
+    } else if cfg!(feature = "turso") {
+        backends.turso = Some(TursoBackendConfig {
+            db_path: ":memory:".into(),
+            ..Default::default()
+        });
+    } else if cfg!(feature = "postgres") {
+        backends.postgres = Some(PostgresBackendConfig {
+            dsn: std::env::var("TEST_POSTGRES_DSN").expect("owned Postgres DSN is required"),
             max_pool_size: 4,
             background_max_pool_size: 4,
             tls: false,
             immediate_gsi_consistency: false,
-        }),
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
+        });
+    } else if cfg!(feature = "rocksdb") {
+        backends.rocksdb = Some(RocksdbBackendConfig {
+            db_path: directory
+                .join("pubsub.rocksdb")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        });
+    } else if cfg!(feature = "foundationdb") {
+        backends.foundationdb = Some(FoundationdbBackendConfig {
+            cluster_file: Some(
+                std::env::var("FDB_CLUSTER_FILE").expect("owned FDB_CLUSTER_FILE is required"),
+            ),
+            subspace_prefix: Some(format!("tests/pubsub-standalone/{}/", uuid::Uuid::now_v7())),
+            ..Default::default()
+        });
+    } else {
+        panic!("standalone pubsub test requires a native backend");
     }
-}
-
-#[cfg(not(any(
-    all(feature = "turso", not(feature = "sqlite")),
-    all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    )
-)))]
-fn standalone_fixture_backends() -> Backends {
-    Backends {
-        sqlite: Some(SqliteBackendConfig {
-            db_path: ":memory:".to_string(),
-            immediate_gsi_consistency: false,
-        }),
-        turso: None,
-        postgres: None,
-        rocksdb: None,
-        foundationdb: None,
-        remote: None,
-    }
-}
-
-#[test]
-fn standalone_fixture_selects_the_only_compiled_sql_backend() {
-    let backends = standalone_fixture_backends();
-    let turso_only = cfg!(all(feature = "turso", not(feature = "sqlite")));
-    let postgres_only = cfg!(all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    ));
-    assert_eq!(backends.turso.is_some(), turso_only);
-    assert_eq!(backends.sqlite.is_some(), !(turso_only || postgres_only));
-    assert_eq!(backends.postgres.is_some(), postgres_only);
+    backends
 }
 
 #[cfg(feature = "rocksdb")]

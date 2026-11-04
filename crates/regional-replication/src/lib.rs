@@ -5,7 +5,6 @@ mod constants;
 pub mod control;
 pub mod delivery;
 mod history_capacity;
-mod history_image_charge;
 pub mod import;
 pub mod import_receipt;
 mod job_recovery;
@@ -47,3 +46,13 @@ pub mod history;
 mod archive;
 
 pub mod trim;
+
+mod image_equality;
+mod json_projection;
+mod numeric_token;
+
+#[cfg(test)]
+mod table_stream_eligibility_tests;
+
+#[cfg(test)]
+mod job_recovery_tests;

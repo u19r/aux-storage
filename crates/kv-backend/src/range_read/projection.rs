@@ -8,7 +8,7 @@ use crate::item_read::HydratedPrimaryItem;
 
 pub(super) enum RangeContent {
     Primary(Box<HydratedPrimaryItem>),
-    Projection(Box<crate::gsi::HydratedProjection>),
+    Projection(Box<crate::gsi::DecodedProjection>),
 }
 
 pub(super) trait RangeProjection {
@@ -93,7 +93,7 @@ impl RangeProjection for GsiState {
                 "GSI state lacks hydrated content",
             ));
         };
-        let crate::gsi::HydratedProjection { image, revision } = *projection;
+        let crate::gsi::DecodedProjection { image, revision } = *projection;
         let (key, size) = range_evidence(table, bound, physical, &image)?;
         let row = storage_provider::GsiProjectionRow {
             key: key.clone(),

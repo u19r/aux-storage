@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryScope {
+    /// Immutable local incarnation that serves these originals.
+    pub physical: storage_types::TableHistoryId,
     pub origin: OriginId,
     /// Original publishing table, independent of the relay incarnation.
     pub table: TableIdentity,
@@ -28,7 +30,7 @@ impl DeliveryScope {
             origin: self.origin.clone(),
             range,
             membership: self.membership,
-            tables: vec![(self.table, self.lineage)],
+            tables: vec![(self.table, self.lineage, self.physical)],
         }
     }
 

@@ -22,7 +22,6 @@ use crate::{
 /// prefix, which is removed again before the KV family sees a range result.
 pub struct FoundationDbAttempt {
     settlement: storage_types::NativeAttemptSettlement,
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
     transaction: Transaction,
     input_limits: NativeInputLimits,
     read_slots: tokio::sync::Semaphore,
@@ -40,7 +39,6 @@ impl FoundationDbAttempt {
     ) -> Self {
         let (mode, limits) = execution;
         Self {
-            ownership: Default::default(),
             settlement: storage_types::NativeAttemptSettlement::new(limits),
             transaction,
             input_limits: NativeInputLimits::new(prefix),
@@ -101,6 +99,31 @@ impl FoundationDbAttempt {
                 "FoundationDB committed with an invalid versionstamp",
             )
         })
+    }
+
+    async fn load_first_key(
+        &self,
+        begin: &[u8],
+        end: &[u8],
+        protection: ReadProtection,
+    ) -> StorageResult<Option<Vec<u8>>> {
+        let snapshot = self.snapshot(protection)?;
+        let (begin, end) = self.input_limits.prepare_bounds(begin, end)?;
+        if begin >= end {
+            return Ok(None);
+        }
+        let selector = foundationdb::KeySelector::first_greater_or_equal(begin.as_slice());
+        let _read = self.acquire_read().await?;
+        let key = self
+            .transaction
+            .get_key(&selector, snapshot)
+            .await
+            .map_err(map_operation_error)?;
+        if key.as_ref() < begin.as_slice() || key.as_ref() >= end.as_slice() {
+            return Ok(None);
+        }
+        self.settlement.charge_data(key.len())?;
+        crate::backend::copy_native_key(self.input_limits.logical_key(key.as_ref())?).map(Some)
     }
 
     async fn acquire_read(&self) -> StorageResult<tokio::sync::SemaphorePermit<'_>> {
@@ -205,18 +228,12 @@ impl KvAttempt for FoundationDbAttempt {
         &self.settlement
     }
 
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
-    }
-
-    async fn native_has_key_in_range(
+    async fn native_first_key_in_range(
         &self,
         begin: &[u8],
         end: &[u8],
         protection: ReadProtection,
-    ) -> StorageResult<bool> {
+    ) -> StorageResult<Option<Vec<u8>>> {
         let call = self.settlement.begin_call()?;
         let result = async {
             self.settlement.charge_data(
@@ -225,28 +242,7 @@ impl KvAttempt for FoundationDbAttempt {
                     .checked_add(end.len())
                     .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?,
             )?;
-            let snapshot = self.snapshot(protection)?;
-            let (begin, end) = self.input_limits.prepare_bounds(begin, end)?;
-            if begin >= end {
-                return Ok(false);
-            }
-            if !snapshot {
-                self.transaction
-                    .add_conflict_range(
-                        &begin,
-                        &end,
-                        foundationdb::options::ConflictRangeType::Read,
-                    )
-                    .map_err(map_operation_error)?;
-            }
-            let selector = foundationdb::KeySelector::first_greater_or_equal(begin.as_slice());
-            let _read = self.acquire_read().await?;
-            let key = self
-                .transaction
-                .get_key(&selector, true)
-                .await
-                .map_err(map_operation_error)?;
-            Ok(key.as_ref() >= begin.as_slice() && key.as_ref() < end.as_slice())
+            self.load_first_key(begin, end, protection).await
         }
         .await;
         call.complete(result)

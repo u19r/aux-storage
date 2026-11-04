@@ -231,7 +231,8 @@ async fn drain(batched: bool) -> DeliveryMeasurement {
     for position in 1..=16 {
         fixture::put(&source, 1, &format!("value-{position}")).await;
     }
-    let scope = fixture::delivery_scope(fixture::frame(&source, 1, 0, 1).await.as_ref());
+    let scope =
+        fixture::delivery_scope(&source, fixture::frame(&source, 1, 0, 1).await.as_ref()).await;
     let client = TcpTransport::try_new(Arc::clone(&configured))
         .unwrap()
         .peer([2; 16].try_into().unwrap())

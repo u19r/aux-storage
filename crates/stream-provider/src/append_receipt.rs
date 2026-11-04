@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage_types::{StorageError, StorageResult, StreamItemId, TableName};
+use storage_types::{
+    StorageError, StorageResult, StreamItemId, TableHistoryId, TableHistoryTarget, TableName,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
@@ -46,8 +48,23 @@ impl From<StreamAppendOperationId> for uuid::Uuid {
 #[derive(Clone)]
 pub struct TableAppendRequest {
     operation: StreamAppendOperationId,
-    table: TableName,
+    target: TableHistoryTarget,
     digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableAppendReceiptKey {
+    pub history_id: TableHistoryId,
+    pub operation: StreamAppendOperationId,
+}
+
+impl From<&TableAppendRequest> for TableAppendReceiptKey {
+    fn from(request: &TableAppendRequest) -> Self {
+        Self {
+            history_id: request.target.history_id,
+            operation: request.operation,
+        }
+    }
 }
 
 impl TableAppendRequest {
@@ -55,21 +72,29 @@ impl TableAppendRequest {
         self.operation
     }
     pub fn table(&self) -> &TableName {
-        &self.table
+        &self.target.table_name
+    }
+    pub fn target(&self) -> &TableHistoryTarget {
+        &self.target
     }
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }
 
-    pub fn new(operation: StreamAppendOperationId, table: TableName, data: &[u8]) -> Self {
+    pub fn new(
+        operation: StreamAppendOperationId,
+        target: TableHistoryTarget,
+        data: &[u8],
+    ) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"table-append/1");
-        digest.update((table.as_ref().len() as u64).to_be_bytes());
-        digest.update(table.as_ref().as_bytes());
+        digest.update(b"table-append/2");
+        digest.update(target.history_id.as_ref());
+        digest.update((target.table_name.as_ref().len() as u64).to_be_bytes());
+        digest.update(target.table_name.as_ref().as_bytes());
         digest.update(data);
         Self {
             operation,
-            table,
+            target,
             digest: digest.finalize().into(),
         }
     }
@@ -107,6 +132,7 @@ impl StreamAppendAllocation {
 #[serde(deny_unknown_fields)]
 pub struct StreamAppendReceipt {
     version: u16,
+    pub history_id: TableHistoryId,
     pub operation: StreamAppendOperationId,
     pub request_digest: [u8; 32],
     pub proof: Vec<u8>,
@@ -121,6 +147,7 @@ impl StreamAppendReceipt {
     ) -> Self {
         Self {
             version: crate::constants::STREAM_APPEND_RECEIPT_VERSION,
+            history_id: request.target.history_id,
             operation: request.operation,
             request_digest: request.digest,
             proof,
@@ -128,9 +155,11 @@ impl StreamAppendReceipt {
         }
     }
 
-    pub fn require_identity(&self, operation: StreamAppendOperationId) -> StorageResult<()> {
+    pub fn require_identity(&self, key: TableAppendReceiptKey) -> StorageResult<()> {
         if self.version != crate::constants::STREAM_APPEND_RECEIPT_VERSION
-            || self.operation != operation
+            || self.operation != key.operation
+            || self.history_id != key.history_id
+            || self.history_id.as_ref() == &[0; 16]
             || self.proof.is_empty()
         {
             return Err(invalid_receipt());
@@ -139,7 +168,7 @@ impl StreamAppendReceipt {
     }
 
     pub fn require_request(&self, request: &TableAppendRequest) -> StorageResult<()> {
-        self.require_identity(request.operation)?;
+        self.require_identity(request.into())?;
         if self.request_digest != request.digest {
             return Err(invalid_receipt());
         }
@@ -155,6 +184,15 @@ impl StreamAppendReceipt {
         }
         self.response = StreamAppendAllocation::AttemptAllocated(StreamItemId::from(stamp));
         Ok(self)
+    }
+}
+
+impl From<&StreamAppendReceipt> for TableAppendReceiptKey {
+    fn from(receipt: &StreamAppendReceipt) -> Self {
+        Self {
+            history_id: receipt.history_id,
+            operation: receipt.operation,
+        }
     }
 }
 

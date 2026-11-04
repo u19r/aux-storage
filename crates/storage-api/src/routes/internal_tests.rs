@@ -331,11 +331,18 @@ async fn append_table_stream_record_route_accepts_payload() {
         .expect("create stream-enabled table");
         assert_eq!(create_response.status(), StatusCode::OK);
 
+        let created: serde_json::Value = serde_json::from_slice(
+            &body::to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let append_response = internal::append_table_stream_record_endpoint(
             State(app_state),
             Bytes::from(
                 json!({
                     "TableName": "orders",
+                    "TableId": created["TableDescription"]["TableId"],
                     "Data": "stream-payload"
                 })
                 .to_string(),
@@ -650,7 +657,7 @@ async fn system_stream_rejects_forged_well_formed_checkpoint_before_backend_read
 }
 
 #[tokio::test]
-async fn internal_stream_reader_omits_last_evaluated_key_on_final_non_empty_page() {
+async fn given_table_stream_when_pages_reach_the_tail_then_qualified_checkpoint_resumes_empty() {
     for_each_conformance_backend(|_, db| async move {
         let app_state = Arc::new(AppState::new(db));
 
@@ -720,7 +727,7 @@ async fn internal_stream_reader_omits_last_evaluated_key_on_final_non_empty_page
             .to_string();
 
         let second_response = internal::get_stream_records_endpoint(
-            State(app_state),
+            State(app_state.clone()),
             Bytes::from(
                 json!({
                     "TableName": "paged-orders",
@@ -740,10 +747,46 @@ async fn internal_stream_reader_omits_last_evaluated_key_on_final_non_empty_page
             serde_json::from_slice(&second_body).expect("second response json");
         let second_records = second_json["Records"].as_array().expect("second records");
         assert_eq!(second_records.len(), 1);
-        assert!(
-            second_json["LastEvaluatedKey"].is_null(),
-            "final non-empty page should not emit a token"
+        let second_lek = second_json["LastEvaluatedKey"]
+            .as_str()
+            .expect("tail checkpoint");
+        let checkpoint: storage_types::TableStreamCheckpoint =
+            second_lek.parse().expect("qualified checkpoint");
+        assert_ne!(checkpoint.history_id().as_ref(), &[0; 16]);
+        let keys = first_records
+            .iter()
+            .chain(second_records)
+            .map(|record| {
+                let key = record["Keys"]["pk"]["S"].as_str().expect("record key");
+                assert_eq!(
+                    record["Item"],
+                    json!({"pk": {"S": key}, "status": {"S": "pending"}})
+                );
+                assert!(record.get("OldImage").is_none());
+                assert!(record.get("NewImage").is_none());
+                key.to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            ["order#1", "order#2", "order#3"].map(str::to_owned).into()
         );
+        let tail = internal::get_stream_records_endpoint(
+            State(app_state),
+            Bytes::from(
+                json!({"TableName": "paged-orders", "Limit": 2, "LastEvaluatedKey": second_lek})
+                    .to_string(),
+            ),
+        )
+        .await
+        .expect("tail response");
+        assert_eq!(tail.status(), StatusCode::OK);
+        let tail_body = body::to_bytes(tail.into_body(), usize::MAX)
+            .await
+            .expect("tail body");
+        let tail_json: serde_json::Value = serde_json::from_slice(&tail_body).expect("tail json");
+        assert_eq!(tail_json["Records"], json!([]));
+        assert_eq!(tail_json["LastEvaluatedKey"], second_lek);
     })
     .await;
 }

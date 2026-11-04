@@ -14,10 +14,10 @@ use storage_types::{
     GetItemRequest, GetItemResponse, GetStreamRecordsRequest, GetStreamRecordsResponse,
     ListStreamsRequest, ListStreamsResponse, ListTablesRequest, ListTablesResponse, PutItemRequest,
     PutItemResponse, QueryRequest, QueryResponse, ReadSequenceRequest, ReadSequenceResponse,
-    ScanRequest, ScanResponse, StorageResult, StoredTableInfo, StreamItemId, TableName,
-    TransactGetItemsRequest, TransactGetItemsResponse, TransactWriteItemsRequest,
-    TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse, UpdateTableRequest,
-    UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    ScanRequest, ScanResponse, StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest,
+    TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
+    UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
 };
 
 use super::runtime::RegionalDynamo;
@@ -231,6 +231,40 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
         self.read_point(request).await
     }
 
+    async fn describe_stream(
+        &self,
+        request: storage_types::DescribeStreamRequest,
+    ) -> StorageResult<storage_types::DescribeStreamResponse> {
+        self.journal.native_admission.require()?;
+        self.read_point(super::catalog_reads::DynamoStreamRead(
+            storage_provider::DescribeDynamoStream::try_from(request)?,
+            self.port.now(),
+        ))
+        .await
+    }
+    async fn get_shard_iterator(
+        &self,
+        request: storage_types::GetShardIteratorRequest,
+    ) -> StorageResult<storage_types::GetShardIteratorResponse> {
+        self.journal.native_admission.require()?;
+        self.read_point(super::catalog_reads::DynamoStreamRead(
+            storage_provider::GetDynamoShardIterator::try_from(request)?,
+            self.port.now(),
+        ))
+        .await
+    }
+    async fn get_records(
+        &self,
+        request: storage_types::GetRecordsRequest,
+    ) -> StorageResult<storage_types::GetRecordsResponse> {
+        self.journal.native_admission.require()?;
+        self.read_point(super::catalog_reads::DynamoStreamRead(
+            storage_provider::GetDynamoStreamRecords::try_from(request)?,
+            self.port.now(),
+        ))
+        .await
+    }
+
     async fn get_stream_records(
         &self,
         request: GetStreamRecordsRequest,
@@ -239,15 +273,19 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
         request
             .table_name()
             .ok_or_else(|| storage_types::StorageError::raw_validation("TableName is required"))?;
-        self.read_point(request).await
+        self.read_point(super::catalog_reads::TableStreamRead(
+            request,
+            self.port.now(),
+        ))
+        .await
     }
 
-    async fn latest_table_stream_pointer(
+    async fn table_stream_checkpoint(
         &self,
-        table_name: TableName,
-    ) -> StorageResult<Option<StreamItemId>> {
+        target: storage_types::TableHistoryTarget,
+    ) -> StorageResult<storage_types::TableStreamCheckpoint> {
         self.journal.native_admission.require()?;
-        self.read_point(super::catalog_reads::StreamPointerRead(table_name))
+        self.read_point(super::catalog_reads::StreamPointerRead(target))
             .await
     }
 

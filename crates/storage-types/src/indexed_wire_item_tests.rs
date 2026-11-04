@@ -444,7 +444,6 @@ fn table_info_fixture(
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::default(),
-        default_item_stream_duration: StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

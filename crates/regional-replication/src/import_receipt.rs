@@ -59,10 +59,17 @@ where
             crate::journal::NativeAttempt::Items(AttemptMode::ReadOnly),
             move |attempt, _| {
                 Box::pin(async move {
+                    let tables = journal
+                        .load_import_table_copies(
+                            attempt,
+                            import.as_ref(),
+                            storage_types::ReadProtection::Snapshot,
+                        )
+                        .await?;
                     let pages = journal
                         .load_import_pages(
                             attempt,
-                            import.as_ref(),
+                            (import.as_ref(), &tables),
                             &codec,
                             ImportPageScope::Selected,
                         )
@@ -71,7 +78,7 @@ where
                         journal
                             .load_import_pages(
                                 attempt,
-                                import.as_ref(),
+                                (import.as_ref(), &tables),
                                 &codec,
                                 ImportPageScope::Complete,
                             )

@@ -5,8 +5,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
-use storage_types::{CreateTableRequest, GetItemRequest, PutItemRequest, QueryRequest, StreamName};
-use stream_provider::StreamRowKind;
+use storage_types::{CreateTableRequest, GetItemRequest, PutItemRequest, QueryRequest};
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
@@ -166,16 +165,10 @@ async fn given_invalid_indexers_when_put_item_runs_then_exact_errors_and_no_item
             assert_eq!(serde_json::to_value(read).unwrap(), json!({}), "{name}");
         }
 
-        let cdc = store
-            .stream_operations
-            .read_forward(
-                StreamRowKind::System(StreamName::system_table_stream()),
-                None,
-                10,
-            )
+        let cdc = super::cdc_stream_tests::system_records(&store, 10)
             .await
             .unwrap();
-        assert!(cdc.items.is_empty(), "rejected PutItem must not append CDC");
+        assert!(cdc.is_empty(), "rejected PutItem must not append CDC");
     })
     .catch_unwind()
     .await;

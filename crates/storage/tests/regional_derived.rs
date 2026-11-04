@@ -222,9 +222,11 @@ async fn given_independent_native_ttl_workers_when_same_victim_expires_and_is_re
             table_name: TableName::new(TABLE),
             input: storage_common::TtlSweepPageInput::try_new("expires", TimestampMillis::from_timestamp((expiry + 1) * 1000), 25, None)?,
         };
-        let commands = [fixture.managers[0].prepare_ttl_sweep_command(request.clone()).await?, fixture.managers[1].prepare_ttl_sweep_command(request).await?];
+        let commands = [fixture.managers[0].prepare_ttl_sweep_command(request.clone()).await.context("prepare source expiration")?, fixture.managers[1].prepare_ttl_sweep_command(request).await.context("prepare receiver expiration")?];
         let (source, remote) = tokio::join!(fixture.managers[0].run_ttl_sweep_command(commands[0].clone()), fixture.managers[1].run_ttl_sweep_command(commands[1].clone()));
-        anyhow::ensure!(source?.deleted_items == 1 && remote?.deleted_items == 1, "both native owners must independently delete the same victim");
+        let source = source.map_err(|error| anyhow::anyhow!("source expiration: {:?}", error.as_ref()))?;
+        let remote = remote.map_err(|error| anyhow::anyhow!("receiver expiration: {:?}", error.as_ref()))?;
+        anyhow::ensure!(source.deleted_items == 1 && remote.deleted_items == 1, "both native owners must independently delete the same victim");
         for manager in &fixture.managers {
             anyhow::ensure!(manager.get_item(TableName::new(TABLE), key("ttl-victim")).await?.is_none(), "native expiration did not delete its victim");
         }
@@ -235,7 +237,9 @@ async fn given_independent_native_ttl_workers_when_same_victim_expires_and_is_re
         anyhow::ensure!(source.iter().filter(|original| *original == &parent[0]).count() == 1, "expiration changed or duplicated its immutable parent");
         let refreshed_expiry = expiry + 7200;
         put(&fixture.managers[0], refreshed_expiry, "refreshed").await?;
-        anyhow::ensure!(fixture.managers[0].run_ttl_sweep_command(commands[0].clone()).await?.deleted_items == 0, "stale cutoff deleted the refreshed winner");
+        let stale = fixture.managers[0].run_ttl_sweep_command(commands[0].clone()).await
+            .map_err(|error| anyhow::anyhow!("stale source expiration: {:?}", error.as_ref()))?;
+        anyhow::ensure!(stale.deleted_items == 0, "stale cutoff deleted the refreshed winner");
         await_exact(&fixture.managers[0], refreshed_expiry, "refreshed").await?;
         fixture.restart().await?;
         if let Err(error) = await_exact(&fixture.managers[1], refreshed_expiry, "refreshed").await {
@@ -284,7 +288,8 @@ async fn put(manager: &DatabaseManager, expiry: i64, value: &str) -> Result<()> 
                 .item(item(expiry, value)?)
                 .build(),
         )
-        .await?;
+        .await
+        .map_err(|error| anyhow::anyhow!("put {value}: {:?}", error.as_ref()))?;
     Ok(())
 }
 

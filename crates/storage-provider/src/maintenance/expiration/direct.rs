@@ -44,10 +44,10 @@ pub trait DirectExpirationTransaction {
         Self: Sized,
     {
         async move {
-            let (config, table_info) = self
-                .read_direct_policy(&command.table_name)
-                .await?
-                .ok_or_else(|| StorageError::from(StorageEnum::ConditionalCheckFailed))?;
+            let (config, table_info) =
+                self.read_direct_policy(&command.target.table_name)
+                    .await?
+                    .ok_or_else(|| StorageError::from(StorageEnum::ConditionalCheckFailed))?;
             let scan = DirectExpirationScanRead::try_new(command, config, (*table_info).clone())?;
             self.execute_direct_scan(scan).await
         }
@@ -68,9 +68,11 @@ pub trait DirectExpirationTransaction {
                     StorageError::validation("ttl sweep requires an enabled ttl policy")
                 })?;
             let command = TtlSweepPageCommand::try_new(
-                request.table_name.clone(),
+                storage_common::TtlSweepPolicy {
+                    target: table_info.as_ref().into(),
+                    config: config.clone(),
+                },
                 request.input.clone(),
-                config.policy_generation,
                 TimestampMillis::now(),
             )?;
             let scan = DirectExpirationScanRead::try_new(&command, config, (*table_info).clone())?;
@@ -110,6 +112,7 @@ pub(super) async fn prepare_direct_scan<T: DirectExpirationTransaction>(
 pub async fn read_direct_expiration_policy_in_attempt<A>(
     attempt: &mut A,
     table_name: &TableName,
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(TtlConfigRecord, Arc<BoundTableInfo>)>>
 where
     A: CatalogAttempt + DescribeTimeToLiveAttempt,
@@ -117,6 +120,7 @@ where
     let Some(stamp) = attempt.read_catalog_stamp(table_name).await? else {
         return Ok(None);
     };
+    bindings.observe(table_name, stamp.history_id)?;
     let table = attempt.read_table_at_stamp(table_name, stamp).await?;
     let config = attempt.read_ttl_config(&table).await?;
     Ok(config.map(|config| (config, table)))
@@ -147,7 +151,10 @@ impl DirectExpirationScanRead {
         config: TtlConfigRecord,
         table_info: BoundTableInfo,
     ) -> StorageResult<Self> {
-        if table_info.table_name != command.table_name {
+        if table_info.history_id != command.target.history_id {
+            return Err(StorageEnum::ConditionalCheckFailed.into());
+        }
+        if table_info.table_name != command.target.table_name {
             return Err(StorageError::internal(
                 "expiration table metadata does not match its direct command",
             ));
@@ -175,7 +182,7 @@ impl DirectExpirationScanRead {
         Ok(Self {
             config,
             table_info,
-            table_name: command.table_name.clone(),
+            table_name: command.target.table_name.clone(),
             cutoff_seconds: command.input.scan_time.timestamp().max(0),
             cursor,
             limit,
@@ -254,7 +261,8 @@ impl<P: super::ExpirationPort, S: super::ExpirationEffectPolicy<P>> DirectExpira
         &mut self,
         table_name: &TableName,
     ) -> StorageResult<Option<(TtlConfigRecord, Arc<BoundTableInfo>)>> {
-        let policy = read_direct_expiration_policy_in_attempt(self.port, table_name).await?;
+        let policy =
+            read_direct_expiration_policy_in_attempt(self.port, table_name, &self.bindings).await?;
         let Some((config, table)) = policy else {
             return Ok(None);
         };

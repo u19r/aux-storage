@@ -1,37 +1,36 @@
+//! One qualified source prefix supplies exact GSI target/predecessor snapshots.
 use storage_types::{
-    BoundTableInfo, ItemStreamVersion, StorageEnum, StorageError, StorageResult, StreamName,
-    SystemStreamCheckpoint, WireItem, storage_serde,
+    BoundTableInfo, ItemHistoryChange, ItemHistoryPointer, ItemRevision, StorageEnum, StorageError,
+    StorageResult, SystemStreamCheckpoint, TableHistoryId,
 };
 use stream_provider::{
-    DynamoDbStreamImages, StoredStreamPointer, StreamDataType, StreamItem,
-    SystemStreamHistoryObservation, SystemStreamHistoryPage, SystemStreamHistoryRead,
-    SystemStreamHistoryReadPage,
+    ItemHistoryImages, ItemHistoryReadAttempt, SystemStreamHistoryObservation,
+    SystemStreamHistoryPage, SystemStreamHistoryRead, SystemStreamHistoryReadPage,
 };
 
 use super::{GsiSourceProjection, GsiStreamCandidate, GsiStreamPageEnd, GsiStreamSourcePage};
 
-/// Assembles one logical GSI catch-up page from batched physical history reads.
 pub struct GsiStreamPageAssembly<'a> {
     plan: &'a SystemStreamHistoryPage,
+    target: TableHistoryId,
     observations: Vec<SystemStreamHistoryObservation<'a>>,
     more: Vec<bool>,
-    candidates: Vec<GsiStreamCandidate>,
+    pointers: Vec<ItemHistoryPointer>,
+    admitted_bytes: usize,
 }
 
 impl<'a> GsiStreamPageAssembly<'a> {
-    #[must_use]
-    pub fn new(plan: &'a SystemStreamHistoryPage) -> Self {
-        let capacity = plan.as_ref().len();
+    pub fn new(plan: &'a SystemStreamHistoryPage, target: TableHistoryId) -> Self {
         Self {
             plan,
-            observations: Vec::with_capacity(capacity),
-            more: Vec::with_capacity(capacity),
-            candidates: Vec::new(),
+            target,
+            observations: Vec::new(),
+            more: Vec::new(),
+            pointers: Vec::new(),
+            admitted_bytes: 0,
         }
     }
 
-    /// Returns true after a short physical page; later planned pages are
-    /// unnecessary.
     pub fn push_pages(
         &mut self,
         reads: &'a [SystemStreamHistoryRead],
@@ -41,38 +40,76 @@ impl<'a> GsiStreamPageAssembly<'a> {
             return Err(StorageEnum::HistoryUnavailable.into());
         }
         for (read, page) in reads.iter().zip(pages) {
-            let SystemStreamHistoryReadPage {
-                retired_through,
-                records,
-                observations,
-                pointers,
-                more,
-            } = page;
-            if records.len() != observations.len() || observations.len() != pointers.len() {
-                return Err(StorageEnum::HistoryUnavailable.into());
-            }
-            for pointer in pointers.into_iter().flatten() {
-                self.candidates.push(GsiStreamCandidate::try_from(pointer)?);
-            }
-            let short = observations.len() < read.limit as usize;
-            self.observations.push(SystemStreamHistoryObservation {
-                retired_through,
-                read,
-                records: observations,
-            });
-            self.more.push(more);
-            if short
-                && (read.ordering == stream_provider::SystemStreamHistoryOrdering::Contiguous
-                    || more)
-            {
+            if self.push_page(read, page)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    pub fn finish(
+    fn push_page(
+        &mut self,
+        read: &'a SystemStreamHistoryRead,
+        page: SystemStreamHistoryReadPage,
+    ) -> StorageResult<bool> {
+        if page.records.len() != page.observations.len() {
+            return Err(StorageEnum::HistoryUnavailable.into());
+        }
+        let mut selected = Vec::with_capacity(page.records.len());
+        let mut more = page.more;
+        for (record, observation) in page.records.into_iter().zip(page.observations) {
+            if record.position() != &observation.position {
+                return Err(StorageEnum::HistoryUnavailable.into());
+            }
+            record.require_scope(self.plan.expanded_checkpoint().scope())?;
+            if let Some(pointer) = record
+                .pointer()
+                .filter(|pointer| pointer.metadata().address().history_id == self.target)
+            {
+                if !self.admit_pointer(pointer)? {
+                    more = true;
+                    break;
+                }
+                self.pointers.push(pointer.clone());
+            }
+            selected.push(observation);
+        }
+        if more && selected.is_empty() {
+            return Ok(true);
+        }
+        let short = selected.len() < read.limit as usize;
+        self.observations.push(SystemStreamHistoryObservation {
+            retired_through: page.retired_through,
+            read,
+            records: selected,
+        });
+        self.more.push(more);
+        Ok(short
+            && (read.ordering == stream_provider::SystemStreamHistoryOrdering::Contiguous || more))
+    }
+
+    fn admit_pointer(&mut self, pointer: &ItemHistoryPointer) -> StorageResult<bool> {
+        let envelope =
+            stream_provider::StreamRowValue::history_envelope_bytes(pointer.metadata().address())?;
+        let bytes = pointer.record_bytes()
+            + envelope
+            + pointer
+                .predecessor_record_bytes_bound()
+                .map_or(0, |bytes| bytes + envelope);
+        let next = self
+            .admitted_bytes
+            .checked_add(bytes)
+            .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        if next > crate::constants::GSI_HISTORY_READ_BYTES.get() {
+            return Ok(false);
+        }
+        self.admitted_bytes = next;
+        Ok(true)
+    }
+
+    pub async fn finish<A: ItemHistoryReadAttempt>(
         self,
+        attempt: &mut A,
         table: &BoundTableInfo,
         through: &SystemStreamCheckpoint,
     ) -> StorageResult<GsiStreamSourcePage> {
@@ -80,35 +117,29 @@ impl<'a> GsiStreamPageAssembly<'a> {
             .plan
             .finish_bounded(&self.observations, &self.more)
             .map_err(|_| StorageEnum::HistoryUnavailable)?;
-        let end = if next == *through {
-            GsiStreamPageEnd::ReachedThrough
-        } else {
-            GsiStreamPageEnd::Continue(next)
-        };
+        let resolved = stream_provider::resolve_item_history(
+            attempt,
+            &self.pointers,
+            ItemHistoryImages::WithPredecessor,
+            crate::constants::GSI_HISTORY_READ_BYTES,
+        )
+        .await?;
+        let candidates = resolved
+            .into_iter()
+            .map(|history| {
+                history
+                    .map(|history| GsiStreamCandidate { history })
+                    .ok_or_else(|| StorageEnum::HistoryUnavailable.into())
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
         Ok(GsiStreamSourcePage {
             table: table.clone(),
-            end,
-            candidates: self.candidates,
-        })
-    }
-}
-
-impl TryFrom<StreamItem> for GsiStreamCandidate {
-    type Error = StorageError;
-
-    fn try_from(item: StreamItem) -> StorageResult<Self> {
-        if item.data_type != StreamDataType::StreamPointer
-            || item.stream_name.as_ref() != Some(&StreamName::system_table_stream())
-        {
-            return Err(StorageError::internal(
-                "GSI history row is not a SystemStream pointer",
-            ));
-        }
-        Ok(Self {
-            pointer_id: item.id,
-            created_at: item.created_at,
-            pointer: storage_serde::from_bytes(&item.data)?,
-            referenced_items: None,
+            end: if next == *through {
+                GsiStreamPageEnd::ReachedThrough
+            } else {
+                GsiStreamPageEnd::Continue(next)
+            },
+            candidates,
         })
     }
 }
@@ -116,69 +147,37 @@ impl TryFrom<StreamItem> for GsiStreamCandidate {
 impl GsiStreamCandidate {
     pub fn into_projections(
         self,
-        table: &storage_types::BoundTableInfo,
+        table: &BoundTableInfo,
         index_name: &storage_types::IndexName,
     ) -> StorageResult<Vec<GsiSourceProjection>> {
-        if !self.pointer.matches_table_history(table.history_id) {
-            return Ok(Vec::new());
+        let current = &self.history.current;
+        if current.metadata().address().history_id != table.history_id {
+            return Err(StorageError::internal("GSI history has another table"));
         }
-        let (item_version, indexers, items) = match self.pointer {
-            StoredStreamPointer::Embedded {
-                table_name,
-                item_revision,
-                items,
-                indexers,
-                ..
-            } => {
-                if table_name != table.table_name {
-                    return Ok(Vec::new());
-                }
-                let items = items
-                    .into_iter()
-                    .map(|item| StreamItem {
-                        id: self.pointer_id,
-                        stream_name: None,
-                        data: item.data,
-                        data_type: item.data_type,
-                        created_at: self.created_at,
-                    })
-                    .collect();
-                (item_revision, indexers, items)
+        let (new_item, indexers) = match current.change() {
+            ItemHistoryChange::Image { item, indexers } => {
+                (Some(item.clone()), indexers.names().to_vec())
             }
-            StoredStreamPointer::Pointer {
-                table_name,
-                item_stream_version,
-                item_revision,
-                indexers,
-                ..
-            } => {
-                if table_name != table.table_name {
-                    return Ok(Vec::new());
-                }
-                let items = self.referenced_items.ok_or_else(|| {
-                    StorageError::internal("GSI pointer target history is unavailable")
-                })?;
-                if items
-                    .first()
-                    .is_none_or(|item| ItemStreamVersion::from(item.id) != item_stream_version)
-                {
-                    return Err(StorageError::internal(
-                        "GSI pointer target history is unavailable",
-                    ));
-                }
-                (item_revision, indexers, items)
-            }
+            ItemHistoryChange::Deleted { .. } => (None, Vec::new()),
         };
-        let images = DynamoDbStreamImages::try_from(items.as_slice())?;
-        let old_item = images.old.as_ref().map(WireItem::try_from).transpose()?;
-        let new_item = images.new.as_ref().map(WireItem::try_from).transpose()?;
+        let old_item = self
+            .history
+            .predecessor
+            .as_ref()
+            .map(|entry| match entry.change() {
+                ItemHistoryChange::Image { item, .. } => Ok(item.clone()),
+                ItemHistoryChange::Deleted { .. } => {
+                    Err(StorageError::internal("GSI predecessor is not an image"))
+                }
+            })
+            .transpose()?;
         GsiSourceProjection::from_stream_images(
             table,
             index_name,
             old_item,
             new_item,
             indexers,
-            item_version,
+            ItemRevision::try_from(current.metadata().version().get())?,
         )
     }
 }

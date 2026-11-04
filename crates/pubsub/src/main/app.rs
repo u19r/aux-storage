@@ -219,6 +219,7 @@ pub(crate) fn ensure_no_remote_pubsub_backend(
     Ok(())
 }
 
+#[cfg(any(feature = "sqlite", test))]
 pub(crate) fn sqlite_pubsub_db_path(backends: &config::Backends) -> String {
     backends
         .sqlite

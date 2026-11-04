@@ -41,6 +41,7 @@ impl BootstrapTailScope {
             .require_partition(self.cut.origin.journal_partition)
             .map_err(|_| corrupt_record())?;
         Ok(DeliveryScope {
+            physical: source.proposed.physical,
             origin: self.cut.origin.clone(),
             table: source.proposed.configuration.table,
             local_table: source.proposed.configuration.table,

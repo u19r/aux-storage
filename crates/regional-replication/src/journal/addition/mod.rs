@@ -19,7 +19,7 @@ impl JournalStore {
     pub(crate) async fn execute_addition<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

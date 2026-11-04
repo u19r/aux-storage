@@ -21,8 +21,6 @@ pub struct StoredTableInfo {
     pub stream_specification: Option<StreamSpecification>,
     #[serde(default = "default_table_stream_duration")]
     pub table_stream_duration: StreamRetentionDuration,
-    #[serde(default = "default_item_stream_duration")]
-    pub default_item_stream_duration: StreamRetentionDuration,
     #[serde(default)]
     pub deletion_protection_enabled: bool,
 }
@@ -49,30 +47,35 @@ impl StoredTableInfo {
         Ok(key)
     }
 
-    /// Whether a table mutation must be retained in the stream for a public
-    /// stream or deferred secondary-index projection.
+    /// A public stream or a temporary internal GSI build requires history.
     #[must_use]
-    pub fn requires_stream_entry(&self, immediate_gsi_consistency: bool) -> bool {
-        let stream_enabled = self
-            .stream_specification
+    pub fn requires_stream_entry(&self) -> bool {
+        self.has_public_stream_request() || self.has_internal_stream_capture()
+    }
+
+    #[must_use]
+    pub fn has_public_stream_request(&self) -> bool {
+        self.stream_specification
             .as_ref()
-            .is_some_and(|specification| specification.stream_enabled);
-        let has_deferred_index = !immediate_gsi_consistency
-            && self
-                .global_secondary_indexes
-                .as_ref()
-                .is_some_and(|indexes| {
-                    indexes.iter().any(|index| !index.index_name.is_ttl_index())
-                });
-        stream_enabled || has_deferred_index
+            .is_some_and(|spec| spec.stream_enabled)
+    }
+
+    #[must_use]
+    pub fn has_internal_stream_capture(&self) -> bool {
+        self.global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|index| index.capture_for_build)
+    }
+
+    #[must_use]
+    pub fn has_enabled_stream(&self) -> bool {
+        self.has_public_stream_request() && self.table_status == TableStatus::Active
     }
 }
 
 fn default_table_stream_duration() -> StreamRetentionDuration {
-    StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
-}
-
-fn default_item_stream_duration() -> StreamRetentionDuration {
     StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
 }
 
@@ -87,6 +90,11 @@ pub struct AttributeDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GlobalSecondaryIndex {
+    /// Temporary ownership of mutation history, hidden from public index
+    /// descriptions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schema(ignore)]
+    pub capture_for_build: bool,
     #[serde(rename = "IndexName")]
     pub index_name: IndexName,
 

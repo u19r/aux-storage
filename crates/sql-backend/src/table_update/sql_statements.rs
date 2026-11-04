@@ -1,6 +1,6 @@
 //! SQL statements for one table metadata update.
 
-use storage_types::{BoundTableInfo, IndexName, StorageResult, TableName};
+use storage_types::{BoundTableInfo, IndexName, StorageResult, TableHistoryId};
 
 use crate::{SqlLayout, SqlStatement, SqlValue};
 
@@ -48,21 +48,10 @@ pub(super) fn save_catalog(
                 .map(serde_json::to_string)
                 .transpose()?,
         ),
-        SqlValue::Boolean(
-            table
-                .info
-                .stream_specification
-                .as_ref()
-                .is_some_and(|spec| spec.stream_enabled),
-        ),
+        SqlValue::Boolean(table.info.has_enabled_stream()),
         SqlValue::Integer(table.info.table_stream_duration.as_hours_wire_value()),
-        SqlValue::Integer(
-            table
-                .info
-                .default_item_stream_duration
-                .as_hours_wire_value(),
-        ),
         SqlValue::Boolean(table.info.deletion_protection_enabled),
+        SqlValue::Text(String::from(&table.info.table_status)),
         SqlValue::Text(table.info.table_name.to_string()),
         SqlValue::Text(uuid::Uuid::from_bytes(*table.history_id.as_ref()).to_string()),
     ];
@@ -73,8 +62,8 @@ pub(super) fn save_catalog(
         "stream_specification",
         "stream_enabled",
         "table_stream_duration_hours",
-        "default_item_stream_duration_hours",
         "deletion_protection_enabled",
+        "table_status",
     ]
     .iter()
     .enumerate()
@@ -94,36 +83,20 @@ pub(super) fn save_catalog(
     ))
 }
 
-pub(super) fn delete_history_holds(
+pub(super) fn delete_build(
     engine: impl SqlLayout,
-    table: &TableName,
+    history: TableHistoryId,
     index: &str,
 ) -> SqlStatement {
     SqlStatement::new(
         format!(
-            "DELETE FROM {relation_sys_gsi_history_holds} WHERE table_name = {} AND index_name = \
-             {}",
-            engine.engine().placeholder(1),
-            engine.engine().placeholder(2),
-            relation_sys_gsi_history_holds = engine.relation_name("sys_gsi_history_holds"),
-        ),
-        vec![
-            SqlValue::Text(table.to_string()),
-            SqlValue::Text(index.to_owned()),
-        ],
-    )
-}
-
-pub(super) fn delete_build(engine: impl SqlLayout, table: &TableName, index: &str) -> SqlStatement {
-    SqlStatement::new(
-        format!(
-            "DELETE FROM {relation_sys_gsi_builds} WHERE table_name = {} AND index_name = {}",
+            "DELETE FROM {relation_sys_gsi_builds} WHERE table_id = {} AND index_name = {}",
             engine.engine().placeholder(1),
             engine.engine().placeholder(2),
             relation_sys_gsi_builds = engine.relation_name("sys_gsi_builds"),
         ),
         vec![
-            SqlValue::Text(table.to_string()),
+            SqlValue::Blob(history.as_ref().to_vec()),
             SqlValue::Text(index.to_owned()),
         ],
     )

@@ -17,7 +17,9 @@ pub async fn transact_get_items_in_attempt<A: GetItemAttempt>(
     cache: &TableMetadataCache,
     plan: TransactGetPlan,
 ) -> StorageResult<(TransactGetItemsResponse, Vec<CachePublication>)> {
-    let tables = resolve_tables_batch_in_attempt(attempt, cache, plan.table_names()).await?;
+    let bindings = crate::RequestTableBindings::default();
+    let tables =
+        resolve_tables_batch_in_attempt(attempt, cache, plan.table_names(), &bindings).await?;
     let mut publications = Vec::new();
     let tables = tables.into_iter().map(|result| {
         result.map(|(table, publication)| {

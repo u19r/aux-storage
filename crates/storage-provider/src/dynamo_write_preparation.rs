@@ -30,18 +30,26 @@ pub(crate) async fn prepare_write_table<P: DynamoPort>(
     port: &P,
     cache: &Arc<TableMetadataCache>,
     name: &TableName,
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<PreparedTable> {
     if let Some(candidate) = cache.prepared_candidate(name) {
-        warm_ttl_policies(port, cache, std::slice::from_ref(&candidate.table)).await?;
+        warm_ttl_policies(
+            port,
+            cache,
+            std::slice::from_ref(&candidate.table),
+            bindings,
+        )
+        .await?;
         return Ok(candidate);
     }
     let name = name.clone();
     let publication_cache = Arc::clone(cache);
     let cache = Arc::clone(cache);
+    let read_bindings = bindings.clone();
     let (prepared, publication) = port
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
-                resolve_prepared_table_in_attempt(attempt, &cache, &name)
+                resolve_prepared_table_in_attempt(attempt, &cache, &name, &read_bindings)
                     .await?
                     .into_result()
             })
@@ -52,6 +60,7 @@ pub(crate) async fn prepare_write_table<P: DynamoPort>(
         port,
         &publication_cache,
         std::slice::from_ref(&prepared.table),
+        bindings,
     )
     .await?;
     Ok(prepared)
@@ -67,6 +76,7 @@ impl PreparedWriteTables {
         port: &P,
         cache: &Arc<TableMetadataCache>,
         names: Vec<TableName>,
+        bindings: &crate::RequestTableBindings,
     ) -> StorageResult<Self> {
         let candidates = names
             .iter()
@@ -80,6 +90,7 @@ impl PreparedWriteTables {
         } else {
             let read_names = names.clone();
             let read_cache = Arc::clone(cache);
+            let read_bindings = bindings.clone();
             let observations = port
                 .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
                     Box::pin(async move {
@@ -87,6 +98,7 @@ impl PreparedWriteTables {
                             attempt,
                             &read_cache,
                             &read_names,
+                            &read_bindings,
                         )
                         .await
                     })
@@ -100,7 +112,7 @@ impl PreparedWriteTables {
             .flatten()
             .map(|table| Arc::clone(&table.table))
             .collect::<Vec<_>>();
-        warm_ttl_policies(port, cache, &tables).await?;
+        warm_ttl_policies(port, cache, &tables, bindings).await?;
         Ok(prepared)
     }
 
@@ -161,6 +173,7 @@ impl PreparedWriteTables {
         &self,
         attempt: &mut A,
         cache: &TableMetadataCache,
+        bindings: &crate::RequestTableBindings,
     ) -> StorageResult<()> {
         let stamps = attempt.read_catalog_stamps(&self.names).await?;
         if stamps.len() != self.names.len() {
@@ -168,10 +181,20 @@ impl PreparedWriteTables {
                 "prepared catalog stamp count differs",
             ));
         }
-        for ((name, table), stamp) in self.names.iter().zip(&self.tables).zip(stamps) {
-            cache.confirm_stamp(name, table.as_ref().map(|table| table.stamp), stamp)?;
-        }
-        Ok(())
+        bindings.confirm_observations(
+            cache,
+            self.names
+                .iter()
+                .zip(&self.tables)
+                .zip(stamps)
+                .map(|((name, table), observed)| {
+                    crate::dynamo_table_bindings::CatalogConfirmation {
+                        name,
+                        prepared: table.as_ref().map(|table| table.stamp),
+                        observed,
+                    }
+                }),
+        )
     }
 }
 
@@ -181,6 +204,7 @@ async fn warm_ttl_policies<P: DynamoPort>(
     port: &P,
     cache: &Arc<TableMetadataCache>,
     tables: &[Arc<BoundTableInfo>],
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<()> {
     let missing = tables
         .iter()
@@ -193,14 +217,20 @@ async fn warm_ttl_policies<P: DynamoPort>(
         return Ok(());
     }
     let read_cache = Arc::clone(cache);
+    let read_bindings = bindings.clone();
     let policies = port
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
                 let mut policies = Vec::with_capacity(missing.len());
                 for (name, generation) in missing {
-                    let (table, _) = resolve_prepared_table_in_attempt(attempt, &read_cache, &name)
-                        .await?
-                        .into_result()?;
+                    let (table, _) = resolve_prepared_table_in_attempt(
+                        attempt,
+                        &read_cache,
+                        &name,
+                        &read_bindings,
+                    )
+                    .await?
+                    .into_result()?;
                     let config = attempt.read_ttl_config(&table.table).await?;
                     policies.push((table.table, config, generation));
                 }

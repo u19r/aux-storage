@@ -38,7 +38,6 @@ pub(super) struct MutationView<'accepted> {
     pub key: &'accepted KeyAttributes,
     pub images: SourceImagesRef<'accepted>,
     pub provenance: Option<&'accepted ItemProvenance>,
-    pub source: Option<storage_types::StoredImageSource>,
 }
 
 impl<'accepted> OriginMutation<'accepted> {
@@ -51,7 +50,6 @@ impl<'accepted> OriginMutation<'accepted> {
                     physical: &item.table,
                     key: &item.key,
                     provenance: item.old_provenance.as_ref(),
-                    source: item.old_item.as_ref().and_then(|item| item.stored_source()),
                     images: SourceImagesRef {
                         old: item.old_item.as_deref(),
                         new: Some(&item.new_item),
@@ -65,7 +63,6 @@ impl<'accepted> OriginMutation<'accepted> {
                     physical: &item.table,
                     key: &item.key,
                     provenance: item.old_provenance.as_ref(),
-                    source: item.old_item.as_ref().and_then(|item| item.stored_source()),
                     images: SourceImagesRef {
                         old: item.old_item.as_deref(),
                         new: None,

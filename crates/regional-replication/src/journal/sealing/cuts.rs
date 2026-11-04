@@ -58,14 +58,23 @@ impl JournalStore {
                 .load_source_heads(attempt, &partitions, ReadProtection::Conflict)
                 .await?;
             let before = record.request.before()?;
-            let table = (before.configuration.table, before.configuration.lineage);
             let activities = partitions
                 .iter()
                 .copied()
                 .zip(heads.iter().copied())
-                .map(|high| (table, high));
+                .map(|high| {
+                    Ok(super::super::delivery_activity::DeliveryActivity {
+                        table: before.configuration.table,
+                        physical: before.physical,
+                        source_table: before.configuration.table,
+                        lineage: before.configuration.lineage,
+                        origin: self.origin(high.0)?,
+                        through: high.1,
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
             let mut changes = self
-                .prepare_local_delivery_activities(attempt, activities)
+                .prepare_local_delivery_activities(attempt, activities.into_iter())
                 .await?;
             for (partition, through) in partitions.into_iter().zip(heads) {
                 let cut = SealCut {

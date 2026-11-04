@@ -36,7 +36,9 @@ impl RetentionHandler {
         wall_now: Timestamp,
     ) -> StorageResult<JobOutcome> {
         let delay = if did_work || page_full {
-            Duration::ZERO
+            // Pending tables yield until the next millisecond. An earlier
+            // empty turn would replace their continuation with the idle hour.
+            Duration::from_millis(u64::from(crate::constants::TABLE_CLEANUP_YIELD_MILLIS))
         } else {
             self.interval
         };

@@ -141,7 +141,7 @@ async fn given_sqlite_manager_when_store_is_requested_then_default_is_bootstrapp
     let clone = store.clone();
     assert_eq!(
         clone
-            .commit(&put_transaction(b"factory-shared-marker", b"shared"))
+            .transact(&put_transaction(b"factory-shared-marker", b"shared"))
             .await
             .expect("commit through cloned handle"),
         CommitOutcome::Committed
@@ -212,7 +212,7 @@ async fn given_two_live_file_backed_sqlite_managers_when_second_disables_jobs_th
     let first_store = first_store.expect("first manager scheduled store");
     assert_eq!(
         first_store
-            .commit(&put_transaction(b"first-manager", b"first"))
+            .transact(&put_transaction(b"first-manager", b"first"))
             .await
             .expect("first manager commit"),
         CommitOutcome::Committed
@@ -237,7 +237,7 @@ async fn given_two_live_file_backed_sqlite_managers_when_second_disables_jobs_th
     );
     assert_eq!(
         second_store
-            .commit(&put_transaction(b"second-manager", b"second"))
+            .transact(&put_transaction(b"second-manager", b"second"))
             .await
             .expect("second manager commit"),
         CommitOutcome::Committed
@@ -318,7 +318,7 @@ async fn given_synchronized_sqlite_manager_construction_when_http_and_observer_a
         };
     assert_eq!(
         http_store
-            .commit(&put_transaction(b"concurrent-http", b"http"))
+            .transact(&put_transaction(b"concurrent-http", b"http"))
             .await
             .expect("HTTP manager commit"),
         CommitOutcome::Committed
@@ -332,7 +332,7 @@ async fn given_synchronized_sqlite_manager_construction_when_http_and_observer_a
     );
     assert_eq!(
         observer_store
-            .commit(&put_transaction(b"concurrent-observer", b"observer"))
+            .transact(&put_transaction(b"concurrent-observer", b"observer"))
             .await
             .expect("observer manager commit"),
         CommitOutcome::Committed
@@ -371,7 +371,7 @@ async fn given_multiple_connections_when_store_is_requested_then_only_default_is
     let store = store.expect("default connection has a scheduled job store");
     assert_eq!(
         store
-            .commit(&put_transaction(b"default-only-marker", b"default"))
+            .transact(&put_transaction(b"default-only-marker", b"default"))
             .await
             .expect("commit default store row"),
         CommitOutcome::Committed

@@ -28,7 +28,7 @@ async fn given_initialized_owner_when_job_store_conformance_runs_then_ordered_tr
         assert_eq!(report.reads, 3);
         assert_eq!(report.get_many, 4);
         assert_eq!(report.ranges, 4);
-        assert_eq!(report.commits, 9);
+        assert_eq!(report.commits, 10);
         assert_eq!(report.conflicts, 4);
         assert_eq!(report.unknowns, 0);
     })
@@ -122,7 +122,8 @@ async fn given_initialized_owner_when_isolated_job_runs_overlap_then_both_commit
 }
 
 #[tokio::test]
-async fn given_initialized_owner_when_operation_id_is_reused_then_effect_is_applied_once() {
+async fn given_initialized_owner_when_a_conditional_transaction_is_retried_then_current_checks_prevent_reapplication()
+ {
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         store.scheduled_job_store.bootstrap().await.unwrap();
@@ -130,12 +131,12 @@ async fn given_initialized_owner_when_operation_id_is_reused_then_effect_is_appl
         let key = StoreKey::try_from(b"p-jobs-same-op/k1".to_vec()).unwrap();
         let first = job_transaction(operation_id, key.clone(), b"v-a");
         assert_eq!(
-            store.scheduled_job_store.commit(&first).await.unwrap(),
+            store.scheduled_job_store.transact(&first).await.unwrap(),
             CommitOutcome::Committed
         );
         assert_eq!(
-            store.scheduled_job_store.commit(&first).await.unwrap(),
-            CommitOutcome::Committed
+            store.scheduled_job_store.transact(&first).await.unwrap(),
+            CommitOutcome::Conflict
         );
         assert_eq!(
             store
@@ -149,7 +150,7 @@ async fn given_initialized_owner_when_operation_id_is_reused_then_effect_is_appl
         );
         let conflicting = job_transaction(operation_id, key.clone(), b"v-b");
         assert!(!matches!(
-            store.scheduled_job_store.commit(&conflicting).await,
+            store.scheduled_job_store.transact(&conflicting).await,
             Ok(CommitOutcome::Committed)
         ));
         assert_eq!(
@@ -178,7 +179,7 @@ fn job_transaction(
 ) -> StoreTransaction {
     StoreTransaction::try_from(StoreTransactionInput {
         operation_id,
-        checks: Vec::new(),
+        checks: vec![scheduled_bg_jobs::store::Check::Absent(key.clone())],
         mutations: vec![Mutation::Put(key, value.to_vec().into())],
         limits: TransactionLimits {
             max_checks: NonZeroU32::new(100).unwrap(),
@@ -187,4 +188,79 @@ fn job_transaction(
         },
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn given_accepted_enqueue_and_completion_when_the_producers_never_return_then_native_recovery_finishes_both()
+ {
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        store.scheduled_job_store.bootstrap().await.unwrap();
+        let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
+            "recovery/{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let report = scheduled_bg_jobs_conformance::run_recovery(
+            store.scheduled_job_store.clone(),
+            store.scheduled_job_store.clone(),
+            namespace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.recovered_enqueues, 1);
+        assert_eq!(report.recovered_completions, 1);
+        assert_eq!(report.recovered_schedules, 1);
+        assert_eq!(report.handler_executions, 1);
+    })
+    .catch_unwind()
+    .await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn given_repeated_completed_jobs_when_running_twenty_thousand_native_occurrences_then_rows_bytes_and_idle_mutations_are_bounded()
+ {
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        store.scheduled_job_store.bootstrap().await.unwrap();
+        for deduplication in [false, true] {
+            let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
+                "lifecycle-growth/{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .unwrap();
+            let size = NonZeroU32::new(10_000).unwrap();
+            let report = if deduplication {
+                scheduled_bg_jobs_conformance::run_deduplication_growth(
+                    store.scheduled_job_store.clone(),
+                    namespace,
+                    size,
+                )
+                .await
+                .unwrap()
+            } else {
+                scheduled_bg_jobs_conformance::run_lifecycle_growth(
+                    store.scheduled_job_store.clone(),
+                    namespace,
+                    size,
+                )
+                .await
+                .unwrap()
+            };
+            assert_eq!(report.completed, 20_000);
+            assert_eq!(report.after_first_batch, report.after_second_batch);
+            assert_eq!(report.idle_mutations, 0);
+            eprintln!("native completed-job growth (deduplication={deduplication}): {report:?}");
+        }
+    })
+    .catch_unwind()
+    .await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
 }

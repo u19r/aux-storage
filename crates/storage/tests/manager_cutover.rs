@@ -154,7 +154,6 @@ async fn manager_operations_share_the_initialized_store_and_rejected_transaction
             put_request: Some(PutRequest {
                 item: item("two", "batch"),
                 indexers: None,
-                aux_item_stream_ttl_hours: None,
             }),
             delete_request: None,
         };
@@ -176,7 +175,6 @@ async fn manager_operations_share_the_initialized_store_and_rejected_transaction
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 ..TransactWriteItem::default()
             }],
@@ -196,7 +194,6 @@ async fn manager_operations_share_the_initialized_store_and_rejected_transaction
                                 "four",
                                 "encoded batch",
                             )),
-                            aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
                     }],
@@ -220,7 +217,6 @@ async fn manager_operations_share_the_initialized_store_and_rejected_transaction
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     ..storage_types::TransactEncodeItem::default()
                 }],

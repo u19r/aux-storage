@@ -9,7 +9,6 @@ exhaustive correctness or qualify a storage provider.
 | Adaptive admission | `crates/storage/src/admission/quint_admission_tests.rs` | Real adaptive controller transitions across bounded state and signal combinations. |
 | GSI maintenance | `crates/storage-provider/src/maintenance/gsi/observation_model_tests.rs` | Shared observation evaluation, build transitions, frontier decisions, and effects. |
 | Partition reconciliation | `crates/storage-provider/src/quint_partition_tests.rs` | Shared reconciliation, returned topology and controller state, with required split and admission-gate coverage. |
-| Custom retention | `crates/storage-provider/src/quint_custom_stream_duration_tests.rs` | Retention planning and trim-worker decisions over generated policy, version, and protection boundaries. |
 
 Run `just quint` for these adapters, or use the normal workspace test suite. Each adapter
 invokes its model through `quint-connect`; a passing standalone model is not release evidence.
@@ -22,10 +21,12 @@ simulator's integer range; extending their length requires checking that represe
 
 ## Design specifications
 
-`just quint-design` checks three abstract protocol models independently of production tests:
+`just quint-design` checks five abstract protocol models independently of production tests:
 
 | Model | Purpose |
 | --- | --- |
+| `table_deletion.qnt` | Detach a name for immediate fresh-ID reuse while old IDs remain DELETING, fence old producers/cursors, and pair expiry markers with their states. Focused gate: `just quint-table-deletion`. Contract: [write-simplify.md](../docs/plans/write-simplify.md#table-deletion-and-recreation-security-contract). |
+| `write_simplify.qnt` | Explore snapshot history, exact writer predecessors, one custom table duration, unpublished current anchors, quiet baseline replacement/deletion with committed-retirement release, independently retiring lineages, captured-time inversion, table-generation fences, prospective retirement and bounded metadata cleanup/restart. Focused gate: `just quint-write-simplify`. Design contract: [write-simplify.md](../docs/plans/write-simplify.md). |
 | `maintenance_commit.qnt` | Explore destination fencing, replacement, observation/commit races, and lost acknowledgments. |
 | `gsi_history_lifetime.qnt` | Explore delayed allocation, split-lineage holds, independent shard progress, and image/record reclamation. |
 | `system_stream_scope_frontier.qnt` | Explore checkpoint issuance uncertainty, exact replay, split continuation, and protected frontiers. |

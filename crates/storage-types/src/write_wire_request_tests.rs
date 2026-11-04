@@ -131,7 +131,6 @@ fn batch_write_item_request_converts_put_item_to_encode_tests() {
                     ]))
                     .unwrap(),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             }],

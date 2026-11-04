@@ -10,7 +10,6 @@ use crate::{AttemptMode, ReadProtection, SqlAttempt, SqlQueryPage, SqlStatement}
 /// A transaction-scoped SQLite statement executor; construction is private.
 pub struct SqliteAttempt {
     settlement: storage_types::NativeAttemptSettlement,
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
     session: Session,
     mode: AttemptMode,
     #[cfg(feature = "fault-injection")]
@@ -25,7 +24,6 @@ impl SqliteAttempt {
     ) -> Self {
         let (mode, limits) = execution;
         Self {
-            ownership: Default::default(),
             settlement: storage_types::NativeAttemptSettlement::new(limits),
             session,
             mode,
@@ -49,11 +47,6 @@ impl SqlAttempt for SqliteAttempt {
     }
     fn require_settlement(&self) -> StorageResult<()> {
         self.settlement.require_open()
-    }
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
     }
 
     async fn query_batch_protected(

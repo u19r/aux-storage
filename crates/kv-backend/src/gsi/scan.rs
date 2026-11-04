@@ -11,7 +11,7 @@ use crate::{
     KvAttempt, KvRange, KvRangePage, ReadProtection,
     catalog::KvTableIdentity,
     constants::{PAGE_READ_BYTES, PRIMARY_ITEM_FAMILY},
-    item_read::{hydrate_primary_items, primary_item_key},
+    item_read::{decode_primary_items, primary_item_key},
     range::prefix_upper_bound,
     stream_history::capture_high,
 };
@@ -38,7 +38,7 @@ pub(crate) async fn read_scan_source_page<A: KvAttempt>(
     crate::item_read::select_primary_prefix(table, &mut page)?;
     let next = page.entries.last().map(|entry| entry.key.clone());
     let more = page.more;
-    let items = decode_scan_entries(catalog, identity, table, page).await?;
+    let items = decode_scan_entries(identity, table, page)?;
     let end = if more {
         GsiScanPageEnd::Continue(
             next.ok_or_else(|| StorageError::internal("KV GSI scan page has no cursor"))?,
@@ -54,8 +54,7 @@ pub(crate) async fn read_scan_source_page<A: KvAttempt>(
     })
 }
 
-async fn decode_scan_entries<A: KvAttempt>(
-    catalog: &mut crate::catalog::KvCatalogAttempt<'_, A>,
+fn decode_scan_entries(
     identity: &KvTableIdentity,
     table: &BoundTableInfo,
     page: KvRangePage,
@@ -65,7 +64,7 @@ async fn decode_scan_entries<A: KvAttempt>(
         .iter()
         .map(|entry| (table, Some(entry.value.as_slice())))
         .collect();
-    let hydrated = hydrate_primary_items(catalog, requests, PAGE_READ_BYTES.get()).await?;
+    let hydrated = decode_primary_items(requests, PAGE_READ_BYTES.get())?;
     let mut items = Vec::with_capacity(page.entries.len());
     for (entry, item) in page.entries.into_iter().zip(hydrated) {
         let item = item.ok_or_else(|| StorageError::internal("Missing GSI source content"))?;

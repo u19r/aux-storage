@@ -31,8 +31,6 @@ fn table() -> Arc<storage_types::StoredTableInfo> {
         stream_specification: None,
         table_stream_duration:
             storage_types::StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
-        default_item_stream_duration:
-            storage_types::StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
         deletion_protection_enabled: false,
     })
 }
@@ -58,7 +56,6 @@ fn given_put_write_when_for_single_put_then_foreground_context_applies() {
 
     assert_eq!(input.table.table_name, table_name());
     assert!(input.stream.immediate_gsi_consistency);
-    assert!(input.item_stream_ttl_hours.is_none());
 }
 
 #[test]
@@ -78,7 +75,6 @@ fn given_update_write_when_for_single_update_then_options_apply() {
         return_consumed_capacity: None,
         return_item_collection_metrics: None,
         return_values_on_condition_check_failure: None,
-        aux_item_stream_ttl_hours: None,
     };
     let write =
         PhysicalWrite::try_new(0, table_name(), request, direct_context()).expect("physical write");

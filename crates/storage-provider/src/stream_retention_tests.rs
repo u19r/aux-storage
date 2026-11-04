@@ -1,85 +1,88 @@
-//! Transaction I/O adapter for the existing deterministic retention models.
+//! Retention wave construction and generation invariants.
+use crate::StreamTrimScope;
 
-use storage_types::StorageResult;
-
-use crate::{
-    StreamDurationTrimPageRequest, StreamDurationTrimPageResult, StreamRetentionRepository,
-    StreamTrimScope, StreamTrimScopeBoundaries,
-    maintenance::{StreamRetentionFinish, StreamRetentionTransaction},
-};
-
-pub(crate) trait ModelRetentionIo {
-    fn trim_stream_pages(
-        &self,
-        requests: Vec<StreamDurationTrimPageRequest>,
-    ) -> impl std::future::Future<Output = StorageResult<Vec<StreamDurationTrimPageResult>>> + Send;
-
-    fn finish_stream_trim_markers(
-        &self,
-        finishes: Vec<StreamRetentionFinish>,
-    ) -> impl std::future::Future<Output = StorageResult<()>> + Send;
+struct RecordedMarkerWaves {
+    markers: Vec<crate::StreamTrimDueMarker>,
+    waves: std::sync::Mutex<Vec<Vec<crate::StreamTrimDueMarker>>>,
 }
 
-pub(crate) struct ModelTransaction<'a, T: ?Sized> {
-    model: &'a T,
-    rejected: bool,
+#[async_trait::async_trait]
+impl crate::StreamRetentionRepository for RecordedMarkerWaves {
+    async fn trim_stream_marker_wave(
+        &self,
+        wave: crate::maintenance::StreamRetentionWave,
+    ) -> storage_types::StorageResult<crate::maintenance::StreamDurationTrimStats> {
+        self.waves.lock().unwrap().push(wave.markers().to_vec());
+        Ok(crate::maintenance::StreamDurationTrimStats {
+            due_markers_scanned: wave.markers().len(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_due_stream_trim_markers(
+        &self,
+        _: storage_types::TimestampMillis,
+        limit: usize,
+    ) -> storage_types::StorageResult<Vec<crate::StreamTrimDueMarker>> {
+        Ok(self.markers.iter().take(limit).cloned().collect())
+    }
+
+    async fn load_stream_trim_states(
+        &self,
+        _: &[crate::StreamTrimScope],
+    ) -> storage_types::StorageResult<Vec<Option<crate::StreamTrimState>>> {
+        panic!("worker dispatch must leave observations inside each native wave")
+    }
 }
 
-impl<'a, T: ?Sized> ModelTransaction<'a, T> {
-    pub(crate) fn new(model: &'a T) -> Self {
-        Self {
-            model,
-            rejected: false,
+#[tokio::test]
+async fn given_more_markers_than_native_wave_capacity_when_worker_dispatches_then_every_scope_is_bounded_and_serial()
+ {
+    use storage_types::{TableName, TimestampMillis};
+
+    use crate::{StreamDurationTrimConfig, StreamDurationTrimWorker, StreamTrimDueMarker};
+
+    let now = TimestampMillis::from_timestamp(0);
+    let markers = (1..=2)
+        .flat_map(|version| {
+            (0..40).map(move |id| {
+                let name = format!("table-{id:02}");
+                StreamTrimDueMarker::new(
+                    now,
+                    StreamTrimScope::table(name.clone(), TableName::new(&name)),
+                    version,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let backend = RecordedMarkerWaves {
+        markers,
+        waves: Default::default(),
+    };
+    let stats = StreamDurationTrimWorker::new(&backend, StreamDurationTrimConfig::default())
+        .run_due_page(now, now)
+        .await
+        .unwrap();
+    assert_eq!(stats.due_markers_scanned, 80);
+    let waves = backend.waves.lock().unwrap();
+    assert!(
+        waves
+            .iter()
+            .all(|wave| wave.len() <= crate::constants::TABLE_CLEANUP_PAGE_ROWS)
+    );
+    let mut observed = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for wave in waves.iter() {
+        let mut scopes = std::collections::HashSet::new();
+        for marker in wave {
+            assert!(scopes.insert(marker.scope.scope_id.clone()));
+            observed
+                .entry(marker.scope.scope_id.clone())
+                .or_default()
+                .push(marker.policy_version);
         }
     }
-}
-
-impl<T: StreamRetentionRepository + ModelRetentionIo + ?Sized> StreamRetentionTransaction
-    for ModelTransaction<'_, T>
-{
-    async fn load_stream_trim_observations(
-        &mut self,
-        markers: &[crate::StreamTrimDueMarker],
-    ) -> StorageResult<Vec<crate::maintenance::StreamRetentionObservation>> {
-        let scopes = markers
-            .iter()
-            .map(|marker| marker.scope.clone())
-            .collect::<Vec<_>>();
-        let states = self.model.load_stream_trim_states(&scopes).await?;
-        let present = self
-            .model
-            .list_due_stream_trim_markers(
-                storage_types::TimestampMillis::from_timestamp(i64::MAX),
-                usize::MAX,
-            )
-            .await?;
-        Ok(markers
-            .iter()
-            .zip(states)
-            .map(|(marker, state)| (present.contains(marker), state).into())
-            .collect())
-    }
-
-    async fn load_stream_trim_boundaries(
-        &mut self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>> {
-        self.model.load_stream_trim_boundaries(scopes).await
-    }
-
-    async fn trim_stream_pages(
-        &mut self,
-        requests: Vec<StreamDurationTrimPageRequest>,
-    ) -> StorageResult<Vec<StreamDurationTrimPageResult>> {
-        self.model.trim_stream_pages(requests).await
-    }
-
-    async fn finish_stream_trim_markers(
-        &mut self,
-        finishes: Vec<StreamRetentionFinish>,
-    ) -> StorageResult<()> {
-        self.model.finish_stream_trim_markers(finishes).await
-    }
+    assert_eq!(observed.len(), 40);
+    assert!(observed.values().all(|versions| versions == &[1, 2]));
 }
 
 #[test]
@@ -139,59 +142,12 @@ fn given_max_policy_version_when_advancing_retention_policy_then_overflow_is_rej
     let state = StreamTrimState {
         scope,
         policy_version: u64::MAX,
-        retention: StreamRetentionDuration::FiniteHours(1),
-        effective_retention: StreamRetentionDuration::FiniteHours(1),
+        frontier: crate::retention_test_support::frontier(u64::MAX),
+        retention: StreamRetentionDuration::from_hours(24).unwrap(),
         next_due_at: None,
-        oldest_retained_version: None,
-        oldest_retained_timestamp: None,
-        latest_version: None,
-        latest_timestamp: None,
         updated_at: TimestampMillis::from_timestamp(1),
     };
 
     assert!(matches!(StreamTrimState::next_policy_version(None), Ok(1)));
     assert!(StreamTrimState::next_policy_version(Some(&state)).is_err());
-}
-
-// These deterministic policy fixtures do not model native durability.
-impl<T: Sync + ?Sized> infrastructure_provider::physical_attempt::PhysicalRecordAttempt
-    for ModelTransaction<'_, T>
-{
-    fn read_protection(&self) -> storage_types::ReadProtection {
-        storage_types::ReadProtection::Conflict
-    }
-    fn reject_settlement(&mut self) {
-        self.rejected = true;
-    }
-    fn reject_settlement_error(&mut self, _: &storage_types::StorageError) {
-        self.reject_settlement();
-    }
-    async fn has_records_in_namespace(
-        &mut self,
-        _: &str,
-        _: storage_types::ReadProtection,
-    ) -> StorageResult<bool> {
-        panic!("policy model must not access protected physical records")
-    }
-    async fn load_records(
-        &mut self,
-        _: &[infrastructure_provider::record::DurableRecordKey],
-        _: storage_types::ReadProtection,
-        _: infrastructure_provider::limits::InfrastructureLimits,
-    ) -> StorageResult<Vec<Option<infrastructure_provider::record::DurableRecord>>> {
-        panic!("policy model must not access protected physical records")
-    }
-    async fn scan_records(
-        &mut self,
-        _: infrastructure_provider::page::RecordPageRequest,
-        _: infrastructure_provider::limits::InfrastructureLimits,
-    ) -> StorageResult<infrastructure_provider::page::RecordPage> {
-        panic!("policy model must not access protected physical records")
-    }
-    async fn store_records(
-        &mut self,
-        _: &infrastructure_provider::batch::RecordBatch<'_>,
-    ) -> StorageResult<infrastructure_provider::record::ConditionalWriteResult> {
-        panic!("policy model must not access protected physical records")
-    }
 }

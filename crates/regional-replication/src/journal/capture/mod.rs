@@ -85,16 +85,51 @@ impl JournalStore {
         let Some(row) = rows.pop().flatten() else {
             return Ok(None);
         };
-        let record: CaptureRecord = self.records.decode(&row)?;
-        if record.proposal != *proposal || row.key != key {
+        let record = self.decode_source_capture(&row)?;
+        if record.proposal != *proposal {
             return Err(corrupt_record());
         }
-        let source = replication_provider::control::source_capture_state(proposal)
+        Ok(Some((row, record)))
+    }
+
+    fn decode_source_capture(&self, row: &DurableRecord) -> StorageResult<CaptureRecord> {
+        let record: CaptureRecord = self.records.decode(row)?;
+        record.proposal.validate().map_err(|_| corrupt_record())?;
+        if record.proposal.operation().home_region != self.region
+            || row.key
+                != self.identity_key(SOURCE_CAPTURE_SUFFIX, &record.proposal.operation().id)?
+        {
+            return Err(corrupt_record());
+        }
+        let source = replication_provider::control::source_capture_state(&record.proposal)
             .map_err(|_| corrupt_record())?;
         self.require_local_source(&source)?;
         record.schema.validate(&source.name)?;
         record.require_partition(self.partitions)?;
-        Ok(Some((row, record)))
+        Ok(record)
+    }
+
+    pub(super) async fn reclaim_source_capture<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        row: &DurableRecord,
+        history: storage_types::TableHistoryId,
+    ) -> StorageResult<()> {
+        let record = self.decode_source_capture(row)?;
+        let source = replication_provider::control::source_capture_state(&record.proposal)
+            .map_err(|_| corrupt_record())?;
+        if source.physical != history {
+            return Ok(());
+        }
+        self.records
+            .store(
+                attempt,
+                &[infrastructure_provider::record::RecordChange::Delete {
+                    key: row.key.clone(),
+                    expected: row.revision,
+                }],
+            )
+            .await
     }
 
     async fn store_source_capture<A: PhysicalRecordAttempt>(

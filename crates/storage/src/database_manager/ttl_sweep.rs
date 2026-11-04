@@ -20,12 +20,7 @@ impl DatabaseManager {
                 .ok_or_else(|| {
                     StorageError::validation("ttl sweep requires an enabled ttl policy")
                 })?;
-            TtlSweepPageCommand::try_new(
-                request.table_name,
-                request.input,
-                policy.policy_generation,
-                TimestampMillis::now(),
-            )
+            TtlSweepPageCommand::try_new(policy, request.input, TimestampMillis::now())
         })
         .await
     }

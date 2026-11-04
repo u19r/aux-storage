@@ -358,6 +358,7 @@ impl JournalStore {
                     state.configuration.table,
                     binding.table,
                     state.configuration.lineage,
+                    state.physical,
                 ),
                 origins,
                 protection,

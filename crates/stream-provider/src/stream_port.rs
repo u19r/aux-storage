@@ -8,14 +8,13 @@ use storage_common::partition::{
 };
 use storage_types::{
     AttemptMode, Clock, StorageError, StorageResult, StreamItemId, StreamName,
-    SystemStreamCheckpoint, SystemStreamCheckpointToken,
+    SystemStreamCheckpoint,
 };
 
 use crate::{
     CursorName, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem, StreamReadKind,
     StreamReadRequest, StreamReadResult, StreamRowKind, StreamRowPage, StreamRowValue,
-    SystemStreamCheckpointIssue, SystemStreamCheckpointReceipt, SystemStreamHistory,
-    SystemStreamHistoryRead, SystemStreamHistoryReadPage, SystemStreamSplitOperationId,
+    SystemStreamCheckpointIssue, SystemStreamHistory, SystemStreamSplitOperationId,
     SystemStreamSplitReceipt,
 };
 
@@ -36,7 +35,7 @@ pub enum StreamItemIdAllocation {
 }
 
 pub trait StreamAttempt:
-    Send + infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+    Send + crate::ItemHistoryReadAttempt + crate::SystemHistoryReadAttempt
 {
     /// The physical layout is a property of the attempt family, not a flag
     /// supplied by a domain caller or stored on each request.
@@ -49,7 +48,7 @@ pub trait StreamAttempt:
 
     fn load_append_receipt(
         &mut self,
-        operation: crate::StreamAppendOperationId,
+        key: crate::TableAppendReceiptKey,
     ) -> impl Future<Output = StorageResult<Option<crate::StreamAppendReceipt>>> + Send;
 
     fn read_stream_record(
@@ -86,20 +85,6 @@ pub trait StreamAttempt:
         id: StreamItemId,
         through: StreamItemId,
     ) -> impl Future<Output = StorageResult<Option<StreamItem>>> + Send;
-
-    /// Read the protected history and an optional checkpoint in one native
-    /// batch. Both observations must belong to this attempt's snapshot.
-    fn read_system_page_start(
-        &mut self,
-        token: Option<&SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(SystemStreamHistory, Option<SystemStreamCheckpointReceipt>)>,
-    > + Send;
-
-    fn read_system_history_pages(
-        &mut self,
-        reads: &[SystemStreamHistoryRead],
-    ) -> impl Future<Output = StorageResult<Vec<SystemStreamHistoryReadPage>>> + Send;
 
     /// Protect the topology and read an optional idempotency receipt in one
     /// native attempt before the shared split decision.
@@ -301,6 +286,7 @@ pub trait TableAppendCapture<A: StreamAttempt>: Clone + Send + Sync + 'static {
         attempt: &mut A,
         request: &crate::TableAppendRequest,
         append: &crate::UserStreamAppend,
+        table: &storage_types::BoundTableInfo,
     ) -> impl Future<Output = StorageResult<Option<Self::Captured>>> + Send;
 
     fn store_response(
@@ -328,6 +314,7 @@ impl<A: StreamAttempt> TableAppendCapture<A> for NoTableAppendCapture {
         _attempt: &mut A,
         _request: &crate::TableAppendRequest,
         _append: &crate::UserStreamAppend,
+        _table: &storage_types::BoundTableInfo,
     ) -> StorageResult<Option<Self::Captured>> {
         Ok(None)
     }

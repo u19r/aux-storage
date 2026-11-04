@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use storage_types::{
-    AttributeValue, SystemStreamCheckpoint, SystemStreamCheckpointToken, SystemStreamPosition,
-    SystemStreamScope, SystemStreamSourceTableName, TableName,
+    AttributeValue, StreamRecord, SystemStreamCheckpoint, SystemStreamCheckpointToken,
+    SystemStreamPosition, SystemStreamScope, TableName,
 };
-use stream_provider::{SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamStoredRecord};
+use stream_provider::{SystemStreamIssuedCheckpoint, SystemStreamPage};
 
 #[test]
 fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_are_preserved() {
@@ -12,13 +12,13 @@ fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_
     let scope = SystemStreamScope::try_new("catalog", 1).expect("scope");
     let position = SystemStreamPosition::try_new("shard-1", "lineage-1", "offset-1")
         .expect("logical position");
-    let record = SystemStreamStoredRecord {
-        source_table_name: SystemStreamSourceTableName::try_new("missing-delete")
-            .expect("logical source table"),
+    let record = StreamRecord {
+        cursor: None,
+        source_table_name: Some(TableName::new("missing-delete")),
         keys: key_image.clone().into(),
-        old_image: None,
-        new_image: None,
-        position: position.clone(),
+        sequence_number: position.offset().as_str().to_string(),
+        item: None,
+        system_position: Some(position.clone()),
     };
     let checkpoint =
         SystemStreamCheckpoint::try_new(scope.clone(), vec![position]).expect("logical checkpoint");
@@ -26,7 +26,7 @@ fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_
         .expect("checkpoint token");
     let page = SystemStreamPage::new(
         scope,
-        vec![record.into_stream_record().unwrap()],
+        vec![record],
         SystemStreamIssuedCheckpoint::new(token, checkpoint).expect("issued checkpoint"),
         true,
     )
@@ -35,8 +35,7 @@ fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_
     let response = page.into_response().expect("SystemStream response");
     let record = &response.records()[0];
     assert_eq!(record.keys, key_image.into());
-    assert!(record.new_image.is_none());
-    assert!(record.old_image.is_none());
+    assert!(record.item.is_none());
     assert_eq!(record.sequence_number, "offset-1");
     assert!(record.cursor.is_none());
     assert_eq!(

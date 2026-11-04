@@ -61,8 +61,9 @@ impl JournalStore {
         let result = async {
             self.require_archive_hold(expected)?;
             let family = self
-                .load_archive_state(attempt, expected.cursor.kind, protection)
-                .await?;
+                .find_archive_state(attempt, expected.cursor.kind, protection)
+                .await?
+                .ok_or_else(corrupt_record)?;
             let ArchiveState::Pending(hold) = &family.state else {
                 return Err(corrupt_record());
             };

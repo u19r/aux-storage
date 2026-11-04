@@ -20,12 +20,10 @@ use crate::{
 };
 
 impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
-    type Catalog = BoundTableInfo;
-
     async fn observe_table_update(
         &mut self,
         name: &TableName,
-    ) -> StorageResult<Option<Self::Catalog>> {
+    ) -> StorageResult<Option<BoundTableInfo>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -47,7 +45,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
 
     async fn observe_table_retention(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
     ) -> StorageResult<TableUpdateRetention> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -67,7 +65,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
 
     async fn load_index_name_lock(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
         name: &IndexName,
     ) -> StorageResult<Option<TimestampMillis>> {
         let mut settlement =
@@ -96,9 +94,9 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
 
     async fn persist_table_update(
         &mut self,
-        current: Self::Catalog,
+        current: BoundTableInfo,
         change: TableUpdateChange,
-    ) -> StorageResult<Self::Catalog> {
+    ) -> StorageResult<BoundTableInfo> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -123,6 +121,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
                             StorageError::internal("KV deleted index has no physical identity")
                         })?;
                     let target = GsiBuildTarget {
+                        history_id: current.history_id,
                         table_name: current.table_name.clone(),
                         index_name: delete.index_name.clone(),
                         incarnation: crate::gsi::index_incarnation(
@@ -159,7 +158,7 @@ impl<A: KvAttempt> TableUpdateTransaction for KvCatalogAttempt<'_, A> {
 
     async fn observe_table_update_readiness(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
     ) -> StorageResult<GsiReadinessSnapshot> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -187,6 +186,7 @@ async fn register_created_index<A: KvAttempt>(
     let incarnation = crate::gsi::index_incarnation(identity.table_id, index.index_id);
     let build = GsiBuild::<()>::new(
         GsiBuildTarget {
+            history_id: identity.table_id.into(),
             table_name: identity.table_name.clone(),
             index_name: name.clone(),
             incarnation: TargetIncarnation::from(incarnation),

@@ -8,8 +8,7 @@ use std::{
 use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
-use storage_types::{CreateTableRequest, GetItemRequest, PutItemRequest, StreamName};
-use stream_provider::StreamRowKind;
+use storage_types::{CreateTableRequest, GetItemRequest, PutItemRequest};
 use tokio::sync::Barrier;
 
 use super::test_support::{TestStore, unique_table_name};
@@ -80,37 +79,23 @@ async fn given_eight_concurrent_puts_to_one_key_when_all_commit_then_eight_chang
             .expect("writer number");
         assert!((0..8).any(|writer| winner == writer.to_string()));
 
-        let stream = StreamRowKind::System(StreamName::system_table_stream());
-        let mut cursor = None;
-        let mut changes = Vec::new();
-        let mut exhausted = false;
-        for _ in 0..9 {
-            let page = observe(
-                store
-                    .stream_operations
-                    .read_forward(stream.clone(), cursor, 10),
-            )
-            .await;
-            page.assert_no_warning_or_error();
-            let page = page.result.expect("read committed CDC changes");
-            assert!(
-                !page.items.is_empty() || !page.has_more,
-                "CDC page must advance"
-            );
-            cursor = page.last_evaluated_key;
-            changes.extend(page.items);
-            if !page.has_more {
-                exhausted = true;
-                break;
-            }
-        }
-        assert!(exhausted, "CDC stream must have a finite end");
+        let changes = super::cdc_stream_tests::system_records(&store, 2)
+            .await
+            .unwrap();
         assert_eq!(
             changes.len(),
             8,
             "one durable CDC pointer per committed write"
         );
-        assert!(changes.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(changes.windows(2).all(|pair| {
+            pair[0]
+                .system_position
+                .as_ref()
+                .unwrap()
+                .offset()
+                .compare_order(pair[1].system_position.as_ref().unwrap().offset())
+                == Ok(std::cmp::Ordering::Less)
+        }));
     })
     .catch_unwind()
     .await;

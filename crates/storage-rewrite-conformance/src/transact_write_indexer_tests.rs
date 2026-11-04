@@ -5,10 +5,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
-use storage_types::{
-    CreateTableRequest, GetItemRequest, QueryRequest, StreamName, TransactWriteItemsRequest,
-};
-use stream_provider::StreamRowKind;
+use storage_types::{CreateTableRequest, GetItemRequest, QueryRequest, TransactWriteItemsRequest};
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
@@ -73,10 +70,10 @@ async fn given_transactional_indexers_when_one_is_invalid_then_no_item_gsi_or_cd
             let response = store.operations.get_item(get).await.unwrap();
             assert_eq!(serde_json::to_value(response).unwrap(), json!({}));
         }
-        let stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(stream.clone(), None, 10)
-            .await.unwrap();
-        assert!(before.items.is_empty(), "rejected transaction must not append CDC");
+        let scope = store.stream_operations.system_stream_scope().await.unwrap();
+        let request = stream_provider::SystemStreamPageRequest::try_new(scope, None, 10).unwrap();
+        let before = store.stream_operations.get_system_stream_page(request.clone()).await.unwrap();
+        assert!(before.records().is_empty(), "rejected transaction must not append CDC");
         let query = QueryRequest::try_from(json!({
             "TableName": table.as_ref(),
             "IndexName": "ByStatus",
@@ -138,9 +135,8 @@ async fn given_transactional_indexers_when_one_is_invalid_then_no_item_gsi_or_cd
                 "ScannedCount": 1
             })
         );
-        let after = store.stream_operations.read_forward(stream, None, 10)
-            .await.unwrap();
-        assert_eq!(after.items.len(), 2);
+        let after = store.stream_operations.get_system_stream_page(request).await.unwrap();
+        assert_eq!(after.records().len(), 2);
     })
     .catch_unwind()
     .await;

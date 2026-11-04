@@ -52,7 +52,11 @@ pub(crate) fn read_range_for_prefix(
     if begin >= end {
         return Ok(None);
     }
-    let limit = NonZeroU32::new(request.limit.get() + 1)
+    let limit = request
+        .limit
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU32::new)
         .ok_or_else(|| StorageError::internal("stream read limit overflowed"))?;
     Ok(Some((
         prefix,

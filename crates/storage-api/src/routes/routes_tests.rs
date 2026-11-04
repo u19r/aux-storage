@@ -92,7 +92,6 @@ pub async fn seed_item(
         return_values_on_condition_check_failure: input
             .return_old_on_condition_failure
             .then(|| "ALL_OLD".to_string()),
-        aux_item_stream_ttl_hours: input.aux_item_stream_ttl_hours,
     };
     db.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
         dynamo.put_item(request).await

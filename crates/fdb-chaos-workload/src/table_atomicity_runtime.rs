@@ -1,16 +1,39 @@
 use crate::{common::*, imports::*, table_atomicity::*};
 
+enum Phase {
+    Setup,
+    Start,
+    Check,
+}
+
+impl TableAtomicityWorkload {
+    async fn run_phase(&mut self, db: SimDatabase, phase: Phase) {
+        let context = std::rc::Rc::clone(&self.context);
+        let (clock, requests) = crate::simulation_clock::SimulationClock::new();
+        self.clock = Some(clock);
+        let operation = async {
+            match phase {
+                Phase::Setup => self.setup_phase(db).await,
+                Phase::Start => self.start_phase(db).await,
+                Phase::Check => self.check_phase(db).await,
+            }
+        };
+        crate::simulation_clock::drive_operation(context, requests, operation).await;
+        self.clock = None;
+    }
+}
+
 impl RustWorkload for TableAtomicityWorkload {
     async fn setup(&mut self, db: SimDatabase) {
-        self.setup_phase(db).await;
+        self.run_phase(db, Phase::Setup).await;
     }
 
     async fn start(&mut self, db: SimDatabase) {
-        self.start_phase(db).await;
+        self.run_phase(db, Phase::Start).await;
     }
 
     async fn check(&mut self, db: SimDatabase) {
-        self.check_phase(db).await;
+        self.run_phase(db, Phase::Check).await;
     }
 
     fn get_metrics(&self, mut out: Metrics) {
@@ -51,10 +74,6 @@ impl RustWorkload for TableAtomicityWorkload {
             metric_val_u64(
                 "aux_storage_table_atomicity_trim_execution_count",
                 self.trim_execution_count,
-            ),
-            metric_val_u64(
-                "aux_storage_table_atomicity_trim_unclassified_scope_count",
-                self.trim_model.unclassified_count() as u64,
             ),
             metric_val_u64(
                 "aux_storage_table_atomicity_stream_audit_count",

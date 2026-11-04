@@ -6,9 +6,9 @@ use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
 use storage_types::{
-    CreateTableRequest, DeleteItemRequest, GetItemRequest, PutItemRequest, QueryRequest, StreamName,
+    CreateTableRequest, DeleteItemRequest, GetItemRequest, PutItemRequest, QueryRequest,
 };
-use stream_provider::{StreamRowKind, SystemStreamPageRequest};
+use stream_provider::SystemStreamPageRequest;
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
@@ -119,10 +119,9 @@ async fn given_versioned_item_when_conditional_deletes_run_then_only_matching_de
         .unwrap();
         store.operations.put_item(put).await.unwrap();
 
-        let system_stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(system_stream.clone(), None, 10)
+        let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
-        assert_eq!(before.items.len(), 1);
+        assert_eq!(before.len(), 1);
 
         let delete_request = |expected_version: &str| {
             DeleteItemRequest::try_from(json!({
@@ -150,10 +149,10 @@ async fn given_versioned_item_when_conditional_deletes_run_then_only_matching_de
         let unchanged = store.operations.get_item(get_request()).await.unwrap();
         assert_eq!(serde_json::to_value(unchanged).unwrap(),
             json!({"Item": original}));
-        let after_rejection = store.stream_operations.read_forward(system_stream.clone(), None, 10)
+        let after_rejection = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
-        assert_eq!(after_rejection.items.len(), 1);
-        assert_eq!(after_rejection.items[0].id, before.items[0].id);
+        assert_eq!(after_rejection.len(), 1);
+        assert_eq!(after_rejection[0].sequence_number, before[0].sequence_number);
 
         let accepted = observe(store.operations.delete_item(delete_request("2"))).await;
         accepted.assert_no_warning_or_error();
@@ -161,11 +160,11 @@ async fn given_versioned_item_when_conditional_deletes_run_then_only_matching_de
             .unwrap(), json!({"Attributes": original}));
         let absent = store.operations.get_item(get_request()).await.unwrap();
         assert_eq!(serde_json::to_value(absent).unwrap(), json!({}));
-        let after_commit = store.stream_operations.read_forward(system_stream, None, 10)
+        let after_commit = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
-        assert_eq!(after_commit.items.len(), 2);
-        assert_eq!(after_commit.items[0].id, before.items[0].id);
-        assert_ne!(after_commit.items[1].id, before.items[0].id);
+        assert_eq!(after_commit.len(), 2);
+        assert_eq!(after_commit[0].sequence_number, before[0].sequence_number);
+        assert_ne!(after_commit[1].sequence_number, before[0].sequence_number);
     })
     .catch_unwind()
     .await;

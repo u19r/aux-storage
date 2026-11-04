@@ -139,14 +139,9 @@ async fn direct_pages(fixture: &TestStore) -> anyhow::Result<()> {
             "ttl",
             captured_at,
             1,
-            policy.checkpoint.cursor,
+            policy.config.checkpoint.cursor.clone(),
         )?;
-        let command = storage_provider::TtlSweepPageCommand::try_new(
-            table.clone(),
-            input,
-            policy.policy_generation,
-            captured_at,
-        )?;
+        let command = storage_provider::TtlSweepPageCommand::try_new(policy, input, captured_at)?;
         let page = repository.execute_ttl_sweep_page(command.clone()).await?;
         anyhow::ensure!(
             page.deleted_items == 1 && count_survivors(fixture).await? == expected_remaining,
@@ -180,9 +175,8 @@ async fn direct_pages(fixture: &TestStore) -> anyhow::Result<()> {
         .expect("enabled policy");
     let captured_at = TimestampMillis::from_timestamp(2_000_000_000_000);
     let stale = storage_provider::TtlSweepPageCommand::try_new(
-        table.clone(),
+        policy,
         storage_provider::TtlSweepPageInput::try_new("ttl", captured_at, 1, None)?,
-        policy.policy_generation,
         captured_at,
     )?;
     for enabled in [false, true] {
@@ -273,8 +267,6 @@ async fn replace_active_target(fixture: &TestStore, recreate: bool) -> anyhow::R
                 table_name: table.clone(),
             })
             .await?;
-        // The public route reserves deleted names for 30 seconds.
-        fixture.advance_time(std::time::Duration::from_secs(30));
         seed_due_items(fixture).await?;
         return Ok(3);
     }

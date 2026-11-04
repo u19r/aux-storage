@@ -58,16 +58,16 @@ struct NativeCommandExecutor<'worker, 'database> {
 impl NativeCommandExecutor<'_, '_> {
     fn dispatch(&mut self, command: Command) -> Option<NativeSettlementCommand> {
         match command {
-            Command::HasKeyInRange {
+            Command::FirstKeyInRange {
                 begin,
                 end,
                 protection,
                 answer,
             } => {
                 let result = self.execute_command(&answer, || {
-                    protection
-                        .validate(self.mode)
-                        .and_then(|()| has_native_key_in_range(self.native, &begin, &end))
+                    protection.validate(self.mode).and_then(|()| {
+                        load_first_native_key(self.native, &begin, &end, &self.settlement)
+                    })
                 });
                 self.reply(answer, result);
             }
@@ -213,13 +213,14 @@ fn apply_changes(
     })
 }
 
-fn has_native_key_in_range(
+fn load_first_native_key(
     native: &rocksdb::Transaction<'_, OptimisticTransactionDB>,
     begin: &[u8],
     end: &[u8],
-) -> StorageResult<bool> {
+    settlement: &NativeAttemptSettlement,
+) -> StorageResult<Option<Vec<u8>>> {
     if begin >= end {
-        return Ok(false);
+        return Ok(None);
     }
     let snapshot = native.snapshot();
     let mut reads = ReadOptions::default();
@@ -227,7 +228,11 @@ fn has_native_key_in_range(
     let mut iterator = native.raw_iterator_opt(reads);
     iterator.seek(begin);
     iterator.status().map_err(map_operation_error)?;
-    Ok(iterator.key().is_some_and(|key| key < end))
+    let Some(key) = iterator.key().filter(|key| *key < end) else {
+        return Ok(None);
+    };
+    settlement.charge_data(key.len())?;
+    crate::backend::copy_native_key(key).map(Some)
 }
 
 fn scan_native(

@@ -43,32 +43,6 @@ async fn given_scan_and_stream_pages_when_evaluated_then_activation_requires_com
 }
 
 #[tokio::test]
-async fn given_active_partial_page_when_tail_changes_then_captured_high_is_drained_first() {
-    let mut build = GsiBuild::new_active(target(), checkpoint(1));
-    let mut first = Observations::new([Read::Tail, Read::Stream(1, 4)]);
-    first.tail = 4;
-    first.stream = Some(stream(1, 4, GsiStreamPageEnd::Continue(checkpoint(2))));
-    let change = first.evaluate(&build).await.unwrap();
-    persist(&mut build, change);
-    assert!(build.state.required_stream_history() == &checkpoint(2));
-
-    let mut last = Observations::new([Read::Stream(2, 4)]);
-    last.tail = 9;
-    last.stream = Some(stream(2, 4, GsiStreamPageEnd::ReachedThrough));
-    let change = last.evaluate(&build).await.unwrap();
-    persist(&mut build, change);
-    assert!(build.state.required_stream_history() == &checkpoint(4));
-
-    let mut next = Observations::new([Read::Tail, Read::Stream(4, 9)]);
-    next.tail = 9;
-    next.stream = Some(stream(4, 9, GsiStreamPageEnd::ReachedThrough));
-    let change = next.evaluate(&build).await.unwrap();
-    persist(&mut build, change);
-    assert!(build.state.required_stream_history() == &checkpoint(9));
-    assert!(build.state.permits_queries());
-}
-
-#[tokio::test]
 async fn given_missing_history_when_scan_finishes_then_build_blocks_at_retained_frontier() {
     let build = GsiBuild::new(target(), checkpoint(1));
     let mut observation = Observations::new([Read::Scan(None), Read::Frontier(1, 4)]);
@@ -128,19 +102,10 @@ async fn given_nonhistory_read_failure_when_evaluated_then_error_propagates_with
 }
 
 #[tokio::test]
-async fn given_missing_stream_history_when_evaluated_then_catchup_and_active_builds_retain_progress()
- {
-    for build in [
-        catching_up(2, 4),
-        GsiBuild::new_active(target(), checkpoint(2)),
-    ] {
-        let reads = if build.state.permits_queries() {
-            vec![Read::Tail, Read::Stream(2, 4)]
-        } else {
-            vec![Read::Stream(2, 4)]
-        };
+async fn given_missing_stream_history_when_evaluated_then_catchup_retains_progress() {
+    for build in [catching_up(2, 4)] {
+        let reads = vec![Read::Stream(2, 4)];
         let mut observation = Observations::new(reads);
-        observation.tail = 4;
         observation.stream = Some(Err(storage_types::StorageEnum::HistoryUnavailable.into()));
         let GsiChange::Persist {
             next_state: GsiState::Blocked(blocked),
@@ -153,19 +118,6 @@ async fn given_missing_stream_history_when_evaluated_then_catchup_and_active_bui
         assert!(blocked.retained_from == checkpoint(2));
         assert_eq!(projections.into_iter().count(), 0);
     }
-}
-
-#[tokio::test]
-async fn given_active_build_at_tail_when_empty_page_is_read_then_no_transition_is_written() {
-    let build = GsiBuild::new_active(target(), checkpoint(4));
-    let mut observation = Observations::new([Read::Tail, Read::Stream(4, 4)]);
-    observation.tail = 4;
-    observation.stream = Some(stream(4, 4, GsiStreamPageEnd::ReachedThrough));
-    assert!(matches!(
-        observation.evaluate(&build).await.unwrap(),
-        GsiChange::Idle
-    ));
-    assert!(build.state.required_stream_history() == &checkpoint(4));
 }
 
 #[tokio::test]

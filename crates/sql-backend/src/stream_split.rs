@@ -7,7 +7,7 @@ use stream_provider::{
 };
 
 use crate::{
-    SqlAttempt, SqlEngine, SqlLayout, SqlStatement, SqlValue, stream_checkpoint,
+    SqlAttempt, SqlEngine, SqlLayout, SqlStatement, SqlValue,
     stream_history::{decode_history_page, history_statement},
 };
 
@@ -64,33 +64,6 @@ pub(crate) async fn write_split<A: SqlAttempt>(
     let parent = split.sealed_parent();
     let generation = i64::try_from(scope.generation()).map_err(|_| unavailable())?;
     let sealed_after = i64::try_from(receipt.sealed_after_offset).map_err(|_| unavailable())?;
-    let protected = attempt
-        .query(
-            SqlStatement::new(
-                format!(
-                    "SELECT 1 FROM {relation_sys_dynamo_stream_protected_frontier} WHERE scope_id \
-                     = {} AND generation = {} AND shard_id = {} AND lineage_id = {}",
-                    engine.engine().placeholder(1),
-                    engine.engine().placeholder(2),
-                    engine.engine().placeholder(3),
-                    engine.engine().placeholder(4),
-                    relation_sys_dynamo_stream_protected_frontier =
-                        engine.relation_name("sys_dynamo_stream_protected_frontier"),
-                ),
-                vec![
-                    SqlValue::Text(scope.scope_id().as_str().to_owned()),
-                    SqlValue::Integer(generation),
-                    SqlValue::Text(parent.shard_id().as_str().to_owned()),
-                    SqlValue::Text(parent.lineage_id().as_str().to_owned()),
-                ],
-            ),
-            ReadProtection::Conflict,
-            SYSTEM_STREAM_SNAPSHOT_BYTES,
-        )
-        .await?;
-    if protected.more || protected.rows.len() > 1 {
-        return Err(unavailable());
-    }
     if engine.engine() == SqlEngine::Postgres {
         attempt
             .execute(SqlStatement::new(
@@ -166,12 +139,6 @@ pub(crate) async fn write_split<A: SqlAttempt>(
                 SqlValue::Integer(initial),
             ],
         ));
-        if !protected.rows.is_empty() {
-            let frontier = child.initial_frontier().map_err(|_| unavailable())?;
-            writes.push(stream_checkpoint::protect_frontier(
-                engine, scope, &frontier,
-            )?);
-        }
     }
     writes.push(SqlStatement::new(
         format!(

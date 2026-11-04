@@ -128,7 +128,7 @@ impl SourceVector {
 
 impl JournalStore {
     pub(crate) async fn observe_table_cut<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -159,18 +159,21 @@ impl JournalStore {
     /// A native held receipt fixes its original inventory independently of
     /// today's membership. External cuts must use load_table_source_vector.
     pub(in crate::journal) async fn verify_held_source_vector<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        input: (&storage_types::TableName, &CanonicalTableCut),
+        input: (
+            (storage_types::TableHistoryId, &storage_types::TableName),
+            &CanonicalTableCut,
+        ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
     ) -> StorageResult<CanonicalTableCut> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let (table, cut) = input;
+            let ((physical, table), cut) = input;
             let mut vector = SourceVector::try_new(
                 (cut.lineage, cut.membership, cut.trim),
                 Some(cut),
@@ -193,7 +196,7 @@ impl JournalStore {
                 let manifest = self
                     .load_history_terminal_manifest(
                         attempt,
-                        (&selection, component.through),
+                        (physical, &selection, component.through),
                         encoding,
                     )
                     .await?;
@@ -209,7 +212,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_table_source_vector<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -302,7 +305,7 @@ impl JournalStore {
     }
 
     async fn load_historical_source_vector<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -362,7 +365,7 @@ impl JournalStore {
             let terminal = self
                 .load_history_terminal_manifest(
                     attempt,
-                    (&selection, cut.through),
+                    (state.physical, &selection, cut.through),
                     (encoding.0, encoding.1),
                 )
                 .await?;
@@ -377,7 +380,9 @@ impl JournalStore {
         vector.finish()
     }
 
-    async fn append_source_vector<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn append_source_vector<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         source: (
@@ -423,7 +428,11 @@ impl JournalStore {
                 available.bounds().require_cut(cut)?;
             }
             let terminal_manifest = self
-                .load_history_terminal_manifest(attempt, (&selection, through), input.1)
+                .load_history_terminal_manifest(
+                    attempt,
+                    (state.physical, &selection, through),
+                    input.1,
+                )
                 .await?;
             if supplied
                 .as_ref()

@@ -22,7 +22,8 @@ pub async fn batch_get_item_in_attempt<A: GetItemAttempt>(
         .iter()
         .map(|table| table.table_name.clone())
         .collect::<Vec<_>>();
-    let metadata = match resolve_tables_batch_in_attempt(attempt, cache, &names).await {
+    let bindings = crate::RequestTableBindings::default();
+    let metadata = match resolve_tables_batch_in_attempt(attempt, cache, &names, &bindings).await {
         Ok(metadata) => metadata,
         Err(_) => {
             let results = (0..plan.tables.len())

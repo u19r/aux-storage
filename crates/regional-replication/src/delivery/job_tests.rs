@@ -38,7 +38,21 @@ async fn given_out_of_order_receipts_when_workers_restart_then_native_progress_c
     fixture::put(&source, 1, "first").await;
     fixture::put(&source, 1, "second").await;
     let second = fixture::frame(&source, 1, 1, 2).await;
-    let scope = fixture::delivery_scope(&second);
+    let scope = fixture::delivery_scope(&source, &second).await;
+    let mut wrong_incarnation = scope.clone();
+    wrong_incarnation.physical = storage_types::TableHistoryId::from([99; 16]);
+    assert!(
+        load_delivery_progress(source.as_ref(), fixture::journal(1), wrong_incarnation)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        load_delivery_progress(source.as_ref(), fixture::journal(1), scope.clone())
+            .await
+            .unwrap()
+            .through(),
+        fixture::source_position(&source, 1, 0).await.into(),
+    );
     let receipt = client.deliver(Arc::clone(&second)).await.unwrap();
     let pending = fixture::acknowledge(&source, second, receipt).await;
     assert_eq!(

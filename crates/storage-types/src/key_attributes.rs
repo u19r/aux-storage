@@ -32,6 +32,23 @@ impl PartialEq for KeyAttributes {
 }
 
 impl KeyAttributes {
+    /// Select the complete primary key without cloning unrelated item values.
+    pub fn try_from_schema(
+        schema: &[crate::KeySchemaElement],
+        item: &impl AttributeValueLookup,
+    ) -> StorageResult<Self> {
+        let mut keys = Self::with_capacity(schema.len());
+        for element in schema {
+            let value = item
+                .get_attribute_value(&element.attribute_name)
+                .ok_or_else(|| {
+                    StorageError::internal("stream image lacks a table key attribute")
+                })?;
+            keys.insert(element.attribute_name.clone(), value.clone());
+        }
+        Ok(keys)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self(SmallVec::new())

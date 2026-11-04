@@ -45,12 +45,33 @@ impl StreamRowKind {
     }
 }
 
-pub(crate) async fn read_partitioning_mode<A: StreamAttempt>(
+pub(crate) async fn resolve_stream_layout<A: StreamAttempt>(
     attempt: &mut A,
     stream: &StreamRowKind,
 ) -> StorageResult<StreamPartitioningMode> {
+    if let Some(history) = stream.value().table_history_id()? {
+        let states = attempt.load_item_history_table_states(&[history]).await?;
+        return match states.as_slice() {
+            [Some(storage_types::TableHistoryState::Active(_))] => {
+                Ok(StreamPartitioningMode::Single)
+            }
+            [None | Some(storage_types::TableHistoryState::Deleting)] => {
+                Err(storage_types::StorageEnum::ResourceNotFound {
+                    resource_type: "table history",
+                    resource_id: uuid::Uuid::from_bytes(*history.as_ref()).to_string(),
+                }
+                .into())
+            }
+            _ => Err(storage_types::StorageError::internal(
+                "History catalog returned another state count",
+            )),
+        };
+    }
     if !stream.is_user() {
-        return Ok(StreamPartitioningMode::Single);
+        return Err(storage_types::StorageError::unsupported(
+            "History row reads require an immutable table ID; system history uses qualified \
+             checkpoints",
+        ));
     }
     let stream_name = stream.stream_name();
     attempt

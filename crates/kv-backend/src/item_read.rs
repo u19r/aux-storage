@@ -14,6 +14,26 @@ use crate::{
 };
 
 impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
+    async fn read_primary_live_revisions(
+        &mut self,
+        reads: &[(&BoundTableInfo, &KeyAttributes)],
+    ) -> StorageResult<Vec<Option<ItemRevision>>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = async {
+            let keys = reads
+                .iter()
+                .map(|(table, key)| {
+                    primary_item_key(catalog.identity_for(&table.table_name)?, table, key)
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            load_live_revisions(catalog.attempt, &keys, catalog.protection).await
+        }
+        .await;
+        operation.complete(result)
+    }
+
     async fn read_primary_item(
         &mut self,
         table: &BoundTableInfo,
@@ -66,9 +86,9 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
             );
             let bound = reads
                 .len()
-                .checked_mul(crate::constants::PAGE_READ_BYTES.get())
+                .checked_mul(storage_types::MaterializedItemRecord::encoded_length_bound())
                 .ok_or_else(|| StorageError::internal("Primary batch bound overflow"))?;
-            let hydrated = hydrate_primary_items(catalog, requests, bound).await?;
+            let hydrated = decode_primary_items(requests, bound)?;
             if hydrated.len() != reads.len() {
                 return Err(StorageError::internal("KV primary hydration count differs"));
             }
@@ -87,6 +107,44 @@ impl<A: KvAttempt> GetItemAttempt for KvCatalogAttempt<'_, A> {
         .await;
         settlement.complete(result)
     }
+}
+
+async fn load_live_revisions<A: KvAttempt>(
+    attempt: &A,
+    keys: &[Vec<u8>],
+    protection: crate::ReadProtection,
+) -> StorageResult<Vec<Option<ItemRevision>>> {
+    let bound = crate::constants::KV_UNQUALIFIED_VALUE_BYTES;
+    let maximum = crate::constants::KV_MAX_VALUE_BYTES;
+    let per_head = attempt.native_value_limit().min(maximum).max(1);
+    let group_size = (bound / per_head).max(1);
+    let mut revisions = Vec::with_capacity(keys.len());
+    for keys in keys.chunks(group_size) {
+        let call = attempt.settlement().begin_call()?;
+        let prefixes = call.complete(
+            crate::value_prefix::load_value_prefixes(
+                attempt,
+                keys,
+                crate::value_prefix::KvPrefixRead {
+                    protection,
+                    prefix_bytes: crate::constants::PRIMARY_ITEM_HEADER_BYTES,
+                    allowance: crate::KvValueAllowance::new(maximum, bound.max(per_head)),
+                },
+            )
+            .await,
+        )?;
+        revisions.extend(
+            prefixes
+                .into_iter()
+                .map(|prefix| {
+                    prefix
+                        .map(|prefix| crate::item_codec::decode_primary_revision(&prefix.bytes))
+                        .transpose()
+                })
+                .collect::<StorageResult<Vec<_>>>()?,
+        );
+    }
+    Ok(revisions)
 }
 
 pub(crate) fn primary_item_key(
@@ -118,82 +176,40 @@ pub(crate) struct HydratedPrimaryItem {
     pub ttl_epoch: Option<i64>,
 }
 
-pub(crate) async fn hydrate_primary_items<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
->(
-    attempt: &mut A,
+pub(crate) fn decode_primary_items(
     reads: Vec<(&storage_types::BoundTableInfo, Option<&[u8]>)>,
-    bound: usize,
+    maximum: usize,
 ) -> StorageResult<Vec<Option<HydratedPrimaryItem>>> {
-    let mut settlement =
-        infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-    let attempt = settlement.as_mut();
-    let result = async {
-        let maximum = crate::constants::PAGE_READ_BYTES.get();
-        let present = reads.iter().filter(|(_, value)| value.is_some()).count();
-        let mut headers = Vec::new();
-        let mut records = Vec::new();
-        let mut results = Vec::new();
-        headers
-            .try_reserve_exact(reads.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        records
-            .try_reserve_exact(present)
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        results
-            .try_reserve_exact(reads.len())
-            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        for (table, value) in reads {
-            let header = value
-                .map(|value| -> StorageResult<_> {
+    if reads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut budget = storage_types::PageByteBudget::try_new(maximum)?;
+    reads
+        .into_iter()
+        .map(|(table, value)| {
+            value
+                .map(|value| {
                     let envelope = PrimaryItemEnvelope::decode(value)?;
-                    let record = stream_provider::retained_image::RetainedItemRecord::decode(
+                    let record = storage_types::MaterializedItemRecord::decode(
                         envelope.image,
                         table.history_id,
-                        maximum,
+                        storage_types::MaterializedItemRecord::encoded_length_bound(),
                     )?;
-                    records.push((table, record, table.info.max_indexers));
-                    Ok((
-                        envelope.revision,
-                        envelope.decode_provenance()?,
-                        envelope.ttl_epoch,
-                    ))
-                })
-                .transpose()?;
-            headers.push(header);
-        }
-        if records.is_empty() {
-            results.extend(headers.into_iter().map(|_| None));
-            return Ok(results);
-        }
-        let hydrated =
-            stream_provider::retained_image::RetainedItemRecord::hydrate(attempt, records, bound)
-                .await?;
-        let mut items = hydrated.into_iter();
-        for header in headers {
-            results.push(
-                header
-                    .map(|(revision, provenance, ttl_epoch)| -> StorageResult<_> {
-                        let stored = items.next().ok_or_else(|| {
-                            StorageError::internal("Missing hydrated primary item")
-                        })?;
-                        Ok(HydratedPrimaryItem {
-                            stored,
-                            revision,
-                            provenance,
-                            ttl_epoch,
-                        })
+                    if !budget.admit(record.decoded_bytes()) {
+                        return Err(
+                            storage_types::InfrastructureResultKind::NativeCapacityRejected.into(),
+                        );
+                    }
+                    Ok(HydratedPrimaryItem {
+                        stored: record.into_stored(table.info.max_indexers)?,
+                        revision: envelope.revision,
+                        provenance: envelope.decode_provenance()?,
+                        ttl_epoch: envelope.ttl_epoch,
                     })
-                    .transpose()?,
-            );
-        }
-        if items.next().is_some() {
-            return Err(StorageError::internal("Extra hydrated primary item"));
-        }
-        Ok(results)
-    }
-    .await;
-    settlement.complete(result)
+                })
+                .transpose()
+        })
+        .collect()
 }
 
 pub(crate) fn select_primary_prefix(
@@ -201,17 +217,17 @@ pub(crate) fn select_primary_prefix(
     page: &mut crate::KvRangePage,
 ) -> StorageResult<()> {
     let maximum = crate::constants::PAGE_READ_BYTES.get();
-    let mut budget = stream_provider::retained_image::RetainedImagePageBudget::try_new(maximum)?;
+    let mut budget = storage_types::PageByteBudget::try_new(maximum)?;
     let mut count = 0;
     for entry in &page.entries {
         let envelope = PrimaryItemEnvelope::decode(&entry.value)?;
-        let record = stream_provider::retained_image::RetainedItemRecord::decode(
+        let record = storage_types::MaterializedItemRecord::decode(
             envelope.image,
             table.history_id,
-            maximum,
+            storage_types::MaterializedItemRecord::encoded_length_bound(),
         )?;
-        let work = record.read_work_bytes(maximum)?;
-        if !budget.admit(work)? {
+        let work = record.decoded_bytes();
+        if !budget.admit(work) {
             break;
         }
         count += 1;

@@ -15,12 +15,10 @@ impl DatabaseManager {
         request: TransactWriteItemsRequest,
         authority: scheduled_bg_jobs::JobEffectAuthority,
     ) -> StorageResult<TransactWriteItemsResponse> {
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation(
-                "transact_write_job_effect",
-                dynamo.transact_write_job_effect(request, authority),
-            )
-            .await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation("transact_write_job_effect", async move {
+                dynamo.transact_write_job_effect(request, authority).await
+            })
         })
         .await
     }
@@ -35,12 +33,10 @@ impl DatabaseManager {
         authority: scheduled_bg_jobs::JobEffectAuthority,
     ) -> StorageResult<Option<TransactWriteItemsResponse>> {
         let token = token.to_owned();
-        self.run_dynamo_admitted("default", AdmissionClass::PointRead, |dynamo| async move {
-            record_storage_operation(
-                "find_job_effect_receipt",
-                dynamo.find_job_effect_receipt(&token, authority),
-            )
-            .await
+        self.run_dynamo_admitted("default", AdmissionClass::PointRead, |dynamo| {
+            record_storage_operation("find_job_effect_receipt", async move {
+                dynamo.find_job_effect_receipt(&token, authority).await
+            })
         })
         .await
     }
@@ -52,12 +48,12 @@ impl DatabaseManager {
         request: storage_provider::JobTerminalProjection,
         authority: scheduled_bg_jobs::JobTerminalAuthority,
     ) -> StorageResult<TransactWriteItemsResponse> {
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation(
-                "transact_write_job_projection",
-                dynamo.transact_write_job_projection(request, authority),
-            )
-            .await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation("transact_write_job_projection", async move {
+                dynamo
+                    .transact_write_job_projection(request, authority)
+                    .await
+            })
         })
         .await
     }
@@ -67,9 +63,10 @@ impl DatabaseManager {
         mut request: TransactWriteItemsRequest,
     ) -> StorageResult<TransactWriteItemsResponse> {
         self.stamp_transaction(&mut request)?;
-        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("transact_write_items", dynamo.transact_write_items(request))
-                .await
+        self.run_dynamo_admitted("default", AdmissionClass::Write, |dynamo| {
+            record_storage_operation("transact_write_items", async move {
+                dynamo.transact_write_items(request).await
+            })
         })
         .await
     }

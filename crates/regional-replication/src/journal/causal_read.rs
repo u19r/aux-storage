@@ -125,7 +125,7 @@ impl CausalClosure {
 
 impl JournalStore {
     pub(crate) async fn load_causal_closure<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -180,7 +180,7 @@ impl JournalStore {
     }
 
     pub(super) async fn load_verified_causal_identity<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -192,25 +192,30 @@ impl JournalStore {
         let attempt = settlement.as_mut();
         let result = async {
             let (identity, scopes) = input;
+            let scope = scopes
+                .iter()
+                .find(|scope| identity.is_bound_to(scope.declaration.lineage))
+                .ok_or_else(|| {
+                    StorageError::from(storage_types::StorageEnum::HistoryUnavailable)
+                })?;
             let accepted = self
-                .load_acceptance_protected(attempt, identity, encoding.1, ReadProtection::Snapshot)
+                .load_acceptance_protected(
+                    attempt,
+                    (scope.physical, identity),
+                    encoding.1,
+                    ReadProtection::Snapshot,
+                )
                 .await?
                 .ok_or_else(|| {
                     StorageError::from(storage_types::StorageEnum::HistoryUnavailable)
                 })?;
-            let scope = scopes
-                .iter()
-                .find(|scope| scope.declaration.lineage == accepted.event.lineage())
-                .ok_or_else(|| {
-                    StorageError::from(storage_types::StorageEnum::HistoryUnavailable)
-                })?;
-            if !identity.is_bound_to(scope.declaration.lineage) {
+            if accepted.event.lineage() != scope.declaration.lineage {
                 return Err(corrupt_record());
             }
             self.require_retained_publication(
                 attempt,
                 (
-                    &scope.declaration.table,
+                    (scope.physical, &scope.declaration.table),
                     &scope.cut,
                     identity,
                     accepted.receipt.digest,

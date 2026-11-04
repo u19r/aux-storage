@@ -53,6 +53,31 @@ pub(super) fn encode_namespace_prefix(namespace: &str) -> StorageResult<Vec<u8>>
     Ok(bytes)
 }
 
+pub(super) fn generation_bounds(
+    resource_of: &DurableRecordKey,
+    minimum: u64,
+) -> StorageResult<(Vec<u8>, Vec<u8>)> {
+    let address = resource_of.as_ref();
+    let mut prefix = encode_namespace_prefix(&address.namespace)?;
+    let extra = address
+        .resource
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(2 + std::mem::size_of::<u64>()))
+        .ok_or(InfrastructureResultKind::NativeCapacityRejected)?;
+    prefix
+        .try_reserve_exact(extra)
+        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+    append_segment(&mut prefix, &address.resource);
+    let range = KvRange::try_for_prefix(prefix, NonZeroU32::MIN, NonZeroUsize::MIN)?;
+    let mut begin = range.begin;
+    begin
+        .try_reserve_exact(std::mem::size_of::<u64>())
+        .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
+    begin.extend_from_slice(&minimum.to_be_bytes());
+    Ok((begin, range.end))
+}
+
 pub(super) fn encoded_key_length_bound(logical_bytes: usize) -> StorageResult<usize> {
     // Logical addresses charge 16 fixed bytes; native keys have generation (8),
     // three terminators (6), and escaping. At least one namespace byte cannot

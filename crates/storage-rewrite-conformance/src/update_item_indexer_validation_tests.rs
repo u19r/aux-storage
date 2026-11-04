@@ -5,8 +5,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use futures::FutureExt as _;
 use serde_json::json;
 use storage_observability_test_support::observation::observe;
-use storage_types::{GetItemRequest, PutItemRequest, StreamName, UpdateItemRequest};
-use stream_provider::StreamRowKind;
+use storage_types::{GetItemRequest, PutItemRequest, UpdateItemRequest};
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
@@ -37,13 +36,10 @@ async fn given_indexed_item_when_invalid_update_indexers_are_submitted_then_erro
             "TableName": table.as_ref(), "Key": {"pk": {"S": "stable"}}
         }))
         .unwrap();
-        let stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store
-            .stream_operations
-            .read_forward(stream.clone(), None, 10)
+        let before = super::cdc_stream_tests::system_records(&store, 10)
             .await
             .unwrap();
-        assert_eq!(before.items.len(), 1);
+        assert_eq!(before.len(), 1);
 
         for line in include_str!("../fixtures/indexer_invalid_cases.jsonl").lines() {
             let case: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -89,13 +85,11 @@ async fn given_indexed_item_when_invalid_update_indexers_are_submitted_then_erro
             );
         }
 
-        let after = store
-            .stream_operations
-            .read_forward(stream, None, 10)
+        let after = super::cdc_stream_tests::system_records(&store, 10)
             .await
             .unwrap();
-        assert_eq!(after.items.len(), 1, "rejected updates must not append CDC");
-        assert_eq!(after.items[0].id, before.items[0].id);
+        assert_eq!(after.len(), 1, "rejected updates must not append CDC");
+        assert_eq!(after[0].sequence_number, before[0].sequence_number);
     })
     .catch_unwind()
     .await;

@@ -10,6 +10,7 @@ use super::{
 
 fn target() -> GsiBuildTarget {
     GsiBuildTarget {
+        history_id: 1u32.into(),
         table_name: TableName::new("orders"),
         index_name: IndexName::new("by-status"),
         incarnation: TargetIncarnation::try_from(vec![1]).unwrap(),
@@ -68,7 +69,7 @@ fn given_invalid_build_status_when_decoding_then_unknown_phase_and_identity_are_
         serde_json::json!({"target": target(), "state": {"Unknown": {}}}),
         serde_json::json!({"target": target(), "state": {"Active": {}, "Scanning": {}}}),
         serde_json::json!({"target": target()}),
-        serde_json::json!({"target": {"table_name": "orders", "index_name": "by-status", "incarnation": []}, "state": {"Active": {}}}),
+        serde_json::json!({"target": {"history_id": target().history_id, "table_name": "orders", "index_name": "by-status", "incarnation": []}, "state": {"Active": {}}}),
     ] {
         let bytes = storage_serde::to_bytes(&record).unwrap();
         assert!(storage_serde::from_bytes::<GsiBuildStatus>(&bytes).is_err());

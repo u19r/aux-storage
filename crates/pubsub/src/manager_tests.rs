@@ -145,122 +145,80 @@ impl Transport for RecordingHttpTransport {
     }
 }
 
-async fn create_test_queue_manager() -> TestQueueManager {
-    let config = pubsub_fixture_queue_config();
+async fn create_test_queue_manager() -> (TestQueueManager, tempfile::TempDir) {
+    let directory = tempfile::tempdir().expect("pubsub queue fixture directory");
+    let config = pubsub_fixture_queue_config(directory.path());
     let provider = create_queue_provider(config).await.unwrap();
-    TestQueueManager::new(Arc::from(provider))
+    (TestQueueManager::new(Arc::from(provider)), directory)
 }
 
-#[cfg(all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")))]
-fn pubsub_fixture_queue_config() -> QueueConfig {
-    QueueConfig {
-        backend_type: QueueBackend::Turso,
-        connection_string: Some(":memory:".to_string()),
+fn pubsub_fixture_queue_config(directory: &std::path::Path) -> QueueConfig {
+    let backend_type = pubsub_fixture_queue_backend();
+    let mut config = QueueConfig {
+        backend_type,
+        connection_string: None,
         file_path: None,
         postgres: None,
         foundationdb: None,
         remote: None,
+    };
+    match config.backend_type {
+        QueueBackend::SQLite | QueueBackend::Turso => {
+            config.connection_string = Some(":memory:".into())
+        }
+        QueueBackend::Postgres => {
+            let dsn = std::env::var("TEST_POSTGRES_DSN")
+                .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
+                .expect("owned Postgres DSN is required");
+            config.postgres = Some(queue::PostgresSettings {
+                dsn,
+                max_pool_size: 4,
+                background_max_pool_size: 4,
+                tls: false,
+            });
+        }
+        QueueBackend::RocksDB => {
+            config.connection_string = Some(
+                directory
+                    .join("queue.rocksdb")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        QueueBackend::FoundationDb => {
+            config.foundationdb = Some(queue::FoundationDbSettings {
+                cluster_file: Some(
+                    std::env::var("FDB_CLUSTER_FILE").expect("owned FDB_CLUSTER_FILE is required"),
+                ),
+                subspace_prefix: Some(format!(
+                    "tests/pubsub-queue/{}/",
+                    directory
+                        .file_name()
+                        .expect("unique directory name")
+                        .to_string_lossy()
+                )),
+                ..Default::default()
+            });
+        }
+        QueueBackend::Remote => unreachable!("native queue fixture"),
     }
-}
-
-#[cfg(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-))]
-fn pubsub_fixture_queue_config() -> QueueConfig {
-    let dsn = std::env::var("TEST_POSTGRES_DSN")
-        .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
-        .expect("TEST_POSTGRES_DSN or AUX_QUEUE_POSTGRES_DSN is required");
-    QueueConfig {
-        backend_type: QueueBackend::Postgres,
-        connection_string: Some(dsn.clone()),
-        file_path: None,
-        postgres: Some(queue::PostgresSettings {
-            dsn,
-            max_pool_size: 4,
-            background_max_pool_size: 4,
-            tls: false,
-        }),
-        foundationdb: None,
-        remote: None,
-    }
-}
-
-#[cfg(not(any(
-    all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")),
-    all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    )
-)))]
-fn pubsub_fixture_queue_config() -> QueueConfig {
-    QueueConfig {
-        backend_type: QueueBackend::SQLite,
-        connection_string: Some(":memory:".to_string()),
-        file_path: None,
-        postgres: None,
-        foundationdb: None,
-        remote: None,
-    }
+    config
 }
 
 fn pubsub_fixture_queue_backend() -> QueueBackend {
-    #[cfg(all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")))]
-    {
-        return QueueBackend::Turso;
-    }
-    #[cfg(all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    ))]
-    {
-        return QueueBackend::Postgres;
-    }
-    #[cfg(not(any(
-        all(feature = "turso", not(feature = "sqlite"), not(feature = "postgres")),
-        all(
-            feature = "postgres",
-            not(feature = "sqlite"),
-            not(feature = "turso"),
-            not(feature = "rocksdb"),
-            not(feature = "foundationdb")
-        )
-    )))]
-    {
+    if cfg!(feature = "sqlite") {
         QueueBackend::SQLite
+    } else if cfg!(feature = "turso") {
+        QueueBackend::Turso
+    } else if cfg!(feature = "postgres") {
+        QueueBackend::Postgres
+    } else if cfg!(feature = "rocksdb") {
+        QueueBackend::RocksDB
+    } else if cfg!(feature = "foundationdb") {
+        QueueBackend::FoundationDb
+    } else {
+        panic!("pubsub manager tests require a native backend")
     }
-}
-
-#[test]
-fn pubsub_manager_fixture_selects_the_only_compiled_sql_backend() {
-    let backend = pubsub_fixture_queue_backend();
-    assert_eq!(
-        matches!(backend, QueueBackend::Turso),
-        cfg!(all(
-            feature = "turso",
-            not(feature = "sqlite"),
-            not(feature = "postgres")
-        ))
-    );
-    assert_eq!(
-        matches!(backend, QueueBackend::Postgres),
-        cfg!(all(
-            feature = "postgres",
-            not(feature = "sqlite"),
-            not(feature = "turso"),
-            not(feature = "rocksdb"),
-            not(feature = "foundationdb")
-        ))
-    );
 }
 
 #[cfg(all(
@@ -279,11 +237,12 @@ async fn postgres_queue_provider_initialization_is_concurrent_safe() {
             .map_err(|error| format!("create queue provider: {error:?}"))
     }
 
+    let directory = tempfile::tempdir().expect("pubsub queue initialization fixture");
     let (first, second, third, fourth) = tokio::join!(
-        initialize(pubsub_fixture_queue_config()),
-        initialize(pubsub_fixture_queue_config()),
-        initialize(pubsub_fixture_queue_config()),
-        initialize(pubsub_fixture_queue_config()),
+        initialize(pubsub_fixture_queue_config(directory.path())),
+        initialize(pubsub_fixture_queue_config(directory.path())),
+        initialize(pubsub_fixture_queue_config(directory.path())),
+        initialize(pubsub_fixture_queue_config(directory.path())),
     );
     for result in [first, second, third, fourth] {
         result.expect("concurrent PostgreSQL queue initialization should be idempotent");
@@ -387,7 +346,8 @@ async fn publish_routes_http_subscription_to_custom_sender_with_extra_json() {
 #[tokio::test]
 async fn subscribe_stores_subscription_for_topic_listing() {
     let provider = Arc::new(InMemoryPubsubProvider::default());
-    let queue_manager = Arc::new(create_test_queue_manager().await);
+    let (queue_manager, _directory) = create_test_queue_manager().await;
+    let queue_manager = Arc::new(queue_manager);
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders".to_string(),
@@ -566,7 +526,8 @@ async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
 #[tokio::test]
 async fn publish_sends_queue_notification_body_matching_aws_fixture() {
     let provider = Arc::new(InMemoryPubsubProvider::default());
-    let queue_manager = Arc::new(create_test_queue_manager().await);
+    let (queue_manager, _directory) = create_test_queue_manager().await;
+    let queue_manager = Arc::new(queue_manager);
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders-queue".to_string(),
@@ -629,7 +590,8 @@ async fn publish_sends_queue_notification_body_matching_aws_fixture() {
 #[tokio::test]
 async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
     let provider = Arc::new(InMemoryPubsubProvider::default());
-    let queue_manager = Arc::new(create_test_queue_manager().await);
+    let (queue_manager, _directory) = create_test_queue_manager().await;
+    let queue_manager = Arc::new(queue_manager);
     queue_manager
         .create_queue(CreateQueueRequest {
             queue_name: "orders-raw-queue".to_string(),

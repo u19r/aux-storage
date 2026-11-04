@@ -29,13 +29,17 @@ impl JournalStore {
     pub(in crate::journal) async fn prepare_import_coverage<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, storage_types::TableHistoryId)],
+        ),
     ) -> StorageResult<Vec<RecordChange>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let scopes = self.prepare_import_scopes(import)?;
+            let (import, tables) = input;
+            let scopes = self.prepare_import_scopes((import, tables))?;
             let count = scopes
                 .len()
                 .checked_mul(2)
@@ -73,7 +77,12 @@ impl JournalStore {
     pub(in crate::journal) async fn load_received_coverage<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        tables: (TableIdentity, TableIdentity, TableLineage),
+        tables: (
+            TableIdentity,
+            TableIdentity,
+            TableLineage,
+            storage_types::TableHistoryId,
+        ),
         origin: &OriginId,
         protection: ReadProtection,
     ) -> StorageResult<DeliveryCoverage> {
@@ -93,7 +102,12 @@ impl JournalStore {
     pub(in crate::journal) async fn load_received_coverages<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        tables: (TableIdentity, TableIdentity, TableLineage),
+        tables: (
+            TableIdentity,
+            TableIdentity,
+            TableLineage,
+            storage_types::TableHistoryId,
+        ),
         origins: &[OriginId],
         protection: ReadProtection,
     ) -> StorageResult<Vec<DeliveryCoverage>> {
@@ -125,13 +139,17 @@ impl JournalStore {
     pub(in crate::journal) async fn require_complete_import_coverage<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, storage_types::TableHistoryId)],
+        ),
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let scopes = self.prepare_import_scopes(import)?;
+            let (import, tables) = input;
+            let scopes = self.prepare_import_scopes((import, tables))?;
             let observed = self
                 .observe_import_coverages(attempt, scopes, ReadProtection::Snapshot)
                 .await?;
@@ -149,15 +167,24 @@ impl JournalStore {
 
     fn prepare_import_scopes(
         &self,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, storage_types::TableHistoryId)],
+        ),
     ) -> StorageResult<Vec<(DurableRecordKey, DeliveryActivity)>> {
+        let (import, tables) = input;
         let mut scopes = Vec::new();
         scopes
             .try_reserve_exact(import.bindings().len())
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
         for binding in import.bindings() {
             scopes.push(self.import_coverage_scope(
-                (binding.local_table, binding.source_table, binding.lineage),
+                (
+                    binding.local_table,
+                    binding.source_table,
+                    binding.lineage,
+                    self.select_original_history(tables, (binding.source_table, binding.lineage))?,
+                ),
                 &import.manifest().origin,
             )?);
         }
@@ -166,15 +193,22 @@ impl JournalStore {
 
     fn import_coverage_scope(
         &self,
-        tables: (TableIdentity, TableIdentity, TableLineage),
+        tables: (
+            TableIdentity,
+            TableIdentity,
+            TableLineage,
+            storage_types::TableHistoryId,
+        ),
         origin: &OriginId,
     ) -> StorageResult<(DurableRecordKey, DeliveryActivity)> {
-        let key = self.identity_key(
+        let key = self.table_identity_key(
             IMPORT_COVERAGE_SUFFIX,
+            tables.3,
             &(tables.0, tables.1, tables.2, origin),
         )?;
         let activity = DeliveryActivity {
             table: tables.0,
+            physical: tables.3,
             source_table: tables.1,
             lineage: tables.2,
             origin: origin.clone(),

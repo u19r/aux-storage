@@ -349,17 +349,6 @@ impl ItemKey {
         Ok(URL_SAFE.encode(parts))
     }
 
-    pub fn add_length_prefixed_part(parts: &mut Vec<u8>, data: &[u8]) {
-        // Use 2 bytes: 10 bits for length, 2 bits for version (00), 4 bits
-        // reserved for flags. Cap length at 1023 and convert safely.
-        let length_u16 = u16::try_from(data.len()).unwrap_or(u16::MAX);
-        let length = length_u16.min(1023);
-        // Version is 00 (0), flags are 0000 (0)
-        let prefix = length << 6; // Shift length to upper 10 bits, version/flags = 0
-        parts.extend(prefix.to_be_bytes());
-        parts.extend(data);
-    }
-
     pub fn item_key_from_next_page_token(
         next_page_token: &str,
         table_info: &StoredTableInfo,
@@ -368,7 +357,7 @@ impl ItemKey {
         let decoded = URL_SAFE.decode(next_page_token).map_err(|_error| {
             ItemKeyEnum::Deserialization("Invalid next page token".to_string())
         })?;
-        let decoded_parts = split_next_token_to_keys(&decoded);
+        let decoded_parts = split_next_token_to_keys(&decoded)?;
 
         let mut keys = KeyAttributes::new();
 
@@ -543,25 +532,25 @@ impl ItemKey {
             // Add GSI hash key
             let gsi_hash_string = scalar_key_str(&key.hash_key)?;
             let gsi_hash_bytes = gsi_hash_string.as_bytes();
-            Self::add_length_prefixed_part(&mut parts, gsi_hash_bytes);
+            Self::append_length_prefixed_key(&mut parts, gsi_hash_bytes)?;
 
             // Add GSI range key if present
             if let Some(gsi_range_key) = &key.range_key {
                 let gsi_range_string = scalar_key_str(gsi_range_key)?;
                 let gsi_range_bytes = gsi_range_string.as_bytes();
-                Self::add_length_prefixed_part(&mut parts, gsi_range_bytes);
+                Self::append_length_prefixed_key(&mut parts, gsi_range_bytes)?;
             }
 
             // Add table hash key
             let table_hash_string = scalar_key_str(&key.table_key.hash_key)?;
             let table_hash_bytes = table_hash_string.as_bytes();
-            Self::add_length_prefixed_part(&mut parts, table_hash_bytes);
+            Self::append_length_prefixed_key(&mut parts, table_hash_bytes)?;
 
             // Add table range key if present
             if let Some(table_range_key) = &key.table_key.range_key {
                 let table_range_string = scalar_key_str(table_range_key)?;
                 let table_range_bytes = table_range_string.as_bytes();
-                Self::add_length_prefixed_part(&mut parts, table_range_bytes);
+                Self::append_length_prefixed_key(&mut parts, table_range_bytes)?;
             }
 
             let base64_encoded = URL_SAFE.encode(&parts);
@@ -579,13 +568,13 @@ impl ItemKey {
             // Add hash key
             let hash_string = scalar_key_str(&key.hash_key)?;
             let hash_bytes = hash_string.as_bytes();
-            Self::add_length_prefixed_part(&mut parts, hash_bytes);
+            Self::append_length_prefixed_key(&mut parts, hash_bytes)?;
 
             // Add range key if present
             if let Some(range_key) = &key.range_key {
                 let range_string = scalar_key_str(range_key)?;
                 let range_bytes = range_string.as_bytes();
-                Self::add_length_prefixed_part(&mut parts, range_bytes);
+                Self::append_length_prefixed_key(&mut parts, range_bytes)?;
             }
 
             let base64_encoded = URL_SAFE.encode(&parts);
@@ -602,12 +591,12 @@ fn hash_range_key_part_for_values(
 
     let hash_string = scalar_key_str(hash_key)?;
     let hash_bytes = hash_string.as_bytes();
-    ItemKey::add_length_prefixed_part(&mut parts, hash_bytes);
+    ItemKey::append_length_prefixed_key(&mut parts, hash_bytes)?;
 
     if let Some(range_key) = range_key {
         let range_string = scalar_key_str(range_key)?;
         let range_bytes = range_string.as_bytes();
-        ItemKey::add_length_prefixed_part(&mut parts, range_bytes);
+        ItemKey::append_length_prefixed_key(&mut parts, range_bytes)?;
     }
 
     Ok(parts)
@@ -651,34 +640,16 @@ pub(crate) fn keys_for_schema(
     Ok((hash_key, range_key))
 }
 
-pub(crate) fn split_next_token_to_keys(key: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_next_token_to_keys(mut key: &[u8]) -> Result<Vec<Vec<u8>>, ItemKeyError> {
     let mut parts = Vec::new();
-    let mut pos = 0;
-
-    while pos < key.len() {
-        if pos + 2 > key.len() {
-            // Not enough bytes for prefix, add remaining as one part
-            parts.push(key[pos..].to_vec());
-            break;
-        }
-
-        // Read 2-byte prefix
-        let prefix = u16::from_be_bytes([key[pos], key[pos + 1]]);
-        let length = (prefix >> 6) as usize; // Extract upper 10 bits for length
-        pos += 2;
-
-        if pos + length > key.len() {
-            // Length exceeds remaining bytes, add remaining as one part
-            parts.push(key[pos - 2..].to_vec());
-            break;
-        }
-
-        // Extract the data part
-        parts.push(key[pos..pos + length].to_vec());
-        pos += length;
+    while !key.is_empty() {
+        let (prefix, rest) = key.split_at_checked(2).ok_or_else(invalid_token)?;
+        let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
+        let (part, rest) = rest.split_at_checked(length).ok_or_else(invalid_token)?;
+        parts.push(part.to_vec());
+        key = rest;
     }
-
-    parts
+    Ok(parts)
 }
 
 fn insert_schema_values(

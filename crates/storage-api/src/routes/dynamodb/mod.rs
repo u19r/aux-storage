@@ -473,3 +473,6 @@ mod decode_perf_tests;
 
 #[cfg(test)]
 mod dynamodb_tests;
+
+#[cfg(test)]
+mod stream_view_tests;

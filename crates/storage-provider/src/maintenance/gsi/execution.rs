@@ -96,7 +96,10 @@ impl GsiBuildEvaluation {
         Transaction: GsiBuildTransaction,
     {
         if !expected.target.index_name.is_ttl_index()
-            || !matches!(expected.state, storage_backfill::GsiState::CatchingUp(_))
+            || !matches!(
+                expected.state,
+                storage_backfill::GsiState::Scanning(_) | storage_backfill::GsiState::CatchingUp(_)
+            )
             || !matches!(next_state, storage_backfill::GsiState::Active(_))
         {
             return Ok(None);

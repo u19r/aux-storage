@@ -48,6 +48,20 @@ impl<A: SqlAttempt, L: SqlLayout> PhysicalRecordAttempt for SqlCatalogAttempt<'_
         operation.complete(result)
     }
 
+    async fn find_record_generation(
+        &mut self,
+        resource_of: &DurableRecordKey,
+        minimum: u64,
+        protection: ReadProtection,
+    ) -> StorageResult<Option<u64>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let result =
+            read::find_record_generation(operation.as_mut(), resource_of, minimum, protection)
+                .await;
+        operation.complete(result)
+    }
+
     async fn load_records(
         &mut self,
         keys: &[DurableRecordKey],
@@ -82,15 +96,5 @@ impl<A: SqlAttempt, L: SqlLayout> PhysicalRecordAttempt for SqlCatalogAttempt<'_
         let catalog = operation.as_mut();
         let result = async { write::store_records(catalog, batch).await }.await;
         operation.complete(result)
-    }
-}
-
-impl<A: SqlAttempt, L: SqlLayout> stream_provider::retained_image::RetainedOwnershipAttempt
-    for SqlCatalogAttempt<'_, A, L>
-{
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        self.attempt.ownership_changes()
     }
 }

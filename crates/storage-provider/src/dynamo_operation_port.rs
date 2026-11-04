@@ -15,10 +15,10 @@ use storage_types::{
     ListStreamsRequest, ListStreamsResponse, ListTablesRequest, ListTablesResponse, PutItemRequest,
     PutItemResponse, QueryRequest, QueryResponse, ReadSequenceRequest, ReadSequenceResponse,
     ReadSequenceValidationCapabilities, ScanRequest, ScanResponse, StorageEnum, StorageResult,
-    StoredTableInfo, StreamItemId, TableName, TimestampMillis, TransactGetItemsRequest,
-    TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
-    UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
-    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, context::WrappedError as _,
+    StoredTableInfo, TableName, TimestampMillis, TransactGetItemsRequest, TransactGetItemsResponse,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    context::WrappedError as _,
 };
 
 use super::{
@@ -33,7 +33,7 @@ use crate::{
     dynamo_bound_write::{BoundItemWrite, DynamoItemWriteShape},
     dynamo_read_execution::{DynamoPointReadShape, ValidatedDynamoReadRequest},
     dynamo_table_stream::{
-        get_table_stream_records_in_attempt, latest_table_stream_pointer_in_attempt,
+        get_table_stream_records_in_attempt, table_stream_checkpoint_in_attempt,
     },
     dynamo_write_preparation::prepare_write_table,
     list_streams_in_attempt,
@@ -113,6 +113,7 @@ pub trait DynamoPort: Clock + Send + Sync + Clone + 'static {
         &self,
         request: UpdateTableRequest,
         captured_at: TimestampMillis,
+        bindings: crate::RequestTableBindings,
     ) -> impl Future<Output = StorageResult<UpdateTableResponse>> + Send;
 }
 
@@ -151,11 +152,13 @@ async fn write_item<P: DynamoPort, S: DynamoItemWriteShape>(
 ) -> StorageResult<<S::Bound as BoundItemWrite>::Response> {
     let created_at = port.now();
     let cache = port.metadata_cache();
+    let bindings = crate::RequestTableBindings::default();
     let outcome = retry_native_conflicts(port, DYNAMO_WRITE_RETRY, || {
         let shape = shape.clone();
         let cache = Arc::clone(&cache);
+        let bindings = bindings.clone();
         async move {
-            let prepared = prepare_write_table(port, &cache, shape.table_name()).await?;
+            let prepared = prepare_write_table(port, &cache, shape.table_name(), &bindings).await?;
             let ttl = if S::CAUSE == crate::ItemWriteCause::Put {
                 crate::dynamo_write_preparation::prepared_ttl_policy(&cache, &prepared.table)?
             } else {
@@ -168,7 +171,7 @@ async fn write_item<P: DynamoPort, S: DynamoItemWriteShape>(
             };
             port.with_dynamo_attempt(AttemptMode::ReadWriteItems, move |attempt| {
                 Box::pin(async move {
-                    prepared.confirm(attempt, &cache).await?;
+                    prepared.confirm(attempt, &cache, &bindings).await?;
                     attempt.install_prepared_writes(writes);
                     bound?.execute(attempt, created_at).await
                 })
@@ -245,16 +248,16 @@ impl<P: DynamoPort> DynamoOperations for P {
         .await
     }
 
-    async fn latest_table_stream_pointer(
+    async fn table_stream_checkpoint(
         &self,
-        table_name: TableName,
-    ) -> StorageResult<Option<StreamItemId>> {
+        target: storage_types::TableHistoryTarget,
+    ) -> StorageResult<storage_types::TableStreamCheckpoint> {
         let cache = self.metadata_cache();
         let publication_cache = Arc::clone(&cache);
         let (pointer, publication) = self
             .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
                 Box::pin(async move {
-                    latest_table_stream_pointer_in_attempt(attempt, &cache, &table_name).await
+                    table_stream_checkpoint_in_attempt(attempt, &cache, &target).await
                 })
             })
             .await?;
@@ -262,16 +265,48 @@ impl<P: DynamoPort> DynamoOperations for P {
         Ok(pointer)
     }
 
+    async fn describe_stream(
+        &self,
+        request: storage_types::DescribeStreamRequest,
+    ) -> StorageResult<storage_types::DescribeStreamResponse> {
+        crate::dynamodb_streams::read_dynamo_stream(
+            self,
+            crate::DescribeDynamoStream::try_from(request)?,
+        )
+        .await
+    }
+    async fn get_shard_iterator(
+        &self,
+        request: storage_types::GetShardIteratorRequest,
+    ) -> StorageResult<storage_types::GetShardIteratorResponse> {
+        crate::dynamodb_streams::read_dynamo_stream(
+            self,
+            crate::GetDynamoShardIterator::try_from(request)?,
+        )
+        .await
+    }
+    async fn get_records(
+        &self,
+        request: storage_types::GetRecordsRequest,
+    ) -> StorageResult<storage_types::GetRecordsResponse> {
+        crate::dynamodb_streams::read_dynamo_stream(
+            self,
+            crate::GetDynamoStreamRecords::try_from(request)?,
+        )
+        .await
+    }
+
     async fn get_stream_records(
         &self,
         request: GetStreamRecordsRequest,
     ) -> StorageResult<GetStreamRecordsResponse> {
+        let now = self.now();
         let cache = self.metadata_cache();
         let publication_cache = Arc::clone(&cache);
         let (response, publication) = self
             .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
                 Box::pin(async move {
-                    get_table_stream_records_in_attempt(attempt, &cache, &request).await
+                    get_table_stream_records_in_attempt(attempt, &cache, &request, now).await
                 })
             })
             .await?;
@@ -316,15 +351,19 @@ impl<P: DynamoPort> DynamoOperations for P {
         request: DeleteTableRequest,
     ) -> StorageResult<DeleteTableResponse> {
         let name = request.table_name.clone();
-        let captured_at = self.now();
         let cache = self.metadata_cache();
+        let bindings = crate::RequestTableBindings::default();
         let response = retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
             let request = request.clone();
+            let bindings = bindings.clone();
             let cache = Arc::clone(&cache);
             async move {
                 self.with_dynamo_schema_attempt(move |attempt| {
                     Box::pin(async move {
-                        delete_table_in_attempt(attempt, &cache, &request, captured_at)
+                        let (table, _) = bindings
+                            .resolve_table(attempt, &cache, &request.table_name)
+                            .await?;
+                        delete_table_in_attempt(attempt, &table)
                             .await?
                             .into_result()
                     })
@@ -365,9 +404,11 @@ impl<P: DynamoPort> DynamoOperations for P {
         let name = request.table_name.clone();
         let cache = self.metadata_cache();
         let captured_at = self.now();
+        let bindings = crate::RequestTableBindings::default();
         let response = retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
             let request = request.clone();
-            async move { self.update_table_once(request, captured_at).await }
+            let bindings = bindings.clone();
+            async move { self.update_table_once(request, captured_at, bindings).await }
         })
         .await?;
         cache.invalidate(&name);
@@ -438,14 +479,17 @@ impl<P: DynamoPort> DynamoOperations for P {
         let shape = DynamoBatchWriteShape::try_from_request(request)?;
         let cache = self.metadata_cache();
         let captured_at = self.now();
+        let bindings = crate::RequestTableBindings::default();
         let result = retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
             let shape = shape.clone();
             let cache = Arc::clone(&cache);
+            let bindings = bindings.clone();
             async move {
                 let tables = crate::dynamo_write_preparation::PreparedWriteTables::load(
                     self,
                     &cache,
                     shape.table_names(),
+                    &bindings,
                 )
                 .await?;
                 let bound = shape.bind(tables.ensure_present().map(|()| {
@@ -462,7 +506,7 @@ impl<P: DynamoPort> DynamoOperations for P {
                 };
                 self.with_dynamo_attempt(AttemptMode::ReadWriteItems, move |attempt| {
                     Box::pin(async move {
-                        tables.confirm(attempt, &cache).await?;
+                        tables.confirm(attempt, &cache, &bindings).await?;
                         attempt.install_prepared_writes(writes);
                         bound?.execute(attempt, captured_at).await
                     })
@@ -613,15 +657,25 @@ impl<P: DynamoPort> DynamoOperations for P {
         let name = request.table_name.clone();
         let now = self.now();
         let cache = self.metadata_cache();
+        let bindings = crate::RequestTableBindings::default();
         let response = retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
             let request = request.clone();
+            let bindings = bindings.clone();
             let cache = Arc::clone(&cache);
             async move {
                 self.with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
                     Box::pin(async move {
-                        update_time_to_live_in_attempt(attempt, &cache, &request, now)
-                            .await?
-                            .into_result()
+                        let (table, _) = bindings
+                            .resolve_table(attempt, &cache, &request.table_name)
+                            .await?;
+                        update_time_to_live_in_attempt(
+                            attempt,
+                            &table,
+                            &request.time_to_live_specification,
+                            now,
+                        )
+                        .await?
+                        .into_result()
                     })
                 })
                 .await

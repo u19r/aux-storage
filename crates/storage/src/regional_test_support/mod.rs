@@ -11,7 +11,8 @@ use operator::features;
 use proxy::RegionalProxy;
 use serde_json::json;
 use storage_types::{
-    AttributeMap, AttributeValue, CreateTableRequest, KeyAttributes, TableName, WireItem,
+    AttributeMap, AttributeValue, CreateTableRequest, KeyAttributes, StreamSpecification,
+    StreamViewType, TableName, WireItem,
 };
 
 use crate::{DatabaseManager, DatabaseManagerRuntimeOptions, PutItemInput};
@@ -140,7 +141,14 @@ impl RegionalFixture {
         self.create_global_table_with_schema(request).await
     }
 
-    pub async fn create_global_table_with_schema(&self, request: CreateTableRequest) -> Result<()> {
+    pub async fn create_global_table_with_schema(
+        &self,
+        mut request: CreateTableRequest,
+    ) -> Result<()> {
+        request.stream_specification = Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewAndOldImages),
+        });
         self.managers[0].create_table(&request).await?;
         put(&self.managers[0], "baseline", "before-enable").await?;
         self.managers[0]

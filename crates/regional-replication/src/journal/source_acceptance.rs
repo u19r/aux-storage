@@ -19,13 +19,14 @@ use crate::{canonical_original::CanonicalOriginalRef, native_record::corrupt_rec
 
 #[derive(Default)]
 pub(in crate::journal) struct PreparedSourceAcceptance {
-    originals: PreparedOriginalBatch<'static>,
+    originals: PreparedOriginalBatch,
     declarations: Vec<FirstSeenDeclaration>,
     receipts: Vec<CanonicalAcceptanceReceipt>,
     links: BTreeMap<CanonicalEventId, SourcePublicationEvidence>,
 }
 
 struct SourcePublicationEvidence {
+    physical: TableHistoryId,
     binding: SourcePublicationBinding,
     original_bytes: usize,
 }
@@ -42,7 +43,7 @@ impl PreparedSourceAcceptance {
         input: (
             CanonicalOriginalRef<'_>,
             &CanonicalAcceptanceReceipt,
-            Option<TableHistoryId>,
+            TableHistoryId,
         ),
         publication: (&OriginId, &CanonicalEventLink),
     ) -> StorageResult<()> {
@@ -64,7 +65,7 @@ impl PreparedSourceAcceptance {
         input: (
             CanonicalOriginalRef<'_>,
             &CanonicalAcceptanceReceipt,
-            Option<TableHistoryId>,
+            TableHistoryId,
         ),
     ) -> StorageResult<()> {
         let evidence = SourcePublicationBinding::Deferred(input.0.publication().into_owned());
@@ -77,7 +78,7 @@ impl PreparedSourceAcceptance {
         input: (
             CanonicalOriginalRef<'_>,
             &CanonicalAcceptanceReceipt,
-            Option<TableHistoryId>,
+            TableHistoryId,
         ),
         evidence: SourcePublicationBinding,
     ) -> StorageResult<()> {
@@ -89,12 +90,14 @@ impl PreparedSourceAcceptance {
             return Err(corrupt_record());
         }
         let original_bytes = event.bytes().len();
-        self.originals.include_owned(journal, event, history)?;
-        self.declarations.push(journal.declare_first_seen(event));
+        self.originals.include(journal, event, history)?;
+        self.declarations
+            .push(journal.declare_first_seen(event, history));
         self.receipts.push(receipt.clone());
         self.links.insert(
             event.identity().clone(),
             SourcePublicationEvidence {
+                physical: history,
                 binding: evidence,
                 original_bytes,
             },
@@ -111,8 +114,21 @@ impl PreparedSourceAcceptance {
     ) -> StorageResult<()> {
         let mut keys = Vec::with_capacity(self.receipts.len());
         for receipt in &self.receipts {
-            keys.push(journal.identity_key(crate::constants::ACCEPTANCE_SUFFIX, &receipt.event)?);
-            keys.push(journal.identity_key(crate::constants::EVENT_SUFFIX, &receipt.event)?);
+            let physical = self
+                .links
+                .get(&receipt.event)
+                .ok_or_else(corrupt_record)?
+                .physical;
+            keys.push(journal.table_identity_key(
+                crate::constants::ACCEPTANCE_SUFFIX,
+                physical,
+                &receipt.event,
+            )?);
+            keys.push(journal.table_identity_key(
+                crate::constants::EVENT_SUFFIX,
+                physical,
+                &receipt.event,
+            )?);
         }
         let rows = journal
             .load_immutable_waves(attempt, &keys, storage_types::ReadProtection::Conflict)
@@ -123,15 +139,24 @@ impl PreparedSourceAcceptance {
         Ok(())
     }
 
-    pub(in crate::journal) fn require_sources(
+    pub(in crate::journal) fn bind_source_activities(
         &mut self,
         journal: &JournalStore,
         sources: &[super::SourcePosition],
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<super::delivery_activity::DeliveryActivity>> {
+        let mut activities = Vec::new();
         for source in sources {
             let mut original_bytes = 0usize;
             for link in &source.events {
                 let evidence = self.links.remove(&link.event).ok_or_else(corrupt_record)?;
+                activities.push(super::delivery_activity::DeliveryActivity {
+                    table: link.table,
+                    physical: evidence.physical,
+                    source_table: link.table,
+                    lineage: link.lineage,
+                    origin: source.origin.clone(),
+                    through: source.position,
+                });
                 original_bytes = original_bytes
                     .checked_add(evidence.original_bytes)
                     .ok_or_else(corrupt_record)?;
@@ -148,11 +173,11 @@ impl PreparedSourceAcceptance {
         if !self.links.is_empty() {
             return Err(corrupt_record());
         }
-        Ok(())
+        Ok(activities)
     }
 
     pub(in crate::journal) async fn prepare<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         self,
         journal: &JournalStore,
@@ -162,8 +187,7 @@ impl PreparedSourceAcceptance {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let originals = self.originals.prepare(journal, attempt).await?;
-            drop(self.originals);
+            let originals = self.originals.into_changes();
             let deliveries = journal
                 .prepare_first_seen_declarations(attempt, &self.declarations)
                 .await?;

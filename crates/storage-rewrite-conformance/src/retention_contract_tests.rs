@@ -78,14 +78,14 @@ async fn given_markers_when_list_due_then_bounded() -> anyhow::Result<()> {
         }
         let mut ordered = wide.clone();
         ordered.sort_by(|left, right| {
-            left.due_bucket
-                .cmp(&right.due_bucket)
+            left.due_at
+                .cmp(&right.due_at)
                 .then_with(|| left.scope.scope_id.cmp(&right.scope.scope_id))
                 .then_with(|| left.policy_version.cmp(&right.policy_version))
         });
         anyhow::ensure!(
             wide == ordered,
-            "due markers are not in (due_bucket, scope_id, policy_version) order"
+            "due markers are not in (due_at, scope_id, policy_version) order"
         );
         // Production due buckets are real timestamps: nothing is due at
         // the epoch, while everything seeded is due at the far bound.
@@ -113,9 +113,7 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
         let table = TableName::new("ret-durations");
         let mut create = hash_table_request(TableName::new("ret-durations"));
         create.aux_stream_duration_hours =
-            Some(storage_types::StreamRetentionDuration::FiniteHours(168));
-        create.aux_default_item_stream_duration_hours =
-            Some(storage_types::StreamRetentionDuration::Forever);
+            Some(storage_types::StreamRetentionDuration::from_hours(168).unwrap());
         fixture
             .operations
             .create_table(create)
@@ -127,30 +125,24 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             .await
             .map_err(|err| anyhow::anyhow!("table info: {err:?}"))?;
         anyhow::ensure!(
-            info.table_stream_duration == storage_types::StreamRetentionDuration::FiniteHours(168),
+            info.table_stream_duration
+                == storage_types::StreamRetentionDuration::from_hours(168).unwrap(),
             "table duration: {:?}",
             info.table_stream_duration
         );
-        anyhow::ensure!(
-            info.default_item_stream_duration == storage_types::StreamRetentionDuration::Forever,
-            "item duration: {:?}",
-            info.default_item_stream_duration
-        );
         let repository = fixture.stream_retention_repository.as_ref();
-        // Per-item custom duration reaches production in the actual
-        // request: the written item stays readable with its exact value.
+        // Ordinary writes use the single table policy and preserve their exact
+        // value.
         let item = AttributeMap::from_iter([
             ("pk".to_string(), AttributeValue::S("k1".to_string())),
             ("value".to_string(), AttributeValue::S("v1".to_string())),
         ]);
-        let mut request = PutItemRequest::new(table.clone(), WireItem::try_from(&item)?);
-        request.aux_item_stream_ttl_hours =
-            Some(storage_types::StreamRetentionDuration::FiniteHours(1));
+        let request = PutItemRequest::new(table.clone(), WireItem::try_from(&item)?);
         fixture
             .operations
             .put_item(request)
             .await
-            .map_err(|err| anyhow::anyhow!("put with item duration: {err:?}"))?;
+            .map_err(|err| anyhow::anyhow!("put under table policy: {err:?}"))?;
         let found = fixture
             .operations
             .get_item(GetItemRequest {
@@ -160,12 +152,12 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             .await
             .map_err(|err| anyhow::anyhow!("get: {err:?}"))?
             .item
-            .ok_or_else(|| anyhow::anyhow!("item with custom duration missing"))?
+            .ok_or_else(|| anyhow::anyhow!("item under the table policy missing"))?
             .to_attribute_map()
             .map_err(|err| anyhow::anyhow!("decode: {err:?}"))?;
         anyhow::ensure!(
             found == item,
-            "item with custom duration changed: {found:?}"
+            "item under the table policy changed: {found:?}"
         );
         // Policy update through the real update path: persisted durations
         // and the table scope's trim-state retention/version must advance.
@@ -173,10 +165,7 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             .operations
             .update_table(storage_types::UpdateTableRequest {
                 aux_stream_duration_hours: Some(
-                    storage_types::StreamRetentionDuration::FiniteHours(24),
-                ),
-                aux_default_item_stream_duration_hours: Some(
-                    storage_types::StreamRetentionDuration::FiniteHours(48),
+                    storage_types::StreamRetentionDuration::from_hours(24).unwrap(),
                 ),
                 ..storage_types::UpdateTableRequest::new(table.clone())
             })
@@ -189,15 +178,9 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             .map_err(|err| anyhow::anyhow!("updated table info: {err:?}"))?;
         anyhow::ensure!(
             updated.table_stream_duration
-                == storage_types::StreamRetentionDuration::FiniteHours(24),
+                == storage_types::StreamRetentionDuration::from_hours(24).unwrap(),
             "updated table duration: {:?}",
             updated.table_stream_duration
-        );
-        anyhow::ensure!(
-            updated.default_item_stream_duration
-                == storage_types::StreamRetentionDuration::FiniteHours(48),
-            "updated item duration: {:?}",
-            updated.default_item_stream_duration
         );
         let due = repository
             .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 10)
@@ -217,7 +200,7 @@ async fn given_custom_durations_when_table_created_and_updated_then_policy_advan
             anyhow::bail!("updated table scope has no trim state");
         };
         anyhow::ensure!(
-            state.retention == storage_types::StreamRetentionDuration::FiniteHours(24),
+            state.retention == storage_types::StreamRetentionDuration::from_hours(24).unwrap(),
             "trim state retention did not advance: {:?}",
             state.retention
         );
@@ -477,59 +460,10 @@ async fn given_missing_or_malformed_target_when_observed_then_fail_closed_withou
 }
 
 #[tokio::test]
-async fn given_item_writes_when_boundaries_loaded_then_embedded_and_pointer_cohere()
--> anyhow::Result<()> {
-    let fixture = TestStore::new().await;
-    let outcome = async {
-        let table = TableName::new("ret-streams");
-        fixture
-            .operations
-            .create_table(hash_table_request(TableName::new("ret-streams")))
-            .await
-            .map_err(|err| anyhow::anyhow!("create: {err:?}"))?;
-        for pk in ["s-1", "s-2"] {
-            let item = AttributeMap::from_iter([
-                ("pk".to_string(), AttributeValue::S(pk.to_string())),
-                ("value".to_string(), AttributeValue::S("v".to_string())),
-            ]);
-            fixture
-                .operations
-                .put_item(direct_put(table.clone(), item)?)
-                .await
-                .map_err(|err| anyhow::anyhow!("put {pk}: {err:?}"))?;
-        }
-        let repository = fixture.stream_retention_repository.as_ref();
-        let due = repository
-            .list_due_stream_trim_markers(TimestampMillis::from_timestamp(i64::MAX), 10)
-            .await
-            .map_err(|err| anyhow::anyhow!("due: {err:?}"))?;
-        anyhow::ensure!(!due.is_empty(), "no due markers after item writes");
-        // Every selected scope must produce a corresponding boundary
-        // observation.
-        let scopes: Vec<storage_provider::StreamTrimScope> = due
-            .iter()
-            .take(4)
-            .map(|marker| marker.scope.clone())
-            .collect();
-        let boundaries = repository
-            .load_stream_trim_boundaries(&scopes)
-            .await
-            .map_err(|err| anyhow::anyhow!("boundaries: {:?}", err.as_ref()))?;
-        anyhow::ensure!(
-            boundaries.len() == scopes.len(),
-            "boundary cardinality changed"
-        );
-        Ok(())
-    }
-    .await;
-    fixture.finish().await;
-    outcome
-}
-
-#[tokio::test]
 async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resumes()
 -> anyhow::Result<()> {
     let fixture = TestStore::new_durable().await;
+    let observed_at = fixture.now() + 7 * 24 * 60 * 60 * 1000;
     let outcome = async {
         let table = TableName::new("ret-restart");
         fixture
@@ -564,10 +498,7 @@ async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resum
             },
         );
         let first = worker
-            .run_due_page(
-                TimestampMillis::from_timestamp(i64::MAX),
-                TimestampMillis::from_timestamp(i64::MAX),
-            )
+            .run_due_page(observed_at, observed_at)
             .await
             .map_err(|err| anyhow::anyhow!("first trim page: {err:?}"))?;
         anyhow::ensure!(
@@ -598,10 +529,7 @@ async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resum
             },
         );
         let second = worker
-            .run_due_page(
-                TimestampMillis::from_timestamp(i64::MAX),
-                TimestampMillis::from_timestamp(i64::MAX),
-            )
+            .run_due_page(observed_at, observed_at)
             .await
             .map_err(|err| anyhow::anyhow!("second trim page: {err:?}"))?;
         anyhow::ensure!(
@@ -615,8 +543,21 @@ async fn given_due_markers_when_worker_runs_then_pages_bounded_and_restart_resum
             .await
             .map_err(|err| anyhow::anyhow!("due after restart: {err:?}"))?;
         anyhow::ensure!(
-            due.iter().all(|marker| due_before.contains(marker)),
-            "finished work resurrected after restart"
+            due.len() == 1,
+            "finite table lost or duplicated its idle schedule"
+        );
+        anyhow::ensure!(
+            due.iter()
+                .all(|marker| !due_before.contains(marker) && marker.due_at > observed_at),
+            "finished deadline resurrected after restart"
+        );
+        let states = repository
+            .load_stream_trim_states(&[due[0].scope.clone()])
+            .await?;
+        anyhow::ensure!(
+            states[0]
+                .as_ref()
+                .is_some_and(|state| state.marker_matches(&due[0]))
         );
         Ok(())
     }
@@ -636,7 +577,7 @@ async fn verify_stale_policy_wave(fixture: &TestStore) -> anyhow::Result<()> {
     use storage_provider::{StreamTrimPageLimit, maintenance::StreamRetentionWave};
     let mut request = hash_table_request(TableName::new("ret-finish"));
     request.aux_stream_duration_hours =
-        Some(storage_types::StreamRetentionDuration::FiniteHours(1));
+        Some(storage_types::StreamRetentionDuration::from_hours(24).unwrap());
     fixture.operations.create_table(request.clone()).await?;
     let repository = fixture.stream_retention_repository.as_ref();
     let due = fixture.now() + 48 * 60 * 60 * 1000;
@@ -649,7 +590,7 @@ async fn verify_stale_policy_wave(fixture: &TestStore) -> anyhow::Result<()> {
     fixture
         .operations
         .update_table(serde_json::from_value(serde_json::json!({
-            "TableName": request.table_name, "AuxStreamDurationHours": 1
+            "TableName": request.table_name, "AuxStreamDurationHours": 48
         }))?)
         .await?;
     let scopes = [marker.scope.clone()];
@@ -666,7 +607,9 @@ async fn verify_stale_policy_wave(fixture: &TestStore) -> anyhow::Result<()> {
         StreamTrimPageLimit::try_from(1usize)?,
     )?;
     let first = repository.trim_stream_marker_wave(wave.clone()).await?;
-    anyhow::ensure!(first.stale_markers == 1 && first.rows_deleted == 0 && first.state_writes == 0);
+    anyhow::ensure!(
+        first.due_markers_scanned == 1 && first.rows_deleted == 0 && first.state_writes == 0
+    );
     let remaining = repository.list_due_stream_trim_markers(due, 10).await?;
     anyhow::ensure!(!remaining.contains(&marker) && remaining.len() == 1);
     anyhow::ensure!(repository.load_stream_trim_states(&scopes).await? == state);

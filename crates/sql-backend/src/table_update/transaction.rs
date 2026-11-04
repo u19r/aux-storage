@@ -19,12 +19,10 @@ use crate::{
 };
 
 impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'_, A, L> {
-    type Catalog = BoundTableInfo;
-
     async fn observe_table_update(
         &mut self,
         name: &TableName,
-    ) -> StorageResult<Option<Self::Catalog>> {
+    ) -> StorageResult<Option<BoundTableInfo>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -46,7 +44,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
 
     async fn observe_table_retention(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
     ) -> StorageResult<TableUpdateRetention> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -73,7 +71,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
 
     async fn load_index_name_lock(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
         name: &IndexName,
     ) -> StorageResult<Option<TimestampMillis>> {
         let mut settlement =
@@ -109,9 +107,9 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
 
     async fn persist_table_update(
         &mut self,
-        current: Self::Catalog,
+        current: BoundTableInfo,
         change: TableUpdateChange,
-    ) -> StorageResult<Self::Catalog> {
+    ) -> StorageResult<BoundTableInfo> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -179,7 +177,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableUpdateTransaction for SqlCatalogAttempt<'
 
     async fn observe_table_update_readiness(
         &mut self,
-        table: &Self::Catalog,
+        table: &BoundTableInfo,
     ) -> StorageResult<GsiReadinessSnapshot> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);

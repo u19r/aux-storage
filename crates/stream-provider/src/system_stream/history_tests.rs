@@ -142,25 +142,18 @@ fn given_invalid_frontier_when_planning_then_no_read_is_issued() {
 }
 
 fn record(lineage: &str, offset: u64) -> SystemStreamHistoryRecord {
-    let pointer = storage_types::StreamItemId::from([3; 12]);
     SystemStreamHistoryRecord {
         position: position(lineage, offset),
-        expected_pointer: pointer,
-        actual_pointer: Some(pointer),
     }
 }
 
 #[test]
-fn given_missing_or_wrong_pointer_when_finishing_page_then_progress_is_rejected() {
+fn given_another_lineage_when_finishing_a_page_then_progress_is_rejected() {
     let history = history();
     let high = history.capture_high().unwrap();
     let current = checkpoint(vec![position("root", 1)]);
-    for actual in [None, Some(storage_types::StreamItemId::from([9; 12]))] {
-        let plan = history.plan_page(&current, &high, 2).unwrap();
-        let mut observation = record("root", 2);
-        observation.actual_pointer = actual;
-        assert!(finish(&plan, vec![vec![observation]]).is_err());
-    }
+    let plan = history.plan_page(&current, &high, 2).unwrap();
+    assert!(finish(&plan, vec![vec![record("other", 2)]]).is_err());
 }
 
 #[test]
@@ -318,49 +311,23 @@ fn given_large_backlog_when_limit_is_unbounded_then_native_work_has_the_contract
 }
 
 #[test]
-fn given_parent_hold_when_children_start_at_seven_then_all_child_records_are_protected() {
-    let limits = history()
-        .private_trim_boundaries(&[position("root", 1)])
-        .unwrap();
-    assert!(limits.contains(&position("root", 2)));
-    assert!(limits.contains(&position("left", 7)));
-    assert!(limits.contains(&position("right", 7)));
-}
-
-#[test]
-fn given_child_holds_when_parent_hold_is_released_then_consumed_history_is_reclaimable() {
-    let limits = history()
-        .private_trim_boundaries(&[position("left", 8), position("right", 6)])
-        .unwrap();
-    assert!(
-        !limits
-            .iter()
-            .any(|position| position.lineage_id().as_str() == "root")
+fn given_retired_parent_and_children_when_a_fresh_checkpoint_is_issued_then_all_floors_survive() {
+    let history = history();
+    let retired = [
+        position("root", 2),
+        position("left", 7),
+        position("right", 7),
+    ];
+    assert_eq!(
+        history.retained_checkpoint(&retired).unwrap(),
+        checkpoint(vec![position("left", 7), position("right", 7)])
     );
-    assert!(limits.contains(&position("left", 9)));
-    assert!(limits.contains(&position("right", 7)));
-    assert!(history().private_trim_boundaries(&[]).unwrap().is_empty());
-}
-
-#[test]
-fn given_parent_and_child_holds_when_combined_then_ancestor_retention_wins() {
-    let limits = history()
-        .private_trim_boundaries(&[position("root", 2), position("left", 8)])
-        .unwrap();
-    assert!(limits.contains(&position("left", 7)));
-    assert!(limits.contains(&position("right", 7)));
-}
-
-#[test]
-fn given_invalid_private_hold_when_planning_trim_then_no_deletion_is_authorized() {
     for invalid in [
-        vec![position("unknown", 0)],
-        vec![position("left", 5)],
-        vec![position("left", 9)],
-        vec![position("left", 7), position("left", 8)],
-        vec![SystemStreamPosition::try_new("wrong-shard", "left", "7").unwrap()],
+        position("unknown", 1),
+        position("left", 99),
+        SystemStreamPosition::try_new("other-shard", "left", "7").unwrap(),
     ] {
-        assert!(history().private_trim_boundaries(&invalid).is_err());
+        assert!(history.retained_checkpoint(&[invalid]).is_err());
     }
 }
 

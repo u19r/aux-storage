@@ -1,7 +1,7 @@
 use serde::{Serialize, ser::SerializeMap};
 use storage_types::{
     AttributeValueLookup, ItemStreamVersion, KeyAttributes, StorageError, StorageResult,
-    StreamItemId, SystemStreamSourceTableName, TableName, TimestampMillis, WireItem,
+    SystemStreamSourceTableName, TableName, TimestampMillis, WireItem,
     normalize_key_attribute_value_for_write,
 };
 
@@ -14,13 +14,11 @@ use storage_types::{
 pub struct LogicalSystemStreamMutationInput<'a> {
     pub history_id: storage_types::TableHistoryId,
     pub route: &'a DynamoMutationRoute,
-    pub item: PreparedStreamImage,
-    pub old_item: Option<storage_types::VerifiedWireItem>,
+    pub item: Option<storage_types::VerifiedWireItem>,
+    pub old_item: Option<&'a storage_types::VerifiedWireItem>,
+    pub previous_version: Option<ItemStreamVersion>,
     pub indexers: &'a [String],
-    pub old_indexers: Option<&'a [String]>,
-    pub stream_item_id: StreamItemId,
     pub item_stream_version: ItemStreamVersion,
-    pub is_deleted: bool,
 
     pub created_at: TimestampMillis,
 }
@@ -30,103 +28,49 @@ pub struct LogicalSystemStreamMutationInput<'a> {
 #[derive(Clone, Debug)]
 pub struct LogicalSystemStreamMutation {
     pub history_id: storage_types::TableHistoryId,
-    pub stream_item_id: StreamItemId,
     pub source_table_name: SystemStreamSourceTableName,
     pub key: KeyAttributes,
-    pub item: WireItem,
-    pub item_json: Vec<u8>,
-    pub old_item: Option<WireItem>,
-    pub(crate) old_source: Option<storage_types::StoredImageSource>,
+    pub item: Option<WireItem>,
+    pub predecessor_payload_bytes: Option<usize>,
+    pub previous_version: Option<ItemStreamVersion>,
     pub item_stream_version: ItemStreamVersion,
     pub indexers: Vec<String>,
-    pub old_indexers: Option<Vec<String>>,
 
-    pub is_deleted: bool,
     pub created_at: TimestampMillis,
-    pub routing_key: Vec<u8>,
 }
 
-impl From<LogicalSystemStreamMutationInput<'_>> for LogicalSystemStreamMutation {
-    fn from(input: LogicalSystemStreamMutationInput<'_>) -> Self {
+impl TryFrom<LogicalSystemStreamMutationInput<'_>> for LogicalSystemStreamMutation {
+    type Error = StorageError;
+
+    fn try_from(input: LogicalSystemStreamMutationInput<'_>) -> StorageResult<Self> {
+        if input.old_item.is_some() != input.previous_version.is_some()
+            || input.previous_version.is_some_and(|previous| {
+                previous.get() == 0 || previous >= input.item_stream_version
+            })
+        {
+            return Err(StorageError::internal("Invalid exact stream predecessor"));
+        }
         let key = input.route.key.clone();
-        let PreparedStreamImage { item, json } = input.item;
-        Self {
+        let predecessor_payload_bytes = input
+            .old_item
+            .map(|item| item.dynamo_json_bytes().map(|bytes| bytes.len()))
+            .transpose()?;
+        if input.item.is_none() && input.previous_version.is_none() {
+            return Err(StorageError::internal(
+                "Deletion history requires its exact predecessor",
+            ));
+        }
+        Ok(Self {
             history_id: input.history_id,
-            stream_item_id: input.stream_item_id,
             source_table_name: input.route.source_table_name.clone(),
-            item,
-            item_json: json,
-            old_source: input
-                .old_item
-                .as_ref()
-                .and_then(storage_types::VerifiedWireItem::stored_source),
-            old_item: input.old_item.map(WireItem::from),
+            item: input.item.map(WireItem::from),
+            predecessor_payload_bytes,
+            previous_version: input.previous_version,
             key,
             item_stream_version: input.item_stream_version,
             indexers: input.indexers.to_vec(),
-            old_indexers: input.old_indexers.map(<[_]>::to_vec),
 
-            is_deleted: input.is_deleted,
             created_at: input.created_at,
-            routing_key: input.route.routing_key.clone(),
-        }
-    }
-}
-
-impl LogicalSystemStreamMutation {
-    pub(crate) async fn restore_source_image<
-        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
-    >(
-        &mut self,
-        attempt: &mut A,
-    ) -> StorageResult<()> {
-        let Some(old) = &self.old_item else {
-            if self.old_source.is_some() {
-                return Err(StorageError::internal(
-                    "Absent stream predecessor has source custody",
-                ));
-            }
-            return Ok(());
-        };
-        let source = self
-            .old_source
-            .ok_or_else(|| StorageError::internal("Stream predecessor has no source custody"))?;
-        if source.address.history() != self.history_id {
-            return Err(StorageError::internal(
-                "Stream predecessor source belongs to another incarnation",
-            ));
-        }
-        let exact = crate::retained_image::load_stored_image(attempt, source).await?;
-        crate::retained_image::require_materialized_image(&exact, old)?;
-        if self.is_deleted {
-            self.item_json = exact.dynamo_json_bytes()?.into_owned();
-            self.item = exact.clone();
-        }
-        self.old_item = Some(exact);
-        Ok(())
-    }
-}
-
-/// Key-complete accepted image; native consumers share its raw JSON spelling.
-pub struct PreparedStreamImage {
-    item: WireItem,
-    json: Vec<u8>,
-}
-
-impl PreparedStreamImage {
-    pub fn try_new(route: &DynamoMutationRoute, item: WireItem) -> StorageResult<Self> {
-        Self::try_from(storage_types::VerifiedWireItem::try_new(item, &route.key)?)
-    }
-}
-
-impl TryFrom<storage_types::VerifiedWireItem> for PreparedStreamImage {
-    type Error = StorageError;
-
-    fn try_from(item: storage_types::VerifiedWireItem) -> StorageResult<Self> {
-        let json = item.dynamo_json_bytes()?.into_owned();
-        Ok(Self {
-            item: item.into(),
-            json,
         })
     }
 }
@@ -139,6 +83,10 @@ pub struct DynamoMutationRoute {
 }
 
 impl DynamoMutationRoute {
+    pub fn verify_item(&self, item: WireItem) -> StorageResult<storage_types::VerifiedWireItem> {
+        storage_types::VerifiedWireItem::try_new(item, &self.key)
+    }
+
     pub fn try_new(
         table_name: &TableName,
         key_schema: &[storage_types::KeySchemaElement],

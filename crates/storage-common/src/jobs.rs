@@ -1,7 +1,7 @@
 //! Storage-owned scheduled maintenance job identities and cadence settings.
 use std::{fmt, str::FromStr, time::Duration};
 
-use scheduled_bg_jobs::{JobKind, QueueName};
+use scheduled_bg_jobs::{JobId, JobKind, QueueName};
 
 use crate::{JobIntervalMillis, constants::DEFAULT_JOB_INTERVALS, errors::StorageJobParseError};
 
@@ -36,6 +36,20 @@ impl StorageJob {
             Self::TableReclaim => "table-reclaim",
             Self::TtlSweep => "ttl-sweep",
         }
+    }
+
+    /// Stable persisted identity of this namespace's maintenance controller.
+    #[must_use]
+    pub fn job_id(self) -> JobId {
+        let identity = match self {
+            Self::GsiBackfill => 1,
+            Self::PartitionReconciliation => 2,
+            Self::QueueMessageCleanup => 3,
+            Self::StreamTrim => 4,
+            Self::TableReclaim => 5,
+            Self::TtlSweep => 6,
+        };
+        JobId::from([identity; 16])
     }
 
     #[must_use]

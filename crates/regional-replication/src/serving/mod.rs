@@ -32,3 +32,6 @@ mod table_metadata;
 
 mod retention;
 mod table_reclaim;
+
+#[cfg(test)]
+mod control_identity_tests;

@@ -9,18 +9,15 @@ use infrastructure_provider::{
 };
 use storage_backfill::GsiBuildTarget;
 use storage_types::{StorageEnum, StorageResult, TableHistoryId, maintenance::TargetIncarnation};
-use stream_provider::retained_image::{RetainedOwnerKind, RetainedOwnerRetirement};
 
 use crate::{
     CatalogAttempt, TableReclaimStep,
     gsi_reclaim_discovery::GsiReclaimDiscovery,
-    gsi_reclaim_record::{GsiReclaimPhase, GsiReclaimRecord, invalid_marker},
+    gsi_reclaim_record::{GsiReclaimRecord, invalid_marker},
 };
 
 /// Physical index binding observations and exact bounded family deletion.
-pub trait GsiReclaimAttempt:
-    CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt
-{
+pub trait GsiReclaimAttempt: CatalogAttempt + PhysicalRecordAttempt {
     fn load_index_incarnation(
         &mut self,
         history: TableHistoryId,
@@ -63,39 +60,17 @@ pub async fn reclaim_index_page(
             return Ok(TableReclaimStep::Complete);
         };
         let advance = discovery.prepare_advance(row.key.clone())?;
-        let mut marker = GsiReclaimRecord::decode(&row)?;
+        let marker = GsiReclaimRecord::decode(&row)?;
         require_retired_binding(attempt, &marker).await?;
-        let change = match &marker.phase {
-            GsiReclaimPhase::OwnerReceipts { after } => {
-                let next = RetainedOwnerRetirement::try_new(
-                    RetainedOwnerKind::Projection,
-                    marker.history,
-                )?
-                .release_projection_page(
-                    attempt,
-                    &marker.target.incarnation,
-                    &marker.target.index_name,
-                    after.clone(),
-                )
-                .await?;
-                marker.phase = match next {
-                    Some(after) => GsiReclaimPhase::OwnerReceipts { after: Some(after) },
-                    None => GsiReclaimPhase::PhysicalRows,
-                };
-                Some(marker.prepare_store(RecordExpectation::Revision(row.revision))?)
-            }
-            GsiReclaimPhase::PhysicalRows => {
-                match attempt
-                    .delete_index_page(marker.history, &marker.target)
-                    .await?
-                {
-                    TableReclaimStep::Advanced => None,
-                    TableReclaimStep::Complete => Some(RecordChange::Delete {
-                        key: row.key,
-                        expected: row.revision,
-                    }),
-                }
-            }
+        let change = match attempt
+            .delete_index_page(marker.history, &marker.target)
+            .await?
+        {
+            TableReclaimStep::Advanced => None,
+            TableReclaimStep::Complete => Some(RecordChange::Delete {
+                key: row.key,
+                expected: row.revision,
+            }),
         };
         let mut changes = vec![advance];
         changes.extend(change);

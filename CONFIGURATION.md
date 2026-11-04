@@ -103,16 +103,10 @@ metadata, not stored item data, and standard DynamoDB-compatible clients are
 unchanged when the extension fields are omitted.
 
 Duration values are hours. Omitted values use the service default of 72 hours,
-finite values must be in `1..=61320` (`24 * 365 * 7`), and `-1` means forever.
-The physical item stream retention is:
-
-```text
-max(table_stream_retention, item_stream_retention)
-```
-
-If either side is forever, the effective item retention is forever. This means a
-short item TTL can make item cleanup due earlier, but item stream rows still
-remain while table stream retention may expose pointers to those rows.
+finite values must be in `24..=61320` (`24 * 365 * 7`), and `-1` means forever.
+Table stream retention also controls item history. Items have no independent history duration.
+Table cleanup preserves the snapshots and predecessors needed by retained DynamoDB stream records.
+DynamoDB live-item TTL can delete a current item while its historical snapshots remain readable.
 
 Create or update table-level retention with aux fields:
 
@@ -132,30 +126,9 @@ Create or update table-level retention with aux fields:
     "StreamEnabled": true,
     "StreamViewType": "NEW_AND_OLD_IMAGES"
   },
-  "AuxStreamDurationHours": 168,
-  "AuxDefaultItemStreamDurationHours": 72
+  "AuxStreamDurationHours": 168
 }
 ```
-
-Set an item-specific policy on write operations:
-
-```json
-{
-  "TableName": "Orders",
-  "Item": {
-    "pk": { "S": "order#123" },
-    "sk": { "S": "v0" },
-    "status": { "S": "open" }
-  },
-  "AuxItemStreamTtlHours": 24
-}
-```
-
-`DeleteItem` accepts the same field alongside `TableName` and `Key`.
-`BatchWriteItem` accepts `AuxItemStreamTtlHours` inside `PutRequest` and
-`DeleteRequest`. `TransactWriteItems` accepts it inside `Put`, `Update`, and
-`Delete` members. Condition-check operations do not accept item stream TTL
-because they do not write an item stream version.
 
 Backend support:
 
@@ -168,15 +141,24 @@ Backend support:
 | Turso | Supported for SQL deployments; validate trim-job scheduling and backlog monitoring in your runtime. |
 | Remote | Mirrors the capability of the remote service it calls. |
 
+Enabling a stream on an existing table captures its current items in bounded background
+pages. `DescribeTable` reports `UPDATING` and `StreamEnabled: false` until capture completes.
+Concurrent writes are captured during initialization. Regional replication requires the
+completed public stream. Adding a GSI while public streams are off starts temporary internal
+capture for its base scan and catch-up. The last completed or cancelled internal build stops
+that capture automatically. This does not enable a public stream or add another full-table scan.
+Explicit public streams remain enabled. Active indexes receive atomic foreground updates
+without requiring history, and TTL alone does not enable history.
+
 Historical and background-work interactions:
 
 - `VersionAt` reads and `ExportTableToPointInTime` are planned historical APIs.
   They must fail closed when required stream history has been trimmed. Until
   those APIs exist, custom stream duration exposes the trim-state fields they
   need but does not add a user-facing historical read/export surface.
-- Cross-region table bootstrap, stream catch-up, GSI backfill, and future export sessions
-  can protect stream boundaries. Custom duration trim must stop before those
-  protected boundaries, even when the configured retention horizon is older.
+- Consumers must catch up within the configured history window. Consumer checkpoints
+  do not extend the fixed 24-hour system stream. Table history remains available for
+  the table's configured duration.
 - TTL cleanup and custom stream trim are cooperative background jobs. They may
   lag for hours under high load; operators should prefer bounded progress over
   aggressive synchronous drain behavior.

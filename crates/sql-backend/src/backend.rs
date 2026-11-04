@@ -135,10 +135,6 @@ pub trait SqlAttempt: Send {
     fn reject_settlement_error(&mut self, error: &storage_types::StorageError);
     fn require_settlement(&self) -> StorageResult<()>;
 
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges;
-
     fn query(
         &mut self,
         statement: SqlStatement,

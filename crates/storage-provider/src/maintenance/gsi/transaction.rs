@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use storage_backfill::{
     GsiActivationState, GsiBuild, GsiBuildCandidates, GsiBuildTarget, GsiPageLimit, GsiProjection,
-    GsiProjectionKey, GsiProjectionStateReadBatch, GsiReferencedHistoryItem,
-    GsiReferencedHistoryRead, GsiScanSourcePage, GsiStreamSourcePage,
+    GsiProjectionKey, GsiProjectionStateReadBatch, GsiScanSourcePage, GsiStreamSourcePage,
 };
 use storage_common::TtlConfigRecord;
 use storage_types::{
@@ -15,8 +14,7 @@ use storage_types::{
 
 use super::{
     GsiBuildAdvance, GsiBuildRequest, GsiBuildTransaction, GsiCandidateRead, GsiPort,
-    GsiScanSource, GsiStreamSource, GsiTargetAdmission, GsiTransition, OrdinaryGsiBuild,
-    models::GsiBuildStart,
+    GsiScanSource, GsiTargetAdmission, GsiTransition, OrdinaryGsiBuild, models::GsiBuildStart,
 };
 
 pub struct GsiAttempt<'a, P: GsiPort, S = OrdinaryGsiBuild> {
@@ -25,6 +23,7 @@ pub struct GsiAttempt<'a, P: GsiPort, S = OrdinaryGsiBuild> {
     pub(super) table: Option<Arc<BoundTableInfo>>,
     pub(super) ttl: Option<Option<TtlConfigRecord>>,
     progress_fence: P::ProgressFence,
+    pub(super) captured_at: storage_types::TimestampMillis,
 }
 
 impl<P: GsiPort> GsiAttempt<'_, P> {
@@ -56,6 +55,7 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiAttempt<'_, P, S> {
                 table: None,
                 ttl: None,
                 progress_fence,
+                captured_at: request.captured_at,
             };
             start.advance(&mut attempt).await
         }
@@ -72,11 +72,22 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiCandidateRead<Vec<u8>> for GsiAtte
         self.port.scan_gsi_candidates(after).await
     }
     async fn admits_gsi_candidate(&mut self, build: &GsiBuild<Vec<u8>>) -> StorageResult<bool> {
-        self.admission.admits_target(self.port, &build.target).await
+        if !self
+            .admission
+            .admits_target(self.port, &build.target)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !build.state.is_runnable() {
+            return Ok(true);
+        }
+        let table = self.load_table(&build.target.table_name).await?;
+        Ok(table.table_status == storage_types::TableStatus::Active)
     }
     async fn validate_gsi_candidate(&mut self, build: &GsiBuild<Vec<u8>>) -> StorageResult<()> {
-        let observed = self.port.load_gsi_candidate_holds(build).await?;
-        build.validate_candidate_holds(observed.build.as_ref(), &observed.holds)
+        let observed = self.port.load_gsi_candidate(build).await?;
+        build.validate_candidate(observed.as_ref())
     }
 }
 
@@ -145,19 +156,18 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
     ) -> StorageResult<GsiStreamSourcePage> {
         let table = self.load_table(&target.table_name).await?;
         target.validate_table(&table)?;
-        self.port
-            .load_gsi_stream_source_page(GsiStreamSource {
-                table: &table,
-                target,
+        let (history, _) = self.port.read_system_page_start(None).await?;
+        let plan = history
+            .plan_page(
                 after,
                 through,
-                limit,
-            })
-            .await
-    }
-
-    async fn read_gsi_stream_tail(&mut self) -> StorageResult<SystemStreamCheckpoint> {
-        self.port.load_gsi_stream_tail().await
+                u32::from(limit).min(crate::constants::GSI_STREAM_PAGE_ROWS),
+            )
+            .map_err(|_| storage_types::StorageEnum::HistoryUnavailable)?;
+        let pages = self.port.read_system_history_pages(plan.as_ref()).await?;
+        let mut assembly = storage_backfill::GsiStreamPageAssembly::new(&plan, table.history_id);
+        assembly.push_pages(plan.as_ref(), pages)?;
+        assembly.finish(self.port, &table, through).await
     }
 
     async fn read_gsi_projection_states(
@@ -167,13 +177,6 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
         let table = self.load_table(&batch.table.table_name).await?;
         batch.target.validate_table(&table)?;
         self.port.load_gsi_projection_states(&table, batch).await
-    }
-
-    async fn read_gsi_referenced_histories(
-        &mut self,
-        reads: &[GsiReferencedHistoryRead<'_>],
-    ) -> StorageResult<Vec<GsiReferencedHistoryItem>> {
-        self.port.load_gsi_referenced_histories(reads).await
     }
 
     async fn validate_gsi_frontier(
@@ -228,8 +231,20 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
         // protected policy observation. A concurrent policy change is rejected
         // by the native conflict fence (KV) or conditional update (SQL), never
         // a cached-value check.
+        let release = if !transition.next_state.is_runnable() {
+            crate::TableUpdateChange::release_gsi_capture(
+                &table.info,
+                &transition.expected.target.index_name,
+            )
+        } else {
+            None
+        };
         self.port
             .store_gsi_transition(&table, transition, &self.progress_fence)
-            .await
+            .await?;
+        if let Some(change) = release {
+            self.persist_capture_release(&table, change).await?;
+        }
+        Ok(())
     }
 }

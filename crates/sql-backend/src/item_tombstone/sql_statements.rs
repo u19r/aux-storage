@@ -119,7 +119,7 @@ pub(crate) fn primary_delete_statements(
         .try_reserve_exact(2)
         .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
     let (predicate, binds) = primary_key_predicate(engine, table, key)?;
-    let physical = engine.item_table_name(&table.info.table_name, table.history_id);
+    let physical = engine.item_table_name(table.history_id);
     let primary = SqlStatement::new(
         format!("DELETE FROM \"{physical}\" WHERE {predicate}"),
         binds,

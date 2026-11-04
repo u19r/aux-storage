@@ -17,12 +17,22 @@ pub struct KvValuePrefix {
     pub(crate) bytes: Vec<u8>,
 }
 
+pub(crate) struct KvPrefixRead {
+    pub protection: ReadProtection,
+    pub prefix_bytes: NonZeroUsize,
+    pub allowance: crate::KvValueAllowance,
+}
+
 pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
     attempt: &A,
     keys: &[Vec<u8>],
-    protection: ReadProtection,
-    prefix_bytes: NonZeroUsize,
+    read: KvPrefixRead,
 ) -> StorageResult<Vec<Option<KvValuePrefix>>> {
+    let KvPrefixRead {
+        protection,
+        prefix_bytes,
+        allowance,
+    } = read;
     if prefix_bytes.get() > KV_CHUNK_BYTES {
         return Err(invalid_prefix());
     }
@@ -38,7 +48,7 @@ pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
         attempt,
         keys,
         protection,
-        crate::KvValueAllowance::for_unqualified_values(keys.len()).for_head_reads(keys.len())?,
+        allowance.for_head_reads(keys.len())?,
     )
     .await?;
     for (index, head) in heads.into_iter().enumerate() {
@@ -51,9 +61,6 @@ pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
                 }));
             }
             Some(ValueHeader::Chunked { length, .. }) => {
-                if length < prefix_bytes.get() {
-                    return Err(invalid_prefix());
-                }
                 output.push(None);
                 pending.push((index, length));
             }
@@ -87,7 +94,7 @@ pub(crate) async fn load_value_prefixes<A: KvAttempt + ?Sized>(
 }
 
 fn copy_prefix(value: &[u8], prefix_bytes: NonZeroUsize) -> StorageResult<Vec<u8>> {
-    let prefix = value.get(..prefix_bytes.get()).ok_or_else(invalid_prefix)?;
+    let prefix = &value[..value.len().min(prefix_bytes.get())];
     let mut copied = Vec::new();
     copied
         .try_reserve_exact(prefix.len())

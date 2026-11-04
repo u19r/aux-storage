@@ -4,12 +4,9 @@ use std::future::Future;
 
 use storage_backfill::{
     GsiActivationState, GsiBuild, GsiBuildTarget, GsiPageLimit, GsiProjection, GsiProjectionKey,
-    GsiProjectionStateReadBatch, GsiReferencedHistoryItem, GsiReferencedHistoryRead,
-    GsiScanSourcePage, GsiStreamSourcePage,
+    GsiProjectionStateReadBatch, GsiScanSourcePage,
 };
-use storage_types::{
-    BoundTableInfo, StorageResult, SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope,
-};
+use storage_types::{BoundTableInfo, StorageResult, SystemStreamCheckpoint};
 
 use super::GsiTransition;
 use crate::{CatalogAttempt, DescribeTimeToLiveAttempt, maintenance::MaintenancePort};
@@ -21,53 +18,31 @@ pub struct GsiScanSource<'a> {
     pub limit: GsiPageLimit,
 }
 
-pub struct GsiStreamSource<'a> {
-    pub table: &'a BoundTableInfo,
-    pub target: &'a GsiBuildTarget,
-    pub after: &'a SystemStreamCheckpoint,
-    pub through: &'a SystemStreamCheckpoint,
-    pub limit: GsiPageLimit,
-}
-
-pub struct GsiCandidateObservation {
-    pub build: Option<GsiBuild<Vec<u8>>>,
-    pub holds: Vec<(SystemStreamScope, SystemStreamPosition)>,
-}
-
 pub trait GsiPort:
     CatalogAttempt
+    + crate::TableUpdateTransaction
     + DescribeTimeToLiveAttempt
     + MaintenancePort
-    + infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+    + stream_provider::SystemHistoryReadAttempt
+    + stream_provider::ItemHistoryReadAttempt
 {
     fn scan_gsi_candidates(
         &mut self,
         after: Option<&GsiBuildTarget>,
     ) -> impl Future<Output = StorageResult<[Option<GsiBuild<Vec<u8>>>; 2]>> + Send;
-    fn load_gsi_candidate_holds(
+    fn load_gsi_candidate(
         &mut self,
         build: &GsiBuild<Vec<u8>>,
-    ) -> impl Future<Output = StorageResult<GsiCandidateObservation>> + Send;
+    ) -> impl Future<Output = StorageResult<Option<GsiBuild<Vec<u8>>>>> + Send;
     fn load_gsi_scan_source_page(
         &mut self,
         source: GsiScanSource<'_>,
     ) -> impl Future<Output = StorageResult<GsiScanSourcePage<Vec<u8>>>> + Send;
-    fn load_gsi_stream_source_page(
-        &mut self,
-        source: GsiStreamSource<'_>,
-    ) -> impl Future<Output = StorageResult<GsiStreamSourcePage>> + Send;
-    fn load_gsi_stream_tail(
-        &mut self,
-    ) -> impl Future<Output = StorageResult<SystemStreamCheckpoint>> + Send;
     fn load_gsi_projection_states(
         &mut self,
         table: &BoundTableInfo,
         batch: GsiProjectionStateReadBatch<'_>,
     ) -> impl Future<Output = StorageResult<Vec<Option<GsiProjection<GsiProjectionKey>>>>> + Send;
-    fn load_gsi_referenced_histories(
-        &mut self,
-        reads: &[GsiReferencedHistoryRead<'_>],
-    ) -> impl Future<Output = StorageResult<Vec<GsiReferencedHistoryItem>>> + Send;
     fn load_gsi_frontier(
         &mut self,
         current: &SystemStreamCheckpoint,

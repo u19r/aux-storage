@@ -4,8 +4,8 @@ use storage_backfill::GsiProjectionLifecycle;
 use storage_common::{TtlConfigRecord, TtlIndexWrite, TtlIndexWriteBatch};
 use storage_provider::{
     AcceptedUpsert, ItemPrimaryEffects, ItemWriteObservation, ItemWriteObservationAttempt,
-    ItemWriteObservationRead, StreamTrimScope, StreamTrimState, UpsertAttempt,
-    combine_write_observations, lifecycle_tables_for_writes,
+    ItemWriteObservationRead, UpsertAttempt, combine_write_observations,
+    lifecycle_tables_for_writes,
 };
 use storage_types::{BoundTableInfo, KeyAttributes, StorageError, StorageResult, storage_serde};
 
@@ -14,9 +14,9 @@ use crate::{
     catalog::{KvCatalogAttempt, KvTableIdentity},
     expiration::key_layout::encode_index_key,
     gsi::{decode_gsi_lifecycle, gsi_build_keys},
-    item_read::{HydratedPrimaryItem, hydrate_primary_items, primary_item_key},
+    item_read::{HydratedPrimaryItem, decode_primary_items, primary_item_key},
     item_tombstone::{decode::decode_deleted, primary_tombstone_key},
-    retention, stream_history, ttl_policy,
+    stream_history, ttl_policy,
 };
 
 impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
@@ -27,24 +27,24 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
     async fn read_item_write_prerequisites(
         &mut self,
         table: &BoundTableInfo,
-        retention_scope: Option<&StreamTrimScope>,
-        needs_ttl: bool,
-    ) -> StorageResult<(Option<TtlConfigRecord>, Option<StreamTrimState>)> {
+        prerequisites: storage_provider::ItemWritePrerequisites,
+    ) -> StorageResult<Option<TtlConfigRecord>> {
         let mut operation =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = operation.as_mut();
         let result = async {
+            let storage_provider::ItemWritePrerequisites {
+                needs_ttl,
+                needs_history,
+            } = prerequisites;
             let mut keys = Vec::new();
-            keys.try_reserve_exact(usize::from(needs_ttl) + usize::from(retention_scope.is_some()))
+            keys.try_reserve_exact(usize::from(needs_ttl))
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
             if needs_ttl {
                 let identity = catalog.identity_for(&table.info.table_name)?;
-                keys.push(ttl_policy::ttl_config_key(identity)?);
+                keys.push(ttl_policy::ttl_config_key(identity.table_id));
             }
-            if let Some(scope) = retention_scope {
-                keys.push(retention::state_key(scope));
-            }
-            let needs_history = catalog.dynamo_history.is_none();
+            let needs_history = needs_history && catalog.dynamo_history.is_none();
             let attempt = &*catalog.attempt;
             let protection = catalog.protection;
             let values = async {
@@ -65,7 +65,7 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
             if let Some(history) = history {
                 catalog.dynamo_history = Some(stream_history::KvSystemWriteState::new(history));
             }
-            if values.len() != usize::from(needs_ttl) + usize::from(retention_scope.is_some()) {
+            if values.len() != usize::from(needs_ttl) {
                 return Err(StorageError::internal(
                     "KV item write prerequisite count differs",
                 ));
@@ -80,16 +80,7 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
             } else {
                 None
             };
-            let retention = retention_scope
-                .zip(values.next())
-                .map(|(scope, value)| {
-                    value
-                        .map(|bytes| retention::decode_trim_state(&bytes, scope))
-                        .transpose()
-                })
-                .transpose()?
-                .flatten();
-            Ok((ttl, retention))
+            Ok(ttl)
         }
         .await;
         operation.complete(result)
@@ -161,15 +152,13 @@ impl<A: KvAttempt> ItemWriteObservationAttempt for KvCatalogAttempt<'_, A> {
                     .enumerate()
                     .map(|(index, read)| (read.target().0, values[index * 2].as_deref())),
             );
-            let hydrated = hydrate_primary_items(
-                catalog,
+            let hydrated = decode_primary_items(
                 requests,
                 reads
                     .len()
-                    .checked_mul(crate::constants::PAGE_READ_BYTES.get())
+                    .checked_mul(storage_types::MaterializedItemRecord::encoded_length_bound())
                     .ok_or_else(|| StorageError::internal("Primary observation bound overflow"))?,
-            )
-            .await?;
+            )?;
             for (read, item) in reads.iter().zip(&hydrated) {
                 if let Some(item) = item
                     && !item.stored.item.has_verified_keys(read.target().1)?
@@ -248,9 +237,7 @@ impl<A: KvAttempt> UpsertAttempt for KvCatalogAttempt<'_, A> {
             };
             catalog.prepared_writes = Ok(prepared);
             let identity = catalog.identity_for(&item.table.info.table_name)?.clone();
-            let mut changes = image
-                .prepare(catalog, &identity, effects, item.old_item.as_ref())
-                .await?;
+            let mut changes = image.prepare(&identity, effects)?;
             let ttl = ttl_index_mutations(identity.table_id, writes)?;
             changes
                 .try_reserve(ttl.len())

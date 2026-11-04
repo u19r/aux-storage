@@ -12,11 +12,11 @@ use crate::{
 // this channel is its async bridge. FoundationDB owns an async transaction and
 // implements the same KvAttempt trait without a command channel.
 pub(super) enum Command {
-    HasKeyInRange {
+    FirstKeyInRange {
         begin: Vec<u8>,
         end: Vec<u8>,
         protection: ReadProtection,
-        answer: oneshot::Sender<StorageResult<bool>>,
+        answer: oneshot::Sender<StorageResult<Option<Vec<u8>>>>,
     },
     GetBatch {
         keys: Vec<Vec<u8>>,
@@ -45,7 +45,6 @@ pub(super) enum Command {
 /// Async handle to a native transaction held only by the blocking worker.
 pub struct RocksDbAttempt {
     settlement: Arc<storage_types::NativeAttemptSettlement>,
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
     sender: mpsc::UnboundedSender<Command>,
     mode: AttemptMode,
     // Reads flush this buffer first so they observe preceding writes.
@@ -62,7 +61,6 @@ impl RocksDbAttempt {
         #[cfg(feature = "fault-injection")] fault_probe: Option<Arc<dyn crate::KvFaultProbe>>,
     ) -> Self {
         Self {
-            ownership: Default::default(),
             settlement,
             sender,
             mode,
@@ -145,18 +143,12 @@ impl KvAttempt for RocksDbAttempt {
         &self.settlement
     }
 
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
-    }
-
-    async fn native_has_key_in_range(
+    async fn native_first_key_in_range(
         &self,
         begin: &[u8],
         end: &[u8],
         protection: ReadProtection,
-    ) -> StorageResult<bool> {
+    ) -> StorageResult<Option<Vec<u8>>> {
         let call = self.settlement.begin_call()?;
         let result = async {
             self.settlement.charge_data(
@@ -170,7 +162,7 @@ impl KvAttempt for RocksDbAttempt {
             self.flush_pending().await?;
             let (answer, reply) = oneshot::channel();
             self.sender
-                .send(Command::HasKeyInRange {
+                .send(Command::FirstKeyInRange {
                     begin,
                     end,
                     protection,

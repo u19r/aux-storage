@@ -21,19 +21,33 @@ pub fn archive_namespace(root: &Path) -> Result<PathBuf> {
 pub async fn await_archived_original(namespace: &Path, original: &[u8]) -> Result<PathBuf> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while tokio::time::Instant::now() < deadline {
-        for entry in std::fs::read_dir(namespace)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name.to_string_lossy().len() == 64
-                && entry.file_type()?.is_file()
-                && std::fs::read(entry.path())? == original
-            {
-                return Ok(entry.path());
-            }
+        if let Some(path) = find_archived_original(namespace, original)? {
+            return Ok(path);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("canonical original was not published to the configured archive")
+}
+
+fn find_archived_original(namespace: &Path, original: &[u8]) -> Result<Option<PathBuf>> {
+    for entry in std::fs::read_dir(namespace)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || !entry.file_name().to_string_lossy().starts_with("table-")
+        {
+            continue;
+        }
+        for object in std::fs::read_dir(entry.path())? {
+            let object = object?;
+            if object.file_name().to_string_lossy().len() == 64
+                && object.file_type()?.is_file()
+                && std::fs::read(object.path())? == original
+            {
+                return Ok(Some(object.path()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub async fn await_archive_handoff(

@@ -46,7 +46,6 @@ impl DatabaseManager {
             expression_attribute_values,
             return_values,
             return_old_on_condition_failure: false,
-            aux_item_stream_ttl_hours: None,
         })
         .await
     }
@@ -71,7 +70,6 @@ impl DatabaseManager {
             expression_attribute_values: input.expression_attribute_values,
             return_values: input.return_values,
             return_old_on_condition_failure: false,
-            aux_item_stream_ttl_hours: None,
         })
         .await
     }

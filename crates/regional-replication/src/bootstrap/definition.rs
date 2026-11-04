@@ -251,7 +251,6 @@ pub(crate) fn logical_table_content(table: &StoredTableInfo) -> StorageResult<Ca
         &table.global_secondary_indexes,
         &table.stream_specification,
         table.table_stream_duration,
-        table.default_item_stream_duration,
         table.deletion_protection_enabled,
     ))
     .map_err(|_| corrupt_record())?;

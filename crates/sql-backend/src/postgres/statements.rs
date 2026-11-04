@@ -86,7 +86,7 @@ impl<'native> NativeStatements<'native> {
         let params = bind_refs(&binds).inspect_err(|error| self.settlement.reject_error(error))?;
         let prepared = self
             .client
-            .prepare(sql.as_ref())
+            .prepare_cached(sql.as_ref())
             .await
             .map_err(PostgresCallError::from)
             .inspect_err(|error| error.reject_settlement(self.settlement))?;
@@ -109,7 +109,7 @@ impl<'native> NativeStatements<'native> {
             .inspect_err(|error| self.settlement.reject_error(error))?;
         let statement = self
             .client
-            .prepare(sql.as_ref())
+            .prepare_cached(sql.as_ref())
             .await
             .map_err(PostgresCallError::from)
             .inspect_err(|error| error.reject_settlement(self.settlement))?;

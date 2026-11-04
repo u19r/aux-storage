@@ -7,6 +7,7 @@ use crate::{SqlEngine, SqlQueryPage, SqlRow, SqlValue, test_support::table};
 
 fn row(table_name: &str, phase: &str) -> SqlRow {
     SqlRow::new(vec![
+        SqlValue::Blob(table().history_id.as_ref().to_vec()),
         SqlValue::Text(table_name.to_owned()),
         SqlValue::Text("by-status".to_owned()),
         SqlValue::Blob(vec![1]),
@@ -17,6 +18,7 @@ fn row(table_name: &str, phase: &str) -> SqlRow {
 fn indexed_table() -> storage_types::BoundTableInfo {
     let mut table = table();
     Arc::make_mut(&mut table.info).global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+        capture_for_build: false,
         index_name: IndexName::new("by-status"),
         key_schema: vec![],
         projection: Projection {
@@ -34,7 +36,9 @@ fn given_gsi_foreground_read_when_decoding_then_only_identity_and_phase_are_requ
         let (sql, _) = gsi_lifecycle_statement(engine, &table)
             .unwrap()
             .into_parts();
-        assert!(sql.starts_with("SELECT table_name, index_name, incarnation, phase FROM"));
+        assert!(
+            sql.starts_with("SELECT table_id, table_name, index_name, incarnation, phase FROM")
+        );
     }
     for phase in ["scanning", "catching-up", "active", "blocked"] {
         let mut page = SqlQueryPage::new();
@@ -57,6 +61,7 @@ fn given_invalid_gsi_status_rows_when_decoding_then_catalog_and_physical_invaria
         vec![row("table", "active"), row("table", "active")],
         vec![SqlRow::new(vec![])],
         vec![SqlRow::new(vec![
+            SqlValue::Null,
             SqlValue::Null,
             SqlValue::Null,
             SqlValue::Null,

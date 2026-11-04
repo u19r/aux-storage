@@ -15,7 +15,7 @@ impl JournalStore {
     pub(crate) async fn accept_pending_control<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

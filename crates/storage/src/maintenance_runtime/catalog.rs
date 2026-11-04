@@ -6,8 +6,8 @@ use std::{
 
 use queue_provider::QueueMessageCleanupHandler;
 use scheduled_bg_jobs::{
-    EffectMode, EnqueueOptions, FairnessClass, FairnessPolicy, JobCatalog, JobHandler, JobId,
-    JobSpec, RetryPreset, RetrySelection, Timestamp,
+    EffectMode, EnqueueOptions, FairnessClass, FairnessPolicy, JobCatalog, JobHandler, JobSpec,
+    RetryPreset, RetrySelection, Timestamp,
 };
 use storage_backfill::GsiPageLimit;
 use storage_common::{DatabaseJobIntervals, StorageJob};
@@ -47,7 +47,12 @@ impl MaintenanceJobCatalog {
         let page_limit = GsiPageLimit::try_from(256usize)
             .map_err(|_| StorageError::validation("invalid GSI maintenance page limit"))?;
         registration.register_job(&mut catalog, StorageJob::GsiBackfill, |interval| {
-            GsiBuildHandler::try_new(repositories.gsi_build_repository, interval, page_limit)
+            GsiBuildHandler::try_new(
+                repositories.gsi_build_repository,
+                repositories.stream_initialization_repository,
+                interval,
+                page_limit,
+            )
         })?;
         if let Some(repository) = repositories.partition_reconciliation_repository {
             registration.register_job(
@@ -77,7 +82,26 @@ impl MaintenanceJobCatalog {
                 TableReclaimHandler::try_new(repository, interval)
             })?;
         }
-        Ok(catalog)
+        let mut seed_ids = StorageJob::ALL
+            .into_iter()
+            .map(StorageJob::job_id)
+            .collect::<Vec<_>>();
+        let (revision, schedules) = if let Some(contribution) = catalog.manifest() {
+            seed_ids.extend_from_slice(contribution.seed_ids());
+            (
+                contribution.revision(),
+                contribution.schedule_ids().to_vec(),
+            )
+        } else {
+            (
+                scheduled_bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+                Vec::new(),
+            )
+        };
+        let manifest =
+            scheduled_bg_jobs::CatalogManifest::try_new(revision, seed_ids, schedules)
+                .map_err(|_| StorageError::validation("invalid maintenance namespace manifest"))?;
+        Ok(catalog.with_manifest(manifest))
     }
 }
 
@@ -99,7 +123,7 @@ impl MaintenanceJobRegistration {
         F: FnOnce(Duration) -> StorageResult<H>,
     {
         let interval = job.interval(self.intervals);
-        let job_id = JobId::from(md5::compute(job.as_str().as_bytes()).0);
+        let job_id = job.job_id();
         let handler = build(interval)?;
         catalog
             .register_seeded(

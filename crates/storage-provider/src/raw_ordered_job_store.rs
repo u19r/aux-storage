@@ -17,8 +17,6 @@ pub enum RawOrderedJobStoreError {
     Backend(StorageError),
     /// Persisted bytes violated the provider's advertised key/value shape.
     Corrupt(&'static str),
-    /// A commit identity was reused for different checks or mutations.
-    OperationReuseMismatch,
     Timeout,
 }
 
@@ -27,7 +25,6 @@ impl fmt::Debug for RawOrderedJobStoreError {
         match self {
             Self::Backend(_) => formatter.write_str("Backend(<redacted>)"),
             Self::Corrupt(_) => formatter.write_str("Corrupt(<redacted>)"),
-            Self::OperationReuseMismatch => formatter.write_str("OperationReuseMismatch"),
             Self::Timeout => formatter.write_str("Timeout"),
         }
     }
@@ -38,9 +35,6 @@ impl fmt::Display for RawOrderedJobStoreError {
         match self {
             Self::Backend(_) => formatter.write_str("ordered store backend failure"),
             Self::Corrupt(_) => formatter.write_str("ordered store corrupt data"),
-            Self::OperationReuseMismatch => {
-                formatter.write_str("commit operation ID was reused with different content")
-            }
             Self::Timeout => formatter.write_str("ordered store operation timed out"),
         }
     }
@@ -84,7 +78,7 @@ pub trait RawOrderedJobStore: Send + Sync {
         request: &RangeRequest,
     ) -> Result<RangePage, RawOrderedJobStoreError>;
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError>;

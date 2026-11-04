@@ -8,7 +8,7 @@ module gsi_backfill_catchup {
   type Effect = { entity: int, before: int, after: int, version: int }
   type Observation = { key: int, version: int, live: bool }
   type Build = {
-    phase: str, cursor: int, high: int, pending: bool, scan: int, hold: int,
+    phase: str, cursor: int, high: int, scan: int, hold: int,
     rows: int -> Row, sources: int -> Source, history: List[Effect],
     historyAvailable: bool, currentTarget: bool,
     beforeRows: int -> Row, observations: List[Observation], beforeCursor: int,
@@ -18,7 +18,7 @@ module gsi_backfill_catchup {
   pure val KEYS = Set(0, 1, 2, 3)
   pure val emptyRows = KEYS.mapBy(_ => { version: 0, live: false })
   pure val initial: Build = {
-    phase: "absent", cursor: 0, high: 0, pending: false, scan: 0, hold: -1,
+    phase: "absent", cursor: 0, high: 0, scan: 0, hold: -1,
     rows: emptyRows, sources: ITEMS.mapBy(_ => { version: 0, index: -1 }), history: List(),
     historyAvailable: true, currentTarget: true,
     beforeRows: emptyRows, observations: List(), beforeCursor: 0,
@@ -73,9 +73,9 @@ module gsi_backfill_catchup {
   pure def observe(s: Build, observations: List[Observation]): Build = {
     val read = s.with("observations", observations)
     if (not(s.historyAvailable)) read.with("phase", "blocked").with("high", 0)
-      .with("pending", false).with("scan", 0).with("outcome", "history_blocked")
+      .with("scan", 0).with("outcome", "history_blocked")
     else if (conflict(s.rows, observations)) read.with("phase", "blocked").with("high", 0)
-      .with("pending", false).with("scan", 0).with("outcome", "projection_blocked")
+      .with("scan", 0).with("outcome", "projection_blocked")
     else {
       val writes = requiredWrites(s.rows, observations)
       read.with("writes", writes).with("rows", apply(s.rows, writes)).with("outcome", "persist")
@@ -92,7 +92,7 @@ module gsi_backfill_catchup {
 
   pure def capture(s: Build): Build = begin(s, "capture")
     .with("phase", "scanning").with("cursor", s.history.length()).with("hold", s.history.length())
-    .with("high", 0).with("scan", 0).with("pending", false)
+    .with("high", 0).with("scan", 0)
     .with("rows", emptyRows).with("currentTarget", true).with("historyAvailable", true)
     .with("outcome", "persist")
 
@@ -111,14 +111,12 @@ module gsi_backfill_catchup {
   }
 
   pure def readStream(s: Build, limit: int): Build = {
-    val high = if (s.phase == "catching_up" or s.pending) s.high else s.history.length()
+    val high = s.high
     val through = if (s.cursor + limit < high) s.cursor + limit else high
     val evaluated = observe(begin(s, "stream"), page(s, through))
     if (evaluated.phase == "blocked") evaluated else {
-      val active = s.phase == "active"
       evaluated.with("cursor", through).with("hold", through).with("high", high)
-        .with("pending", active and through < high)
-        .with("outcome", if (active and through == s.cursor and not(s.pending)) "idle" else "persist")
+        .with("outcome", "persist")
     }
   }
 
@@ -151,11 +149,11 @@ module gsi_backfill_catchup {
   action ScanObservation = all { state.phase == "scanning", state.scan < 2, state' = scan(state) }
   action MarkScanComplete = all { state.phase == "scanning", state.scan == 2, state' = finishScan(state) }
   action StreamObservation = all {
-    state.phase == "active" or (state.phase == "catching_up" and state.cursor < state.high),
+    (state.phase == "catching_up" and state.cursor < state.high),
     state' = readStream(state, 1),
   }
   action FinalDrain = all {
-    state.phase == "active" or (state.phase == "catching_up" and state.cursor < state.high),
+    (state.phase == "catching_up" and state.cursor < state.high),
     state' = readStream(state, 2),
   }
   action Activate = all { state.phase == "catching_up", state.cursor == state.high, state' = activate(state) }
@@ -175,7 +173,7 @@ module gsi_backfill_catchup {
   action ReleaseBoundary = all {
     state.phase == "active",
     state' = begin(state, "delete_build").with("phase", "absent").with("cursor", 0)
-      .with("high", 0).with("pending", false).with("scan", 0).with("hold", -1).with("rows", emptyRows),
+      .with("high", 0).with("scan", 0).with("hold", -1).with("rows", emptyRows),
   }
   action Restart = state' = begin(state, "restart")
 
@@ -209,7 +207,6 @@ module gsi_backfill_catchup {
   val workerCursorRespectsOrderedEffects = all {
     state.cursor <= state.history.length(),
     state.phase != "catching_up" or state.cursor <= state.high,
-    state.phase != "active" or not(state.pending) or state.cursor < state.high,
     state.phase == "absent" or state.hold == state.cursor,
   }
   val projectedRowsMatchLatestAppliedVersion = all {
@@ -288,11 +285,10 @@ module gsi_backfill_catchup {
     all { assert(result.phase == "active"), assert(result.hold == 2) }
   }
   run capturedHighDoesNotChaseLaterWritesTest = {
-    val active = activate(readStream(prepared, 2))
-    val published = mutate(mutate(active, 1, 0), 1, 1)
+    val published = mutate(mutate(prepared, 1, 0), 1, 1)
     val partial = readStream(published, 1)
     val later = mutate(partial, 0, 0)
     val drained = readStream(later, 2)
-    all { assert(partial.pending), assert(drained.cursor == 4), assert(drained.history.length() == 5) }
+    all { assert(partial.cursor == 1), assert(drained.cursor == prepared.high), assert(drained.history.length() == 5) }
   }
 }

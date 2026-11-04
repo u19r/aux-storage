@@ -25,7 +25,7 @@ use crate::HarnessResult;
 
 #[cfg(feature = "native-sqlite")]
 #[tokio::test]
-async fn given_ordinary_file_sqlite_when_initialized_then_retained_image_infrastructure_layout_is_present()
+async fn given_ordinary_file_sqlite_when_initialized_then_protected_record_infrastructure_layout_is_present()
 -> HarnessResult<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("ordinary.sqlite");
@@ -722,6 +722,42 @@ where
     let generations = [0, 1, i64::MAX as u64, 1_u64 << 63, u64::MAX];
     let result = fixture::with_records(port, AttemptMode::ReadOnly, move |attempt| {
         Box::pin(async move {
+            let resource = key(u64::MAX)?;
+            for (minimum, expected) in [
+                (0, 0),
+                (1, 1),
+                (2, i64::MAX as u64),
+                (1_u64 << 63, 1_u64 << 63),
+                (u64::MAX, u64::MAX),
+            ] {
+                assert_eq!(
+                    attempt
+                        .find_record_generation(
+                            &resource,
+                            minimum,
+                            storage_types::ReadProtection::Snapshot
+                        )
+                        .await?,
+                    Some(expected),
+                    "generation discovery must seek unsigned metadata within one resource",
+                );
+            }
+            let mut other_namespace = resource.as_ref().clone();
+            other_namespace.namespace.push_str("-empty");
+            let mut other_resource = resource.as_ref().clone();
+            other_resource.resource.push(0);
+            for absent in [other_namespace, other_resource] {
+                assert_eq!(
+                    attempt
+                        .find_record_generation(
+                            &absent.try_into()?,
+                            0,
+                            storage_types::ReadProtection::Snapshot
+                        )
+                        .await?,
+                    None
+                );
+            }
             let keys = generations
                 .into_iter()
                 .map(key)

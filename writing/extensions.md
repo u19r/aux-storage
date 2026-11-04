@@ -910,14 +910,14 @@ key count.
 
 `ReadSequence` is capability-gated by backend configuration:
 
-| Backend      | Eventual and strong base-table reads | Transactional snapshots | Transactional GSI reads |
-| ------------ | ------------------------------------ | ----------------------- | ----------------------- |
-| SQLite       | Supported.                           | Supported for file-backed SQLite. | Supported only with immediate GSI consistency. |
-| Postgres     | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
-| Turso        | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
-| RocksDB / KV | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
-| FoundationDB | Supported.                           | Supported.              | Supported only with immediate GSI consistency. |
-| Remote       | Supported through standard DynamoDB calls; the custom target is not forwarded. | Rejected.               | Rejected.               |
+| Backend      | Eventual and strong base-table reads                                           | Transactional snapshots           | Transactional GSI reads                        |
+| ------------ | ------------------------------------------------------------------------------ | --------------------------------- | ---------------------------------------------- |
+| SQLite       | Supported.                                                                     | Supported for file-backed SQLite. | Supported only with immediate GSI consistency. |
+| Postgres     | Supported.                                                                     | Supported.                        | Supported only with immediate GSI consistency. |
+| Turso        | Supported.                                                                     | Supported.                        | Supported only with immediate GSI consistency. |
+| RocksDB / KV | Supported.                                                                     | Supported.                        | Supported only with immediate GSI consistency. |
+| FoundationDB | Supported.                                                                     | Supported.                        | Supported only with immediate GSI consistency. |
+| Remote       | Supported through standard DynamoDB calls; the custom target is not forwarded. | Rejected.                         | Rejected.                                      |
 
 For production environments, verify the exact backend, service version, and GSI
 consistency setting before accepting `ReadSequence` traffic from application
@@ -937,58 +937,23 @@ dependent graph. It is a poor fit for broad analytics, arbitrary graph traversal
 unbounded relationship expansion, or access patterns that should be represented
 as a purpose-built GSI.
 
-## Custom Stream Horizon and Item Duration
+## Custom Table Stream Horizon
 
-DynamoDB Streams expose recent item changes for consumers such as replication,
-event processing, cache invalidation, and audit workflows. Standard DynamoDB
-retention is fixed. aux-storage adds explicit retention controls so a table can
-keep stream history for a shorter operational window, a longer window, or a
-per-item duration.
+aux-storage tables retain stream history for 72 hours by default. Set
+`AuxStreamDurationHours` on `CreateTable` or `UpdateTable` to use a finite window
+from 24 through 61320 hours, or `-1` to retain history indefinitely. The maximum
+finite duration is seven years: `24 * 365 * 7`.
 
-The extension has two levels:
+The table duration also governs item stream history. Items have no independent
+history duration or override. DynamoDB item TTL controls when a live item is
+deleted; its historical snapshots and delete marker remain readable within the
+table's history window.
 
-- A table stream horizon controls how long table-level stream records remain
-  readable.
-- An item stream duration controls how long the item history behind those stream
-  records is physically retained.
-
-When both table and item durations apply, aux-storage keeps the physical item
-stream history for the longer of the two durations. This protects stream records
-from pointing at item history that has already been trimmed.
-
-### Duration Values
-
-Duration values are expressed in hours:
-
-- Omit the extension fields to use aux-storage's default 72-hour retention.
-- Use a finite value from `1` through `61320` hours.
-- `61320` hours is seven years: `24 * 365 * 7`.
-- Use `-1` to retain the covered stream data indefinitely.
-
-Retention cleanup is cooperative background work. It is allowed to lag when the
-system is under load. Operators should treat retention values as minimum
-availability windows, not as exact deletion deadlines.
-
-### Table-Level API Fields
-
-`CreateTable` and `UpdateTable` accept these aux-storage fields:
-
-- `AuxStreamDurationHours`: table stream horizon.
-- `AuxDefaultItemStreamDurationHours`: default item stream duration for writes
-  that do not set a per-item duration.
-
-### Item-Level API Field
-
-`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem` put/delete requests,
-and `TransactWriteItems` put/update/delete requests accept:
-
-- `AuxItemStreamTtlHours`: item-specific stream duration for that write.
-
-The value is scoped to the item stream, not only to the individual version being
-written. A later put, update, or delete with `AuxItemStreamTtlHours` changes the
-retention policy for that item stream and can shorten or lengthen the horizon for
-previous retained versions of that item. Transaction condition checks do not
-accept an item stream duration because they do not write an item version.
+The system stream has a fixed 24-hour window. Table and item streams follow the
+table's configured window. Consumer checkpoints do not extend these windows.
+Increasing a table duration does not restore history that has already been
+retired. Cleanup can lag under load, and retired records can remain physically
+stored until a bounded background pass removes them.
 
 ### Example: Create a Table with Seven-Day Stream History
 
@@ -1008,248 +973,49 @@ accept an item stream duration because they do not write an item version.
     "StreamEnabled": true,
     "StreamViewType": "NEW_AND_OLD_IMAGES"
   },
-  "AuxStreamDurationHours": 168,
-  "AuxDefaultItemStreamDurationHours": 168
+  "AuxStreamDurationHours": 168
 }
 ```
 
-This keeps the table stream horizon and default item stream history for seven
-days.
+This keeps table and item stream history for seven days.
 
 ### Example: Update a Table to Keep Stream Records for 30 Days
 
 ```json
 {
   "TableName": "LedgerEntries",
-  "AuxStreamDurationHours": 720,
-  "AuxDefaultItemStreamDurationHours": 720
+  "AuxStreamDurationHours": 720
 }
 ```
 
-### Example: Keep One Item History for Seven Years
+### Storage Implications
 
-```json
-{
-  "TableName": "LedgerEntries",
-  "Item": {
-    "account_id": { "S": "ACCOUNT#acme" },
-    "entry_id": { "S": "ENTRY#2026-06-09#0001" },
-    "amount_cents": { "N": "12900" },
-    "currency": { "S": "USD" }
-  },
-  "AuxItemStreamTtlHours": 61320
-}
-```
+Longer windows retain more history and increase storage and replay work.
+Cleanup preserves the exact predecessor required by a retained DynamoDB stream
+record and the current live snapshot. Once a deleted item's history has expired,
+cleanup can remove its final delete marker and leave an empty item stream.
 
-This write keeps the item stream history for seven years, even if the table
-default is shorter.
-
-### Example: Retain a Critical Item Indefinitely
-
-```json
-{
-  "TableName": "LedgerEntries",
-  "Key": {
-    "account_id": { "S": "ACCOUNT#acme" },
-    "entry_id": { "S": "ENTRY#2026-06-09#0001" }
-  },
-  "UpdateExpression": "SET audit_status = :status",
-  "ExpressionAttributeValues": {
-    ":status": { "S": "locked" }
-  },
-  "AuxItemStreamTtlHours": -1
-}
-```
-
-### Example: Delete an Item and Shorten Its Audit Horizon
-
-```json
-{
-  "TableName": "LedgerEntries",
-  "Key": {
-    "account_id": { "S": "ACCOUNT#acme" },
-    "entry_id": { "S": "ENTRY#2026-06-09#0001" }
-  },
-  "AuxItemStreamTtlHours": 24
-}
-```
-
-This writes the delete marker and changes the item stream duration to 24 hours.
-Previous retained versions for that item can be trimmed after the effective
-retention window has passed. The table stream horizon still protects table-level
-stream records, so the physical item history is retained for the longer of the
-table horizon and the item-specific duration.
-
-### Example: Batch Write with Item Durations
-
-```json
-{
-  "RequestItems": {
-    "LedgerEntries": [
-      {
-        "PutRequest": {
-          "Item": {
-            "account_id": { "S": "ACCOUNT#acme" },
-            "entry_id": { "S": "ENTRY#2026-06-09#0002" },
-            "amount_cents": { "N": "4500" }
-          },
-          "AuxItemStreamTtlHours": 24
-        }
-      },
-      {
-        "DeleteRequest": {
-          "Key": {
-            "account_id": { "S": "ACCOUNT#acme" },
-            "entry_id": { "S": "ENTRY#2026-06-09#expired" }
-          },
-          "AuxItemStreamTtlHours": 24
-        }
-      }
-    ]
-  }
-}
-```
-
-### Example: Transactional Write with Item Durations
-
-```json
-{
-  "TransactItems": [
-    {
-      "Put": {
-        "TableName": "LedgerEntries",
-        "Item": {
-          "account_id": { "S": "ACCOUNT#acme" },
-          "entry_id": { "S": "ENTRY#2026-06-09#0003" },
-          "amount_cents": { "N": "9800" }
-        },
-        "AuxItemStreamTtlHours": 168
-      }
-    },
-    {
-      "Delete": {
-        "TableName": "LedgerEntries",
-        "Key": {
-          "account_id": { "S": "ACCOUNT#acme" },
-          "entry_id": { "S": "ENTRY#2026-06-09#old" }
-        },
-        "AuxItemStreamTtlHours": 24
-      }
-    },
-    {
-      "Update": {
-        "TableName": "LedgerEntries",
-        "Key": {
-          "account_id": { "S": "ACCOUNT#acme" },
-          "entry_id": { "S": "ENTRY#2026-06-09#0001" }
-        },
-        "UpdateExpression": "SET reviewed = :reviewed",
-        "ExpressionAttributeValues": {
-          ":reviewed": { "BOOL": true }
-        },
-        "AuxItemStreamTtlHours": 61320
-      }
-    }
-  ]
-}
-```
-
-### Backend Availability
-
-The extension is designed to be explicit about backend support:
-
-| Backend          | Custom stream duration status                                                                         |
-| ---------------- | ----------------------------------------------------------------------------------------------------- |
-| SQLite           | Supported.                                                                                            |
-| Postgres / Turso | Supported for SQL deployments; validate trim-job scheduling and backlog monitoring in your runtime.   |
-| RocksDB / KV     | Supported.                                                                                            |
-| FoundationDB     | Intended production target; validate against your live FoundationDB environment before broad rollout. |
-| Remote           | Mirrors the configured aux-storage service.                                                           |
-
-For production environments, operators should verify the exact backend and
-service version before accepting aux-storage extension fields from application
-clients.
-
-### Performance and Storage Implications
-
-Custom stream duration gives teams more control over retention, but longer
-history is still durable data that must be written, indexed, scanned, and
-eventually trimmed.
-
-Important implications:
-
-- Standard DynamoDB-compatible clients remain unchanged when aux-storage fields are omitted.
-- Longer table horizons increase stream storage and the amount of history stream consumers can replay.
-- Per-item durations add durable retention metadata so trim work can find the correct item history later. This creates additional small metadata writes for items that set an override.
-- Reusing the same item duration for most writes is cheaper operationally than assigning highly varied durations to every item.
-- `-1` should be reserved for records that genuinely need indefinite history, such as audit anchors, legal holds, or high-value reconciliation data.
-- Cleanup is intentionally cooperative. During bursts, TTL cleanup and stream trimming may run late so foreground traffic and cluster health remain the priority.
-- Capacity planning should include retained stream bytes, trim backlog, backend range-clear or delete throughput, and consumer replay windows.
-- Deleting an item does not immediately delete the stream records. A delete with `AuxItemStreamTtlHours` changes the item stream policy, and cleanup removes old stream data later when the effective horizon allows it.
-
-Finite item durations add a small amount of durable bookkeeping to each write. That is expected: the service is recording retention policy state in addition to the item write. The operational goal is to keep that extra work constant and bounded so large bursts do not create unbounded memory or CPU pressure.
-
-### Choosing Values
-
-Use the shortest duration that satisfies the workflow:
-
-- Use the default horizon for ordinary event consumers.
-- Use DynamoDB item TTL values to delete items themselves on a schedule; use `AuxItemStreamTtlHours` to control how long the stream history remains.
-- Use weeks or months for operational audit and customer support workflows.
-- Use seven years only when the data class needs that retention window.
-- Use indefinite retention only for explicit legal, audit, or reconciliation
-  requirements.
-
-For most tables, set a table default that matches the common case and override
-only the exceptional items. That keeps request payloads simpler and makes storage
-growth easier to forecast.
+Use the shortest table window that meets the application requirement. Keep
+indefinite history only where the application needs it. Changing a table to
+indefinite retention preserves future history while cleanup finishes any work
+that was already retired under the earlier policy.
 
 ## Audit Stream Reads
 
-Custom stream retention is most useful when applications can read retained
-history directly. aux-storage keeps two related streams for DynamoDB table
-writes:
+The table stream returns the ordered changes for a table. The item stream
+returns retained versions of one item, including versions written before the
+item was deleted. Both follow the table's retention policy. The system stream
+returns changes across its qualified source and has a fixed 24-hour window.
 
-- The table stream records the ordered sequence of writes for the table.
-- The table item stream records the ordered history for one item key.
+Table names are catalog labels. History belongs to an immutable table ID.
+Deleting a table immediately detaches its name; a new table with that name gets
+a fresh ID while old-ID cleanup continues. Old cursors, stream ARNs and physical
+item addresses cannot read the replacement table.
 
-The table stream is the right source for replication, event processing, and
-"show me what changed in this table" workflows. The item stream is the right
-source for an audit timeline for one record, including a record that has already
-been deleted from the base table.
+### Read a Table Stream
 
-### Stream Names
-
-For table `LedgerEntries`, the table stream name is:
-
-```text
-LedgerEntries/stream-table
-```
-
-For the item with key:
-
-```json
-{
-  "account_id": { "S": "ACCOUNT#acme" },
-  "entry_id": { "S": "ENTRY#2026-06-09#0001" }
-}
-```
-
-the table item stream name is built from the table name and the DynamoDB key
-attributes:
-
-```text
-LedgerEntries/stream-item/account_id=S:ACCOUNT#acme/entry_id=S:ENTRY#2026-06-09#0001
-```
-
-Very large keys may be represented by a stable hash suffix instead of the full
-key payload. Client libraries should use aux-storage's item-stream-name helper
-when available rather than reconstructing this string by hand.
-
-### Read a Table Stream from the Beginning
-
-Use `GetStreamRecords` to read a table stream in chronological order. Omit
-`LastEvaluatedKey` to start at the oldest retained table stream record.
+Use `GetStreamRecords` to read resolved table snapshots in forward order. Omit
+`LastEvaluatedKey` to start at the oldest visible retained record:
 
 ```http
 POST /storage
@@ -1264,194 +1030,8 @@ content-type: application/x-amz-json-1.0
 }
 ```
 
-Example response:
-
-```json
-{
-  "TableName": "LedgerEntries",
-  "Records": [
-    {
-      "Keys": {
-        "account_id": { "S": "ACCOUNT#acme" },
-        "entry_id": { "S": "ENTRY#2026-06-09#0001" }
-      },
-      "SequenceNumber": "0197657f8f0772c1917be0db",
-      "NewImage": {
-        "account_id": { "S": "ACCOUNT#acme" },
-        "entry_id": { "S": "ENTRY#2026-06-09#0001" },
-        "amount_cents": { "N": "12900" },
-        "status": { "S": "posted" }
-      }
-    }
-  ],
-  "LastEvaluatedKey": "0197657f8f0772c1917be0db"
-}
-```
-
-Pass `LastEvaluatedKey` from the previous response to continue the scan:
-
-```json
-{
-  "TableName": "LedgerEntries",
-  "LastEvaluatedKey": "0197657f8f0772c1917be0db",
-  "Limit": 100
-}
-```
-
-`GetStreamRecords` returns DynamoDB-style stream records. `NewImage` and
-`OldImage` are controlled by the table's `StreamSpecification.StreamViewType`.
-
-### Read a Table Stream with DynamoDB Streams Iterators
-
-Applications that already use DynamoDB Streams can also use
-`GetShardIterator` and `GetRecords`.
-
-To replay from the oldest retained record:
-
-```json
-{
-  "StreamArn": "arn:aws:dynamodb:local:000000000000:table/LedgerEntries/stream/aux",
-  "ShardId": "shardId-000000000000",
-  "ShardIteratorType": "TRIM_HORIZON"
-}
-```
-
-To start at the current end of the table stream for tailing new changes:
-
-```json
-{
-  "StreamArn": "arn:aws:dynamodb:local:000000000000:table/LedgerEntries/stream/aux",
-  "ShardId": "shardId-000000000000",
-  "ShardIteratorType": "LATEST"
-}
-```
-
-Use the returned `ShardIterator` with `DynamoDBStreams_20120810.GetRecords`.
-This path follows DynamoDB Streams semantics: it is for forward consumption from
-the chosen position. Use the aux-storage stream read extension when a UI or
-audit tool needs to page backward from the newest retained change.
-
-### Read Backward from the Most Recent Change
-
-Aux-storage stream clients can read table and item streams directly with an
-explicit direction. Use `Direction: "backward"` and omit `PageToken` to start at
-the newest retained record.
-
-```json
-{
-  "StreamName": "LedgerEntries/stream-table",
-  "Direction": "backward",
-  "Limit": 50
-}
-```
-
-Example response:
-
-```json
-{
-  "Items": [
-    {
-      "ItemId": "0197658b4f587e4bbbcf3221",
-      "Timestamp": "2026-06-09T10:31:12.408Z",
-      "DataType": "stream_pointer",
-      "Data": {
-        "table_name": "LedgerEntries",
-        "item_stream_name": "LedgerEntries/stream-item/account_id=S:ACCOUNT#acme/entry_id=S:ENTRY#2026-06-09#0001",
-        "item_stream_version": 4
-      }
-    }
-  ],
-  "NextToken": "0197658b4f587e4bbbcf3221",
-  "HasMore": true
-}
-```
-
-Use `NextToken` as the next `PageToken` to continue moving backward:
-
-```json
-{
-  "StreamName": "LedgerEntries/stream-table",
-  "Direction": "backward",
-  "PageToken": "0197658b4f587e4bbbcf3221",
-  "Limit": 50
-}
-```
-
-This pattern is useful for operator consoles and support tools that show the
-most recent changes first.
-
-### Read an Item Audit History
-
-To show the full history for a single item, read its table item stream. Omit
-`PageToken` and use `Direction: "forward"` to start at the oldest retained
-version:
-
-```json
-{
-  "StreamName": "LedgerEntries/stream-item/account_id=S:ACCOUNT#acme/entry_id=S:ENTRY#2026-06-09#0001",
-  "Direction": "forward",
-  "Limit": 100
-}
-```
-
-Use `Direction: "backward"` to show the newest version first:
-
-```json
-{
-  "StreamName": "LedgerEntries/stream-item/account_id=S:ACCOUNT#acme/entry_id=S:ENTRY#2026-06-09#0001",
-  "Direction": "backward",
-  "Limit": 25
-}
-```
-
-Example response:
-
-```json
-{
-  "Items": [
-    {
-      "ItemId": "000000000000000000000004",
-      "Timestamp": "2026-06-09T10:31:12.408Z",
-      "DataType": "dynamodb_json",
-      "Data": {
-        "account_id": { "S": "ACCOUNT#acme" },
-        "entry_id": { "S": "ENTRY#2026-06-09#0001" },
-        "amount_cents": { "N": "12900" },
-        "status": { "S": "reviewed" }
-      }
-    },
-    {
-      "ItemId": "000000000000000000000003",
-      "Timestamp": "2026-06-09T10:20:44.020Z",
-      "DataType": "dynamodb_json",
-      "Data": {
-        "account_id": { "S": "ACCOUNT#acme" },
-        "entry_id": { "S": "ENTRY#2026-06-09#0001" },
-        "amount_cents": { "N": "12900" },
-        "status": { "S": "posted" }
-      }
-    }
-  ],
-  "NextToken": "000000000000000000000003",
-  "HasMore": true
-}
-```
-
-Each item stream entry is one retained version of the item. For a human-facing
-audit view, sort or page by the stream order and compare adjacent versions to
-show field-level changes over time.
-
-### Deleted Items
-
-An item stream can still be read after the base item has been deleted, as long
-as the stream history is still within the effective retention window. This is
-the main difference between an item stream and `GetItem`: `GetItem` reads only
-the current base-table image, while the item stream reads retained historical
-versions.
-
-A delete writes a delete marker into the item stream. In a table stream response
-using `NEW_AND_OLD_IMAGES`, the delete appears with `OldImage` and no
-`NewImage`:
+Each record contains `Keys`, `SequenceNumber` and `Item`. `Item` is the complete
+snapshot after the change, or explicit `null` for a delete marker. For example:
 
 ```json
 {
@@ -1459,40 +1039,86 @@ using `NEW_AND_OLD_IMAGES`, the delete appears with `OldImage` and no
     "account_id": { "S": "ACCOUNT#acme" },
     "entry_id": { "S": "ENTRY#2026-06-09#0001" }
   },
-  "SequenceNumber": "019765912a4e712fb2f04a99",
-  "OldImage": {
+  "SequenceNumber": "0000000000000000000000000000000000000004",
+  "Item": {
     "account_id": { "S": "ACCOUNT#acme" },
     "entry_id": { "S": "ENTRY#2026-06-09#0001" },
     "amount_cents": { "N": "12900" },
-    "status": { "S": "reviewed" }
+    "status": { "S": "posted" }
   }
 }
 ```
 
-In a direct item stream read, the delete appears as a typed delete marker:
+The response includes `TableFrontier`, which identifies the table history,
+source scope and each shard/lineage's physical bounds. These bounds describe
+physical storage; retention can make an older physical record invisible.
 
-```json
-{
-  "ItemId": "000000000000000000000005",
-  "Timestamp": "2026-06-09T10:40:02.100Z",
-  "DataType": "delete_marker",
-  "Data": null
-}
-```
+Pass the returned `LastEvaluatedKey` unchanged on the next request. It is an
+opaque continuation containing the immutable table identity, qualified lane
+positions and the scan's initial visibility cutoff. A record's `SequenceNumber`
+is not a continuation token. Sequence numbers order records within their lane;
+independent lanes do not share a scalar global order.
 
-Audit tools should treat this as the point where the item stopped existing in
-the base table. Older retained versions can still be displayed before that
-marker.
+An empty page can still carry a qualified tail checkpoint. Stop a finite replay
+when the page is empty; keep that checkpoint to poll for future changes. Token
+presence alone does not mean that more records are currently available.
 
-### Performance and Storage Implications
+`Limit` accepts 1–1,000 records. A page also has a 4 MiB response budget. Cleanup
+can invalidate history needed by an old continuation; handle the resulting
+history-gap error instead of restarting silently and skipping changes.
 
-Audit stream reads are ordinary paged reads over retained stream data:
+### Use DynamoDB Streams Iterators
 
-- Reading from the table stream is best for broad event timelines.
-- Reading from an item stream is best for focused audit history for one key.
-- Backward reads are useful for UI timelines because they avoid scanning from
-  the beginning only to display the latest changes.
-- Long retention windows increase the amount of history available to these
-  reads and should be included in storage and replay planning.
-- A deleted item's history remains available only until stream trimming removes
-  it under the effective table and item retention policy.
+The standard `GetShardIterator` and `GetRecords` operations preserve DynamoDB's
+four stream views: `KEYS_ONLY`, `NEW_IMAGE`, `OLD_IMAGE` and `NEW_AND_OLD_IMAGES`.
+Cleanup keeps the exact predecessor needed for each retained old-image record.
+The custom snapshot API and system stream do not return old/new image pairs.
+
+Obtain the current stream ARN from `DescribeTable` or `ListStreams`, then get
+the actual shard IDs and parent relationships from `DescribeStream`. Pass that
+ARN and a returned shard ID to `GetShardIterator`. Use `TRIM_HORIZON` for the
+oldest retained record or `LATEST` to tail new changes. Pass the returned
+`ShardIterator` to `DynamoDBStreams_20120810.GetRecords`, then continue with
+`NextShardIterator`. Standard `GetRecords` pages have a 1 MiB budget.
+
+Do not construct an ARN from a table name or assume one fixed shard ID. The ARN
+binds the immutable table ID, and the provider can expose multiple lineages.
+Deleting and recreating the name does not make an earlier iterator valid again.
+
+### Read Item History Through the Rust Stream Interface
+
+Item-history reads use `StreamOperations::read_forward` or `read_backward` with
+`StreamRowKind::Item`. Construct the physical address with
+`ItemHistoryAddress { history_id, stream_name }.physical_stream_name()`.
+Capture `history_id` from the authoritative table binding; build the logical
+item `stream_name` with the item's typed key helper. A logical name such as
+`LedgerEntries/stream-item/...` alone is not a physical history address.
+
+Pass `None` as the exclusive start to read the oldest retained version forward
+or the newest version backward. Continue with the page's returned item position
+in the same direction. These reads resolve materialized history: an image row
+has `StreamDataType::DynamoDbJson` and DynamoDB JSON bytes; a delete has
+`StreamDataType::DeleteMarker` and its key bytes. They do not return image-owner
+references. There is no item-history HTTP operation corresponding to this Rust
+interface.
+
+A deleted base item can still have readable history within the table's window.
+An active table's current snapshot and the predecessors needed by retained
+DynamoDB events remain protected. Once all history for a deleted item expires,
+cleanup can remove its final delete marker and leave an empty item stream.
+Deleting the table itself rejects history reads for its old ID even while its
+physical cleanup is still running.
+
+### Read the System Stream
+
+Use the system-stream form of `GetStreamRecords` with `SystemStream: true`, its
+required `SourceScope`, and the returned opaque `Checkpoint` for continuation.
+System pages use qualified shard/lineage positions rather than table-stream
+`LastEvaluatedKey`. Each record includes the logical `SourceTableName`,
+`SystemPosition`, `Keys`, and the resolved `Item` snapshot or `null` delete
+marker. Keep the returned scope with the checkpoint.
+
+System cleanup changes system visibility only. It never deletes item-history
+values or their DynamoDB predecessors; the table cleanup owner controls those.
+Longer table retention therefore remains readable after the system's 24-hour
+window has elapsed.

@@ -157,7 +157,7 @@ fn decode_due_marker(row: SqlRow) -> StorageResult<StreamTrimDueMarker> {
         StorageError::internal("SQL stream trim due marker has invalid column count")
     })?;
     let [
-        SqlValue::Integer(due_bucket),
+        SqlValue::Integer(due_at),
         SqlValue::Text(scope_id),
         SqlValue::Integer(policy_version),
         SqlValue::Blob(marker_blob),
@@ -168,7 +168,7 @@ fn decode_due_marker(row: SqlRow) -> StorageResult<StreamTrimDueMarker> {
         ));
     };
     StreamTrimDueRecord {
-        due_bucket,
+        due_at,
         scope_id,
         policy_version,
         marker_blob,
@@ -190,6 +190,7 @@ pub(crate) fn decode_trim_state(
         ));
     };
     let state: StreamTrimState = storage_serde::from_bytes(&blob)?;
+    state.require_valid_frontier()?;
     if scope_id != scope.scope_id || state.scope != *scope {
         return Err(StorageError::internal(
             "SQL stream trim state has another scope",

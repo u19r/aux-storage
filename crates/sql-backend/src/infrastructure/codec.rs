@@ -71,6 +71,17 @@ pub(super) fn decode_revision(row: SqlRow) -> StorageResult<Revision> {
     Ok(u64::from_be_bytes(revision.try_into().map_err(|_| invalid_row())?).into())
 }
 
+pub(super) fn decode_generation(row: SqlRow) -> StorageResult<u64> {
+    let [SqlValue::Blob(generation)] =
+        <[SqlValue; 1]>::try_from(row.into_values()).map_err(|_| invalid_row())?
+    else {
+        return Err(invalid_row());
+    };
+    Ok(u64::from_be_bytes(
+        generation.try_into().map_err(|_| invalid_row())?,
+    ))
+}
+
 fn invalid_row() -> StorageError {
     StorageError::from(InfrastructureResultKind::Encoding {
         context: InfrastructureContext::RecordEncoding,

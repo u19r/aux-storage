@@ -100,7 +100,7 @@ impl JournalStore {
 
     /// Accept exact originals and publish every local position in this attempt.
     pub(in crate::journal) async fn store_source_publications<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -108,7 +108,7 @@ impl JournalStore {
         accepted: &[(
             &replication_types::event::content::CanonicalEvent,
             &replication_types::event::disposition::CanonicalAcceptanceReceipt,
-            Option<storage_types::TableHistoryId>,
+            storage_types::TableHistoryId,
         )],
     ) -> StorageResult<()> {
         let mut settlement =
@@ -135,7 +135,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn store_prepared_source_publications<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -147,9 +147,9 @@ impl JournalStore {
         let attempt = settlement.as_mut();
         let result = async {
             let sources = self.prepare_source_positions(publications)?;
-            accepted.require_sources(self, &sources)?;
+            let activities = accepted.bind_source_activities(self, &sources)?;
             let publications = self
-                .prepare_source_publication_changes(attempt, &sources)
+                .prepare_source_publication_changes(attempt, (&sources, activities))
                 .await?;
             let mut changes = accepted.prepare(self, attempt).await?;
             changes.extend(publications);
@@ -191,8 +191,12 @@ impl JournalStore {
     >(
         &self,
         attempt: &mut A,
-        sources: &[SourcePosition],
+        input: (
+            &[SourcePosition],
+            Vec<super::delivery_activity::DeliveryActivity>,
+        ),
     ) -> StorageResult<Vec<infrastructure_provider::record::RecordChange>> {
+        let (sources, activities) = input;
         let publications = sources
             .iter()
             .flat_map(|source| source.events.iter().map(|link| (&source.origin, link)));
@@ -206,16 +210,8 @@ impl JournalStore {
                 source,
             )?);
         }
-        let activities = sources.iter().flat_map(|source| {
-            source.events.iter().map(|link| {
-                (
-                    (link.table, link.lineage),
-                    (source.origin.journal_partition, source.position),
-                )
-            })
-        });
         changes.extend(
-            self.prepare_local_delivery_activities(attempt, activities)
+            self.prepare_local_delivery_activities(attempt, activities.into_iter())
                 .await?,
         );
         Ok(changes)

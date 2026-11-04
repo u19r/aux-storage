@@ -352,6 +352,7 @@ impl PublicTrimAuthority {
             return Err(storage_types::StorageEnum::HistoryUnavailable.into());
         }
         crate::history::source_selection::SourceHistoryBounds::try_new(
+            self.head.incarnation().physical,
             self.revision(),
             after,
             through,
@@ -390,6 +391,7 @@ impl PublicTrimAuthority {
         self.require_lineage(selection.lineage)?;
         let after = self.source_floor(selection)?.min(through);
         crate::history::source_selection::SourceHistoryBounds::try_new(
+            self.head.incarnation().physical,
             self.revision(),
             after,
             through,
@@ -399,7 +401,7 @@ impl PublicTrimAuthority {
 
 impl JournalStore {
     pub(in crate::journal) async fn is_receiver_original_visible<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -423,7 +425,11 @@ impl JournalStore {
             };
             self.require_original_floor_visibility(
                 attempt,
-                (floors, certificate.proposal.candidate.membership),
+                (
+                    floors,
+                    certificate.proposal.candidate.membership,
+                    authority.head.incarnation().physical,
+                ),
                 (&event.as_ref().id, event.as_ref().digest),
                 encoding,
             )

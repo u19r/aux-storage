@@ -21,6 +21,7 @@ async fn given_operator_startup_when_public_table_enable_and_writes_complete_the
         fixture.managers[0]
             .create_table(&serde_json::from_value(json!({
                 "TableName": empty, "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}]
             }))?)

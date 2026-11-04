@@ -15,7 +15,7 @@ use crate::native_record::corrupt_record;
 
 impl JournalStore {
     pub(crate) async fn observe_transaction_conditions<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -73,10 +73,6 @@ impl<'accepted> ConditionObservationInput<'accepted> {
             physical: &condition.table,
             key: &condition.key,
             provenance: condition.old_provenance.as_ref(),
-            source: condition
-                .old_item
-                .as_ref()
-                .and_then(|item| item.stored_source()),
             images: SourceImagesRef {
                 old,
                 old_indexers: old.map(|_| condition.old_indexers.as_slice()),

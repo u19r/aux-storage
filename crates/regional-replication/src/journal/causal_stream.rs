@@ -23,13 +23,13 @@ use crate::{
 pub(super) struct CausalStreamScope<'a> {
     pub request: &'a CanonicalCausalStreamRequest,
     pub scopes: Vec<HeldCausalScope>,
-    pub receiver_authority: super::public_trim_authority::PublicTrimAuthority,
+    pub receiver_selection: super::history_view::QualifiedViewSelection,
     pub limits: &'a WorkLimits,
     pub codec: &'a CanonicalJsonCodec,
 }
 impl JournalStore {
     pub(crate) async fn advance_causal_stream<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -84,7 +84,10 @@ impl JournalStore {
             let scope = CausalStreamScope {
                 request,
                 scopes,
-                receiver_authority: bounds.authority,
+                receiver_selection: super::history_view::QualifiedViewSelection {
+                    physical: bounds.physical,
+                    authority: bounds.authority,
+                },
                 limits: encoding.0,
                 codec: encoding.1,
             };
@@ -120,7 +123,7 @@ impl JournalStore {
         settlement.complete(crate::history::retention::settle_expiry(result))?
     }
     async fn advance_or_replay_causal_stream<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -152,7 +155,14 @@ impl JournalStore {
             .load_causal_stream_event(attempt, scope, identity)
             .await?;
         let visit = self
-            .load_causal_visit(attempt, (stream.operation, identity, event.as_ref().digest))
+            .load_causal_visit(
+                attempt,
+                (
+                    (stream.physical, stream.operation),
+                    identity,
+                    event.as_ref().digest,
+                ),
+            )
             .await?
             .ok_or_else(corrupt_record)?
             .1;
@@ -162,7 +172,7 @@ impl JournalStore {
         self.render_causal_stream_event(event).map(Some)
     }
     pub(super) async fn load_causal_stream_event<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,

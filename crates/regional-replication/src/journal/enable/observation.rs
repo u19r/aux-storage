@@ -43,7 +43,10 @@ impl JournalStore {
         settlement.complete(result)
     }
 
-    pub(super) fn decode_enable_record(&self, row: &DurableRecord) -> StorageResult<EnableRecord> {
+    pub(in crate::journal) fn decode_enable_record(
+        &self,
+        row: &DurableRecord,
+    ) -> StorageResult<EnableRecord> {
         let record: EnableRecord = self.records.decode(row)?;
         let plan = &record.plan;
         plan.validate()?;

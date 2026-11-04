@@ -58,7 +58,6 @@ pub(crate) fn require_separate_metadata(request: &UpdateTableRequest) -> Storage
         || request.global_secondary_index_updates.is_some()
         || request.stream_specification.is_some()
         || request.aux_stream_duration_hours.is_some()
-        || request.aux_default_item_stream_duration_hours.is_some()
     {
         return Err(StorageError::validation(
             "regional lifecycle controls cannot be combined with table metadata changes",

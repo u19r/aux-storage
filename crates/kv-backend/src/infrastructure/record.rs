@@ -57,6 +57,43 @@ impl<A: KvAttempt> PhysicalRecordAttempt for KvCatalogAttempt<'_, A> {
         operation.complete(result)
     }
 
+    async fn find_record_generation(
+        &mut self,
+        resource_of: &DurableRecordKey,
+        minimum: u64,
+        protection: ReadProtection,
+    ) -> StorageResult<Option<u64>> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = async {
+            let (begin, end) = key_layout::generation_bounds(resource_of, minimum)?;
+            let Some(key) = catalog
+                .attempt
+                .root_attempt()
+                .first_key_in_range(&begin, &end, protection)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let key = key_layout::decode_key(&key)?;
+            let address = key.as_ref();
+            let expected = resource_of.as_ref();
+            if address.namespace != expected.namespace
+                || address.resource != expected.resource
+                || address.generation < minimum
+            {
+                return Err(InfrastructureResultKind::Encoding {
+                    context: InfrastructureContext::RecordAddress,
+                }
+                .into());
+            }
+            Ok(Some(address.generation))
+        }
+        .await;
+        operation.complete(result)
+    }
+
     async fn load_records(
         &mut self,
         keys: &[DurableRecordKey],
@@ -246,14 +283,4 @@ fn encode_change(change: &RecordChange) -> StorageResult<KvMutation> {
         },
         RecordChange::Delete { .. } => KvMutation::Delete { key },
     })
-}
-
-impl<A: KvAttempt> stream_provider::retained_image::RetainedOwnershipAttempt
-    for KvCatalogAttempt<'_, A>
-{
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        self.attempt.root_attempt().ownership_changes()
-    }
 }

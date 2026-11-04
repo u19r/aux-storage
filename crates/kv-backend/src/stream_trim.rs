@@ -3,8 +3,7 @@
 use std::{future::Future, num::NonZeroU32};
 
 use storage_types::{
-    ReadProtection, StorageError, StorageResult, StreamName, SystemStreamEffectDigest,
-    SystemStreamPosition, storage_serde,
+    ReadProtection, StorageError, StorageResult, SystemStreamPosition, storage_serde,
 };
 use stream_provider::{
     MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimAttempt, SystemStreamTrimOperationId,
@@ -18,13 +17,7 @@ use crate::{
         STREAM_READ_BYTES, SYSTEM_STREAM_RECORD_PREFIX, SYSTEM_STREAM_TRIM_RECEIPT_PREFIX,
     },
     range::prefix_upper_bound,
-    stream_read::row::decode_stored_stream_row,
-    stream_write::{
-        key_layout::{
-            decode_pointer_reference_key, effect_key, item_key, pointer_owner_key, record_key,
-        },
-        record::KvSystemStreamRecord,
-    },
+    stream_write::key_layout::record_key,
 };
 
 impl<A: KvAttempt> SystemStreamTrimAttempt for KvCatalogAttempt<'_, A> {
@@ -38,13 +31,6 @@ impl<A: KvAttempt> SystemStreamTrimAttempt for KvCatalogAttempt<'_, A> {
         )>,
     > + Send {
         read_receipts(self.attempt, request)
-    }
-
-    fn load_trim_boundaries(
-        &mut self,
-        request: &SystemStreamTrimPageRequest,
-    ) -> impl Future<Output = StorageResult<Vec<SystemStreamPosition>>> + Send {
-        crate::stream_history::load_trim_boundaries(self.attempt, request)
     }
 
     fn scan_trim_records(
@@ -68,155 +54,71 @@ async fn apply_page<A: KvAttempt>(
     selected: &[SystemStreamTrimRecord],
     receipt: &SystemStreamTrimPageReceipt,
 ) -> StorageResult<()> {
-    if selected.is_empty() {
-        return write_receipt(attempt, receipt);
-    }
-    let system_stream = StreamName::system_table_stream();
-    let item_prefix = crate::stream_write::key_layout::item_row_prefix(&system_stream)?;
-    let mut keys = Vec::with_capacity(selected.len() * 4);
+    let mut frontiers = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    let mut mutations = Vec::with_capacity(selected.len() * 3);
     for record in selected {
-        keys.push(effect_key(record.effect_id.as_str()));
-        keys.push(record_key(&record.position)?);
-        keys.push(item_key(&system_stream, record.pointer_item_id)?);
-        keys.push(pointer_owner_key(&system_stream, record.pointer_item_id)?);
+        let key = crate::stream_write::key_layout::retired_key(&record.position);
+        let offset = match record.position.offset().versionstamp() {
+            Some(stamp) => stamp.to_vec(),
+            None => record
+                .position
+                .offset()
+                .order()
+                .map_err(|_| invalid_record())?
+                .to_be_bytes()
+                .to_vec(),
+        };
+        frontiers
+            .entry(key)
+            .and_modify(|current| {
+                if *current < offset {
+                    *current = offset.clone();
+                }
+            })
+            .or_insert(offset);
+        mutations.push(KvMutation::Delete {
+            key: record_key(&record.position)?,
+        });
+        if let Some(history) = record.table_history_id {
+            mutations.push(KvMutation::Delete {
+                key: crate::stream_write::key_layout::table_record_key(history, &record.position)?,
+            });
+        }
+    }
+    store_retired_offsets(attempt, frontiers, &mut mutations).await?;
+    attempt.stage(mutations)?;
+    write_receipt(attempt, receipt)
+}
+
+async fn store_retired_offsets<A: KvAttempt>(
+    attempt: &A,
+    frontiers: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    mutations: &mut Vec<KvMutation>,
+) -> StorageResult<()> {
+    if frontiers.is_empty() {
+        return Ok(());
     }
     let values = attempt
-        .get_batch(keys.clone(), ReadProtection::Conflict)
+        .get_batch(
+            frontiers.keys().cloned().collect(),
+            ReadProtection::Conflict,
+        )
         .await?;
-    if values.len() != keys.len() {
-        return Err(StorageError::internal(
-            "KV SystemStream trim observation count differs",
-        ));
+    if values.len() != frontiers.len() {
+        return Err(invalid_record());
     }
-    let mut values = values.into_iter();
-    let mut descriptors = Vec::with_capacity(selected.len());
-    let mut pointers = Vec::with_capacity(selected.len());
-    let mut observations = Vec::with_capacity(selected.len());
-    for (record, keys) in selected.iter().zip(keys.as_chunks::<4>().0.iter()) {
-        let effect = values
-            .next()
-            .ok_or_else(invalid_record)?
-            .ok_or_else(invalid_record)?;
-        let stored = values
-            .next()
-            .ok_or_else(invalid_record)?
-            .ok_or_else(invalid_record)?;
-        let pointer = values
-            .next()
-            .ok_or_else(invalid_record)?
-            .ok_or_else(invalid_record)?;
-        let reverse_key = values
-            .next()
-            .ok_or_else(invalid_record)?
-            .ok_or_else(invalid_record)?;
-        let effect = crate::stream_write::record::decode_effect(&effect)?;
-        let stored = KvSystemStreamRecord::decode(&keys[1], &stored)?;
-        if stored.record.position != record.position
-            || stored.pointer_item_id != record.pointer_item_id
-            || stored.effect_id != record.effect_id.as_str()
-            || stored.created_at != record.created_at
+    for ((key, next), current) in frontiers.into_iter().zip(values) {
+        if current
+            .as_ref()
+            .is_some_and(|current| current.len() != next.len())
         {
             return Err(invalid_record());
         }
-        let pointer =
-            decode_stored_stream_row(&item_prefix, crate::KvEntry::new(keys[2].clone(), pointer))?;
-        pointer.require_address(&system_stream, record.pointer_item_id)?;
-        pointer.require_pointer_effect(&record.effect_id)?;
-        let reverse_key = crate::stream_write::key_layout::resolve_pointer_owner(
-            reverse_key,
-            record.pointer_item_id,
-        )?;
-        let reference = decode_pointer_reference_key(&reverse_key)?;
-        if stored.record.history() != effect.history_id {
-            return Err(invalid_record());
+        if current.as_ref().is_none_or(|current| *current < next) {
+            mutations.push(KvMutation::Put { key, value: next });
         }
-        descriptors.push(stored.record);
-        pointers.push(pointer);
-        observations.push((effect, reference, reverse_key));
     }
-    let mut catalog = KvCatalogAttempt::new(attempt, storage_types::ReadProtection::Conflict);
-    stream_provider::retained_image::system_stream::RetainedSystemStreamRecord::admit_trim_work(
-        &descriptors,
-        &pointers,
-        STREAM_READ_BYTES.get(),
-    )?;
-    let mut retiring =
-        stream_provider::retained_image::stream_row::StoredStreamRow::retirement_receipts(
-            &pointers,
-        )?;
-    retiring.extend(stream_provider::retained_image::system_stream::RetainedSystemStreamRecord::retirement_receipts(&descriptors)?);
-    let pointers = stream_provider::retained_image::stream_row::StoredStreamRow::hydrate(
-        &mut catalog,
-        pointers,
-        STREAM_READ_BYTES.get(),
-    )
-    .await?;
-    let retained =
-        stream_provider::retained_image::system_stream::RetainedSystemStreamRecord::hydrate(
-            &mut catalog,
-            descriptors,
-            STREAM_READ_BYTES.get(),
-        )
-        .await?;
-    if retained.len() != selected.len() || pointers.len() != selected.len() {
-        return Err(invalid_record());
-    }
-    stream_provider::retained_image::RetainedOwnerRecord::release_stream_batch(
-        &mut catalog,
-        retiring,
-    )
-    .await?;
-    let mut mutations = Vec::with_capacity(selected.len() * 5);
-    let mut reverse_keys = Vec::with_capacity(selected.len());
-    for ((((record, keys), (effect, reference, reverse_key)), logical), pointer) in selected
-        .iter()
-        .zip(keys.as_chunks::<4>().0.iter())
-        .zip(observations)
-        .zip(retained)
-        .zip(pointers)
-    {
-        let trimmed = effect.accept_trim(record, &logical, &pointer, &reference)?;
-        mutations.push(KvMutation::Put {
-            key: keys[0].clone(),
-            value: storage_serde::to_bytes(&trimmed)?,
-        });
-        if let Some(stamp) = record.position.offset().versionstamp() {
-            let mut value = stamp.to_vec();
-            value.push(0); // Existing inline physical value tag.
-            attempt.native_stage_byte_max(
-                crate::stream_write::key_layout::retired_key(&record.position),
-                value,
-            )?;
-        }
-        mutations.push(KvMutation::Delete {
-            key: keys[1].clone(),
-        });
-        mutations.push(KvMutation::Delete {
-            key: keys[2].clone(),
-        });
-        mutations.push(KvMutation::Delete {
-            key: keys[3].clone(),
-        });
-        reverse_keys.push(reverse_key);
-    }
-    let reverse_values = attempt
-        .get_batch_admitted(
-            reverse_keys.clone(),
-            ReadProtection::Conflict,
-            crate::KvValueAllowance::new(0, 0),
-        )
-        .await?;
-    if reverse_values.len() != reverse_keys.len() {
-        return Err(invalid_record());
-    }
-    for (key, value) in reverse_keys.into_iter().zip(reverse_values) {
-        if value.as_deref() != Some(&[]) {
-            return Err(invalid_record());
-        }
-        mutations.push(KvMutation::Delete { key });
-    }
-    attempt.stage(mutations)?;
-    write_receipt(attempt, receipt)
+    Ok(())
 }
 
 pub(crate) async fn read_receipts<A: KvAttempt>(
@@ -339,48 +241,13 @@ pub(crate) async fn scan_records<A: KvAttempt>(
         .into_iter()
         .take(MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS)
         .map(|entry| {
-            let row = KvSystemStreamRecord::decode(&entry.key, &entry.value)?;
-            if record_key(&row.record.position)? != entry.key {
-                return Err(StorageError::internal(
-                    "KV SystemStream record key differs from value",
-                ));
-            }
-            let length = row.record.read_work_bytes(STREAM_READ_BYTES.get())?;
-            Ok((
-                length,
-                SystemStreamTrimRecord {
-                    position: row.record.position,
-                    pointer_item_id: row.pointer_item_id,
-                    effect_id: SystemStreamEffectDigest::try_new(row.effect_id).map_err(|_| {
-                        StorageError::internal("KV SystemStream effect ID is invalid")
-                    })?,
-                    created_at: row.created_at,
-                },
-            ))
+            let record = crate::stream_write::record::decode_record(&entry.key, &entry.value)?;
+            Ok(SystemStreamTrimRecord {
+                position: record.position().clone(),
+                created_at: record.created_at(),
+                table_history_id: record.table_history_id(),
+            })
         })
         .collect::<StorageResult<Vec<_>>>()?;
-    let system_stream = StreamName::system_table_stream();
-    let prefix = crate::stream_write::key_layout::item_row_prefix(&system_stream)?;
-    let keys = records
-        .iter()
-        .map(|(_, record)| item_key(&system_stream, record.pointer_item_id))
-        .collect::<StorageResult<Vec<_>>>()?;
-    let values = attempt
-        .get_batch(keys.clone(), ReadProtection::Conflict)
-        .await?;
-    if values.len() != keys.len() {
-        return Err(invalid_record());
-    }
-    let pointers = keys
-        .into_iter()
-        .zip(values)
-        .map(|(key, value)| {
-            decode_stored_stream_row(
-                &prefix,
-                crate::KvEntry::new(key, value.ok_or_else(invalid_record)?),
-            )
-        })
-        .collect::<StorageResult<Vec<_>>>()?;
-    let (selected, excluded) = stream_provider::retained_image::system_stream::RetainedSystemStreamRecord::select_trim_prefix(records, pointers, STREAM_READ_BYTES.get())?;
-    Ok((selected, more || excluded))
+    Ok((records, more))
 }

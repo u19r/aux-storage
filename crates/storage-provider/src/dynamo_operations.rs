@@ -15,10 +15,9 @@ use storage_types::{
     GetStreamRecordsRequest, GetStreamRecordsResponse, ListStreamsRequest, ListStreamsResponse,
     ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse, QueryRequest,
     QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest, ScanResponse,
-    StorageResult, StoredTableInfo, StreamItemId, TableName, TransactGetItemsRequest,
-    TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
-    UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
-    UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
+    StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest, TransactGetItemsResponse,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
 };
 
 /// One public operation is one native attempt per try, including all required
@@ -136,14 +135,26 @@ pub trait DynamoOperations: Send + Sync {
         &self,
         request: DescribeTimeToLiveRequest,
     ) -> StorageResult<DescribeTimeToLiveResponse>;
+    async fn describe_stream(
+        &self,
+        request: storage_types::DescribeStreamRequest,
+    ) -> StorageResult<storage_types::DescribeStreamResponse>;
+    async fn get_shard_iterator(
+        &self,
+        request: storage_types::GetShardIteratorRequest,
+    ) -> StorageResult<storage_types::GetShardIteratorResponse>;
+    async fn get_records(
+        &self,
+        request: storage_types::GetRecordsRequest,
+    ) -> StorageResult<storage_types::GetRecordsResponse>;
     async fn get_stream_records(
         &self,
         request: GetStreamRecordsRequest,
     ) -> StorageResult<GetStreamRecordsResponse>;
-    async fn latest_table_stream_pointer(
+    async fn table_stream_checkpoint(
         &self,
-        table_name: TableName,
-    ) -> StorageResult<Option<StreamItemId>>;
+        target: storage_types::TableHistoryTarget,
+    ) -> StorageResult<storage_types::TableStreamCheckpoint>;
     async fn list_streams(&self, request: ListStreamsRequest)
     -> StorageResult<ListStreamsResponse>;
 }

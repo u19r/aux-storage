@@ -3,15 +3,15 @@ use smallvec::SmallVec;
 use storage_common::TtlIndexKey;
 use storage_types::{
     AttributeValue, GlobalSecondaryIndex, IndexName, IndexerDeclaration, ItemRevision,
-    KeyAttributes, StoredTableInfo, StreamItemId, SystemStreamCheckpoint, TableName,
-    TimestampMillis, WireItem, maintenance::TargetIncarnation,
+    KeyAttributes, StoredTableInfo, SystemStreamCheckpoint, TableName, WireItem,
+    maintenance::TargetIncarnation,
 };
-use stream_provider::{StoredStreamPointer, StreamItem};
 
 use super::{GsiBuildPhase, GsiRecordError};
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct GsiBuildTarget {
+    pub history_id: storage_types::TableHistoryId,
     pub table_name: TableName,
     pub index_name: IndexName,
     pub incarnation: TargetIncarnation,
@@ -39,6 +39,7 @@ pub enum GsiBuildDiscovery {
 }
 
 pub struct GsiRecord {
+    pub history_id: storage_types::TableHistoryId,
     pub table_name: String,
     pub index_name: String,
     pub incarnation: Vec<u8>,
@@ -65,7 +66,6 @@ pub type GsiCatchingUp = crate::TailProgress<SystemStreamCheckpoint>;
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub struct GsiActive {
     pub cursor: SystemStreamCheckpoint,
-    pub pending_high: Option<SystemStreamCheckpoint>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -106,8 +106,12 @@ impl<Cursor: serde::de::DeserializeOwned> TryFrom<GsiRecord> for GsiBuild<Cursor
     type Error = GsiRecordError;
 
     fn try_from(record: GsiRecord) -> Result<Self, Self::Error> {
-        let target =
-            GsiBuildTarget::try_from((record.table_name, record.index_name, record.incarnation))?;
+        let target = GsiBuildTarget::try_from((
+            record.history_id,
+            record.table_name,
+            record.index_name,
+            record.incarnation,
+        ))?;
         let phase = GsiBuildPhase::try_from(record.phase.as_str())?;
         let state: GsiState<Cursor> =
             serde_json::from_slice(&record.state).map_err(|_| GsiRecordError::Position)?;
@@ -130,11 +134,6 @@ pub enum GsiReadRequest<Cursor> {
     CatchUp {
         after: SystemStreamCheckpoint,
         through: SystemStreamCheckpoint,
-        limit: GsiPageLimit,
-    },
-    Continue {
-        after: SystemStreamCheckpoint,
-        pending_high: Option<SystemStreamCheckpoint>,
         limit: GsiPageLimit,
     },
     InspectActivation {
@@ -182,21 +181,7 @@ pub struct GsiStreamSourcePage {
 }
 
 pub struct GsiStreamCandidate {
-    /// Physical pointer identity. This value is never a replay cursor.
-    pub pointer_id: StreamItemId,
-    /// Timestamp inherited by items embedded in the SystemStream pointer.
-    pub created_at: TimestampMillis,
-    pub pointer: StoredStreamPointer,
-    /// Items loaded from the referenced item stream. Embedded pointers leave
-    /// this empty because their images are carried by `pointer`.
-    pub referenced_items: Option<Vec<StreamItem>>,
-}
-
-/// One provider-decoded item from a referenced item stream, correlated to the
-/// SystemStream candidate that requested it.
-pub struct GsiReferencedHistoryItem {
-    pub candidate_ordinal: usize,
-    pub item: StreamItem,
+    pub history: stream_provider::ResolvedItemHistory,
 }
 
 pub type GsiStreamPageEnd = crate::TailPageEnd<SystemStreamCheckpoint>;
@@ -243,7 +228,7 @@ pub struct GsiProjectedRow {
 }
 
 impl GsiProjectedRow {
-    pub fn projected_image(&self) -> storage_types::StorageResult<WireItem> {
+    pub fn projected_image(&self) -> storage_types::StorageResult<std::borrow::Cow<'_, WireItem>> {
         self.projection.project(&self.source_item)
     }
 }

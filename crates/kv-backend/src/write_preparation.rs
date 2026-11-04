@@ -75,8 +75,7 @@ pub(crate) struct PreparedPrimaryWrite {
     history_id: TableHistoryId,
     key: KeyAttributes,
     suffix: Vec<u8>,
-    image: stream_provider::retained_image::AcceptedImagePlan,
-    owner: stream_provider::retained_image::PrimaryImageOwner,
+    image: Vec<u8>,
     tombstone_key: Vec<u8>,
 }
 
@@ -87,9 +86,7 @@ impl PreparedPrimaryWrite {
             &item.table.key_schema,
             item.key,
         )?;
-        let owner =
-            stream_provider::retained_image::PrimaryImageOwner::try_new(item.table, item.key)?;
-        let image = stream_provider::retained_image::AcceptedImagePlan::try_new(
+        let image = storage_types::MaterializedItemRecord::encode(
             item.table.history_id,
             item.new_item,
             item.declaration,
@@ -99,7 +96,6 @@ impl PreparedPrimaryWrite {
             key: item.key.clone(),
             suffix: item_key.sorted_storage_suffix()?,
             image,
-            owner,
             tombstone_key: primary_tombstone_key(item.table, item.key)?.0,
         })
     }
@@ -108,12 +104,10 @@ impl PreparedPrimaryWrite {
         self.history_id == item.table.history_id && self.key == item.key
     }
 
-    pub(crate) async fn prepare<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    pub(crate) fn prepare(
         self,
-        attempt: &mut A,
         identity: &KvTableIdentity,
         effects: &ItemPrimaryEffects,
-        previous: Option<&storage_types::VerifiedWireItem>,
     ) -> StorageResult<Vec<KvMutation>> {
         let mut changes = Vec::new();
         changes
@@ -128,9 +122,7 @@ impl PreparedPrimaryWrite {
         key.push(crate::constants::PRIMARY_ITEM_FAMILY);
         key.extend_from_slice(&identity.table_id.to_be_bytes());
         key.extend_from_slice(&self.suffix);
-        let image = self.image.prepare(attempt).await?;
-        self.owner.replace(attempt, previous, &image).await?;
-        let image = image.encode()?;
+        let image = self.image;
         changes.push(KvMutation::Put {
             key,
             value: encode_primary_item(&image, effects)?,

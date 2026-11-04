@@ -1,8 +1,6 @@
 //! SQL GSI discovery, source, and destination-state reads.
 
-use storage_backfill::{
-    GsiBuild, GsiBuildTarget, GsiPageLimit, GsiProjectionKey, GsiReferencedHistoryRead,
-};
+use storage_backfill::{GsiBuildTarget, GsiPageLimit, GsiProjectionKey};
 use storage_types::{
     AttributeName, AttributeValue, BoundTableInfo, GlobalSecondaryIndex, IndexName, ItemKey,
     KeyAttributeType, KeyAttributes, KeySchemaElement, StorageError, StorageResult,
@@ -11,48 +9,6 @@ use storage_types::{
 
 use super::key::BoundProjectionKey;
 use crate::{SqlEngine, SqlLayout, SqlStatement, SqlValue, item_read::encode_key_value};
-
-pub(in crate::gsi) fn referenced_histories_statement(
-    engine: impl SqlLayout,
-    reads: &[GsiReferencedHistoryRead<'_>],
-) -> SqlStatement {
-    let mut binds = Vec::with_capacity(reads.len() * 2);
-    let sql = referenced_history_tree(engine, reads, 0, &mut binds);
-    SqlStatement::new(format!("{sql} ORDER BY ordinal, item_id DESC"), binds)
-}
-
-fn referenced_history_tree(
-    engine: impl SqlLayout,
-    reads: &[GsiReferencedHistoryRead<'_>],
-    start: usize,
-    binds: &mut Vec<SqlValue>,
-) -> String {
-    if reads.len() == 1 {
-        let read = &reads[0];
-        binds.push(SqlValue::Blob(
-            read.physical_stream_name().as_ref().to_vec(),
-        ));
-        let stream = engine.engine().placeholder(binds.len());
-        binds.push(SqlValue::Blob(
-            storage_types::StreamItemId::from(read.through)
-                .as_bytes()
-                .to_vec(),
-        ));
-        let through = engine.engine().placeholder(binds.len());
-        return format!(
-            "SELECT {start} AS ordinal, image.* FROM (SELECT item_id, row_blob FROM \
-             {relation_sys_dynamo_stream_items} WHERE stream_name = {stream} AND item_id <= \
-             {through} ORDER BY item_id DESC LIMIT 2) AS image",
-            relation_sys_dynamo_stream_items = engine.relation_name("sys_dynamo_stream_items"),
-        );
-    }
-    let half = reads.len() / 2;
-    let left = referenced_history_tree(engine, &reads[..half], start, binds);
-    let right = referenced_history_tree(engine, &reads[half..], start + half, binds);
-    format!(
-        "SELECT * FROM ({left}) AS left_images UNION ALL SELECT * FROM ({right}) AS right_images"
-    )
-}
 
 pub(in crate::gsi) fn projection_state_statement(
     engine: impl SqlLayout,
@@ -78,13 +34,6 @@ pub(in crate::gsi) struct ProjectionStateQuery<'a> {
     pub index: &'a GlobalSecondaryIndex,
     pub keys: &'a [&'a GsiProjectionKey],
     pub incarnation: &'a TargetIncarnation,
-}
-
-pub(in crate::gsi) fn projection_descriptor_statement(
-    engine: impl SqlLayout,
-    query: ProjectionStateQuery<'_>,
-) -> StorageResult<SqlStatement> {
-    render_projection_state(engine, query, "g.__aux_item_version, g.item_descriptor")
 }
 
 fn render_projection_state(
@@ -126,7 +75,7 @@ fn render_projection_state(
         bound.append_request_row(engine, ordinal, &mut binds, &mut values)?;
     }
     let columns = columns.ok_or_else(|| StorageError::internal("GSI state page is empty"))?;
-    let physical = engine.gsi_table_name(&table.table_name, &index.index_name, incarnation);
+    let physical = engine.gsi_table_name(incarnation);
     let sql = projection_state_sql(&physical, columns_sql, &columns, &values.finish()?)?;
     Ok(SqlStatement::new(sql, binds))
 }
@@ -161,7 +110,6 @@ fn projection_state_sql(
 
 pub(in crate::gsi) fn ttl_projection_state_statement(
     engine: impl SqlLayout,
-    table: &StoredTableInfo,
     keys: &[&GsiProjectionKey],
     history_id: TableHistoryId,
 ) -> StorageResult<SqlStatement> {
@@ -201,7 +149,7 @@ pub(in crate::gsi) fn ttl_projection_state_statement(
             SqlValue::try_from(crate::row_view::SqlValueRef::Text(token))?,
         ]);
     }
-    let physical = engine.ttl_table_name(&table.table_name, history_id);
+    let physical = engine.ttl_table_name(history_id);
     sql.append(format_args!(
         ") SELECT requested.ordinal, CASE WHEN g.key_token IS NULL THEN NULL ELSE 0 END, \
          CAST(NULL AS BIGINT) FROM requested LEFT JOIN \"{physical}\" AS g ON g.ttl_value = \
@@ -251,11 +199,11 @@ pub(in crate::gsi) fn scan_source_statement(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let physical = engine.item_table_name(&table.info.table_name, table.history_id);
+    let physical = engine.item_table_name(table.history_id);
     Ok(SqlStatement::new(
         format!(
-            "SELECT item_descriptor, __aux_revision, __aux_indexers, {physical_keys} FROM \
-             \"{physical}\" {where_clause} ORDER BY {order} LIMIT {}",
+            "SELECT item_value, __aux_revision, {physical_keys} FROM \"{physical}\" \
+             {where_clause} ORDER BY {order} LIMIT {}",
             engine.engine().placeholder(binds.len()),
         ),
         binds,
@@ -306,8 +254,9 @@ pub(in crate::gsi) fn candidate_statement(
 ) -> SqlStatement {
     let mut sql = crate::sql_template::sql_template!(
         engine,
-        "SELECT table_name, index_name, incarnation, phase, state FROM "["sys_gsi_builds"],
-        " WHERE phase <> 'blocked'"
+        "SELECT table_id, table_name, index_name, incarnation, phase, state FROM "
+            ["sys_gsi_builds"],
+        " WHERE phase IN ('scanning', 'catching-up')"
     )
     .into_owned();
     let mut values = Vec::new();
@@ -330,84 +279,14 @@ pub(in crate::gsi) fn candidate_binding_statement(
 ) -> SqlStatement {
     SqlStatement::new(
         format!(
-            "SELECT table_name, index_name, incarnation, phase, state FROM \
-             {relation_sys_gsi_builds} WHERE table_name = {} AND index_name = {}",
+            "SELECT table_id, table_name, index_name, incarnation, phase, state FROM \
+             {relation_sys_gsi_builds} WHERE table_id = {} AND index_name = {}",
             engine.engine().placeholder(1),
             engine.engine().placeholder(2),
             relation_sys_gsi_builds = engine.relation_name("sys_gsi_builds"),
         ),
         vec![
-            SqlValue::Text(target.table_name.to_string()),
-            SqlValue::Text(target.index_name.to_string()),
-        ],
-    )
-}
-
-pub(in crate::gsi) fn read_hold_statement(
-    engine: impl SqlLayout,
-    build: &GsiBuild<Vec<u8>>,
-) -> SqlStatement {
-    let sql = format!(
-        "SELECT source_scope, source_generation, shard_id, lineage_id, consumed_offset FROM \
-         {relation_sys_gsi_history_holds} WHERE table_name = {} AND index_name = {} AND \
-         index_incarnation = {} ORDER BY lineage_id",
-        engine.engine().placeholder(1),
-        engine.engine().placeholder(2),
-        engine.engine().placeholder(3),
-        relation_sys_gsi_history_holds = engine.relation_name("sys_gsi_history_holds"),
-    );
-    SqlStatement::new(
-        sql,
-        vec![
-            SqlValue::Text(build.target.table_name.to_string()),
-            SqlValue::Text(build.target.index_name.to_string()),
-            SqlValue::Blob(build.target.incarnation.as_ref().to_vec()),
-        ],
-    )
-}
-
-pub(in crate::gsi) fn minimum_hold_statement(
-    engine: impl SqlLayout,
-    scope: &storage_types::SystemStreamScope,
-    lineage: &storage_types::SystemStreamPosition,
-) -> StorageResult<SqlStatement> {
-    let generation = i64::try_from(scope.generation())
-        .map_err(|_| StorageError::internal("GSI hold generation exceeds SQL range"))?;
-    Ok(SqlStatement::new(
-        format!(
-            "SELECT table_name, index_name, index_incarnation, consumed_offset FROM \
-             {relation_sys_gsi_history_holds} WHERE source_scope = {} AND source_generation = {} \
-             AND shard_id = {} AND lineage_id = {} ORDER BY consumed_offset, index_incarnation \
-             LIMIT 1",
-            engine.engine().placeholder(1),
-            engine.engine().placeholder(2),
-            engine.engine().placeholder(3),
-            engine.engine().placeholder(4),
-            relation_sys_gsi_history_holds = engine.relation_name("sys_gsi_history_holds"),
-        ),
-        vec![
-            SqlValue::Text(scope.scope_id().as_str().to_owned()),
-            SqlValue::Integer(generation),
-            SqlValue::Text(lineage.shard_id().as_str().to_owned()),
-            SqlValue::Text(lineage.lineage_id().as_str().to_owned()),
-        ],
-    ))
-}
-
-pub(in crate::gsi) fn build_for_hold_statement(
-    engine: impl SqlLayout,
-    target: &GsiBuildTarget,
-) -> SqlStatement {
-    SqlStatement::new(
-        format!(
-            "SELECT table_name, index_name, incarnation, phase, state FROM \
-             {relation_sys_gsi_builds} WHERE table_name = {} AND index_name = {}",
-            engine.engine().placeholder(1),
-            engine.engine().placeholder(2),
-            relation_sys_gsi_builds = engine.relation_name("sys_gsi_builds"),
-        ),
-        vec![
-            SqlValue::Text(target.table_name.to_string()),
+            SqlValue::Blob(target.history_id.as_ref().to_vec()),
             SqlValue::Text(target.index_name.to_string()),
         ],
     )
@@ -420,11 +299,11 @@ fn gsi_catalog_statement(
     columns: &str,
 ) -> SqlStatement {
     let mut sql = format!(
-        "SELECT {columns} FROM {relation_sys_gsi_builds} WHERE table_name = {}",
+        "SELECT {columns} FROM {relation_sys_gsi_builds} WHERE table_id = {}",
         engine.engine().placeholder(1),
         relation_sys_gsi_builds = engine.relation_name("sys_gsi_builds"),
     );
-    let mut values = vec![SqlValue::Text(table.info.table_name.to_string())];
+    let mut values = vec![SqlValue::Blob(table.history_id.as_ref().to_vec())];
     if let Some(index) = requested {
         sql.push_str(&format!(
             " AND index_name = {}",
@@ -445,7 +324,7 @@ pub(in crate::gsi) fn gsi_status_statement(
         engine,
         table,
         requested,
-        "table_name, index_name, incarnation, phase",
+        "table_id, table_name, index_name, incarnation, phase",
     )
 }
 
@@ -458,6 +337,6 @@ pub(in crate::gsi) fn gsi_build_statement(
         engine,
         table,
         requested,
-        "table_name, index_name, incarnation, phase, state",
+        "table_id, table_name, index_name, incarnation, phase, state",
     )
 }

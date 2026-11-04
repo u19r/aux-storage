@@ -94,6 +94,5 @@ pub fn put_input_with_immediate(
         table: std::sync::Arc::new(table.clone()),
         stream: stream_context_with_immediate(immediate_gsi_consistency),
         ttl_config: None,
-        item_stream_ttl_hours: None,
     }
 }

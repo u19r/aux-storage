@@ -88,6 +88,39 @@ impl JournalStore {
         settlement.complete(result)
     }
 
+    /// Resolve immutable local table identities once for receipt recovery. A
+    /// reused public name cannot select a replacement table's receipts.
+    pub(crate) async fn load_import_table_copies<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        import: &replication_types::regional_import::RegionalImport,
+        protection: ReadProtection,
+    ) -> StorageResult<
+        Vec<(
+            TableIdentity,
+            replication_types::identity::resource::TableLineage,
+            storage_types::TableHistoryId,
+        )>,
+    > {
+        let identities = import
+            .bindings()
+            .iter()
+            .map(|binding| binding.local_table)
+            .collect::<Vec<_>>();
+        let states = self
+            .observe_table_states(attempt, &identities, protection)
+            .await?;
+        import
+            .bindings()
+            .iter()
+            .zip(states)
+            .map(|(binding, state)| {
+                let state = state.ok_or(storage_types::StorageEnum::HistoryUnavailable)?;
+                Ok((binding.source_table, binding.lineage, state.state.physical))
+            })
+            .collect()
+    }
+
     fn decode_table_state(
         &self,
         record: &infrastructure_provider::record::DurableRecord,
@@ -218,7 +251,9 @@ impl JournalStore {
                 .records
                 .prepare(key, observed.map(|old| old.revision), &next)?;
             self.records.store(attempt, &[change]).await?;
-            attempt.advance_catalog_stamp(&next.name, stamp).await?;
+            attempt
+                .store_external_cleanup_barrier(&next.name, stamp)
+                .await?;
             Ok(())
         }
         .await;

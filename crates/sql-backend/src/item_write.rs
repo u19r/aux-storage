@@ -4,8 +4,8 @@ use storage_backfill::GsiProjectionLifecycle;
 use storage_common::{TtlConfigRecord, TtlIndexWrite, TtlIndexWriteBatch};
 use storage_provider::{
     AcceptedUpsert, CATALOG_READ_BYTES, ItemPrimaryEffects, ItemWriteObservation,
-    ItemWriteObservationAttempt, ItemWriteObservationRead, StreamTrimScope, StreamTrimState,
-    UpsertAttempt, combine_write_observations, lifecycle_tables_for_writes,
+    ItemWriteObservationAttempt, ItemWriteObservationRead, UpsertAttempt,
+    combine_write_observations, lifecycle_tables_for_writes,
 };
 use storage_types::{BoundTableInfo, StorageError, StorageResult, StoredWireItem, TableName};
 
@@ -18,11 +18,11 @@ use crate::{
         decode::{decode_deleted, decode_provenance, decode_revision},
         sql_statements::deleted_observation_statement,
     },
-    retention, stream_history, ttl_policy,
+    stream_history, ttl_policy,
 };
 
 pub(crate) const WRITE_COLUMNS: &str =
-    "item_descriptor, __aux_indexers, __aux_revision, __aux_provenance, __aux_ttl_epoch";
+    "item_value, __aux_revision, __aux_provenance, __aux_ttl_epoch";
 
 struct WriteObservationReads<'a> {
     statements: Vec<(SqlStatement, ReadProtection)>,
@@ -139,33 +139,26 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
     async fn read_item_write_prerequisites(
         &mut self,
         table: &BoundTableInfo,
-        retention_scope: Option<&StreamTrimScope>,
-        needs_ttl: bool,
-    ) -> StorageResult<(Option<TtlConfigRecord>, Option<StreamTrimState>)> {
+        prerequisites: storage_provider::ItemWritePrerequisites,
+    ) -> StorageResult<Option<TtlConfigRecord>> {
         let mut operation =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = operation.as_mut();
         let result = async {
-            // The history scope and TTL policy are independent prerequisites.
+            // Stream routing and live-item TTL are independent prerequisites.
             // Later members reuse this attempt's history observation.
-            let needs_history = catalog.dynamo_history.is_none();
+            let storage_provider::ItemWritePrerequisites {
+                needs_ttl,
+                needs_history,
+            } = prerequisites;
+            let needs_history = needs_history && catalog.dynamo_history.is_none();
             let mut statements = Vec::new();
             statements
-                .try_reserve_exact(
-                    usize::from(needs_ttl)
-                        + usize::from(retention_scope.is_some())
-                        + usize::from(needs_history),
-                )
+                .try_reserve_exact(usize::from(needs_ttl) + usize::from(needs_history))
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
             if needs_ttl {
                 statements.push((
                     ttl_policy::ttl_config_statement(catalog.engine, table),
-                    ReadProtection::Snapshot,
-                ));
-            }
-            if let Some(scope) = retention_scope {
-                statements.push((
-                    retention::state_statement(catalog.engine, &scope.scope_id),
                     ReadProtection::Snapshot,
                 ));
             }
@@ -187,11 +180,7 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
                     .query_batch_protected(statements, CATALOG_READ_BYTES)
                     .await?
             };
-            if pages.len()
-                != usize::from(needs_ttl)
-                    + usize::from(retention_scope.is_some())
-                    + usize::from(needs_history)
-            {
+            if pages.len() != usize::from(needs_ttl) + usize::from(needs_history) {
                 return Err(StorageError::internal(
                     "SQL item write prerequisite count differs",
                 ));
@@ -205,25 +194,6 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
             } else {
                 None
             };
-            let retention = retention_scope
-                .map(|scope| {
-                    pages.next().map(|page| (scope, page)).ok_or_else(|| {
-                        StorageError::internal("SQL retention prerequisite page is missing")
-                    })
-                })
-                .transpose()?
-                .map(|(scope, page)| {
-                    if page.more || page.rows.len() > 1 {
-                        return Err(StorageError::internal("SQL retention state is not unique"));
-                    }
-                    page.rows
-                        .into_iter()
-                        .next()
-                        .map(|row| retention::decode_trim_state(row, scope))
-                        .transpose()
-                })
-                .transpose()?
-                .flatten();
             if needs_history {
                 let page = pages.next().ok_or_else(|| {
                     StorageError::internal("SQL history prerequisite page is missing")
@@ -236,7 +206,7 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
                 catalog.dynamo_history =
                     Some(stream_history::decode_history_page(page, catalog.engine)?);
             }
-            Ok((ttl, retention))
+            Ok(ttl)
         }
         .await;
         operation.complete(result)
@@ -293,9 +263,9 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
             }
             let bound = reads
                 .len()
-                .checked_mul(CATALOG_READ_BYTES.get())
+                .checked_mul(storage_types::MaterializedItemRecord::encoded_length_bound())
                 .ok_or_else(|| StorageError::internal("Primary observation bound overflow"))?;
-            let hydrated = crate::item_read::hydrate_item_images(catalog, requests, bound).await?;
+            let hydrated = crate::item_read::decode_item_images(catalog, requests, bound)?;
             for (read, item) in reads.iter().zip(&hydrated) {
                 if let Some(item) = item
                     && !item.item.has_verified_keys(read.target().1)?
@@ -352,9 +322,7 @@ impl<A: SqlAttempt, L: SqlLayout> UpsertAttempt for SqlCatalogAttempt<'_, A, L> 
                 )?,
             };
             catalog.prepared_writes = Ok(prepared);
-            let (primary, tombstone) = image
-                .prepare(catalog, effects, item.old_item.as_ref())
-                .await?;
+            let (primary, tombstone) = image.prepare(effects)?;
             let ttl = ttl_index_statements(catalog.engine, &item.table, writes)?;
             let count = ttl
                 .len()
@@ -412,7 +380,7 @@ pub(crate) fn ttl_index_statements(
     table: &BoundTableInfo,
     writes: impl IntoIterator<Item = TtlIndexWrite>,
 ) -> StorageResult<Vec<SqlStatement>> {
-    let table = engine.ttl_table_name(&table.table_name, table.history_id);
+    let table = engine.ttl_table_name(table.history_id);
     let mut statements = Vec::new();
     for write in writes {
         let (upsert, key) = match write {
@@ -466,21 +434,10 @@ pub(crate) fn decode_live(
     row: SqlRow,
     stored: StoredWireItem,
 ) -> StorageResult<ItemWriteObservation> {
-    let [_descriptor, indexers, revision, provenance, ttl_epoch] = row
+    let [_value, revision, provenance, ttl_epoch] = row
         .into_values()
         .try_into()
         .map_err(|_| StorageError::internal("SQL item observation width is invalid"))?;
-    let SqlValue::Text(indexers) = indexers else {
-        return Err(StorageError::internal(
-            "SQL stored indexers have invalid type",
-        ));
-    };
-    let indexers: Vec<String> = serde_json::from_str(&indexers)?;
-    if indexers != stored.indexers {
-        return Err(StorageError::internal(
-            "SQL native indexers differ from retained content",
-        ));
-    }
     let revision = decode_revision(revision)?;
     let provenance = decode_provenance(provenance)?;
     let ttl_epoch = match ttl_epoch {

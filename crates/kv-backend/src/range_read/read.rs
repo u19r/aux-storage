@@ -102,8 +102,8 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
                 break;
             }
             let range = input.physical_range(&begin, &end)?;
-            let (batch, projections) = if let Some(index) = bound.index_name.as_ref() {
-                let (batch, images) = crate::gsi::read_tree_page(self, table, index, range).await?;
+            let (batch, projections) = if bound.index_name.is_some() {
+                let (batch, images) = crate::gsi::read_projection_page(self, table, range).await?;
                 (batch, Some(images))
             } else {
                 let mut batch = self.read_range_batch(range).await?;
@@ -111,9 +111,8 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
                 (batch, None)
             };
             let has_more = batch.more;
-            let (last_physical, stopped) = input
-                .decode_batch::<P, A>(self, (batch, projections), &mut result, &identity)
-                .await?;
+            let (last_physical, stopped) =
+                input.decode_batch::<P>((batch, projections), &mut result, &identity)?;
             if stopped {
                 return result.finish_with_more();
             }
@@ -169,28 +168,25 @@ impl RangeReadInput<'_, '_> {
         })
     }
 
-    async fn decode_batch<P: RangeProjection, A: KvAttempt>(
+    fn decode_batch<P: RangeProjection>(
         &self,
-        attempt: &mut KvCatalogAttempt<'_, A>,
         input: (
             crate::KvRangePage,
-            Option<Vec<crate::gsi::HydratedProjection>>,
+            Option<Vec<crate::gsi::DecodedProjection>>,
         ),
         result: &mut RangeReadPage<P::Item>,
         identity: &crate::catalog::KvTableIdentity,
     ) -> StorageResult<(Option<Vec<u8>>, bool)> {
         let (batch, projections) = input;
         let mut content = if self.bound.index.is_none() {
-            crate::item_read::hydrate_primary_items(
-                attempt,
+            crate::item_read::decode_primary_items(
                 batch
                     .entries
                     .iter()
                     .map(|entry| (self.table, Some(entry.value.as_slice())))
                     .collect(),
                 PAGE_READ_BYTES.get(),
-            )
-            .await?
+            )?
             .into_iter()
             .map(|item| {
                 item.map(|item| RangeContent::Primary(Box::new(item)))
@@ -199,7 +195,7 @@ impl RangeReadInput<'_, '_> {
             .collect::<StorageResult<Vec<_>>>()?
         } else {
             projections
-                .ok_or_else(|| StorageError::internal("Missing verified tree images"))?
+                .ok_or_else(|| StorageError::internal("Missing materialized GSI images"))?
                 .into_iter()
                 .map(|projection| RangeContent::Projection(Box::new(projection)))
                 .collect()

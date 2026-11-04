@@ -2,7 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-pub(crate) const INFRASTRUCTURE_LAYOUT_VERSION: i64 = 28;
+pub(crate) const INFRASTRUCTURE_LAYOUT_VERSION: i64 = 45;
 
 // One bounded scan, savepoint/rollback/release and conflict-revision query.
 #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
@@ -50,18 +50,12 @@ pub(crate) const POSTGRES_RECORD_ROW_FRAME_BYTES: usize = 4 + 2 + 6 * 4;
 #[cfg(feature = "postgres")]
 pub(crate) const POSTGRES_FORMAT_ROW_FRAME_BYTES: usize = 4 + 2 + INFRASTRUCTURE_FORMAT_COLUMNS * 4;
 
-pub(crate) const GSI_HISTORY_CHUNK_ROWS: usize = 32;
-pub(crate) const GSI_HISTORY_CHUNK_BYTES: NonZeroUsize =
-    NonZeroUsize::MIN.saturating_add(64 * 1024 * 1024 - 1);
 pub(crate) const GSI_PROJECTION_STATE_READ_ROWS: usize = 64;
-pub(crate) const GSI_STREAM_PAGE_ROWS: u32 = 32;
 #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
+pub(crate) const SCHEDULED_JOB_DATA_TABLE: &str = "sys_scheduled_jobs_v2";
 pub(crate) const SCHEDULED_JOB_POINT_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(2 * 1024 * 1024 - 1);
 #[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
-pub(crate) const SCHEDULED_JOB_VALUE_BYTES: usize = 1024 * 1024;
-#[cfg(any(feature = "sqlite", feature = "turso", feature = "postgres"))]
-pub(crate) const JOB_RECEIPT_MAX_CONTENT_BYTES: usize = SCHEDULED_JOB_VALUE_BYTES + 1024;
 pub(crate) const QUEUE_CATALOG_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
 pub(crate) const PUBSUB_CATALOG_READ_BYTES: NonZeroUsize =
@@ -80,7 +74,6 @@ pub(crate) const RANGE_PAGE_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
 pub(crate) const RETENTION_READ_BYTES: NonZeroUsize =
     NonZeroUsize::MIN.saturating_add(1024 * 1024 - 1);
-pub(crate) const RETENTION_DELETE_BATCH_ROWS: usize = 400;
 
 pub(crate) const SQLITE_PLACEHOLDERS: [&str; 21] = [
     "?0", "?1", "?2", "?3", "?4", "?5", "?6", "?7", "?8", "?9", "?10", "?11", "?12", "?13", "?14",
@@ -111,3 +104,6 @@ pub(crate) const INFRASTRUCTURE_FORMAT_PAYLOAD_BYTES: usize = 2 * std::mem::size
 /// Header-length varint plus one serial-type varint per format field.
 #[cfg(feature = "sqlite")]
 pub(crate) const SQLITE_FORMAT_HEADER_BOUND: usize = (INFRASTRUCTURE_FORMAT_COLUMNS + 1) * 9;
+
+pub(crate) const INFRASTRUCTURE_GENERATION_BYTES: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::MIN.saturating_add(std::mem::size_of::<u64>() - 1);

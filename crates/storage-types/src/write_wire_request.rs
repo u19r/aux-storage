@@ -2,10 +2,9 @@ use typed_builder::TypedBuilder;
 
 use crate::{
     AllOld, AttributeMap, BatchWriteItemRequest, DeleteRequest, PutItemRequest, PutRequest,
-    ReturnConsumedCapacity, StorageError, StorageResult, StreamRetentionDuration, TableName,
-    TransactConditionCheckRequest, TransactDeleteRequest, TransactPutRequest,
-    TransactUpdateRequest, TransactWriteItem, TransactWriteItemsRequest, VecMap, WireItem,
-    WriteRequest, single_table_entity::WireEntity,
+    ReturnConsumedCapacity, StorageError, StorageResult, TableName, TransactConditionCheckRequest,
+    TransactDeleteRequest, TransactPutRequest, TransactUpdateRequest, TransactWriteItem,
+    TransactWriteItemsRequest, VecMap, WireItem, WriteRequest, single_table_entity::WireEntity,
 };
 
 #[derive(Debug, Clone)]
@@ -18,7 +17,6 @@ pub struct PutItemEncodeRequest {
     pub expression_attribute_values: Option<AttributeMap>,
     pub return_values: Option<AllOld>,
     pub return_old_on_condition_failure: bool,
-    pub aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl TryFrom<PutItemEncodeRequest> for PutItemRequest {
@@ -34,7 +32,6 @@ impl TryFrom<PutItemEncodeRequest> for PutItemRequest {
         request.return_values_on_condition_check_failure = encoded
             .return_old_on_condition_failure
             .then(|| "ALL_OLD".to_string());
-        request.aux_item_stream_ttl_hours = encoded.aux_item_stream_ttl_hours;
         Ok(request)
     }
 }
@@ -103,8 +100,6 @@ pub struct EncodeWriteRequest {
 pub struct EncodePutRequest {
     #[builder(setter(!strip_option))]
     pub item: WireEntity,
-    #[builder(default, setter(strip_option))]
-    pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
 
 impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
@@ -118,11 +113,7 @@ impl TryFrom<BatchWriteItemEncodeRequest> for BatchWriteItemRequest {
                 let put_request = match write_request.put_request {
                     Some(put_request) => {
                         let (item, indexers) = put_request.item.into_write_parts();
-                        Some(PutRequest {
-                            item,
-                            indexers,
-                            aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
-                        })
+                        Some(PutRequest { item, indexers })
                     }
                     None => None,
                 };
@@ -154,7 +145,6 @@ impl TryFrom<BatchWriteItemRequest> for BatchWriteItemEncodeRequest {
                 let put_request = match write_request.put_request {
                     Some(put_request) => Some(EncodePutRequest {
                         item: WireEntity::from_write_parts(put_request.item, put_request.indexers),
-                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     }),
                     None => None,
                 };
@@ -206,7 +196,6 @@ pub struct TransactEncodePutRequest {
     pub expression_attribute_names: Option<crate::VecMap<String, String>>,
     pub expression_attribute_values: Option<AttributeMap>,
     pub return_values_on_condition_check_failure: Option<String>,
-    pub aux_item_stream_ttl_hours: Option<crate::StreamRetentionDuration>,
 }
 
 impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
@@ -227,7 +216,6 @@ impl TryFrom<TransactWriteItemsEncodeRequest> for TransactWriteItemsRequest {
                         expression_attribute_values: put_request.expression_attribute_values,
                         return_values_on_condition_check_failure: put_request
                             .return_values_on_condition_check_failure,
-                        aux_item_stream_ttl_hours: put_request.aux_item_stream_ttl_hours,
                     })
                 }
                 None => None,

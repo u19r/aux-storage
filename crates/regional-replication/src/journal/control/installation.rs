@@ -11,7 +11,7 @@ impl JournalStore {
     pub(super) async fn install_control<
         A: PhysicalRecordAttempt
             + storage_provider::UpdateTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

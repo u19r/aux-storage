@@ -164,10 +164,10 @@ where
                         storage_provider::native_admission::NativeWork::Recovery,
                     ),
                     crate::journal::NativeAttempt::Schema,
-                    move |attempt, now| {
-                        Box::pin(async move {
-                            journal.cancel_hidden_target(attempt, &request, now).await
-                        })
+                    move |attempt, _| {
+                        Box::pin(
+                            async move { journal.cancel_hidden_target(attempt, &request).await },
+                        )
                     },
                 )
                 .await

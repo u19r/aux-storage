@@ -2,11 +2,7 @@ use infrastructure_provider::{
     physical_attempt::PhysicalRecordAttempt,
     record::{DurableRecord, DurableRecordKey, RecordChange},
 };
-use replication_types::identity::{
-    journal_partition::JournalPartition,
-    origin::OriginPosition,
-    resource::{TableIdentity, TableLineage},
-};
+use replication_types::identity::origin::OriginPosition;
 use storage_types::{ReadProtection, StorageResult};
 
 use super::record::{DeliveryActivity, DeliveryActivityObservation};
@@ -19,8 +15,9 @@ impl JournalStore {
         &self,
         activity: &DeliveryActivity,
     ) -> StorageResult<DurableRecordKey> {
-        self.identity_key(
+        self.table_identity_key(
             DELIVERY_ACTIVITY_SUFFIX,
+            activity.physical,
             &(
                 activity.table,
                 activity.source_table,
@@ -40,6 +37,7 @@ impl JournalStore {
             Some(row) => {
                 let activity: DeliveryActivity = self.records.decode(row)?;
                 if row.key != key
+                    || activity.physical != expected.physical
                     || activity.table != expected.table
                     || activity.lineage != expected.lineage
                     || activity.source_table != expected.source_table
@@ -81,12 +79,7 @@ impl JournalStore {
     >(
         &'attempt self,
         attempt: &'attempt mut A,
-        activities: impl Iterator<
-            Item = (
-                (TableIdentity, TableLineage),
-                (JournalPartition, OriginPosition),
-            ),
-        >,
+        activities: impl Iterator<Item = DeliveryActivity>,
     ) -> impl Future<Output = StorageResult<Vec<RecordChange>>> + Send + 'attempt {
         let inventory = self.prepare_local_delivery_inventory(activities);
         self.prepare_local_delivery_changes(attempt, inventory)
@@ -123,22 +116,10 @@ impl JournalStore {
 
     fn prepare_local_delivery_inventory(
         &self,
-        activities: impl Iterator<
-            Item = (
-                (TableIdentity, TableLineage),
-                (JournalPartition, OriginPosition),
-            ),
-        >,
+        activities: impl Iterator<Item = DeliveryActivity>,
     ) -> StorageResult<std::collections::BTreeMap<DurableRecordKey, DeliveryActivity>> {
         let mut inventory = std::collections::BTreeMap::<DurableRecordKey, DeliveryActivity>::new();
-        for (table, high) in activities {
-            let activity = DeliveryActivity {
-                table: table.0,
-                source_table: table.0,
-                lineage: table.1,
-                origin: self.origin(high.0)?,
-                through: high.1,
-            };
+        for activity in activities {
             let key = self.delivery_activity_key(&activity)?;
             match inventory.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -146,7 +127,8 @@ impl JournalStore {
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
-                    if current.table != activity.table
+                    if current.physical != activity.physical
+                        || current.table != activity.table
                         || current.source_table != activity.source_table
                         || current.lineage != activity.lineage
                         || current.origin != activity.origin

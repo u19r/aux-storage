@@ -18,7 +18,6 @@ use crate::{
 
 /// One checked-out Postgres client; construction is limited to its backend.
 pub struct PostgresAttempt {
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
     client: Option<Client>,
     mode: PostgresTransaction,
     settlement: NativeAttemptSettlement,
@@ -40,7 +39,6 @@ impl PostgresAttempt {
     ) -> Self {
         let (mode, limits) = execution;
         Self {
-            ownership: Default::default(),
             client: Some(client),
             mode,
             settlement: NativeAttemptSettlement::new(limits),
@@ -126,12 +124,6 @@ impl SqlAttempt for PostgresAttempt {
 
     fn require_settlement(&self) -> StorageResult<()> {
         self.settlement.require_open()
-    }
-
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
     }
 
     async fn query(

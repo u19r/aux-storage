@@ -74,7 +74,9 @@ impl JournalStore {
         settlement.complete(result)
     }
 
-    async fn require_expected_ttl<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn require_expected_ttl<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         root: &TargetRecord,
@@ -85,11 +87,19 @@ impl JournalStore {
         let key = KeyAttributes::from(token.parse_key_map(&row.0.info)?);
         let canonical = input.1.encode_key(&key).map_err(|_| corrupt_record())?;
         let expected = self
-            .load_expected_winner(attempt, root.request.operation.id, &canonical)
+            .load_expected_winner(
+                attempt,
+                (root.state.physical, root.request.operation.id),
+                &canonical,
+            )
             .await?
             .ok_or_else(corrupt_record)?;
         let authority = self
-            .load_winner_authority(attempt, (&expected.key, &expected.provenance), input.1)
+            .load_winner_authority(
+                attempt,
+                (row.0.history_id, &expected.key, &expected.provenance),
+                input.1,
+            )
             .await?;
         let images = authority.images()?;
         let image = images.new.ok_or_else(corrupt_record)?;

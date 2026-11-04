@@ -13,7 +13,7 @@ use storage_types::{
 use stream_provider::{
     DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamCheckpointReceipt,
     SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamLineage,
-    SystemStreamLineageCatalog, SystemStreamTrimPageRequest,
+    SystemStreamLineageCatalog,
 };
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
         SYSTEM_STREAM_LINEAGE_PREFIX as LINEAGE_PREFIX, SYSTEM_STREAM_SCHEMA_KEY as SCHEMA_KEY,
         SYSTEM_STREAM_SCOPE_KEY as SCOPE_KEY, SYSTEM_STREAM_SEQUENCE_PREFIX as SEQUENCE_PREFIX,
     },
-    gsi, stream_checkpoint,
+    stream_checkpoint,
 };
 
 // Persisted identifiers are open-ended strings, validated when the row is
@@ -199,11 +199,15 @@ impl KvSystemWriteState {
         &mut self,
         attempt: &A,
         routing_key: &[u8],
-    ) -> StorageResult<SystemStreamPosition> {
+    ) -> StorageResult<(SystemStreamScope, SystemStreamPosition)> {
+        let scope = self.history.as_ref().source_scope().clone();
         if self.is_commit_ordered {
             let ordinal = self.native_ordinal;
             self.native_ordinal = ordinal.checked_add(1).ok_or_else(unavailable)?;
-            return self.history.pending_commit_position(routing_key, ordinal);
+            return Ok((
+                scope,
+                self.history.pending_commit_position(routing_key, ordinal)?,
+            ));
         }
         let allocation = self.history.reserve_write(routing_key)?;
         let key = segmented_key(SEQUENCE_PREFIX, allocation.position.shard_id().as_str())?;
@@ -212,14 +216,13 @@ impl KvSystemWriteState {
                 return Err(unavailable());
             }
             row.next_offset = allocation.next_offset.get();
-            return Ok(allocation.position);
+            return Ok((scope, allocation.position));
         }
         let bytes = attempt
             .get(&key, ReadProtection::Conflict)
             .await?
             .ok_or_else(unavailable)?;
         let row: SequenceRow = storage_serde::from_bytes(&bytes).map_err(|_| unavailable())?;
-        let scope = self.history.as_ref().source_scope();
         if row.scope_id != scope.scope_id().as_str()
             || row.generation != scope.generation()
             || row.shard_id != allocation.position.shard_id().as_str()
@@ -232,7 +235,7 @@ impl KvSystemWriteState {
             ..row
         };
         self.sequences.push((key, row));
-        Ok(allocation.position)
+        Ok((scope, allocation.position))
     }
 
     pub(crate) fn drain_mutations(&mut self) -> StorageResult<Vec<KvMutation>> {
@@ -281,22 +284,6 @@ pub(crate) async fn read_history_protected<A: KvAttempt>(
 
 /// Keep catalog, checkpoint, and private hold observations in the caller's
 /// protected attempt. The shared history model owns all trim decisions.
-pub(crate) async fn load_trim_boundaries<A: KvAttempt>(
-    attempt: &mut A,
-    request: &SystemStreamTrimPageRequest,
-) -> StorageResult<Vec<SystemStreamPosition>> {
-    let (_, history) = read_history_protected(attempt).await?;
-    history
-        .validate_scope(request.scope())
-        .map_err(|_| unavailable())?;
-    let lineages = history.trim_hold_probes().map_err(|_| unavailable())?;
-    let (frontiers, minima) =
-        gsi::load_trim_protection_rows(attempt, request.scope(), &lineages).await?;
-    history
-        .trim_boundaries(request, &frontiers, &minima)
-        .map_err(|_| unavailable())
-}
-
 /// Discovery needs one coherent read snapshot but does not commit a write.
 pub(crate) async fn read_history_for_catalog<A: KvAttempt>(
     attempt: &A,
@@ -314,14 +301,10 @@ pub(crate) async fn read_history_for_catalog<A: KvAttempt>(
 pub(crate) async fn read_page_start<A: KvAttempt>(
     attempt: &A,
     token: Option<&SystemStreamCheckpointToken>,
+    protection: ReadProtection,
 ) -> StorageResult<(SystemStreamHistory, Option<SystemStreamCheckpointReceipt>)> {
-    let (_, history, receipt) = read_history_with_protection(
-        attempt,
-        ReadProtection::Conflict,
-        ReadProtection::Conflict,
-        token,
-    )
-    .await?;
+    let (_, history, receipt) =
+        read_history_with_protection(attempt, protection, protection, token).await?;
     Ok((history, receipt))
 }
 

@@ -83,15 +83,12 @@ pub(crate) struct PreparedPrimaryWrite {
     statement: SqlStatement,
     revision_bind: usize,
     tombstone: SqlStatement,
-    image: stream_provider::retained_image::AcceptedImagePlan,
-    owner: stream_provider::retained_image::PrimaryImageOwner,
+    image: Vec<u8>,
 }
 
 impl PreparedPrimaryWrite {
     pub(crate) fn try_new(engine: impl SqlLayout, item: UpsertImage<'_>) -> StorageResult<Self> {
-        let owner =
-            stream_provider::retained_image::PrimaryImageOwner::try_new(item.table, item.key)?;
-        let image = stream_provider::retained_image::AcceptedImagePlan::try_new(
+        let image = storage_types::MaterializedItemRecord::encode(
             item.table.history_id,
             item.new_item,
             item.declaration,
@@ -107,7 +104,6 @@ impl PreparedPrimaryWrite {
             revision_bind,
             tombstone,
             image,
-            owner,
         })
     }
 
@@ -115,15 +111,11 @@ impl PreparedPrimaryWrite {
         self.history_id == item.table.history_id && self.key == item.key
     }
 
-    pub(crate) async fn prepare<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    pub(crate) fn prepare(
         self,
-        attempt: &mut A,
         effects: &ItemPrimaryEffects,
-        previous: Option<&storage_types::VerifiedWireItem>,
     ) -> StorageResult<(SqlStatement, SqlStatement)> {
-        let image = self.image.prepare(attempt).await?;
-        self.owner.replace(attempt, previous, &image).await?;
-        let image = image.encode()?;
+        let image = self.image;
         let (sql, mut binds) = self.statement.into_parts();
         binds[self.revision_bind + 4] = SqlValue::Blob(image);
         binds[self.revision_bind] = SqlValue::Integer(i64::try_from(effects.revision())?);
@@ -165,7 +157,7 @@ fn encode_primary_upsert(
     );
     let count = columns
         .len()
-        .checked_add(6)
+        .checked_add(5)
         .and_then(|count| count.checked_add(table.max_indexers.as_usize()))
         .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
     let mut row = InsertRow::try_new(engine, count)?;
@@ -176,7 +168,7 @@ fn encode_primary_upsert(
         row.push(column.into(), None, SqlValue::Null);
     }
     row.append_item_payload(&item, &attributes)?;
-    let physical = engine.item_table_name(&table.table_name, item.table.history_id);
+    let physical = engine.item_table_name(item.table.history_id);
     Ok((row.finish(&physical, &table.key_schema)?, revision_bind))
 }
 
@@ -243,12 +235,7 @@ impl<L: SqlLayout> InsertRow<L> {
             None,
             SqlValue::Integer(i64::from(item.item_size)),
         );
-        self.push("item_descriptor".into(), None, SqlValue::Null);
-        self.push(
-            "__aux_indexers".into(),
-            None,
-            SqlValue::Text(serde_json::to_string(item.declaration.names())?),
-        );
+        self.push("item_value".into(), None, SqlValue::Null);
         for ordinal in 0..table.max_indexers.as_usize() {
             let value = match item
                 .declaration

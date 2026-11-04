@@ -45,7 +45,7 @@ pub(crate) enum ImportAuthority {
 /// Validate deterministic child content against the immutable victim, never
 /// against the receiver's current winner or current schema.
 pub(super) async fn verify_expiration<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,
@@ -53,15 +53,20 @@ pub(super) async fn verify_expiration<
         &CanonicalEvent,
         &CanonicalJsonCodec,
         &crate::journal::PreparedImportEvents,
+        storage_types::TableHistoryId,
     ),
 ) -> StorageResult<()> {
-    let (event, codec, inventory) = input;
-    let CanonicalEventId::Expiration { victim, .. } = &event.as_ref().id else {
+    let (event, codec, inventory, history) = input;
+    if !matches!(event.as_ref().id, CanonicalEventId::Expiration { .. }) {
         return Ok(());
+    }
+    let CanonicalPayload::Item(item) = &event.as_ref().payload else {
+        return Err(corrupt_record());
     };
+    let victim = &item.version;
     if matches!(victim, VersionIdentity::Baseline { .. }) {
         let baseline = journal
-            .load_baseline(attempt, victim, codec)
+            .load_baseline(attempt, (history, victim), codec)
             .await?
             .ok_or_else(victim_unavailable)?;
         let (identity, child) = baseline
@@ -84,7 +89,7 @@ pub(super) async fn verify_expiration<
     let accepted = match inventory.observed_acceptance(&identity) {
         Some(accepted) => accepted,
         None => journal
-            .load_acceptance(attempt, &identity, codec)
+            .load_acceptance(attempt, (history, &identity), codec)
             .await?
             .ok_or_else(victim_unavailable)?,
     };

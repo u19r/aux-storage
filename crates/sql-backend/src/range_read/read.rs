@@ -4,7 +4,7 @@ use storage_provider::{
     BoundRangeReadPage, BoundRangeReadPlan, DynamoRangeReadAttempt, GsiReadinessSnapshot,
     PrimaryStateRow, PrimaryStateScan, PrimaryStateScanAttempt, RangeReadItem, RangeReadPage,
 };
-use storage_types::{BoundTableInfo, IndexName, StorageError, StorageResult};
+use storage_types::{BoundTableInfo, IndexName, StorageResult};
 
 use super::{
     decode::{RangeDecode, decode_range_rows},
@@ -141,42 +141,29 @@ impl<A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'_, A, L> {
             .await?;
         let hydrated = if let Some(image_column) = P::IMAGE_COLUMN {
             let offset = input.columns.len() + 1 + image_column;
-            if let Some(index) = input.bound.index.as_ref() {
-                let incarnation = input.incarnation.ok_or_else(|| {
-                    StorageError::internal("SQL projection page has no index incarnation")
-                })?;
-                crate::gsi::hydrate_projection_page(
-                    self,
-                    &mut fetched,
-                    crate::gsi::ProjectionPageScope {
-                        table: input.table,
-                        index: &index.index_name,
-                        incarnation,
-                        image_column: offset,
-                    },
-                )
-                .await?
+            crate::item_read::select_image_prefix(
+                input.table,
+                &mut fetched,
+                offset,
+                RANGE_PAGE_READ_BYTES.get(),
+            )?;
+            let capacity = if input.bound.index.is_some() {
+                storage_types::MaxIndexers::ZERO
             } else {
-                crate::item_read::select_image_prefix(
-                    input.table,
-                    &mut fetched,
-                    offset,
-                    RANGE_PAGE_READ_BYTES.get(),
-                )?;
-                let requests = fetched
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        Ok((
-                            input.table,
-                            Some(row.value(crate::ColumnIndex::new(offset))?),
-                            input.table.max_indexers,
-                        ))
-                    })
-                    .collect::<StorageResult<Vec<_>>>()?;
-                crate::item_read::hydrate_item_images(self, requests, RANGE_PAGE_READ_BYTES.get())
-                    .await?
-            }
+                input.table.max_indexers
+            };
+            let requests = fetched
+                .rows
+                .iter()
+                .map(|row| {
+                    Ok((
+                        input.table,
+                        Some(row.value(crate::ColumnIndex::new(offset))?),
+                        capacity,
+                    ))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            crate::item_read::decode_item_images(self, requests, RANGE_PAGE_READ_BYTES.get())?
         } else {
             fetched.rows.iter().map(|_| None).collect()
         };

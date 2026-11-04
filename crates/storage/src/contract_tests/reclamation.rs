@@ -30,8 +30,8 @@ async fn given_expired_candidate_when_ttl_changes_then_newer_item_survives() {
 }
 
 #[tokio::test]
-async fn given_live_hold_when_trim_races_split_then_history_survives_until_release() {
-    assert_stream_reclamation_hold_race(
+async fn given_checkpoint_when_trim_races_split_then_checkpoint_does_not_delay_retirement() {
+    assert_stream_reclamation_checkpoint_race(
         StatefulTestBackend::sqlite()
             .await
             .expect("construct SQLite stateful fixture"),
@@ -41,8 +41,9 @@ async fn given_live_hold_when_trim_races_split_then_history_survives_until_relea
 
 #[cfg(feature = "turso")]
 #[tokio::test]
-async fn given_live_hold_on_turso_when_trim_races_split_then_history_survives_until_release() {
-    assert_stream_reclamation_hold_race(
+async fn given_checkpoint_on_turso_when_trim_races_split_then_checkpoint_does_not_delay_retirement()
+{
+    assert_stream_reclamation_checkpoint_race(
         StatefulTestBackend::turso()
             .await
             .expect("construct Turso stateful fixture"),
@@ -52,8 +53,9 @@ async fn given_live_hold_on_turso_when_trim_races_split_then_history_survives_un
 
 #[cfg(feature = "rocksdb")]
 #[tokio::test]
-async fn given_live_hold_on_rocksdb_when_trim_races_split_then_history_survives_until_release() {
-    assert_stream_reclamation_hold_race(
+async fn given_checkpoint_on_rocksdb_when_trim_races_split_then_checkpoint_does_not_delay_retirement()
+ {
+    assert_stream_reclamation_checkpoint_race(
         StatefulTestBackend::rocksdb()
             .await
             .expect("construct RocksDB stateful fixture"),
@@ -64,73 +66,62 @@ async fn given_live_hold_on_rocksdb_when_trim_races_split_then_history_survives_
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore = "requires a configured external database service"]
-async fn given_live_hold_on_postgres_when_trim_races_split_then_history_survives_until_release() {
+async fn given_checkpoint_on_postgres_when_trim_races_split_then_checkpoint_does_not_delay_retirement()
+ {
     let fixture = StatefulTestBackend::postgres()
         .await
         .expect("construct Postgres stateful fixture")
         .expect("Postgres stateful fixture requires a configured test DSN");
-    assert_stream_reclamation_hold_race(fixture).await;
+    assert_stream_reclamation_checkpoint_race(fixture).await;
 }
 
 #[cfg(feature = "foundationdb")]
 #[tokio::test]
 #[ignore = "requires a configured external database service"]
-async fn given_live_hold_on_foundationdb_when_trim_races_split_then_history_survives_until_release()
-{
+async fn given_checkpoint_on_foundationdb_when_trim_races_split_then_checkpoint_does_not_delay_retirement()
+ {
     let fixture = StatefulTestBackend::foundationdb()
         .await
         .expect("construct FoundationDB stateful fixture")
         .expect("FoundationDB stateful fixture requires a configured cluster file");
-    assert_stream_reclamation_hold_race(fixture).await;
+    assert_stream_reclamation_checkpoint_race(fixture).await;
 }
 
-async fn assert_stream_reclamation_hold_race(fixture: StatefulTestBackend) {
+async fn assert_stream_reclamation_checkpoint_race(fixture: StatefulTestBackend) {
     fixture
-        .establish_stream_reclamation_hold("reclamation_hold_race")
+        .establish_stream_reclamation_checkpoint("reclamation_checkpoint_race")
         .await
-        .expect("establish protected SystemStream history");
-
+        .expect("establish qualified SystemStream checkpoint");
     let before = fixture
-        .read_system_history_ids()
+        .read_system_history_positions()
         .await
-        .expect("physical history before trim");
-    let protected_record = *before.first().expect("eligible protected record");
-    let reclaimed_while_held = fixture
+        .expect("source history before trim");
+    assert_eq!(before.len(), 4);
+    let reclaimed = fixture
         .race_stream_trim_and_split()
         .await
-        .expect("split and trim race must serialize safely");
-    assert_eq!(reclaimed_while_held, 0);
+        .expect("split and trim must serialize safely");
+    assert_eq!(
+        reclaimed, 4,
+        "reader checkpoints cannot delay source retirement"
+    );
     assert!(
         fixture
-            .read_held_system_stream()
+            .read_system_history_positions()
             .await
-            .expect("retained history must remain readable")
-            > 0
+            .expect("fresh source history")
+            .is_empty()
     );
-
+    assert!(
+        fixture.read_checkpoint_system_stream().await.is_err(),
+        "retired checkpoint must report a gap"
+    );
     assert_eq!(
         fixture
-            .read_system_history_ids()
+            .read_reclamation_table_records()
             .await
-            .expect("held physical history"),
-        before,
-        "the same physical records must survive the hold and split"
-    );
-    fixture
-        .release_stream_reclamation_hold()
-        .await
-        .expect("release protected SystemStream history");
-    let reclaimed_after_release = fixture
-        .trim_released_system_stream()
-        .await
-        .expect("released history must become reclaimable");
-    assert!(reclaimed_after_release > 0);
-    assert!(
-        !fixture
-            .read_system_history_ids()
-            .await
-            .expect("released physical history")
-            .contains(&protected_record),
-        "the exact record protected before release must now be reclaimed"
+            .expect("independent table history"),
+        4,
+        "system retirement must preserve longer table history and its item bodies"
     );
 }

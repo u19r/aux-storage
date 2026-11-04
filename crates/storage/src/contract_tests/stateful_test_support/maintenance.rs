@@ -12,7 +12,7 @@ use bg_jobs_tokio::{
 use queue_provider::{QueueMessageCleanupHandler, QueueMessageCleanupRepository};
 use scheduled_bg_jobs::{
     DriveBudget, DriveBudgetInput, DriveStopReason, EffectMode, EnqueueOptions, FairnessClass,
-    FairnessPolicy, JobCatalog, JobHandler, JobId, JobSpec, Namespace, OwnerId, QueueSelection,
+    FairnessPolicy, JobCatalog, JobHandler, JobSpec, Namespace, OwnerId, QueueSelection,
     RetryPreset, RetrySelection, Timestamp, runtime::MonotonicDeadline,
 };
 use storage_backfill::GsiPageLimit;
@@ -61,7 +61,7 @@ impl MaintenanceHarness {
                 .repository
                 .advance_expiration(ExpirationRequest {
                     destination: self.expiration_namespace.clone(),
-                    job: JobId::from(md5::compute(StorageJob::TtlSweep.as_str().as_bytes()).0),
+                    job: StorageJob::TtlSweep.job_id(),
                     fence: NonZeroU64::MIN,
                     requested_cutoff: TimestampMillis::from_timestamp(1_800_000_000_000),
                     candidate_limit: NonZeroUsize::new(256).expect("positive fixture page limit"),
@@ -90,6 +90,7 @@ impl MaintenanceHarness {
         let clock = TestClock::new(CLOCK_START, MonotonicDeadline::ZERO);
         let faults = Arc::new(ExpirationFaults::default());
         let MaintenanceRepositories {
+            stream_initialization_repository,
             expiration_repository,
             gsi_build_repository,
             partition_reconciliation_repository: _,
@@ -122,7 +123,7 @@ impl MaintenanceHarness {
         )?;
         let gsi_owner = Self::gsi_runtime(
             store.clone(),
-            gsi_build_repository,
+            (gsi_build_repository, stream_initialization_repository),
             Self::namespace(StorageJob::GsiBackfill)?,
             clock.clone(),
             3,
@@ -356,19 +357,26 @@ impl MaintenanceHarness {
 
     fn gsi_runtime(
         store: ScheduledJobStore,
-        repository: Arc<dyn GsiBuildRepository>,
+        repositories: (
+            Arc<dyn GsiBuildRepository>,
+            Arc<dyn storage_provider::TableStreamInitializationRepository>,
+        ),
         namespace: Namespace,
         clock: TestClock,
         owner: u8,
     ) -> StorageResult<Arc<JobRuntime<ScheduledJobStore>>> {
         let job = StorageJob::GsiBackfill;
-        let job_id = JobId::from(md5::compute(job.as_str().as_bytes()).0);
         let page_limit = GsiPageLimit::try_from(1usize)
             .map_err(|error| StorageError::validation(error.to_string()))?;
-        let handler = GsiBuildHandler::try_new(repository, EXPIRATION_INTERVAL, page_limit)?;
+        let handler = GsiBuildHandler::try_new(
+            repositories.0,
+            repositories.1,
+            EXPIRATION_INTERVAL,
+            page_limit,
+        )?;
         Self::job_runtime(
             store,
-            Self::catalog(job, job_id, handler)?,
+            Self::catalog(job, handler)?,
             job,
             namespace,
             clock,
@@ -384,7 +392,6 @@ impl MaintenanceHarness {
         owner: u8,
     ) -> StorageResult<Arc<JobRuntime<ScheduledJobStore>>> {
         let job = StorageJob::QueueMessageCleanup;
-        let job_id = JobId::from(md5::compute(job.as_str().as_bytes()).0);
         let handler = QueueMessageCleanupHandler::try_new(
             repository,
             EXPIRATION_INTERVAL,
@@ -392,7 +399,7 @@ impl MaintenanceHarness {
         )?;
         Self::job_runtime(
             store,
-            Self::catalog(job, job_id, handler)?,
+            Self::catalog(job, handler)?,
             job,
             namespace,
             clock,
@@ -408,11 +415,10 @@ impl MaintenanceHarness {
         owner: u8,
     ) -> StorageResult<Arc<JobRuntime<ScheduledJobStore>>> {
         let job = StorageJob::TtlSweep;
-        let job_id = JobId::from(md5::compute(job.as_str().as_bytes()).0);
         let handler = ExpirationHandler::try_new(repository, EXPIRATION_INTERVAL)?;
         Self::job_runtime(
             store,
-            Self::catalog(job, job_id, handler)?,
+            Self::catalog(job, handler)?,
             job,
             namespace,
             clock,
@@ -448,12 +454,15 @@ impl MaintenanceHarness {
         Ok(Arc::new(runtime))
     }
 
-    fn catalog<H: JobHandler>(
-        job: StorageJob,
-        job_id: JobId,
-        handler: H,
-    ) -> StorageResult<JobCatalog> {
-        let mut catalog = JobCatalog::new();
+    fn catalog<H: JobHandler>(job: StorageJob, handler: H) -> StorageResult<JobCatalog> {
+        let mut catalog = JobCatalog::new().with_manifest(
+            scheduled_bg_jobs::CatalogManifest::try_new(
+                scheduled_bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+                vec![job.job_id()],
+                Vec::new(),
+            )
+            .expect("complete fixture catalog manifest"),
+        );
         catalog
             .register_seeded(
                 JobSpec::unit(job.kind(), NonZeroU16::MIN, job.queue(), handler).policy(
@@ -464,7 +473,7 @@ impl MaintenanceHarness {
                 ),
                 (),
                 EnqueueOptions::new(FairnessClass::low_volume())
-                    .job_id(job_id)
+                    .job_id(job.job_id())
                     .scheduled_at(CLOCK_START),
                 CLOCK_START,
             )

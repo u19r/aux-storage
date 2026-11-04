@@ -1,7 +1,7 @@
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
 use replication_types::configuration::proposal::ControlProposal;
 use storage_provider::DynamoAttempt;
-use storage_types::{ReadProtection, StorageResult, TimestampMillis};
+use storage_types::{ReadProtection, StorageResult};
 
 use super::record::SealPhase;
 use crate::{
@@ -12,12 +12,12 @@ use crate::{
 impl JournalStore {
     /// Global completion certifies every installation, including survivor seal
     /// vectors. Native deletion only retires this exact physical incarnation;
-    /// the ordinary reclamation job remains the single physical cleanup owner.
+    /// the reclamation job must complete regional/archive cleanup before native
+    /// table-family cleanup can start.
     pub(crate) async fn retire_removed_table<A: PhysicalRecordAttempt + DynamoAttempt>(
         &self,
         attempt: &mut A,
         proposal: &ControlProposal,
-        now: TimestampMillis,
     ) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -67,7 +67,7 @@ impl JournalStore {
                 return Err(corrupt_record());
             }
             let table = attempt.read_table_at_stamp(&expected.name, stamp).await?;
-            attempt.delete_table_layout(&table, now).await?;
+            storage_provider::retire_table_in_attempt(attempt, &table).await?;
             root.phase = SealPhase::Retired;
             self.store_table_seal(attempt, &root, Some(row.revision))
                 .await

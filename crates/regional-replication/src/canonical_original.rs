@@ -78,15 +78,6 @@ impl<'original> CanonicalOriginalRef<'original> {
             WinnerOrder::Baseline { .. } => None,
         }
     }
-    pub(crate) fn item_observations(self) -> Option<bool> {
-        match self {
-            Self::Received(event) => match &event.as_ref().payload {
-                CanonicalPayload::Item(item) => Some(!item.observations.is_empty()),
-                _ => None,
-            },
-            Self::Authored(event) => Some(event.has_observations()),
-        }
-    }
     pub(crate) fn publication(self) -> CanonicalPublication<'original> {
         match self {
             Self::Received(event) => event.into(),

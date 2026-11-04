@@ -131,10 +131,9 @@ async fn given_missing_item_when_batch_and_transaction_delete_it_then_cdc_waits_
             Some(&table)
         );
         assert_eq!(
-            serde_json::to_value(&resumed.records()[0].new_image).unwrap(),
+            serde_json::to_value(&resumed.records()[0].item).unwrap(),
             image
         );
-        assert!(resumed.records()[0].old_image.is_none());
     })
     .catch_unwind()
     .await;
@@ -145,9 +144,9 @@ async fn given_missing_item_when_batch_and_transaction_delete_it_then_cdc_waits_
 }
 
 // Business rule: a table without DynamoDB Streams stays undiscoverable after
-// a write, while the replacement store still records that write internally.
+// a write and emits no internal mutation history.
 #[tokio::test]
-async fn given_stream_disabled_table_when_item_is_put_then_public_stream_stays_disabled_and_internal_cdc_records_it()
+async fn given_stream_disabled_table_when_item_is_put_then_public_stream_stays_disabled_and_no_history_is_emitted()
  {
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
@@ -194,16 +193,7 @@ async fn given_stream_disabled_table_when_item_is_put_then_public_stream_stays_d
         .await;
         internal.assert_no_warning_or_error();
         let internal = internal.result.unwrap();
-        assert_eq!(internal.records().len(), 1);
-        assert_eq!(
-            internal.records()[0].source_table_name.as_ref(),
-            Some(&disabled)
-        );
-        assert_eq!(
-            serde_json::to_value(&internal.records()[0].new_image).unwrap(),
-            item
-        );
-        assert!(internal.records()[0].old_image.is_none());
+        assert!(internal.records().is_empty());
         assert!(internal.terminal());
         let checkpoint = internal.issued_checkpoint().token().clone();
 
@@ -251,7 +241,7 @@ async fn given_stream_disabled_table_when_item_is_put_then_public_stream_stays_d
             Some(&enabled)
         );
         assert_eq!(
-            serde_json::to_value(&resumed.records()[0].new_image).unwrap(),
+            serde_json::to_value(&resumed.records()[0].item).unwrap(),
             enabled_item,
         );
     })

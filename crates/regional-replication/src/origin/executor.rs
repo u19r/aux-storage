@@ -7,11 +7,13 @@ use serde::Serialize;
 use storage_common::retry::retry_native_conflicts;
 use storage_provider::{
     BoundItemWrite, DYNAMO_WRITE_RETRY, DynamoItemWriteShape, DynamoPort, ItemWriteCause,
-    resolve_table_in_attempt,
 };
 use storage_types::{AttemptMode, ItemProvenance, StorageError};
 
-use super::receipt::{OriginOperationReceipt, RecoveryOperation};
+use super::{
+    receipt::{OriginOperationReceipt, RecoveryOperation},
+    response_scope::{OperationReceiptState, OriginItemResponse, ReceiptDataOwner},
+};
 use crate::{
     journal::{
         JournalStore,
@@ -40,7 +42,7 @@ pub(crate) async fn execute_item_write<P: DynamoPort, S: DynamoItemWriteShape>(
 ) -> Result<<S::Bound as BoundItemWrite>::Response, OriginFailure>
 where
     for<'native> P::Attempt<'native>: PhysicalRecordAttempt,
-    <S::Bound as BoundItemWrite>::Response: Serialize + Sync,
+    <S::Bound as BoundItemWrite>::Response: OriginItemResponse + Sync,
 {
     execute_operation(port, execution, ItemOperation(shape)).await
 }
@@ -53,12 +55,35 @@ pub(super) struct OriginAttemptContext {
     pub operation: replication_types::identity::resource::OperationIdentity,
     pub created_at: storage_types::TimestampMillis,
     pub wall_ms: u64,
+    pub bindings: storage_provider::RequestTableBindings,
+}
+
+impl OriginAttemptContext {
+    pub(super) fn try_new<P: DynamoPort>(
+        port: &P,
+        execution: OriginExecution,
+        operation: replication_types::identity::resource::OperationIdentity,
+    ) -> storage_types::StorageResult<Self> {
+        let created_at = port.now();
+        let wall_ms = u64::try_from(created_at.timestamp_millis()).map_err(|_| corrupt_record())?;
+        Ok(Self {
+            journal: execution.journal,
+            codec: execution.codec,
+            cache: port.metadata_cache(),
+            clock: port.clock(),
+            operation,
+            created_at,
+            wall_ms,
+            bindings: storage_provider::RequestTableBindings::default(),
+        })
+    }
 }
 
 pub(super) struct OriginAttemptOutput<R> {
     pub response: R,
     pub publications: Vec<storage_provider::CachePublication>,
-    pub events: Vec<replication_types::event::identity::CanonicalEventId>,
+    pub has_captured: bool,
+    pub owners: Vec<ReceiptDataOwner>,
 }
 
 pub(super) trait OriginOperation: Clone + Send + 'static {
@@ -85,22 +110,11 @@ where
         identity: replication_types::identity::resource::OperationIdentity::fresh(),
         kind: O::KIND,
     };
-    let cache = port.metadata_cache();
-    let publication_cache = Arc::clone(&cache);
-    let created_at = port.now();
-    let wall_ms = u64::try_from(created_at.timestamp_millis()).map_err(|_| OriginFailure {
-        recovery,
-        error: corrupt_record(),
-    })?;
-    let context = Arc::new(OriginAttemptContext {
-        journal: execution.journal,
-        codec: execution.codec,
-        cache,
-        clock: port.clock(),
-        operation: recovery.identity(),
-        created_at,
-        wall_ms,
-    });
+    let context = Arc::new(
+        OriginAttemptContext::try_new(port, execution, recovery.identity())
+            .map_err(|error| OriginFailure { recovery, error })?,
+    );
+    let publication_cache = Arc::clone(&context.cache);
     let result = retry_native_conflicts(port, DYNAMO_WRITE_RETRY, || {
         let operation = operation.clone();
         let context = Arc::clone(&context);
@@ -108,7 +122,7 @@ where
             port.with_dynamo_attempt(AttemptMode::ReadWriteItems, move |attempt| {
                 Box::pin(async move {
                     let output = operation.execute(attempt, &context).await?;
-                    if !output.events.is_empty() {
+                    if output.has_captured {
                         context
                             .journal
                             .store_operation_receipt(
@@ -117,7 +131,8 @@ where
                                     operation: context.operation,
                                     cause: O::KIND,
                                     response: &output.response,
-                                    events: output.events,
+                                    owners: output.owners,
+                                    state: OperationReceiptState::Complete,
                                 },
                             )
                             .await?;
@@ -140,10 +155,10 @@ where
 }
 
 #[derive(Clone)]
-struct ItemOperation<S>(S);
+pub(super) struct ItemOperation<S>(pub(super) S);
 
 impl<S: DynamoItemWriteShape> OriginOperation for ItemOperation<S>
-where <S::Bound as BoundItemWrite>::Response: Serialize + Sync
+where <S::Bound as BoundItemWrite>::Response: OriginItemResponse + Sync
 {
     type Response = <S::Bound as BoundItemWrite>::Response;
     const KIND: super::receipt::OriginOperationKind =
@@ -155,8 +170,10 @@ where <S::Bound as BoundItemWrite>::Response: Serialize + Sync
         context: &OriginAttemptContext,
     ) -> storage_types::StorageResult<OriginAttemptOutput<Self::Response>> {
         let shape = self.0;
-        let (table, publication) =
-            resolve_table_in_attempt(attempt, &context.cache, shape.table_name()).await?;
+        let (table, publication) = context
+            .bindings
+            .resolve_table(attempt, &context.cache, shape.table_name())
+            .await?;
         let configured = context.journal.load_capture_state(attempt, &table).await?;
         context
             .journal
@@ -198,19 +215,27 @@ where <S::Bound as BoundItemWrite>::Response: Serialize + Sync
             }
             None => Vec::new(),
         };
-        let events = captured
-            .iter()
-            .map(|mutation| mutation.event.clone())
-            .collect();
+        let has_captured = !captured.is_empty();
         let provenance = captured
             .pop()
             .map_or_else(ItemProvenance::default, |mutation| mutation.provenance);
         let outcome =
             S::Bound::apply_accepted(attempt, accepted, context.created_at, provenance).await?;
+        let response = S::Bound::finish(outcome)?;
+        let owners = if has_captured && response.has_item_data() {
+            let state = configured.as_ref().ok_or_else(corrupt_record)?.state();
+            vec![ReceiptDataOwner {
+                table: state.name.clone(),
+                physical: state.physical,
+            }]
+        } else {
+            Vec::new()
+        };
         Ok(OriginAttemptOutput {
-            response: S::Bound::finish(outcome)?,
+            response,
             publications: publication.into_iter().collect(),
-            events,
+            has_captured,
+            owners,
         })
     }
 }

@@ -19,6 +19,7 @@ struct QueueServer {
     child: Child,
     client: Client,
     base_url: String,
+    _directory: tempfile::TempDir,
 }
 
 impl QueueServer {
@@ -26,54 +27,82 @@ impl QueueServer {
         let port = reserve_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let mut command = Command::new(env!("CARGO_BIN_EXE_queue"));
+        let directory = tempfile::tempdir().expect("queue HTTP fixture directory");
         let storage = queue_fixture_storage();
-        let postgres_dsn = match queue_fixture_postgres_dsn() {
-            Some(base_dsn) => Some(queue_fixture_isolated_postgres_dsn(&base_dsn).await),
-            None => None,
-        };
-        command.arg("--port").arg(port.to_string());
-        if let Some(db_path) = queue_fixture_db_path() {
-            command.arg("--db-path").arg(db_path);
-        }
-        if let Some(storage) = storage {
-            command.arg("--storage").arg(storage);
-        }
-        if let Some(postgres_dsn) = postgres_dsn {
-            command
-                .arg("--postgres-dsn")
-                .arg(postgres_dsn)
-                .arg("--overrides")
-                .arg("features.backends.postgres.tls=false");
+        command
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--storage")
+            .arg(storage);
+        match storage {
+            "postgres" => {
+                let dsn = std::env::var("TEST_POSTGRES_DSN")
+                    .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
+                    .expect("TEST_POSTGRES_DSN or AUX_QUEUE_POSTGRES_DSN is required");
+                command
+                    .arg("--postgres-dsn")
+                    .arg(queue_fixture_isolated_postgres_dsn(&dsn).await)
+                    .arg("--overrides")
+                    .arg("features.backends.postgres.tls=false");
+            }
+            "foundationdb" => {
+                command
+                    .arg("--foundationdb-cluster-file")
+                    .arg(
+                        std::env::var("FDB_CLUSTER_FILE")
+                            .expect("owned FDB_CLUSTER_FILE is required"),
+                    )
+                    .arg("--foundationdb-subspace-prefix")
+                    .arg(format!("tests/queue-http/{}/", uuid::Uuid::now_v7()));
+            }
+            "rocksdb" => {
+                command
+                    .arg("--db-path")
+                    .arg(directory.path().join("queue.rocksdb"));
+            }
+            _ => {
+                command.arg("--db-path").arg(":memory:");
+            }
         }
         let child = command
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn queue server");
         let client = Client::new();
 
-        let server = Self {
+        let mut server = Self {
             child,
             client,
             base_url,
+            _directory: directory,
         };
         server.wait_until_ready().await;
         server
     }
 
-    async fn wait_until_ready(&self) {
-        for _ in 0..80 {
+    async fn wait_until_ready(&mut self) {
+        // This bounds a hung fixture; it is not a startup-latency assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("inspect queue server") {
+                panic!("queue server exited before readiness: {status}");
+            }
             let response = self
                 .client
                 .get(format!("{}/health", self.base_url))
+                .timeout(Duration::from_secs(5))
                 .send()
                 .await;
             if response.is_ok_and(|resp| resp.status().is_success()) {
                 return;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "queue server readiness fixture timed out"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("queue server did not become ready");
     }
 
     async fn post(&self, target: &str, payload: Value) -> reqwest::Response {
@@ -98,73 +127,22 @@ impl QueueServer {
     }
 }
 
-fn queue_fixture_storage() -> Option<&'static str> {
-    #[cfg(all(feature = "turso", not(feature = "sqlite")))]
-    {
-        Some("turso")
-    }
-    #[cfg(all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    ))]
-    {
-        Some("postgres")
-    }
-    #[cfg(not(any(
-        all(feature = "turso", not(feature = "sqlite")),
-        all(
-            feature = "postgres",
-            not(feature = "sqlite"),
-            not(feature = "turso"),
-            not(feature = "rocksdb"),
-            not(feature = "foundationdb")
-        )
-    )))]
-    {
-        None
-    }
+fn queue_fixture_storage() -> &'static str {
+    let compiled = [
+        ("sqlite", cfg!(feature = "sqlite")),
+        ("turso", cfg!(feature = "turso")),
+        ("postgres", cfg!(feature = "postgres")),
+        ("rocksdb", cfg!(feature = "rocksdb")),
+        ("foundationdb", cfg!(feature = "foundationdb")),
+    ];
+    let requested = std::env::var("AUX_QUEUE_CORRECTNESS_BACKEND").ok();
+    compiled
+        .into_iter()
+        .find(|(name, enabled)| *enabled && requested.as_deref().is_none_or(|value| value == *name))
+        .expect("queue HTTP tests require a compiled native backend")
+        .0
 }
 
-fn queue_fixture_db_path() -> Option<&'static str> {
-    (queue_fixture_storage() != Some("postgres")).then_some(":memory:")
-}
-
-#[cfg(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-))]
-fn queue_fixture_postgres_dsn() -> Option<String> {
-    Some(
-        std::env::var("TEST_POSTGRES_DSN")
-            .or_else(|_| std::env::var("AUX_QUEUE_POSTGRES_DSN"))
-            .expect("TEST_POSTGRES_DSN or AUX_QUEUE_POSTGRES_DSN is required"),
-    )
-}
-
-#[cfg(not(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-)))]
-fn queue_fixture_postgres_dsn() -> Option<String> {
-    None
-}
-
-#[cfg(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-))]
 async fn queue_fixture_isolated_postgres_dsn(base_dsn: &str) -> String {
     let schema = format!("queue_http_{}", uuid::Uuid::now_v7().simple());
     let (client, connection) = tokio_postgres::connect(base_dsn, tokio_postgres::NoTls)
@@ -179,37 +157,6 @@ async fn queue_fixture_isolated_postgres_dsn(base_dsn: &str) -> String {
         .expect("create isolated queue HTTP schema");
     let separator = if base_dsn.contains('?') { '&' } else { '?' };
     format!("{base_dsn}{separator}options=-csearch_path%3D{schema}")
-}
-
-#[cfg(not(all(
-    feature = "postgres",
-    not(feature = "sqlite"),
-    not(feature = "turso"),
-    not(feature = "rocksdb"),
-    not(feature = "foundationdb")
-)))]
-async fn queue_fixture_isolated_postgres_dsn(_base_dsn: &str) -> String {
-    unreachable!("Postgres fixture DSN is only available with the Postgres-only feature cell")
-}
-
-#[test]
-fn queue_http_fixture_selects_the_only_compiled_sql_backend() {
-    let expected_storage = if cfg!(all(feature = "turso", not(feature = "sqlite"))) {
-        Some("turso")
-    } else if cfg!(all(
-        feature = "postgres",
-        not(feature = "sqlite"),
-        not(feature = "turso"),
-        not(feature = "rocksdb"),
-        not(feature = "foundationdb")
-    )) {
-        Some("postgres")
-    } else {
-        None
-    };
-    assert_eq!(queue_fixture_storage(), expected_storage);
-    let expected_db_path = (expected_storage != Some("postgres")).then_some(":memory:");
-    assert_eq!(queue_fixture_db_path(), expected_db_path);
 }
 
 impl Drop for QueueServer {

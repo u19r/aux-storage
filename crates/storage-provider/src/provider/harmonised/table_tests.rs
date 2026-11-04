@@ -105,7 +105,6 @@ fn bare_table() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
-        default_item_stream_duration: StreamRetentionDuration::Forever,
         deletion_protection_enabled: false,
     }
 }
@@ -114,6 +113,7 @@ fn armed_table() -> StoredTableInfo {
     let mut table = bare_table();
     table.max_indexers = MaxIndexers::try_new(4).unwrap();
     table.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+        capture_for_build: false,
         index_name: IndexName::new("gsi1"),
         key_schema: vec![KeySchemaElement {
             attribute_name: "gsi_pk".to_owned(),
@@ -174,7 +174,6 @@ fn put_input(
         table: std::sync::Arc::new(table.clone()),
         stream: stream_context(),
         ttl_config,
-        item_stream_ttl_hours: None,
     }
 }
 
@@ -251,7 +250,6 @@ fn given_conditional_update_when_building_observation_contract_then_image_is_req
                 index: 0,
                 ttl_config: None,
                 ttl_context: ttl_context(),
-                item_stream_ttl_hours: None,
             },
         })
         .unwrap();
@@ -284,7 +282,6 @@ fn given_update_without_expression_when_building_observation_contract_then_image
                 index: 0,
                 ttl_config: None,
                 ttl_context: ttl_context(),
-                item_stream_ttl_hours: None,
             },
         })
         .unwrap();
@@ -334,7 +331,6 @@ fn given_update_without_expression_when_prepare_then_condition_only_update() {
                 index: 0,
                 ttl_config: None,
                 ttl_context: ttl.clone(),
-                item_stream_ttl_hours: None,
             },
         })
         .unwrap();
@@ -580,7 +576,6 @@ fn given_update_without_old_when_finish_then_key_seeded_image() {
                 index: 0,
                 ttl_config: None,
                 ttl_context: ttl.clone(),
-                item_stream_ttl_hours: None,
             },
         })
         .unwrap();
@@ -634,7 +629,6 @@ fn given_batch_when_execute_then_receipts_follow_ordinals() {
                     return_consumed_capacity: None,
                     return_item_collection_metrics: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 },
                 ttl_context(),
             )
@@ -642,7 +636,6 @@ fn given_batch_when_execute_then_receipts_follow_ordinals() {
             table: std::sync::Arc::new(table.clone()),
             stream: stream_context(),
             ttl_config: None,
-            item_stream_ttl_hours: None,
         }],
         Vec::new(),
     )
@@ -682,7 +675,6 @@ fn given_ttl_enabled_and_old_present_when_finish_delete_then_ttl_delete_planned(
                 return_consumed_capacity: None,
                 return_item_collection_metrics: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             },
             ttl_context(),
         )
@@ -690,7 +682,6 @@ fn given_ttl_enabled_and_old_present_when_finish_delete_then_ttl_delete_planned(
         table: std::sync::Arc::new(table.clone()),
         stream: stream_context(),
         ttl_config: Some(ttl_config()),
-        item_stream_ttl_hours: None,
     };
     let prepared = store.prepare_table_delete(input).unwrap();
     assert!(prepared.observation.requests_old_item());

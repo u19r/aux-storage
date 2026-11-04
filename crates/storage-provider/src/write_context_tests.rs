@@ -46,10 +46,6 @@ fn consumed_physical_write_mapping_preserves_payload_and_sidecars() {
         actual.request().return_values_on_condition_check_failure,
         expected.request().return_values_on_condition_check_failure
     );
-    assert_eq!(
-        actual.request().aux_item_stream_ttl_hours,
-        expected.request().aux_item_stream_ttl_hours
-    );
 }
 
 #[test]
@@ -111,7 +107,6 @@ fn physical_put_write(item: WireItem) -> PhysicalWrite<PutItemEncodeRequest, Ttl
         )])),
         return_values: None,
         return_old_on_condition_failure: true,
-        aux_item_stream_ttl_hours: None,
     };
     PhysicalWrite::try_new(7, table_name, request, context).unwrap()
 }
@@ -140,7 +135,6 @@ fn legacy_clone_map(
         expression_attribute_values,
         return_values,
         return_old_on_condition_failure,
-        aux_item_stream_ttl_hours,
     } = write.request().clone();
     PhysicalWrite::try_new(
         write.ordinal(),
@@ -159,7 +153,6 @@ fn legacy_clone_map(
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: return_old_on_condition_failure
                 .then(|| "ALL_OLD".to_string()),
-            aux_item_stream_ttl_hours,
         },
         write.context().clone(),
     )
@@ -178,7 +171,6 @@ fn consuming_map(
             expression_attribute_values,
             return_values,
             return_old_on_condition_failure,
-            aux_item_stream_ttl_hours,
         } = request;
         Ok(PutItemRequest {
             table_name,
@@ -194,7 +186,6 @@ fn consuming_map(
             return_item_collection_metrics: None,
             return_values_on_condition_check_failure: return_old_on_condition_failure
                 .then(|| "ALL_OLD".to_string()),
-            aux_item_stream_ttl_hours,
         })
     })
 }
@@ -265,7 +256,6 @@ fn alignment_put_item(table: TableName) -> storage_types::TransactWriteItem {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         update: None,
         delete: None,
@@ -335,7 +325,6 @@ fn given_aligned_batch_request_when_validated_then_accepts() {
                     put_request: Some(PutRequest {
                         item: WireItem::dynamo_json(b"{}".to_vec()),
                         indexers: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 },
@@ -343,7 +332,6 @@ fn given_aligned_batch_request_when_validated_then_accepts() {
                     put_request: Some(PutRequest {
                         item: WireItem::dynamo_json(b"{}".to_vec()),
                         indexers: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     delete_request: None,
                 },
@@ -394,7 +382,6 @@ fn given_aligned_encode_items_when_validated_then_accepts() {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         update: None,
         delete: None,

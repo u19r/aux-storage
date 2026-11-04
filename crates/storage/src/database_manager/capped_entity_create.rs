@@ -166,7 +166,6 @@ where T: SingleTableEntity + TryIntoWireItem {
             expression_attribute_names: None,
             expression_attribute_values: None,
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         ..Default::default()
     })
@@ -192,7 +191,6 @@ fn prepare_counter_create(
                 None,
             )),
             return_values_on_condition_check_failure: None,
-            aux_item_stream_ttl_hours: None,
         }),
         ..Default::default()
     }

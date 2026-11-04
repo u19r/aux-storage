@@ -9,10 +9,9 @@ use futures::FutureExt as _;
 use serde_json::{Value, json};
 use storage_observability_test_support::observation::observe;
 use storage_types::{
-    CreateTableRequest, GetItemRequest, KeyAttributes, PutItemRequest, StreamName, TableName,
+    CreateTableRequest, GetItemRequest, KeyAttributes, PutItemRequest, TableName,
     TransactWriteItemsRequest,
 };
-use stream_provider::StreamRowKind;
 use tracing::Level;
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
@@ -43,10 +42,9 @@ async fn given_failing_middle_check_when_transaction_runs_then_items_and_cdc_rem
             })).unwrap();
             store.operations.put_item(put).await.unwrap();
         }
-        let system_stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(system_stream.clone(), None, 10)
+        let before = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
-        assert_eq!(before.items.len(), 2);
+        assert_eq!(before.len(), 2);
 
         let request = TransactWriteItemsRequest::try_from(json!({
             "TransactItems": [
@@ -93,11 +91,11 @@ async fn given_failing_middle_check_when_transaction_runs_then_items_and_cdc_rem
             let actual = store.operations.get_item(get).await.unwrap();
             assert_eq!(serde_json::to_value(actual).unwrap(), expected);
         }
-        let after = store.stream_operations.read_forward(system_stream, None, 10)
+        let after = super::cdc_stream_tests::system_records(&store, 10)
             .await.unwrap();
-        assert_eq!(after.items.len(), before.items.len());
-        assert_eq!(after.items.iter().map(|row| &row.id).collect::<Vec<_>>(),
-            before.items.iter().map(|row| &row.id).collect::<Vec<_>>());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.iter().map(|row| &row.sequence_number).collect::<Vec<_>>(),
+            before.iter().map(|row| &row.sequence_number).collect::<Vec<_>>());
     })
     .catch_unwind()
     .await;

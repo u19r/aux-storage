@@ -44,6 +44,7 @@ tracing = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+storage-provider = { path = "../storage-provider", features = ["test-support"] }
 tempfile = { workspace = true }
 
 [lints]

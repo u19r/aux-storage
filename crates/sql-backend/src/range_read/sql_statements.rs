@@ -74,12 +74,12 @@ pub(super) fn range_statement<P: RangeProjection>(
         columns,
         incarnation,
     } = input;
-    let physical = if let Some(index) = bound.index.as_ref() {
+    let physical = if bound.index.is_some() {
         let incarnation = incarnation
             .ok_or_else(|| StorageError::internal("SQL GSI page has no physical incarnation"))?;
-        engine.gsi_table_name(&table.info.table_name, &index.index_name, incarnation)
+        engine.gsi_table_name(incarnation)
     } else {
-        engine.item_table_name(&table.info.table_name, table.history_id)
+        engine.item_table_name(table.history_id)
     };
     let mut binds = Vec::new();
     let mut predicates = Vec::new();

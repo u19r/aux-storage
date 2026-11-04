@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableHistoryId([u8; 16]);
 
 impl From<[u8; 16]> for TableHistoryId {
@@ -34,6 +34,17 @@ impl AsRef<[u8; 16]> for TableHistoryId {
 }
 
 impl TableHistoryId {
+    pub fn stream_prefix(self) -> Vec<u8> {
+        format!("history/{}/", Uuid::from_bytes(self.0).simple()).into_bytes()
+    }
+
+    /// Explicit appends use a separate kind from DynamoDB pointer indexes.
+    pub fn append_stream_name(self) -> crate::StreamName {
+        let mut name = self.stream_prefix();
+        name.extend_from_slice(b"append-table");
+        crate::StreamName::new(&name)
+    }
+
     /// Replace a catalog incarnation deterministically for one durable
     /// operation. The old incarnation is the namespace, so replay on
     /// another replica agrees and recreation cannot reuse an earlier

@@ -7,12 +7,13 @@ pub(crate) const SOURCE_SUFFIX: &[u8] = b"source/";
 pub(crate) const IMPORT_PAGE_SUFFIX: &[u8] = b"import-page/";
 pub(crate) const RETAINED_POSITION_SUFFIX: &[u8] = b"retained-position/";
 pub(crate) const IMPORT_MANIFEST_SUFFIX: &[u8] = b"import-manifest/";
+pub(crate) const TABLE_RECLAIM_SUFFIX: &[u8] = b"table-reclaim/";
 pub(crate) const TABLE_STATE_SUFFIX: &[u8] = b"table-state/";
 pub(crate) const CAPTURE_SUFFIX: &[u8] = b"capture/";
 pub(crate) const OPERATION_SUFFIX: &[u8] = b"operation/";
 
 pub(crate) const TRANSPORT_MAGIC: [u8; 4] = *b"AUXR";
-pub(crate) const TRANSPORT_VERSION: u16 = 33;
+pub(crate) const TRANSPORT_VERSION: u16 = 34;
 pub(crate) const TRANSPORT_HEADER_BYTES: usize = 16;
 pub(crate) const TRANSPORT_DATA_KIND: u8 = 1;
 pub(crate) const TRANSPORT_REPLY_KIND: u8 = 3;
@@ -106,7 +107,7 @@ pub(crate) const HISTORY_CUT_PAGE_WIDTH: usize = 64;
 
 pub(crate) const TARGET_CANCELLATION_SUFFIX: &[u8] = b"target-cancellation/";
 
-pub(crate) const REGIONAL_LAYOUT_VERSION: u16 = 107;
+pub(crate) const REGIONAL_LAYOUT_VERSION: u16 = 125;
 pub(crate) const NATIVE_JOURNAL_BINDING_RESOURCE: &[u8] = b"native-database";
 pub(crate) const NATIVE_JOURNAL_BINDING_SUFFIX: &[u8] = b"binding";
 pub(crate) const NATIVE_ARCHIVE_BINDING_SUFFIX: &[u8] = b"archive-binding";
@@ -135,8 +136,6 @@ pub(crate) const CAUSAL_STREAM_SUFFIX: &[u8] = b"causal-stream/";
 pub(crate) const CAUSAL_STACK_SUFFIX: &[u8] = b"causal-stack/";
 pub(crate) const CAUSAL_VISITED_SUFFIX: &[u8] = b"causal-visited/";
 
-pub(crate) const HISTORY_IMAGE_CHARGE_SUFFIX: &[u8] = b"capacity-image/";
-
 pub(crate) const REENABLE_INVENTORY_SUFFIX: &[u8] = b"reenable-inventory/";
 pub(crate) const REENABLE_CUT_SUFFIX: &[u8] = b"reenable-cut/";
 pub(crate) const RETAINED_LINEAGE_SUFFIX: &[u8] = b"retained-lineage/";
@@ -156,10 +155,9 @@ pub(crate) const ARCHIVE_FAMILY_SUFFIX: &[u8] = b"archive-family";
 pub(crate) const ARCHIVE_SCAN_SUFFIX: &[u8] = b"archive-scan";
 pub(crate) const ARCHIVE_STATE_SUFFIX: &[u8] = b"archive-state";
 pub(crate) const ARCHIVE_POINTER_SUFFIX: &[u8] = b"archive-pointer/";
-pub(crate) const ARCHIVE_PUBLICATION_COVERAGE_SUFFIX: &[u8] = b"archive-publication-coverage/";
 pub(crate) const ARCHIVE_JOB_KIND: &str = "regional-archive";
 pub(crate) const ARCHIVE_IDENTITY_FILE: &str = ".aux-storage-archive";
-pub(crate) const ARCHIVE_IDENTITY_FORMAT: &[u8; 8] = b"AXARCH02";
+pub(crate) const ARCHIVE_IDENTITY_FORMAT: &[u8; 8] = b"AXARCH04";
 
 pub(crate) const PUBLIC_TRIM_HEAD_SUFFIX: &[u8] = b"public-trim-head/";
 
@@ -184,3 +182,24 @@ pub(crate) const PUBLIC_TRIM_INSTALLATION_SUFFIX: &[u8] = b"public-trim-installa
 pub(crate) const PUBLIC_TRIM_COMPLETION_SUFFIX: &[u8] = b"public-trim-completion/";
 
 pub(crate) const ARCHIVE_HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Bound temporary JSON traversal independently of numeric source spelling.
+pub(crate) const CANONICAL_JSON_MAX_CONTAINERS: usize =
+    2 * storage_types::MAX_ATTRIBUTE_NESTING_DEPTH + 8;
+pub(crate) const CANONICAL_JSON_DECODE_CHUNK_BYTES: usize = 4096;
+
+pub(crate) const ARCHIVE_TABLE_PREFIX: &str = "table-";
+pub(crate) const ARCHIVE_AUTHORITY_EXTENSION: &str = "authority";
+
+pub(crate) const REGIONAL_CONTROLLER_JOB_KINDS: [&str; 6] = [
+    ENABLE_JOB_KIND,
+    ADDITION_JOB_KIND,
+    DELIVERY_JOB_KIND,
+    CONTROL_JOB_KIND,
+    READER_EXPIRY_JOB_KIND,
+    ARCHIVE_JOB_KIND,
+];
+
+// Membership changes within a generation require advancing JournalGeneration.
+// Keep this base fixed: revision 1 belongs to local-only maintenance.
+pub(crate) const REGIONAL_CATALOG_REVISION_BASE: u64 = 2;

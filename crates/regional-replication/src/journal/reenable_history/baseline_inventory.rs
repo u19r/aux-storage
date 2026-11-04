@@ -24,7 +24,7 @@ struct BaselineInventoryRecord {
 
 impl JournalStore {
     pub(super) async fn capture_retained_baselines<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -66,7 +66,11 @@ impl JournalStore {
             let page = self
                 .load_baseline_page(
                     attempt,
-                    (lineage.survivor.configuration.lineage, after),
+                    (
+                        lineage.survivor.physical,
+                        lineage.survivor.configuration.lineage,
+                        after,
+                    ),
                     (encoding.0, budget),
                 )
                 .await?;

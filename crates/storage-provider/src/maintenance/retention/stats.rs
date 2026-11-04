@@ -12,9 +12,6 @@ impl AddAssign for StreamDurationTrimStats {
         self.stale_markers = self.stale_markers.saturating_add(other.stale_markers);
         self.forever_markers = self.forever_markers.saturating_add(other.forever_markers);
         self.missing_states = self.missing_states.saturating_add(other.missing_states);
-        self.protected_markers = self
-            .protected_markers
-            .saturating_add(other.protected_markers);
         self.scopes_trimmed = self.scopes_trimmed.saturating_add(other.scopes_trimmed);
         self.rows_deleted = self.rows_deleted.saturating_add(other.rows_deleted);
         self.state_writes = self.state_writes.saturating_add(other.state_writes);
@@ -45,9 +42,6 @@ impl StreamDurationTrimStats {
             }
             StreamRetentionFinishReason::Forever => {
                 self.forever_markers = self.forever_markers.saturating_add(1);
-            }
-            StreamRetentionFinishReason::Protected => {
-                self.protected_markers = self.protected_markers.saturating_add(1);
             }
             StreamRetentionFinishReason::Page { deleted_rows } => {
                 self.rows_deleted = self.rows_deleted.saturating_add(deleted_rows);

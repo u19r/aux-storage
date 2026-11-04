@@ -17,34 +17,33 @@ mod logical_mutation_tests;
 mod page;
 mod page_preparation;
 pub(crate) mod read;
+mod snapshot_page;
 mod split;
 mod trim;
+#[cfg(test)]
+mod trim_tests;
 
-pub(crate) use catalog::pointer_slot;
 pub use catalog::{SystemStreamLineage, SystemStreamLineageCatalog};
 pub use checkpoint::{
-    SystemStreamCheckpointIssue, SystemStreamCheckpointLookup, SystemStreamCheckpointReceipt,
+    SystemStreamCheckpointIssue, SystemStreamCheckpointIssueInput, SystemStreamCheckpointLookup,
+    SystemStreamCheckpointReceipt,
 };
 pub use history::{
-    SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamHistoryObservation,
-    SystemStreamHistoryOrdering, SystemStreamHistoryPage, SystemStreamHistoryRead,
-    SystemStreamHistoryRecord, SystemStreamWriteAllocation,
+    SystemHistoryReadAttempt, SystemStreamHistory, SystemStreamHistoryBounds,
+    SystemStreamHistoryObservation, SystemStreamHistoryOrdering, SystemStreamHistoryPage,
+    SystemStreamHistoryRead, SystemStreamHistoryRecord, SystemStreamWriteAllocation,
 };
 pub use logical_mutation::{
     DynamoMutationRoute, LogicalSystemStreamMutation, LogicalSystemStreamMutationInput,
-    PreparedStreamImage, canonical_route_key,
+    canonical_route_key,
 };
-pub use page::{
-    SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamPagePlan, SystemStreamPageRequest,
-    SystemStreamStoredRecord,
-};
+pub use page::{SystemStreamIssuedCheckpoint, SystemStreamPage, SystemStreamPageRequest};
 pub use split::{
     SystemStreamSplitChild, SystemStreamSplitDisposition, SystemStreamSplitOperationId,
     SystemStreamSplitReceipt, SystemStreamSplitRequest, SystemStreamSplitResult,
 };
 pub use trim::{
-    SystemStreamTrimAttempt, SystemStreamTrimCandidate, SystemStreamTrimCandidateObservation,
-    SystemStreamTrimContinuation, SystemStreamTrimCursor, SystemStreamTrimKey,
-    SystemStreamTrimOperationId, SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest,
-    SystemStreamTrimPageResult, SystemStreamTrimRecord, execute_trim_page,
+    SystemStreamTrimAttempt, SystemStreamTrimContinuation, SystemStreamTrimOperationId,
+    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest, SystemStreamTrimPageResult,
+    SystemStreamTrimRecord, execute_trim_page,
 };

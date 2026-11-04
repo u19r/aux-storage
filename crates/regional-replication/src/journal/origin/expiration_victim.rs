@@ -13,7 +13,7 @@ use super::{
 use crate::native_record::corrupt_record;
 
 pub(super) async fn load_expiration_victim<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,

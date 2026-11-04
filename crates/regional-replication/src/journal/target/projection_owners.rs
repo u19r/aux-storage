@@ -31,11 +31,11 @@ struct ProjectionOwner {
 impl JournalStore {
     fn projection_owner_key(
         &self,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         address: &NativeProjectionAddress,
     ) -> StorageResult<DurableRecordKey> {
         let mut key: RecordAddress = self
-            .identity_key(PROJECTION_OWNER_SUFFIX, &operation)?
+            .table_identity_key(PROJECTION_OWNER_SUFFIX, scope.0, &scope.1)?
             .into();
         let serialized_digest = CanonicalDigest::of_json(address).map_err(|_| corrupt_record())?;
         key.suffix.extend_from_slice(serialized_digest.as_ref());
@@ -82,8 +82,12 @@ impl JournalStore {
                     return Err(corrupt_record());
                 }
                 for address in addresses {
-                    self.retain_projection_owner(attempt, target.0, (address, &key))
-                        .await?;
+                    self.retain_projection_owner(
+                        attempt,
+                        (target.1.history_id, target.0),
+                        (address, &key),
+                    )
+                    .await?;
                 }
             }
             Ok(())
@@ -95,10 +99,10 @@ impl JournalStore {
     async fn retain_projection_owner<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         input: (NativeProjectionAddress, &CanonicalItemKey),
     ) -> StorageResult<()> {
-        let key = self.projection_owner_key(operation, &input.0)?;
+        let key = self.projection_owner_key(scope, &input.0)?;
         let rows = self
             .records
             .load(
@@ -109,7 +113,7 @@ impl JournalStore {
             .await?;
         if let Some(row) = &rows[0] {
             let existing: ProjectionOwner = self.records.decode(row)?;
-            if existing.operation != operation
+            if existing.operation != scope.1
                 || existing.address != input.0
                 || &existing.key != input.1
             {
@@ -117,7 +121,7 @@ impl JournalStore {
             }
         } else {
             let owner = ProjectionOwner {
-                operation,
+                operation: scope.1,
                 address: input.0,
                 key: input.1.clone(),
             };
@@ -131,14 +135,14 @@ impl JournalStore {
     pub(super) async fn load_projection_owner<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         address: &NativeProjectionAddress,
     ) -> StorageResult<CanonicalItemKey> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let key = self.projection_owner_key(operation, address)?;
+            let key = self.projection_owner_key(scope, address)?;
             let rows = self
                 .records
                 .load(attempt, &[key], ReadProtection::Shared)
@@ -146,7 +150,7 @@ impl JournalStore {
             let owner: ProjectionOwner = self
                 .records
                 .decode(rows[0].as_ref().ok_or_else(corrupt_record)?)?;
-            if owner.operation != operation || &owner.address != address {
+            if owner.operation != scope.1 || &owner.address != address {
                 return Err(corrupt_record());
             }
             Ok(owner.key)

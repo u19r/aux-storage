@@ -71,10 +71,18 @@ async fn given_two_table_transaction_when_fragments_abort_and_completion_loses_a
         "one transaction split its shared source position"
     );
     let mut tables = vec![
-        (first.configuration.table, first.configuration.lineage),
-        (second.configuration.table, second.configuration.lineage),
+        (
+            first.configuration.table,
+            first.configuration.lineage,
+            first.physical,
+        ),
+        (
+            second.configuration.table,
+            second.configuration.lineage,
+            second.physical,
+        ),
     ];
-    tables.sort_unstable();
+    tables.sort_unstable_by_key(|table| table.0);
     let request = crate::source_frame::SourceFrameRequest {
         origin: replication_types::identity::origin::OriginId {
             region: fixture::region(1),
@@ -262,12 +270,25 @@ async fn given_two_table_transaction_when_fragments_abort_and_completion_loses_a
     assert_eq!(receipt.pages(), completed);
     crate::transport::test_support::measure_import_reply("reopened-complete", &receipt);
     let originals = frame.events().to_vec();
+    let copies = [
+        fixture::installed_state(&destination, 2, fixture::NAME).await,
+        fixture::installed_state(&destination, 2, SECOND).await,
+    ];
     destination
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
                 for original in originals {
+                    let history = copies
+                        .iter()
+                        .find(|state| state.configuration.lineage == original.lineage())
+                        .unwrap()
+                        .physical;
                     let retained = fixture::journal(2)
-                        .load_acceptance(attempt, &original.as_ref().id, &fixture::codec())
+                        .load_acceptance(
+                            attempt,
+                            (history, &original.as_ref().id),
+                            &fixture::codec(),
+                        )
                         .await?
                         .unwrap();
                     assert_eq!(retained.event.as_ref().bytes, original.as_ref().bytes);

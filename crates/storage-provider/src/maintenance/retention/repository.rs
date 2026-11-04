@@ -3,10 +3,7 @@ use storage_common::retry::retry_native_conflicts;
 use storage_types::{StorageResult, TimestampMillis};
 use stream_provider::{SystemStreamTrimPageRequest, SystemStreamTrimPageResult};
 
-use super::{
-    StreamRetentionPort, StreamRetentionTransaction, StreamTrimDueMarker, StreamTrimScope,
-    StreamTrimScopeBoundaries, StreamTrimState,
-};
+use super::{StreamRetentionPort, StreamTrimDueMarker, StreamTrimScope, StreamTrimState};
 use crate::{DYNAMO_WRITE_RETRY, DynamoPort};
 
 #[async_trait]
@@ -27,11 +24,6 @@ pub trait StreamRetentionRepository: Send + Sync {
         &self,
         scopes: &[StreamTrimScope],
     ) -> StorageResult<Vec<Option<StreamTrimState>>>;
-
-    async fn load_stream_trim_boundaries(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>>;
 }
 
 #[async_trait]
@@ -68,18 +60,6 @@ where for<'native> P::Attempt<'native>: StreamRetentionPort
             Box::pin(
                 async move { StreamRetentionPort::load_stream_trim_states(attempt, &scopes).await },
             )
-        })
-        .await
-    }
-    async fn load_stream_trim_boundaries(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>> {
-        let scopes = scopes.to_vec();
-        self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move {
-                StreamRetentionTransaction::load_stream_trim_boundaries(attempt, &scopes).await
-            })
         })
         .await
     }

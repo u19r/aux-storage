@@ -66,7 +66,7 @@ where
 }
 
 pub(crate) async fn load_bounded_frame<
-    A: stream_provider::retained_image::RetainedOwnershipAttempt,
+    A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
 >(
     journal: &JournalStore,
     attempt: &mut A,

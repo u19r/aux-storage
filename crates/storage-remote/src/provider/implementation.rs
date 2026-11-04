@@ -26,11 +26,10 @@ use storage_types::{
     BatchWriteItemResponse, CreateTableRequest, CreateTableResponse, DeleteItemRequest,
     DeleteItemResponse, DeleteTableRequest, DeleteTableResponse, DescribeTableRequest,
     DescribeTableResponse, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse, DurationSeconds,
-    GetItemRequest, GetStreamRecordsRequest, GetStreamRecordsResponse, KeyAttributes,
-    KeysAndAttributes, ListTablesRequest, ListTablesResponse, MAX_LIST_TABLES_LIMIT,
-    PutItemRequest, PutItemResponse, QueryTableRequest, STORAGE_LEADER_HINT_HEADER,
-    STORAGE_NOT_LEADER_ERROR_TYPE, ScanTableRequest, StorageEnum, StorageError, StorageResult,
-    StoredTableInfo, StreamItemId, StreamName, StreamRecord, TableName, TableStatus,
+    GetItemRequest, KeyAttributes, KeysAndAttributes, ListTablesRequest, ListTablesResponse,
+    MAX_LIST_TABLES_LIMIT, PutItemRequest, PutItemResponse, QueryTableRequest,
+    STORAGE_LEADER_HINT_HEADER, STORAGE_NOT_LEADER_ERROR_TYPE, ScanTableRequest, StorageEnum,
+    StorageError, StorageResult, StoredTableInfo, StreamItemId, StreamName, TableName, TableStatus,
     TimeToLiveSpecification, TransactGetItemsRequest, TransactGetItemsResponse,
     TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
     UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest, UpdateTimeToLiveResponse,
@@ -751,51 +750,6 @@ impl StreamProvider for RemoteStorageProvider {
         Err(StreamError::internal("remote streams not implemented"))
     }
 
-    async fn get_stream_records_from_pointer_stream(
-        &self,
-        pointer_stream_name: StreamName,
-        _key_schema: &[storage_types::KeySchemaElement],
-        starting_item_id: Option<StreamItemId>,
-        limit: Option<u32>,
-    ) -> StreamResult<(Vec<StreamRecord>, Option<StreamItemId>)> {
-        let stream_name = pointer_stream_name.as_ref();
-        if pointer_stream_name == StreamName::system_table_stream() {
-            return Err(StorageError::unsupported(
-                "remote SystemStream logical lineage is unavailable",
-            )
-            .into());
-        }
-        let table_name = stream_name
-            .strip_suffix(StreamName::TABLE_STREAM_SUFFIX)
-            .and_then(|name| std::str::from_utf8(name).ok())
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                StreamError::internal(format!(
-                    "remote pointer stream is not a table stream: {pointer_stream_name:?}"
-                ))
-            })?;
-        let request = GetStreamRecordsRequest::table(
-            TableName::new(table_name),
-            starting_item_id.map(|item_id| item_id.to_string()),
-            limit,
-        );
-        let response: GetStreamRecordsResponse = self
-            .invoke("DynamoDB_20120810.GetStreamRecords", &request)
-            .await
-            .map_err(StreamError::from)?;
-        let (records, last_evaluated_key) = response.into_parts();
-        let last_evaluated_key = last_evaluated_key
-            .as_deref()
-            .map(str::parse::<StreamItemId>)
-            .transpose()
-            .map_err(|error| {
-                StreamError::internal(format!(
-                    "remote stream response returned an invalid cursor: {error}"
-                ))
-            })?;
-        Ok((records, last_evaluated_key))
-    }
-
     async fn create_cursor(
         &self,
         _stream_name: StreamName,
@@ -1224,21 +1178,6 @@ impl RemoteStorageProvider {
         serde_json::from_slice(&bytes).map_err(StorageError::from)
     }
 
-    pub(super) async fn invoke_transaction(
-        &self,
-        request: &TransactWriteItemsRequest,
-    ) -> Result<TransactWriteItemsResponse, RemoteInvocationError> {
-        let bytes = self
-            .invoke_bytes_with_dispatch_status("DynamoDB_20120810.TransactWriteItems", request)
-            .await?;
-        serde_json::from_slice(&bytes).map_err(|err| {
-            RemoteInvocationError::new(
-                StorageError::from(err),
-                HttpRequestError::Decode.dispatch_status(),
-            )
-        })
-    }
-
     pub(super) async fn invoke_bytes<Request>(
         &self,
         target: &str,
@@ -1247,15 +1186,20 @@ impl RemoteStorageProvider {
     where
         Request: Serialize + ?Sized,
     {
-        self.invoke_bytes_with_dispatch_status(target, request)
-            .await
-            .map_err(|failure| failure.error)
+        self.invoke_bytes_with_dispatch_status(
+            target,
+            request,
+            super::transaction::ReplayPolicy::Transport,
+        )
+        .await
+        .map_err(|failure| failure.error)
     }
 
-    async fn invoke_bytes_with_dispatch_status<Request>(
+    pub(super) async fn invoke_bytes_with_dispatch_status<Request>(
         &self,
         target: &str,
         request: &Request,
+        replay_policy: super::transaction::ReplayPolicy,
     ) -> Result<Bytes, RemoteInvocationError>
     where
         Request: Serialize + ?Sized,
@@ -1339,6 +1283,13 @@ impl RemoteStorageProvider {
                         {
                             request_dispatch_status = HttpRequestDispatchStatus::PossiblyDispatched;
                         }
+                        let failure = RemoteInvocationError::new(error, request_dispatch_status);
+                        if replay_policy == super::transaction::ReplayPolicy::Journal
+                            && failure.is_ambiguous()
+                        {
+                            return Err(failure);
+                        }
+                        let error = failure.error;
                         let outcome = error_label(&error);
                         let normal_operation_error = Self::is_normal_operation_error(&error);
                         record_latency(&operation, outcome, start.elapsed());

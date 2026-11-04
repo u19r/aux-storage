@@ -4,7 +4,7 @@ mod policy;
 
 pub use domain::{
     PreparedTtlPut, TtlConfigRecord, TtlIndexKey, TtlIndexKeyToken, TtlPolicyGeneration,
-    TtlSweepPageCommand, TtlSweepPageInput, ttl_tracking_enabled,
+    TtlSweepPageCommand, TtlSweepPageInput, TtlSweepPolicy, ttl_tracking_enabled,
 };
 pub use models::{
     TtlConfigActivation, TtlIndexWrite, TtlIndexWriteBatch, TtlMaintenanceCheckpoint,

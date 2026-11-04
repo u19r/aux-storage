@@ -1,30 +1,26 @@
 use std::ops::Deref;
 
 use super::WireItem;
-use crate::{KeyAttributes, StorageResult, StoredImageSource, StoredWireItem};
+use crate::{KeyAttributes, StorageError, StorageResult, StoredWireItem};
 
 /// An image whose logical keys have been checked against its addressed item.
 #[derive(Clone, Debug)]
 pub struct VerifiedWireItem {
     item: WireItem,
-    source: Option<StoredImageSource>,
 }
 
 impl VerifiedWireItem {
     pub fn try_new(item: WireItem, key: &KeyAttributes) -> StorageResult<Self> {
-        item.with_verified_keys(key)
-            .map(|item| Self { item, source: None })
+        item.with_verified_keys(key).map(|item| Self { item })
     }
 
     pub fn try_from_stored(stored: StoredWireItem, key: &KeyAttributes) -> StorageResult<Self> {
-        Ok(Self {
-            item: stored.item.with_verified_keys(key)?,
-            source: stored.source,
-        })
-    }
-
-    pub fn stored_source(&self) -> Option<StoredImageSource> {
-        self.source
+        if !stored.item.has_verified_keys(key)? {
+            return Err(StorageError::internal(
+                "Stored item differs from its addressed key",
+            ));
+        }
+        Ok(Self { item: stored.item })
     }
 }
 

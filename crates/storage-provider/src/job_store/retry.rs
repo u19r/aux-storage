@@ -9,7 +9,8 @@ use storage_types::{StorageEnum, StorageError, context::WrappedError as _};
 use crate::RawOrderedJobStoreError;
 
 /// Retry only native attempts known to have aborted. An ambiguous settlement
-/// stays unknown so the caller can resolve it through the durable receipt.
+/// stays unknown so the caller can resolve it through the common command
+/// journal.
 pub async fn settle_native_commit<F, Fut>(
     duration: Duration,
     mut attempt: F,

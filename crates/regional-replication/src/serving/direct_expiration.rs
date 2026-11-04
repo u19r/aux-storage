@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use infrastructure_provider::physical_attempt::PhysicalRecordAttempt;
 use storage_common::{
-    TtlConfigRecord, TtlSweepPageCommand, TtlSweepPageResult, TtlSweepRequest,
+    TtlSweepPageCommand, TtlSweepPageResult, TtlSweepPolicy, TtlSweepRequest,
     retry::retry_native_conflicts,
 };
 use storage_provider::{
@@ -21,23 +21,30 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
     async fn read_ttl_sweep_policy(
         &self,
         name: &TableName,
-    ) -> StorageResult<Option<TtlConfigRecord>> {
+    ) -> StorageResult<Option<TtlSweepPolicy>> {
         self.journal.native_admission.require()?;
         let name = name.clone();
         let admission = RegionalExpirationAdmission {
             journal: Arc::clone(&self.journal),
             codec: Arc::clone(&self.codec),
         };
+        let bindings = storage_provider::RequestTableBindings::default();
         retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
             let name = name.clone();
+            let bindings = bindings.clone();
             let admission = admission.clone();
             self.port
                 .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
                     Box::pin(async move {
-                        ExpirationAttempt::with_admission(attempt, admission)
+                        ExpirationAttempt::with_admission(attempt, admission, bindings)
                             .read_direct_policy(&name)
                             .await
-                            .map(|policy| policy.map(|(config, _)| config))
+                            .map(|policy| {
+                                policy.map(|(config, table)| TtlSweepPolicy {
+                                    target: table.as_ref().into(),
+                                    config,
+                                })
+                            })
                     })
                 })
         })
@@ -59,7 +66,7 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
             self.port
                 .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
                     Box::pin(async move {
-                        ExpirationAttempt::with_admission(attempt, admission)
+                        ExpirationAttempt::with_admission(attempt, admission, Default::default())
                             .execute_direct_expiration(&command)
                             .await
                     })
@@ -77,13 +84,15 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
             journal: Arc::clone(&self.journal),
             codec: Arc::clone(&self.codec),
         };
+        let bindings = storage_provider::RequestTableBindings::default();
         retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
+            let bindings = bindings.clone();
             let request = request.clone();
             let admission = admission.clone();
             self.port
                 .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
                     Box::pin(async move {
-                        ExpirationAttempt::with_admission(attempt, admission)
+                        ExpirationAttempt::with_admission(attempt, admission, bindings)
                             .execute_direct_request(&request)
                             .await
                     })

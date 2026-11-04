@@ -24,6 +24,7 @@ pub struct CanonicalSourceSelection {
 }
 
 pub(crate) struct SourceHistoryBounds {
+    pub(crate) physical: storage_types::TableHistoryId,
     pub(crate) trim: super::trim_authority::TrimRevision,
     pub(crate) after: OriginPosition,
     pub(crate) through: OriginPosition,
@@ -31,6 +32,7 @@ pub(crate) struct SourceHistoryBounds {
 
 impl SourceHistoryBounds {
     pub(crate) fn try_new(
+        physical: storage_types::TableHistoryId,
         trim: super::trim_authority::TrimRevision,
         after: OriginPosition,
         through: OriginPosition,
@@ -39,6 +41,7 @@ impl SourceHistoryBounds {
             return Err(crate::native_record::corrupt_record());
         }
         Ok(Self {
+            physical,
             trim,
             after,
             through,

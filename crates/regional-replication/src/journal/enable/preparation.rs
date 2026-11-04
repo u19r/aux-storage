@@ -16,7 +16,7 @@ impl JournalStore {
     pub(super) async fn prepare_enable<
         A: PhysicalRecordAttempt
             + DescribeTimeToLiveAttempt
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>,
+            + storage_provider::TableUpdateTransaction,
     >(
         &self,
         attempt: &mut A,

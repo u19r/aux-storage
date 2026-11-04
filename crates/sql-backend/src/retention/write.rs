@@ -36,7 +36,11 @@ pub(crate) fn stream_retention_statements(
 ) -> StorageResult<Vec<crate::SqlStatement>> {
     let mut record: StreamTrimStateRecord = write.try_into()?;
     let next_marker = record.next_marker.take();
+    let replaced_marker = record.replaced_marker.take();
     let mut statements = vec![sql_statements::save_state(engine, record)];
+    if let Some(marker) = replaced_marker {
+        statements.push(sql_statements::remove_marker(engine, marker));
+    }
     if let Some(marker) = next_marker {
         statements.push(sql_statements::save_marker(engine, marker));
     }
@@ -76,6 +80,12 @@ pub(crate) async fn finish_stream_trim_markers<A: SqlAttempt>(
     let mut states = Vec::new();
     let mut markers = Vec::new();
     for ((record, _), changed) in prepared.into_iter().zip(counts) {
+        if changed == 0 && record.state_write.is_some() {
+            return Err(storage_types::StorageEnum::TransactionConflict {
+                message: "Table retention authority changed before cleanup completion".to_owned(),
+            }
+            .into());
+        }
         if changed > 1 {
             return Err(StorageError::internal(
                 "SQL stream trim marker delete is not unique",

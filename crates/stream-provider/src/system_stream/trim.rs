@@ -2,8 +2,8 @@ use std::{fmt, future::Future};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use storage_types::{
-    StorageError, StorageResult, StreamItemId, SystemStreamEffectDigest, SystemStreamPosition,
-    SystemStreamScope, TimestampMillis, storage_serde,
+    StorageError, StorageResult, SystemStreamPosition, SystemStreamScope, TimestampMillis,
+    storage_serde,
 };
 
 use crate::{
@@ -12,49 +12,20 @@ use crate::{
         MAX_SYSTEM_STREAM_TRIM_CONTINUATION_BYTES, MAX_SYSTEM_STREAM_TRIM_PAGE_LIMIT,
         MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS,
     },
-    protected_cursor_floor_in_attempt,
 };
 
-/// Stable ordering identity for one logical SystemStream trim candidate.
-///
-/// Providers may persist this value in different native forms, but use the
-/// same fields to resume an ordered scan without skipping equal positions.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SystemStreamTrimKey {
-    pub shard_id: String,
-    pub lineage_id: String,
-    pub offset_order: i64,
-    pub offset: String,
-    pub effect_id: String,
-}
-
-/// Provider-neutral identity of one logical row selected for trimming.
-pub struct SystemStreamTrimCandidate {
-    pub key: SystemStreamTrimKey,
-    pub pointer_item_id: String,
-}
-
-/// Provider-neutral candidate after native publication evidence is validated.
-pub struct SystemStreamTrimCandidateObservation {
-    pub candidate: SystemStreamTrimCandidate,
-}
-
-/// Typed metadata from one ordered physical record scan. The legacy candidate
-/// above carries provider string IDs and cannot represent the new row layout.
+/// Compact source metadata; trimming never resolves an item image.
 pub struct SystemStreamTrimRecord {
     pub position: SystemStreamPosition,
-    pub pointer_item_id: StreamItemId,
-    pub effect_id: SystemStreamEffectDigest,
     pub created_at: TimestampMillis,
+    pub table_history_id: Option<storage_types::TableHistoryId>,
 }
 
-/// Authenticated provider cursor payload for one ordered trim scan.
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SystemStreamTrimCursor {
-    pub sequence: u64,
-    pub key: SystemStreamTrimKey,
+struct TrimScanCursor {
+    position: SystemStreamPosition,
+    blocked_lineage: bool,
 }
 
 /// Stable identity of one logical SystemStream trim operation.
@@ -270,9 +241,8 @@ impl SystemStreamTrimPageRequest {
     }
 
     pub fn after_position(&self) -> StorageResult<Option<SystemStreamPosition>> {
-        self.continuation()
-            .map(|cursor| storage_serde::from_bytes(cursor.as_bytes()))
-            .transpose()
+        self.scan_cursor()
+            .map(|cursor| cursor.map(|cursor| cursor.position))
     }
 
     /// A continuation is authority only when it is the exact output of the
@@ -303,54 +273,23 @@ impl SystemStreamTrimPageRequest {
         Ok(())
     }
 
-    /// A persisted record is reclaimable only before the earliest durable
-    /// replay boundary for its lineage and before the protected pointer floor.
-    /// Missing checkpoint protection retains the whole lineage.
-    pub fn permits_record(
-        &self,
-        position: &SystemStreamPosition,
-        created_at: TimestampMillis,
-        pointer_item_id: StreamItemId,
-        boundaries: &[SystemStreamPosition],
-        pointer_floor: Option<StreamItemId>,
-    ) -> StorageResult<bool> {
-        if created_at >= self.cutoff_timestamp
-            || pointer_floor.is_some_and(|floor| pointer_item_id >= floor)
-        {
-            return Ok(false);
-        }
-        let Some(boundary) = boundaries.iter().find(|boundary| {
-            boundary.shard_id() == position.shard_id()
-                && boundary.lineage_id() == position.lineage_id()
-        }) else {
-            return Ok(false);
-        };
-        let offset = position
-            .offset()
-            .order()
-            .map_err(|_| StorageError::internal("SystemStream trim record offset is invalid"))?;
-        let frontier = boundary.offset().order().map_err(|_| {
-            StorageError::internal("SystemStream trim protection offset is invalid")
-        })?;
-        if position.offset().versionstamp().is_some() {
-            return position
-                .offset()
-                .compare_order(boundary.offset())
-                .map(|order| order.is_lt())
-                .map_err(|_| StorageError::internal("Invalid native trim boundary"));
-        }
-        Ok(offset < frontier)
+    fn scan_cursor(&self) -> StorageResult<Option<TrimScanCursor>> {
+        self.continuation()
+            .map(|cursor| storage_serde::from_bytes(cursor.as_bytes()))
+            .transpose()
     }
 
-    /// Select one bounded page from a physically ordered scan. The caller
-    /// validates its durable predecessor first, then validates selected effect
-    /// receipts before staging this page's deletes and receipt in one attempt.
+    pub fn permits_record(&self, created_at: TimestampMillis) -> bool {
+        created_at <= self.cutoff_timestamp
+    }
+
+    /// Retire a time-qualified prefix in each lineage. Request timestamps can
+    /// precede commit order, so the first unexpired row blocks its suffix.
     pub fn select_records(
         &self,
         records: Vec<SystemStreamTrimRecord>,
         more: bool,
-        boundaries: &[SystemStreamPosition],
-        pointer_floor: Option<StreamItemId>,
+        publication_boundaries: &[SystemStreamPosition],
     ) -> StorageResult<(Vec<SystemStreamTrimRecord>, SystemStreamTrimPageReceipt)> {
         if records.len() > MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS || (more && records.is_empty()) {
             return Err(StorageError::internal(
@@ -358,30 +297,29 @@ impl SystemStreamTrimPageRequest {
             ));
         }
         let input_count = records.len();
-        let mut previous = self.after_position()?;
+        let cursor = self.scan_cursor()?;
+        let mut blocked = cursor.as_ref().is_some_and(|cursor| cursor.blocked_lineage);
+        let mut previous = cursor.map(|cursor| cursor.position);
         let mut scanned = 0;
         let mut selected = Vec::new();
         for record in records {
-            if previous
-                .as_ref()
-                .map(|last| precedes_position(last, &record.position))
-                .transpose()?
-                .is_some_and(|precedes| !precedes)
-            {
-                return Err(StorageError::internal(
-                    "SystemStream trim scan is out of order",
-                ));
+            if let Some(last) = &previous {
+                if !precedes_position(last, &record.position)? {
+                    return Err(StorageError::internal(
+                        "SystemStream trim scan is out of order",
+                    ));
+                }
+                if last.shard_id() != record.position.shard_id()
+                    || last.lineage_id() != record.position.lineage_id()
+                {
+                    blocked = false;
+                }
             }
-            let permitted = self.permits_record(
-                &record.position,
-                record.created_at,
-                record.pointer_item_id,
-                boundaries,
-                pointer_floor,
-            )?;
+            blocked |= !self.permits_record(record.created_at)
+                || !record.is_published(publication_boundaries)?;
             previous = Some(record.position.clone());
             scanned += 1;
-            if permitted {
+            if !blocked {
                 selected.push(record);
                 if selected.len() == self.page_limit {
                     break;
@@ -389,9 +327,12 @@ impl SystemStreamTrimPageRequest {
             }
         }
         let next_cursor = if more || scanned < input_count {
-            Some(storage_serde::to_bytes(&previous.ok_or_else(|| {
-                StorageError::internal("SystemStream trim scan cannot advance")
-            })?)?)
+            Some(storage_serde::to_bytes(&TrimScanCursor {
+                position: previous.ok_or_else(|| {
+                    StorageError::internal("SystemStream trim scan cannot advance")
+                })?,
+                blocked_lineage: blocked,
+            })?)
         } else {
             None
         };
@@ -414,11 +355,6 @@ pub trait SystemStreamTrimAttempt: StreamAttempt {
             Option<SystemStreamTrimPageReceipt>,
         )>,
     > + Send;
-
-    fn load_trim_boundaries(
-        &mut self,
-        request: &SystemStreamTrimPageRequest,
-    ) -> impl Future<Output = StorageResult<Vec<SystemStreamPosition>>> + Send;
 
     fn scan_trim_records(
         &mut self,
@@ -445,17 +381,40 @@ pub async fn execute_trim_page<A: SystemStreamTrimAttempt>(
             return current.replay(&request);
         }
         request.validate_predecessor(predecessor.as_ref())?;
-        let boundaries = attempt.load_trim_boundaries(&request).await?;
-        let pointer_floor = protected_cursor_floor_in_attempt(attempt).await?;
+        let (history, _) = attempt.read_system_page_start(None).await?;
+        history
+            .validate_scope(request.scope())
+            .map_err(|_| StorageError::internal("SystemStream trim has another source"))?;
         let after = request.after_position()?;
         let (records, more) = attempt.scan_trim_records(after.as_ref()).await?;
-        let (selected, receipt) =
-            request.select_records(records, more, &boundaries, pointer_floor)?;
+        let boundaries = history
+            .retirement_boundaries()
+            .map_err(|_| StorageError::internal("Invalid SystemStream publication frontier"))?;
+        let (selected, receipt) = request.select_records(records, more, &boundaries)?;
         attempt.apply_trim_page(&selected, &receipt).await?;
         receipt.replay(&request)
     }
     .await;
     settlement.complete(result)
+}
+
+impl SystemStreamTrimRecord {
+    fn is_published(&self, boundaries: &[SystemStreamPosition]) -> StorageResult<bool> {
+        let boundary = boundaries
+            .iter()
+            .find(|boundary| {
+                boundary.shard_id() == self.position.shard_id()
+                    && boundary.lineage_id() == self.position.lineage_id()
+            })
+            .ok_or_else(|| {
+                StorageError::internal("SystemStream record has no publication authority")
+            })?;
+        self.position
+            .offset()
+            .compare_order(boundary.offset())
+            .map(|order| !order.is_gt())
+            .map_err(|_| StorageError::internal("Invalid SystemStream publication position"))
+    }
 }
 
 fn precedes_position(

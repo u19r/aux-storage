@@ -19,6 +19,37 @@ use crate::{
     constants::INFRASTRUCTURE_POINT_LOAD_KEYS,
 };
 
+pub(super) async fn find_record_generation<A: SqlAttempt>(
+    catalog: &mut SqlCatalogAttempt<'_, A, impl SqlLayout>,
+    resource_of: &DurableRecordKey,
+    minimum: u64,
+    protection: ReadProtection,
+) -> StorageResult<Option<u64>> {
+    let statement =
+        sql_statements::select_next_generation(catalog.engine.engine(), resource_of, minimum)?;
+    let page = catalog
+        .attempt
+        .query(
+            statement,
+            protection,
+            crate::constants::INFRASTRUCTURE_GENERATION_BYTES,
+        )
+        .await?;
+    if page.more || page.rows.len() > 1 {
+        return Err(invalid_result());
+    }
+    let generation = page
+        .rows
+        .into_iter()
+        .next()
+        .map(codec::decode_generation)
+        .transpose()?;
+    if generation.is_some_and(|generation| generation < minimum) {
+        return Err(invalid_result());
+    }
+    Ok(generation)
+}
+
 pub(super) async fn load_records<A: SqlAttempt>(
     catalog: &mut SqlCatalogAttempt<'_, A, impl SqlLayout>,
     keys: &[DurableRecordKey],

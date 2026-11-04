@@ -312,6 +312,48 @@ async fn given_missing_table_when_ttl_is_described_then_aws_error_and_log_level_
 // Business rule: a bounded direct sweep deletes only current expired values;
 // stale cursor and policy commands cannot make further changes.
 #[tokio::test]
+async fn given_recreated_table_with_same_ttl_generation_when_old_sweep_runs_then_new_items_survive()
+{
+    use storage_common::{TtlSweepPageCommand, TtlSweepPageInput};
+
+    let store = TestStore::new().await;
+    let outcome = AssertUnwindSafe(async {
+        let table = super::test_support::unique_table_name();
+        let mut stale = None;
+        for incarnation in 0..2 {
+            store.create_hash_table(table.clone()).await;
+            store.operations.update_time_to_live(serde_json::from_value(json!({
+                "TableName": table, "TimeToLiveSpecification": {"AttributeName": "ttl", "Enabled": true}
+            })).unwrap()).await.unwrap();
+            let policy = store.ttl_sweep_repository.read_ttl_sweep_policy(&table).await.unwrap().unwrap();
+            let command = TtlSweepPageCommand::try_new(policy, TtlSweepPageInput::try_new("ttl", store.now(), 10, None).unwrap(), store.now()).unwrap();
+            if incarnation == 0 {
+                stale = Some(command);
+                store.operations.delete_table(storage_types::DeleteTableRequest { table_name: table.clone() }).await.unwrap();
+                continue;
+            }
+            store.operations.put_item(PutItemRequest::try_from(json!({
+                "TableName": table, "Item": {"pk": {"S": "new"}, "ttl": {"N": "1"}}
+            })).unwrap()).await.unwrap();
+            let stale = stale.take().unwrap();
+            assert!(stale.expected_policy_generation == command.expected_policy_generation);
+            assert_ne!(stale.target.history_id, command.target.history_id);
+            let stale: TtlSweepPageCommand = serde_json::from_slice(&serde_json::to_vec(&stale).unwrap()).unwrap();
+            let error = store.ttl_sweep_repository.execute_ttl_sweep_page(stale).await.err().expect("old table ID must be rejected");
+            assert!(matches!(error.to_enum(), storage_types::StorageEnum::ConditionalCheckFailed));
+            let item = store.operations.get_item(GetItemRequest::try_from(json!({"TableName": table, "Key": {"pk": {"S": "new"}}})).unwrap()).await.unwrap();
+            assert!(item.item.is_some(), "stale command deleted a replacement-table item");
+            let page = store.ttl_sweep_repository.execute_ttl_sweep_page(command).await.unwrap();
+            assert_eq!(page.deleted_items, 1, "fresh accepted ID must remain usable");
+        }
+    }).catch_unwind().await;
+    store.finish().await;
+    if let Err(panic) = outcome {
+        resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
     use storage_common::{TtlSweepPageCommand, TtlSweepPageInput};
 
@@ -345,9 +387,8 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
             .unwrap()
             .unwrap();
         let first = TtlSweepPageCommand::try_new(
-            table.clone(),
+            config.clone(),
             TtlSweepPageInput::try_new("ttl".to_owned(), cutoff, 1, None).unwrap(),
-            config.policy_generation,
             cutoff,
         )
         .unwrap();
@@ -373,16 +414,15 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
         let mut deleted = page.deleted_items;
         while let Some(next) = cursor {
             let command = TtlSweepPageCommand::try_new(
-                table.clone(),
+                config.clone(),
                 TtlSweepPageInput::try_new("ttl".to_owned(), cutoff, 1, Some(next)).unwrap(),
-                config.policy_generation,
                 cutoff,
             )
             .unwrap();
             let page = store
                 .ttl_sweep_repository
                 .execute_ttl_sweep_request(storage_common::TtlSweepRequest {
-                    table_name: command.table_name,
+                    table_name: command.target.table_name,
                     input: command.input,
                 })
                 .await
@@ -391,6 +431,18 @@ async fn direct_ttl_sweep_pages_and_rejects_stale_commands() {
             cursor = page.next_cursor;
         }
         assert_eq!(deleted, 3);
+        for _ in 0..2 {
+            let empty = store
+                .ttl_sweep_repository
+                .execute_ttl_sweep_request(storage_common::TtlSweepRequest {
+                    table_name: table.clone(),
+                    input: TtlSweepPageInput::try_new("ttl", cutoff, 1, None).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(empty.deleted_items, 0);
+            assert!(empty.next_cursor.is_none());
+        }
         for key in ["a", "b", "c", "live"] {
             let response = store
                 .operations

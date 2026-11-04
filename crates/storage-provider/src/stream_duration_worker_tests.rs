@@ -1,5 +1,6 @@
+//! System retention runner validates native progress without a consumer
+//! frontier.
 use std::{
-    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, Mutex,
@@ -9,106 +10,26 @@ use std::{
 };
 
 use async_trait::async_trait;
-use storage_types::{
-    ItemStreamVersion, StorageError, StorageResult, StreamItemId, StreamRetentionDuration,
-    SystemStreamScope, TableName, TimestampMillis,
-};
+use storage_types::{StorageError, StorageResult, SystemStreamScope, TimestampMillis};
 use stream_provider::{
     MAX_SYSTEM_STREAM_TRIM_CONTINUATION_BYTES, MAX_SYSTEM_STREAM_TRIM_PAGE_LIMIT,
     MAX_SYSTEM_STREAM_TRIM_SCAN_ROWS, SystemStreamTrimContinuation, SystemStreamTrimOperationId,
     SystemStreamTrimPageRequest, SystemStreamTrimPageResult,
 };
 
-use crate::{
-    StreamDurationTrimConfig, StreamDurationTrimPageRequest, StreamDurationTrimPageResult,
-    StreamDurationTrimWorker, StreamRetentionRepository, StreamTrimBoundary, StreamTrimDueMarker,
-    StreamTrimPageLimit, StreamTrimScope, StreamTrimScopeBoundaries, StreamTrimState,
-    StreamTrimStateWrite, SystemStreamTrimExecutor, SystemStreamTrimRepository,
-    maintenance::{StreamDurationTrimStats, StreamRetentionFinish},
-};
+use crate::{SystemStreamTrimExecutor, SystemStreamTrimRepository};
 
 #[derive(Clone, Default)]
 struct FakeBackend {
     inner: Arc<Mutex<FakeBackendState>>,
 }
-
 #[derive(Default)]
 struct FakeBackendState {
-    markers: Vec<StreamTrimDueMarker>,
-    apply_marker_writes: bool,
-    state: Option<StreamTrimState>,
-    states: HashMap<String, StreamTrimState>,
-    boundaries: Option<StreamTrimScopeBoundaries>,
-    protected_scopes: HashSet<String>,
-    page_result: Option<StreamDurationTrimPageResult>,
-    trim_requests: Vec<StreamDurationTrimPageRequest>,
-    boundary_loads: usize,
-    due_marker_loads: usize,
     system_page_result: Option<SystemStreamTrimPageResult>,
     alternate_system_cursors: bool,
     repeat_system_sequence: bool,
     fail_system_trim: bool,
     system_trim_requests: Vec<SystemStreamTrimPageRequest>,
-    finished_markers: Vec<StreamTrimDueMarker>,
-    writes: Vec<StreamTrimStateWrite>,
-    fail_next_finish: bool,
-}
-
-struct BatchedScopeBackend {
-    markers: Vec<StreamTrimDueMarker>,
-    state_batch_sizes: Mutex<Vec<usize>>,
-    boundary_batch_sizes: Mutex<Vec<usize>>,
-    trim_batch_sizes: Mutex<Vec<usize>>,
-    finish_batch_sizes: Mutex<Vec<usize>>,
-}
-
-#[async_trait]
-impl StreamRetentionRepository for BatchedScopeBackend {
-    async fn trim_stream_marker_wave(
-        &self,
-        wave: crate::maintenance::StreamRetentionWave,
-    ) -> StorageResult<crate::maintenance::StreamDurationTrimStats> {
-        wave.execute(&mut crate::stream_retention_tests::ModelTransaction::new(
-            self,
-        ))
-        .await
-    }
-
-    async fn list_due_stream_trim_markers(
-        &self,
-        _due_before: TimestampMillis,
-        limit: usize,
-    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
-        Ok(self.markers.iter().take(limit).cloned().collect())
-    }
-
-    async fn load_stream_trim_states(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<Option<StreamTrimState>>> {
-        self.state_batch_sizes
-            .lock()
-            .expect("state batch sizes lock")
-            .push(scopes.len());
-        Ok(scopes
-            .iter()
-            .map(|scope| Some(finite_state(scope.clone(), 1)))
-            .collect())
-    }
-
-    async fn load_stream_trim_boundaries(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>> {
-        self.boundary_batch_sizes
-            .lock()
-            .expect("boundary batch sizes lock")
-            .push(scopes.len());
-        Ok(scopes
-            .iter()
-            .map(|_| StreamTrimScopeBoundaries::unbounded())
-            .collect())
-    }
 }
 
 fn block_on<F>(future: F) -> F::Output
@@ -121,87 +42,6 @@ where F: Future {
             Poll::Ready(output) => return output,
             Poll::Pending => std::thread::yield_now(),
         }
-    }
-}
-
-#[async_trait]
-impl StreamRetentionRepository for FakeBackend {
-    async fn trim_stream_marker_wave(
-        &self,
-        wave: crate::maintenance::StreamRetentionWave,
-    ) -> StorageResult<crate::maintenance::StreamDurationTrimStats> {
-        wave.execute(&mut crate::stream_retention_tests::ModelTransaction::new(
-            self,
-        ))
-        .await
-    }
-
-    async fn list_due_stream_trim_markers(
-        &self,
-        due_before: TimestampMillis,
-        limit: usize,
-    ) -> StorageResult<Vec<StreamTrimDueMarker>> {
-        let mut inner = self.inner.lock().expect("fake backend lock");
-        inner.due_marker_loads = inner.due_marker_loads.saturating_add(1);
-        let mut markers = inner
-            .markers
-            .iter()
-            .filter(|marker| !inner.apply_marker_writes || marker.due_bucket <= due_before)
-            .cloned()
-            .collect::<Vec<_>>();
-        if inner.apply_marker_writes {
-            markers.sort_by(|left, right| {
-                left.due_bucket
-                    .cmp(&right.due_bucket)
-                    .then_with(|| left.scope.scope_id.cmp(&right.scope.scope_id))
-                    .then_with(|| left.policy_version.cmp(&right.policy_version))
-            });
-        }
-        Ok(markers.into_iter().take(limit).collect())
-    }
-
-    async fn load_stream_trim_states(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<Option<StreamTrimState>>> {
-        let inner = self.inner.lock().expect("fake backend lock");
-        Ok(scopes
-            .iter()
-            .map(|scope| {
-                inner
-                    .states
-                    .get(&scope.scope_id)
-                    .cloned()
-                    .or_else(|| inner.state.clone())
-            })
-            .collect())
-    }
-
-    async fn load_stream_trim_boundaries(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>> {
-        let mut inner = self.inner.lock().expect("fake backend lock");
-        inner.boundary_loads = inner.boundary_loads.saturating_add(1);
-        Ok(scopes
-            .iter()
-            .map(|scope| {
-                if inner.protected_scopes.contains(&scope.scope_id) {
-                    return StreamTrimScopeBoundaries {
-                        latest_item_id: Some(StreamItemId::default()),
-                        protected_boundary: Some(StreamTrimBoundary {
-                            item_id: stream_id(1),
-                        }),
-                        retained_table_pointer_boundary: None,
-                    };
-                }
-                inner
-                    .boundaries
-                    .as_ref()
-                    .map(copy_boundaries)
-                    .unwrap_or_else(StreamTrimScopeBoundaries::unbounded)
-            })
-            .collect())
     }
 }
 
@@ -273,47 +113,6 @@ impl SystemStreamTrimRepository for PendingSystemBackend {
     }
 }
 
-fn trim_page(
-    inner: &Arc<Mutex<FakeBackendState>>,
-    request: StreamDurationTrimPageRequest,
-) -> StorageResult<StreamDurationTrimPageResult> {
-    let mut inner = inner.lock().expect("fake backend lock");
-    inner.trim_requests.push(request);
-    Ok(inner
-        .page_result
-        .as_ref()
-        .map(copy_page_result)
-        .unwrap_or(StreamDurationTrimPageResult {
-            deleted_rows: 0,
-            first_remaining_version: None,
-            first_remaining_timestamp: None,
-        }))
-}
-
-fn copy_boundaries(boundaries: &StreamTrimScopeBoundaries) -> StreamTrimScopeBoundaries {
-    StreamTrimScopeBoundaries {
-        latest_item_id: boundaries.latest_item_id,
-        protected_boundary: boundaries.protected_boundary,
-        retained_table_pointer_boundary: boundaries.retained_table_pointer_boundary,
-    }
-}
-
-fn copy_page_result(result: &StreamDurationTrimPageResult) -> StreamDurationTrimPageResult {
-    StreamDurationTrimPageResult {
-        deleted_rows: result.deleted_rows,
-        first_remaining_version: result.first_remaining_version,
-        first_remaining_timestamp: result.first_remaining_timestamp,
-    }
-}
-
-fn table_scope() -> StreamTrimScope {
-    StreamTrimScope::table("table/orders", TableName::new("orders"))
-}
-
-fn item_scope() -> StreamTrimScope {
-    StreamTrimScope::item("item/orders/1", TableName::new("orders"), "hash-1")
-}
-
 fn system_scope() -> SystemStreamScope {
     SystemStreamScope::try_new("orders", 7).expect("system scope")
 }
@@ -335,50 +134,11 @@ fn system_continuation(
         .expect("continuation")
 }
 
-fn stream_id(value: u64) -> StreamItemId {
-    StreamItemId::from(ItemStreamVersion::new(value))
-}
-
-fn finite_state(scope: StreamTrimScope, policy_version: u64) -> StreamTrimState {
-    StreamTrimState {
-        scope,
-        policy_version,
-        retention: StreamRetentionDuration::FiniteHours(1),
-        effective_retention: StreamRetentionDuration::FiniteHours(1),
-        next_due_at: Some(TimestampMillis::from_timestamp(3_600_000)),
-        oldest_retained_version: None,
-        oldest_retained_timestamp: None,
-        latest_version: None,
-        latest_timestamp: None,
-        updated_at: TimestampMillis::from_timestamp(0),
-    }
-}
-
 struct TestWorker<'a> {
     backend: &'a FakeBackend,
 }
 
-fn trim_limit(limit: usize) -> StreamTrimPageLimit {
-    StreamTrimPageLimit::try_from(limit).expect("valid stream trim page limit")
-}
-
 impl TestWorker<'_> {
-    async fn run_due_page(
-        &self,
-        due_before: TimestampMillis,
-        now: TimestampMillis,
-    ) -> StorageResult<StreamDurationTrimStats> {
-        StreamDurationTrimWorker::new(
-            self.backend,
-            StreamDurationTrimConfig {
-                marker_page_size: trim_limit(10),
-                stream_page_size: trim_limit(25),
-            },
-        )
-        .run_due_page(due_before, now)
-        .await
-    }
-
     async fn run_system_stream_trim_page(
         &self,
         scope: SystemStreamScope,
@@ -396,393 +156,6 @@ fn worker(backend: &FakeBackend) -> TestWorker<'_> {
 }
 
 #[test]
-fn worker_batches_independent_scopes_and_serializes_each_scope() {
-    let due_at = TimestampMillis::from_timestamp(3_600_000);
-    let table_scope = StreamTrimScope::table("scope/table", TableName::new("orders"));
-    let item_scope = StreamTrimScope::item("scope/item", TableName::new("orders"), "hash-1");
-    let backend = BatchedScopeBackend {
-        markers: vec![
-            StreamTrimDueMarker::new(due_at, table_scope.clone(), 1),
-            StreamTrimDueMarker::new(due_at, table_scope, 1),
-            StreamTrimDueMarker::new(due_at, item_scope, 1),
-        ],
-        state_batch_sizes: Mutex::new(Vec::new()),
-        boundary_batch_sizes: Mutex::new(Vec::new()),
-        trim_batch_sizes: Mutex::new(Vec::new()),
-        finish_batch_sizes: Mutex::new(Vec::new()),
-    };
-
-    let stats = block_on(
-        StreamDurationTrimWorker::new(
-            &backend,
-            StreamDurationTrimConfig {
-                marker_page_size: trim_limit(10),
-                stream_page_size: trim_limit(25),
-            },
-        )
-        .run_due_page(due_at, TimestampMillis::from_timestamp(7_200_000)),
-    )
-    .expect("worker should run");
-
-    assert_eq!(stats.due_markers_scanned, 3);
-    assert!(
-        *backend
-            .state_batch_sizes
-            .lock()
-            .expect("state batch sizes lock")
-            == vec![2, 1]
-    );
-    assert!(
-        *backend
-            .boundary_batch_sizes
-            .lock()
-            .expect("boundary batch sizes lock")
-            == vec![2, 1]
-    );
-    assert!(
-        *backend
-            .finish_batch_sizes
-            .lock()
-            .expect("finish batch sizes lock")
-            == vec![2, 1]
-    );
-    assert!(
-        *backend
-            .trim_batch_sizes
-            .lock()
-            .expect("trim batch sizes lock")
-            == vec![2, 1]
-    );
-}
-
-#[test]
-fn worker_skips_stale_markers_without_trimming() {
-    let backend = FakeBackend::default();
-    let scope = table_scope();
-    let marker = StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope, 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker.clone()];
-        inner.state = Some(finite_state(marker.scope.clone(), 2));
-    }
-
-    let stats = block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert_eq!(stats.stale_markers, 1);
-    assert_eq!(inner.trim_requests.len(), 0);
-    assert!(inner.finished_markers == vec![marker]);
-}
-
-#[test]
-fn worker_skips_forever_scopes_and_clears_next_due() {
-    let backend = FakeBackend::default();
-    let scope = table_scope();
-    let marker = StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope, 1);
-    let mut state = finite_state(marker.scope.clone(), 1);
-    state.retention = StreamRetentionDuration::Forever;
-    state.effective_retention = StreamRetentionDuration::Forever;
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker];
-        inner.state = Some(state);
-    }
-
-    let stats = block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert_eq!(stats.forever_markers, 1);
-    assert_eq!(inner.trim_requests.len(), 0);
-    assert_eq!(inner.writes[0].state.next_due_at, None);
-    assert!(inner.writes[0].next_marker.is_none());
-}
-
-#[test]
-fn worker_applies_bounded_page_request_with_protective_version_ceiling() {
-    let backend = FakeBackend::default();
-    let scope = item_scope();
-    let marker =
-        StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope.clone(), 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker];
-        inner.state = Some(finite_state(scope, 1));
-        inner.boundaries = Some(StreamTrimScopeBoundaries {
-            latest_item_id: Some(stream_id(5)),
-            protected_boundary: Some(StreamTrimBoundary {
-                item_id: stream_id(4),
-            }),
-            retained_table_pointer_boundary: Some(StreamTrimBoundary {
-                item_id: stream_id(3),
-            }),
-        });
-        inner.page_result = Some(StreamDurationTrimPageResult {
-            deleted_rows: 2,
-            first_remaining_version: Some(ItemStreamVersion::new(3)),
-            first_remaining_timestamp: Some(TimestampMillis::from_timestamp(3_700_000)),
-        });
-    }
-
-    let stats = block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    let request = &inner.trim_requests[0];
-    assert_eq!(stats.rows_deleted, 2);
-    assert_eq!(usize::from(request.page_limit), 25);
-    assert_eq!(request.max_deleted_item_id, Some(stream_id(2)));
-    assert_eq!(
-        request.cutoff_timestamp,
-        TimestampMillis::from_timestamp(3_600_000)
-    );
-    assert_eq!(
-        inner.writes[0]
-            .next_marker
-            .as_ref()
-            .map(|marker| marker.due_bucket),
-        Some(TimestampMillis::from_timestamp(7_200_000))
-    );
-    assert_eq!(
-        inner.writes[0].state.oldest_retained_version,
-        Some(ItemStreamVersion::new(3))
-    );
-    assert_eq!(
-        inner.writes[0].state.oldest_retained_timestamp,
-        Some(TimestampMillis::from_timestamp(3_700_000))
-    );
-}
-
-#[test]
-fn worker_requeues_marker_when_zero_boundary_has_no_predecessor() {
-    let backend = FakeBackend::default();
-    let scope = item_scope();
-    let marker =
-        StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope.clone(), 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker.clone()];
-        inner.state = Some(finite_state(scope, 1));
-        inner.boundaries = Some(StreamTrimScopeBoundaries {
-            latest_item_id: Some(StreamItemId::default()),
-            protected_boundary: Some(StreamTrimBoundary {
-                item_id: stream_id(100),
-            }),
-            retained_table_pointer_boundary: None,
-        });
-    }
-
-    let stats = block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert_eq!(stats.protected_markers, 1);
-    assert_eq!(inner.trim_requests.len(), 0);
-    assert!(inner.finished_markers == vec![marker.clone()]);
-    assert_eq!(
-        inner.writes[0]
-            .next_marker
-            .as_ref()
-            .map(|marker| marker.due_bucket),
-        Some(TimestampMillis::from_timestamp(10_800_000))
-    );
-    assert_eq!(
-        inner.writes[0].state.next_due_at,
-        Some(TimestampMillis::from_timestamp(10_800_000))
-    );
-}
-
-#[test]
-fn worker_reschedules_zero_delete_protected_residual_page() {
-    let backend = FakeBackend::default();
-    let scope = item_scope();
-    let marker =
-        StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope.clone(), 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker];
-        inner.state = Some(finite_state(scope, 1));
-        inner.boundaries = Some(StreamTrimScopeBoundaries {
-            latest_item_id: Some(stream_id(5)),
-            protected_boundary: Some(StreamTrimBoundary {
-                item_id: stream_id(4),
-            }),
-            retained_table_pointer_boundary: None,
-        });
-        inner.page_result = Some(StreamDurationTrimPageResult {
-            deleted_rows: 0,
-            first_remaining_version: Some(ItemStreamVersion::new(1)),
-            first_remaining_timestamp: Some(TimestampMillis::from_timestamp(0)),
-        });
-    }
-
-    block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert_eq!(inner.trim_requests.len(), 1);
-    assert_eq!(inner.writes.len(), 1);
-    assert_eq!(
-        inner.writes[0]
-            .next_marker
-            .as_ref()
-            .map(|marker| marker.due_bucket),
-        Some(TimestampMillis::from_timestamp(10_800_000))
-    );
-    assert_eq!(
-        inner.writes[0].state.next_due_at,
-        Some(TimestampMillis::from_timestamp(10_800_000))
-    );
-}
-
-#[test]
-fn worker_does_not_starve_an_eligible_marker_behind_a_protected_page_prefix() {
-    let backend = FakeBackend::default();
-    let due_at = TimestampMillis::from_timestamp(3_600_000);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.apply_marker_writes = true;
-        for index in 0..=250 {
-            let scope =
-                StreamTrimScope::table(format!("fairness/{index:03}"), TableName::new("orders"));
-            let marker = StreamTrimDueMarker::new(due_at, scope.clone(), 1);
-            inner
-                .states
-                .insert(scope.scope_id.clone(), finite_state(scope.clone(), 1));
-            if index < 250 {
-                inner.protected_scopes.insert(scope.scope_id.clone());
-            }
-            inner.markers.push(marker);
-        }
-    }
-    let worker = StreamDurationTrimWorker::new(
-        &backend,
-        StreamDurationTrimConfig {
-            marker_page_size: trim_limit(250),
-            stream_page_size: trim_limit(25),
-        },
-    );
-
-    let first = block_on(worker.run_due_page(due_at, TimestampMillis::from_timestamp(7_200_000)))
-        .expect("first worker page should run");
-    let second = block_on(worker.run_due_page(due_at, TimestampMillis::from_timestamp(7_200_000)))
-        .expect("second worker page should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert!(first.marker_page_full);
-    assert_eq!(first.protected_markers, 250);
-    assert!(!second.marker_page_full);
-    assert_eq!(inner.trim_requests.len(), 1);
-    assert_eq!(inner.trim_requests[0].scope.scope_id, "fairness/250");
-}
-
-#[test]
-fn worker_does_not_move_retained_floor_backwards_on_older_page_observation() {
-    let backend = FakeBackend::default();
-    let scope = table_scope();
-    let marker =
-        StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope.clone(), 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        let mut state = finite_state(scope, 1);
-        state.oldest_retained_version = Some(ItemStreamVersion::new(11));
-        state.oldest_retained_timestamp = Some(TimestampMillis::from_timestamp(4_000_000));
-        inner.markers = vec![marker];
-        inner.state = Some(state);
-        inner.page_result = Some(StreamDurationTrimPageResult {
-            deleted_rows: 1,
-            first_remaining_version: Some(ItemStreamVersion::new(2)),
-            first_remaining_timestamp: Some(TimestampMillis::from_timestamp(3_700_000)),
-        });
-    }
-
-    block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("worker should run");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    let write = &inner.writes[0];
-    assert_eq!(
-        write.state.oldest_retained_version,
-        Some(ItemStreamVersion::new(11))
-    );
-    assert_eq!(
-        write.state.oldest_retained_timestamp,
-        Some(TimestampMillis::from_timestamp(4_000_000))
-    );
-    assert_eq!(
-        write.state.next_due_at,
-        Some(TimestampMillis::from_timestamp(7_600_000))
-    );
-    assert_eq!(
-        write.next_marker.as_ref().map(|marker| marker.due_bucket),
-        Some(TimestampMillis::from_timestamp(7_200_000))
-    );
-}
-
-#[test]
-fn worker_retries_safely_after_finish_failure() {
-    let backend = FakeBackend::default();
-    let scope = table_scope();
-    let marker =
-        StreamTrimDueMarker::new(TimestampMillis::from_timestamp(3_600_000), scope.clone(), 1);
-    {
-        let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.markers = vec![marker.clone()];
-        inner.state = Some(finite_state(scope, 1));
-        inner.page_result = Some(StreamDurationTrimPageResult {
-            deleted_rows: 1,
-            first_remaining_version: Some(ItemStreamVersion::new(2)),
-            first_remaining_timestamp: Some(TimestampMillis::from_timestamp(3_700_000)),
-        });
-        inner.fail_next_finish = true;
-    }
-
-    let first = block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ));
-    assert!(first.is_err());
-
-    block_on(worker(&backend).run_due_page(
-        TimestampMillis::from_timestamp(3_600_000),
-        TimestampMillis::from_timestamp(7_200_000),
-    ))
-    .expect("retry should finish");
-
-    let inner = backend.inner.lock().expect("fake backend lock");
-    assert_eq!(inner.trim_requests.len(), 2);
-    assert!(inner.finished_markers == vec![marker]);
-    assert_eq!(inner.writes.len(), 1);
-    assert_eq!(
-        inner.writes[0].state.oldest_retained_version,
-        Some(ItemStreamVersion::new(2))
-    );
-    assert_eq!(
-        inner.writes[0].state.oldest_retained_timestamp,
-        Some(TimestampMillis::from_timestamp(3_700_000))
-    );
-}
-
-#[test]
 fn worker_routes_system_trim_without_loading_or_accepting_frontier_state() {
     let backend = FakeBackend::default();
     let scope = system_scope();
@@ -791,13 +164,6 @@ fn worker_routes_system_trim_without_loading_or_accepting_frontier_state() {
     let next_continuation = system_continuation(&operation_id, 2, "cursor-1");
     {
         let mut inner = backend.inner.lock().expect("fake backend lock");
-        inner.boundaries = Some(StreamTrimScopeBoundaries {
-            latest_item_id: Some(stream_id(99)),
-            protected_boundary: Some(StreamTrimBoundary {
-                item_id: stream_id(98),
-            }),
-            retained_table_pointer_boundary: None,
-        });
         inner.system_page_result = Some(SystemStreamTrimPageResult::new(
             operation_id,
             2,
@@ -815,9 +181,6 @@ fn worker_routes_system_trim_without_loading_or_accepting_frontier_state() {
     let inner = backend.inner.lock().expect("fake backend lock");
     assert_eq!(page.reclaimed_records(), 2);
     assert_eq!(page.next_continuation(), Some(&next_continuation));
-    assert_eq!(inner.boundary_loads, 0);
-    assert_eq!(inner.due_marker_loads, 0);
-    assert_eq!(inner.trim_requests.len(), 0);
     assert_eq!(inner.system_trim_requests.len(), 1);
     let request = &inner.system_trim_requests[0];
     assert_eq!(request.scope(), &scope);
@@ -1092,7 +455,7 @@ fn given_backend_error_when_system_trim_runs_then_worker_propagates_it() {
 
 #[test]
 fn given_trim_backend_when_used_as_trait_object_then_it_is_object_safe() {
-    fn accepts_trait_object(_: &dyn StreamRetentionRepository) {}
+    fn accepts_trait_object(_: &dyn SystemStreamTrimRepository) {}
 
     accepts_trait_object(&FakeBackend::default());
 }
@@ -1259,81 +622,4 @@ fn system_trim_request_bounds_are_validated_and_cursor_debug_is_redacted() {
 
     let continuation = system_continuation(&operation_id, 1, "cursor-0");
     assert!(!format!("{continuation:?}").contains("cursor-0"));
-}
-
-impl crate::stream_retention_tests::ModelRetentionIo for BatchedScopeBackend {
-    async fn trim_stream_pages(
-        &self,
-        requests: Vec<StreamDurationTrimPageRequest>,
-    ) -> StorageResult<Vec<StreamDurationTrimPageResult>> {
-        self.trim_batch_sizes
-            .lock()
-            .expect("trim batch sizes lock")
-            .push(requests.len());
-        Ok(requests
-            .into_iter()
-            .map(|_| StreamDurationTrimPageResult {
-                deleted_rows: 0,
-                first_remaining_version: None,
-                first_remaining_timestamp: None,
-            })
-            .collect())
-    }
-
-    async fn finish_stream_trim_markers(
-        &self,
-        finishes: Vec<StreamRetentionFinish>,
-    ) -> StorageResult<()> {
-        self.finish_batch_sizes
-            .lock()
-            .expect("finish batch sizes lock")
-            .push(finishes.len());
-        Ok(())
-    }
-}
-
-impl crate::stream_retention_tests::ModelRetentionIo for FakeBackend {
-    async fn trim_stream_pages(
-        &self,
-        requests: Vec<StreamDurationTrimPageRequest>,
-    ) -> StorageResult<Vec<StreamDurationTrimPageResult>> {
-        requests
-            .into_iter()
-            .map(|request| trim_page(&self.inner, request))
-            .collect()
-    }
-
-    async fn finish_stream_trim_markers(
-        &self,
-        finishes: Vec<StreamRetentionFinish>,
-    ) -> StorageResult<()> {
-        let mut inner = self.inner.lock().expect("fake backend lock");
-        if inner.fail_next_finish {
-            inner.fail_next_finish = false;
-            return Err(StorageError::internal("simulated finish failure"));
-        }
-        for finish in finishes {
-            let marker = finish.marker;
-            inner.finished_markers.push(marker.clone());
-            if let Some(update) = finish.update {
-                let write = update.write;
-                if inner.apply_marker_writes {
-                    inner.markers.retain(|candidate| {
-                        candidate.due_bucket != marker.due_bucket
-                            || candidate.scope.scope_id != marker.scope.scope_id
-                            || candidate.policy_version != marker.policy_version
-                    });
-                    if let Some(next_marker) = write.next_marker.as_ref() {
-                        inner.markers.push(next_marker.clone());
-                    }
-                }
-                inner.state = Some(write.state.clone());
-                inner
-                    .states
-                    .insert(write.state.scope.scope_id.clone(), write.state.clone());
-                inner.writes.push(write);
-            }
-        }
-        Ok(())
-    }
 }

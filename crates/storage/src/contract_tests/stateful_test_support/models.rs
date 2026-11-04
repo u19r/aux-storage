@@ -1,8 +1,6 @@
 use queue_provider::MessageId;
-use storage_types::{
-    IndexName, KeyAttributes, StreamItemId, SystemStreamScope, TableName, TimestampMillis,
-};
-use stream_provider::{BootstrapCursorName, SystemStreamLineage};
+use storage_types::{IndexName, KeyAttributes, SystemStreamScope, TableName, TimestampMillis};
+use stream_provider::SystemStreamLineage;
 
 pub struct StatefulObservation {
     pub active: bool,
@@ -27,11 +25,8 @@ pub(super) struct GsiFixtureTarget {
 pub(super) struct StreamReclamationFixtureTarget {
     pub scope: SystemStreamScope,
     pub parent: SystemStreamLineage,
-    pub cursor_name: BootstrapCursorName,
-    /// Immutable physical history boundary authenticated by every held read.
-    pub protected_boundary: StreamItemId,
-    /// Mutable consumer position expected by the next held read.
-    pub cursor_position: StreamItemId,
+    pub checkpoint: storage_types::SystemStreamCheckpointToken,
+    pub table_name: TableName,
     pub cutoff_timestamp: TimestampMillis,
 }
 

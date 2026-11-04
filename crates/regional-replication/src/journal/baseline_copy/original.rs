@@ -155,7 +155,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn record_adopted_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,

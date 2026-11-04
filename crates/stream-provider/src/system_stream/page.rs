@@ -2,16 +2,11 @@
 //! Ordinary stream pages use `StreamRowKind`; both reach the same physical
 //! `StreamAttempt::read_stream` entry point.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use storage_types::{
-    GetStreamRecordsResponse, KeyAttributes, StreamRecord, SystemStreamCheckpoint,
-    SystemStreamCheckpointToken, SystemStreamContractError, SystemStreamPosition,
-    SystemStreamScope, SystemStreamSourceTableName, TableName, WireItem,
+    GetStreamRecordsResponse, StreamRecord, SystemStreamCheckpoint, SystemStreamCheckpointToken,
+    SystemStreamContractError, SystemStreamScope, SystemStreamSourceTableName,
 };
-
-use crate::constants::SYSTEM_STREAM_PAGE_ENVELOPE_RESERVE_BYTES;
 
 /// A validated checkpoint and its opaque, server-issued identifier.
 ///
@@ -158,65 +153,6 @@ pub struct SystemStreamPage {
     terminal: bool,
 }
 
-/// Provider-neutral selection of decoded records for one bounded page.
-pub struct SystemStreamPagePlan {
-    pub records: Vec<StreamRecord>,
-    pub next_frontier: Vec<SystemStreamPosition>,
-    pub has_more: bool,
-}
-
-impl SystemStreamPagePlan {
-    pub fn try_new(
-        frontier: &SystemStreamCheckpoint,
-        candidates: Vec<StreamRecord>,
-        provider_has_more: bool,
-        limit: u32,
-    ) -> storage_types::StorageResult<Self> {
-        if limit == 0 || limit > storage_types::SYSTEM_STREAM_RECORDS_LIMIT_MAX {
-            return Err(storage_types::StorageError::validation(
-                "SystemStream page limit is outside its bound",
-            ));
-        }
-        let mut records = Vec::with_capacity(limit as usize);
-        let mut next_frontier = frontier
-            .frontier()
-            .iter()
-            .map(|position| (position.shard_id().as_str().to_string(), position.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut encoded_bytes = 0usize;
-        let mut has_more = provider_has_more || candidates.len() > limit as usize;
-        for record in candidates.into_iter().take(limit as usize) {
-            let record_bytes = serde_json::to_vec(&record)?.len();
-            let encoded_page_bytes = encoded_bytes
-                .saturating_add(record_bytes)
-                .saturating_add(usize::from(!records.is_empty()))
-                .saturating_add(SYSTEM_STREAM_PAGE_ENVELOPE_RESERVE_BYTES);
-            if encoded_page_bytes > storage_types::STREAM_RECORDS_MAX_ENCODED_BYTES as usize {
-                if records.is_empty() {
-                    return Err(storage_types::StorageError::validation(
-                        "The first SystemStream record exceeds the response byte limit",
-                    ));
-                }
-                has_more = true;
-                break;
-            }
-            encoded_bytes = encoded_bytes
-                .saturating_add(record_bytes)
-                .saturating_add(usize::from(!records.is_empty()));
-            let position = record.system_position.clone().ok_or_else(|| {
-                storage_types::StorageError::validation("SystemStream record is missing position")
-            })?;
-            next_frontier.insert(position.shard_id().as_str().to_string(), position);
-            records.push(record);
-        }
-        Ok(Self {
-            records,
-            next_frontier: next_frontier.into_values().collect(),
-            has_more,
-        })
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageWire {
@@ -315,60 +251,5 @@ impl<'de> Deserialize<'de> for SystemStreamPage {
             wire.terminal,
         )
         .map_err(D::Error::custom)
-    }
-}
-
-/// Provider-neutral description of one stored logical record before it is
-/// assembled into the public `StreamRecord` shape.  The source table identity
-/// is required and logical; physical pointers remain provider-private.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemStreamStoredRecord {
-    pub source_table_name: SystemStreamSourceTableName,
-    pub keys: KeyAttributes,
-    #[serde(with = "storage_types::dynamo_json::optional")]
-    pub old_image: Option<WireItem>,
-    #[serde(with = "storage_types::dynamo_json::optional")]
-    pub new_image: Option<WireItem>,
-    pub position: SystemStreamPosition,
-}
-
-impl SystemStreamStoredRecord {
-    pub fn effect_digest(
-        &self,
-        history_id: storage_types::TableHistoryId,
-        version: storage_types::ItemStreamVersion,
-    ) -> storage_types::StorageResult<storage_types::SystemStreamEffectDigest> {
-        use sha2::{Digest as _, Sha256};
-        let bytes = serde_json::to_vec(&(
-            history_id,
-            version,
-            &self.source_table_name,
-            &self.keys,
-            self.old_image
-                .as_ref()
-                .map(storage_types::dynamo_json::ItemRef),
-            self.new_image
-                .as_ref()
-                .map(storage_types::dynamo_json::ItemRef),
-        ))?;
-        storage_types::SystemStreamEffectDigest::try_new(hex::encode(Sha256::digest(bytes)))
-    }
-
-    pub fn into_stream_record(self) -> storage_types::StorageResult<StreamRecord> {
-        Ok(StreamRecord {
-            cursor: None,
-            source_table_name: Some(TableName::new(self.source_table_name.as_str())),
-            keys: self.keys,
-            sequence_number: self.position.offset().as_str().to_string(),
-            old_image: self
-                .old_image
-                .map(WireItem::into_attribute_map)
-                .transpose()?,
-            new_image: self
-                .new_image
-                .map(WireItem::into_attribute_map)
-                .transpose()?,
-            system_position: Some(self.position),
-        })
     }
 }

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{AttributeValue, StorageError, StorageResult, WireItem};
@@ -55,12 +57,12 @@ impl FrozenImageProjection {
         source.select_attribute_values(&fields).map(Some)
     }
 
-    pub fn project(&self, source: &WireItem) -> StorageResult<WireItem> {
+    pub fn project<'a>(&self, source: &'a WireItem) -> StorageResult<Cow<'a, WireItem>> {
         match self {
-            Self::All => Ok(source.clone()),
+            Self::All => Ok(Cow::Borrowed(source)),
             Self::Fields(fields) => {
                 let fields = fields.0.iter().map(String::as_str).collect::<Vec<_>>();
-                source.project_wire_attributes(&fields)
+                source.project_wire_attributes(&fields).map(Cow::Owned)
             }
         }
     }

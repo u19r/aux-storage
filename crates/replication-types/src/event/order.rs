@@ -144,9 +144,9 @@ impl WinnerProvenance {
             {
                 Ok(())
             }
-            (Some(CanonicalEventId::Expiration { lineage, victim }), _)
-                if *lineage == self.lineage
-                    && victim == &self.version
+            (Some(event @ CanonicalEventId::Expiration { .. }), _)
+                if self.version.lineage() == self.lineage
+                    && event == &self.version.expiration_id()?
                     && self.order.is_expiration() =>
             {
                 Ok(())

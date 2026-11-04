@@ -26,9 +26,8 @@ pub async fn describe_table_from_table<A: DynamoRangeReadAttempt>(
     attempt: &mut A,
     bound: &BoundTableInfo,
 ) -> StorageResult<DescribeTableResponse> {
-    let table = bound.info.as_ref().clone();
-    let status = table.table_status.clone();
-    let mut description = TableDescription::from_stored_table_info(table, status);
+    let status = bound.info.table_status.clone();
+    let mut description = TableDescription::from_bound_table_info(bound.clone(), status);
     if description
         .global_secondary_indexes
         .as_ref()

@@ -348,18 +348,19 @@ where
     let frontier = table_stream
         .table_frontier()
         .ok_or("table stream omitted its observed frontier")?;
-    assert_eq!(frontier.head.is_some(), expected_count != 0);
-    assert_eq!(frontier.oldest.is_some(), expected_count != 0);
-    if let Some(head) = frontier.head {
-        assert!(frontier.can_resume_from(frontier.table_history_id, head));
-        assert!(!frontier.can_resume_from(
-            frontier.table_history_id,
-            head.predecessor().ok_or("head has no predecessor")?,
-        ));
+    assert_eq!(
+        frontier.lanes.iter().any(|lane| lane.head.is_some()),
+        expected_count != 0
+    );
+    assert_eq!(
+        frontier.lanes.iter().any(|lane| lane.oldest.is_some()),
+        expected_count != 0
+    );
+    if expected_count != 0 {
         let idle = store
             .get_stream_records(GetStreamRecordsRequest::table(
                 name.clone(),
-                Some(head.to_string()),
+                table_stream.last_evaluated_key().map(str::to_owned),
                 Some(10),
             ))
             .await?;
@@ -373,11 +374,7 @@ where
     );
     assert!(regional.terminal());
     for record in table_stream.records().iter().chain(regional.records()) {
-        assert!(record.old_image.is_none());
-        let image = record
-            .new_image
-            .as_ref()
-            .ok_or("committed stream lost image")?;
+        let image = record.item.as_ref().ok_or("committed stream lost image")?;
         assert_eq!(
             Some(&storage_types::AttributeValue::S("committed".into())),
             image.get("pk")

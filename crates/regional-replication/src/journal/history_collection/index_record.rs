@@ -1,5 +1,5 @@
 //! Immutable source-vector indexes bind their address and frozen definition.
-use infrastructure_provider::record::{DurableRecord, DurableRecordKey, RecordChange};
+use infrastructure_provider::record::{DurableRecord, RecordChange};
 use replication_types::identity::{replica::RegionId, resource::ControlOperationId};
 use serde::{Deserialize, Serialize};
 use storage_types::{Revision, StorageResult};
@@ -20,16 +20,6 @@ pub(in crate::journal) struct CollectedHistoryPage {
 }
 
 impl CollectedHistoryPage {
-    pub(in crate::journal) fn definition_key(
-        &self,
-        journal: &JournalStore,
-    ) -> StorageResult<DurableRecordKey> {
-        journal.identity_key(
-            crate::constants::COLLECTED_HISTORY_DEFINITION_SUFFIX,
-            &(self.operation, &self.region),
-        )
-    }
-
     pub(in crate::journal) fn qualify(
         self,
         definition: &HistoryCaptureDefinition,
@@ -79,27 +69,6 @@ impl JournalStore {
             return Err(corrupt_record());
         }
         Ok(record)
-    }
-
-    pub(in crate::journal) fn require_collected_baseline_definition(
-        &self,
-        row: &DurableRecord,
-    ) -> StorageResult<()> {
-        let definition: crate::history_capture::RetainedBaselineDefinition =
-            self.records.decode(row)?;
-        definition.validate()?;
-        let request = definition.request();
-        self.require_collection_request(request)?;
-        if row.revision != Revision::INITIAL
-            || row.key
-                != self.identity_key(
-                    crate::constants::COLLECTED_BASELINE_DEFINITION_SUFFIX,
-                    &(request.proposal.operation().id, &request.region),
-                )?
-        {
-            return Err(corrupt_record());
-        }
-        Ok(())
     }
 
     pub(super) fn prepare_collected_history_page(

@@ -132,9 +132,7 @@ impl NativeImportStore<'_> {
                 .iter()
                 .find(|table| table.state.configuration.table == binding.local_table)
                 .ok_or_else(corrupt_record)?;
-            let history = matches!(event.as_ref().payload, CanonicalPayload::Item(_))
-                .then_some(table.physical.history_id);
-            declarations.push((event, history));
+            declarations.push((event, table.physical.history_id));
         }
         self.events = self
             .journal
@@ -157,9 +155,34 @@ impl<A: DynamoAttempt + PhysicalRecordAttempt> RegionalMutationStore<A> for Nati
         let attempt = settlement.as_mut();
         let result = async {
             self.events.require_accepted_inventory()?;
+            let tables = self
+                .import
+                .bindings()
+                .iter()
+                .map(|binding| {
+                    let table = self
+                        .tables
+                        .iter()
+                        .find(|table| table.state.configuration.table == binding.local_table)
+                        .ok_or_else(corrupt_record)?;
+                    Ok((
+                        binding.source_table,
+                        binding.lineage,
+                        table.physical.history_id,
+                    ))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
             self.completed = self
                 .journal
-                .seal_import_pages(attempt, (self.import, pages), self.codec)
+                .seal_import_pages(
+                    attempt,
+                    self.import,
+                    crate::journal::import_page::ImportPageInventory {
+                        pages,
+                        tables: &tables,
+                    },
+                    self.codec,
+                )
                 .await?;
             if self.completed.is_none() {
                 return Ok(());
@@ -206,7 +229,12 @@ impl<A: DynamoAttempt + PhysicalRecordAttempt> RegionalMutationStore<A> for Nati
                     native: None,
                 });
             }
-            verify_expiration(self.journal, attempt, (event, self.codec, &self.events)).await?;
+            verify_expiration(
+                self.journal,
+                attempt,
+                (event, self.codec, &self.events, table.state.physical),
+            )
+            .await?;
             table
                 .load_payload_observation(attempt, event, self.codec)
                 .await

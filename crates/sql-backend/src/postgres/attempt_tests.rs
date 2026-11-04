@@ -5,6 +5,56 @@ use alloc_counter::AllocationGuard;
 use super::statements::append_query_protection;
 use crate::{ReadProtection, SqlEngine, sql_template::sql_template};
 
+#[tokio::test]
+#[ignore = "requires TEST_POSTGRES_DSN"]
+async fn given_reused_sql_when_binds_and_table_change_then_observe_current_rows() {
+    use crate::{AttemptMode, SqlAttempt, SqlBackend, SqlStatement, SqlValue};
+
+    let fixture = super::test_support::NativeFixture::open().await;
+    for _ in 0..2 {
+        fixture
+            .backend
+            .with_attempt(AttemptMode::ReadWrite, |attempt| {
+                Box::pin(async move {
+                    for value in [1, 2] {
+                        attempt
+                            .execute(SqlStatement::new(
+                                "INSERT INTO native_commit_probe (value) VALUES ($1)",
+                                vec![SqlValue::Integer(value)],
+                            ))
+                            .await?;
+                    }
+                    for (threshold, expected) in [(0, 2), (1, 1)] {
+                        let page = attempt
+                            .query(
+                                SqlStatement::new(
+                                    "SELECT value FROM native_commit_probe WHERE value > $1",
+                                    vec![SqlValue::Integer(threshold)],
+                                ),
+                                ReadProtection::Snapshot,
+                                std::num::NonZeroUsize::new(4096).unwrap(),
+                            )
+                            .await?;
+                        assert_eq!(page.rows.len(), expected);
+                    }
+                    attempt
+                        .execute(SqlStatement::new("DROP TABLE native_commit_probe", vec![]))
+                        .await?;
+                    attempt
+                        .execute(SqlStatement::new(
+                            "CREATE TABLE native_commit_probe (value bigint NOT NULL)",
+                            vec![],
+                        ))
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+    fixture.close().await;
+}
+
 #[test]
 fn given_borrowed_or_owned_query_when_protected_then_preserve_lock_sql() {
     for (protection, suffix) in [

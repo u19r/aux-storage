@@ -6,8 +6,7 @@ use storage_provider::{
     DynamoPort,
     maintenance::{
         StreamDurationTrimStats, StreamRetentionPort, StreamRetentionRepository,
-        StreamRetentionTransaction, StreamRetentionWave, StreamTrimDueMarker, StreamTrimScope,
-        StreamTrimScopeBoundaries, StreamTrimState,
+        StreamRetentionWave, StreamTrimDueMarker, StreamTrimScope, StreamTrimState,
     },
     native_admission::NativeWork,
 };
@@ -63,25 +62,6 @@ where for<'native> P::Attempt<'native>: StreamRetentionPort + PhysicalRecordAtte
                 move |attempt, _| {
                     Box::pin(async move {
                         StreamRetentionPort::load_stream_trim_states(attempt, &scopes).await
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn load_stream_trim_boundaries(
-        &self,
-        scopes: &[StreamTrimScope],
-    ) -> StorageResult<Vec<StreamTrimScopeBoundaries>> {
-        let scopes = scopes.to_vec();
-        Arc::clone(&self.journal)
-            .with_admitted_attempt(
-                (self.port.as_ref(), NativeWork::Background),
-                NativeAttempt::Items(AttemptMode::ReadOnly),
-                move |attempt, _| {
-                    Box::pin(async move {
-                        StreamRetentionTransaction::load_stream_trim_boundaries(attempt, &scopes)
-                            .await
                     })
                 },
             )

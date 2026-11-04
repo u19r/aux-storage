@@ -2,16 +2,14 @@
 
 use storage_backfill::{
     GsiActivationState, GsiBuild, GsiBuildTarget, GsiProjection, GsiProjectionKey,
-    GsiProjectionStateReadBatch, GsiReferencedHistoryItem, GsiReferencedHistoryRead,
-    GsiScanSourcePage, GsiStreamSourcePage,
+    GsiProjectionStateReadBatch, GsiScanSourcePage,
 };
-use storage_provider::maintenance::{GsiPort, GsiScanSource, GsiStreamSource, GsiTransition};
+use storage_provider::maintenance::{GsiPort, GsiScanSource, GsiTransition};
 use storage_types::{BoundTableInfo, StorageResult, SystemStreamCheckpoint};
 
 use super::{
-    apply_gsi_transition, read_activation_state, read_candidate_holds, read_projection_states,
-    read_referenced_histories, read_scan_source_page, read_stream_source_page,
-    scan_build_candidates,
+    apply_gsi_transition, read_activation_state, read_candidate_binding, read_projection_states,
+    read_scan_source_page, scan_build_candidates,
 };
 use crate::{SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt, stream_history};
 
@@ -27,15 +25,15 @@ impl<A: SqlAttempt, L: SqlLayout> GsiPort for SqlCatalogAttempt<'_, A, L> {
             async { scan_build_candidates(catalog.attempt, catalog.engine, after).await }.await;
         settlement.complete(result)
     }
-    async fn load_gsi_candidate_holds(
+    async fn load_gsi_candidate(
         &mut self,
         build: &GsiBuild<Vec<u8>>,
-    ) -> StorageResult<storage_provider::maintenance::GsiCandidateObservation> {
+    ) -> StorageResult<Option<GsiBuild<Vec<u8>>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result =
-            async { read_candidate_holds(catalog.attempt, catalog.engine, build).await }.await;
+            async { read_candidate_binding(catalog.attempt, catalog.engine, build).await }.await;
         settlement.complete(result)
     }
     async fn load_gsi_scan_source_page(
@@ -46,25 +44,6 @@ impl<A: SqlAttempt, L: SqlLayout> GsiPort for SqlCatalogAttempt<'_, A, L> {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async { read_scan_source_page(catalog, source).await }.await;
-        settlement.complete(result)
-    }
-    async fn load_gsi_stream_source_page(
-        &mut self,
-        source: GsiStreamSource<'_>,
-    ) -> StorageResult<GsiStreamSourcePage> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result =
-            async { read_stream_source_page(catalog.attempt, catalog.engine, source).await }.await;
-        settlement.complete(result)
-    }
-    async fn load_gsi_stream_tail(&mut self) -> StorageResult<SystemStreamCheckpoint> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result =
-            async { stream_history::capture_high(catalog.attempt, catalog.engine).await }.await;
         settlement.complete(result)
     }
     async fn load_gsi_projection_states(
@@ -79,17 +58,6 @@ impl<A: SqlAttempt, L: SqlLayout> GsiPort for SqlCatalogAttempt<'_, A, L> {
             read_projection_states(catalog.attempt, catalog.engine, batch, table.history_id).await
         }
         .await;
-        settlement.complete(result)
-    }
-    async fn load_gsi_referenced_histories(
-        &mut self,
-        reads: &[GsiReferencedHistoryRead<'_>],
-    ) -> StorageResult<Vec<GsiReferencedHistoryItem>> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
-        let catalog = settlement.as_mut();
-        let result =
-            async { read_referenced_histories(catalog.attempt, catalog.engine, reads).await }.await;
         settlement.complete(result)
     }
     async fn load_gsi_frontier(

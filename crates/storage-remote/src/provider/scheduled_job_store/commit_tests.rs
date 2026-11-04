@@ -4,10 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http_request::{HttpRequestDispatchStatus, HttpRequestError, HttpRequestErrorKind};
-use httpmock::{Mock, prelude::*};
+use httpmock::prelude::*;
 use scheduled_bg_jobs::store::{
     Check, CommitOperationId, Mutation, StoreKey, StoreTransaction, StoreTransactionInput,
     TransactionLimits,
@@ -15,10 +14,7 @@ use scheduled_bg_jobs::store::{
 use storage_provider::{RawOrderedJobStoreError, RemoteCredentialStrategy, RemoteStorageSettings};
 use storage_types::{StorageError, context::WrappedError as _};
 
-use super::{
-    commit::{SendTransactionError, classify_send_transaction_error, run_attempt},
-    encoding,
-};
+use super::commit::{SendTransactionError, classify_send_transaction_error, run_attempt};
 use crate::provider::implementation::RemoteInvocationError;
 
 fn absent_transaction() -> StoreTransaction {
@@ -71,68 +67,6 @@ fn unconditional_transaction() -> StoreTransaction {
         },
     })
     .expect("valid transaction")
-}
-
-fn receipt_key() -> String {
-    format!("R#{}", "09".repeat(16))
-}
-
-fn data_key() -> String {
-    "K#636f6e666c696374".to_string()
-}
-
-fn existing_data_item() -> serde_json::Value {
-    serde_json::json!({
-        "pk": {"S": "SCHEDULED_JOB_STORE#1"},
-        "sk": {"S": data_key()},
-        "v": {"B": STANDARD.encode(b"existing")},
-    })
-}
-
-fn operation_token() -> String {
-    format!("{}-f", "09".repeat(16))
-}
-
-fn committed_operation_token() -> String {
-    format!("{}-c", "09".repeat(16))
-}
-
-async fn delayed_attempt_mocks(
-    server: &MockServer,
-    check_delay: Duration,
-    transaction_delay: Duration,
-) -> (Mock<'_>, Mock<'_>, Mock<'_>) {
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(receipt_key())
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200).body("{}").delay(Duration::from_millis(20));
-        })
-        .await;
-    let check = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.BatchGetItem")
-                .body_includes(data_key())
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200)
-                .json_body(serde_json::json!({
-                    "Responses": {"job": [existing_data_item()]}
-                }))
-                .delay(check_delay);
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(operation_token());
-            then.status(200).body("{}").delay(transaction_delay);
-        })
-        .await;
-    (receipt, check, transaction)
 }
 
 #[test]
@@ -209,106 +143,116 @@ fn given_idempotent_parameter_mismatch_when_dispatch_may_have_started_then_commi
 }
 
 #[tokio::test]
-async fn given_a_stalled_check_read_when_deadline_expires_then_no_transaction_is_sent() {
+async fn given_an_expired_dispatch_deadline_when_attempted_then_no_native_transaction_is_sent() {
     let server = MockServer::start_async().await;
     let provider = provider_for(&server).await;
-    let (receipt, check, transaction) =
-        delayed_attempt_mocks(&server, Duration::from_millis(500), Duration::ZERO).await;
-    let transaction_input = absent_transaction();
-    let fingerprint = encoding::transaction_fingerprint(&transaction_input);
-    let result = tokio::time::timeout(
-        Duration::from_millis(300),
-        run_attempt(
-            provider,
-            &transaction_input,
-            &fingerprint,
-            Instant::now() + Duration::from_millis(100),
-        ),
-    )
-    .await
-    .expect("stalled pre-dispatch read must be bounded");
-
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.status(200).body("{}");
+        })
+        .await;
+    let input = absent_transaction();
+    let result = run_attempt(provider, &input, Instant::now() - Duration::from_millis(1)).await;
     assert!(matches!(result, Err(RawOrderedJobStoreError::Timeout)));
-    receipt.assert_calls_async(1).await;
-    check.assert_calls_async(1).await;
-    assert_eq!(transaction.calls_async().await, 0);
+    transaction.assert_calls_async(0).await;
 }
 
 #[tokio::test]
-async fn given_slow_pre_dispatch_reads_when_send_outlives_deadline_then_outcome_is_unknown_without_retry()
+async fn given_a_conditional_request_when_native_dispatch_succeeds_then_only_the_checked_data_write_is_sent()
  {
     let server = MockServer::start_async().await;
     let provider = provider_for(&server).await;
-    let (receipt, check, transaction) = delayed_attempt_mocks(
-        &server,
-        Duration::from_millis(20),
-        Duration::from_millis(500),
-    )
-    .await;
-    let transaction_input = absent_transaction();
-    let fingerprint = encoding::transaction_fingerprint(&transaction_input);
-    let result = tokio::time::timeout(
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
+                .body_includes("attribute_not_exists(#pk)")
+                .body_includes("K#636f6e666c696374")
+                .body_excludes("ClientRequestToken")
+                .body_excludes("R#");
+            then.status(200).body("{}");
+        })
+        .await;
+    let outcome = super::commit::run(provider, &absent_transaction())
+        .await
+        .unwrap();
+    assert_eq!(outcome, scheduled_bg_jobs::store::CommitOutcome::Committed);
+    transaction.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn given_a_definitive_native_condition_failure_when_dispatched_then_the_attempt_returns_conflict()
+ {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.status(400).json_body(serde_json::json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+                "CancellationReasons": [{"Code": "ConditionalCheckFailed"}]
+            }));
+        })
+        .await;
+    let outcome = super::commit::run(provider, &absent_transaction())
+        .await
+        .unwrap();
+    assert_eq!(outcome, scheduled_bg_jobs::store::CommitOutcome::Conflict);
+    transaction.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn given_a_dispatched_write_when_its_response_exceeds_the_deadline_then_outcome_is_unknown_without_retry()
+ {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.status(200)
+                .body("{}")
+                .delay(Duration::from_millis(500));
+        })
+        .await;
+    let input = absent_transaction();
+    let outcome = tokio::time::timeout(
         Duration::from_secs(2),
         run_attempt(
             provider,
-            &transaction_input,
-            &fingerprint,
+            &input,
             Instant::now() + Duration::from_millis(100),
         ),
     )
     .await
-    .expect("send deadline must be bounded")
-    .expect("possibly dispatched send returns an outcome");
-
+    .expect("bounded native attempt")
+    .expect("ambiguous dispatch is an outcome");
     assert!(matches!(
-        result,
-        crate::provider::scheduled_job_store::commit::AttemptDecision::Outcome(
-            scheduled_bg_jobs::store::CommitOutcome::Unknown,
-        )
+        outcome,
+        super::commit::AttemptDecision::Outcome(scheduled_bg_jobs::store::CommitOutcome::Unknown)
     ));
-    receipt.assert_calls_async(1).await;
-    check.assert_calls_async(1).await;
-    assert_eq!(transaction.calls_async().await, 1);
+    transaction.assert_calls_async(1).await;
 }
 
 #[tokio::test]
 async fn given_redirect_then_unreachable_target_when_committing_then_outcome_is_unknown() {
     let server = MockServer::start_async().await;
-    let receipt_redirect = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(receipt_key())
-                .body_includes("\"ConsistentRead\":true");
-            then.status(307).header("location", "/receipt");
-        })
-        .await;
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .path("/receipt")
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(receipt_key())
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200).body("{}");
-        })
-        .await;
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve unreachable port");
-    let unreachable_port = listener.local_addr().expect("unreachable address").port();
+    let unreachable_port = listener.local_addr().unwrap().port();
     drop(listener);
     let transaction = server
         .mock_async(|when, then| {
             when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(committed_operation_token());
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
             then.status(307).header(
                 "location",
                 format!("http://127.0.0.1:{unreachable_port}/unreachable"),
             );
         })
         .await;
-
     let mut provider =
         crate::provider::implementation::RemoteStorageProvider::new(RemoteStorageSettings {
             endpoint_urls: vec![server.url("/")],
@@ -318,18 +262,84 @@ async fn given_redirect_then_unreachable_target_when_committing_then_outcome_is_
             timeouts: None,
         })
         .await
-        .expect("remote provider");
+        .unwrap();
     provider.enable_scheduled_job_http_redirects();
-
-    let outcome = crate::provider::scheduled_job_store::commit::run(
-        Arc::new(provider),
-        &unconditional_transaction(),
-    )
-    .await
-    .expect("ambiguous commit is reconciled to an outcome");
-
+    let outcome = super::commit::run(Arc::new(provider), &unconditional_transaction())
+        .await
+        .unwrap();
     assert_eq!(outcome, scheduled_bg_jobs::store::CommitOutcome::Unknown);
-    assert!(transaction.calls_async().await > 0);
-    assert!(receipt_redirect.calls_async().await >= 2);
-    assert!(receipt.calls_async().await >= 2);
+    transaction.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn given_an_ambiguous_native_failure_before_a_later_abort_when_invoked_then_transport_does_not_retry()
+ {
+    let server = MockServer::start_async().await;
+    let provider = provider_for(&server).await;
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorded = Arc::clone(&requests);
+    let transaction = server.mock_async(|when, then| {
+        when.method(POST).header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+        then.respond_with(move |_| {
+            let first = recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let body = if first {
+                serde_json::json!({"__type": "InternalServerError"})
+            } else {
+                serde_json::json!({"__type": "TransactionCanceledException", "CancellationReasons": [{"Code": "ConditionalCheckFailed"}]})
+            };
+            HttpMockResponse::builder().status(if first {500} else {400}).body(body.to_string()).build()
+        });
+    }).await;
+    let outcome = super::commit::run(provider, &absent_transaction())
+        .await
+        .unwrap();
+    assert_eq!(outcome, scheduled_bg_jobs::store::CommitOutcome::Unknown);
+    transaction.assert_calls_async(1).await;
+}
+
+#[tokio::test]
+async fn given_a_definitive_not_leader_abort_when_invoked_then_the_native_attempt_follows_the_leader_hint()
+ {
+    let follower = MockServer::start_async().await;
+    let leader = MockServer::start_async().await;
+    let leader_endpoint = leader.url("/");
+    let provider =
+        crate::provider::implementation::RemoteStorageProvider::new(RemoteStorageSettings {
+            endpoint_urls: vec![follower.url("/"), leader_endpoint.clone()],
+            region: None,
+            tls: false,
+            credentials: RemoteCredentialStrategy::DefaultChain,
+            timeouts: None,
+        })
+        .await
+        .unwrap();
+    let aborted = follower
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.status(500)
+                .header(
+                    storage_types::STORAGE_LEADER_HINT_HEADER,
+                    leader_endpoint.trim_end_matches('/'),
+                )
+                .json_body(
+                    serde_json::json!({"__type": storage_types::STORAGE_NOT_LEADER_ERROR_TYPE}),
+                );
+        })
+        .await;
+    let committed = leader
+        .mock_async(|when, then| {
+            when.method(POST)
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
+            then.status(200).body("{}");
+        })
+        .await;
+    assert_eq!(
+        super::commit::run(Arc::new(provider), &absent_transaction())
+            .await
+            .unwrap(),
+        scheduled_bg_jobs::store::CommitOutcome::Committed
+    );
+    aborted.assert_calls_async(1).await;
+    committed.assert_calls_async(1).await;
 }

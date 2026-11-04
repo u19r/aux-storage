@@ -149,12 +149,12 @@ impl JournalStore {
         self.identity_key(crate::constants::ARCHIVE_FAMILY_SUFFIX, &kind)
     }
 
-    pub(super) async fn load_archive_state<A: PhysicalRecordAttempt>(
+    pub(super) async fn find_archive_state<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
         kind: ArchiveKind,
         protection: ReadProtection,
-    ) -> StorageResult<ArchiveFamilyObservation> {
+    ) -> StorageResult<Option<ArchiveFamilyObservation>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
@@ -169,9 +169,16 @@ impl JournalStore {
                 .load(attempt, &keys, protection)
                 .await?
                 .into_iter();
-            let row = rows.next().flatten().ok_or_else(corrupt_record)?;
-            let cursor_row = rows.next().flatten().ok_or_else(corrupt_record)?;
+            let row = rows.next().flatten();
+            let cursor_row = rows.next().flatten();
             let index = rows.next().flatten();
+            let Some(row) = row else {
+                if cursor_row.is_some() || index.is_some() {
+                    return Err(corrupt_record());
+                }
+                return Ok(None);
+            };
+            let cursor_row = cursor_row.ok_or_else(corrupt_record)?;
             let state: ArchiveState = self.records.decode(&row)?;
             let cursor: ArchiveCursor = self.records.decode(&cursor_row)?;
             self.require_archive_cursor(&cursor)?;
@@ -188,13 +195,13 @@ impl JournalStore {
                 return Err(corrupt_record());
             }
             self.require_archive_state_index(&state, index.as_ref())?;
-            Ok(ArchiveFamilyObservation {
+            Ok(Some(ArchiveFamilyObservation {
                 row,
                 state,
                 cursor_row,
                 cursor,
                 index,
-            })
+            }))
         }
         .await;
         settlement.complete(result)

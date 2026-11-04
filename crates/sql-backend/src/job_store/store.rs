@@ -131,7 +131,7 @@ impl<B: SqlBackend + 'static> RawOrderedJobStore for SqlRawOrderedJobStore<B> {
         range::read(self, request.clone()).await
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {

@@ -10,18 +10,16 @@ use serde_json::json;
 use storage_observability_test_support::observation::observe;
 use storage_provider::SystemStreamTrimExecutor;
 use storage_types::{
-    CreateTableRequest, PutItemRequest, SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES, StreamName,
-    SystemStreamScope,
+    CreateTableRequest, PutItemRequest, SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES, SystemStreamScope,
 };
 use stream_provider::{
-    StreamRowKind, SystemStreamPageRequest, SystemStreamTrimContinuation,
-    SystemStreamTrimOperationId,
+    SystemStreamPageRequest, SystemStreamTrimContinuation, SystemStreamTrimOperationId,
 };
 
 use super::test_support::{TestStore, assert_dynamo_error_response_exact, unique_table_name};
 
-// Boundary and implementation rules from the legacy SQL SystemStream trim
-// tests: bounded reclamation replays receipts and preserves issued checkpoints.
+// Bounded reclamation replays receipts; a consumed checkpoint survives without
+// retaining rows behind it.
 #[tokio::test]
 async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_replay_and_checkpoint_survives()
  {
@@ -84,7 +82,7 @@ async fn given_issued_cdc_checkpoint_when_system_stream_is_trimmed_then_pages_re
         let terminal = observe(worker.run_page(scope.clone(), cutoff, Some(continuation))).await;
         terminal.assert_no_warning_or_error();
         let terminal = terminal.result.unwrap();
-        assert_eq!(terminal.reclaimed_records(), 0);
+        assert_eq!(terminal.reclaimed_records(), 1);
         assert!(terminal.next_continuation().is_none());
 
         let resumed = observe(store.stream_operations.get_system_stream_page(
@@ -199,9 +197,8 @@ async fn given_tampered_trim_continuation_when_page_is_requested_then_validation
         let first = worker.run_page(scope.clone(), cutoff, None).await.unwrap();
         assert_eq!(first.reclaimed_records(), 1);
         let continuation = first.next_continuation().cloned().unwrap();
-        let stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(stream.clone(), None, 10).await.unwrap();
-        assert_eq!(before.items.len(), 1);
+        let before = store.stream_operations.get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap()).await.unwrap();
+        assert_eq!(before.records().len(), 1);
 
         let tampered = SystemStreamTrimContinuation::try_new(
             SystemStreamTrimOperationId::new(&scope, cutoff),
@@ -217,13 +214,11 @@ async fn given_tampered_trim_continuation_when_page_is_requested_then_validation
             r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"system stream trim continuation does not match preceding page"}"#,
         );
 
-        let after = store.stream_operations.read_forward(stream, None, 10).await.unwrap();
-        assert_eq!(after.items.len(), before.items.len());
-        assert_eq!(after.items[0].id, before.items[0].id);
-        assert_eq!(after.items[0].data, before.items[0].data);
-        assert_eq!(after.items[0].data_type, before.items[0].data_type);
+        let after = store.stream_operations.get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap()).await.unwrap();
+        assert_eq!(after.records().len(), before.records().len());
+        assert_eq!(serde_json::to_value(after.records()).unwrap(), serde_json::to_value(before.records()).unwrap());
         let valid = worker.run_page(scope, cutoff, Some(continuation)).await.unwrap();
-        assert_eq!(valid.reclaimed_records(), 0);
+        assert_eq!(valid.reclaimed_records(), 1);
         assert!(valid.next_continuation().is_none());
     })
     .catch_unwind()
@@ -269,9 +264,8 @@ async fn given_wrong_source_scope_when_system_cdc_trim_runs_then_history_is_not_
         issued.assert_no_warning_or_error();
         assert_eq!(issued.result.unwrap().records().len(), 2);
 
-        let stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store.stream_operations.read_forward(stream.clone(), None, 10).await.unwrap();
-        assert_eq!(before.items.len(), 2);
+        let before = store.stream_operations.get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap()).await.unwrap();
+        assert_eq!(before.records().len(), 2);
         let worker = SystemStreamTrimExecutor::new(
             store.system_stream_trim_repository.as_ref(),
             1,
@@ -286,10 +280,9 @@ async fn given_wrong_source_scope_when_system_cdc_trim_runs_then_history_is_not_
             r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"DynamoDB could not process your request."}"#,
         );
 
-        let after = store.stream_operations.read_forward(stream, None, 10).await.unwrap();
-        assert_eq!(after.items.len(), before.items.len());
-        assert_eq!(after.items[0].id, before.items[0].id);
-        assert_eq!(after.items[1].id, before.items[1].id);
+        let after = store.stream_operations.get_system_stream_page(SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap()).await.unwrap();
+        assert_eq!(after.records().len(), before.records().len());
+        assert_eq!(serde_json::to_value(after.records()).unwrap(), serde_json::to_value(before.records()).unwrap());
         let valid = observe(worker.run_page(scope, cutoff, None)).await;
         valid.assert_no_warning_or_error();
         assert_eq!(valid.result.unwrap().reclaimed_records(), 1);
@@ -302,8 +295,8 @@ async fn given_wrong_source_scope_when_system_cdc_trim_runs_then_history_is_not_
     }
 }
 
-// Boundary rule from the legacy SQL trim test: a large number of issued
-// receipts must not cap protected-frontier derivation or invalidate a resume.
+// Issued receipts do not extend system history. Consumed checkpoints remain
+// resumable, and a checkpoint behind reclaimed data reports a gap.
 #[tokio::test]
 async fn given_more_than_checkpoint_entry_bound_when_system_cdc_is_trimmed_then_latest_receipt_replays()
  {
@@ -384,19 +377,20 @@ async fn given_more_than_checkpoint_entry_bound_when_system_cdc_is_trimmed_then_
             pages += 1;
             assert!(pages <= SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES + 2);
         }
-        assert_eq!(reclaimed, 1, "later checkpoint frontiers remain protected");
+        assert_eq!(reclaimed, SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES + 2, "issued checkpoints must not extend system history");
 
         let early = observe(store.stream_operations.get_system_stream_page(
             SystemStreamPageRequest::try_new(scope.clone(), Some(first_checkpoint), 1).unwrap(),
         ))
         .await;
-        early.assert_no_warning_or_error();
-        let early = early.result.unwrap();
-        assert_eq!(early.records().len(), 1);
-        assert_eq!(
-            serde_json::to_value(&early.records()[0].keys).unwrap(),
-            json!({"pk": {"S": "checkpoint-2"}}),
+        assert_dynamo_error_response_exact(
+            early.result.unwrap_err().into_storage_error(), axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"DynamoDB could not process your request."}"#,
         );
+        let fresh = store.stream_operations.get_system_stream_page(
+            SystemStreamPageRequest::try_new(scope.clone(), None, 1).unwrap(),
+        ).await.unwrap();
+        assert!(fresh.records().is_empty() && fresh.terminal());
 
         let resumed = observe(store.stream_operations.get_system_stream_page(
             SystemStreamPageRequest::try_new(scope, Some(checkpoint.clone()), 1).unwrap(),

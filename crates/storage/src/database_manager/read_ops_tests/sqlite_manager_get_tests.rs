@@ -53,7 +53,8 @@ impl sql_backend::SqlBackend for CountedBackend {
 }
 
 #[tokio::test]
-async fn given_manager_get_when_cache_cold_and_warm_then_one_native_attempt_supplies_item() {
+async fn given_manager_point_reads_when_cache_cold_and_warm_then_one_attempt_supplies_item_and_reservation()
+ {
     let path = crate::storage_test_support_tests::unique_path("manager-get-attempt");
     let table = TableName::new("manager_get_scope");
     let seed = DatabaseManager::new_for_test_with_config(storage_provider::StorageConfig {
@@ -131,6 +132,36 @@ async fn given_manager_get_when_cache_cold_and_warm_then_one_native_attempt_supp
             1,
             "{temperature} Get must own one native attempt"
         );
+        attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        // The guard is deliberately non-serializable, including in profiling
+        // builds.
+        let (reservation, received) = tokio::sync::oneshot::channel();
+        let (response, reservation) = manager
+            .batch_get_item_retaining(
+                storage_types::BatchGetItemRequest {
+                    request_items: storage_types::VecMap::from_iter([(
+                        table.clone(),
+                        storage_types::KeysAndAttributes {
+                            keys: vec![storage_types::KeyAttributes::from_iter([(
+                                "pk".to_owned(),
+                                AttributeValue::S("item#1".to_owned()),
+                            )])],
+                            attributes_to_get: None,
+                            projection_expression: None,
+                            expression_attribute_names: None,
+                            consistent_read: Some(true),
+                        },
+                    )]),
+                    return_consumed_capacity: None,
+                },
+                reservation,
+            )
+            .await
+            .expect("manager BatchGet with retained guard");
+        assert_eq!(response.responses.unwrap().get(&table).unwrap().len(), 1);
+        reservation.send(()).expect("reservation is still alive");
+        received.await.expect("original reservation returned");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
     drop(manager);
     std::fs::remove_file(path).expect("remove owned database");
@@ -240,16 +271,33 @@ async fn given_table_stream_when_cursor_is_malformed_then_public_read_rejects_it
     let manager = crate::DatabaseManager::new_for_test()
         .await
         .expect("SQLite manager");
+    let name = TableName::new("malformed_table_stream_cursor");
+    let mut request = CreateTableRequest::new(
+        name.clone(),
+        vec![AttributeDefinition {
+            attribute_name: "pk".to_string(),
+            attribute_type: KeyAttributeType::S,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "pk".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        BillingMode::PayPerRequest,
+    );
+    request.stream_specification = Some(storage_types::StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+    });
+    manager
+        .create_table(&request)
+        .await
+        .expect("create stream table");
     let error = manager
-        .get_stream_records_for_table_name(
-            &crate::Tables::sys_namespaces(),
-            Some("not-hex"),
-            Some(10),
-        )
+        .get_stream_records_for_table_name(&name, Some("not-hex"), Some(10))
         .await
         .expect_err("malformed cursor must fail");
     assert!(matches!(
         storage_types::context::WrappedError::to_enum(&error),
-        storage_types::StorageEnum::InternalServerError { .. }
+        storage_types::StorageEnum::RawValidation { .. }
     ));
 }

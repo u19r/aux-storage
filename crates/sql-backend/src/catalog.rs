@@ -8,12 +8,11 @@ use storage_common::point_results::place_value;
 use storage_provider::{
     CATALOG_READ_BYTES, CatalogAttempt, CatalogNamePage, CatalogStamp, CatalogStreamPage,
     CreateTableLayout, ListStreamsAttempt, ListTablesAttempt, TableMetadataCache,
-    TableNameReservation,
 };
 use storage_types::{
     BoundTableInfo, MaxIndexers, StorageEnum, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, SystemStreamPosition, SystemStreamShardId, TableHistoryId, TableName,
-    TableStatus, TimestampMillis, context::WrappedError as _,
+    StreamRetentionDuration, SystemStreamPosition, SystemStreamScope, SystemStreamShardId,
+    TableHistoryId, TableName, TableStatus, TimestampMillis, context::WrappedError as _,
 };
 use stream_provider::SystemStreamHistory;
 
@@ -57,7 +56,6 @@ pub(crate) enum SqlDynamoWriteKind {
     Primary,
     Gsi,
     Stream,
-    Retention,
 }
 
 impl SqlDynamoWriteKind {
@@ -70,9 +68,6 @@ impl SqlDynamoWriteKind {
             Self::Gsi => StorageError::internal("SQL GSI write changed the wrong row count"),
             Self::Stream => {
                 StorageError::internal("SQL Dynamo stream write affected an unexpected row count")
-            }
-            Self::Retention => {
-                StorageError::internal("SQL retention write affected the wrong row count")
             }
         }
     }
@@ -132,14 +127,18 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
     pub(crate) fn reserve_stream_position(
         &mut self,
         routing_key: &[u8],
-    ) -> StorageResult<SystemStreamPosition> {
+    ) -> StorageResult<(SystemStreamScope, SystemStreamPosition)> {
         let history = self
             .dynamo_history
             .as_mut()
             .ok_or_else(|| StorageError::internal("SQL stream history was not prepared"))?;
+        let scope = history.as_ref().source_scope().clone();
         let positions = match &mut self.dynamo_positions {
             DynamoStreamPositions::Native(allocation) => {
-                return history.native_numeric_position(routing_key, allocation.reserve()?);
+                return Ok((
+                    scope,
+                    history.native_numeric_position(routing_key, allocation.reserve()?)?,
+                ));
             }
             DynamoStreamPositions::Sequential(positions) => positions,
         };
@@ -154,7 +153,7 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
                 allocation.next_offset,
             ));
         }
-        Ok(allocation.position)
+        Ok((scope, allocation.position))
     }
 
     pub(crate) fn append_dynamo_statements(
@@ -271,7 +270,7 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
     pub async fn read_table_layout(
         &mut self,
         table: &StoredTableInfo,
-    ) -> StorageResult<CreateTableLayout<bool>> {
+    ) -> StorageResult<CreateTableLayout<()>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -280,7 +279,8 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
                 .query_one(
                     SqlStatement::new(
                         format!(
-                            "SELECT locked_until FROM {relation_tables} WHERE table_name = {}",
+                            "SELECT id FROM {relation_tables} WHERE table_name = {} AND \
+                             table_status <> 'DELETING'",
                             catalog.engine.engine().placeholder(1),
                             relation_tables = catalog.engine.relation_name("tables"),
                         ),
@@ -289,19 +289,9 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
                     ReadProtection::Conflict,
                 )
                 .await?;
-            let reservation = match lock.as_ref() {
-                None => TableNameReservation::Available,
-                Some(row) => match row.value(ColumnIndex::new(0))? {
-                    SqlValue::Integer(millis) => {
-                        TableNameReservation::LockedUntil(TimestampMillis::from_timestamp(*millis))
-                    }
-                    SqlValue::Null => TableNameReservation::Active,
-                    _ => return Err(StorageError::internal("invalid SQL name reservation")),
-                },
-            };
             Ok(CreateTableLayout {
-                reservation,
-                seed: lock.is_some(),
+                name_in_use: lock.is_some(),
+                seed: (),
             })
         }
         .await;
@@ -312,50 +302,19 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
         &mut self,
         table: &StoredTableInfo,
         history_id: TableHistoryId,
-        clear_expired_lock: bool,
     ) -> StorageResult<bool> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
         let result = async {
-            let name = &table.table_name;
-            if clear_expired_lock {
-                let deleted = catalog
-                    .attempt
-                    .execute(SqlStatement::new(
-                        format!(
-                            "DELETE FROM {relation_tables} WHERE table_name = {} AND locked_until \
-                             <= {}",
-                            catalog.engine.engine().placeholder(1),
-                            catalog.engine.engine().placeholder(2),
-                            relation_tables = catalog.engine.relation_name("tables"),
-                        ),
-                        vec![
-                            SqlValue::Text(name.to_string()),
-                            SqlValue::Integer(table.created_at.timestamp_millis()),
-                        ],
-                    ))
-                    .await?;
-                if deleted == 0 {
-                    return Ok(false);
-                }
-                if deleted != 1 {
-                    return Err(StorageError::internal(
-                        "SQL name reservation deletion affected multiple rows",
-                    ));
-                }
-            }
             let mut layout = vec![
                 insert_table_statement(catalog.engine, table, history_id)?,
                 SqlStatement::new(render_item_table(catalog.engine, table, history_id), vec![]),
-                SqlStatement::new(
-                    render_ttl_index_table(catalog.engine, table, history_id),
-                    vec![],
-                ),
+                SqlStatement::new(render_ttl_index_table(catalog.engine, history_id), vec![]),
                 crate::stream_write::sql_statements::initialize_sequence(
                     catalog.engine,
                     &crate::stream_write::sql_statements::user_sequence_name(
-                        &storage_types::StreamName::table_stream(name),
+                        &history_id.append_stream_name(),
                     ),
                 ),
             ];
@@ -406,15 +365,14 @@ fn insert_table_statement(
     table: &StoredTableInfo,
     history_id: TableHistoryId,
 ) -> StorageResult<SqlStatement> {
-    let placeholders = (1..=15)
+    let placeholders = (1..=14)
         .map(|index| engine.engine().placeholder(index))
         .collect::<Vec<_>>();
     let sql = format!(
         "INSERT INTO {relation_tables} (id, table_name, table_status, created_at, \
          attribute_definitions, key_schema, max_indexers, global_secondary_indexes, \
          table_size_bytes, item_count, stream_specification, stream_enabled, \
-         deletion_protection_enabled, table_stream_duration_hours, \
-         default_item_stream_duration_hours) VALUES ({})",
+         deletion_protection_enabled, table_stream_duration_hours) VALUES ({})",
         placeholders.join(", "),
         relation_tables = engine.relation_name("tables"),
     );
@@ -449,21 +407,15 @@ fn insert_table_statement(
                 .map(serde_json::to_string)
                 .transpose()?,
         ),
-        SqlValue::Boolean(
-            table
-                .stream_specification
-                .as_ref()
-                .is_some_and(|spec| spec.stream_enabled),
-        ),
+        SqlValue::Boolean(table.has_enabled_stream()),
         SqlValue::Boolean(table.deletion_protection_enabled),
         SqlValue::Integer(table.table_stream_duration.as_hours_wire_value()),
-        SqlValue::Integer(table.default_item_stream_duration.as_hours_wire_value()),
     ];
     Ok(SqlStatement::new(sql, values))
 }
 
 impl<A: SqlAttempt, L: SqlLayout> CatalogAttempt for SqlCatalogAttempt<'_, A, L> {
-    async fn advance_catalog_stamp(
+    async fn store_external_cleanup_barrier(
         &mut self,
         name: &TableName,
         expected: CatalogStamp,
@@ -482,8 +434,9 @@ impl<A: SqlAttempt, L: SqlLayout> CatalogAttempt for SqlCatalogAttempt<'_, A, L>
                 .map_err(|_| StorageError::internal("catalog revision overflow"))?;
             let statement = SqlStatement::new(
                 format!(
-                    "UPDATE {} SET catalog_revision = {} WHERE table_name = {} AND id = {} AND \
-                     catalog_revision = {} AND locked_until IS NULL",
+                    "UPDATE {} SET catalog_revision = {}, external_cleanup_required = 1 WHERE \
+                     table_name = {} AND id = {} AND catalog_revision = {} AND table_status <> \
+                     'DELETING'",
                     catalog.engine.relation_name("tables"),
                     catalog.engine.engine().placeholder(1),
                     catalog.engine.engine().placeholder(2),
@@ -629,7 +582,7 @@ impl<A: SqlAttempt, L: SqlLayout> CatalogAttempt for SqlCatalogAttempt<'_, A, L>
                 "id, table_name, table_status, created_at, attribute_definitions, key_schema, \
                  max_indexers, global_secondary_indexes, table_size_bytes, item_count, \
                  stream_specification, deletion_protection_enabled, table_stream_duration_hours, \
-                 default_item_stream_duration_hours, catalog_revision",
+                 catalog_revision",
             );
             let page = catalog
                 .attempt
@@ -640,7 +593,7 @@ impl<A: SqlAttempt, L: SqlLayout> CatalogAttempt for SqlCatalogAttempt<'_, A, L>
                 )
                 .await?;
             let tables = collect_catalog_rows(&names, page, 1, |row| {
-                Ok((Arc::new(decode_table(row)?), decode_revision(row, 14)?))
+                Ok((Arc::new(decode_table(row)?), decode_revision(row, 13)?))
             })?;
             requests
                 .iter()
@@ -671,7 +624,7 @@ fn catalog_batch_statement(
     let placeholders = engine.engine().placeholders(names.len());
     let sql = format!(
         "SELECT {columns} FROM {relation_tables} WHERE table_name IN ({placeholders}) AND \
-         locked_until IS NULL",
+         table_status <> 'DELETING'",
         relation_tables = engine.relation_name("tables"),
     );
     SqlStatement::new(
@@ -728,7 +681,7 @@ fn single_catalog_row(page: SqlQueryPage) -> StorageResult<Option<SqlRow>> {
 fn catalog_stamp_statement(engine: impl SqlLayout, name: &TableName) -> SqlStatement {
     let sql = format!(
         "SELECT id, catalog_revision FROM {relation_tables} WHERE table_name = {} AND \
-         locked_until IS NULL",
+         table_status <> 'DELETING'",
         engine.engine().placeholder(1),
         relation_tables = engine.relation_name("tables"),
     );
@@ -746,9 +699,9 @@ fn table_at_stamp_statement(
     let sql = format!(
         "SELECT id, table_name, table_status, created_at, attribute_definitions, key_schema, \
          max_indexers, global_secondary_indexes, table_size_bytes, item_count, \
-         stream_specification, deletion_protection_enabled, table_stream_duration_hours, \
-         default_item_stream_duration_hours FROM {relation_tables} WHERE table_name = {} AND id = \
-         {} AND catalog_revision = {} AND locked_until IS NULL",
+         stream_specification, deletion_protection_enabled, table_stream_duration_hours FROM \
+         {relation_tables} WHERE table_name = {} AND id = {} AND catalog_revision = {} AND \
+         table_status <> 'DELETING'",
         engine.engine().placeholder(1),
         engine.engine().placeholder(2),
         engine.engine().placeholder(3),
@@ -778,11 +731,11 @@ impl<A: SqlAttempt, L: SqlLayout> ListTablesAttempt for SqlCatalogAttempt<'_, A,
             let where_clause = if let Some(after) = after {
                 binds.push(SqlValue::Text(after.to_string()));
                 format!(
-                    "WHERE table_name > {} AND locked_until IS NULL",
+                    "WHERE table_name > {} AND table_status <> 'DELETING'",
                     catalog.engine.engine().placeholder(1)
                 )
             } else {
-                "WHERE locked_until IS NULL".to_string()
+                "WHERE table_status <> 'DELETING'".to_string()
             };
             binds.push(SqlValue::Integer(i64::from(limit)));
             let sql = format!(
@@ -823,7 +776,7 @@ impl<A: SqlAttempt, L: SqlLayout> ListStreamsAttempt for SqlCatalogAttempt<'_, A
     async fn read_stream_entry(
         &mut self,
         name: &TableName,
-    ) -> StorageResult<Option<TimestampMillis>> {
+    ) -> StorageResult<Option<storage_types::TableStreamIdentity>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
@@ -832,8 +785,8 @@ impl<A: SqlAttempt, L: SqlLayout> ListStreamsAttempt for SqlCatalogAttempt<'_, A
                 .query_one(
                     SqlStatement::new(
                         format!(
-                            "SELECT created_at FROM {relation_tables} WHERE table_name = {} AND \
-                             stream_enabled = TRUE",
+                            "SELECT id, created_at FROM {relation_tables} WHERE table_name = {} \
+                             AND stream_enabled = TRUE",
                             catalog.engine.engine().placeholder(1),
                             relation_tables = catalog.engine.relation_name("tables"),
                         ),
@@ -842,13 +795,7 @@ impl<A: SqlAttempt, L: SqlLayout> ListStreamsAttempt for SqlCatalogAttempt<'_, A
                     catalog.protection,
                 )
                 .await?;
-            row.map(|row| match row.value(ColumnIndex::new(0))? {
-                SqlValue::Integer(value) => Ok(TimestampMillis::from_timestamp(*value)),
-                _ => Err(StorageError::internal(
-                    "stream catalog timestamp has invalid type",
-                )),
-            })
-            .transpose()
+            row.map(|row| decode_stream_identity(&row, 0)).transpose()
         }
         .await;
         settlement.complete(result)
@@ -875,8 +822,8 @@ impl<A: SqlAttempt, L: SqlLayout> ListStreamsAttempt for SqlCatalogAttempt<'_, A
             };
             binds.push(SqlValue::Integer(i64::from(limit)));
             let sql = format!(
-                "SELECT table_name, created_at FROM {relation_tables} WHERE stream_enabled = TRUE \
-                 {after_clause} ORDER BY table_name LIMIT {}",
+                "SELECT table_name, id, created_at FROM {relation_tables} WHERE stream_enabled = \
+                 TRUE {after_clause} ORDER BY table_name LIMIT {}",
                 catalog.engine.engine().placeholder(binds.len()),
                 relation_tables = catalog.engine.relation_name("tables"),
             );
@@ -900,15 +847,7 @@ impl<A: SqlAttempt, L: SqlLayout> ListStreamsAttempt for SqlCatalogAttempt<'_, A
                             ));
                         }
                     };
-                    let created_at = match row.value(ColumnIndex::new(1))? {
-                        SqlValue::Integer(value) => TimestampMillis::from_timestamp(*value),
-                        _ => {
-                            return Err(StorageError::internal(
-                                "stream catalog timestamp has invalid type",
-                            ));
-                        }
-                    };
-                    Ok((name, created_at))
+                    Ok((name, decode_stream_identity(&row, 1)?))
                 })
                 .collect::<StorageResult<Vec<_>>>()?;
             Ok(CatalogStreamPage {
@@ -941,6 +880,18 @@ pub async fn initialize_catalog<A: SqlAttempt>(
             vec![],
         ))
         .await?;
+    attempt
+        .execute(SqlStatement::new(
+            crate::sql_template::sql_template!(
+                engine,
+                "CREATE UNIQUE INDEX IF NOT EXISTS "["tables_active_name"],
+                " ON "["tables"],
+                " (table_name) WHERE table_status <> 'DELETING'"
+            )
+            .to_string(),
+            vec![],
+        ))
+        .await?;
     Ok(())
 }
 
@@ -959,9 +910,9 @@ fn render_catalog_schema(engine: impl SqlLayout) -> String {
          global_secondary_indexes {text}, table_size_bytes {int} NOT NULL DEFAULT 0, item_count \
          {int} NOT NULL DEFAULT 0, stream_specification {text}, stream_enabled {stream_boolean}, \
          deletion_protection_enabled {boolean}, table_stream_duration_hours {int} NOT NULL \
-         DEFAULT 72, default_item_stream_duration_hours {int} NOT NULL DEFAULT 72, \
-         ttl_config_blob {blob}, catalog_revision {int} NOT NULL DEFAULT 1 CHECK \
-         (catalog_revision > 0), locked_until {int}, PRIMARY KEY (id), UNIQUE (table_name)){}",
+         DEFAULT 72, ttl_config_blob {blob}, external_cleanup_required {int} NOT NULL DEFAULT 0 \
+         CHECK (external_cleanup_required IN (0, 1)), catalog_revision {int} NOT NULL DEFAULT 1 \
+         CHECK (catalog_revision > 0), PRIMARY KEY (id)){}",
         engine.engine().table_suffix(),
         relation_tables = engine.relation_name("tables"),
     )
@@ -988,8 +939,6 @@ fn decode_table(row: &SqlRow) -> StorageResult<BoundTableInfo> {
         .map_err(|_| StorageError::internal("invalid catalog table incarnation"))?;
     let table_stream_duration = StreamRetentionDuration::try_from(integer_column(row, 12)?)
         .map_err(|_| StorageError::internal("invalid catalog stream duration"))?;
-    let default_item_stream_duration = StreamRetentionDuration::try_from(integer_column(row, 13)?)
-        .map_err(|_| StorageError::internal("invalid catalog item stream duration"))?;
     let max_indexers = u8::try_from(integer_column(row, 6)?)
         .map_err(|_| StorageError::internal("invalid catalog max_indexers"))?;
     let info = StoredTableInfo {
@@ -1005,7 +954,6 @@ fn decode_table(row: &SqlRow) -> StorageResult<BoundTableInfo> {
         stream_specification: optional_json(row, 10)?,
         deletion_protection_enabled: integer_column(row, 11)? != 0,
         table_stream_duration,
-        default_item_stream_duration,
     };
     Ok((info, id).into())
 }
@@ -1047,4 +995,18 @@ fn optional_json<T: DeserializeOwned>(row: &SqlRow, index: usize) -> StorageResu
             "catalog JSON column has invalid type",
         )),
     }
+}
+
+fn decode_stream_identity(
+    row: &crate::SqlRow,
+    first: usize,
+) -> StorageResult<storage_types::TableStreamIdentity> {
+    let history_id = uuid::Uuid::parse_str(text_column(row, first)?)
+        .map_err(|_| StorageError::internal("stream catalog identity is invalid"))?
+        .into();
+    let created_at = TimestampMillis::from_timestamp(integer_column(row, first + 1)?);
+    Ok(storage_types::TableStreamIdentity {
+        history_id,
+        created_at,
+    })
 }

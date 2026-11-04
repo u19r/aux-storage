@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use replication_contract_tests::native::commit_fault::{NativeCommitBoundary, NativeCommitFault};
 use replication_types::regional_import::RegionalImport;
-use storage_provider::{DynamoOperations, PutItemShape};
+use storage_provider::{CatalogAttempt, DynamoOperations, PutItemShape};
 use storage_types::{GetItemRequest, PutItemRequest, TableName, context::WrappedError};
 
 use crate::{
@@ -262,8 +262,13 @@ async fn given_captured_enable_when_cancellation_loses_ack_and_names_are_reused_
     source
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
+                let history = attempt
+                    .read_catalog_stamp(&TableName::new(fixture::NAME))
+                    .await?
+                    .unwrap()
+                    .history_id;
                 let retained = journal
-                    .load_acceptance(attempt, &event.as_ref().id, &fixture::codec())
+                    .load_acceptance(attempt, (history, &event.as_ref().id), &fixture::codec())
                     .await?
                     .unwrap();
                 assert_eq!(retained.event.as_ref().bytes, event.as_ref().bytes);
@@ -272,12 +277,7 @@ async fn given_captured_enable_when_cancellation_loses_ack_and_names_are_reused_
         })
         .await
         .unwrap();
-    // Ordinary deletion reserves the name briefly; reuse follows that existing
-    // contract.
-    let reusable = destination.clone().with_clock(Arc::new(fixture::FixedClock(
-        storage_provider::name_locked_until(storage_types::Clock::now(&destination)),
-    )));
-    fixture::create_table(&reusable, &TableName::new(fixture::NAME)).await;
+    fixture::create_table(&destination, &TableName::new(fixture::NAME)).await;
     pair.operations[1]
         .put_item(PutItemRequest::new(
             TableName::new(fixture::NAME),
@@ -522,6 +522,9 @@ async fn given_installed_regions_when_import_aborts_or_loses_native_ack_then_ato
     // retained-source path. Selection reads only the receiver; it does not call
     // the publishing store.
     use storage_provider::DynamoPort;
+    let physical = fixture::installed_state(&destination, 2, fixture::NAME)
+        .await
+        .physical;
     let request = crate::source_frame::SourceFrameRequest {
         origin: import.manifest().origin.clone(),
         range: import.manifest().range,
@@ -529,6 +532,7 @@ async fn given_installed_regions_when_import_aborts_or_loses_native_ack_then_ato
         tables: vec![(
             import.bindings()[0].source_table,
             import.bindings()[0].lineage,
+            physical,
         )],
     };
     let relayed = destination
@@ -615,9 +619,8 @@ async fn given_received_numeric_spellings_when_imported_and_reopened_then_normal
     let mut envelope: serde_json::Value = serde_json::from_slice(original.bytes.as_ref()).unwrap();
     envelope["payload"]["Item"]["images"]["new"] = serde_json::from_slice(&received_bytes).unwrap();
     let codec = fixture::codec();
-    let received = codec
-        .decode_event(&serde_json::to_vec(&envelope).unwrap())
-        .unwrap();
+    let received_encoding = format!(" \n{}\t ", serde_json::to_string(&envelope).unwrap());
+    let received = codec.decode_event(received_encoding.as_bytes()).unwrap();
     let mut manifest = initial.manifest().clone();
     manifest.links[0].digest = received.as_ref().digest;
     manifest.digest = CanonicalDigest::of(codec.encode_interval(&manifest).unwrap().as_ref());
@@ -894,6 +897,7 @@ async fn given_persisted_missing_corrupt_or_exhausted_authoring_state_when_store
 #[tokio::test]
 async fn given_local_and_global_tables_when_mixed_writes_commit_then_only_global_members_replicate()
 {
+    use storage_provider::DynamoPort;
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source.sqlite");
     let lost_reply = Arc::new(NativeCommitFault::new(
@@ -1013,7 +1017,7 @@ async fn given_local_and_global_tables_when_mixed_writes_commit_then_only_global
     let request: storage_types::BatchWriteItemRequest = serde_json::from_value(serde_json::json!({"RequestItems": {
         fixture::NAME: [
             {"PutRequest": {"Item": {"pk": {"S": first_key}, "value": {"S": "accepted-before-lost-reply"}}}},
-            {"PutRequest": {"Item": {"pk": {"S": rejected_key}, "value": {"S": "still-unprocessed"}}, "Indexers": [], "AuxItemStreamTtlHours": 1}}
+            {"PutRequest": {"Item": {"pk": {"S": rejected_key}, "value": {"S": "still-unprocessed"}}, "Indexers": []}}
         ],
         "local_table": [{"PutRequest": {"Item": {"pk": {"S": first_key}, "value": {"S": "ordinary-accepted"}}}}]
     }})).unwrap();
@@ -1029,6 +1033,13 @@ async fn given_local_and_global_tables_when_mixed_writes_commit_then_only_global
         ],
     );
     let journal = fixture::journal_with_maximum_events(1, fixture::nz(1));
+    let observer = Arc::clone(&journal);
+    let before_head = source
+        .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+            Box::pin(async move { observer.load_source_head(attempt, partition).await })
+        })
+        .await
+        .unwrap();
     lost_reply.arm();
     let failure = crate::origin::execute_batch_write(
         &source,
@@ -1054,7 +1065,40 @@ async fn given_local_and_global_tables_when_mixed_writes_commit_then_only_global
         serde_json::to_value(response.unprocessed_items).unwrap(),
         serde_json::to_value(Some(expected)).unwrap()
     );
-    assert_eq!(receipt.events.len(), 1);
+    assert_eq!(receipt.owners.len(), 1);
+    assert_eq!(receipt.owners[0].physical, state.physical);
+    let after_head = source
+        .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+            Box::pin(async move {
+                fixture::journal(1)
+                    .load_source_head(attempt, partition)
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        u64::from(after_head),
+        u64::from(before_head) + 1,
+        "exactly one accepted publication must commit"
+    );
+    let publications = source
+        .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+            Box::pin(async move {
+                let journal = fixture::journal(1);
+                journal
+                    .load_source_position(attempt, &journal.origin(partition)?, after_head)
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        publications.events.len(),
+        1,
+        "the committed source record must contain exactly one accepted event"
+    );
     let exact_response = receipt.response.get().to_owned();
     drop(source);
     let source = fixture::reopen(&source_path).await;
@@ -1066,7 +1110,37 @@ async fn given_local_and_global_tables_when_mixed_writes_commit_then_only_global
         panic!("reopen lost partial batch response");
     };
     assert_eq!(reopened.response.get(), exact_response);
-    assert_eq!(reopened.events, receipt.events);
+    assert_eq!(
+        serde_json::to_value(reopened.owners).unwrap(),
+        serde_json::to_value(receipt.owners).unwrap()
+    );
+    let reopened_head = source
+        .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+            Box::pin(async move {
+                fixture::journal(1)
+                    .load_source_head(attempt, partition)
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened_head, after_head,
+        "recovery must not publish another event"
+    );
+    let reopened_publications = source
+        .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+            Box::pin(async move {
+                let journal = fixture::journal(1);
+                journal
+                    .load_source_position(attempt, &journal.origin(partition)?, reopened_head)
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_publications.events, publications.events);
     for (table, value) in [
         (fixture::NAME, "accepted-before-lost-reply"),
         ("local_table", "ordinary-accepted"),

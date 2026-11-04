@@ -19,7 +19,7 @@ use crate::{
 
 impl JournalStore {
     pub(crate) async fn prepare_archive_turn<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -35,8 +35,9 @@ impl JournalStore {
         let result = async {
             let codec = encoding.1;
             let family = self
-                .load_archive_state(attempt, kind, ReadProtection::Conflict)
-                .await?;
+                .find_archive_state(attempt, kind, ReadProtection::Conflict)
+                .await?
+                .ok_or_else(corrupt_record)?;
             match family.state {
                 ArchiveState::Pending(hold) => self
                     .load_archive_plan(attempt, hold, codec)
@@ -60,7 +61,9 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
 
-    async fn scan_archive_family<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn scan_archive_family<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         selected: (DurableRecord, DurableRecord, ArchiveCursor),
@@ -129,7 +132,7 @@ impl JournalStore {
     }
 
     async fn qualify_archive_selection<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -191,7 +194,7 @@ impl JournalStore {
     }
 
     async fn prepare_archive_selection<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -202,9 +205,8 @@ impl JournalStore {
         if record.revision != storage_types::Revision::INITIAL {
             return Err(corrupt_record());
         }
-        self.require_archive_metadata(&record, codec)?;
         if let Some(pointer) = self
-            .load_archive_pointer(attempt, &record, ReadProtection::Conflict)
+            .find_archive_pointer(attempt, &record.key, ReadProtection::Conflict)
             .await?
         {
             let hold = ArchiveHold::new(cursor, pointer);
@@ -212,15 +214,12 @@ impl JournalStore {
             return Ok(hold);
         }
         let metadata = Arc::clone(&record.bytes);
-        let bytes: Arc<[u8]> = if cursor.kind.is_payload() {
-            self.load_retained_bytes(attempt, &record, codec).await?
-        } else {
-            Arc::clone(&metadata)
-        };
-        if cursor.kind.is_payload() {
-            self.require_archive_original_identity(&record, &bytes, codec)?;
-        }
+        let payload = self.decode_original_payload(&record, codec)?;
+        let history = payload.history;
+        let bytes: Arc<[u8]> = Arc::from(payload.original_bytes()?);
+        self.require_archive_original_identity(&record, &bytes, codec)?;
         let pointer = ArchivePointer {
+            history,
             key: record.key.clone(),
             revision: record.revision,
             manifest: CanonicalDigest::of(&metadata),
@@ -233,7 +232,9 @@ impl JournalStore {
         Ok(hold)
     }
 
-    async fn load_archive_plan<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn load_archive_plan<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         hold: ArchiveHold,
@@ -254,30 +255,23 @@ impl JournalStore {
             Some(record) => record,
             None => self.load_archive_record(&hold.pointer).await?,
         };
-        self.prepare_archive_plan(attempt, hold, record, codec)
-            .await
+        self.prepare_archive_plan(hold, record, codec)
     }
 
-    async fn prepare_archive_plan<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    fn prepare_archive_plan(
         &self,
-        attempt: &mut A,
         hold: ArchiveHold,
         record: DurableRecord,
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<ArchivePlan> {
         self.require_archive_hold(&hold)?;
         hold.pointer.require_record(&record)?;
-        self.require_archive_metadata(&record, codec)?;
-        if hold.cursor.kind.has_publication_coverage() {
-            return self
-                .prepare_archive_publication(attempt, hold, record, codec)
-                .await;
-        }
-        let manifest = self.decode_retained_manifest(&record, codec)?;
-        if hold.pointer.length != manifest.original_length() {
+        let payload = self.decode_original_payload(&record, codec)?;
+        let original = payload.original_bytes()?;
+        if hold.pointer.history != payload.history || hold.pointer.length != original.len() {
             return Err(corrupt_record());
         }
-        let bytes = self.load_retained_bytes(attempt, &record, codec).await?;
+        let bytes: Arc<[u8]> = Arc::from(original);
         self.require_archive_original_identity(&record, &bytes, codec)?;
         ArchivePlan::try_new(hold, record, bytes)
     }
@@ -295,51 +289,7 @@ impl JournalStore {
             Some(ArchiveKind::Baseline) => {
                 self.decode_retained_baseline(record, Arc::clone(bytes), codec)?;
             }
-            _ => return Err(corrupt_record()),
-        }
-        Ok(())
-    }
-
-    pub(super) fn require_archive_metadata(
-        &self,
-        record: &DurableRecord,
-        codec: &CanonicalJsonCodec,
-    ) -> StorageResult<()> {
-        match ArchiveKind::from_key(&record.key) {
-            Some(ArchiveKind::CollectionBaseline) => {
-                self.require_collected_baseline_definition(record)?
-            }
-            Some(ArchiveKind::CollectionRetainedDefinition) => {
-                self.require_collected_retained_definition(record)?
-            }
-            Some(ArchiveKind::CollectionRetainedCut) => {
-                self.decode_collected_retained_cut(record)?;
-            }
-            Some(ArchiveKind::CollectionCatalog) => {
-                self.decode_collected_catalog_page(record)?;
-            }
-            Some(ArchiveKind::CollectionRetiredPage) => {
-                self.decode_collected_retired_index(record)?;
-            }
-            Some(ArchiveKind::CollectionDeclaration) => {
-                self.decode_source_collection_declaration(record)?;
-            }
-            Some(ArchiveKind::CollectionDefinition) => {
-                self.decode_collected_history_definition(record)?;
-            }
-            Some(ArchiveKind::CollectionPage) => {
-                self.decode_collected_history_page(record)?;
-            }
-            Some(ArchiveKind::ImportManifest) => {
-                self.decode_import_manifest_record(record, codec)?;
-            }
-            Some(ArchiveKind::ImportPage) => {
-                self.decode_import_page_record(record)?;
-            }
-            Some(ArchiveKind::RetainedPosition) => {
-                self.decode_retained_position_record(record)?;
-            }
-            _ => {}
+            None => return Err(corrupt_record()),
         }
         Ok(())
     }

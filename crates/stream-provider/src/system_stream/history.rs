@@ -4,17 +4,42 @@
 //! Ordinary stream rows use ordered item IDs. Logical history adds lineage
 //! bounds and exact pointer observations; both use `StreamReadKind` at the
 //! physical attempt boundary.
-use std::{borrow::Cow, collections::BTreeMap, num::NonZeroU64};
+use std::{borrow::Cow, num::NonZeroU64};
 
 use storage_types::{
-    StorageError, StorageResult, StreamItemId, SystemStreamCheckpoint, SystemStreamContractError,
+    StorageError, StorageResult, SystemStreamCheckpoint, SystemStreamContractError,
     SystemStreamLineageId, SystemStreamOffset, SystemStreamPosition,
 };
 
 use super::{
     SystemStreamLineageCatalog, SystemStreamSplitReceipt, SystemStreamSplitRequest,
-    SystemStreamSplitResult, SystemStreamTrimPageRequest,
+    SystemStreamSplitResult,
 };
+
+/// Logical source observations remain in the caller's native attempt.
+pub trait SystemHistoryReadAttempt:
+    infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+{
+    fn read_system_page_start(
+        &mut self,
+        token: Option<&storage_types::SystemStreamCheckpointToken>,
+    ) -> impl Future<
+        Output = StorageResult<(
+            SystemStreamHistory,
+            Option<super::SystemStreamCheckpointReceipt>,
+        )>,
+    > + Send;
+
+    fn load_system_retired_frontiers(
+        &mut self,
+        origins: &[SystemStreamPosition],
+    ) -> impl Future<Output = StorageResult<Vec<Option<SystemStreamPosition>>>> + Send;
+
+    fn read_system_history_pages(
+        &mut self,
+        reads: &[SystemStreamHistoryRead],
+    ) -> impl Future<Output = StorageResult<Vec<crate::SystemStreamHistoryReadPage>>> + Send;
+}
 
 /// Immutable allocation baseline and committed upper bound for one lineage.
 #[derive(Debug)]
@@ -70,8 +95,6 @@ pub struct SystemStreamHistoryRead {
 #[derive(Debug)]
 pub struct SystemStreamHistoryRecord {
     pub position: SystemStreamPosition,
-    pub expected_pointer: StreamItemId,
-    pub actual_pointer: Option<StreamItemId>,
 }
 
 /// A native response tied to the complete read that produced it.
@@ -367,169 +390,75 @@ impl SystemStreamHistory {
         })
     }
 
-    /// Convert private consumed positions to exclusive trim limits. A hold on
-    /// any ancestor protects every record in each descendant until handoff.
-    pub fn private_trim_boundaries(
+    pub fn retirement_origins(
         &self,
-        minima: &[SystemStreamPosition],
     ) -> Result<Vec<SystemStreamPosition>, SystemStreamContractError> {
-        if minima.len() > self.bounds.len() {
-            return Err(SystemStreamContractError::BackendContract);
-        }
-        for (ordinal, position) in minima.iter().enumerate() {
-            let lineage = self
-                .catalog
-                .lineage(position.lineage_id())
-                .ok_or(SystemStreamContractError::UnknownLineage)?;
-            let bounds = self.find_bounds(position.lineage_id())?;
-            let offset = position.offset().order()?;
-            if lineage.shard_id() != position.shard_id()
-                || offset < bounds.initial_sequence.get() - 1
-                || offset >= bounds.next_sequence.get()
-                || minima[..ordinal]
-                    .iter()
-                    .any(|previous| previous.lineage_id() == position.lineage_id())
-            {
-                return Err(SystemStreamContractError::BackendContract);
-            }
-        }
-        if self.ordering == SystemStreamHistoryOrdering::Versionstamped {
-            return self.native_trim_boundaries(minima);
-        }
-        let mut limits = Vec::new();
-        for lineage in self.catalog.entries() {
-            let mut limit = None;
-            for position in minima {
-                let bound = if position.lineage_id() == lineage.lineage_id() {
-                    Some(
-                        position
-                            .offset()
-                            .order()?
-                            .checked_add(1)
-                            .ok_or(SystemStreamContractError::BackendContract)?,
-                    )
-                } else if self.is_ancestor(position.lineage_id(), lineage.lineage_id()) {
-                    Some(
-                        self.find_bounds(lineage.lineage_id())?
-                            .initial_sequence
-                            .get(),
-                    )
-                } else {
-                    None
-                };
-                if let Some(bound) = bound {
-                    limit = Some(limit.map_or(bound, |current: u64| current.min(bound)));
-                }
-            }
-            if let Some(limit) = limit {
-                let offset = format!("{limit:020}");
-                limits.push(lineage.position(offset)?);
-            }
-        }
-        Ok(limits)
-    }
-
-    fn native_trim_boundaries(
-        &self,
-        minima: &[SystemStreamPosition],
-    ) -> Result<Vec<SystemStreamPosition>, SystemStreamContractError> {
-        let mut limits = Vec::new();
-        for lineage in self.catalog.entries() {
-            let mut limit: Option<SystemStreamPosition> = None;
-            for position in minima {
-                let boundary = if position.lineage_id() == lineage.lineage_id() {
-                    position.next_versionstamp()?
-                } else if self.is_ancestor(position.lineage_id(), lineage.lineage_id()) {
-                    let initial = self
-                        .find_bounds(lineage.lineage_id())?
-                        .initial_sequence
-                        .get();
-                    lineage.position(format!("{initial:020}-vs00000000"))?
-                } else {
-                    continue;
-                };
-                if limit
-                    .as_ref()
-                    .map(|current| {
-                        boundary
-                            .offset()
-                            .compare_order(current.offset())
-                            .map(|order| order.is_lt())
-                    })
-                    .transpose()?
-                    .unwrap_or(true)
-                {
-                    limit = Some(boundary);
-                }
-            }
-            limits.extend(limit);
-        }
-        Ok(limits)
-    }
-
-    /// Bounded lineage identities used for one indexed minimum-hold probe per
-    /// lineage. The zero offset is only a probe key; it is not a frontier.
-    pub fn trim_hold_probes(&self) -> Result<Vec<SystemStreamPosition>, SystemStreamContractError> {
         self.catalog
             .entries()
             .iter()
-            .map(|lineage| lineage.position("0"))
+            .map(|lineage| {
+                let bound = self.find_bounds(lineage.lineage_id())?;
+                self.frontier_position(lineage, bound.initial_sequence.get() - 1)
+            })
             .collect()
     }
 
-    /// Combine durable checkpoint frontiers with GSI private holds into one
-    /// exclusive boundary per lineage. An absent checkpoint boundary retains
-    /// the lineage even when no GSI build is active.
-    pub fn trim_boundaries(
+    /// These are publication bounds, independent of consumer checkpoints.
+    /// PostgreSQL transaction IDs can be allocated before an older attempt
+    /// commits.
+    pub fn retirement_boundaries(
         &self,
-        request: &SystemStreamTrimPageRequest,
-        checkpoint_frontiers: &[SystemStreamPosition],
-        private_minima: &[SystemStreamPosition],
     ) -> Result<Vec<SystemStreamPosition>, SystemStreamContractError> {
-        self.catalog.validate_scope(request.scope())?;
-        if checkpoint_frontiers.len() > self.catalog.entries().len() {
-            return Err(SystemStreamContractError::BackendContract);
-        }
-        for position in checkpoint_frontiers {
+        let high = self.capture_high()?;
+        self.retirement_origins()?
+            .into_iter()
+            .map(|origin| {
+                let through = self.read_boundary(&origin, &high)?;
+                SystemStreamPosition::try_new(
+                    origin.shard_id().as_str(),
+                    origin.lineage_id().as_str(),
+                    through.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    /// A fresh reader starts at durable retained prefixes. Issued checkpoints
+    /// remain strict: missing history behind a retirement frontier is a gap.
+    pub fn retained_checkpoint(
+        &self,
+        retired: &[SystemStreamPosition],
+    ) -> Result<SystemStreamCheckpoint, SystemStreamContractError> {
+        let high = self.capture_high()?;
+        for position in retired {
             let lineage = self
                 .catalog
                 .lineage(position.lineage_id())
                 .ok_or(SystemStreamContractError::UnknownLineage)?;
-            let bounds = self.find_bounds(position.lineage_id())?;
-            let offset = position.offset().order()?;
-            if lineage.shard_id() != position.shard_id()
-                || offset < bounds.initial_sequence.get() - 1
-                || offset >= bounds.next_sequence.get()
-            {
+            if lineage.shard_id() != position.shard_id() {
                 return Err(SystemStreamContractError::BackendContract);
             }
+            self.read_boundary(position, &high)?;
         }
-        let mut boundaries = BTreeMap::<SystemStreamLineageId, SystemStreamPosition>::new();
-        for position in self
-            .catalog
-            .expand_protected_positions(checkpoint_frontiers)?
-        {
-            let position = if self.ordering == SystemStreamHistoryOrdering::Versionstamped
-                && position.offset().versionstamp().is_none()
-            {
-                SystemStreamPosition::try_new(
-                    position.shard_id().as_str(),
-                    position.lineage_id().as_str(),
-                    format!("{:020}-vs00000000", position.offset().order()?),
-                )?
-            } else {
-                position
-            };
-            boundaries.insert(position.lineage_id().clone(), position);
-        }
-        for position in self.private_trim_boundaries(private_minima)? {
-            if let Some(current) = boundaries.get_mut(position.lineage_id())
-                && position.offset().compare_order(current.offset())?.is_lt()
-            {
-                *current = position;
+        let mut current = self.initial_checkpoint()?;
+        loop {
+            let mut positions = current.frontier().to_vec();
+            for position in &mut positions {
+                if let Some(floor) = retired
+                    .iter()
+                    .find(|floor| floor.lineage_id() == position.lineage_id())
+                    && position.offset().compare_order(floor.offset())?.is_lt()
+                {
+                    *position = floor.clone();
+                }
             }
+            let floored = SystemStreamCheckpoint::try_new(current.scope().clone(), positions)?;
+            let expanded = self.expand_frontier(&floored, &high)?;
+            if expanded == floored {
+                return Ok(expanded);
+            }
+            current = expanded;
         }
-        Ok(boundaries.into_values().collect())
     }
 
     fn find_bounds(
@@ -841,7 +770,6 @@ impl SystemStreamHistoryPage {
                 } else {
                     SystemStreamHistory::parse_offset(&row.position)? != after + ordinal as u64 + 1
                 }
-                || row.actual_pointer != Some(row.expected_pointer)
             {
                 return Err(SystemStreamContractError::BackendContract);
             }

@@ -16,7 +16,11 @@ use lru_ttl_cache::LruTtlCache;
 use storage_common::TtlConfigRecord;
 use storage_types::{BoundTableInfo, StorageError, StorageResult, TableHistoryId, TableName};
 
-use crate::{SemanticDecision, TABLE_INFO_CACHE_TTL_SECONDS, table_info_cache_config};
+use crate::{
+    SemanticDecision, TABLE_INFO_CACHE_TTL_SECONDS,
+    dynamo_table_bindings::{CatalogConfirmation, RequestTableBindings},
+    table_info_cache_config,
+};
 
 /// Catalog identity changes on table recreation; revision changes on every
 /// schema, status, stream, GSI, or TTL configuration change.
@@ -24,6 +28,22 @@ use crate::{SemanticDecision, TABLE_INFO_CACHE_TTL_SECONDS, table_info_cache_con
 pub struct CatalogStamp {
     pub history_id: TableHistoryId,
     pub revision: NonZeroU64,
+}
+
+impl RequestTableBindings {
+    /// Resolve and pin an authoritative catalog observation before dependent
+    /// I/O.
+    pub async fn resolve_table<A: CatalogAttempt>(
+        &self,
+        attempt: &mut A,
+        cache: &TableMetadataCache,
+        name: &TableName,
+    ) -> StorageResult<(Arc<BoundTableInfo>, Option<CachePublication>)> {
+        let lookup = cache.lookup(name);
+        let stamp = self.pin_stamp(name, attempt.read_catalog_stamp(name).await?)?;
+        let (prepared, publication) = lookup.resolve(attempt, stamp).await?;
+        Ok((prepared.table, publication))
+    }
 }
 
 /// Candidate metadata for preparation; authority requires an in-attempt stamp
@@ -39,12 +59,17 @@ impl PreparedTable {
         &self,
         attempt: &mut A,
         cache: &TableMetadataCache,
+        bindings: &RequestTableBindings,
     ) -> StorageResult<()> {
         let name = &self.table.info.table_name;
-        cache.confirm_stamp(
-            name,
-            Some(self.stamp),
-            attempt.read_catalog_stamp(name).await?,
+        let observed = attempt.read_catalog_stamp(name).await?;
+        bindings.confirm_observations(
+            cache,
+            [CatalogConfirmation {
+                name,
+                prepared: Some(self.stamp),
+                observed,
+            }],
         )
     }
 }
@@ -103,6 +128,15 @@ impl TableMetadataCache {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         (self.entries.get(name), *generation)
+    }
+
+    fn lookup<'a>(&self, name: &'a TableName) -> CatalogLookup<'a> {
+        let (candidate, generation) = self.candidate(name);
+        CatalogLookup {
+            name,
+            candidate,
+            generation,
+        }
     }
 
     pub(crate) fn prepared_candidate(&self, name: &TableName) -> Option<PreparedTable> {
@@ -199,10 +233,10 @@ pub struct CachePublication {
 /// A write attempt protects the stamp against concurrent catalog mutation.
 /// Readers use one snapshot; writers protect the catalog until settlement.
 pub trait CatalogAttempt: Send {
-    /// Change only the catalog revision in this same attempt. Capture/control
-    /// installation uses this barrier to conflict with previously bound
-    /// writers.
-    fn advance_catalog_stamp(
+    /// Persist a permanent external-cleanup requirement and change the catalog
+    /// revision in this attempt. Capture/control installation conflicts with
+    /// previously bound writers. Ordinary metadata updates cannot clear it.
+    fn store_external_cleanup_barrier(
         &mut self,
         name: &TableName,
         expected: CatalogStamp,
@@ -240,6 +274,7 @@ pub(crate) async fn resolve_prepared_tables_in_attempt<A: CatalogAttempt>(
     attempt: &mut A,
     cache: &TableMetadataCache,
     names: &[TableName],
+    bindings: &RequestTableBindings,
 ) -> StorageResult<Vec<StorageResult<(PreparedTable, Option<CachePublication>)>>> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -271,9 +306,12 @@ pub(crate) async fn resolve_prepared_tables_in_attempt<A: CatalogAttempt>(
     for (slot, ((name, stamp), (candidate, _))) in
         unique_names.iter().zip(stamps).zip(&candidates).enumerate()
     {
-        let Some(stamp) = stamp else {
-            resolved[slot] = Some(Err(StorageError::table_not_found(name)));
-            continue;
+        let stamp = match bindings.pin_stamp(name, stamp) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                resolved[slot] = Some(Err(error));
+                continue;
+            }
         };
         if let Some(candidate) = candidate
             && candidate.stamp == stamp
@@ -335,12 +373,15 @@ pub async fn resolve_tables_batch_in_attempt<A: CatalogAttempt>(
     attempt: &mut A,
     cache: &TableMetadataCache,
     names: &[TableName],
+    bindings: &RequestTableBindings,
 ) -> StorageResult<Vec<StorageResult<(Arc<BoundTableInfo>, Option<CachePublication>)>>> {
-    Ok(resolve_prepared_tables_in_attempt(attempt, cache, names)
-        .await?
-        .into_iter()
-        .map(|result| result.map(|(prepared, publication)| (prepared.table, publication)))
-        .collect())
+    Ok(
+        resolve_prepared_tables_in_attempt(attempt, cache, names, bindings)
+            .await?
+            .into_iter()
+            .map(|result| result.map(|(prepared, publication)| (prepared.table, publication)))
+            .collect(),
+    )
 }
 
 /// Resolve a table inside the operation attempt. The returned publication
@@ -349,42 +390,61 @@ pub(crate) async fn resolve_prepared_table_in_attempt<A: CatalogAttempt>(
     attempt: &mut A,
     cache: &TableMetadataCache,
     name: &TableName,
+    bindings: &RequestTableBindings,
 ) -> StorageResult<SemanticDecision<(PreparedTable, Option<CachePublication>)>> {
-    let (candidate, generation) = cache.candidate(name);
-    let Some(stamp) = attempt.read_catalog_stamp(name).await? else {
-        return Ok(SemanticDecision::Rejected(StorageError::table_not_found(
-            name,
-        )));
+    let lookup = cache.lookup(name);
+    let stamp = attempt.read_catalog_stamp(name).await?;
+    let stamp = match bindings.pin_stamp(name, stamp) {
+        Ok(stamp) => stamp,
+        Err(error) => return Ok(SemanticDecision::Rejected(error)),
     };
-    if let Some(candidate) = candidate
-        && candidate.stamp == stamp
-    {
-        return Ok(SemanticDecision::Accepted((
-            PreparedTable {
-                table: candidate.table,
+    Ok(SemanticDecision::Accepted(
+        lookup.resolve(attempt, stamp).await?,
+    ))
+}
+
+/// Cache generation is captured before the stamp read. The ID binding owner
+/// can observe that stamp before metadata I/O, while publication still rejects
+/// an invalidation that raced with this lookup.
+struct CatalogLookup<'a> {
+    name: &'a TableName,
+    candidate: Option<PreparedTable>,
+    generation: u64,
+}
+
+impl CatalogLookup<'_> {
+    async fn resolve(
+        self,
+        attempt: &mut impl CatalogAttempt,
+        stamp: CatalogStamp,
+    ) -> StorageResult<(PreparedTable, Option<CachePublication>)> {
+        if let Some(candidate) = self.candidate
+            && candidate.stamp == stamp
+        {
+            return Ok((
+                PreparedTable {
+                    table: candidate.table,
+                    stamp,
+                },
+                None,
+            ));
+        }
+        let table = attempt.read_table_at_stamp(self.name, stamp).await?;
+        if table.history_id != stamp.history_id {
+            return Err(StorageError::internal(
+                "catalog table incarnation does not match stamp",
+            ));
+        }
+        let publication = CachePublication {
+            name: self.name.clone(),
+            entry: PreparedTable {
                 stamp,
+                table: Arc::clone(&table),
             },
-            None,
-        )));
+            generation: self.generation,
+        };
+        Ok((PreparedTable { table, stamp }, Some(publication)))
     }
-    let table = attempt.read_table_at_stamp(name, stamp).await?;
-    if table.history_id != stamp.history_id {
-        return Err(StorageError::internal(
-            "catalog table incarnation does not match stamp",
-        ));
-    }
-    let publication = CachePublication {
-        name: name.clone(),
-        entry: PreparedTable {
-            stamp,
-            table: Arc::clone(&table),
-        },
-        generation,
-    };
-    Ok(SemanticDecision::Accepted((
-        PreparedTable { table, stamp },
-        Some(publication),
-    )))
 }
 
 pub async fn resolve_table_in_attempt<A: CatalogAttempt>(
@@ -392,8 +452,9 @@ pub async fn resolve_table_in_attempt<A: CatalogAttempt>(
     cache: &TableMetadataCache,
     name: &TableName,
 ) -> StorageResult<(Arc<BoundTableInfo>, Option<CachePublication>)> {
-    let (prepared, publication) = resolve_prepared_table_in_attempt(attempt, cache, name)
-        .await?
-        .into_result()?;
+    let (prepared, publication) =
+        resolve_prepared_table_in_attempt(attempt, cache, name, &RequestTableBindings::default())
+            .await?
+            .into_result()?;
     Ok((prepared.table, publication))
 }

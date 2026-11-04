@@ -236,6 +236,7 @@ async fn targets(
         {
             targets.push((
                 DeliveryScope {
+                    physical: state.physical,
                     origin: OriginId {
                         region: fixture::region(1),
                         database_group: [1; 16].try_into().unwrap(),

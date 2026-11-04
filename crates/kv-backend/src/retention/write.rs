@@ -1,8 +1,8 @@
 //! Retention state and conditional marker completion on one KV attempt.
 
 use storage_provider::{
-    StreamRetentionFinishRecord, StreamTrimDueMarker, StreamTrimScopeKind, StreamTrimStateRecord,
-    StreamTrimStateWrite, maintenance::StreamRetentionFinish, table_retention_scope_id,
+    StreamRetentionFinishRecord, StreamTrimDueMarker, StreamTrimStateRecord, StreamTrimStateWrite,
+    maintenance::StreamRetentionFinish, table_retention_scope_id,
 };
 use storage_types::{StorageError, StorageResult, storage_serde};
 
@@ -17,13 +17,36 @@ pub async fn write_stream_retention<A: KvAttempt>(
     attempt.stage(stream_retention_mutations(identity, write)?)
 }
 
+pub(crate) async fn delete_table_retention<A: KvAttempt>(
+    attempt: &mut A,
+    scope: storage_provider::StreamTrimScope,
+) -> StorageResult<()> {
+    let states = super::read::load_stream_trim_states(
+        attempt,
+        std::slice::from_ref(&scope),
+        ReadProtection::Conflict,
+    )
+    .await?;
+    let [state]: [Option<storage_provider::StreamTrimState>; 1] = states
+        .try_into()
+        .map_err(|_| StorageError::internal("KV table retention read count differs"))?;
+    let mut changes = vec![KvMutation::Delete {
+        key: key_layout::state_key(&scope),
+    }];
+    if let Some(marker) = state.and_then(|state| state.scheduled_marker()) {
+        changes.push(KvMutation::Delete {
+            key: key_layout::due_key(&marker),
+        });
+    }
+    attempt.stage(changes)
+}
+
 pub(crate) fn stream_retention_mutations(
     identity: &KvTableIdentity,
     write: StreamTrimStateWrite,
 ) -> StorageResult<Vec<KvMutation>> {
     if write.state.scope.table_name != identity.table_name
-        || (write.state.scope.kind == StreamTrimScopeKind::Table
-            && write.state.scope.scope_id != table_retention_scope_id(identity.table_id.into()))
+        || write.state.scope.scope_id != table_retention_scope_id(identity.table_id.into())
     {
         return Err(StorageError::internal(
             "KV retention scope has another table identity",
@@ -34,6 +57,11 @@ pub(crate) fn stream_retention_mutations(
         key: state_key,
         value: storage_serde::to_bytes(&write.state)?,
     }];
+    if let Some(marker) = write.replaced_marker {
+        changes.push(KvMutation::Delete {
+            key: key_layout::due_key(&marker),
+        });
+    }
     if let Some(marker) = write.next_marker {
         if marker.scope != write.state.scope {
             return Err(StorageError::internal(
@@ -97,6 +125,12 @@ pub(crate) async fn finish_stream_trim_markers<A: KvAttempt>(
             return Err(StorageError::internal(
                 "KV stream trim marker payload differs",
             ));
+        }
+        if finish.record.state_write.is_some() && (due_value.is_none() || !state_matches) {
+            return Err(storage_types::StorageEnum::TransactionConflict {
+                message: "Table retention authority changed before cleanup completion".to_owned(),
+            }
+            .into());
         }
         if due_value.is_some() && state_matches {
             append_completion(&mut changes, finish)?;

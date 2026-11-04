@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use replication_types::event::{content::CanonicalEventCodec, identity::VersionIdentity};
-use storage_provider::{DynamoOperations, DynamoPort};
+use storage_provider::{CatalogAttempt, DynamoOperations, DynamoPort};
 use storage_types::{
     AttemptMode, AttributeValue, GetItemRequest, KeyAttributes, PutItemRequest, TableName, WireItem,
 };
@@ -235,7 +235,11 @@ async fn given_frozen_bootstrap_cut_when_live_rows_change_then_exact_baselines_a
                         },
                         range: (0.into(), through).try_into().unwrap(),
                         membership: state.membership,
-                        tables: vec![(state.configuration.table, state.configuration.lineage)],
+                        tables: vec![(
+                            state.configuration.table,
+                            state.configuration.lineage,
+                            state.physical,
+                        )],
                     };
                     originals.extend(
                         crate::source_frame::load_source_frame(
@@ -306,10 +310,15 @@ async fn given_frozen_bootstrap_cut_when_live_rows_change_then_exact_baselines_a
         store
             .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
                 Box::pin(async move {
+                    let history = attempt
+                        .read_catalog_stamp(&TableName::new(fixture::NAME))
+                        .await?
+                        .unwrap()
+                        .history_id;
                     for (identity, bytes) in baselines {
                         assert_eq!(
                             journal
-                                .load_baseline(attempt, &identity, &fixture::codec())
+                                .load_baseline(attempt, (history, &identity), &fixture::codec())
                                 .await?
                                 .unwrap()
                                 .bytes(),
@@ -319,7 +328,11 @@ async fn given_frozen_bootstrap_cut_when_live_rows_change_then_exact_baselines_a
                     for original in originals {
                         assert_eq!(
                             journal
-                                .load_acceptance(attempt, &original.as_ref().id, &fixture::codec())
+                                .load_acceptance(
+                                    attempt,
+                                    (history, &original.as_ref().id),
+                                    &fixture::codec()
+                                )
                                 .await?
                                 .unwrap()
                                 .event
@@ -439,8 +452,13 @@ async fn given_held_replica_addition_when_trim_is_requested_then_capture_keeps_e
     let configuration_original = source
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
+                let history = attempt
+                    .read_catalog_stamp(&TableName::new(fixture::NAME))
+                    .await?
+                    .unwrap()
+                    .history_id;
                 Ok(journal
-                    .load_acceptance(attempt, &configuration_id, &fixture::codec())
+                    .load_acceptance(attempt, (history, &configuration_id), &fixture::codec())
                     .await?
                     .unwrap()
                     .event)
@@ -753,7 +771,46 @@ async fn given_held_replica_addition_when_trim_is_requested_then_capture_keeps_e
         causal,
         "reopen changed persisted causal closure"
     );
+    reclaim_bootstrap_source(&cluster, &stores, &originals).await;
     cluster.shutdown().await;
+}
+
+async fn reclaim_bootstrap_source(
+    cluster: &fixture::NativeCluster,
+    stores: &[&fixture::Store],
+    originals: &[replication_types::event::content::CanonicalEvent],
+) {
+    let source = stores[0];
+    let old = fixture::installed_state(source, 1, fixture::NAME)
+        .await
+        .physical;
+    // Seed native incarnation retirement, as the replica lifecycle does.
+    // Regional DeleteTable retains its separate local-metadata restriction.
+    source
+        .delete_table(storage_types::DeleteTableRequest {
+            table_name: TableName::new(fixture::NAME),
+        })
+        .await
+        .unwrap();
+    fixture::create_table(source, &TableName::new(fixture::NAME)).await;
+    source
+        .put_item(PutItemRequest::new(
+            TableName::new(fixture::NAME),
+            fixture::item("source-replacement"),
+        ))
+        .await
+        .unwrap();
+    crate::journal::table_reclaim_test_support::reclaim_deleted_table(
+        source,
+        cluster.operations[0].as_ref(),
+        old,
+    )
+    .await;
+    fixture::assert_item(source, Some("source-replacement")).await;
+    for (offset, store) in stores.iter().enumerate().skip(1) {
+        fixture::assert_item(store, Some("during-held-addition")).await;
+        require_originals(store, u8::try_from(offset + 1).unwrap(), originals).await;
+    }
 }
 
 async fn require_originals(
@@ -766,9 +823,18 @@ async fn require_originals(
         .with_dynamo_attempt(AttemptMode::ReadOnly, move |attempt| {
             Box::pin(async move {
                 let journal = fixture::journal(index);
+                let history = attempt
+                    .read_catalog_stamp(&TableName::new(fixture::NAME))
+                    .await?
+                    .unwrap()
+                    .history_id;
                 for original in originals {
                     let accepted = journal
-                        .load_acceptance(attempt, &original.as_ref().id, &fixture::codec())
+                        .load_acceptance(
+                            attempt,
+                            (history, &original.as_ref().id),
+                            &fixture::codec(),
+                        )
                         .await?
                         .expect("joining/reopened replica lost a captured original");
                     assert_eq!(accepted.event.as_ref().bytes, original.as_ref().bytes);

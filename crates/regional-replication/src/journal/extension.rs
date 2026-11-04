@@ -43,22 +43,19 @@ impl JournalStore {
     /// The protected catalog selection, stream row and original share one
     /// native transaction. An extension never creates item winner effects.
     pub(crate) async fn capture_table_append<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
         request: &TableAppendRequest,
         input: (&UserStreamAppend, &CanonicalJsonCodec),
+        bound: &storage_types::BoundTableInfo,
     ) -> StorageResult<Option<CapturedTableAppend>> {
         let mut settlement_guard =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement_guard.as_mut();
         let result = async {
-            let Some(stamp) = attempt.read_catalog_stamp(request.table()).await? else {
-                return Ok(None);
-            };
-            let bound = attempt.read_table_at_stamp(request.table(), stamp).await?;
-            let state = self.load_capture_state(attempt, &bound).await?;
+            let state = self.load_capture_state(attempt, bound).await?;
             self.require_origin_admission(state.as_ref())?;
             let Some(state) = state.filter(|state| state.state().captures_origin()) else {
                 return Ok(None);
@@ -95,7 +92,7 @@ impl JournalStore {
             self.store_source_publications(
                 attempt,
                 vec![(allocation, vec![link])],
-                &[(&event, &receipt, None)],
+                &[(&event, &receipt, bound.history_id)],
             )
             .await?;
             Ok(Some(CapturedTableAppend {
@@ -108,7 +105,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn reconcile_table_append<
-        A: StreamAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: StreamAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -119,12 +116,12 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement_guard.as_mut();
         let result = async {
-            let Some(receipt) = attempt.load_append_receipt(request.operation()).await? else {
+            let Some(receipt) = attempt.load_append_receipt(request.into()).await? else {
                 return Ok(TableAppendReconciliation::Unresolved);
             };
             receipt.require_request(request)?;
             let proof: TableAppendProof = storage_serde::from_bytes(&receipt.proof)?;
-            if proof.name != *request.table() {
+            if proof.name != *request.table() || proof.physical != request.target().history_id {
                 return Err(corrupt_record());
             }
             self.require_append_incarnation(attempt, &proof).await?;
@@ -138,7 +135,7 @@ impl JournalStore {
                 return Err(corrupt_record());
             }
             let accepted = self
-                .load_acceptance(attempt, &proof.original, codec)
+                .load_acceptance(attempt, (proof.physical, &proof.original), codec)
                 .await?
                 .ok_or_else(corrupt_record)?;
             if accepted.receipt.digest != proof.digest
@@ -151,8 +148,12 @@ impl JournalStore {
             else {
                 return Err(corrupt_record());
             };
-            if TableAppendRequest::new(request.operation(), request.table().clone(), bytes.as_ref())
-                .digest()
+            if TableAppendRequest::new(
+                request.operation(),
+                request.target().clone(),
+                bytes.as_ref(),
+            )
+            .digest()
                 != request.digest()
             {
                 return Err(corrupt_record());

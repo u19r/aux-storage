@@ -4,19 +4,17 @@ use std::future::Future;
 
 use storage_backfill::{GsiBuild, GsiBuildTarget};
 use storage_types::{
-    CreateTableResponse, IndexName, StorageError, StorageResult, StoredTableInfo,
-    SystemStreamCheckpoint, TableDescription, TableStatus, maintenance::TargetIncarnation,
+    BoundTableInfo, CreateTableResponse, IndexName, StorageError, StorageResult, StoredTableInfo,
+    SystemStreamCheckpoint, TableDescription, TableHistoryId, TableStatus,
+    maintenance::TargetIncarnation,
 };
 
-use crate::{
-    SemanticDecision, StreamTrimStateWrite, name_reservation::TableNameReservation,
-    plan_table_stream_duration,
-};
+use crate::{SemanticDecision, StreamTrimStateWrite, plan_table_stream_duration};
 
 /// One physical read result. `seed` carries any backend state read alongside
-/// the reservation, such as the KV table-ID allocator, into the insert step.
+/// the name binding, such as the KV table-ID allocator, into the insert step.
 pub struct CreateTableLayout<Seed> {
-    pub reservation: TableNameReservation,
+    pub name_in_use: bool,
     pub seed: Seed,
 }
 
@@ -40,7 +38,7 @@ pub trait CreateTableAttempt:
         seed: Self::LayoutSeed,
     ) -> impl Future<Output = StorageResult<Option<Self::Identity>>> + Send;
 
-    fn retention_scope_id(&self, table: &StoredTableInfo, identity: &Self::Identity) -> String;
+    fn table_history_id(&self, identity: &Self::Identity) -> TableHistoryId;
 
     fn write_retention(
         &mut self,
@@ -79,7 +77,7 @@ pub async fn create_table_in_attempt<A: CreateTableAttempt>(
     let attempt = settlement.as_mut();
     let result = async {
         let layout = attempt.read_layout(&table).await?;
-        if !layout.reservation.is_available(table.created_at) {
+        if layout.name_in_use {
             return Ok(SemanticDecision::Rejected(
                 StorageError::table_already_exists(&table.table_name),
             ));
@@ -88,25 +86,32 @@ pub async fn create_table_in_attempt<A: CreateTableAttempt>(
             .insert_layout(&table, layout.seed)
             .await?
             .ok_or_else(|| StorageError::table_already_exists(&table.table_name))?;
-        let scope = attempt.retention_scope_id(&table, &identity);
+        let history_id = attempt.table_history_id(&identity);
+        let scope = crate::table_retention_scope_id(history_id);
+        let source_high = attempt.capture_high().await?;
+        let frontier = crate::maintenance::TableHistoryTrimFrontier::initial(
+            history_id,
+            std::num::NonZeroU64::MIN,
+            &source_high,
+        )?;
         let retention = plan_table_stream_duration(
-            table.table_name.clone(),
-            scope,
-            1,
+            crate::StreamTrimScope::table(scope, table.table_name.clone()),
+            frontier,
             table.table_stream_duration,
-            table.default_item_stream_duration,
             table.created_at,
-        );
-        let retention_write = StreamTrimStateWrite {
-            state: retention.trim_state,
-            next_marker: retention.due_marker,
-        };
+        )?;
         // These effects share a mutable native attempt. KV staging is local;
         // SQL uses one connection, so concurrent calls cannot reduce latency.
-        attempt.write_retention(&identity, retention_write).await?;
-        register_initial_gsis(attempt, &table, identity).await?;
+        attempt.write_retention(&identity, retention).await?;
+        register_initial_gsis(attempt, &table, identity, source_high).await?;
         Ok(SemanticDecision::Accepted(CreateTableResponse {
-            table_description: TableDescription::from_stored_table_info(table, TableStatus::Active),
+            table_description: TableDescription::from_bound_table_info(
+                BoundTableInfo {
+                    history_id,
+                    info: std::sync::Arc::new(table),
+                },
+                TableStatus::Active,
+            ),
         }))
     }
     .await;
@@ -117,6 +122,7 @@ async fn register_initial_gsis<A: CreateTableAttempt>(
     attempt: &mut A,
     table: &StoredTableInfo,
     identity: A::Identity,
+    frontier: SystemStreamCheckpoint,
 ) -> StorageResult<()> {
     let Some(indexes) = table
         .global_secondary_indexes
@@ -125,12 +131,12 @@ async fn register_initial_gsis<A: CreateTableAttempt>(
     else {
         return Ok(());
     };
-    let frontier = attempt.capture_high().await?;
     let builds = indexes
         .iter()
         .map(|index| {
             Ok(GsiBuild::new_active(
                 GsiBuildTarget {
+                    history_id: attempt.table_history_id(&identity),
                     table_name: table.table_name.clone(),
                     index_name: index.index_name.clone(),
                     incarnation: attempt.index_incarnation(&identity, &index.index_name)?,

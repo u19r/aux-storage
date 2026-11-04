@@ -15,7 +15,7 @@ use storage_types::{
     GetStreamRecordsRequest, GetStreamRecordsResponse, ListStreamsRequest, ListStreamsResponse,
     ListTablesRequest, ListTablesResponse, PutItemRequest, PutItemResponse, QueryRequest,
     QueryResponse, ReadSequenceRequest, ReadSequenceResponse, ScanRequest, ScanResponse,
-    StorageError, StorageResult, StoredTableInfo, StreamItemId, TableName, TransactGetItemsRequest,
+    StorageError, StorageResult, StoredTableInfo, TableName, TransactGetItemsRequest,
     TransactGetItemsResponse, TransactWriteItemsRequest, TransactWriteItemsResponse,
     UpdateItemRequest, UpdateItemResponse, UpdateTableRequest, UpdateTableResponse,
     UpdateTimeToLiveRequest, UpdateTimeToLiveResponse, WireItem,
@@ -49,13 +49,35 @@ impl DynamoOperations for RemoteStorageProvider {
             .await
     }
 
-    async fn latest_table_stream_pointer(
+    async fn table_stream_checkpoint(
         &self,
-        _table_name: TableName,
-    ) -> StorageResult<Option<StreamItemId>> {
+        _target: storage_types::TableHistoryTarget,
+    ) -> StorageResult<storage_types::TableStreamCheckpoint> {
         Err(StorageError::unsupported(
             "remote table stream tail is unavailable",
         ))
+    }
+
+    async fn describe_stream(
+        &self,
+        request: storage_types::DescribeStreamRequest,
+    ) -> StorageResult<storage_types::DescribeStreamResponse> {
+        self.invoke("DynamoDBStreams_20120810.DescribeStream", &request)
+            .await
+    }
+    async fn get_shard_iterator(
+        &self,
+        request: storage_types::GetShardIteratorRequest,
+    ) -> StorageResult<storage_types::GetShardIteratorResponse> {
+        self.invoke("DynamoDBStreams_20120810.GetShardIterator", &request)
+            .await
+    }
+    async fn get_records(
+        &self,
+        request: storage_types::GetRecordsRequest,
+    ) -> StorageResult<storage_types::GetRecordsResponse> {
+        self.invoke("DynamoDBStreams_20120810.GetRecords", &request)
+            .await
     }
 
     async fn get_stream_records(

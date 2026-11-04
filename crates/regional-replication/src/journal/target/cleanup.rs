@@ -64,7 +64,7 @@ impl JournalStore {
                 _ => return Err(corrupt_record()),
             }
             for prefix in [EXPECTED_WINNER_SUFFIX, PROJECTION_OWNER_SUFFIX] {
-                let first = self.identity_key(prefix, &operation.id)?;
+                let first = self.table_identity_key(prefix, root.state.physical, &operation.id)?;
                 let page = self
                     .records
                     .scan(

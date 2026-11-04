@@ -22,7 +22,7 @@ use crate::{
 pub(in crate::journal) struct TrimReservation {
     pub(in crate::journal) proposal: PublicTrimProposal,
     prefix: CanonicalDigest,
-    grant: CanonicalDigest,
+    pub(super) grant: CanonicalDigest,
 }
 
 #[derive(Serialize, Deserialize)]

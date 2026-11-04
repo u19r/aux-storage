@@ -230,7 +230,7 @@ pub(crate) fn selected_native_backend_case(label: &str) -> BackendCase {
     }
 }
 
-pub(crate) fn selected_distributed_backend_case(label: &str) -> BackendCase {
+pub(crate) fn selected_distributed_backend_case(_label: &str) -> BackendCase {
     let compiled = compiled_native_backend_names()
         .into_iter()
         .filter(|backend| matches!(*backend, "postgres" | "foundationdb"))
@@ -240,9 +240,9 @@ pub(crate) fn selected_distributed_backend_case(label: &str) -> BackendCase {
         .unwrap_or_else(|error| panic!("{error}"));
     match backend {
         #[cfg(feature = "postgres")]
-        "postgres" => postgres_case(label).expect("Postgres queue correctness fixture"),
+        "postgres" => postgres_case(_label).expect("Postgres queue correctness fixture"),
         #[cfg(feature = "foundationdb")]
-        "foundationdb" => foundationdb_case(label).expect(
+        "foundationdb" => foundationdb_case(_label).expect(
             "FoundationDB queue correctness fixture requires FDB_CLUSTER_FILE or a local cluster",
         ),
         _ => unreachable!("selected backend must be a compiled distributed queue backend"),

@@ -24,7 +24,8 @@ impl JournalStore {
             };
             let state = table.state();
             self.require_local_source(state)?;
-            if state.configuration.lineage != activity.lineage
+            if state.physical != activity.physical
+                || state.configuration.lineage != activity.lineage
                 || !matches!(
                     state.phase,
                     RegionalTablePhase::Active | RegionalTablePhase::Sealing
@@ -69,6 +70,7 @@ impl JournalStore {
                 .ok_or_else(corrupt_record)?
                 .clone();
             let scope = DeliveryScope {
+                physical: state.physical,
                 origin: activity.origin.clone(),
                 table: activity.source_table,
                 local_table: activity.table,

@@ -68,10 +68,6 @@ impl RetainedBaselineDefinition {
         Ok(())
     }
 
-    pub(crate) fn request(&self) -> &HistoryCaptureRequest {
-        &self.request
-    }
-
     pub fn content(&self) -> CanonicalDigest {
         self.content
     }

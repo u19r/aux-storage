@@ -1,6 +1,7 @@
 mod dynamo_operations;
 mod gsi;
 mod implementation;
+mod transaction;
 
 pub use implementation::*;
 

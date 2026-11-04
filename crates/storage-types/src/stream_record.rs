@@ -4,7 +4,7 @@ use utoipa::ToSchema;
 use crate::{AttributeMap, KeyAttributes, SystemStreamPosition, TableName};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct StreamRecord {
     #[serde(skip)]
     pub cursor: Option<String>,
@@ -14,10 +14,9 @@ pub struct StreamRecord {
     pub source_table_name: Option<TableName>,
     pub keys: KeyAttributes,
     pub sequence_number: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_image: Option<AttributeMap>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_image: Option<AttributeMap>,
+    /// Resolved snapshot. Null is a delete marker addressed by Keys.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub item: Option<AttributeMap>,
     /// Logical shard, lineage, and opaque offset for a SystemStream record.
     /// Ordinary table-stream records leave this absent.
     #[serde(skip_serializing_if = "Option::is_none")]

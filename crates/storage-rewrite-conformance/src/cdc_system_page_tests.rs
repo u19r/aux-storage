@@ -84,13 +84,12 @@ async fn given_three_committed_writes_when_system_cdc_is_paged_then_checkpoint_r
             assert!(record.cursor.is_none());
             assert!(!record.sequence_number.is_empty());
             assert!(record.system_position.is_some());
-            assert!(record.old_image.is_none());
             assert_eq!(
                 serde_json::to_value(&record.keys).unwrap(),
                 json!({"pk": {"S": key}}),
             );
             assert_eq!(
-                serde_json::to_value(&record.new_image).unwrap(),
+                serde_json::to_value(&record.item).unwrap(),
                 json!({"pk": {"S": key}, "value": {"S": key}}),
             );
         }
@@ -104,7 +103,7 @@ async fn given_three_committed_writes_when_system_cdc_is_paged_then_checkpoint_r
                     "SourceTableName": &table,
                     "Keys": {"pk": {"S": key}},
                     "SequenceNumber": record.sequence_number.as_str(),
-                    "NewImage": {"pk": {"S": key}, "value": {"S": key}},
+                    "Item": {"pk": {"S": key}, "value": {"S": key}},
                     "SystemPosition": record.system_position.as_ref().unwrap(),
                 })
             })
@@ -140,7 +139,8 @@ async fn given_three_committed_writes_when_system_cdc_is_paged_then_checkpoint_r
 // Business and format rules: the logical CDC boundary exposes the exact
 // before and after images of each committed item transition.
 #[tokio::test]
-async fn given_item_put_update_delete_when_logical_cdc_is_read_then_images_match_each_transition() {
+async fn given_item_put_update_delete_when_logical_cdc_is_read_then_snapshots_and_marker_are_exact()
+{
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = unique_table_name();
@@ -211,24 +211,12 @@ async fn given_item_put_update_delete_when_logical_cdc_is_read_then_images_match
             );
             assert!(record.system_position.is_some());
         }
-        assert!(records[0].old_image.is_none());
+        assert_eq!(serde_json::to_value(&records[0].item).unwrap(), original);
         assert_eq!(
-            serde_json::to_value(&records[0].new_image).unwrap(),
-            original
-        );
-        assert_eq!(
-            serde_json::to_value(&records[1].old_image).unwrap(),
-            original
-        );
-        assert_eq!(
-            serde_json::to_value(&records[1].new_image).unwrap(),
+            serde_json::to_value(&records[1].item).unwrap(),
             updated_image
         );
-        assert_eq!(
-            serde_json::to_value(&records[2].old_image).unwrap(),
-            updated_image
-        );
-        assert!(records[2].new_image.is_none());
+        assert!(records[2].item.is_none());
     })
     .catch_unwind()
     .await;
@@ -387,7 +375,7 @@ async fn given_equal_keys_in_two_tables_when_system_cdc_is_paged_then_each_recor
             assert_eq!(page.terminal(), page_number == 2);
             let record = &page.records()[0];
             let table: &str = record.source_table_name.as_ref().unwrap().as_ref();
-            let image = serde_json::to_value(&record.new_image).unwrap();
+            let image = serde_json::to_value(&record.item).unwrap();
             let value = image["value"]["S"].as_str().unwrap();
             assert_eq!(
                 image,
@@ -400,14 +388,8 @@ async fn given_equal_keys_in_two_tables_when_system_cdc_is_paged_then_each_recor
                 json!({"pk": {"S": "same-key"}}),
             );
             assert!(record.cursor.is_none());
-            if table == first_table.as_ref() && value == "first-2" {
-                assert_eq!(
-                    serde_json::to_value(&record.old_image).unwrap(),
-                    json!({"pk": {"S": "same-key"}, "value": {"S": "first-1"}}),
-                );
-            } else {
-                assert!(record.old_image.is_none());
-            }
+            let wire = serde_json::to_value(record).unwrap();
+            assert!(wire.get("OldImage").is_none() && wire.get("NewImage").is_none());
             assert!(positions.insert(record.system_position.clone().unwrap()));
             assert!(observed.insert((table.to_string(), value.to_string())));
             checkpoint = Some(page.issued_checkpoint().token().clone());
@@ -506,8 +488,7 @@ async fn given_empty_system_cdc_checkpoint_when_item_is_put_then_resume_and_retr
         assert!(page.terminal());
         let record = &page.records()[0];
         assert_eq!(record.source_table_name.as_ref(), Some(&table));
-        assert_eq!(serde_json::to_value(&record.new_image).unwrap(), image);
-        assert!(record.old_image.is_none());
+        assert_eq!(serde_json::to_value(&record.item).unwrap(), image);
         assert!(record.cursor.is_none());
         assert!(record.system_position.is_some());
 
@@ -594,15 +575,10 @@ async fn given_deleted_item_when_deleted_again_then_logical_cdc_contains_only_on
             json!({"pk": {"S": "one"}}),
         );
         assert_eq!(
-            serde_json::to_value(&page.records()[0].new_image).unwrap(),
+            serde_json::to_value(&page.records()[0].item).unwrap(),
             image
         );
-        assert!(page.records()[0].old_image.is_none());
-        assert_eq!(
-            serde_json::to_value(&page.records()[1].old_image).unwrap(),
-            image
-        );
-        assert!(page.records()[1].new_image.is_none());
+        assert!(page.records()[1].item.is_none());
 
         let get = GetItemRequest::try_from(json!({
             "TableName": table.as_ref(),

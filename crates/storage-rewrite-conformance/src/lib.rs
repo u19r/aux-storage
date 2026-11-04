@@ -48,17 +48,6 @@ mod batch_write_item_tests;
         feature = "foundationdb"
     )
 ))]
-mod batch_write_retention_tests;
-#[cfg(all(
-    test,
-    any(
-        feature = "sqlite",
-        feature = "turso",
-        feature = "rocksdb",
-        feature = "postgres",
-        feature = "foundationdb"
-    )
-))]
 mod cdc_deleted_table_trim_tests;
 #[cfg(all(
     test,
@@ -104,6 +93,17 @@ mod cdc_system_checkpoint_tests;
     )
 ))]
 mod cdc_system_page_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod cdc_system_snapshot_tests;
 #[cfg(all(
     test,
     any(
@@ -180,17 +180,6 @@ mod delete_item_conformance_tests;
         feature = "foundationdb"
     )
 ))]
-mod delete_item_retention_tests;
-#[cfg(all(
-    test,
-    any(
-        feature = "sqlite",
-        feature = "turso",
-        feature = "rocksdb",
-        feature = "postgres",
-        feature = "foundationdb"
-    )
-))]
 mod delete_item_tests;
 #[cfg(all(
     test,
@@ -225,6 +214,17 @@ mod describe_table_conformance_tests;
     )
 ))]
 mod dynamo_operation_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod dynamodb_stream_history_tests;
 #[cfg(all(
     test,
     any(
@@ -313,6 +313,8 @@ mod native_diagnostic_tests;
 ))]
 mod operation_trace_tests;
 #[cfg(all(test, feature = "postgres"))]
+mod postgres_history_publication_tests;
+#[cfg(all(test, feature = "postgres"))]
 mod postgres_user_stream_tests;
 #[cfg(all(
     test,
@@ -347,17 +349,6 @@ mod put_item_conformance_tests;
     )
 ))]
 mod put_item_indexer_tests;
-#[cfg(all(
-    test,
-    any(
-        feature = "sqlite",
-        feature = "turso",
-        feature = "rocksdb",
-        feature = "postgres",
-        feature = "foundationdb"
-    )
-))]
-mod put_item_retention_tests;
 #[cfg(all(
     test,
     any(
@@ -535,6 +526,39 @@ mod stream_clock_tests;
         feature = "foundationdb"
     )
 ))]
+mod table_history_policy_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod table_history_retention_fault_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod table_history_retention_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
 mod table_recreation_tests;
 #[cfg(all(
     test,
@@ -615,17 +639,6 @@ mod transact_write_items_conformance_tests;
     )
 ))]
 mod transact_write_items_tests;
-#[cfg(all(
-    test,
-    any(
-        feature = "sqlite",
-        feature = "turso",
-        feature = "rocksdb",
-        feature = "postgres",
-        feature = "foundationdb"
-    )
-))]
-mod transact_write_retention_tests;
 #[cfg(all(
     test,
     any(
@@ -953,6 +966,11 @@ mod gsi_lifecycle_tests;
 ))]
 mod image_publication_tests;
 
+#[cfg(test)]
+mod gsi_large_key_tests;
+#[cfg(test)]
+mod materialized_value_tests;
+
 #[cfg(all(
     test,
     any(
@@ -967,3 +985,36 @@ mod cdc_system_split_tests;
 
 #[cfg(all(test, feature = "rocksdb"))]
 mod rocksdb_attempt_tests;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod table_stream_eligibility_tests;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "rocksdb",
+        feature = "postgres",
+        feature = "foundationdb"
+    )
+))]
+mod gsi_stream_capture_tests;
+
+#[cfg(all(test, feature = "foundationdb"))]
+mod table_stream_process_tests;
+
+#[cfg(all(test, any(feature = "sqlite", feature = "turso", feature = "postgres")))]
+mod table_stream_fault_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod scheduled_job_process_tests;

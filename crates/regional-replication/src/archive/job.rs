@@ -10,7 +10,7 @@ use scheduled_bg_jobs::{
 use storage_provider::DynamoPort;
 use storage_types::{AttemptMode, StorageResult};
 
-use super::{ArchiveKind, ArchivePublication, ArchiveTurn, CanonicalArchive, VerifiedArchive};
+use super::{ArchiveKind, ArchiveTurn, CanonicalArchive, VerifiedArchive};
 use crate::{
     journal::JournalStore,
     transport::{TcpTransport, TransportError},
@@ -101,44 +101,12 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                 ArchiveTurn::Idle => return Ok(false),
             };
             source.require_live()?;
-            let verified = job
-                .verify_archive_dependencies(plan.publish(&job.archive).await?, &source)
-                .await?;
+            let verified = plan.publish(&job.archive).await?;
             source.require_live()?;
             job.publish_archive(Arc::new(verified)).await?;
             Ok(true)
         })
         .await
-    }
-
-    async fn verify_archive_dependencies(
-        &self,
-        mut publication: ArchivePublication,
-        source: &crate::transport::SourceReservation,
-    ) -> Result<VerifiedArchive, Box<dyn std::error::Error + Send + Sync>> {
-        // The closed graph is position -> page -> acceptance -> original: at
-        // most three redirects.
-        for turn in 0..=3 {
-            match publication {
-                ArchivePublication::Verified(verified) => return Ok(verified),
-                ArchivePublication::RecoverDependency { hold, pointer } => {
-                    if turn == 3 {
-                        return Err(storage_types::StorageError::internal(
-                            "Archive dependency graph exceeds its supported depth",
-                        )
-                        .into());
-                    }
-                    source.require_live()?;
-                    let plan = self.prepare_dependency_recovery(hold, pointer).await?;
-                    source.require_live()?;
-                    publication = plan.publish(&self.archive).await?;
-                }
-            }
-        }
-        Err(
-            storage_types::StorageError::internal("Archive dependency verification did not settle")
-                .into(),
-        )
     }
 
     async fn prepare_archive(&self) -> StorageResult<ArchiveTurn> {
@@ -193,46 +161,6 @@ where for<'native> P::Attempt<'native>: PhysicalRecordAttempt
                                 Box::pin(
                                     async move { journal.select_archive_family(attempt).await },
                                 )
-                            },
-                        )
-                        .await
-                }
-            },
-        )
-        .await
-    }
-
-    async fn prepare_dependency_recovery(
-        &self,
-        hold: super::ArchiveHold,
-        pointer: super::ArchivePointer,
-    ) -> StorageResult<super::ArchivePlan> {
-        let input = Arc::new((hold, pointer));
-        storage_common::retry::retry_native_conflicts(
-            self.port.as_ref(),
-            storage_provider::DYNAMO_WRITE_RETRY,
-            || {
-                let journal = Arc::clone(&self.journal);
-                let codec = Arc::clone(&self.codec);
-                let input = Arc::clone(&input);
-                async move {
-                    Arc::clone(&journal)
-                        .with_admitted_attempt(
-                            (
-                                self.port.as_ref(),
-                                storage_provider::native_admission::NativeWork::Recovery,
-                            ),
-                            crate::journal::NativeAttempt::Items(AttemptMode::ReadOnly),
-                            move |attempt, _| {
-                                Box::pin(async move {
-                                    journal
-                                        .prepare_archive_dependency_recovery(
-                                            attempt,
-                                            (&input.0, &input.1),
-                                            &codec,
-                                        )
-                                        .await
-                                })
                             },
                         )
                         .await

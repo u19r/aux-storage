@@ -10,7 +10,7 @@ use storage_types::{
 use crate::{
     KvAttempt, KvRange, ReadProtection,
     catalog::{KvCatalogAttempt, KvIndexKind},
-    constants::{GSI_AUTHORITY_FAMILY, GSI_TOMBSTONE_FAMILY, PAGE_READ_BYTES},
+    constants::{GSI_PROJECTION_FAMILY, GSI_TOMBSTONE_FAMILY, PAGE_READ_BYTES},
     gsi::index_incarnation,
 };
 
@@ -35,10 +35,7 @@ impl<A: KvAttempt> GsiProjectionMetadataAttempt for KvCatalogAttempt<'_, A> {
                     table,
                     &key.index_name,
                     incarnation,
-                    crate::gsi::projection_address(&crate::gsi::ordered_projection_suffix(
-                        &key.item_key(&table.info)?,
-                    )?)
-                    .to_vec(),
+                    crate::gsi::ordered_projection_suffix(&key.item_key(&table.info)?)?,
                 )?);
             }
             Ok(addresses)
@@ -89,7 +86,10 @@ impl<A: KvAttempt> GsiProjectionMetadataAttempt for KvCatalogAttempt<'_, A> {
                 let key = entry
                     .key
                     .strip_prefix(prefix.as_slice())
-                    .filter(|key| key.len() == 32)
+                    .filter(|key| {
+                        (32..=crate::constants::GSI_PROJECTION_SUFFIX_MAX_BYTES)
+                            .contains(&key.len())
+                    })
                     .ok_or_else(|| {
                         StorageError::internal("KV projection tombstone has another prefix")
                     })?;
@@ -165,7 +165,7 @@ impl<A: KvAttempt> KvCatalogAttempt<'_, A> {
                 let mut key = entry.key.clone();
                 *key.first_mut()
                     .ok_or_else(|| StorageError::internal("empty KV projection metadata key"))? =
-                    GSI_AUTHORITY_FAMILY;
+                    GSI_PROJECTION_FAMILY;
                 Ok(key)
             })
             .collect::<StorageResult<Vec<_>>>()?;

@@ -4,14 +4,14 @@ use std::future::Future;
 
 use storage_types::{
     ListStreamsRequest, ListStreamsResponse, StorageError, StorageResult, StreamDescriptor,
-    TableName, TimestampMillis, stream_identity,
+    TableName, TableStreamIdentity, stream_identity,
 };
 
 use crate::constants::INTERNAL_TABLE_NAMES;
 
 /// The physical index contains only currently stream-enabled tables.
 pub struct CatalogStreamPage {
-    pub entries: Vec<(TableName, TimestampMillis)>,
+    pub entries: Vec<(TableName, TableStreamIdentity)>,
     pub more: bool,
 }
 
@@ -19,7 +19,7 @@ pub trait ListStreamsAttempt: Send {
     fn read_stream_entry(
         &mut self,
         name: &TableName,
-    ) -> impl Future<Output = StorageResult<Option<TimestampMillis>>> + Send;
+    ) -> impl Future<Output = StorageResult<Option<TableStreamIdentity>>> + Send;
 
     fn list_stream_page(
         &mut self,
@@ -39,11 +39,11 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
     let after = match request.exclusive_start_stream_arn.as_deref() {
         Some(arn) => {
             let name = stream_arn_table_name(arn)?;
-            let created_at = attempt
+            let identity = attempt
                 .read_stream_entry(&name)
                 .await?
                 .ok_or_else(|| StorageError::validation("Invalid ExclusiveStartStreamArn"))?;
-            if stream_identity(&name, created_at).0 != arn {
+            if stream_identity(&name, identity).0 != arn {
                 return Err(StorageError::validation("Invalid ExclusiveStartStreamArn"));
             }
             Some(name)
@@ -63,7 +63,7 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
             attempt
                 .read_stream_entry(name)
                 .await?
-                .map(|created_at| descriptor(name.clone(), created_at))
+                .map(|identity| descriptor(name.clone(), identity))
                 .into_iter()
                 .collect()
         };
@@ -83,7 +83,7 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
                 "stream catalog page did not advance",
             ));
         }
-        for (name, created_at) in page.entries {
+        for (name, identity) in page.entries {
             if cursor
                 .as_ref()
                 .is_some_and(|previous| name.as_ref() <= previous.as_ref())
@@ -94,7 +94,7 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
             }
             cursor = Some(name.clone());
             if !INTERNAL_TABLE_NAMES.contains(&name.as_ref()) {
-                streams.push(descriptor(name, created_at));
+                streams.push(descriptor(name, identity));
             }
         }
         if !page.more {
@@ -112,8 +112,8 @@ pub async fn list_streams_in_attempt<A: ListStreamsAttempt>(
     })
 }
 
-fn descriptor(table_name: TableName, created_at: TimestampMillis) -> StreamDescriptor {
-    let (stream_arn, stream_label) = stream_identity(&table_name, created_at);
+fn descriptor(table_name: TableName, identity: TableStreamIdentity) -> StreamDescriptor {
+    let (stream_arn, stream_label) = stream_identity(&table_name, identity);
     StreamDescriptor {
         stream_arn,
         table_name,

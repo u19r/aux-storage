@@ -1,27 +1,24 @@
-use scheduled_bg_jobs::store::{Check, CommitOperationId, CommitOutcome, StoreTransaction};
+use scheduled_bg_jobs::store::{Check, CommitOutcome, Mutation, StoreTransaction};
 use storage_provider::{
     RawOrderedJobStoreError,
     job_store::{
-        AtomicCommit, CommittedTransaction, ConflictedTransaction, EstablishedCommit,
-        EstablishedCommitOutcome, JobCommitError, TransactionCheckObservations, encode_transaction,
-        execute_commit, run_native_job_attempt, settle_native_commit,
+        AtomicCommit, JobCommitError, execute_commit, run_native_job_attempt, settle_native_commit,
     },
 };
 use storage_types::{AttemptMode, StorageError};
 
-use super::{SqlRawOrderedJobStore, receipt, store::decode_many};
+use super::{SqlRawOrderedJobStore, store::decode_many};
 use crate::{
-    ReadProtection, SqlAttempt, SqlBackend, SqlEngine, SqlStatement,
-    constants::{SCHEDULED_JOB_POINT_READ_BYTES as POINT_READ_BYTES, SCHEDULED_JOB_VALUE_BYTES},
+    ReadProtection, SqlAttempt, SqlBackend, SqlEngine,
+    constants::SCHEDULED_JOB_POINT_READ_BYTES as POINT_READ_BYTES,
 };
 
 pub(super) async fn commit<B: SqlBackend + 'static>(
     store: &SqlRawOrderedJobStore<B>,
     transaction: StoreTransaction,
 ) -> Result<CommitOutcome, RawOrderedJobStoreError> {
-    let canonical = encode_transaction(&transaction)?;
     settle_native_commit(store.capabilities.max_transaction_duration(), |remaining| {
-        commit_once(store, transaction.clone(), canonical.clone(), remaining)
+        commit_once(store, transaction.clone(), remaining)
     })
     .await
 }
@@ -29,11 +26,11 @@ pub(super) async fn commit<B: SqlBackend + 'static>(
 async fn commit_once<B: SqlBackend + 'static>(
     store: &SqlRawOrderedJobStore<B>,
     transaction: StoreTransaction,
-    canonical: Vec<u8>,
     remaining: std::time::Duration,
 ) -> Result<CommitOutcome, RawOrderedJobStoreError> {
     let engine = store.engine;
     let backend = std::sync::Arc::clone(&store.backend);
+    let max_value_bytes = store.capabilities.max_value_bytes();
     run_native_job_attempt(
         remaining,
         store.admission.get().cloned(),
@@ -42,7 +39,9 @@ async fn commit_once<B: SqlBackend + 'static>(
                 .with_attempt(AttemptMode::ReadWrite, move |attempt| {
                     Box::pin(async move {
                         let mut commit = SqlJobCommit { attempt, engine };
-                        slot.preserve(execute_commit(&mut commit, &transaction, &canonical).await)
+                        slot.preserve(
+                            execute_commit(&mut commit, &transaction, max_value_bytes).await,
+                        )
                     })
                 })
                 .await
@@ -58,19 +57,11 @@ struct SqlJobCommit<'a, A> {
 
 impl<A: SqlAttempt> AtomicCommit for SqlJobCommit<'_, A> {
     type Error = JobCommitError;
-    const MAX_SCHEDULED_JOB_VALUE_BYTES: usize = SCHEDULED_JOB_VALUE_BYTES;
 
-    async fn load_established_commit(
-        &mut self,
-        operation_id: CommitOperationId,
-    ) -> Result<Option<EstablishedCommit>, Self::Error> {
-        receipt::load(self.attempt, self.engine, operation_id).await
-    }
-
-    async fn load_transaction_check_observations(
+    async fn load_check_values(
         &mut self,
         checks: &[Check],
-    ) -> Result<TransactionCheckObservations, Self::Error> {
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         let mut keys = Vec::new();
         keys.try_reserve_exact(checks.len()).map_err(|_| {
             StorageError::from(storage_types::InfrastructureResultKind::NativeCapacityRejected)
@@ -92,77 +83,26 @@ impl<A: SqlAttempt> AtomicCommit for SqlJobCommit<'_, A> {
         let values = decode_many(page, &keys, |value: &Vec<u8>| {
             super::sql_statements::copy_blob(value)
         })?;
-        TransactionCheckObservations::from_values(checks, values).map_err(Into::into)
+        Ok(values)
     }
 
-    async fn save_committed_transaction(
-        &mut self,
-        transaction: CommittedTransaction<'_>,
-    ) -> Result<(), Self::Error> {
-        let count = transaction
-            .mutations
-            .puts
-            .len()
-            .checked_add(transaction.mutations.deletes.len())
-            .and_then(|count| count.checked_add(1))
-            .ok_or_else(|| {
-                StorageError::from(storage_types::InfrastructureResultKind::NativeCapacityRejected)
-            })?;
+    async fn store_mutations(&mut self, mutations: &[Mutation]) -> Result<(), Self::Error> {
         let mut statements = Vec::new();
-        statements.try_reserve_exact(count).map_err(|_| {
-            StorageError::from(storage_types::InfrastructureResultKind::NativeCapacityRejected)
-        })?;
-        for put in transaction.mutations.puts {
-            statements.push(super::sql_statements::put(
-                self.engine,
-                put.key.as_bytes(),
-                put.value,
-            )?);
+        statements
+            .try_reserve_exact(mutations.len())
+            .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+        for mutation in mutations {
+            statements.push(match mutation {
+                Mutation::Put(key, value) => {
+                    super::sql_statements::put(self.engine, key.as_bytes(), value)?
+                }
+                Mutation::Delete(key) => {
+                    super::sql_statements::delete(self.engine, key.as_bytes())?
+                }
+            });
         }
-        for key in transaction.mutations.deletes {
-            statements.push(super::sql_statements::delete(self.engine, key.as_bytes())?);
-        }
-        statements.push(receipt::save(
-            self.engine,
-            transaction.operation_id,
-            transaction.transaction_content,
-            EstablishedCommitOutcome::Committed,
-        )?);
-        self.execute_transaction(statements).await
-    }
-
-    async fn save_conflicted_transaction(
-        &mut self,
-        transaction: ConflictedTransaction<'_>,
-    ) -> Result<(), Self::Error> {
-        let statement = receipt::save(
-            self.engine,
-            transaction.operation_id,
-            transaction.transaction_content,
-            EstablishedCommitOutcome::Conflict,
-        )?;
-        let mut statements = Vec::new();
-        statements.try_reserve_exact(1).map_err(|_| {
-            StorageError::from(storage_types::InfrastructureResultKind::NativeCapacityRejected)
-        })?;
-        statements.push(statement);
-        self.execute_transaction(statements).await
-    }
-}
-
-impl<A: SqlAttempt> SqlJobCommit<'_, A> {
-    async fn execute_transaction(
-        &mut self,
-        statements: Vec<SqlStatement>,
-    ) -> Result<(), JobCommitError> {
-        let changed = self.attempt.execute_batch(statements).await?;
-        // The receipt insert is the last statement. Exactly one affected row
-        // proves that this attempt stored the receipt for replay; zero rows
-        // would leave the preceding mutations without that durable proof.
-        if changed.last() != Some(&1) {
-            return Err(
-                StorageError::internal("scheduled-job receipt insert affected no row").into(),
-            );
+        if !statements.is_empty() {
+            self.attempt.execute_batch(statements).await?;
         }
         Ok(())
     }

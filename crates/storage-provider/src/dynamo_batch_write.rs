@@ -115,13 +115,11 @@ impl DynamoBatchWriteShape {
                     (Some(put), None) => {
                         let mut request = PutItemRequest::new(table_name.clone(), put.item.clone());
                         request.indexers = put.indexers.clone();
-                        request.aux_item_stream_ttl_hours = put.aux_item_stream_ttl_hours;
                         MemberShape::Put(Box::new(PutItemShape::from_validated_request(request)?))
                     }
                     (None, Some(delete)) => {
-                        let mut request =
+                        let request =
                             DeleteItemRequest::new(table_name.clone(), delete.key.clone());
-                        request.aux_item_stream_ttl_hours = delete.aux_item_stream_ttl_hours;
                         MemberShape::Delete(Box::new(DeleteItemShape::from_validated_request(
                             request,
                         )?))

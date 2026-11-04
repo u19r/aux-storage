@@ -68,7 +68,12 @@ impl JournalStore {
             let received = self
                 .load_received_coverage(
                     attempt,
-                    (scope.local_table, scope.table, scope.lineage),
+                    (
+                        scope.local_table,
+                        scope.table,
+                        scope.lineage,
+                        scope.physical,
+                    ),
                     &scope.origin,
                     ReadProtection::Snapshot,
                 )
@@ -80,7 +85,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn record_delivery<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -137,7 +142,11 @@ impl JournalStore {
         let (coverage, revision) = self
             .observe_delivery_progress(attempt, scope, ReadProtection::Conflict)
             .await?;
-        let key = self.identity_key(DELIVERY_RECEIPT_SUFFIX, &(scope, &receipt.pages()[0].page))?;
+        let key = self.table_identity_key(
+            DELIVERY_RECEIPT_SUFFIX,
+            scope.physical,
+            &(scope, &receipt.pages()[0].page),
+        )?;
         let rows = self
             .records
             .load(
@@ -163,7 +172,8 @@ impl JournalStore {
         let next = coverage
             .accept(range, self.records.limits.max_records())
             .map_err(|_| corrupt_record())?;
-        let progress_key = self.identity_key(DELIVERY_PROGRESS_SUFFIX, scope)?;
+        let progress_key =
+            self.table_identity_key(DELIVERY_PROGRESS_SUFFIX, scope.physical, scope)?;
         let mut changes = Vec::new();
         if rows[0].is_none() {
             changes.push(self.records.prepare(
@@ -194,7 +204,7 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let key = self.identity_key(DELIVERY_PROGRESS_SUFFIX, scope)?;
+            let key = self.table_identity_key(DELIVERY_PROGRESS_SUFFIX, scope.physical, scope)?;
             let rows = self.records.load(attempt, &[key], protection).await?;
             let Some(record) = &rows[0] else {
                 return Ok((DeliveryCoverage::default(), None));
@@ -238,7 +248,8 @@ impl JournalStore {
             .partitions
             .require_partition(scope.origin.journal_partition)
             .map_err(|_| corrupt_record())?;
-        if !members.contains(&scope.origin.region)
+        if state.physical != scope.physical
+            || !members.contains(&scope.origin.region)
             || scope.destination.region == scope.origin.region
             || state.configuration.lineage != scope.lineage
             || state.membership != scope.membership
@@ -263,7 +274,7 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn require_original_frame<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,

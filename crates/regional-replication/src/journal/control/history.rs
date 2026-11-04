@@ -21,7 +21,7 @@ impl JournalStore {
     /// The primary's decision, original and delivery address share one attempt.
     /// Participant installation remains a separate certified operation.
     pub(super) async fn capture_control_history<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -48,7 +48,22 @@ impl JournalStore {
                 lineage: operation.lineage,
                 operation: operation.id,
             };
-            if let Some(accepted) = self.load_acceptance(attempt, &identity, codec).await? {
+            if let Some(accepted) = self
+                .load_acceptance(
+                    attempt,
+                    (
+                        record
+                            .proposal
+                            .participant(&self.region)
+                            .map_err(|_| corrupt_record())?
+                            .proposed
+                            .physical,
+                        &identity,
+                    ),
+                    codec,
+                )
+                .await?
+            {
                 return self
                     .verify_control_history(attempt, record, &accepted, ReadProtection::Shared)
                     .await;
@@ -84,7 +99,16 @@ impl JournalStore {
             self.store_source_publications(
                 attempt,
                 vec![(allocation, vec![link])],
-                &[(&event, &receipt, None)],
+                &[(
+                    &event,
+                    &receipt,
+                    record
+                        .proposal
+                        .participant(&self.region)
+                        .map_err(|_| corrupt_record())?
+                        .proposed
+                        .physical,
+                )],
             )
             .await
         }
@@ -93,7 +117,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn require_control_history<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -119,7 +143,20 @@ impl JournalStore {
                 operation: operation.id,
             };
             let accepted = self
-                .load_acceptance_protected(attempt, &identity, codec, protection)
+                .load_acceptance_protected(
+                    attempt,
+                    (
+                        record
+                            .proposal
+                            .participant(&self.region)
+                            .map_err(|_| corrupt_record())?
+                            .proposed
+                            .physical,
+                        &identity,
+                    ),
+                    codec,
+                    protection,
+                )
                 .await?
                 .ok_or_else(corrupt_record)?;
             self.verify_control_history(attempt, record, &accepted, protection)

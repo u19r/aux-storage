@@ -24,7 +24,7 @@ use scheduled_bg_jobs::store::{
 use serde_json::{Value, json};
 use storage::{
     DatabaseManager, DatabaseManagerRuntimeOptions, RemoteScheduledJobStoreConfig,
-    ScheduledJobStore, ScheduledJobStoreError,
+    ScheduledJobStore,
 };
 use storage_api::{AppState, server_router};
 use storage_provider::{SqliteSettings, StorageBackend, StorageConfig};
@@ -203,7 +203,7 @@ async fn given_coherent_remote_store_when_racing_and_reopening_then_store_contra
         (6, b"range-z".as_slice(), b"z".as_slice()),
     ] {
         assert_eq!(
-            left.commit(&put_transaction(id, key_bytes, value))
+            left.transact(&put_transaction(id, key_bytes, value))
                 .await
                 .expect("seed transaction"),
             CommitOutcome::Committed
@@ -267,25 +267,25 @@ async fn given_coherent_remote_store_when_racing_and_reopening_then_store_contra
     assert_eq!(page_keys(&second_reverse), vec![b"range-a".to_vec()]);
     assert!(second_reverse.continuation.is_none());
 
-    let replay_transaction = put_transaction(10, b"replay", b"first");
+    let write_transaction = put_transaction(10, b"replay", b"first");
     assert_eq!(
-        left.commit(&replay_transaction)
+        left.transact(&write_transaction)
             .await
-            .expect("initial committed receipt"),
+            .expect("initial native write"),
         CommitOutcome::Committed
     );
     assert_eq!(
         right
-            .commit(&replay_transaction)
+            .transact(&write_transaction)
             .await
-            .expect("exact committed replay"),
+            .expect("repeated unconditional write"),
         CommitOutcome::Committed
     );
-    let mismatch = right
-        .commit(&put_transaction(10, b"replay", b"changed"))
+    let replacement = right
+        .transact(&put_transaction(10, b"replay", b"changed"))
         .await
-        .expect_err("changed operation content must be rejected");
-    assert_eq!(mismatch, ScheduledJobStoreError::OperationReuseMismatch);
+        .expect("native replacement");
+    assert_eq!(replacement, CommitOutcome::Committed);
 
     let left_race = checked_pair_transaction(11, b"race-shared", b"race-left", b"left");
     let right_race = checked_pair_transaction(12, b"race-shared", b"race-right", b"right");
@@ -294,11 +294,11 @@ async fn given_coherent_remote_store_when_racing_and_reopening_then_store_contra
     let right_barrier = Arc::clone(&barrier);
     let left_call = async {
         left_barrier.wait().await;
-        left.commit(&left_race).await
+        left.transact(&left_race).await
     };
     let right_call = async {
         right_barrier.wait().await;
-        right.commit(&right_race).await
+        right.transact(&right_race).await
     };
     let (left_result, right_result) = tokio::join!(left_call, right_call);
     let left_outcome = left_result.expect("left conditional race result");
@@ -332,32 +332,29 @@ async fn given_coherent_remote_store_when_racing_and_reopening_then_store_contra
     let reopened = connect_client(&server.endpoint_url).await;
     assert_eq!(
         reopened
-            .commit(&replay_transaction)
+            .transact(&write_transaction)
             .await
-            .expect("committed receipt replay after restart"),
+            .expect("unconditional write after restart"),
         CommitOutcome::Committed
     );
-    let restart_mismatch = reopened
-        .commit(&put_transaction(10, b"replay", b"changed"))
+    let restart_replacement = reopened
+        .transact(&put_transaction(10, b"replay", b"changed"))
         .await
-        .expect_err("mismatch remains rejected after restart");
+        .expect("native replacement after restart");
+    assert_eq!(restart_replacement, CommitOutcome::Committed);
     assert_eq!(
-        restart_mismatch,
-        ScheduledJobStoreError::OperationReuseMismatch
+        reopened
+            .transact(&left_race)
+            .await
+            .expect("left conditional retry after restart"),
+        CommitOutcome::Conflict
     );
     assert_eq!(
         reopened
-            .commit(&left_race)
+            .transact(&right_race)
             .await
-            .expect("left race outcome replay after restart"),
-        left_outcome
-    );
-    assert_eq!(
-        reopened
-            .commit(&right_race)
-            .await
-            .expect("right race outcome replay after restart"),
-        right_outcome
+            .expect("right conditional retry after restart"),
+        CommitOutcome::Conflict
     );
 }
 
@@ -702,25 +699,25 @@ async fn run_two_process_remote_contract(pair: &mut RemoteProcessPair) {
     assert_eq!(left.capabilities().level(), StoreLevel::Distributed);
     assert_eq!(right.capabilities(), left.capabilities());
 
-    let replay_transaction = put_transaction(40, b"remote-replay", b"first");
+    let write_transaction = put_transaction(40, b"remote-replay", b"first");
     assert_eq!(
-        left.commit(&replay_transaction)
+        left.transact(&write_transaction)
             .await
             .expect("initial remote commit"),
         CommitOutcome::Committed
     );
     assert_eq!(
         right
-            .commit(&replay_transaction)
+            .transact(&write_transaction)
             .await
-            .expect("cross-process replay"),
+            .expect("cross-process unconditional write"),
         CommitOutcome::Committed
     );
-    let mismatch = right
-        .commit(&put_transaction(40, b"remote-replay", b"changed"))
+    let replacement = right
+        .transact(&put_transaction(40, b"remote-replay", b"changed"))
         .await
-        .expect_err("cross-process operation mismatch");
-    assert_eq!(mismatch, ScheduledJobStoreError::OperationReuseMismatch);
+        .expect("cross-process native replacement");
+    assert_eq!(replacement, CommitOutcome::Committed);
 
     let left_race = checked_pair_transaction(41, b"remote-race", b"remote-left", b"left");
     let right_race = checked_pair_transaction(42, b"remote-race", b"remote-right", b"right");
@@ -730,11 +727,11 @@ async fn run_two_process_remote_contract(pair: &mut RemoteProcessPair) {
     let (left_result, right_result) = tokio::join!(
         async {
             left_barrier.wait().await;
-            left.commit(&left_race).await
+            left.transact(&left_race).await
         },
         async {
             right_barrier.wait().await;
-            right.commit(&right_race).await
+            right.transact(&right_race).await
         }
     );
     let left_outcome = left_result.expect("left cross-process conditional race");
@@ -773,25 +770,36 @@ async fn run_two_process_remote_contract(pair: &mut RemoteProcessPair) {
     let reopened = connect_client(&pair.left.endpoint_url).await;
     assert_eq!(
         reopened
-            .commit(&replay_transaction)
+            .transact(&write_transaction)
             .await
-            .expect("replay after API restart"),
+            .expect("unconditional write after API restart"),
         CommitOutcome::Committed
     );
     assert_eq!(
         right
-            .commit(&left_race)
+            .transact(&left_race)
             .await
-            .expect("left outcome replay through switched endpoint"),
-        left_outcome
+            .expect("left conditional retry through switched endpoint"),
+        CommitOutcome::Conflict
     );
     assert_eq!(
         reopened
-            .commit(&right_race)
+            .transact(&right_race)
             .await
-            .expect("right outcome replay after API restart"),
-        right_outcome
+            .expect("right outcome unconditional write after API restart"),
+        CommitOutcome::Conflict
     );
+    let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
+        "process-recovery/{}",
+        Uuid::new_v4().simple()
+    ))
+    .unwrap();
+    let report = scheduled_bg_jobs_conformance::run_recovery(reopened, right, namespace)
+        .await
+        .unwrap();
+    assert_eq!(report.recovered_enqueues, 1);
+    assert_eq!(report.recovered_completions, 1);
+    assert_eq!(report.handler_executions, 1);
 }
 
 #[cfg(feature = "postgres")]
@@ -811,4 +819,22 @@ async fn given_two_foundationdb_storage_api_processes_when_job_store_is_raced_th
 {
     let mut pair = RemoteProcessPair::new(foundationdb_backend_config()).await;
     run_two_process_remote_contract(&mut pair).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_accepted_commands_over_http_when_producers_are_permanently_lost_then_replacement_recovery_finishes_them()
+ {
+    let server = new_server().await;
+    let store = connect_client(&server.endpoint_url).await;
+    let namespace = scheduled_bg_jobs::Namespace::try_new(format!(
+        "http-recovery/{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+    .unwrap();
+    let report = scheduled_bg_jobs_conformance::run_recovery(store.clone(), store, namespace)
+        .await
+        .unwrap();
+    assert_eq!(report.recovered_enqueues, 1);
+    assert_eq!(report.recovered_completions, 1);
+    assert_eq!(report.handler_executions, 1);
 }

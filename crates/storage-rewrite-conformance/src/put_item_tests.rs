@@ -1162,15 +1162,7 @@ async fn given_concurrent_puts_when_keys_overlap_or_differ_then_every_change_is_
         );
         let values = records
             .iter()
-            .map(|record| {
-                record
-                    .new_image
-                    .as_ref()
-                    .unwrap()
-                    .get("value")
-                    .unwrap()
-                    .clone()
-            })
+            .map(|record| record.item.as_ref().unwrap().get("value").unwrap().clone())
             .collect::<Vec<_>>();
         for index in 0..32 {
             assert_eq!(

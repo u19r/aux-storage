@@ -1,11 +1,10 @@
-//! Bounded GSI build discovery and private history-hold validation.
+//! Bounded GSI build discovery and protected candidate binding.
 
 use std::num::NonZeroU32;
 
 use storage_backfill::{GsiBuild, GsiBuildTarget};
 use storage_types::{StorageError, StorageResult, storage_serde};
 
-use super::key_layout::hold_key;
 use crate::{
     KvAttempt, KvRange, KvRangePage, ReadProtection,
     constants::{GSI_RUNNABLE_FAMILY, PAGE_READ_BYTES},
@@ -51,48 +50,17 @@ fn decode_candidate_page(page: KvRangePage) -> StorageResult<Option<GsiBuild<Vec
     decode_candidate(&entry.key, &entry.value).map(Some)
 }
 
-pub(crate) async fn read_candidate_holds<A: KvAttempt>(
+pub(crate) async fn read_candidate_binding<A: KvAttempt>(
     attempt: &mut A,
     build: &GsiBuild<Vec<u8>>,
-) -> StorageResult<storage_provider::maintenance::GsiCandidateObservation> {
-    let checkpoint = build.state.required_stream_history();
-    let mut candidate_key = vec![GSI_RUNNABLE_FAMILY];
-    candidate_key.extend_from_slice(build.target.incarnation.as_ref());
-    let expected = checkpoint.frontier().len();
-    let mut keys = Vec::with_capacity(expected + 1);
-    keys.push(candidate_key);
-    for position in checkpoint.frontier() {
-        keys.push(hold_key(
-            checkpoint,
-            position,
-            build.target.incarnation.as_ref(),
-        )?);
-    }
-    let values = attempt.get_batch(keys, ReadProtection::Conflict).await?;
-    if values.len() != expected + 1 {
-        return Err(StorageError::internal(
-            "KV GSI candidate validation returned the wrong value count",
-        ));
-    }
-    let mut values = values.into_iter();
-    let observed = values
-        .next()
-        .flatten()
+) -> StorageResult<Option<GsiBuild<Vec<u8>>>> {
+    let mut key = vec![GSI_RUNNABLE_FAMILY];
+    key.extend_from_slice(build.target.incarnation.as_ref());
+    attempt
+        .get(&key, ReadProtection::Conflict)
+        .await?
         .map(|bytes| storage_serde::from_bytes(&bytes))
-        .transpose()?;
-    let mut holds = Vec::with_capacity(expected);
-    for (value, position) in values.zip(checkpoint.frontier()) {
-        if let Some(bytes) = value {
-            if !bytes.is_empty() {
-                return Err(StorageError::internal("KV GSI hold value is malformed"));
-            }
-            holds.push((checkpoint.scope().clone(), position.clone()));
-        }
-    }
-    Ok(storage_provider::maintenance::GsiCandidateObservation {
-        build: observed,
-        holds,
-    })
+        .transpose()
 }
 
 fn candidate_range(after: Option<&GsiBuildTarget>) -> StorageResult<KvRange> {
@@ -123,7 +91,13 @@ fn decode_candidate(key: &[u8], bytes: &[u8]) -> StorageResult<GsiBuild<Vec<u8>>
         ));
     }
     let build: GsiBuild<Vec<u8>> = storage_serde::from_bytes(bytes)?;
-    if build.target.incarnation.as_ref() != &key[1..] {
+    let table_id = u32::from_be_bytes(
+        key[1..5]
+            .try_into()
+            .map_err(|_| StorageError::internal("Invalid KV GSI table identity"))?,
+    );
+    if build.target.history_id != table_id.into() || build.target.incarnation.as_ref() != &key[1..]
+    {
         return Err(StorageError::internal(
             "KV GSI build identity does not match its key",
         ));

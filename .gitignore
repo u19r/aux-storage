@@ -25,3 +25,7 @@ run-artifacts/
 tmp/opt-loop/
 _apalache-out/
 deploy-artifacts/
+
+# OpenTofu provider cache; campaign state stays under run-artifacts.
+terraform/**/.terraform/
+terraform/**/*.tfstate*

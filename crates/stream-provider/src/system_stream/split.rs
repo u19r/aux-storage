@@ -168,18 +168,9 @@ impl SystemStreamSplitRequest {
                     .entries()
                     .iter()
                     .any(|entry| entry.shard_id() == child_lineage.shard_id())
-                || catalog.entries().iter().any(|entry| {
-                    super::pointer_slot(entry.lineage_id())
-                        == super::pointer_slot(child_lineage.lineage_id())
-                })
             {
                 return Err(SystemStreamContractError::BackendContract);
             }
-        }
-        if super::pointer_slot(self.children[0].lineage().lineage_id())
-            == super::pointer_slot(self.children[1].lineage().lineage_id())
-        {
-            return Err(SystemStreamContractError::BackendContract);
         }
         Ok(())
     }

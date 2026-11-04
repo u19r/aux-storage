@@ -24,9 +24,6 @@ pub(crate) const AUXILIARY_JSON_BODY_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(feature = "queue")]
 pub(crate) const QUEUE_JSON_TARGET_PREFIX: &str = "AmazonSQS.";
 
-pub(crate) const MERGED_SHARD_ID: &str = "shardId-00000000000000000000-auxfn1";
-pub(crate) const STREAM_ITERATOR_VERSION: &str = "aux-stream-v1";
-
 pub const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(feature = "pubsub")]
 pub const PUBSUB_DELIVERY_IDLE_INTERVAL: Duration = Duration::from_secs(1);

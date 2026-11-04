@@ -665,10 +665,39 @@ async fn inject_sql_required_history_gap<B: sql_backend::SqlBackend>(
     driver: &B,
 ) -> Result<usize, storage::StorageError> {
     use sql_backend::SqlAttempt as _;
-    let statement = sql_statements::inject_required_gsi_history_gap(driver.engine());
+    let engine = driver.engine();
     let deleted = driver
         .with_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move { attempt.execute(statement).await })
+            Box::pin(async move {
+                let page = attempt
+                    .query(
+                        sql_statements::latest_system_record(),
+                        storage_types::ReadProtection::Conflict,
+                        storage_provider::CATALOG_READ_BYTES,
+                    )
+                    .await?;
+                let [row]: [_; 1] = page
+                    .rows
+                    .try_into()
+                    .map_err(|_| storage::StorageError::internal("fault source is not unique"))?;
+                let [sql_backend::SqlValue::Blob(bytes)]: [_; 1] = row
+                    .into_values()
+                    .try_into()
+                    .map_err(|_| storage::StorageError::internal("fault source width differs"))?
+                else {
+                    return Err(storage::StorageError::internal(
+                        "fault source is not a blob",
+                    ));
+                };
+                let record: storage_types::SystemHistoryRecord =
+                    storage_types::storage_serde::from_bytes(&bytes)?;
+                let pointer = record.pointer().ok_or_else(|| {
+                    storage::StorageError::internal("fault source has no history target")
+                })?;
+                attempt
+                    .execute(sql_statements::delete_history_body(engine, pointer)?)
+                    .await
+            })
         })
         .await?;
     usize::try_from(deleted).map_err(|error| storage::StorageError::internal(&error))
@@ -678,28 +707,45 @@ async fn inject_sql_required_history_gap<B: sql_backend::SqlBackend>(
 async fn inject_kv_required_history_gap<B: kv_backend::KvBackend>(
     driver: &B,
 ) -> Result<usize, storage::StorageError> {
-    use kv_backend::{KvAttempt as _, KvMutation, KvRange};
-    use storage_types::{AttemptMode, ReadProtection, StreamName};
+    use kv_backend::{KvAttempt as _, KvMutation, catalog::KvCatalogAttempt};
+    use storage_types::{AttemptMode, ReadProtection};
+    use stream_provider::SystemHistoryReadAttempt;
 
-    // Fault injection removes the last physical System pointer while keeping
-    // its logical record and retention hold. The production owner never exposes
-    // this mutation, which deliberately violates atomic publication.
-    let prefix =
-        kv_backend::stream_write::key_layout::item_row_prefix(&StreamName::system_table_stream())?;
-    let mut range = KvRange::try_for_prefix(
-        prefix,
-        std::num::NonZeroU32::MIN,
-        std::num::NonZeroUsize::new(1024 * 1024).expect("fault page byte bound"),
-    )?;
-    range.reverse = true;
     driver
         .with_attempt(AttemptMode::ReadWrite, move |attempt| {
             Box::pin(async move {
-                let page = attempt.native_scan(range, ReadProtection::Conflict).await?;
-                let Some(entry) = page.entries.into_iter().next() else {
-                    return Ok(0);
+                let position = {
+                    let mut catalog = KvCatalogAttempt::new(attempt, ReadProtection::Conflict);
+                    let (history, _) = catalog.read_system_page_start(None).await?;
+                    let high = history.capture_high().map_err(|_| {
+                        storage::StorageError::internal("invalid fault source high")
+                    })?;
+                    let [position]: [_; 1] = high.frontier().to_vec().try_into().map_err(|_| {
+                        storage::StorageError::internal("fault fixture requires one source lineage")
+                    })?;
+                    position
                 };
-                attempt.native_stage(vec![KvMutation::Delete { key: entry.key }])?;
+                let key = kv_backend::stream_write::key_layout::record_key(&position)?;
+                let bytes = attempt
+                    .get(&key, ReadProtection::Conflict)
+                    .await?
+                    .ok_or_else(|| storage::StorageError::internal("fault source is absent"))?;
+                let mut record: storage_types::SystemHistoryRecord =
+                    storage_types::storage_serde::from_bytes(&bytes)?;
+                if let Some(stamp) = position.offset().versionstamp() {
+                    record = record.with_versionstamp(stamp)?;
+                }
+                let pointer = record.pointer().ok_or_else(|| {
+                    storage::StorageError::internal("fault source has no history target")
+                })?;
+                let key = kv_backend::stream_write::key_layout::item_key(
+                    &pointer.metadata().address().physical_stream_name()?,
+                    pointer.metadata().version().into(),
+                )?;
+                if attempt.get(&key, ReadProtection::Conflict).await?.is_none() {
+                    return Ok(0);
+                }
+                attempt.stage(vec![KvMutation::Delete { key }])?;
                 Ok(1)
             })
         })

@@ -110,7 +110,8 @@ fn decode_gsi_statuses(
     let mut builds = Vec::with_capacity(indexes.len());
     for row in page.rows {
         let build = decode_status_row(row)?;
-        if build.target.table_name != table.info.table_name
+        if build.target.history_id != table.history_id
+            || build.target.table_name != table.info.table_name
             || !indexes.iter().any(|index| {
                 index.index_name == build.target.index_name
                     && requested.is_none_or(|name| index.index_name == *name)
@@ -124,45 +125,67 @@ fn decode_gsi_statuses(
 }
 
 fn decode_status_row(row: SqlRow) -> StorageResult<GsiBuildStatus> {
-    let [table_name, index_name, incarnation, phase] = row
+    let [history_id, table_name, index_name, incarnation, phase] = row
         .into_values()
         .try_into()
         .map_err(|_| StorageError::internal("SQL GSI status row width is invalid"))?;
     let (
+        SqlValue::Blob(history_id),
         SqlValue::Text(table_name),
         SqlValue::Text(index_name),
         SqlValue::Blob(incarnation),
         SqlValue::Text(phase),
-    ) = (table_name, index_name, incarnation, phase)
+    ) = (history_id, table_name, index_name, incarnation, phase)
     else {
         return Err(StorageError::internal(
             "SQL GSI status row has invalid types",
         ));
     };
     Ok(GsiBuildStatus {
-        target: GsiBuildTarget::try_from((table_name, index_name, incarnation))?,
+        target: GsiBuildTarget::try_from((
+            decode_history_id(history_id)?,
+            table_name,
+            index_name,
+            incarnation,
+        ))?,
         phase: GsiBuildPhase::try_from(phase.as_str())?,
     })
 }
 
 pub(super) fn decode_build_row(row: SqlRow) -> StorageResult<GsiBuild<Vec<u8>>> {
-    let [table_name, index_name, incarnation, phase, state] = row
+    let [
+        history_id,
+        table_name,
+        index_name,
+        incarnation,
+        phase,
+        state,
+    ] = row
         .into_values()
         .try_into()
         .map_err(|_| StorageError::internal("SQL GSI build row width is invalid"))?;
     let (
+        SqlValue::Blob(history_id),
         SqlValue::Text(table_name),
         SqlValue::Text(index_name),
         SqlValue::Blob(incarnation),
         SqlValue::Text(phase),
         SqlValue::Blob(state),
-    ) = (table_name, index_name, incarnation, phase, state)
+    ) = (
+        history_id,
+        table_name,
+        index_name,
+        incarnation,
+        phase,
+        state,
+    )
     else {
         return Err(StorageError::internal(
             "SQL GSI build row has invalid types",
         ));
     };
     GsiBuild::try_from(GsiRecord {
+        history_id: decode_history_id(history_id)?,
         table_name,
         index_name,
         incarnation,
@@ -170,4 +193,11 @@ pub(super) fn decode_build_row(row: SqlRow) -> StorageResult<GsiBuild<Vec<u8>>> 
         state,
     })
     .map_err(Into::into)
+}
+
+fn decode_history_id(bytes: Vec<u8>) -> StorageResult<storage_types::TableHistoryId> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| StorageError::internal("Invalid GSI table identity"))?;
+    Ok(bytes.into())
 }

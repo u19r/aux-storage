@@ -63,6 +63,7 @@ async fn assert_redirect_preserves_post(status: u16) {
                 "Table": {
                     "TableName": "remote-test-table",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("remote-test-table").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],
@@ -131,6 +132,7 @@ async fn assert_cross_host_redirect_preserves_post(status: u16) {
                 "Table": {
                     "TableName": "remote-test-table",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("remote-test-table").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [],
                     "KeySchema": [],

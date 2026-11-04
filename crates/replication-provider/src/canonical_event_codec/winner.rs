@@ -195,7 +195,7 @@ impl NativeWinner<'_> {
     ) -> Result<WinnerProvenance, ReplicationProtocolError> {
         let (version, order) = self.stamp.into_identity(self.lineage, &key, self.rank);
         let event = match (&version, self.rank) {
-            (_, EffectRank::Expiration) => Some(version.clone().expiration_id()),
+            (_, EffectRank::Expiration) => Some(version.expiration_id()?),
             (VersionIdentity::Mutation(identity), EffectRank::Mutation) => {
                 Some(CanonicalEventId::Origin(identity.clone()))
             }

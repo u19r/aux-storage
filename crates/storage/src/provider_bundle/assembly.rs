@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use storage_provider::{
-    StreamRetentionRepository, SystemStreamTrimRepository, TableReclaimRepository,
+    StorageStreamOperations, StreamRetentionRepository, SystemStreamTrimRepository,
+    TableReclaimRepository,
     maintenance::{
         ExpirationRepository, GsiBuildRepository, GsiLifecycleRepository,
         PartitionReconciliationSource,
     },
 };
 use storage_types::StorageResult;
-use stream_provider::StreamOperations;
 
 use super::StorageProviderBundle;
 use crate::DatabaseManagerRuntimeOptions;
@@ -25,7 +25,7 @@ where
         + queue_provider::QueuePort
         + infrastructure_provider::physical_store::PhysicalRecordStore
         + bg_job_store::ScheduledJobStoreSource
-        + StreamOperations
+        + StorageStreamOperations
         + stream_provider::StreamPort
         + queue_provider::QueueOperations
         + queue_provider::QueueMessageCleanupRepository
@@ -44,7 +44,7 @@ where
         infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + storage_provider::maintenance::ExpirationPort
             + storage_provider::maintenance::GsiPort
-            + storage_provider::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>
+            + storage_provider::TableUpdateTransaction
             + storage_provider::PrimaryStateScanAttempt
             + storage_provider::ItemTombstoneScanAttempt
             + storage_provider::GsiProjectionScanAttempt
@@ -53,7 +53,7 @@ where
             + storage_provider::maintenance::StreamRetentionPort
             + storage_provider::TableReclaimAttempt,
     for<'native> <S as stream_provider::StreamPort>::Attempt<'native>:
-        stream_provider::retained_image::RetainedOwnershipAttempt
+        infrastructure_provider::physical_attempt::PhysicalRecordAttempt
             + storage_provider::CatalogAttempt,
 {
     options
@@ -86,7 +86,7 @@ where
     S: storage_provider::native_admission::NativeAttemptSource
         + storage_provider::DynamoPort
         + bg_job_store::ScheduledJobStoreSource
-        + StreamOperations
+        + StorageStreamOperations
         + queue_provider::QueueOperations
         + queue_provider::QueueMessageCleanupRepository
         + pubsub_provider::PubsubProvider
@@ -102,7 +102,8 @@ where
         + storage_provider::TtlSweepRepository
         + 'static,
     for<'native> <S as storage_provider::DynamoPort>::Attempt<'native>:
-        storage_provider::maintenance::ExpirationPort
+        storage_provider::PrimaryStateScanAttempt
+            + storage_provider::maintenance::ExpirationPort
             + storage_provider::maintenance::GsiPort
             + storage_provider::maintenance::StreamRetentionPort
             + storage_provider::TableReclaimAttempt,

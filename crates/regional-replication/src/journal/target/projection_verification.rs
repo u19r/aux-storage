@@ -113,7 +113,7 @@ impl JournalStore {
     }
 
     async fn count_expected_projections<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -136,11 +136,19 @@ impl JournalStore {
             return Err(corrupt_record());
         }
         let page = self
-            .load_expected_winners(attempt, root.request.operation.id, after)
+            .load_expected_winners(
+                attempt,
+                (root.state.physical, root.request.operation.id),
+                after,
+            )
             .await?;
         for expected in page.winners {
             let authority = self
-                .load_winner_authority(attempt, (&expected.key, &expected.provenance), input.1)
+                .load_winner_authority(
+                    attempt,
+                    (root.state.physical, &expected.key, &expected.provenance),
+                    input.1,
+                )
                 .await?;
             let images = authority.images()?;
             let Some(image) = images.new else {
@@ -203,11 +211,19 @@ impl JournalStore {
             .key_attributes(&table.info)?;
         let canonical = codec.encode_key(&source).map_err(|_| corrupt_record())?;
         let expected = self
-            .load_expected_winner(attempt, root.request.operation.id, &canonical)
+            .load_expected_winner(
+                attempt,
+                (root.state.physical, root.request.operation.id),
+                &canonical,
+            )
             .await?
             .ok_or_else(corrupt_record)?;
         let authority = self
-            .load_winner_authority(attempt, (&expected.key, &expected.provenance), codec)
+            .load_winner_authority(
+                attempt,
+                (root.state.physical, &expected.key, &expected.provenance),
+                codec,
+            )
             .await?;
         let images = authority.images()?;
         let image = images.new.ok_or_else(corrupt_record)?;

@@ -34,13 +34,13 @@ impl JournalStore {
             let policy = self
                 .load_verification_ttl(attempt, target.0, &target.1)
                 .await?;
-            let ttl = (&target.0.request.schema.table, policy.as_ref());
+            let ttl = (target.1.as_ref(), policy.as_ref());
             match &progress.stage {
                 VerificationStage::Expected(after) => {
                     let page = self
                         .load_expected_winners(
                             attempt,
-                            target.0.request.operation.id,
+                            (target.0.state.physical, target.0.request.operation.id),
                             after.clone(),
                         )
                         .await?;
@@ -61,7 +61,8 @@ impl JournalStore {
                         });
                 }
                 VerificationStage::Live(after) => {
-                    let scan = PrimaryStateScan::try_new(target.1, after.clone(), Some(1))?;
+                    let scan =
+                        PrimaryStateScan::try_new(Arc::clone(&target.1), after.clone(), Some(1))?;
                     let page = attempt.scan_primary_state(&scan).await?.finish()?;
                     for row in page.items {
                         self.require_reconstructed_primary(attempt, target.0, (&row, codec), ttl)
@@ -78,7 +79,7 @@ impl JournalStore {
                 }
                 VerificationStage::Deleted(after) => {
                     let scan = ItemTombstoneScan::try_new(
-                        target.1,
+                        Arc::clone(&target.1),
                         after.clone(),
                         NonZeroU32::MIN,
                         self.records.limits.max_bytes(),
@@ -111,14 +112,14 @@ impl JournalStore {
     }
 
     async fn require_reconstructed_primary<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         root: &TargetRecord,
         input: (&PrimaryStateRow, &CanonicalJsonCodec),
         ttl: (
-            &storage_types::StoredTableInfo,
+            &storage_types::BoundTableInfo,
             Option<&storage_common::TtlConfigRecord>,
         ),
     ) -> StorageResult<()> {
@@ -127,7 +128,11 @@ impl JournalStore {
             .encode_key(&input.0.key)
             .map_err(|_| corrupt_record())?;
         let expected = self
-            .load_expected_winner(attempt, root.request.operation.id, &canonical)
+            .load_expected_winner(
+                attempt,
+                (root.state.physical, root.request.operation.id),
+                &canonical,
+            )
             .await?
             .ok_or_else(corrupt_record)?;
         if expected.key != input.0.key {
@@ -138,14 +143,14 @@ impl JournalStore {
     }
 
     async fn require_expected_primary<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         expected: &ExpectedWinner,
         input: (&ItemWriteObservation, &CanonicalJsonCodec),
         ttl: (
-            &storage_types::StoredTableInfo,
+            &storage_types::BoundTableInfo,
             Option<&storage_common::TtlConfigRecord>,
         ),
     ) -> StorageResult<()> {
@@ -159,7 +164,11 @@ impl JournalStore {
             return Err(corrupt_record());
         }
         let authority = self
-            .load_winner_authority(attempt, (&expected.key, &expected.provenance), input.1)
+            .load_winner_authority(
+                attempt,
+                (ttl.0.history_id, &expected.key, &expected.provenance),
+                input.1,
+            )
             .await?;
         let observed_images = match input.0 {
             ItemWriteObservation::Live { stored, .. } => {

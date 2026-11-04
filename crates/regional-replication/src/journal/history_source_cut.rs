@@ -23,9 +23,26 @@ use crate::{
     source_frame::{SourceFrameRequest, load_source_frame},
 };
 
+enum HistoryReadCut<'cut> {
+    Supplied(std::borrow::Cow<'cut, CanonicalSourceCut>),
+    Held {
+        physical: storage_types::TableHistoryId,
+        cut: CanonicalSourceCut,
+    },
+}
+
+impl AsRef<CanonicalSourceCut> for HistoryReadCut<'_> {
+    fn as_ref(&self) -> &CanonicalSourceCut {
+        match self {
+            Self::Supplied(cut) => cut,
+            Self::Held { cut, .. } => cut,
+        }
+    }
+}
+
 impl JournalStore {
     pub(crate) async fn observe_source_cut<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -43,7 +60,11 @@ impl JournalStore {
             let available = self.qualify_history_selection(attempt, &selection).await?;
             let through = available.through();
             let terminal_manifest = self
-                .load_history_terminal_manifest(attempt, (&selection, through), encoding)
+                .load_history_terminal_manifest(
+                    attempt,
+                    (available.bounds().physical, &selection, through),
+                    encoding,
+                )
                 .await?;
             let cut = CanonicalSourceCut {
                 trim: available.bounds().trim,
@@ -126,18 +147,22 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_history_terminal_manifest<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        selection: (&CanonicalSourceSelection, OriginPosition),
+        selection: (
+            storage_types::TableHistoryId,
+            &CanonicalSourceSelection,
+            OriginPosition,
+        ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
     ) -> StorageResult<Option<CanonicalDigest>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let (selection, through) = selection;
+            let (physical, selection, through) = selection;
             let through_value = u64::from(through);
             if through_value == 0 {
                 return Ok(None);
@@ -145,7 +170,7 @@ impl JournalStore {
             let range = ClosedSourceInterval::try_from(((through_value - 1).into(), through))
                 .map_err(|_| crate::native_record::corrupt_record())?;
             let frame = self
-                .load_history_frame(attempt, (selection, range), encoding)
+                .load_history_frame(attempt, (physical, selection, range), encoding)
                 .await?;
             Ok(Some(frame.manifest().digest))
         }
@@ -154,7 +179,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_bounded_canonical_history<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -170,21 +195,22 @@ impl JournalStore {
             let cut = self
                 .qualify_history_cut(attempt, request, encoding, observed_at)
                 .await?;
-            let available = match (&request.cut, &cut) {
-                (Some(CanonicalHistoryCut::Checkpoint(_)), Some(cut)) => {
-                    AvailableSourcePrefix::Held(
-                        crate::history::source_selection::SourceHistoryBounds::try_new(
-                            cut.trim,
-                            cut.after,
-                            cut.through,
-                        )?,
-                    )
-                }
+            let available = match &cut {
+                Some(HistoryReadCut::Held { physical, cut }) => AvailableSourcePrefix::Held(
+                    crate::history::source_selection::SourceHistoryBounds::try_new(
+                        *physical,
+                        cut.trim,
+                        cut.after,
+                        cut.through,
+                    )?,
+                ),
                 _ => {
                     self.qualify_history_selection(attempt, &request.selection)
                         .await?
                 }
             };
+            let physical = available.bounds().physical;
+            let cut = cut.as_ref().map(AsRef::as_ref);
             available.require_range(request.range, range.through())?;
             if let Some(cut) = &cut {
                 cut.require_selection(&request.selection)?;
@@ -199,7 +225,7 @@ impl JournalStore {
                     let digest = self
                         .load_history_terminal_manifest(
                             attempt,
-                            (&request.selection, cut.through),
+                            (physical, &request.selection, cut.through),
                             encoding,
                         )
                         .await?;
@@ -207,7 +233,7 @@ impl JournalStore {
                 }
             }
             let frame = self
-                .load_history_frame(attempt, (&request.selection, range), encoding)
+                .load_history_frame(attempt, (physical, &request.selection, range), encoding)
                 .await?;
             if let Some(cut) = &cut
                 && range.through() == cut.through
@@ -238,51 +264,74 @@ impl JournalStore {
 
     async fn qualify_history_cut<
         'cut,
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         request: &'cut CanonicalHistoryRequest,
         encoding: (&WorkLimits, &CanonicalJsonCodec),
         observed_at: storage_types::TimestampMillis,
-    ) -> StorageResult<Option<std::borrow::Cow<'cut, CanonicalSourceCut>>> {
+    ) -> StorageResult<Option<HistoryReadCut<'cut>>> {
         match &request.cut {
             None => Ok(None),
-            Some(CanonicalHistoryCut::Source(cut)) => Ok(Some(std::borrow::Cow::Borrowed(cut))),
+            Some(CanonicalHistoryCut::Source(cut)) => Ok(Some(HistoryReadCut::Supplied(
+                std::borrow::Cow::Borrowed(cut),
+            ))),
             Some(CanonicalHistoryCut::Table(cut)) => {
                 let cut = self
                     .qualify_vector_component(attempt, (&request.selection, cut), encoding)
                     .await?;
-                Ok(Some(std::borrow::Cow::Owned(cut)))
+                Ok(Some(HistoryReadCut::Supplied(std::borrow::Cow::Owned(cut))))
             }
             Some(CanonicalHistoryCut::Checkpoint(operation)) => {
-                let vector = self
-                    .load_portable_checkpoint_cut(
+                let (physical, cut) = self
+                    .load_checkpoint_source_cut(
                         attempt,
-                        super::portable_checkpoint::PortableReadScope {
-                            table: &request.selection.table,
-                            lineage: request.selection.lineage,
-                            membership: request.selection.membership,
-                        },
-                        *operation,
+                        (&request.selection, *operation),
+                        encoding,
                         observed_at,
                     )
                     .await?;
-                let vector = self
-                    .verify_held_source_vector(
-                        attempt,
-                        (&request.selection.table, &vector),
-                        encoding,
-                    )
-                    .await?;
-                let cut = select_vector_component(vector, &request.selection)?;
-                Ok(Some(std::borrow::Cow::Owned(cut)))
+                Ok(Some(HistoryReadCut::Held { physical, cut }))
             }
         }
     }
 
+    async fn load_checkpoint_source_cut<A: CatalogAttempt + PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        scope: (
+            &CanonicalSourceSelection,
+            crate::history::checkpoint::CanonicalCheckpointId,
+        ),
+        encoding: (&WorkLimits, &CanonicalJsonCodec),
+        observed_at: storage_types::TimestampMillis,
+    ) -> StorageResult<(storage_types::TableHistoryId, CanonicalSourceCut)> {
+        let (selection, operation) = scope;
+        let held = self
+            .load_portable_checkpoint_cut(
+                attempt,
+                super::portable_checkpoint::PortableReadScope {
+                    table: &selection.table,
+                    lineage: selection.lineage,
+                    membership: selection.membership,
+                },
+                operation,
+                observed_at,
+            )
+            .await?;
+        let vector = self
+            .verify_held_source_vector(
+                attempt,
+                ((held.physical, &selection.table), &held.cut),
+                encoding,
+            )
+            .await?;
+        Ok((held.physical, select_vector_component(vector, selection)?))
+    }
+
     async fn qualify_vector_component<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -306,19 +355,23 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn load_history_frame<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        selection: (&CanonicalSourceSelection, ClosedSourceInterval),
+        selection: (
+            storage_types::TableHistoryId,
+            &CanonicalSourceSelection,
+            ClosedSourceInterval,
+        ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
     ) -> StorageResult<SourceFrame> {
-        let (selection, range) = selection;
+        let (physical, selection, range) = selection;
         let request = SourceFrameRequest {
             origin: selection.origin.clone(),
             range,
             membership: selection.membership,
-            tables: vec![(selection.source.table, selection.lineage)],
+            tables: vec![(selection.source.table, selection.lineage, physical)],
         };
         load_source_frame(self, attempt, (&request, encoding.0), encoding.1)
             .await

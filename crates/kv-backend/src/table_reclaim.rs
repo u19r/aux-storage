@@ -5,20 +5,14 @@ use std::{future::Future, num::NonZeroU32};
 use storage_provider::{
     TableReclaimAttempt, TableReclaimPhase, TableReclaimStep, TableReclaimTarget,
 };
-use storage_types::{
-    ReadProtection, StorageError, StorageResult, TableHistoryId, TimestampMillis, storage_serde,
-};
+use storage_types::{ReadProtection, StorageError, StorageResult, TableHistoryId, storage_serde};
 
 use crate::{
     KvAttempt, KvMutation, KvRange,
-    catalog::{
-        KvCatalogAttempt, encode_name_lock, metadata_key, name_lock_key, table_id_from_history,
-        verify_deleted_metadata,
-    },
+    catalog::{KvCatalogAttempt, metadata_key, table_id_from_history, verify_deleted_metadata},
     constants::{
-        CATALOG_BYTES, GSI_AUTHORITY_FAMILY, GSI_BRANCH_FAMILY, GSI_BUILD_FAMILY,
-        GSI_NAME_LOCK_FAMILY, GSI_PROJECTION_FAMILY, GSI_RUNNABLE_FAMILY, GSI_TOMBSTONE_FAMILY,
-        PRIMARY_ITEM_FAMILY, PRIMARY_TOMBSTONE_PREFIX, TABLE_RECLAIM_DUE_PREFIX,
+        CATALOG_BYTES, GSI_BUILD_FAMILY, GSI_NAME_LOCK_FAMILY, GSI_PROJECTION_FAMILY,
+        GSI_RUNNABLE_FAMILY, GSI_TOMBSTONE_FAMILY, PRIMARY_ITEM_FAMILY, PRIMARY_TOMBSTONE_PREFIX,
         TABLE_RECLAIM_PREFIX, TTL_INDEX_FAMILY,
     },
     range::prefix_upper_bound,
@@ -27,11 +21,40 @@ use crate::{
 const RECLAIM_PAGE_ROWS: NonZeroU32 = NonZeroU32::MIN.saturating_add(64 - 1);
 
 impl<A: KvAttempt> TableReclaimAttempt for KvCatalogAttempt<'_, A> {
+    async fn load_table_system_rows(
+        &mut self,
+        history: TableHistoryId,
+        limit: NonZeroU32,
+    ) -> StorageResult<storage_provider::TableSystemHistoryPage> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result =
+            crate::table_history_reclaim::load_table_system_rows(catalog.attempt, history, limit)
+                .await;
+        operation.complete(result)
+    }
+
+    async fn store_table_system_removals(
+        &mut self,
+        history: TableHistoryId,
+        rows: &[storage_types::SystemHistoryRecord],
+    ) -> StorageResult<()> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = crate::table_history_reclaim::store_table_system_removals(
+            catalog.attempt,
+            history,
+            rows,
+        );
+        operation.complete(result)
+    }
+
     fn load_reclaim_target(
         &mut self,
-        observed_at: TimestampMillis,
     ) -> impl Future<Output = StorageResult<Option<TableReclaimTarget>>> + Send {
-        load_target(self.attempt, observed_at)
+        load_target(self.attempt)
     }
 
     fn delete_reclaim_page(
@@ -47,21 +70,15 @@ impl<A: KvAttempt> TableReclaimAttempt for KvCatalogAttempt<'_, A> {
         next: Option<TableReclaimPhase>,
     ) -> StorageResult<()> {
         let table_id = table_id_from_history(target.history_id)?;
-        let key = marker_key(target, table_id);
+        let key = reclaim_key(table_id);
         let changes = match next {
             Some(phase) => {
                 let mut next_target = target.clone();
                 next_target.phase = phase;
-                let next_key = marker_key(&next_target, table_id);
-                let mut changes = Vec::with_capacity(if key == next_key { 1 } else { 2 });
-                if key != next_key {
-                    changes.push(KvMutation::Delete { key });
-                }
-                changes.push(KvMutation::Put {
-                    key: next_key,
+                vec![KvMutation::Put {
+                    key,
                     value: storage_serde::to_bytes(&next_target)?,
-                });
-                changes
+                }]
             }
             None => vec![
                 KvMutation::Delete {
@@ -80,78 +97,23 @@ pub(crate) fn reclaim_key(table_id: u32) -> Vec<u8> {
     key
 }
 
-fn due_key(table_id: u32, locked_until: TimestampMillis) -> Vec<u8> {
-    let mut key = Vec::with_capacity(TABLE_RECLAIM_DUE_PREFIX.len() + 12);
-    key.extend_from_slice(TABLE_RECLAIM_DUE_PREFIX);
-    let ordered = (locked_until.timestamp_millis() as u64 ^ (1_u64 << 63)).to_be_bytes();
-    key.extend_from_slice(&ordered);
-    key.extend_from_slice(&table_id.to_be_bytes());
-    key
-}
-
-fn marker_key(target: &TableReclaimTarget, table_id: u32) -> Vec<u8> {
-    if target.phase == TableReclaimPhase::NameReservation {
-        due_key(table_id, target.name_locked_until)
-    } else {
-        reclaim_key(table_id)
-    }
-}
-
-async fn load_target<A: KvAttempt>(
-    attempt: &mut A,
-    observed_at: TimestampMillis,
-) -> StorageResult<Option<TableReclaimTarget>> {
-    let core_end = prefix_upper_bound(TABLE_RECLAIM_PREFIX)
-        .ok_or_else(|| StorageError::internal("KV reclaim prefix has no upper bound"))?;
-    let due_end = if observed_at.timestamp_millis() == i64::MAX {
-        prefix_upper_bound(TABLE_RECLAIM_DUE_PREFIX)
-            .ok_or_else(|| StorageError::internal("KV reclaim due prefix has no upper bound"))?
-    } else {
-        let mut end = TABLE_RECLAIM_DUE_PREFIX.to_vec();
-        let next = observed_at.timestamp_millis() + 1;
-        end.extend_from_slice(&(next as u64 ^ (1_u64 << 63)).to_be_bytes());
-        end
-    };
-    let pages = attempt
-        .scan_batch(
-            vec![
-                KvRange {
-                    entry_bounds: None,
-                    begin: TABLE_RECLAIM_PREFIX.to_vec(),
-                    end: core_end,
-                    reverse: false,
-                    limit: NonZeroU32::MIN,
-                    max_bytes: CATALOG_BYTES,
-                },
-                KvRange {
-                    entry_bounds: None,
-                    begin: TABLE_RECLAIM_DUE_PREFIX.to_vec(),
-                    end: due_end,
-                    reverse: false,
-                    limit: NonZeroU32::MIN,
-                    max_bytes: CATALOG_BYTES,
-                },
-            ],
+async fn load_target<A: KvAttempt>(attempt: &mut A) -> StorageResult<Option<TableReclaimTarget>> {
+    let page = attempt
+        .scan(
+            KvRange::try_for_prefix(
+                TABLE_RECLAIM_PREFIX.to_vec(),
+                NonZeroU32::MIN,
+                CATALOG_BYTES,
+            )?,
             ReadProtection::Conflict,
         )
         .await?;
-    let [core, due]: [crate::KvRangePage; 2] = pages
-        .try_into()
-        .map_err(|_| StorageError::internal("KV reclaim scan batch count differs"))?;
-    let Some((entry, due_marker)) = core
-        .entries
-        .into_iter()
-        .next()
-        .map(|entry| (entry, false))
-        .or_else(|| due.entries.into_iter().next().map(|entry| (entry, true)))
-    else {
+    let Some(entry) = page.entries.into_iter().next() else {
         return Ok(None);
     };
     let target: TableReclaimTarget = storage_serde::from_bytes(&entry.value)?;
     let table_id = table_id_from_history(target.history_id)?;
-    if entry.key != marker_key(&target, table_id)
-        || due_marker != (target.phase == TableReclaimPhase::NameReservation)
-    {
+    if entry.key != reclaim_key(table_id) {
         return Err(StorageError::internal(
             "KV reclaim marker key differs from target",
         ));
@@ -168,21 +130,48 @@ async fn delete_page<A: KvAttempt>(
     attempt: &mut A,
     target: &TableReclaimTarget,
 ) -> StorageResult<TableReclaimStep> {
-    if target.phase == TableReclaimPhase::NameReservation {
-        return delete_name_reservation(attempt, target).await;
+    if matches!(
+        target.phase,
+        TableReclaimPhase::ExternalData | TableReclaimPhase::SystemHistory
+    ) {
+        return Err(StorageError::internal(
+            "Table reclaim phase requires its domain owner",
+        ));
+    }
+    if target.phase == TableReclaimPhase::TableHistory {
+        return crate::table_history_reclaim::delete_table_history_rows(attempt, target.history_id)
+            .await;
+    }
+    if target.phase == TableReclaimPhase::ExplicitAppends {
+        let stream = target.history_id.append_stream_name();
+        crate::stream_write::counter::delete_user_sequence(attempt, &stream)?;
+        return delete_family_pages(
+            attempt,
+            vec![
+                crate::stream_write::key_layout::item_row_prefix(&stream)?,
+                crate::stream_cursor::cursor_stream_prefix(&stream)?,
+                crate::stream_write::receipt_prefix(target.history_id),
+            ],
+        )
+        .await;
     }
     let table_id = table_id_from_history(target.history_id)?;
     if target.phase == TableReclaimPhase::MetadataCleanup {
-        return verify_gsi_cleanup(attempt, table_id).await;
+        verify_gsi_cleanup(attempt, table_id).await?;
+        crate::retention::delete_table_retention(
+            attempt,
+            storage_provider::StreamTrimScope::table(
+                storage_provider::table_retention_scope_id(target.history_id),
+                target.table_name.clone(),
+            ),
+        )
+        .await?;
+        attempt.stage(vec![KvMutation::Delete {
+            key: crate::ttl_policy::ttl_config_key(table_id),
+        }])?;
+        return Ok(TableReclaimStep::Complete);
     }
-    let mut prefixes = vec![family_prefix(target.phase, table_id, target.history_id)?];
-    if target.phase == TableReclaimPhase::GsiProjections {
-        for family in [GSI_AUTHORITY_FAMILY, GSI_BRANCH_FAMILY] {
-            let mut prefix = vec![family];
-            prefix.extend_from_slice(&table_id.to_be_bytes());
-            prefixes.push(prefix);
-        }
-    }
+    let prefixes = vec![family_prefix(target.phase, table_id, target.history_id)?];
     delete_family_pages(attempt, prefixes).await
 }
 
@@ -240,13 +229,7 @@ pub(crate) async fn delete_family_pages<A: KvAttempt>(
 }
 
 fn delete_reclaimed_key(key: Vec<u8>) -> KvMutation {
-    if matches!(
-        key.first(),
-        Some(&GSI_BRANCH_FAMILY)
-            | Some(&GSI_PROJECTION_FAMILY)
-            | Some(&GSI_AUTHORITY_FAMILY)
-            | Some(&GSI_TOMBSTONE_FAMILY)
-    ) {
+    if matches!(key.first(), Some(&GSI_TOMBSTONE_FAMILY)) {
         KvMutation::DeleteUnchunked { key }
     } else {
         KvMutation::Delete { key }
@@ -288,19 +271,6 @@ async fn verify_gsi_cleanup<A: KvAttempt>(
     Ok(TableReclaimStep::Complete)
 }
 
-async fn delete_name_reservation<A: KvAttempt>(
-    attempt: &mut A,
-    target: &TableReclaimTarget,
-) -> StorageResult<TableReclaimStep> {
-    let table_id = table_id_from_history(target.history_id)?;
-    let key = name_lock_key(&target.table_name);
-    let current = attempt.get(&key, ReadProtection::Conflict).await?;
-    if current.as_deref() == Some(encode_name_lock(table_id, target.name_locked_until).as_slice()) {
-        attempt.stage(vec![KvMutation::Delete { key }])?;
-    }
-    Ok(TableReclaimStep::Complete)
-}
-
 fn family_prefix(
     phase: TableReclaimPhase,
     table_id: u32,
@@ -312,19 +282,18 @@ fn family_prefix(
             prefix.extend_from_slice(history_id.as_ref());
             return Ok(prefix);
         }
-        TableReclaimPhase::NameReservation => {
-            return Err(StorageError::internal(
-                "KV name reservation has no table family",
-            ));
-        }
         TableReclaimPhase::PrimaryItems => PRIMARY_ITEM_FAMILY,
         TableReclaimPhase::GsiProjections => GSI_PROJECTION_FAMILY,
         TableReclaimPhase::GsiTombstones => GSI_TOMBSTONE_FAMILY,
         TableReclaimPhase::TtlIndex => TTL_INDEX_FAMILY,
         TableReclaimPhase::GsiNameLocks => GSI_NAME_LOCK_FAMILY,
-        TableReclaimPhase::MetadataCleanup => {
+        TableReclaimPhase::ExternalData
+        | TableReclaimPhase::MetadataCleanup
+        | TableReclaimPhase::ExplicitAppends
+        | TableReclaimPhase::SystemHistory
+        | TableReclaimPhase::TableHistory => {
             return Err(StorageError::internal(
-                "KV GSI cleanup has no single table family",
+                "KV reclaim phase has no single table family",
             ));
         }
     };

@@ -29,7 +29,7 @@ impl<'native, A: StreamAttempt> StreamCursorOperation<'native, A> {
         let partitioning_mode = {
             let mut settlement = PhysicalRecordOperation::new(attempt);
             let result =
-                crate::stream_kind::read_partitioning_mode(settlement.as_mut(), &stream).await;
+                crate::stream_kind::resolve_stream_layout(settlement.as_mut(), &stream).await;
             settlement.complete(result)?
         };
         Ok(Self {

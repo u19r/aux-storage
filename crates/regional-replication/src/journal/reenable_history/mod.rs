@@ -40,16 +40,59 @@ impl JournalStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let record: InventoryRecord = self.records.decode(&row)?;
+        let record = self.decode_reenable_inventory(&row)?;
+        if record.proposal.operation().id != operation {
+            return Err(corrupt_record());
+        }
+        Ok(Some((row, record)))
+    }
+
+    fn decode_reenable_inventory(&self, row: &DurableRecord) -> StorageResult<InventoryRecord> {
+        let record: InventoryRecord = self.records.decode(row)?;
         record.proposal.validate().map_err(|_| corrupt_record())?;
         let source = replication_provider::control::source_capture_state(&record.proposal)
             .map_err(|_| corrupt_record())?;
         self.require_local_source(&source)?;
-        if record.proposal.operation().id != operation || row.key != key {
+        if row.key
+            != self.identity_key(REENABLE_INVENTORY_SUFFIX, &record.proposal.operation().id)?
+        {
             return Err(corrupt_record());
         }
         self.require_inventory_phase(&record)?;
-        Ok(Some((row, record)))
+        Ok(record)
+    }
+
+    pub(super) async fn reclaim_reenable_inventory<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        row: &DurableRecord,
+        history: storage_types::TableHistoryId,
+    ) -> StorageResult<()> {
+        let record = self.decode_reenable_inventory(row)?;
+        let source = replication_provider::control::source_capture_state(&record.proposal)
+            .map_err(|_| corrupt_record())?;
+        if source.physical != history {
+            return Ok(());
+        }
+        let revision = if matches!(
+            record.phase,
+            InventoryPhase::Released | InventoryPhase::Cancelled
+        ) {
+            row.revision
+        } else {
+            self.settle_reenable_inventory(attempt, &record.proposal, InventorySettlement::Cancel)
+                .await?;
+            row.revision.checked_next()?
+        };
+        self.records
+            .store(
+                attempt,
+                &[infrastructure_provider::record::RecordChange::Delete {
+                    key: row.key.clone(),
+                    expected: revision,
+                }],
+            )
+            .await
     }
 
     fn require_inventory_phase(&self, record: &InventoryRecord) -> StorageResult<()> {

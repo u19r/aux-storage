@@ -2,7 +2,7 @@
 
 use infrastructure_provider::{
     physical_attempt::PhysicalRecordAttempt,
-    record::{DurableRecord, DurableRecordKey, RecordAddress, RecordChange},
+    record::{DurableRecord, RecordChange},
 };
 use replication_provider::{
     canonical_event_codec::CanonicalJsonCodec, runtime_configuration::limits::WorkLimits,
@@ -17,7 +17,7 @@ use storage_types::{ReadProtection, StorageError, StorageResult};
 
 use super::JournalStore;
 use crate::{
-    constants::{ACCEPTANCE_SUFFIX, CANONICAL_VIEW_SUFFIX},
+    constants::ACCEPTANCE_SUFFIX,
     history::view::{
         CanonicalViewObservation, CanonicalViewPointer, CanonicalViewRecord, CanonicalViewRequest,
         DeliveryPosition,
@@ -38,6 +38,7 @@ pub(in crate::journal) struct QualifiedViewSelection {
 }
 
 pub(in crate::journal) struct FirstSeenDeclaration {
+    physical: storage_types::TableHistoryId,
     partition: JournalPartition,
     clock: Option<replication_types::event::order::HybridLogicalClock>,
     lineage: replication_types::identity::resource::TableLineage,
@@ -72,8 +73,10 @@ impl JournalStore {
     pub(in crate::journal) fn declare_first_seen(
         &self,
         event: crate::canonical_original::CanonicalOriginalRef<'_>,
+        physical: storage_types::TableHistoryId,
     ) -> FirstSeenDeclaration {
         FirstSeenDeclaration {
+            physical,
             partition: self.select_delivery_partition(event),
             clock: event.item_clock(),
             lineage: event.lineage(),
@@ -85,7 +88,7 @@ impl JournalStore {
     pub(in crate::journal) async fn prepare_first_seen_batch<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        input: &[&CanonicalEvent],
+        input: &[(&CanonicalEvent, storage_types::TableHistoryId)],
     ) -> StorageResult<Vec<PreparedFirstSeen>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
@@ -97,7 +100,7 @@ impl JournalStore {
             declarations.extend(
                 input
                     .iter()
-                    .map(|event| self.declare_first_seen((*event).into())),
+                    .map(|(event, physical)| self.declare_first_seen((*event).into(), *physical)),
             );
             self.prepare_first_seen_declarations(settlement.as_mut(), &declarations)
                 .await
@@ -132,6 +135,7 @@ impl JournalStore {
             }
             for (event, position) in input.iter().zip(positions) {
                 let delivery = CanonicalViewPointer {
+                    physical: event.physical,
                     receiver: self.origin(event.partition)?,
                     position,
                     lineage: event.lineage,
@@ -141,7 +145,7 @@ impl JournalStore {
                 let pointer = self.records.prepare(
                     self.canonical_view_key(event.partition, position)?,
                     None,
-                    &delivery,
+                    &super::history_receiver::ReceiverRecord::Event(Box::new(delivery.clone())),
                 )?;
                 prepared.push(PreparedFirstSeen { delivery, pointer });
             }
@@ -161,7 +165,12 @@ impl JournalStore {
         if row.revision != storage_types::Revision::INITIAL
             || pointer.event != accepted.receipt.event
             || pointer.digest != accepted.receipt.digest
-            || row.key != self.identity_key(ACCEPTANCE_SUFFIX, &accepted.receipt.event)?
+            || row.key
+                != self.table_identity_key(
+                    ACCEPTANCE_SUFFIX,
+                    accepted.delivery.physical,
+                    &accepted.receipt.event,
+                )?
         {
             return Err(corrupt_record());
         }
@@ -178,7 +187,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_canonical_view<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -197,15 +206,22 @@ impl JournalStore {
             let fixed = self
                 .load_receiver_checkpoint(attempt, request, observed_at)
                 .await?;
-            let (scope, authority, fixed_high) = match fixed {
-                Some(bounds) => (bounds.scope, bounds.authority, Some(bounds.high)),
+            let (scope, selected, fixed_high) = match fixed {
+                Some(bounds) => (
+                    bounds.scope,
+                    QualifiedViewSelection {
+                        physical: bounds.physical,
+                        authority: bounds.authority,
+                    },
+                    Some(bounds.high),
+                ),
                 None => {
                     let selected = self
                         .qualify_view_selection(attempt, request, ReadProtection::Snapshot)
                         .await?;
                     (
                         request.continuation(selected.authority.revision(), 0u64.into()),
-                        selected.authority,
+                        selected,
                         None,
                     )
                 }
@@ -235,7 +251,7 @@ impl JournalStore {
             let record = if through == after {
                 None
             } else {
-                self.load_view_record(attempt, (request, through, &authority), encoding)
+                self.load_view_record(attempt, (request, through, &selected), encoding)
                     .await?
             };
             let observation = CanonicalViewObservation {
@@ -357,14 +373,14 @@ impl JournalStore {
     }
 
     pub(in crate::journal) async fn load_view_record<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         selection: (
             &CanonicalViewRequest,
             DeliveryPosition,
-            &super::public_trim_authority::PublicTrimAuthority,
+            &QualifiedViewSelection,
         ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
     ) -> StorageResult<Option<CanonicalViewRecord>> {
@@ -372,20 +388,26 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let (request, position, authority) = selection;
-            authority.require_lineage(request.lineage)?;
-            let (pointer, event) = self
-                .load_receiver_original(
+            let (request, position, selected) = selection;
+            selected.authority.require_lineage(request.lineage)?;
+            let Some(pointer) = self
+                .load_receiver_pointer(
                     attempt,
                     (&request.receiver, position),
-                    (encoding.1, ReadProtection::Snapshot),
+                    ReadProtection::Snapshot,
                 )
-                .await?;
-            if pointer.lineage != request.lineage {
+                .await?
+            else {
+                return Ok(None);
+            };
+            if pointer.physical != selected.physical || pointer.lineage != request.lineage {
                 return Ok(None);
             }
+            let event = self
+                .load_pointer_original(attempt, &pointer, (encoding.1, ReadProtection::Snapshot))
+                .await?;
             if !self
-                .is_receiver_original_visible(attempt, authority, &event, encoding)
+                .is_receiver_original_visible(attempt, &selected.authority, &event, encoding)
                 .await?
                 || !request.selection.includes(&event)
             {
@@ -397,85 +419,5 @@ impl JournalStore {
         }
         .await;
         settlement.complete(result)
-    }
-
-    pub(in crate::journal) async fn load_receiver_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
-    >(
-        &self,
-        attempt: &mut A,
-        selection: (
-            &replication_types::identity::origin::OriginId,
-            DeliveryPosition,
-        ),
-        input: (&CanonicalJsonCodec, ReadProtection),
-    ) -> StorageResult<(CanonicalViewPointer, CanonicalEvent)> {
-        let mut settlement =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-        let attempt = settlement.as_mut();
-        let result = async {
-            let (receiver, position) = selection;
-            let (codec, protection) = input;
-            self.require_receiver_scope(receiver, position)?;
-            let key = self.canonical_view_key(receiver.journal_partition, position)?;
-            let row = self
-                .load_immutable_waves(attempt, std::slice::from_ref(&key), protection)
-                .await?
-                .pop()
-                .flatten()
-                .ok_or_else(corrupt_record)?;
-            let pointer = self.decode_receiver_pointer(&row)?;
-            if &pointer.receiver != receiver || pointer.position != position || row.key != key {
-                return Err(corrupt_record());
-            }
-            let (accepted, delivery) = self
-                .load_acceptance_with_delivery(attempt, &pointer.event, codec, protection)
-                .await?
-                .ok_or_else(corrupt_record)?;
-            if delivery != pointer || accepted.event.as_ref().digest != pointer.digest {
-                return Err(corrupt_record());
-            }
-            Ok((pointer, accepted.event))
-        }
-        .await;
-        settlement.complete(result)
-    }
-
-    pub(in crate::journal) fn decode_receiver_pointer(
-        &self,
-        row: &DurableRecord,
-    ) -> StorageResult<CanonicalViewPointer> {
-        let pointer: CanonicalViewPointer = self.records.decode(row)?;
-        self.require_receiver_scope(&pointer.receiver, pointer.position)?;
-        if row.revision != storage_types::Revision::INITIAL
-            || row.key
-                != self.canonical_view_key(pointer.receiver.journal_partition, pointer.position)?
-        {
-            return Err(corrupt_record());
-        }
-        Ok(pointer)
-    }
-
-    fn require_receiver_scope(
-        &self,
-        receiver: &replication_types::identity::origin::OriginId,
-        position: DeliveryPosition,
-    ) -> StorageResult<()> {
-        if position == DeliveryPosition::from(0)
-            || *receiver != self.origin(receiver.journal_partition)?
-        {
-            return Err(corrupt_record());
-        }
-        Ok(())
-    }
-
-    fn canonical_view_key(
-        &self,
-        partition: JournalPartition,
-        position: DeliveryPosition,
-    ) -> StorageResult<DurableRecordKey> {
-        let mut key: RecordAddress = self.identity_key(CANONICAL_VIEW_SUFFIX, &partition)?.into();
-        key.suffix.extend_from_slice(&position.bytes());
-        key.try_into()
     }
 }

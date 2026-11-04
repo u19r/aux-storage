@@ -28,24 +28,6 @@ pub struct CanonicalTableCut {
 }
 
 impl CanonicalTableCut {
-    pub(crate) fn overlaps_manifest(
-        &self,
-        manifest: &replication_types::event::interval::SourceIntervalManifest,
-    ) -> bool {
-        manifest.links.iter().any(|link| {
-            self.sources.iter().any(|cut| {
-                super::publication_scope::SourcePublicationScope::from(cut)
-                    == super::publication_scope::SourcePublicationScope::new(
-                        link.lineage,
-                        &manifest.origin,
-                        link.table,
-                    )
-                    && cut.after < link.position
-                    && link.position <= cut.through
-            })
-        })
-    }
-
     pub(crate) fn require_inventory(&self) -> StorageResult<()> {
         if self.sources.is_empty() {
             return Err(crate::native_record::corrupt_record());

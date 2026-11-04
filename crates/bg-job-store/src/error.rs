@@ -12,7 +12,6 @@ use storage_types::{StorageEnum, StorageError, context::WrappedError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduledJobStoreError {
     Contract(StoreContractError),
-    OperationReuseMismatch,
     Backend(StoreFailure),
 }
 
@@ -20,9 +19,6 @@ impl fmt::Display for ScheduledJobStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Contract(error) => error.fmt(formatter),
-            Self::OperationReuseMismatch => {
-                formatter.write_str("commit operation ID was reused with different content")
-            }
             Self::Backend(error) => error.fmt(formatter),
         }
     }
@@ -33,7 +29,6 @@ impl std::error::Error for ScheduledJobStoreError {
         match self {
             Self::Contract(error) => Some(error),
             Self::Backend(error) => Some(error),
-            Self::OperationReuseMismatch => None,
         }
     }
 }
@@ -47,7 +42,6 @@ impl From<StoreContractError> for ScheduledJobStoreError {
 impl From<RawOrderedJobStoreError> for ScheduledJobStoreError {
     fn from(error: RawOrderedJobStoreError) -> Self {
         match error {
-            RawOrderedJobStoreError::OperationReuseMismatch => Self::OperationReuseMismatch,
             RawOrderedJobStoreError::Timeout => Self::Backend(StoreFailure::Timeout),
             RawOrderedJobStoreError::Corrupt(field) => {
                 Self::Backend(StoreFailure::Corrupt(StoreDataError::Malformed(field)))

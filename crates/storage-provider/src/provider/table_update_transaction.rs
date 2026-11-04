@@ -1,15 +1,17 @@
 //! Complete table-update decisions within a caller-owned native transaction.
 
-use std::{borrow::Borrow, future::Future};
+use std::future::Future;
 
 use storage_common::GsiTableUpdatePlan;
 use storage_types::{
-    IndexName, StorageError, StorageResult, StoredTableInfo, TableDescription, TableName,
-    TableStatus, TimestampMillis, UpdateTableRequest, UpdateTableResponse,
+    BoundTableInfo, IndexName, StorageError, StorageResult, StoredTableInfo, TableDescription,
+    TableName, TableStatus, TimestampMillis, UpdateTableRequest, UpdateTableResponse,
 };
 
 use super::GsiReadinessSnapshot;
-use crate::{SemanticDecision, StreamTrimScope, StreamTrimState, StreamTrimStateWrite};
+use crate::{
+    RequestTableBindings, SemanticDecision, StreamTrimScope, StreamTrimState, StreamTrimStateWrite,
+};
 
 pub struct TableUpdateRetention {
     pub scope: StreamTrimScope,
@@ -53,7 +55,13 @@ impl TableUpdateChange {
         request: &UpdateTableRequest,
         observed_at: TimestampMillis,
     ) -> StorageResult<Self> {
-        if current.table_status != TableStatus::Active {
+        let is_cancellation = current.table_status == TableStatus::Updating
+            && current.has_public_stream_request()
+            && request
+                .stream_specification
+                .as_ref()
+                .is_some_and(|spec| !spec.stream_enabled);
+        if current.table_status != TableStatus::Active && !is_cancellation {
             return Err(StorageError::validation("table must be ACTIVE to update"));
         }
         let mut table = GsiTableUpdatePlan::try_new(current, request)?;
@@ -63,9 +71,7 @@ impl TableUpdateChange {
         {
             table.next_table.max_indexers = capacity;
         }
-        if let Some(specification) = &request.stream_specification {
-            table.next_table.stream_specification = Some(specification.clone());
-        }
+        Self::configure_stream(&mut table, current, request)?;
         if let Some(enabled) = request.deletion_protection_enabled {
             table.next_table.deletion_protection_enabled = enabled;
         }
@@ -74,6 +80,88 @@ impl TableUpdateChange {
             retention: None,
             name_locked_until: crate::name_locked_until(observed_at),
         })
+    }
+
+    fn configure_stream(
+        table: &mut GsiTableUpdatePlan,
+        current: &StoredTableInfo,
+        request: &UpdateTableRequest,
+    ) -> StorageResult<()> {
+        if let Some(specification) = &request.stream_specification {
+            table.next_table.stream_specification = Some(specification.clone());
+            table.next_table.table_status = match (
+                specification.stream_enabled,
+                current.has_public_stream_request(),
+            ) {
+                (true, false) => TableStatus::Updating,
+                (false, _) => TableStatus::Active,
+                _ => current.table_status.clone(),
+            };
+        }
+        if let Some(storage_common::GsiLifecycleAction::Create(create)) = &table.lifecycle
+            && !table.next_table.has_public_stream_request()
+        {
+            let index = table
+                .next_table
+                .global_secondary_indexes
+                .as_mut()
+                .and_then(|indexes| {
+                    indexes
+                        .iter_mut()
+                        .find(|index| index.index_name == create.index_name)
+                })
+                .ok_or_else(|| StorageError::internal("Created GSI is missing from its catalog"))?;
+            index.capture_for_build = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_stream_initialization(current: &StoredTableInfo) -> Self {
+        let mut next_table = current.clone();
+        next_table.table_status = TableStatus::Active;
+        for index in next_table.global_secondary_indexes.iter_mut().flatten() {
+            index.capture_for_build = false;
+        }
+        Self {
+            table: GsiTableUpdatePlan {
+                next_table,
+                lifecycle: None,
+                attribute_definitions_changed: false,
+            },
+            retention: None,
+            name_locked_until: current.created_at,
+        }
+    }
+
+    pub(crate) fn release_gsi_capture(current: &StoredTableInfo, name: &IndexName) -> Option<Self> {
+        if !current
+            .global_secondary_indexes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|index| index.index_name == *name && index.capture_for_build)
+        {
+            return None;
+        }
+        let mut next_table = current.clone();
+        for index in next_table.global_secondary_indexes.iter_mut().flatten() {
+            if index.index_name == *name {
+                index.capture_for_build = false;
+            }
+        }
+        Some(Self {
+            table: GsiTableUpdatePlan {
+                next_table,
+                lifecycle: None,
+                attribute_definitions_changed: false,
+            },
+            retention: None,
+            name_locked_until: current.created_at,
+        })
+    }
+
+    pub(crate) fn is_capture_stop(&self, current: &StoredTableInfo) -> bool {
+        current.requires_stream_entry() && !self.table.next_table.requires_stream_entry()
     }
 
     pub(crate) fn for_ttl_policy(
@@ -137,32 +225,38 @@ impl TableUpdateChange {
         observation: TableUpdateRetention,
         captured_at: TimestampMillis,
     ) -> StorageResult<()> {
-        let table = &mut self.table.next_table;
+        self.table.next_table.table_stream_duration = request
+            .aux_stream_duration_hours
+            .unwrap_or(self.table.next_table.table_stream_duration);
+        self.refresh_retention(observation, captured_at)
+    }
+
+    pub(crate) fn refresh_retention(
+        &mut self,
+        observation: TableUpdateRetention,
+        captured_at: TimestampMillis,
+    ) -> StorageResult<()> {
+        let table = &self.table.next_table;
         let generation = StreamTrimState::next_policy_version(observation.state.as_ref())?;
-        (
-            table.table_stream_duration,
-            table.default_item_stream_duration,
-        ) = crate::merge_table_stream_duration_request(
-            table.table_stream_duration,
-            table.default_item_stream_duration,
-            request.aux_stream_duration_hours,
-            request.aux_default_item_stream_duration_hours,
-        );
+        let mut frontier = observation
+            .state
+            .as_ref()
+            .ok_or_else(|| StorageError::internal("Table retention state is missing"))?
+            .frontier
+            .clone();
+        frontier.table_policy_version = std::num::NonZeroU64::new(generation)
+            .ok_or_else(|| StorageError::internal("Invalid table policy generation"))?;
         let plan = crate::plan_table_stream_duration(
-            table.table_name.clone(),
-            observation.scope.scope_id,
-            generation,
+            observation.scope,
+            frontier,
             table.table_stream_duration,
-            table.default_item_stream_duration,
             captured_at,
-        );
-        self.retention = Some(
-            StreamTrimStateWrite {
-                state: plan.trim_state,
-                next_marker: plan.due_marker,
-            }
-            .preserve_existing_history(observation.state.as_ref())?,
-        );
+        )?;
+        let mut plan = plan.preserve_existing_history(observation.state.as_ref())?;
+        if !table.requires_stream_entry() {
+            plan.schedule_item_history_sweep(captured_at);
+        }
+        self.retention = Some(plan);
         Ok(())
     }
 
@@ -187,41 +281,40 @@ impl TableUpdateChange {
 pub trait TableUpdateTransaction:
     infrastructure_provider::physical_attempt::PhysicalRecordAttempt
 {
-    type Catalog: Borrow<StoredTableInfo> + Send + Sync;
-
     fn observe_table_update(
         &mut self,
         table: &TableName,
-    ) -> impl Future<Output = StorageResult<Option<Self::Catalog>>> + Send;
+    ) -> impl Future<Output = StorageResult<Option<BoundTableInfo>>> + Send;
 
     fn observe_table_retention(
         &mut self,
-        catalog: &Self::Catalog,
+        catalog: &BoundTableInfo,
     ) -> impl Future<Output = StorageResult<TableUpdateRetention>> + Send;
 
     /// Read the physical name reservation within this update's native attempt.
     fn load_index_name_lock(
         &mut self,
-        catalog: &Self::Catalog,
+        catalog: &BoundTableInfo,
         name: &IndexName,
     ) -> impl Future<Output = StorageResult<Option<TimestampMillis>>> + Send;
 
     fn persist_table_update(
         &mut self,
-        catalog: Self::Catalog,
+        catalog: BoundTableInfo,
         change: TableUpdateChange,
-    ) -> impl Future<Output = StorageResult<Self::Catalog>> + Send;
+    ) -> impl Future<Output = StorageResult<BoundTableInfo>> + Send;
 
     fn observe_table_update_readiness(
         &mut self,
-        catalog: &Self::Catalog,
+        catalog: &BoundTableInfo,
     ) -> impl Future<Output = StorageResult<GsiReadinessSnapshot>> + Send;
 
     fn prepare_table_update(
         &mut self,
         request: &UpdateTableRequest,
         time: TableUpdateTime,
-    ) -> impl Future<Output = StorageResult<SemanticDecision<(Self::Catalog, TableUpdateChange)>>> + Send
+        bindings: &RequestTableBindings,
+    ) -> impl Future<Output = StorageResult<SemanticDecision<(BoundTableInfo, TableUpdateChange)>>> + Send
     {
         async move {
             if let Err(error) = require_native_metadata_request(request) {
@@ -232,12 +325,44 @@ pub trait TableUpdateTransaction:
                     &request.table_name,
                 )));
             };
+            bindings.observe(&request.table_name, catalog.history_id)?;
             let mut change =
-                match TableUpdateChange::try_new(catalog.borrow(), request, time.observed_at) {
+                match TableUpdateChange::try_new(&catalog.info, request, time.observed_at) {
                     Ok(change) => change,
                     Err(error) => return Ok(SemanticDecision::Rejected(error)),
                 };
-            if crate::maintenance::update_table_request_has_custom_stream_duration(request) {
+            if catalog.info.has_public_stream_request()
+                && request
+                    .stream_specification
+                    .as_ref()
+                    .is_some_and(|spec| !spec.stream_enabled)
+            {
+                let names = change
+                    .table
+                    .next_table
+                    .global_secondary_indexes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|index| !index.index_name.is_ttl_index() && !index.capture_for_build)
+                    .map(|index| index.index_name.clone())
+                    .collect::<Vec<_>>();
+                let readiness = self
+                    .observe_table_update_readiness(&catalog)
+                    .await?
+                    .select(&names)?;
+                if readiness.iter().any(|(_, state)| {
+                    state.backfilling
+                        || !matches!(state.index_status, storage_types::IndexStatus::Active)
+                }) {
+                    return Ok(SemanticDecision::Rejected(StorageError::validation(
+                        "A GSI build still requires the table stream",
+                    )));
+                }
+            }
+            if crate::maintenance::update_table_request_has_custom_stream_duration(request)
+                || change.is_capture_stop(&catalog.info)
+            {
                 let retention = self.observe_table_retention(&catalog).await?;
                 change.replace_retention(request, retention, time.captured_at)?;
             }
@@ -259,15 +384,16 @@ pub trait TableUpdateTransaction:
         &mut self,
         request: &UpdateTableRequest,
         captured_at: TimestampMillis,
-    ) -> impl Future<Output = StorageResult<SemanticDecision<(Self::Catalog, UpdateTableResponse)>>> + Send
-    {
+        bindings: &RequestTableBindings,
+    ) -> impl Future<Output = StorageResult<SemanticDecision<(BoundTableInfo, UpdateTableResponse)>>>
+    + Send {
         async move {
             let mut settlement =
                 infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
             let attempt = settlement.as_mut();
             let result = async {
                 let (catalog, change) = match attempt
-                    .prepare_table_update(request, captured_at.into())
+                    .prepare_table_update(request, captured_at.into(), bindings)
                     .await?
                 {
                     SemanticDecision::Accepted(prepared) => prepared,
@@ -275,7 +401,14 @@ pub trait TableUpdateTransaction:
                         return Ok(SemanticDecision::Rejected(error));
                     }
                 };
+                let was_disabled = !catalog.info.has_public_stream_request();
                 let updated = attempt.persist_table_update(catalog, change).await?;
+                if was_disabled && updated.info.has_public_stream_request() {
+                    crate::table_stream_initialization::record::register_initialization(
+                        attempt, &updated,
+                    )
+                    .await?;
+                }
                 let response = describe_updated_table(attempt, &updated).await?;
                 Ok(SemanticDecision::Accepted((updated, response)))
             }
@@ -307,9 +440,9 @@ fn require_native_metadata_request(request: &UpdateTableRequest) -> StorageResul
 
 async fn describe_updated_table<A: TableUpdateTransaction + ?Sized>(
     attempt: &mut A,
-    catalog: &A::Catalog,
+    catalog: &BoundTableInfo,
 ) -> StorageResult<UpdateTableResponse> {
-    let table = catalog.borrow();
+    let table = &catalog.info;
     let readiness = if table
         .global_secondary_indexes
         .as_deref()
@@ -321,7 +454,7 @@ async fn describe_updated_table<A: TableUpdateTransaction + ?Sized>(
         attempt.observe_table_update_readiness(catalog).await?
     };
     let mut table_description =
-        TableDescription::from_stored_table_info(table.clone(), TableStatus::Active);
+        TableDescription::from_bound_table_info(catalog.clone(), table.table_status.clone());
     readiness.apply_to_description(&mut table_description)?;
     Ok(UpdateTableResponse { table_description })
 }

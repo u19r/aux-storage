@@ -1,7 +1,7 @@
 pub(crate) const DURABLE_RECORD_MAGIC: [u8; 4] = *b"ARPL";
 pub(crate) const DURABLE_RECORD_VERSION: u16 = 1;
 pub(crate) const DURABLE_HEADER_BYTES: usize = 38;
-pub const CANONICAL_EVENT_SEMANTIC_VERSION: u32 = 8;
+pub const CANONICAL_EVENT_SEMANTIC_VERSION: u32 = 9;
 pub(crate) const NATIVE_WINNER_FORMAT: u8 = 3;
 pub(crate) const TRANSPORT_SEMANTIC_FRAME_MULTIPLIER: usize = 4;
 pub(crate) const TRANSPORT_CLASS_WIRE_MULTIPLIER: usize = 36;

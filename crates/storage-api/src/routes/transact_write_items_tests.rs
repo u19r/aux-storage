@@ -1,5 +1,4 @@
 use serde_json::json;
-use storage::DatabaseManager;
 use storage_types::{AttributeValue, TableName, TransactWriteItemsRequest};
 
 use crate::{
@@ -235,83 +234,6 @@ async fn transact_write_items_put_operations() {
 }
 
 #[tokio::test]
-async fn transact_write_items_accepts_aux_item_stream_ttl_without_storing_attribute() {
-    for_each_conformance_backend(|_backend, db| async move {
-        handle_create_table(
-            db.clone(),
-            json!({
-                "TableName": "TxnRouteDuration",
-                "AttributeDefinitions": [
-                    {"AttributeName": "id", "AttributeType": "S"}
-                ],
-                "KeySchema": [
-                    {"AttributeName": "id", "KeyType": "HASH"}
-                ]
-            })
-            .try_into()
-            .expect("create table request"),
-        )
-        .await
-        .expect("create table");
-
-        handle_transact_write_items(
-            db.clone(),
-            json!({
-                "TransactItems": [
-                    {
-                        "Put": {
-                            "TableName": "TxnRouteDuration",
-                            "Item": {
-                                "id": {"S": "put-item"},
-                                "data": {"S": "created"}
-                            },
-                            "AuxItemStreamTtlHours": 120
-                        }
-                    },
-                    {
-                        "Update": {
-                            "TableName": "TxnRouteDuration",
-                            "Key": {"id": {"S": "update-item"}},
-                            "UpdateExpression": "SET #data = :data",
-                            "ExpressionAttributeNames": {"#data": "data"},
-                            "ExpressionAttributeValues": {
-                                ":data": {"S": "updated"}
-                            },
-                            "AuxItemStreamTtlHours": -1
-                        }
-                    }
-                ]
-            })
-            .try_into()
-            .expect("transact write items request"),
-        )
-        .await
-        .expect("transaction with custom item stream ttl");
-
-        let put_item = get_txn_route_item(db.clone(), "put-item").await;
-        assert_eq!(
-            put_item.get("data"),
-            Some(&AttributeValue::S("created".to_string()))
-        );
-        assert!(
-            !put_item.contains_key("AuxItemStreamTtlHours"),
-            "transact put aux ttl is request metadata, not item data"
-        );
-
-        let update_item = get_txn_route_item(db, "update-item").await;
-        assert_eq!(
-            update_item.get("data"),
-            Some(&AttributeValue::S("updated".to_string()))
-        );
-        assert!(
-            !update_item.contains_key("AuxItemStreamTtlHours"),
-            "transact update aux ttl is request metadata, not item data"
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn transact_write_condition_failure_returns_all_old_item_when_requested() {
     for_each_conformance_backend(|_backend, db| async move {
         handle_create_table(
@@ -341,7 +263,6 @@ async fn transact_write_condition_failure_returns_all_old_item_when_requested() 
                 expression_attribute_values: None,
                 return_values: None,
                 return_old_on_condition_failure: false,
-                aux_item_stream_ttl_hours: None,
             },
         )
         .await
@@ -412,7 +333,6 @@ async fn competing_transaction_writes_return_the_atomic_winner_as_all_old() {
                 expression_attribute_values: None,
                 return_values: None,
                 return_old_on_condition_failure: false,
-                aux_item_stream_ttl_hours: None,
             },
         )
         .await
@@ -469,17 +389,4 @@ async fn competing_transaction_writes_return_the_atomic_winner_as_all_old() {
         );
     })
     .await;
-}
-
-async fn get_txn_route_item(
-    db: std::sync::Arc<DatabaseManager>,
-    id: &str,
-) -> storage_types::AttributeMap {
-    db.get_item_decode::<_, storage_types::AttributeMap>(
-        TableName::new("TxnRouteDuration"),
-        std::collections::HashMap::from([("id".to_string(), AttributeValue::S(id.to_string()))]),
-    )
-    .await
-    .expect("get transaction item")
-    .unwrap_or_else(|| panic!("expected transaction item {id}"))
 }

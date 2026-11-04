@@ -100,7 +100,7 @@ async fn given_committed_job_when_store_reopens_then_receipt_and_effect_persist(
         let transaction = job_transaction(operation_id, key.clone(), b"v-reopen")?;
         let outcome = fixture
             .scheduled_job_store
-            .commit(&transaction)
+            .transact(&transaction)
             .await
             .map_err(|err| anyhow::anyhow!("pre-reopen commit: {err:?}"))?;
         anyhow::ensure!(
@@ -122,7 +122,7 @@ async fn given_committed_job_when_store_reopens_then_receipt_and_effect_persist(
         let transaction = job_transaction(operation_id, key.clone(), b"v-reopen")?;
         let replayed = reopened
             .scheduled_job_store
-            .commit(&transaction)
+            .transact(&transaction)
             .await
             .map_err(|err| anyhow::anyhow!("post-reopen replay: {err:?}"))?;
         anyhow::ensure!(
@@ -224,7 +224,11 @@ async fn verify_complete_update(fixture: &TestStore) -> anyhow::Result<()> {
         "complete-table-update",
     ));
     create.max_indexers = MaxIndexers::try_new(1)?;
-    create.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(1));
+    create.aux_stream_duration_hours = Some(StreamRetentionDuration::from_hours(24).unwrap());
+    create.stream_specification = Some(storage_types::StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+    });
     fixture.operations.create_table(create.clone()).await?;
     let response = fixture
         .operations
@@ -232,7 +236,7 @@ async fn verify_complete_update(fixture: &TestStore) -> anyhow::Result<()> {
             "TableName": create.table_name,
             "MaxIndexers": 3,
             "DeletionProtectionEnabled": true,
-            "AuxStreamDurationHours": 7,
+            "AuxStreamDurationHours": 48,
             "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
             "GlobalSecondaryIndexUpdates": [{"Create": {
                 "IndexName": "new-index",
@@ -267,7 +271,9 @@ async fn verify_committed_update(fixture: &TestStore) -> anyhow::Result<()> {
     let table = storage_types::TableName::new("complete-table-update");
     let metadata = fixture.operations.get_table_info(table.clone()).await?;
     anyhow::ensure!(metadata.max_indexers.get() == 3 && metadata.deletion_protection_enabled);
-    anyhow::ensure!(metadata.table_stream_duration == StreamRetentionDuration::FiniteHours(7));
+    anyhow::ensure!(
+        metadata.table_stream_duration == StreamRetentionDuration::from_hours(48).unwrap()
+    );
     anyhow::ensure!(
         metadata
             .stream_specification
@@ -282,7 +288,7 @@ async fn verify_committed_update(fixture: &TestStore) -> anyhow::Result<()> {
     );
     let markers = fixture
         .stream_retention_repository
-        .list_due_stream_trim_markers(TimestampMillis::now() + 8 * 60 * 60 * 1000, 100)
+        .list_due_stream_trim_markers(TimestampMillis::now() + 49 * 60 * 60 * 1000, 100)
         .await?;
     let marker = markers
         .iter()
@@ -304,7 +310,9 @@ async fn verify_deleted_index(fixture: &TestStore) -> anyhow::Result<()> {
     let table = storage_types::TableName::new("complete-table-update");
     let metadata = fixture.operations.get_table_info(table.clone()).await?;
     anyhow::ensure!(metadata.max_indexers.get() == 4 && !metadata.deletion_protection_enabled);
-    anyhow::ensure!(metadata.table_stream_duration == StreamRetentionDuration::FiniteHours(9));
+    anyhow::ensure!(
+        metadata.table_stream_duration == StreamRetentionDuration::from_hours(72).unwrap()
+    );
     anyhow::ensure!(
         metadata
             .stream_specification
@@ -320,7 +328,7 @@ async fn verify_deleted_index(fixture: &TestStore) -> anyhow::Result<()> {
     );
     let markers = fixture
         .stream_retention_repository
-        .list_due_stream_trim_markers(TimestampMillis::now() + 10 * 60 * 60 * 1000, 100)
+        .list_due_stream_trim_markers(TimestampMillis::now() + 73 * 60 * 60 * 1000, 100)
         .await?;
     let marker = markers
         .iter()
@@ -364,7 +372,7 @@ async fn given_existing_gsi_when_combined_delete_commits_then_settings_and_delet
                 "TableName": "complete-table-update",
                 "MaxIndexers": 4,
                 "DeletionProtectionEnabled": false,
-                "AuxStreamDurationHours": 9,
+                "AuxStreamDurationHours": 72,
                 "StreamSpecification": {"StreamEnabled": false},
                 "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "new-index"}}]
             }))?)

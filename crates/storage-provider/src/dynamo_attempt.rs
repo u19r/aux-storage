@@ -18,7 +18,7 @@ pub trait DynamoAttempt:
     + UpdateTimeToLiveAttempt
     + DynamoTableStreamAttempt
     + PreparedWriteAttempt
-    + crate::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>
+    + crate::TableUpdateTransaction
 {
 }
 
@@ -32,6 +32,6 @@ impl<A> DynamoAttempt for A where A: CreateTableAttempt
         + UpdateTimeToLiveAttempt
         + DynamoTableStreamAttempt
         + PreparedWriteAttempt
-        + crate::TableUpdateTransaction<Catalog = storage_types::BoundTableInfo>
+        + crate::TableUpdateTransaction
 {
 }

@@ -90,13 +90,13 @@ impl ScheduledJobStore {
         validate_range_page(&request, page, capabilities)
     }
 
-    pub async fn commit(
+    pub async fn transact(
         &self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, ScheduledJobStoreError> {
         self.capabilities().validate_transaction(transaction)?;
         self.raw
-            .commit(transaction)
+            .transact(transaction)
             .await
             .map_err(ScheduledJobStoreError::from)
     }
@@ -130,11 +130,11 @@ impl JobStore for ScheduledJobStore {
         ScheduledJobStore::read_range(self, request)
     }
 
-    fn commit<'a>(
+    fn transact<'a>(
         &'a self,
         transaction: &'a StoreTransaction,
     ) -> impl Future<Output = Result<CommitOutcome, Self::Error>> + Send + 'a {
-        ScheduledJobStore::commit(self, transaction)
+        ScheduledJobStore::transact(self, transaction)
     }
 }
 

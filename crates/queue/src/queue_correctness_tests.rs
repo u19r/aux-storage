@@ -251,6 +251,7 @@ async fn run_stale_receipt_does_not_delete_current_claim(
     assert_eq!(still_present[0].message_id, sent_id);
 }
 
+#[cfg(any(feature = "foundationdb", feature = "postgres"))]
 async fn run_node_leave_join_preserves_messages(case: &BackendCase) {
     let first_manager = required_manager_for_case(case).await;
     let queue_url = create_queue(

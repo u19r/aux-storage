@@ -31,7 +31,6 @@ pub(super) fn table() -> BoundTableInfo {
             item_count: 0,
             stream_specification: None,
             table_stream_duration: Default::default(),
-            default_item_stream_duration: Default::default(),
             deletion_protection_enabled: false,
         }),
     }
@@ -64,6 +63,7 @@ fn given_a_physical_primary_key_when_range_image_disagrees_then_content_is_rejec
         indexes: Vec::new(),
         index_id_high_water: 0,
         deleted: false,
+        external_cleanup_required: false,
     };
     let physical = super::key_layout::physical_item_key(&identity, &table, &bound, &key).unwrap();
     let valid = WireItem::dynamo_json(br#"{"pk":{"S":"owned"}}"#.to_vec());

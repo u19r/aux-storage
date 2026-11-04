@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bg-job-store = { path = "../bg-job-store" }
+bytes = { workspace = true }
 futures = { workspace = true }
 http-error = { path = "../http-error" }
 kv-backend = { path = "../kv-backend", optional = true, default-features = false }

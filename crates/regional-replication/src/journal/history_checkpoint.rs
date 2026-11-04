@@ -24,19 +24,20 @@ use crate::{
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckpointRecord {
-    operation: CanonicalCheckpointId,
+pub(super) struct CheckpointRecord {
+    pub(super) operation: CanonicalCheckpointId,
     creation: CheckpointCreation,
-    scope: CanonicalViewCursor,
-    physical: storage_types::TableHistoryId,
+    pub(super) scope: CanonicalViewCursor,
+    pub(super) physical: storage_types::TableHistoryId,
     visibility: super::public_trim_authority::CapturedPublicTrimAuthority,
-    high: DeliveryPosition,
+    pub(super) high: DeliveryPosition,
     #[serde(with = "super::checkpoint_state")]
-    state: CanonicalCheckpointState,
-    retention: crate::history::retention::CheckpointRetention,
+    pub(super) state: CanonicalCheckpointState,
+    pub(super) retention: crate::history::retention::CheckpointRetention,
 }
 
 pub(in crate::journal) struct ReceiverCheckpointBounds {
+    pub(in crate::journal) physical: storage_types::TableHistoryId,
     pub(in crate::journal) scope: CanonicalViewCursor,
     pub(in crate::journal) high: DeliveryPosition,
     pub(in crate::journal) authority: super::public_trim_authority::PublicTrimAuthority,
@@ -152,7 +153,7 @@ impl JournalStore {
         if reference.kind != ReaderHoldKind::Receiver {
             return Err(corrupt_record());
         }
-        let checkpoint = self.decode_receiver_checkpoint(row, reference.operation)?;
+        let checkpoint = self.decode_receiver_checkpoint(row)?;
         let range = checkpoint.scope.retained_partition(checkpoint.high)?;
         if range.lineage != reference.lineage {
             return Err(corrupt_record());
@@ -161,7 +162,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn change_canonical_checkpoint<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -277,7 +278,7 @@ impl JournalStore {
     }
 
     async fn prepare_canonical_checkpoint<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -304,12 +305,8 @@ impl JournalStore {
             )
             .await?;
         if high != DeliveryPosition::from(0) {
-            self.load_view_record(
-                attempt,
-                (&request.view, high, &selected.authority),
-                encoding,
-            )
-            .await?;
+            self.load_view_record(attempt, (&request.view, high, &selected), encoding)
+                .await?;
         }
         self.require_reservation_admission(
             attempt,
@@ -408,6 +405,7 @@ impl JournalStore {
             let current = current.ok_or_else(corrupt_record)?;
             current.require_incarnation(incarnation)?;
             Ok(Some(ReceiverCheckpointBounds {
+                physical: checkpoint.physical,
                 scope: checkpoint
                     .scope
                     .checkpoint_continuation(0u64.into(), operation),
@@ -443,26 +441,30 @@ impl JournalStore {
         request: &CanonicalViewRequest,
         operation: CanonicalCheckpointId,
     ) -> StorageResult<CheckpointRecord> {
-        let checkpoint = self.decode_receiver_checkpoint(row, operation)?;
+        let checkpoint = self.decode_receiver_checkpoint(row)?;
+        if checkpoint.operation != operation {
+            return Err(corrupt_record());
+        }
         checkpoint.scope.require_checkpoint_selection(request)?;
         Ok(checkpoint)
     }
 
-    fn decode_receiver_checkpoint(
+    pub(super) fn decode_receiver_checkpoint(
         &self,
         row: &infrastructure_provider::record::DurableRecord,
-        operation: CanonicalCheckpointId,
     ) -> StorageResult<CheckpointRecord> {
         let checkpoint: CheckpointRecord = self.records.decode(row)?;
-        if checkpoint.operation != operation
-            || row.key
-                != self.identity_key(crate::constants::CANONICAL_CHECKPOINT_SUFFIX, &operation)?
+        if row.key
+            != self.identity_key(
+                crate::constants::CANONICAL_CHECKPOINT_SUFFIX,
+                &checkpoint.operation,
+            )?
         {
             return Err(corrupt_record());
         }
         checkpoint
             .creation
-            .require_distinct(operation)
+            .require_distinct(checkpoint.operation)
             .map_err(|_| corrupt_record())?;
         let range = checkpoint.scope.retained_partition(checkpoint.high)?;
         checkpoint.visibility.require_checkpoint_binding(
@@ -500,7 +502,7 @@ impl JournalStore {
             .pop()
             .flatten()
             .ok_or_else(|| StorageError::from(storage_types::StorageEnum::HistoryUnavailable))?;
-        let mut checkpoint = self.decode_receiver_checkpoint(&row, previous)?;
+        let mut checkpoint = self.decode_receiver_checkpoint(&row)?;
         checkpoint.scope.require_rollover_target(&request.view)?;
         let range = checkpoint.scope.retained_partition(checkpoint.high)?;
         if checkpoint.state == CanonicalCheckpointState::Held {

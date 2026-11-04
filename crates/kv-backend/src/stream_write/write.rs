@@ -3,10 +3,7 @@
 use storage_types::{StorageError, StorageResult, StreamItemId, storage_serde};
 use stream_provider::{DynamoStreamWritePlan, StreamItem, StreamRowValue};
 
-use super::{
-    key_layout::{effect_key, item_row_key, pointer_owner_key, pointer_reference_key, record_key},
-    record::KvSystemStreamRecord,
-};
+use super::key_layout::{item_row_key, record_key};
 use crate::{KvAttempt, KvMutation};
 
 pub(crate) async fn append_attempt_allocated_user_item<A: KvAttempt>(
@@ -46,77 +43,50 @@ pub(crate) fn append_versionstamped_user_item<A: KvAttempt>(
 pub(crate) fn dynamo_stream_mutations(
     plan: DynamoStreamWritePlan,
 ) -> StorageResult<Vec<KvMutation>> {
-    let DynamoStreamWritePlan {
-        rows,
-        pointer_references,
-        record,
-        receipt,
-    } = plan;
-    if record.position != receipt.position {
-        return Err(storage_types::StorageError::internal(
-            "KV SystemStream record differs from its pointer position",
-        ));
-    }
-    let mut changes = Vec::with_capacity(9);
-    for row in rows {
-        let key = item_row_key(row.value())?;
+    let mut changes = Vec::with_capacity(4);
+    for row in plan.rows {
         changes.push(KvMutation::Put {
-            key,
+            key: item_row_key(row.value())?,
             value: StreamRowValue::from_planned(row)?.to_bytes()?,
         });
     }
-    for reference in pointer_references {
-        let reverse_key = pointer_reference_key(&reference)?;
-        changes.push(KvMutation::Put {
-            key: pointer_owner_key(&reference.owner_stream, reference.owner_item_id)?,
-            value: reverse_key.clone(),
-        });
-        changes.push(KvMutation::Put {
-            key: reverse_key,
-            value: Vec::new(),
-        });
-    }
+    let history = plan
+        .record
+        .table_history_id()
+        .ok_or_else(|| StorageError::internal("New system history has no target"))?;
     changes.push(KvMutation::Put {
-        key: record_key(&receipt.position)?,
-        value: KvSystemStreamRecord {
-            pointer_item_id: receipt.pointer_item_id,
-            effect_id: receipt.effect_id.as_str().to_owned(),
-            created_at: receipt.created_at,
-            record,
-        }
-        .encode()?,
+        key: super::key_layout::table_record_key(history, plan.record.position())?,
+        value: Vec::new(),
     });
     changes.push(KvMutation::Put {
-        key: effect_key(receipt.effect_id.as_str()),
-        value: storage_serde::to_bytes(&receipt)?,
+        key: record_key(plan.record.position())?,
+        value: storage_serde::to_bytes(&plan.record)?,
     });
     Ok(changes)
 }
 
-/// Commit-addressed rows use the existing ID-free payload codec. Only the
-/// receipt needs a stamped value because its lookup key is an effect digest.
 pub(crate) fn stage_commit_ordered_dynamo<A: KvAttempt>(
     attempt: &mut A,
     plan: DynamoStreamWritePlan,
 ) -> StorageResult<()> {
-    let stamp = plan
-        .record
-        .position
+    let position = plan.record.position();
+    let stamp = position
         .offset()
         .versionstamp()
         .ok_or_else(|| StorageError::internal("Missing pending native position"))?;
     let ordinal = [stamp[10], stamp[11]];
     let high_key = crate::stream_history::segmented_key(
         crate::constants::SYSTEM_STREAM_SEQUENCE_PREFIX,
-        plan.record.position.shard_id().as_str(),
+        position.shard_id().as_str(),
     )?;
     attempt.stage_versionstamped_value(high_key, stamp.to_vec(), 0)?;
-    let mut changes = Vec::new();
     for (index, row) in plan.rows.into_iter().enumerate() {
         let key = item_row_key(row.value())?;
-        let value = StreamRowValue::from_planned(row)?.to_bytes()?;
+        let row = StreamRowValue::from_planned(row)?;
+        let offset = row.payload_offset()? + storage_types::ItemHistoryRecord::VERSIONSTAMP_OFFSET;
+        let value = row.to_bytes()?;
         if index == 0 {
-            changes.push(KvMutation::Put { key, value });
+            attempt.stage_versionstamped_value(key, value, offset)?;
         } else {
             attempt.stage_versionstamped_puts(vec![(
                 key[..key.len() - 12].to_vec(),
@@ -125,40 +95,17 @@ pub(crate) fn stage_commit_ordered_dynamo<A: KvAttempt>(
             )])?;
         }
     }
-    for reference in plan.pointer_references {
-        stage_commit_ordered_reference(attempt, &reference, ordinal)?;
-    }
-    let key = super::key_layout::record_prefix(&plan.record.position);
-    let record = KvSystemStreamRecord {
-        pointer_item_id: plan.receipt.pointer_item_id,
-        effect_id: plan.receipt.effect_id.as_str().to_owned(),
-        created_at: plan.receipt.created_at,
-        record: plan.record,
-    };
-    attempt.stage_versionstamped_puts(vec![(key, ordinal, record.encode()?)])?;
-    let key = effect_key(plan.receipt.effect_id.as_str());
-    let mut value = b"\0vs/".to_vec();
-    value.extend_from_slice(&stamp);
-    value.extend_from_slice(&storage_serde::to_bytes(&plan.receipt)?);
-    attempt.stage_versionstamped_value(key, value, 4)?;
-    attempt.stage(changes)
-}
-
-fn stage_commit_ordered_reference<A: KvAttempt>(
-    attempt: &mut A,
-    reference: &stream_provider::StreamPointerReference,
-    ordinal: [u8; 2],
-) -> StorageResult<()> {
-    let reverse_key = pointer_reference_key(reference)?;
-    let owner_key = pointer_owner_key(&reference.owner_stream, reference.owner_item_id)?;
-    attempt.stage_versionstamped_puts(vec![(
-        owner_key[..owner_key.len() - 12].to_vec(),
-        ordinal,
-        reverse_key.clone(),
-    )])?;
-    attempt.stage_versionstamped_puts(vec![(
-        reverse_key[..reverse_key.len() - 12].to_vec(),
-        ordinal,
-        Vec::new(),
-    )])
+    let history = plan
+        .record
+        .table_history_id()
+        .ok_or_else(|| StorageError::internal("New system history has no target"))?;
+    let index = super::key_layout::table_record_key(history, position)?;
+    attempt.stage_versionstamped_puts(vec![
+        (
+            super::key_layout::record_prefix(position),
+            ordinal,
+            storage_serde::to_bytes(&plan.record)?,
+        ),
+        (index[..index.len() - 12].to_vec(), ordinal, Vec::new()),
+    ])
 }

@@ -49,26 +49,6 @@ impl TableAtomicityWorkload {
             .ok()
     }
 
-    pub(crate) fn item_stream_ttl_for_key(&self, key: &str) -> Option<StreamRetentionDuration> {
-        self.owned_key_index(key)
-            .is_some()
-            .then_some(StreamRetentionDuration::FiniteHours(ITEM_STREAM_TTL_HOURS))
-    }
-
-    pub(crate) fn item_trim_scope(&self, key: &str) -> Option<TrimScopeExpectation> {
-        self.item_stream_ttl_for_key(key)?;
-        let table = self
-            .table_binding
-            .as_ref()
-            .expect("start captured the table binding");
-        let address =
-            stream_provider::dynamo_item_history_address(table, &self.key_attributes(key))
-                .expect("workload keys match the captured table schema");
-        Some(TrimScopeExpectation::item(
-            storage_provider::item_retention_scope_id(&address),
-        ))
-    }
-
     pub(crate) fn gsi_projection(&self, key: &str, value: &str) -> Option<(String, String)> {
         let key_index = self.owned_key_index(key)?;
         Some((

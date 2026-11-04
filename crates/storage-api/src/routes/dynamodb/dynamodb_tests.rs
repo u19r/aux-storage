@@ -1383,7 +1383,7 @@ async fn execute_dynamodb_json(
         })
 }
 
-async fn execute_dynamodb_json_body(
+pub(super) async fn execute_dynamodb_json_body(
     app_state: Arc<AppState>,
     target: &'static str,
     payload: serde_json::Value,

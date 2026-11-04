@@ -178,7 +178,7 @@ impl NativeSettlementStore {
         ready.send(()).expect("second settlement remains active");
         release.await.expect("second settlement releases first");
 
-        let outcome = self.inner.commit(transaction).await?;
+        let outcome = self.inner.transact(transaction).await?;
         self.record_first_outcome(outcome).await?;
         Ok(outcome)
     }
@@ -192,7 +192,7 @@ impl NativeSettlementStore {
         ready
             .await
             .expect("first settlement records its transaction");
-        let outcome = self.inner.commit(transaction).await?;
+        let outcome = self.inner.transact(transaction).await?;
         if outcome == CommitOutcome::Committed {
             self.record_winner_conflicts().await?;
         }
@@ -323,7 +323,14 @@ impl JobStore for NativeSettlementStore {
         self.inner.read_range(request).await
     }
 
-    async fn commit(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+    async fn transact(&self, transaction: &StoreTransaction) -> Result<CommitOutcome, Self::Error> {
+        if !transaction
+            .mutations()
+            .iter()
+            .any(|mutation| self.key_tag(mutation.key()) == KeyTag::Job)
+        {
+            return self.inner.transact(transaction).await;
+        }
         match self.next_role() {
             CommitRole::First { ready, release } => {
                 self.hold_first(transaction, ready, release).await
@@ -331,7 +338,7 @@ impl JobStore for NativeSettlementStore {
             CommitRole::Second { ready, release } => {
                 self.commit_second(transaction, ready, release).await
             }
-            CommitRole::Later | CommitRole::Unarmed => self.inner.commit(transaction).await,
+            CommitRole::Later | CommitRole::Unarmed => self.inner.transact(transaction).await,
         }
     }
 }
@@ -463,7 +470,7 @@ async fn assert_final_lifecycle(
             .system
             .observe_lifecycle(JobId::from([1; 16]))
             .await?,
-        LifecycleObservation::Terminal(_)
+        LifecycleObservation::Missing
     ));
     let second = fixture
         .system
@@ -471,7 +478,7 @@ async fn assert_final_lifecycle(
         .await?;
     match expected {
         ExpectedSecondOutcome::Complete => {
-            assert!(matches!(second, LifecycleObservation::Terminal(_)));
+            assert!(matches!(second, LifecycleObservation::Missing));
         }
         ExpectedSecondOutcome::Retry => assert!(matches!(
             second,

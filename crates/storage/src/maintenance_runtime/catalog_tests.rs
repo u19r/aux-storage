@@ -126,6 +126,11 @@ async fn given_absent_optional_maintenance_repositories_when_catalog_is_assemble
         .map(|job| (job.as_str().into(), 1))
         .collect();
     assert_eq!(registered_identities(&catalog), expected);
+    let manifest = catalog.manifest().expect("complete namespace manifest");
+    assert_eq!(manifest.seed_ids().len(), StorageJob::ALL.len());
+    for job in StorageJob::ALL {
+        assert!(manifest.seed_ids().contains(&job.job_id()));
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 

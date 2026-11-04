@@ -48,15 +48,6 @@ async fn read_observation<Transaction: GsiBuildTransaction>(
                 .read_gsi_catch_up(&build.target, after, through, limit)
                 .await?,
         ),
-        GsiReadRequest::Continue {
-            after,
-            pending_high,
-            limit,
-        } => GsiObservation::Stream(
-            transaction
-                .read_gsi_continuation(&build.target, after, pending_high, limit)
-                .await?,
-        ),
         GsiReadRequest::InspectActivation {
             required_from,
             through,
@@ -77,7 +68,9 @@ async fn read_scan<Transaction: GsiBuildTransaction>(
     let observation = transaction
         .read_gsi_scan(&build.target, after, limit)
         .await?;
-    if let GsiScanPageEnd::Complete(high) = &observation.end {
+    if !build.target.index_name.is_ttl_index()
+        && let GsiScanPageEnd::Complete(high) = &observation.end
+    {
         transaction
             .validate_gsi_frontier(build.state.required_stream_history(), high)
             .await?;

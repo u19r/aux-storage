@@ -57,8 +57,7 @@ pub const MAX_PROJECTED_ATTRIBUTES: usize = 100;
 // INCLUDE fields plus two table keys and two index keys.
 pub(crate) const MAX_FROZEN_PROJECTION_FIELDS: usize = MAX_PROJECTED_ATTRIBUTES + 4;
 // Fields enum framing, commas, and six digits per logical source field ordinal.
-pub(crate) const MAX_SOURCE_ORDINAL_PROJECTION_BYTES: usize =
-    13 + MAX_FROZEN_PROJECTION_FIELDS * (MAX_ITEM_SIZE_BYTES.ilog10() as usize + 2) - 1;
+
 pub const MIN_INDEX_NAME_BYTES: usize = 3;
 pub const MAX_INDEX_NAME_BYTES: usize = 255;
 pub const MAX_EXPRESSION_BYTES: usize = 4 * 1024;
@@ -267,3 +266,13 @@ pub(crate) const DYNAMODB_NUMBER_ZERO_PADDING: &str =
 
 /// Existing durable maintenance target incarnation envelope.
 pub const MAX_TARGET_INCARNATION_BYTES: usize = 256;
+
+pub(crate) const ITEM_HISTORY_RECORD_FORMAT: u8 = 1;
+pub(crate) const ITEM_HISTORY_RECORD_HEADER_BYTES: usize = 21;
+
+pub(crate) const MATERIALIZED_ITEM_FORMAT: u8 = 1;
+pub(crate) const MATERIALIZED_ITEM_HEADER_BYTES: usize = 21;
+
+/// Bounds generated history addresses, scope/position and the 1,024-byte
+/// declaration, including JSON escaping, before metadata allocation.
+pub(crate) const ITEM_HISTORY_METADATA_MAX_BYTES: usize = 32 * 1024;

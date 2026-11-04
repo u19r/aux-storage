@@ -185,7 +185,7 @@ impl RawOrderedJobStore for RemoteRawOrderedJobStore {
         read::range(Arc::clone(&self.provider), request).await
     }
 
-    async fn commit(
+    async fn transact(
         &self,
         transaction: &StoreTransaction,
     ) -> Result<CommitOutcome, RawOrderedJobStoreError> {

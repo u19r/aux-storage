@@ -263,7 +263,12 @@ impl JournalStore {
                 .collect::<StorageResult<Vec<_>>>()?;
             let rows = self.records.load(attempt, &keys, protection).await?;
             let coverage = self
-                .load_received_coverages(attempt, local, origins, protection)
+                .load_received_coverages(
+                    attempt,
+                    (local.0, local.1, local.2, current.physical),
+                    origins,
+                    protection,
+                )
                 .await?;
             let survivors = authority.removal.survivors()?;
             let content = authority.removal.content()?;

@@ -12,6 +12,13 @@ use crate::{CachePublication, CatalogAttempt, TableMetadataCache, resolve_table_
 
 /// Only physical point lookup belongs to the SQL or KV family.
 pub trait GetItemAttempt: CatalogAttempt {
+    /// Observe live revision authority without loading item images. Missing
+    /// and deleted rows return None; results retain the requested order.
+    fn read_primary_live_revisions(
+        &mut self,
+        reads: &[(&BoundTableInfo, &KeyAttributes)],
+    ) -> impl Future<Output = StorageResult<Vec<Option<storage_types::ItemRevision>>>> + Send;
+
     fn read_primary_item(
         &mut self,
         table: &BoundTableInfo,

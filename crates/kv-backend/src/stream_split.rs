@@ -1,9 +1,7 @@
 //! Physical KV keys for one shared SystemStream split decision.
 
 use futures::future::try_join;
-use storage_types::{
-    ReadProtection, StorageEnum, StorageError, StorageResult, SystemStreamPosition, storage_serde,
-};
+use storage_types::{ReadProtection, StorageEnum, StorageError, StorageResult, storage_serde};
 use stream_provider::{
     SystemStreamHistory, SystemStreamSplitOperationId, SystemStreamSplitReceipt,
 };
@@ -14,7 +12,6 @@ use crate::{
         SYSTEM_STREAM_CATALOG_EPOCH_KEY, SYSTEM_STREAM_LINEAGE_PREFIX,
         SYSTEM_STREAM_SEQUENCE_PREFIX, SYSTEM_STREAM_SPLIT_RECEIPT_PREFIX,
     },
-    stream_checkpoint::key_layout::frontier,
     stream_history::{LineageRow, SequenceRow, read_history_protected, segmented_key},
 };
 
@@ -46,26 +43,17 @@ pub(crate) async fn write_split<A: KvAttempt>(
     let split = &receipt.split;
     let scope = split.source_scope();
     let parent = split.sealed_parent();
-    let parent_position = SystemStreamPosition::try_new(
-        parent.shard_id().as_str(),
-        parent.lineage_id().as_str(),
-        format!("{:020}", receipt.sealed_after_offset - 1),
-    )
-    .map_err(|_| unavailable())?;
     let parent_key = segmented_key(SYSTEM_STREAM_LINEAGE_PREFIX, parent.lineage_id().as_str())?;
     let sequence_key = segmented_key(SYSTEM_STREAM_SEQUENCE_PREFIX, parent.shard_id().as_str())?;
-    let parent_frontier_key = frontier(scope, &parent_position)?;
     let receipt_key = receipt_key(split.operation_id())?;
     let mut keys = vec![
         SYSTEM_STREAM_CATALOG_EPOCH_KEY.to_vec(),
         parent_key.clone(),
         sequence_key,
-        parent_frontier_key.clone(),
         receipt_key.clone(),
     ];
     let mut child_keys = Vec::with_capacity(2);
     for child in split.children() {
-        let position = child.initial_frontier().map_err(|_| unavailable())?;
         let lineage = segmented_key(
             SYSTEM_STREAM_LINEAGE_PREFIX,
             child.lineage().lineage_id().as_str(),
@@ -74,38 +62,27 @@ pub(crate) async fn write_split<A: KvAttempt>(
             SYSTEM_STREAM_SEQUENCE_PREFIX,
             child.lineage().shard_id().as_str(),
         )?;
-        let frontier = frontier(scope, &position)?;
-        keys.extend([lineage.clone(), sequence.clone(), frontier.clone()]);
-        child_keys.push((lineage, sequence, frontier, position));
+        keys.extend([lineage.clone(), sequence.clone()]);
+        child_keys.push((lineage, sequence));
     }
     let [
         epoch,
         parent_bytes,
         sequence_bytes,
-        parent_frontier,
         prior,
         left_lineage,
         left_sequence,
-        left_frontier,
         right_lineage,
         right_sequence,
-        right_frontier,
     ] = attempt
         .get_batch(keys, ReadProtection::Conflict)
         .await?
         .try_into()
         .map_err(|_| unavailable())?;
     if prior.is_some()
-        || [
-            left_lineage,
-            left_sequence,
-            left_frontier,
-            right_lineage,
-            right_sequence,
-            right_frontier,
-        ]
-        .into_iter()
-        .any(|value| value.is_some())
+        || [left_lineage, left_sequence, right_lineage, right_sequence]
+            .into_iter()
+            .any(|value| value.is_some())
     {
         return Err(unavailable());
     }
@@ -150,16 +127,6 @@ pub(crate) async fn write_split<A: KvAttempt>(
     {
         return Err(unavailable());
     }
-    let propagate_frontier = if let Some(bytes) = parent_frontier {
-        let position: SystemStreamPosition =
-            storage_serde::from_bytes(&bytes).map_err(|_| unavailable())?;
-        if frontier(scope, &position)? != parent_frontier_key {
-            return Err(unavailable());
-        }
-        true
-    } else {
-        false
-    };
     row.sealed = true;
     row.sealed_after_offset = Some(receipt.sealed_after_offset);
     let mut changes = vec![
@@ -176,9 +143,7 @@ pub(crate) async fn write_split<A: KvAttempt>(
             value: next_epoch.to_be_bytes().to_vec(),
         },
     ];
-    for (child, (lineage, sequence, frontier_key, position)) in
-        split.children().iter().zip(child_keys)
-    {
+    for (child, (lineage, sequence)) in split.children().iter().zip(child_keys) {
         changes.push(KvMutation::Put {
             key: lineage,
             value: storage_serde::to_bytes(&LineageRow {
@@ -205,12 +170,6 @@ pub(crate) async fn write_split<A: KvAttempt>(
                 })?
             },
         });
-        if propagate_frontier {
-            changes.push(KvMutation::Put {
-                key: frontier_key,
-                value: storage_serde::to_bytes(&position)?,
-            });
-        }
     }
     attempt.stage(changes)
 }

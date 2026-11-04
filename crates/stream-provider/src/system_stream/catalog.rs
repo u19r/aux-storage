@@ -70,16 +70,6 @@ impl SystemStreamLineage {
     }
 }
 
-/// Stable physical pointer namespace for one logical lineage. Catalog
-/// validation rejects a collision before either backend can publish a split.
-pub(crate) fn pointer_slot(lineage_id: &SystemStreamLineageId) -> [u8; 4] {
-    let mut digest = Sha256::new();
-    digest.update(crate::constants::SYSTEM_POINTER_SLOT_DOMAIN);
-    digest.update(lineage_id.as_str().as_bytes());
-    let digest = digest.finalize();
-    [digest[0], digest[1], digest[2], digest[3]]
-}
-
 /// A provider-owned, validated snapshot of the logical lineage catalog.
 ///
 /// The catalog is the precondition for a fresh split.  Its constructor rejects
@@ -239,14 +229,10 @@ fn validate_lineage_catalog(
     }
 
     let mut lineage_ids = HashSet::with_capacity(entries.len());
-    let mut pointer_slots = HashSet::with_capacity(entries.len());
     let mut active_shards = HashSet::with_capacity(entries.len());
     let mut children_by_parent = HashMap::<&str, Vec<&SystemStreamLineage>>::new();
     for entry in entries {
         if !lineage_ids.insert(entry.lineage_id().as_str()) {
-            return Err(SystemStreamContractError::BackendContract);
-        }
-        if !pointer_slots.insert(pointer_slot(entry.lineage_id())) {
             return Err(SystemStreamContractError::BackendContract);
         }
         if !entry.sealed() && !active_shards.insert(entry.shard_id().as_str()) {

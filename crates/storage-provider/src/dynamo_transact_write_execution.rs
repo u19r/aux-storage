@@ -20,8 +20,9 @@ pub(crate) async fn write_transaction<P: DynamoPort>(
         None => shape,
     };
     let captured_at = port.now();
+    let bindings = crate::RequestTableBindings::default();
     retry_native_conflicts(port, DYNAMO_WRITE_RETRY, || {
-        write_transaction_attempt(port, shape.clone(), captured_at)
+        write_transaction_attempt(port, shape.clone(), captured_at, bindings.clone())
     })
     .await
     .inspect_err(|error| {
@@ -40,12 +41,14 @@ async fn write_transaction_attempt<P: DynamoPort>(
     port: &P,
     shape: DynamoTransactWriteShape,
     captured_at: TimestampMillis,
+    bindings: crate::RequestTableBindings,
 ) -> StorageResult<TransactWriteItemsResponse> {
     let cache = port.metadata_cache();
     let tables = crate::dynamo_write_preparation::PreparedWriteTables::load(
         port,
         &cache,
         shape.table_names(),
+        &bindings,
     )
     .await?;
     let bound = shape.bind(
@@ -64,7 +67,7 @@ async fn write_transaction_attempt<P: DynamoPort>(
         Box::pin(async move {
             attempt.install_prepared_writes(writes);
             bound
-                .execute(attempt, &cache, &tables, (captured_at, clock))
+                .execute(attempt, &cache, &tables, &bindings, (captured_at, clock))
                 .await
         })
     })

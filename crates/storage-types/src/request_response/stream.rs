@@ -2,53 +2,56 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeMap, KeyAttributes, KeySchemaElement, StreamItemId, StreamRecord, StreamViewType,
+    AttributeMap, KeyAttributes, KeySchemaElement, StreamRecord, StreamViewType,
     SystemStreamCheckpointToken, SystemStreamContractError, SystemStreamScope,
     SystemStreamSourceTableName, TableHistoryId, TableName, TimestampSecondsFractional,
 };
 
-/// Table incarnation and retained pointer range observed in the same read
-/// attempt as a table-stream page. An empty head certifies an empty stream
-/// for that incarnation at the attempt's snapshot.
+/// Physical bounds are qualified facts, not a certificate of public visibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TableStreamLaneFrontier {
+    pub shard_id: crate::SystemStreamShardId,
+    pub lineage_id: crate::SystemStreamLineageId,
+    #[schema(value_type = Option<String>)]
+    pub oldest: Option<crate::TableStreamSequence>,
+    #[schema(value_type = Option<String>)]
+    pub head: Option<crate::TableStreamSequence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct TableStreamFrontier {
     #[schema(value_type = Vec<u8>)]
     pub table_history_id: TableHistoryId,
-    pub oldest: Option<StreamItemId>,
-    pub head: Option<StreamItemId>,
+    pub source_scope: SystemStreamScope,
+    pub lanes: Vec<TableStreamLaneFrontier>,
 }
 
 impl TableStreamFrontier {
     fn validate(&self) -> Result<(), SystemStreamContractError> {
-        match (self.oldest, self.head) {
-            (None, None) => Ok(()),
-            (Some(oldest), Some(head)) if oldest <= head => Ok(()),
-            _ => Err(SystemStreamContractError::InvalidTableFrontier),
+        if self.lanes.is_empty()
+            || self.lanes.iter().enumerate().any(|(index, lane)| {
+                self.lanes[..index].iter().any(|previous| {
+                    previous.shard_id == lane.shard_id && previous.lineage_id == lane.lineage_id
+                }) || !matches!((lane.oldest, lane.head), (None, None))
+                    && !lane
+                        .oldest
+                        .zip(lane.head)
+                        .is_some_and(|(oldest, head)| oldest <= head)
+            })
+        {
+            return Err(SystemStreamContractError::InvalidTableFrontier);
         }
-    }
-
-    /// A returning subscriber may resume only when its previously verified
-    /// checkpoint is within this incarnation's retained range. Bounds do not
-    /// prove that an arbitrary caller-supplied item ID ever existed. A missing
-    /// checkpoint needs a new snapshot rather than an incremental read.
-    #[must_use]
-    pub fn can_resume_from(
-        &self,
-        table_history_id: TableHistoryId,
-        checkpoint: StreamItemId,
-    ) -> bool {
-        self.table_history_id == table_history_id
-            && self
-                .oldest
-                .zip(self.head)
-                .is_some_and(|(oldest, head)| oldest <= checkpoint && checkpoint <= head)
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, ToSchema)]
 pub struct GetStreamRecordsRequest {
     table_name: Option<TableName>,
+    #[schema(value_type = Option<Vec<u8>>)]
+    table_history_id: Option<TableHistoryId>,
     system_stream: bool,
     last_evaluated_key: Option<String>,
 
@@ -81,6 +84,8 @@ pub struct GetStreamRecordsResponse {
 struct GetStreamRecordsRequestWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     table_name: Option<TableName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table_history_id: Option<TableHistoryId>,
     #[serde(default)]
     system_stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +119,8 @@ struct GetStreamRecordsResponseWire {
 struct GetStreamRecordsRequestWireRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     table_name: Option<&'a TableName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    table_history_id: Option<TableHistoryId>,
     system_stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_evaluated_key: Option<&'a String>,
@@ -148,6 +155,7 @@ impl Serialize for GetStreamRecordsRequest {
             .map_err(<S::Error as serde::ser::Error>::custom)?;
         GetStreamRecordsRequestWireRef {
             table_name: self.table_name.as_ref(),
+            table_history_id: self.table_history_id,
             system_stream: self.system_stream,
             last_evaluated_key: self.last_evaluated_key.as_ref(),
             source_scope: self.source_scope.as_ref(),
@@ -212,12 +220,29 @@ impl GetStreamRecordsRequest {
     ) -> Self {
         Self {
             table_name: Some(table_name),
+            table_history_id: None,
             system_stream: false,
             last_evaluated_key,
             source_scope: None,
             checkpoint: None,
             limit,
         }
+    }
+
+    /// A table ARN or subscriber can require the same incarnation in the
+    /// native attempt that reads the page, including an initial empty cursor.
+    pub fn table_at_incarnation(
+        target: crate::TableHistoryTarget,
+        last_evaluated_key: Option<String>,
+        limit: Option<u32>,
+    ) -> Self {
+        let mut request = Self::table(target.table_name, last_evaluated_key, limit);
+        request.table_history_id = Some(target.history_id);
+        request
+    }
+
+    pub fn table_history_id(&self) -> Option<TableHistoryId> {
+        self.table_history_id
     }
 
     /// Build a logical SystemStream request.  The scope is typed and all
@@ -230,6 +255,7 @@ impl GetStreamRecordsRequest {
     ) -> Self {
         Self {
             table_name: None,
+            table_history_id: None,
             system_stream: true,
             last_evaluated_key: None,
             source_scope: Some(source_scope),
@@ -271,6 +297,7 @@ impl GetStreamRecordsRequest {
     fn from_wire(wire: GetStreamRecordsRequestWire) -> Result<Self, SystemStreamContractError> {
         let request = Self {
             table_name: wire.table_name,
+            table_history_id: wire.table_history_id,
             system_stream: wire.system_stream,
             last_evaluated_key: wire.last_evaluated_key,
             source_scope: wire.source_scope,
@@ -289,7 +316,7 @@ impl GetStreamRecordsRequest {
     /// Validate the request shape before any provider operation is admitted.
     pub fn validate(&self) -> Result<(), SystemStreamContractError> {
         if self.system_stream {
-            if self.table_name.is_some() {
+            if self.table_name.is_some() || self.table_history_id.is_some() {
                 return Err(SystemStreamContractError::ConflictingStreamSources);
             }
             if self.source_scope.is_none() && self.checkpoint.is_some() {

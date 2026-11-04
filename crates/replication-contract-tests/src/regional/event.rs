@@ -60,7 +60,7 @@ impl HarnessEvent {
     }
     pub fn expiration(&self) -> HarnessResult<Self> {
         let mut winner = self.winner.clone();
-        winner.event = Some(winner.version.clone().expiration_id());
+        winner.event = Some(winner.version.expiration_id()?);
         winner.order = winner.order.expiration_child();
         winner.digest = payload_digest(&None)?;
         winner.validate()?;

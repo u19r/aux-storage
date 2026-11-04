@@ -24,7 +24,7 @@ mod protocol_perf_tests;
 mod notification_tests;
 
 #[cfg(all(test, feature = "sqlite"))]
-mod parallel_delivery_perf_tests;
+mod parallel_delivery_tests;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod delivery_perf_tests;

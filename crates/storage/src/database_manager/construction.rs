@@ -9,11 +9,10 @@ use std::{
 use bg_job_store::ScheduledJobStore;
 use storage_provider::{
     DynamoOperations, StorageBackend, StorageConfig, StorageConnectionConfig,
-    StorageConnectionRegistry, SystemStreamTrimRepository, TableReclaimRepository,
-    maintenance::GsiLifecycleRepository,
+    StorageConnectionRegistry, StorageStreamOperations, SystemStreamTrimRepository,
+    TableReclaimRepository, maintenance::GsiLifecycleRepository,
 };
 use storage_types::{StorageError, StorageResult, VecMap, context::ErrorContext as _};
-use stream_provider::StreamOperations;
 
 use crate::{
     admission::AdmissionRegistry,
@@ -27,7 +26,7 @@ use crate::{
 
 pub(crate) struct PreparedStorageProviders {
     pub dynamo_providers: VecMap<String, Arc<dyn DynamoOperations>>,
-    pub stream_providers: HashMap<String, Arc<dyn StreamOperations>>,
+    pub stream_providers: HashMap<String, Arc<dyn StorageStreamOperations>>,
     pub queue_providers: HashMap<String, Arc<dyn queue_provider::QueueOperations>>,
     pub pubsub_providers: HashMap<String, Arc<dyn pubsub_provider::PubsubProvider>>,
     pub default_delivery_source: Option<Arc<dyn crate::provider_bundle::DeliveryProviderSource>>,
@@ -36,7 +35,7 @@ pub(crate) struct PreparedStorageProviders {
     pub default_system_stream_trim_repository: Option<Arc<dyn SystemStreamTrimRepository>>,
     pub default_table_reclaim_repository: Option<Arc<dyn TableReclaimRepository>>,
     pub default_gsi_lifecycle_repository: Arc<dyn GsiLifecycleRepository>,
-    pub maintenance_runtimes: Vec<Arc<MaintenanceRuntime>>,
+    pub maintenance_runtimes: Vec<MaintenanceRuntime>,
     pub default_scheduled_job_store: Option<ScheduledJobStore>,
     pub(super) native_admission: Vec<super::native_admission::NativeConnectionResources>,
     #[cfg(feature = "regional")]
@@ -317,7 +316,7 @@ async fn prepare_initialized_storage_providers(
     };
     let mut dynamo_providers: VecMap<String, Arc<dyn DynamoOperations>> =
         VecMap::with_capacity(registry.connections.len());
-    let mut stream_providers: HashMap<String, Arc<dyn StreamOperations>> =
+    let mut stream_providers: HashMap<String, Arc<dyn StorageStreamOperations>> =
         HashMap::with_capacity(registry.connections.len());
     let mut queue_providers: HashMap<String, Arc<dyn queue_provider::QueueOperations>> =
         HashMap::with_capacity(registry.connections.len());

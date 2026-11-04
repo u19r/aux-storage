@@ -24,7 +24,7 @@ impl<'native, P: ExpirationPort> ExpirationAttempt<'native, P> {
         selection: ExpirationSelection,
     ) -> StorageResult<AcceptedDirectExpirationPage<'native, P>> {
         let (config, table) = self
-            .read_direct_policy(&command.table_name)
+            .read_direct_policy(&command.target.table_name)
             .await?
             .ok_or_else(|| StorageError::from(StorageEnum::ConditionalCheckFailed))?;
         let scan = DirectExpirationScanRead::try_new(command, config, (*table).clone())?;

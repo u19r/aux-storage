@@ -17,14 +17,6 @@ pub(crate) struct GsiReclaimRecord {
     format: u8,
     pub(crate) history: TableHistoryId,
     pub(crate) target: GsiBuildTarget,
-    pub(crate) phase: GsiReclaimPhase,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) enum GsiReclaimPhase {
-    OwnerReceipts { after: Option<DurableRecordKey> },
-    PhysicalRows,
 }
 
 impl GsiReclaimRecord {
@@ -33,7 +25,6 @@ impl GsiReclaimRecord {
             format: 1,
             history,
             target,
-            phase: GsiReclaimPhase::OwnerReceipts { after: None },
         };
         record.require_identity()?;
         Ok(record)

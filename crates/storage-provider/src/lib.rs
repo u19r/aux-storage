@@ -3,6 +3,8 @@
 //! Downstream libraries should depend on this crate for embedded storage
 //! abstractions instead of backend implementation crates.
 
+#[cfg(feature = "test-support")]
+pub mod baseline_test_support;
 mod change_index;
 mod config;
 #[cfg(test)]
@@ -17,6 +19,11 @@ mod dynamo_batch_write;
 mod dynamo_bound_write;
 mod dynamo_catalog;
 mod dynamo_create_table;
+mod dynamo_table_bindings;
+mod table_append;
+#[cfg(feature = "test-support")]
+pub mod table_reclaim_test_support;
+pub use table_append::{StorageStreamOperations, TableAppendOperations};
 mod dynamo_delete_item;
 mod dynamo_delete_table;
 mod dynamo_describe_table;
@@ -25,7 +32,12 @@ mod dynamo_list_streams;
 mod dynamo_list_tables;
 mod dynamo_operation_port;
 mod dynamo_operations;
+mod dynamodb_streams;
+pub use dynamodb_streams::{
+    DescribeDynamoStream, DynamoStreamRead, GetDynamoShardIterator, GetDynamoStreamRecords,
+};
 mod dynamo_put_item;
+pub use dynamo_put_item::ItemWritePrerequisites;
 mod dynamo_range_read;
 mod dynamo_read_execution;
 mod dynamo_read_sequence;
@@ -41,15 +53,19 @@ mod dynamo_update_ttl;
 mod dynamo_write_execution;
 pub mod native_admission;
 pub mod queue_cleanup_admission;
+mod table_history_page;
+mod table_history_read;
 pub use dynamo_baseline::{prepare_baseline_delete, prepare_baseline_upsert};
 mod dynamo_write_preparation;
 #[cfg(test)]
 mod expiration_candidate_tests;
 #[cfg(test)]
 mod expiration_transaction_contract_tests;
-mod gsi_projection_owner;
 #[cfg(test)]
 mod gsi_readiness_tests;
+mod gsi_reclaim;
+mod gsi_reclaim_discovery;
+mod gsi_reclaim_record;
 mod item_tombstone_scan;
 #[doc(hidden)]
 pub mod job_store;
@@ -63,13 +79,7 @@ mod name_reservation;
 mod primary_state;
 mod primary_state_scan;
 mod projection_scan;
-pub use gsi_projection_owner::GsiProjectionOwner;
-mod gsi_reclaim;
-mod gsi_reclaim_discovery;
-mod gsi_reclaim_record;
 mod provider;
-#[cfg(test)]
-mod quint_custom_stream_duration_tests;
 #[cfg(test)]
 mod quint_partition_tests;
 mod raw_ordered_job_store;
@@ -79,7 +89,7 @@ mod read_sequence_context_tests;
 mod read_sequence_metrics;
 #[cfg(test)]
 mod read_sequence_metrics_tests;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod retention_test_support;
 #[cfg(test)]
 mod stream_duration_planner_tests;
@@ -87,8 +97,6 @@ mod stream_duration_planner_tests;
 mod stream_duration_trim_tests;
 #[cfg(test)]
 mod stream_duration_worker_tests;
-#[cfg(test)]
-mod stream_retention_hold_contract_tests;
 #[cfg(test)]
 mod stream_retention_tests;
 mod table_cache;
@@ -127,7 +135,9 @@ pub use dynamo_create_table::{CreateTableAttempt, CreateTableLayout, create_tabl
 pub use dynamo_delete_item::{
     AcceptedDeleteItem, BoundDeleteItem, DeleteItemAttempt, DeleteItemShape,
 };
-pub use dynamo_delete_table::{DeleteTableAttempt, delete_table_in_attempt};
+pub use dynamo_delete_table::{
+    DeleteTableAttempt, delete_table_in_attempt, retire_table_in_attempt,
+};
 pub use dynamo_describe_table::{describe_table_from_table, describe_table_in_attempt};
 pub use dynamo_get_item::{GetItemAttempt, get_item_from_table, get_item_in_attempt};
 pub use dynamo_list_streams::{CatalogStreamPage, ListStreamsAttempt, list_streams_in_attempt};
@@ -150,9 +160,10 @@ pub use dynamo_read_sequence::{
 };
 pub use dynamo_read_sequence_step::{DynamoReadSequenceStep, ReadSequenceStepReader};
 pub use dynamo_stream_write::DynamoStreamWriteAttempt;
+pub use dynamo_table_bindings::RequestTableBindings;
 pub use dynamo_table_stream::{
-    DynamoTableStreamAttempt, get_table_stream_records_from_table,
-    latest_table_stream_pointer_from_table,
+    DynamoTableStreamAttempt, TableHistoryRetentionAttempt, get_table_stream_records_from_table,
+    require_enabled_table_stream, table_stream_checkpoint_from_table,
 };
 pub use dynamo_transact_get::{transact_get_items_from_tables, transact_get_items_in_attempt};
 pub use dynamo_transact_write::{
@@ -170,7 +181,7 @@ pub use item_tombstone_scan::{
     ItemTombstone, ItemTombstonePage, ItemTombstoneScan, ItemTombstoneScanAttempt,
 };
 pub use job_terminal_projection::JobTerminalProjection;
-pub use name_reservation::{TableNameReservation, name_is_locked, name_locked_until};
+pub use name_reservation::{name_is_locked, name_locked_until};
 pub use primary_state::{ItemPrimaryEffects, PrimaryStateRow, UpsertImage};
 pub use primary_state_scan::{PrimaryStateScan, PrimaryStateScanAttempt};
 pub use projection_scan::{
@@ -197,7 +208,7 @@ pub use table_cache::{
 };
 pub use table_reclaim::{
     TableReclaimAttempt, TableReclaimHandler, TableReclaimPhase, TableReclaimRepository,
-    TableReclaimStep, TableReclaimTarget, reclaim_table_page,
+    TableReclaimStep, TableReclaimTarget, TableSystemHistoryPage, reclaim_table_page,
 };
 pub use ttl_sweep_repository::TtlSweepRepository;
 
@@ -205,17 +216,10 @@ pub use crate::{
     change_index::*,
     config::*,
     maintenance::{
-        DetachedItemStreamObservation, DetachedItemStreamPolicy, DetachedItemStreamRange,
-        DetachedItemStreamRanges, DetachedItemStreamReclaim, ItemHistoryRetention,
-        ItemStreamDurationInput, PhysicalStreamPointer, PhysicalStreamPointerFamily,
-        PhysicalStreamTrimSelection, StreamDurationTrimConfig, StreamDurationTrimPageRequest,
-        StreamDurationTrimPageResult, StreamDurationTrimWorker, StreamRetentionFinishRecord,
-        StreamRetentionHold, StreamRetentionRepository, StreamTrimBoundary,
-        StreamTrimDeletionBound, StreamTrimDueMarker, StreamTrimDueRecord, StreamTrimMarkerOutcome,
-        StreamTrimPageLimit, StreamTrimRow, StreamTrimScope, StreamTrimScopeBoundaries,
-        StreamTrimScopeKind, StreamTrimState, StreamTrimStateRecord, StreamTrimStateUpdate,
+        StreamDurationTrimConfig, StreamDurationTrimWorker, StreamRetentionFinishRecord,
+        StreamRetentionRepository, StreamTrimDueMarker, StreamTrimDueRecord, StreamTrimPageLimit,
+        StreamTrimScope, StreamTrimState, StreamTrimStateRecord, StreamTrimStateUpdate,
         StreamTrimStateWrite, SystemStreamTrimExecutor, SystemStreamTrimRepository,
-        item_retention_scope_id, merge_table_stream_duration_request, plan_item_stream_duration,
         plan_table_stream_duration, stream_retention_kind, table_retention_scope_id,
     },
     provider::*,
@@ -234,3 +238,6 @@ mod dynamo_range_read_tests;
 
 #[cfg(test)]
 mod dynamo_catalog_tests;
+
+mod table_stream_initialization;
+pub use table_stream_initialization::repository::TableStreamInitializationRepository;

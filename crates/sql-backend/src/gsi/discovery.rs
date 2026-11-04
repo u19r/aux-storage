@@ -1,11 +1,11 @@
-//! Find one runnable GSI build and verify its private history holds.
+//! Find one runnable GSI build and protect its candidate binding.
 
 use storage_backfill::{GsiBuild, GsiBuildTarget};
 use storage_provider::CATALOG_READ_BYTES;
-use storage_types::{StorageError, StorageResult, SystemStreamPosition, SystemStreamScope};
+use storage_types::{StorageError, StorageResult};
 
 use super::{read::decode_build_row, sql_statements};
-use crate::{ColumnIndex, ReadProtection, SqlAttempt, SqlLayout, SqlRow, SqlValue};
+use crate::{ReadProtection, SqlAttempt, SqlLayout};
 
 pub(crate) async fn scan_build_candidates<A: SqlAttempt>(
     attempt: &mut A,
@@ -45,80 +45,17 @@ fn decode_candidate_page(page: crate::SqlQueryPage) -> StorageResult<Option<GsiB
     decode_build_row(row).map(Some)
 }
 
-pub(crate) async fn read_candidate_holds<A: SqlAttempt>(
+pub(crate) async fn read_candidate_binding<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
     build: &GsiBuild<Vec<u8>>,
-) -> StorageResult<storage_provider::maintenance::GsiCandidateObservation> {
-    let pages = attempt
-        .query_batch(
-            vec![
-                sql_statements::candidate_binding_statement(engine, &build.target),
-                sql_statements::read_hold_statement(engine, build),
-            ],
+) -> StorageResult<Option<GsiBuild<Vec<u8>>>> {
+    let page = attempt
+        .query(
+            sql_statements::candidate_binding_statement(engine, &build.target),
             ReadProtection::Conflict,
             CATALOG_READ_BYTES,
         )
         .await?;
-    let [binding, page]: [crate::SqlQueryPage; 2] = pages.try_into().map_err(|_| {
-        StorageError::internal("SQL GSI candidate validation returned the wrong page count")
-    })?;
-    if binding.more || binding.rows.len() > 1 || page.more {
-        return Err(StorageError::internal(
-            "SQL GSI candidate read exceeded its bounds",
-        ));
-    }
-    let observed = binding
-        .rows
-        .into_iter()
-        .next()
-        .map(decode_build_row)
-        .transpose()?;
-    let holds = page
-        .rows
-        .iter()
-        .map(decode_hold_row)
-        .collect::<StorageResult<Vec<_>>>()?;
-    Ok(storage_provider::maintenance::GsiCandidateObservation {
-        build: observed,
-        holds,
-    })
-}
-
-fn decode_hold_row(row: &SqlRow) -> StorageResult<(SystemStreamScope, SystemStreamPosition)> {
-    let (
-        SqlValue::Text(scope),
-        SqlValue::Integer(generation),
-        SqlValue::Text(shard),
-        SqlValue::Text(lineage),
-        SqlValue::Integer(offset),
-    ) = (
-        row.value(ColumnIndex::new(0))?,
-        row.value(ColumnIndex::new(1))?,
-        row.value(ColumnIndex::new(2))?,
-        row.value(ColumnIndex::new(3))?,
-        row.value(ColumnIndex::new(4))?,
-    )
-    else {
-        return Err(invalid_hold());
-    };
-    let scope = SystemStreamScope::try_new(
-        scope.as_str(),
-        u64::try_from(*generation).map_err(|_| invalid_hold())?,
-    )
-    .map_err(|_| invalid_hold())?;
-    let position = SystemStreamPosition::try_new(
-        shard.as_str(),
-        lineage.as_str(),
-        format!(
-            "{:020}",
-            u64::try_from(*offset).map_err(|_| invalid_hold())?
-        ),
-    )
-    .map_err(|_| invalid_hold())?;
-    Ok((scope, position))
-}
-
-fn invalid_hold() -> StorageError {
-    StorageError::internal("GSI private retention hold does not match its build state")
+    decode_candidate_page(page)
 }

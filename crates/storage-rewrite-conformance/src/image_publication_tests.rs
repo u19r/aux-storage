@@ -2,10 +2,10 @@
 
 use serde_json::json;
 use storage_types::{
-    AttributeMap, AttributeValue, BatchWriteItemRequest, DeleteItemRequest, PutItemRequest,
-    TableName, storage_serde,
+    AttributeMap, AttributeValue, BatchWriteItemRequest, DeleteItemRequest, ItemHistoryPointer,
+    PutItemRequest, TableName, TableStreamSequence, storage_serde,
 };
-use stream_provider::{StoredStreamPointer, StreamDataType, StreamRowKind};
+use stream_provider::StreamRowKind;
 
 use super::{
     gsi_workflow_tests::table_request,
@@ -14,7 +14,7 @@ use super::{
 };
 
 #[tokio::test]
-async fn given_mixed_writes_when_history_is_read_then_images_and_predecessors_are_exact()
+async fn given_mixed_writes_when_extension_history_is_read_then_each_snapshot_is_exact()
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let outcome = async {
@@ -92,29 +92,29 @@ async fn given_mixed_writes_when_history_is_read_then_images_and_predecessors_ar
         );
         let mut previous = None;
         for (ordinal, (record, row)) in records.iter().zip(&pointers.items).enumerate() {
-            anyhow::ensure!(record.new_image == expected[ordinal]);
-            anyhow::ensure!(
-                record.old_image
-                    == ordinal
-                        .checked_sub(1)
-                        .and_then(|index| expected[index].clone())
-            );
+            anyhow::ensure!(record.item == expected[ordinal]);
+            let encoded = serde_json::to_value(record)?;
+            anyhow::ensure!(encoded.get("OldImage").is_none() && encoded.get("NewImage").is_none());
             anyhow::ensure!(
                 record.system_position.is_none(),
                 "table records must not fabricate system positions"
             );
-            anyhow::ensure!(record.sequence_number == row.id.to_string());
-            let pointer: StoredStreamPointer = storage_serde::from_bytes(&row.data)?;
             anyhow::ensure!(
-                matches!(pointer, StoredStreamPointer::Pointer { .. }),
-                "large images must exercise referenced history"
+                record.sequence_number == TableStreamSequence::from(row.id).to_string()
             );
-            let version = pointer.target_item_stream_version();
+            let pointer: ItemHistoryPointer = storage_serde::from_bytes(&row.data)?;
+            let version = pointer.metadata().version();
             anyhow::ensure!(previous.is_none_or(|previous| version > previous));
             let history = fixture
                 .stream_operations
                 .read_backward(
-                    StreamRowKind::Item(pointer.history_address().physical_stream_name()),
+                    StreamRowKind::Item(
+                        pointer
+                            .metadata()
+                            .address()
+                            .physical_stream_name()
+                            .expect("valid history address"),
+                    ),
                     Some(storage_types::StreamItemId::from(version).increment()),
                     2,
                 )
@@ -136,7 +136,7 @@ async fn given_mixed_writes_when_history_is_read_then_images_and_predecessors_ar
                     .and_then(|index| expected[index].as_ref()),
             ]) {
                 let actual: Option<AttributeMap> =
-                    if image.data_type == StreamDataType::DeleteMarker {
+                    if image.data_type == stream_provider::StreamDataType::DeleteMarker {
                         None
                     } else {
                         Some(storage_serde::from_bytes(&image.data)?)
@@ -176,7 +176,7 @@ fn boundary_image(key: &str, seed: &str, length: usize) -> AttributeMap {
 }
 
 #[tokio::test]
-async fn given_embedding_boundary_writes_when_stream_is_read_then_images_and_indexers_are_exact()
+async fn given_declared_indexers_and_different_payload_sizes_when_stream_is_read_then_snapshots_are_exact()
 -> anyhow::Result<()> {
     let fixture = TestStore::new().await;
     let outcome = async {
@@ -189,22 +189,10 @@ async fn given_embedding_boundary_writes_when_stream_is_read_then_images_and_ind
         });
         fixture.operations.create_table(request).await?;
         let mut expected = Vec::new();
-        for total in [
-            stream_provider::STREAM_EMBEDDED_MAX_BYTES - 1,
-            stream_provider::STREAM_EMBEDDED_MAX_BYTES,
-            stream_provider::STREAM_EMBEDDED_MAX_BYTES + 1,
-        ] {
-            let key = format!("boundary-{total}");
+        for total in [32, 1024, 128_000] {
+            let key = format!("size-{total}");
             let old = boundary_image(&key, "old", 32);
-            let old_len = storage_serde::to_bytes(&old)?.len();
-            let new = (0..=total)
-                .map(|length| boundary_image(&key, "new", length))
-                .find(|image| {
-                    storage_serde::to_bytes(image).is_ok_and(|bytes| bytes.len() + old_len == total)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cannot construct exact encoded boundary {total}")
-                })?;
+            let new = boundary_image(&key, "new", total);
             for image in [&old, &new] {
                 let mut put =
                     PutItemRequest::new(table.clone(), storage_types::WireItem::try_from(image)?);
@@ -222,23 +210,34 @@ async fn given_embedding_boundary_writes_when_stream_is_read_then_images_and_ind
         for (total, old, new) in expected {
             let record = records
                 .iter()
-                .find(|record| record.new_image.as_ref() == Some(&new))
+                .find(|record| record.item.as_ref() == Some(&new))
                 .ok_or_else(|| anyhow::anyhow!("public stream omitted boundary {total}"))?;
-            anyhow::ensure!(record.old_image.as_ref() == Some(&old));
+            anyhow::ensure!(
+                records
+                    .iter()
+                    .any(|candidate| candidate.item.as_ref() == Some(&old))
+            );
             let row = pointers
                 .items
                 .iter()
-                .find(|row| row.id.to_string() == record.sequence_number)
+                .find(|row| TableStreamSequence::from(row.id).to_string() == record.sequence_number)
                 .ok_or_else(|| anyhow::anyhow!("public record has no durable pointer"))?;
-            let pointer: StoredStreamPointer = storage_serde::from_bytes(&row.data)?;
-            anyhow::ensure!(
-                matches!(pointer, StoredStreamPointer::Embedded { .. })
-                    == (total <= stream_provider::STREAM_EMBEDDED_MAX_BYTES),
-                "wrong representation at boundary {total}"
-            );
-            let declarations = ["payload".to_owned()];
-            anyhow::ensure!(pointer.indexers() == declarations);
-            anyhow::ensure!(pointer.old_indexers() == Some(declarations.as_slice()));
+            let pointer: ItemHistoryPointer = storage_serde::from_bytes(&row.data)?;
+            let images = fixture
+                .stream_operations
+                .read_backward(
+                    StreamRowKind::Item(pointer.metadata().address().physical_stream_name()?),
+                    Some(
+                        storage_types::StreamItemId::from(pointer.metadata().version()).increment(),
+                    ),
+                    2,
+                )
+                .await?;
+            anyhow::ensure!(images.items.len() == 2);
+            for (image, expected) in images.items.iter().zip([&new, &old]) {
+                let actual: AttributeMap = storage_serde::from_bytes(&image.data)?;
+                anyhow::ensure!(actual == *expected);
+            }
         }
         Ok(())
     }

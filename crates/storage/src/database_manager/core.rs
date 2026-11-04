@@ -2,14 +2,13 @@ use std::sync::Arc;
 
 use bg_job_store::ScheduledJobStore;
 use storage_provider::{
-    DynamoOperations, ListChangeIndexMarkersRequest, SystemStreamTrimRepository,
-    TableReclaimRepository, TtlSweepRepository, maintenance::GsiLifecycleRepository,
+    DynamoOperations, ListChangeIndexMarkersRequest, StorageStreamOperations,
+    SystemStreamTrimRepository, TableReclaimRepository, TtlSweepRepository,
+    maintenance::GsiLifecycleRepository,
 };
 use storage_types::{
     KeyAttributes, StorageError, StorageResult, StoredTableInfo, TableName, VecMap,
 };
-use stream::StreamError;
-use stream_provider::StreamOperations;
 
 use crate::{
     admission::{AdmissionClass, AdmissionController, AdmissionPermit, AdmissionRegistry},
@@ -41,11 +40,11 @@ pub struct ResolvedGetItem {
 pub struct DatabaseManager {
     pub(super) point_reads: std::sync::OnceLock<Arc<crate::point_read::PointReadSource>>,
     pub(super) dynamo: Arc<dyn DynamoOperations>,
-    pub(super) stream: Option<Arc<dyn StreamOperations>>,
+    pub(super) stream: Option<Arc<dyn StorageStreamOperations>>,
     pub(super) scheduled_job_store: Option<ScheduledJobStore>,
 
     pub(super) gsi_lifecycle_repository: Option<Arc<dyn GsiLifecycleRepository>>,
-    pub(super) maintenance_runtimes: Vec<Arc<MaintenanceRuntime>>,
+    pub(super) maintenance_runtimes: Vec<MaintenanceRuntime>,
     pub(super) background_services:
         tokio::sync::Mutex<super::service_shutdown::BackgroundServiceState>,
     pub(super) system_stream_trim_repository: Option<Arc<dyn SystemStreamTrimRepository>>,
@@ -179,7 +178,7 @@ impl DatabaseManager {
         operation: F,
     ) -> StorageResult<T>
     where
-        F: FnOnce(Arc<dyn StreamOperations>) -> Fut,
+        F: FnOnce(Arc<dyn StorageStreamOperations>) -> Fut,
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
@@ -195,7 +194,7 @@ impl DatabaseManager {
         operation: F,
     ) -> StorageResult<T>
     where
-        F: FnOnce(Arc<dyn StreamOperations>) -> Fut,
+        F: FnOnce(Arc<dyn StorageStreamOperations>) -> Fut,
         Fut: std::future::Future<Output = StorageResult<T>> + Send + 'static,
         T: Send + 'static,
     {
@@ -207,7 +206,7 @@ impl DatabaseManager {
     fn stream_for_connection(
         &self,
         connection_id: &str,
-    ) -> StorageResult<Arc<dyn StreamOperations>> {
+    ) -> StorageResult<Arc<dyn StorageStreamOperations>> {
         self.stream
             .as_ref()
             .filter(|_| connection_id == ROUTED_DEFAULT_CONNECTION_ID)
@@ -215,16 +214,15 @@ impl DatabaseManager {
             .ok_or_else(|| StorageError::unsupported("stream operations are unavailable"))
     }
 
-    /// Append a TestUtil table-stream record to the manager's native database
-    /// using the logical table name as the stream identity.
+    /// Append a TestUtil record to one accepted immutable table incarnation.
     pub async fn append_table_stream_record(
         &self,
-        table_name: &TableName,
+        target: &storage_types::TableHistoryTarget,
         item_data: &[u8],
     ) -> StorageResult<storage_types::StreamItemId> {
         self.append_table_stream_record_for_operation(
             stream_provider::StreamAppendOperationId::fresh(),
-            table_name,
+            target,
             item_data,
         )
         .await
@@ -233,10 +231,10 @@ impl DatabaseManager {
     pub async fn append_table_stream_record_for_operation(
         &self,
         operation: stream_provider::StreamAppendOperationId,
-        table_name: &TableName,
+        target: &storage_types::TableHistoryTarget,
         item_data: &[u8],
     ) -> StorageResult<storage_types::StreamItemId> {
-        let table_name = table_name.clone();
+        let target = target.clone();
         let item_data = item_data.to_vec();
         self.run_stream_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
@@ -244,10 +242,10 @@ impl DatabaseManager {
             move |stream| async move {
                 let database_call = metrics_facade::begin_database_call("append_table_stream");
                 let result = stream
-                    .append_table_item(operation, table_name, &item_data)
+                    .append_table_item(operation, target, &item_data)
                     .await;
                 drop(database_call);
-                result.map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
+                result
             },
         )
         .await
@@ -256,7 +254,7 @@ impl DatabaseManager {
     pub async fn reconcile_table_stream_record(
         &self,
         operation: stream_provider::StreamAppendOperationId,
-        table: TableName,
+        target: storage_types::TableHistoryTarget,
         data: Vec<u8>,
     ) -> StorageResult<stream_provider::TableAppendReconciliation> {
         self.run_stream_admitted(
@@ -264,9 +262,8 @@ impl DatabaseManager {
             AdmissionClass::PointRead,
             move |stream| async move {
                 stream
-                    .reconcile_table_append(operation, table, &data)
+                    .reconcile_table_append(operation, target, &data)
                     .await
-                    .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
             },
         )
         .await

@@ -55,16 +55,12 @@ async fn handle_create_table_success() {
             table.table_stream_duration,
             StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
         );
-        assert_eq!(
-            table.default_item_stream_duration,
-            StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION
-        );
     })
     .await;
 }
 
 #[tokio::test]
-async fn handle_create_table_accepts_custom_stream_duration_fields() {
+async fn given_custom_table_duration_when_created_then_policy_is_stored() {
     for_each_conformance_backend(|_backend, db| async move {
         handle_create_table(
             db.clone(),
@@ -76,8 +72,7 @@ async fn handle_create_table_accepts_custom_stream_duration_fields() {
                 "KeySchema": [
                     {"AttributeName": "id", "KeyType": "HASH"}
                 ],
-                "AuxStreamDurationHours": 168,
-                "AuxDefaultItemStreamDurationHours": -1
+                "AuxStreamDurationHours": 168
             })
             .try_into()
             .expect("valid create table request"),
@@ -91,11 +86,7 @@ async fn handle_create_table_accepts_custom_stream_duration_fields() {
             .expect("table metadata");
         assert_eq!(
             table.table_stream_duration,
-            StreamRetentionDuration::FiniteHours(168)
-        );
-        assert_eq!(
-            table.default_item_stream_duration,
-            StreamRetentionDuration::Forever
+            StreamRetentionDuration::from_hours(168).unwrap()
         );
     })
     .await;

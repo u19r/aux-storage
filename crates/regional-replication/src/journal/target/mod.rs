@@ -58,14 +58,56 @@ impl JournalStore {
         let Some(row) = rows.pop().flatten() else {
             return Ok(None);
         };
-        let record: TargetRecord = self.records.decode(&row)?;
-        if record.content != request.content()?
-            || record.content != record.request.content()?
+        let record = self.decode_hidden_target(&row)?;
+        if record.content != request.content()? {
+            return Err(corrupt_record());
+        }
+        Ok(Some((row, record)))
+    }
+
+    fn decode_hidden_target(&self, row: &DurableRecord) -> StorageResult<TargetRecord> {
+        let record: TargetRecord = self.records.decode(row)?;
+        let request = &record.request;
+        replication_provider::control::validate_joining_definition(
+            &request.operation,
+            (&request.source, &request.target),
+            &self.region,
+        )
+        .map_err(|_| corrupt_record())?;
+        request.schema.validate(&request.target.name)?;
+        if row.key != self.identity_key(TARGET_BOOTSTRAP_SUFFIX, &request.operation.id)?
+            || record.content != request.content()?
             || record.state != request.target.bind_physical(record.state.physical)
         {
             return Err(corrupt_record());
         }
-        Ok(Some((row, record)))
+        Ok(record)
+    }
+
+    pub(super) async fn reclaim_hidden_target<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        row: &DurableRecord,
+        history: storage_types::TableHistoryId,
+    ) -> StorageResult<()> {
+        let record = self.decode_hidden_target(row)?;
+        if record.state.physical != history {
+            return Ok(());
+        }
+        // Reservation requests intentionally lack a physical ID. Retain the
+        // existing digest-only cancellation receipt so stale requests cannot
+        // allocate a fresh incarnation after this root has been erased.
+        self.persist_target_tombstone(attempt, &record.request)
+            .await?;
+        self.records
+            .store(
+                attempt,
+                &[infrastructure_provider::record::RecordChange::Delete {
+                    key: row.key.clone(),
+                    expected: row.revision,
+                }],
+            )
+            .await
     }
 
     async fn require_hidden_table<A: PhysicalRecordAttempt + CatalogAttempt>(

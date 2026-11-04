@@ -186,7 +186,6 @@ fn request(table: &TableName, token: &str, value: &str) -> TransactWriteItemsReq
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 update: None,
                 delete: None,
@@ -226,7 +225,6 @@ fn encode_effect_request(
                     expression_attribute_values: put.expression_attribute_values,
                     return_values_on_condition_check_failure: put
                         .return_values_on_condition_check_failure,
-                    aux_item_stream_ttl_hours: put.aux_item_stream_ttl_hours,
                 }),
                 ..Default::default()
             }
@@ -1232,7 +1230,6 @@ fn terminal_projection_request(
                 expression_attribute_names: None,
                 indexers: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],

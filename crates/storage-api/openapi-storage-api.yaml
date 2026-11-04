@@ -84,8 +84,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-      x-aux-audience: internal_private
       x-aux-internal: true
+      x-aux-audience: internal_private
 components:
   schemas:
     AttributeMap:

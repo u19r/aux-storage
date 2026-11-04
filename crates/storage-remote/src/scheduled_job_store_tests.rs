@@ -1,9 +1,6 @@
 use std::{
     num::{NonZeroU32, NonZeroUsize},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -12,11 +9,9 @@ use bg_job_store::{ScheduledJobStore, ScheduledJobStoreError};
 use bytes::Bytes;
 use httpmock::prelude::*;
 use scheduled_bg_jobs::store::{
-    Check, CommitOperationId, CommitOutcome, Mutation, RangeDirection, RangeRequest,
-    RangeRequestInput, StoreKey, StoreLevel, StoreTransaction, StoreTransactionInput,
-    TransactionLimits,
+    CommitOperationId, CommitOutcome, Mutation, RangeDirection, RangeRequest, RangeRequestInput,
+    StoreKey, StoreLevel, StoreTransaction, StoreTransactionInput, TransactionLimits,
 };
-use sha2::{Digest, Sha256};
 use storage_provider::{RemoteCredentialStrategy, RemoteStorageSettings, RemoteTimeoutOverrides};
 
 const PARTITION_KEY: &str = "SCHEDULED_JOB_STORE#1";
@@ -63,7 +58,7 @@ async fn commit_after_observed_timeout(
 ) -> Result<CommitOutcome, ScheduledJobStoreError> {
     tokio::time::pause();
     let input = put_transaction(b"v");
-    let commit = store.commit(&input);
+    let commit = store.transact(&input);
     let observed = async {
         while request.calls_async().await == 0 {
             tokio::task::yield_now().await;
@@ -151,45 +146,6 @@ fn put_transaction(value: &'static [u8]) -> StoreTransaction {
     .expect("valid transaction")
 }
 
-fn absent_transaction() -> StoreTransaction {
-    StoreTransaction::try_from(StoreTransactionInput {
-        operation_id: CommitOperationId::from([9; 16]),
-        checks: vec![Check::Absent(key(b"conflict"))],
-        mutations: vec![Mutation::Put(key(b"conflict"), Bytes::from_static(b"new"))],
-        limits: TransactionLimits {
-            max_checks: NonZeroU32::new(4).expect("non-zero check limit"),
-            max_mutations: NonZeroU32::new(4).expect("non-zero mutation limit"),
-            max_bytes: NonZeroUsize::new(1024).expect("non-zero transaction limit"),
-        },
-    })
-    .expect("valid transaction")
-}
-
-fn receipt_item(sort_key: &str, fingerprint: &[u8], outcome: &str) -> serde_json::Value {
-    serde_json::json!({
-        "pk": {"S": PARTITION_KEY},
-        "sk": {"S": sort_key},
-        "content": {"B": STANDARD.encode(fingerprint)},
-        "outcome": {"S": outcome},
-        "kind": {"S": "commit-receipt-v2"},
-    })
-}
-
-fn fingerprint_put(value: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 1, b'k'];
-    bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(value);
-    Sha256::digest(&bytes).to_vec()
-}
-
-fn operation_hex(byte: u8) -> String {
-    format!("{byte:02x}").repeat(16)
-}
-
-fn receipt_sort_key(byte: u8) -> String {
-    format!("R#{}", operation_hex(byte))
-}
-
 #[tokio::test]
 async fn get_uses_a_strong_read_and_decodes_the_reserved_data_row() {
     let server = MockServer::start_async().await;
@@ -246,6 +202,7 @@ async fn scheduled_store_connector_bootstraps_and_verifies_the_reserved_job_tabl
                 "Table": {
                     "TableName": "job",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("job").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [
                         {"AttributeName": "pk", "AttributeType": "S"},
@@ -290,6 +247,7 @@ async fn scheduled_store_connector_rejects_an_invalid_reserved_job_schema() {
                 "Table": {
                     "TableName": "job",
                     "TableStatus": "ACTIVE",
+                    "TableId": uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ("job").as_bytes()).to_string(),
                     "CreationDateTime": 0,
                     "AttributeDefinitions": [
                         {"AttributeName": "pk", "AttributeType": "S"},
@@ -324,414 +282,6 @@ async fn scheduled_store_connector_rejects_an_invalid_reserved_job_schema() {
 }
 
 #[tokio::test]
-async fn same_operation_race_reconciles_one_durable_commit_for_both_callers() {
-    let server = MockServer::start_async().await;
-    let receipt_key = receipt_sort_key(7);
-    let fingerprint = fingerprint_put(b"v");
-    let receipt_calls = Arc::new(AtomicUsize::new(0));
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                let call = receipt_calls_for_mock.fetch_add(1, Ordering::SeqCst);
-                if call < 2 {
-                    return HttpMockResponse::builder().status(200).body("{}").build();
-                }
-                HttpMockResponse::builder()
-                    .status(200)
-                    .body(
-                        serde_json::json!({
-                            "Item": receipt_item(&receipt_key, &fingerprint, "committed")
-                        })
-                        .to_string(),
-                    )
-                    .build()
-            })
-            .delay(Duration::from_millis(100));
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            then.respond_with({
-                let calls = Arc::new(AtomicUsize::new(0));
-                move |_request| {
-                    let call = calls.fetch_add(1, Ordering::SeqCst);
-                    if call == 0 {
-                        HttpMockResponse::builder()
-                            .status(200)
-                            .body("{}")
-                            .build()
-                    } else {
-                        HttpMockResponse::builder()
-                            .status(400)
-                            .body(
-                                serde_json::json!({
-                                    "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
-                                    "message": "Transaction cancelled",
-                                    "CancellationReasons": [{"Code": "ConditionalCheckFailed"}]
-                                })
-                                .to_string(),
-                            )
-                            .build()
-                    }
-                }
-            });
-        })
-        .await;
-
-    let store = store_for(&server).await;
-    let left = put_transaction(b"v");
-    let right = put_transaction(b"v");
-    let joined = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(store.commit(&left), store.commit(&right))
-    })
-    .await
-    .expect("same-operation race completed");
-    assert_eq!(
-        joined.0.expect("first race result"),
-        CommitOutcome::Committed
-    );
-    assert_eq!(
-        joined.1.expect("second race result"),
-        CommitOutcome::Committed
-    );
-    receipt.assert_calls_async(3).await;
-    transaction.assert_calls_async(2).await;
-}
-
-#[tokio::test]
-async fn independently_constructed_clients_share_atomic_operation_receipt() {
-    let server = MockServer::start_async().await;
-    let receipt_key = receipt_sort_key(7);
-    let left_fingerprint = fingerprint_put(b"left");
-    let right_fingerprint = fingerprint_put(b"right");
-    let winner = Arc::new(Mutex::new(None::<Vec<u8>>));
-    let receipt_calls = Arc::new(AtomicUsize::new(0));
-    let winner_for_receipt = Arc::clone(&winner);
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                let call = receipt_calls_for_mock.fetch_add(1, Ordering::SeqCst);
-                if call < 2 {
-                    return HttpMockResponse::builder().status(200).body("{}").build();
-                }
-                let fingerprint = winner_for_receipt
-                    .lock()
-                    .expect("winner lock")
-                    .clone()
-                    .expect("transaction winner recorded");
-                HttpMockResponse::builder()
-                    .status(200)
-                    .body(
-                        serde_json::json!({
-                            "Item": receipt_item(&receipt_key, &fingerprint, "committed")
-                        })
-                        .to_string(),
-                    )
-                    .build()
-            })
-            .delay(Duration::from_millis(100));
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            let calls = Arc::new(AtomicUsize::new(0));
-            let winner_for_transaction = Arc::clone(&winner);
-            then.respond_with(move |request| {
-                let call = calls.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    let fingerprint = if request.body_string().contains("bGVmdA==") {
-                        left_fingerprint.clone()
-                    } else {
-                        right_fingerprint.clone()
-                    };
-                    *winner_for_transaction.lock().expect("winner lock") = Some(fingerprint);
-                    HttpMockResponse::builder()
-                        .status(200)
-                        .body("{}")
-                        .build()
-                } else {
-                    HttpMockResponse::builder()
-                        .status(400)
-                        .body(
-                            serde_json::json!({
-                                "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
-                                "message": "Transaction cancelled",
-                                "CancellationReasons": [{"Code": "ConditionalCheckFailed"}]
-                            })
-                            .to_string(),
-                        )
-                        .build()
-                }
-            });
-        })
-        .await;
-
-    let left_store = store_for(&server).await;
-    let right_store = store_for(&server).await;
-    let left = put_transaction(b"left");
-    let right = put_transaction(b"right");
-    let joined = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(left_store.commit(&left), right_store.commit(&right))
-    })
-    .await
-    .expect("different-content race completed");
-    let results = [joined.0, joined.1];
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == Ok(CommitOutcome::Committed))
-            .count(),
-        1
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == Err(ScheduledJobStoreError::OperationReuseMismatch))
-            .count(),
-        1
-    );
-    receipt.assert_calls_async(3).await;
-    transaction.assert_calls_async(2).await;
-}
-
-#[tokio::test]
-async fn post_dispatch_request_timeout_reconciles_the_durable_receipt() {
-    let server = MockServer::start_async().await;
-    let store = store_for_with_request_timeout(&server, RESPONSE_TIMEOUT).await;
-    let receipt_key = receipt_sort_key(7);
-    let fingerprint = fingerprint_put(b"v");
-    let receipt_calls = Arc::new(AtomicUsize::new(0));
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                let call = receipt_calls_for_mock.fetch_add(1, Ordering::SeqCst);
-                let body = if call == 0 {
-                    serde_json::json!({})
-                } else {
-                    serde_json::json!({
-                        "Item": receipt_item(&receipt_key, &fingerprint, "committed")
-                    })
-                };
-                HttpMockResponse::builder()
-                    .status(200)
-                    .body(body.to_string())
-                    .build()
-            });
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            then.status(200).body("{}").delay(STALLED_RESPONSE_DELAY);
-        })
-        .await;
-
-    let result = commit_after_observed_timeout(&store, &transaction)
-        .await
-        .expect("durable receipt reconciled");
-
-    assert_eq!(result, CommitOutcome::Committed);
-    receipt.assert_calls_async(2).await;
-    assert!(transaction.calls_async().await >= 1);
-}
-
-#[tokio::test]
-async fn post_dispatch_timeout_without_a_receipt_returns_unknown_without_retrying() {
-    let server = MockServer::start_async().await;
-    let store = store_for_with_request_timeout(&server, RESPONSE_TIMEOUT).await;
-    let receipt_key = receipt_sort_key(7);
-    let receipt_calls = Arc::new(AtomicUsize::new(0));
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                receipt_calls_for_mock.fetch_add(1, Ordering::SeqCst);
-                HttpMockResponse::builder().status(200).body("{}").build()
-            });
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            then.status(200).body("{}").delay(STALLED_RESPONSE_DELAY);
-        })
-        .await;
-
-    let outcome = commit_after_observed_timeout(&store, &transaction).await;
-
-    let transaction_calls = transaction.calls_async().await;
-    assert!(
-        matches!(outcome, Ok(CommitOutcome::Unknown)),
-        "commit outcome: {outcome:?}; completed receipt responses: {}; dispatched transaction \
-         requests: {transaction_calls}",
-        receipt_calls.load(Ordering::SeqCst),
-    );
-    receipt.assert_calls_async(2).await;
-    assert_eq!(transaction_calls, 1);
-}
-
-#[tokio::test]
-async fn given_receipt_read_times_out_when_committing_then_no_transaction_is_dispatched() {
-    let server = MockServer::start_async().await;
-    let store = store_for_with_request_timeout(&server, RESPONSE_TIMEOUT).await;
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(receipt_sort_key(7))
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200).body("{}").delay(STALLED_RESPONSE_DELAY);
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
-            then.status(200).body("{}");
-        })
-        .await;
-
-    let outcome = commit_after_observed_timeout(&store, &receipt).await;
-
-    assert!(
-        matches!(outcome, Err(ScheduledJobStoreError::Backend(_))),
-        "{outcome:?}"
-    );
-    receipt.assert_calls_async(1).await;
-    assert_eq!(transaction.calls_async().await, 0);
-}
-
-#[tokio::test]
-async fn idempotent_parameter_mismatch_is_operation_reuse_mismatch() {
-    let server = MockServer::start_async().await;
-    let receipt_key = receipt_sort_key(7);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200)
-                .body("{}")
-                .delay(Duration::from_millis(100));
-        })
-        .await;
-    let transaction_calls = Arc::new(AtomicUsize::new(0));
-    let transaction_calls_for_mock = Arc::clone(&transaction_calls);
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            then.respond_with(move |_request| {
-                let call = transaction_calls_for_mock.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    HttpMockResponse::builder().status(200).body("{}").build()
-                } else {
-                    HttpMockResponse::builder()
-                        .status(400)
-                        .body(
-                            serde_json::json!({
-                                "__type": "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException",
-                                "message": "request token has already been used with different parameters"
-                            })
-                            .to_string(),
-                        )
-                        .build()
-                }
-            });
-        })
-        .await;
-
-    let store = store_for(&server).await;
-    let left = put_transaction(b"left");
-    let right = put_transaction(b"right");
-    let joined = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(store.commit(&left), store.commit(&right))
-    })
-    .await
-    .expect("idempotency race completed");
-    let results = [joined.0, joined.1];
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == Ok(CommitOutcome::Committed))
-            .count(),
-        1
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == Err(ScheduledJobStoreError::OperationReuseMismatch))
-            .count(),
-        1
-    );
-    receipt.assert_calls_async(2).await;
-    assert_eq!(transaction.calls_async().await, 2);
-}
-
-#[tokio::test]
-async fn idempotent_parameter_mismatch_without_a_receipt_is_operation_reuse_mismatch() {
-    let server = MockServer::start_async().await;
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(receipt_sort_key(7))
-                .body_includes("\"ConsistentRead\":true");
-            then.status(200).body("{}");
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)));
-            then.status(400).json_body(serde_json::json!({
-                "__type": "com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException",
-                "message": "request token has already been used with different parameters"
-            }));
-        })
-        .await;
-
-    let store = store_for(&server).await;
-    let result = store.commit(&put_transaction(b"different")).await;
-
-    assert_eq!(result, Err(ScheduledJobStoreError::OperationReuseMismatch));
-    receipt.assert_calls_async(1).await;
-    transaction.assert_calls_async(1).await;
-}
-
-#[tokio::test]
 async fn cross_host_307_redirect_preserves_scheduled_commit_identity() {
     assert_cross_host_scheduled_commit_redirect(307).await;
 }
@@ -744,23 +294,12 @@ async fn cross_host_308_redirect_preserves_scheduled_commit_identity() {
 async fn assert_cross_host_scheduled_commit_redirect(status: u16) {
     let alias = MockServer::start_async().await;
     let target = MockServer::start_async().await;
-    let token = format!("{}-c", operation_hex(7));
-    let receipt_key = receipt_sort_key(7);
-    let receipt = alias
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true")
-                .header_missing("authorization");
-            then.status(200).body("{}");
-        })
-        .await;
     let alias_transaction = alias
         .mock_async(|when, then| {
             when.method(POST)
                 .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(&token)
+                .body_includes("K#6b")
+                .body_excludes("ClientRequestToken")
                 .header_missing("authorization");
             then.status(status)
                 .header("location", target.url("/target"));
@@ -771,9 +310,9 @@ async fn assert_cross_host_scheduled_commit_redirect(status: u16) {
             when.method(POST)
                 .path("/target")
                 .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(&token)
-                .body_includes(&receipt_key)
-                .body_includes("attribute_not_exists")
+                .body_includes("K#6b")
+                .body_excludes("ClientRequestToken")
+                .body_excludes("R#")
                 .header_missing("authorization");
             then.status(200).body("{}");
         })
@@ -782,12 +321,11 @@ async fn assert_cross_host_scheduled_commit_redirect(status: u16) {
     let store = store_for(&alias).await;
     assert_eq!(
         store
-            .commit(&put_transaction(b"redirected"))
+            .transact(&put_transaction(b"redirected"))
             .await
             .expect("cross-host redirected commit"),
         CommitOutcome::Committed
     );
-    receipt.assert_calls_async(1).await;
     alias_transaction.assert_calls_async(1).await;
     target_transaction.assert_calls_async(1).await;
 }
@@ -803,7 +341,7 @@ async fn given_coherent_remote_store_when_capabilities_are_read_then_level_is_di
     assert_eq!(capabilities.max_get_many_keys().get(), 100);
     assert_eq!(capabilities.max_get_many_key_bytes().get(), 51_100);
     assert_eq!(capabilities.max_transaction_bytes().get(), 1_048_576);
-    assert_eq!(capabilities.max_transaction_keys().get(), 99);
+    assert_eq!(capabilities.max_transaction_keys().get(), 100);
     assert_eq!(capabilities.max_range_items().get(), 100);
     assert_eq!(capabilities.max_range_bytes().get(), 262_144);
     assert_eq!(capabilities.max_transaction_duration().as_secs(), 30);
@@ -1301,160 +839,8 @@ async fn range_without_end_preserves_forward_and_reverse_cursors() {
 }
 
 #[tokio::test]
-async fn commit_replays_exact_receipt_and_rejects_changed_content_without_reapplying() {
-    let server = MockServer::start_async().await;
-    let fingerprint = fingerprint_put(b"v");
-    let receipt_key = receipt_sort_key(7);
-    let receipt_calls = Arc::new(Mutex::new(0usize));
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                let mut calls = receipt_calls_for_mock.lock().expect("receipt call lock");
-                let body = if *calls == 0 {
-                    serde_json::json!({})
-                } else {
-                    serde_json::json!({
-                        "Item": receipt_item(&receipt_key, &fingerprint, "committed")
-                    })
-                };
-                *calls += 1;
-                HttpMockResponse::builder()
-                    .status(200)
-                    .body(body.to_string())
-                    .build()
-            });
-        })
-        .await;
-    let transaction = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes(format!("{}-c", operation_hex(7)))
-                .body_includes("SCHEDULED_JOB_STORE#1")
-                .body_excludes("#v");
-            then.status(200).json_body(serde_json::json!({}));
-        })
-        .await;
-
-    let store = store_for(&server).await;
-    assert_eq!(
-        store.commit(&put_transaction(b"v")).await.expect("commit"),
-        CommitOutcome::Committed
-    );
-    assert_eq!(
-        store.commit(&put_transaction(b"v")).await.expect("replay"),
-        CommitOutcome::Committed
-    );
-    let error = store
-        .commit(&put_transaction(b"different"))
-        .await
-        .expect_err("changed content must be rejected");
-    assert_eq!(format!("{error:?}"), "OperationReuseMismatch");
-    receipt.assert_calls_async(3).await;
-    transaction.assert_calls_async(1).await;
-}
-
-#[tokio::test]
-async fn failed_check_persists_conflict_guard_and_replays_without_mutation() {
-    let server = MockServer::start_async().await;
-    let receipt_key = receipt_sort_key(9);
-    let fingerprint = {
-        let transaction = absent_transaction();
-        let mut bytes = vec![2, 0, 0, 0, 1, 0];
-        let key_bytes = b"conflict";
-        bytes.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(key_bytes);
-        bytes.extend_from_slice(&(1u32).to_be_bytes());
-        bytes.push(2);
-        bytes.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(key_bytes);
-        bytes.extend_from_slice(&(3u32).to_be_bytes());
-        bytes.extend_from_slice(b"new");
-        assert_eq!(transaction.checks().len(), 1);
-        Sha256::digest(&bytes).to_vec()
-    };
-    let receipt_calls = Arc::new(Mutex::new(0usize));
-    let receipt_calls_for_mock = Arc::clone(&receipt_calls);
-    let receipt_key_for_response = receipt_key.clone();
-    let fingerprint_for_response = fingerprint.clone();
-    let receipt = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConsistentRead\":true");
-            then.respond_with(move |_request| {
-                let mut calls = receipt_calls_for_mock.lock().expect("receipt call lock");
-                let body = if *calls == 0 {
-                    serde_json::json!({})
-                } else {
-                    serde_json::json!({
-                        "Item": receipt_item(
-                            &receipt_key_for_response,
-                            &fingerprint_for_response,
-                            "conflict"
-                        )
-                    })
-                };
-                *calls += 1;
-                HttpMockResponse::builder()
-                    .status(200)
-                    .body(body.to_string())
-                    .build()
-            });
-        })
-        .await;
-    let batch = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.BatchGetItem")
-                .body_includes("\"ConsistentRead\":true")
-                .body_includes("K#636f6e666c696374");
-            then.status(200).json_body(serde_json::json!({
-                "Responses": {
-                    "job": [data_item("636f6e666c696374", "ZXhpc3Rpbmc=")]
-                }
-            }));
-        })
-        .await;
-    let conflict_write = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
-                .body_includes("attribute_exists(#pk)")
-                .body_includes(&receipt_key)
-                .body_includes("\"ConditionCheck\"");
-            then.status(200).json_body(serde_json::json!({}));
-        })
-        .await;
-
-    let store = store_for(&server).await;
-    assert_eq!(
-        store
-            .commit(&absent_transaction())
-            .await
-            .expect("durable conflict"),
-        CommitOutcome::Conflict
-    );
-    assert_eq!(
-        store
-            .commit(&absent_transaction())
-            .await
-            .expect("conflict replay"),
-        CommitOutcome::Conflict
-    );
-    receipt.assert_calls_async(2).await;
-    batch.assert_calls_async(1).await;
-    conflict_write.assert_calls_async(1).await;
-}
-
-#[tokio::test]
-async fn given_950_kib_payload_when_remote_chunks_commit_then_receipt_contains_only_a_digest() {
+async fn given_950_kib_payload_when_native_chunks_commit_then_only_the_requested_chunks_are_written()
+ {
     let server = MockServer::start_async().await;
     let receipt = server
         .mock_async(|when, then| {
@@ -1499,7 +885,7 @@ async fn given_950_kib_payload_when_remote_chunks_commit_then_receipt_contains_o
         .await;
     let store = store_for(&server).await;
     assert_eq!(
-        store.commit(&transaction).await.expect("commit"),
+        store.transact(&transaction).await.expect("commit"),
         CommitOutcome::Committed
     );
     let request: serde_json::Value =
@@ -1508,85 +894,36 @@ async fn given_950_kib_payload_when_remote_chunks_commit_then_receipt_contains_o
         .as_array()
         .expect("transaction items");
     let mut restored = Vec::new();
-    let mut receipts = 0;
     for item in items {
         let row = &item["Put"]["Item"];
-        if row["kind"]["S"] == "commit-receipt-v2" {
-            receipts += 1;
-            assert_eq!(
-                STANDARD
-                    .decode(row["content"]["B"].as_str().unwrap())
-                    .unwrap()
-                    .len(),
-                32
-            );
-        } else {
-            restored.extend(STANDARD.decode(row["v"]["B"].as_str().unwrap()).unwrap());
-        }
+        assert!(row["sk"]["S"].as_str().unwrap().starts_with("K#"));
+        assert!(row.get("content").is_none());
+        restored.extend(STANDARD.decode(row["v"]["B"].as_str().unwrap()).unwrap());
     }
-    assert_eq!(receipts, 1);
+    assert_eq!(items.len(), transaction.mutations().len());
+    assert!(request.get("ClientRequestToken").is_none());
     assert_eq!(restored, payload);
-    receipt.assert_calls_async(1).await;
+    receipt.assert_calls_async(0).await;
     commit.assert_calls_async(1).await;
 }
 
 #[tokio::test]
-async fn given_malformed_receipt_fingerprints_when_replaying_then_no_mutation_is_dispatched() {
-    for length in [0, 31, 33] {
-        let server = MockServer::start_async().await;
-        let row = receipt_item(&receipt_sort_key(7), &vec![0; length], "committed");
-        let receipt = server
-            .mock_async(|when, then| {
-                when.method(POST)
-                    .header("x-amz-target", "DynamoDB_20120810.GetItem");
-                then.status(200).json_body(serde_json::json!({"Item": row}));
-            })
-            .await;
-        let mutation = server
-            .mock_async(|when, then| {
-                when.method(POST)
-                    .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
-                then.status(200).body("{}");
-            })
-            .await;
-        let store = store_for(&server).await;
-        assert!(matches!(
-            store.commit(&put_transaction(b"v")).await,
-            Err(ScheduledJobStoreError::Backend(
-                scheduled_bg_jobs::store::StoreFailure::Corrupt(_)
-            ))
-        ));
-        receipt.assert_calls_async(1).await;
-        mutation.assert_calls_async(0).await;
-    }
-}
-
-#[tokio::test]
-async fn given_obsolete_full_content_receipt_when_replaying_then_format_is_rejected() {
+async fn given_a_native_response_timeout_when_dispatched_then_unknown_is_preserved_without_history_reads()
+ {
     let server = MockServer::start_async().await;
-    let mut row = receipt_item(&receipt_sort_key(7), &fingerprint_put(b"v"), "committed");
-    row["kind"]["S"] = serde_json::json!("commit-receipt-v1");
-    let receipt = server
+    let transaction = server
         .mock_async(|when, then| {
             when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.GetItem");
-            then.status(200).json_body(serde_json::json!({"Item": row}));
+                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems")
+                .body_excludes("ClientRequestToken")
+                .body_excludes("R#");
+            then.status(200).body("{}").delay(STALLED_RESPONSE_DELAY);
         })
         .await;
-    let mutation = server
-        .mock_async(|when, then| {
-            when.method(POST)
-                .header("x-amz-target", "DynamoDB_20120810.TransactWriteItems");
-            then.status(200).body("{}");
-        })
-        .await;
-    let store = store_for(&server).await;
-    assert!(matches!(
-        store.commit(&put_transaction(b"v")).await,
-        Err(ScheduledJobStoreError::Backend(
-            scheduled_bg_jobs::store::StoreFailure::Corrupt(_)
-        ))
-    ));
-    receipt.assert_calls_async(1).await;
-    mutation.assert_calls_async(0).await;
+    let store = store_for_with_request_timeout(&server, RESPONSE_TIMEOUT).await;
+    let outcome = commit_after_observed_timeout(&store, &transaction)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Unknown);
+    transaction.assert_calls_async(1).await;
 }

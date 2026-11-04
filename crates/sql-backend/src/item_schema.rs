@@ -40,7 +40,7 @@ pub fn render_item_table(
     let primary = primary_key_columns(&table.key_schema, "");
     create_table(
         engine,
-        &engine.item_table_name(&table.table_name, history_id),
+        &engine.item_table_name(history_id),
         columns,
         primary,
     )
@@ -80,7 +80,7 @@ pub fn render_gsi_table(
     primary.extend(primary_key_columns(&table.key_schema, "table_"));
     create_table(
         engine,
-        &engine.gsi_table_name(&table.table_name, &index.index_name, incarnation),
+        &engine.gsi_table_name(incarnation),
         columns,
         primary,
     )
@@ -95,8 +95,8 @@ pub fn render_gsi_read_index(
     index: &GlobalSecondaryIndex,
     incarnation: &TargetIncarnation,
 ) -> String {
-    let physical = engine.gsi_table_name(&table.table_name, &index.index_name, incarnation);
-    let name = engine.gsi_read_index_name(&table.table_name, &index.index_name, incarnation);
+    let physical = engine.gsi_table_name(incarnation);
+    let name = engine.gsi_read_index_name(incarnation);
     let mut columns = vec!["__aux_tombstone".to_owned()];
     columns.extend(primary_key_columns(&index.key_schema, ""));
     columns.extend(primary_key_columns(&table.key_schema, "table_"));
@@ -107,18 +107,14 @@ pub fn render_gsi_read_index(
 }
 
 #[must_use]
-pub fn render_ttl_index_table(
-    engine: impl SqlLayout,
-    table: &StoredTableInfo,
-    history_id: TableHistoryId,
-) -> String {
+pub fn render_ttl_index_table(engine: impl SqlLayout, history_id: TableHistoryId) -> String {
     let columns = vec![
         format!("ttl_value {} NOT NULL", engine.engine().integer_type()),
         format!("key_token {} NOT NULL", engine.engine().text_type()),
     ];
     create_table(
         engine,
-        &engine.ttl_table_name(&table.table_name, history_id),
+        &engine.ttl_table_name(history_id),
         columns,
         vec!["ttl_value".to_owned(), "key_token".to_owned()],
     )
@@ -129,11 +125,10 @@ pub fn render_ttl_index_table(
 #[must_use]
 pub fn render_add_union_key_column(
     engine: impl SqlLayout,
-    table: &StoredTableInfo,
     column: &PlannedKeyColumn,
     history_id: TableHistoryId,
 ) -> String {
-    let physical = engine.item_table_name(&table.table_name, history_id);
+    let physical = engine.item_table_name(history_id);
     let attribute = AttributeName::new(&column.attribute_name);
     let name = attribute.sanitized();
     let storage = engine.engine().key_column_type(column.attribute_type);
@@ -156,11 +151,7 @@ fn item_metadata_columns(engine: impl SqlLayout) -> Vec<String> {
             "__aux_evaluated_bytes {int} NOT NULL CHECK (__aux_evaluated_bytes > 0 AND \
              __aux_evaluated_bytes <= {MAX_ITEM_SIZE_BYTES})"
         ),
-        format!("item_descriptor {} NOT NULL", engine.engine().blob_type()),
-        format!(
-            "__aux_indexers {} NOT NULL DEFAULT '[]'",
-            engine.engine().text_type()
-        ),
+        format!("item_value {} NOT NULL", engine.engine().blob_type()),
     ]
 }
 
@@ -174,7 +165,7 @@ fn gsi_metadata_columns(engine: impl SqlLayout) -> Vec<String> {
              NULL) OR (__aux_tombstone = 0 AND __aux_evaluated_bytes IS NOT NULL AND \
              __aux_evaluated_bytes > 0 AND __aux_evaluated_bytes <= {MAX_ITEM_SIZE_BYTES}))"
         ),
-        format!("item_descriptor {} NOT NULL", engine.engine().blob_type()),
+        format!("item_value {} NOT NULL", engine.engine().blob_type()),
     ]
 }
 

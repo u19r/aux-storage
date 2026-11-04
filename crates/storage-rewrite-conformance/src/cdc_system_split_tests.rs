@@ -7,7 +7,7 @@ use stream_provider::{
     SystemStreamSplitOperationId, SystemStreamSplitRequest,
 };
 
-use super::test_support::{TestStore, hash_table_request};
+use super::test_support::TestStore;
 
 #[tokio::test]
 async fn given_issued_checkpoint_when_split_replays_and_writes_continue_then_all_records_are_readable()
@@ -15,10 +15,7 @@ async fn given_issued_checkpoint_when_split_replays_and_writes_continue_then_all
     let fixture = TestStore::new_durable().await;
     let outcome = async {
         let table = TableName::new("split_writes");
-        fixture
-            .operations
-            .create_table(hash_table_request(table.clone()))
-            .await?;
+        super::cdc_stream_tests::create_named_table(&fixture, table.clone()).await?;
         let scope = fixture.stream_operations.system_stream_scope().await?;
         for key in ["before-1", "before-2"] {
             fixture

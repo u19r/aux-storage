@@ -20,7 +20,6 @@ fn request() -> TransactWriteItemsRequest {
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..Default::default()
         }],
@@ -49,7 +48,6 @@ fn given_terminal_projection_when_execution_members_are_supplied_then_they_are_r
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values_on_condition_check_failure: None,
-        aux_item_stream_ttl_hours: None,
     });
     assert!(JobTerminalProjection::try_from(delete).is_err());
     let mut put = valid.clone();
@@ -66,7 +64,6 @@ fn given_terminal_projection_when_execution_members_are_supplied_then_they_are_r
         expression_attribute_names: None,
         expression_attribute_values: None,
         return_values_on_condition_check_failure: None,
-        aux_item_stream_ttl_hours: None,
     });
     assert!(JobTerminalProjection::try_from(put).is_err());
     let mut unconditional = valid.clone();

@@ -22,35 +22,6 @@ pub(super) struct CollectedRetainedDefinition {
 }
 
 impl JournalStore {
-    pub(in crate::journal) fn require_collected_retained_definition(
-        &self,
-        row: &infrastructure_provider::record::DurableRecord,
-    ) -> StorageResult<()> {
-        let fact: CollectedRetainedDefinition = self.records.decode(row)?;
-        let request = crate::history_capture::HistoryCaptureRequest {
-            proposal: fact.proposal.clone(),
-            region: fact.proposal.operation().home_region.clone(),
-        };
-        self.require_collection_request(&request)?;
-        if let Some(inventory) = fact.inventory {
-            crate::bootstrap::ReenableHistoryCustody {
-                definition: inventory,
-                ordinal: 0,
-            }
-            .require_custodian(&fact.proposal)?;
-        }
-        if row.revision != storage_types::Revision::INITIAL
-            || row.key
-                != self.identity_key(
-                    crate::constants::COLLECTED_RETAINED_DEFINITION_SUFFIX,
-                    &fact.proposal.operation().id,
-                )?
-        {
-            return Err(corrupt_record());
-        }
-        Ok(())
-    }
-
     pub(in crate::journal) fn decode_collected_retained_cut(
         &self,
         row: &infrastructure_provider::record::DurableRecord,

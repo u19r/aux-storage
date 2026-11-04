@@ -36,7 +36,6 @@ fn table_metadata(table_name: &str) -> Arc<StoredTableInfo> {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
-        default_item_stream_duration: StreamRetentionDuration::DEFAULT_TABLE_STREAM_DURATION,
         deletion_protection_enabled: false,
     })
 }

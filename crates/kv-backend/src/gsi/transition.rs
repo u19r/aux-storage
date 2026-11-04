@@ -4,13 +4,9 @@ use storage_backfill::GsiBuild;
 use storage_provider::{GsiWriteSource, UpdateTimeToLiveAttempt, maintenance::GsiTransition};
 use storage_types::{BoundTableInfo, StorageResult, maintenance::MaintenanceKind};
 
-use super::{
-    GsiWriteInput, catalog::build_mutations, key_layout::hold_key, prepare_gsi_writes,
-    read::target_index,
-};
+use super::{GsiWriteInput, catalog::build_mutations, prepare_gsi_writes, read::target_index};
 use crate::{
-    KvAttempt, KvMutation, catalog::KvCatalogAttempt, item_write::apply_ttl_index_writes,
-    maintenance,
+    KvAttempt, catalog::KvCatalogAttempt, item_write::apply_ttl_index_writes, maintenance,
 };
 
 pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
@@ -41,22 +37,15 @@ pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
             writes: projections,
             prepared: &mut Vec::new(),
         },
-    )
-    .await?;
+    )?;
     catalog
         .attempt
-        .stage(std::mem::take(&mut catalog.projection_tree).into_mutations()?)?;
+        .stage(std::mem::take(&mut catalog.projection_changes).into_mutations()?)?;
     apply_ttl_index_writes(catalog.attempt, identity.table_id, ttl_writes).await?;
     let next = GsiBuild {
         target: expected.target.clone(),
         state: next_state,
     };
-    replace_history_holds(
-        catalog.attempt,
-        expected.target.incarnation.as_ref(),
-        &expected,
-        &next,
-    )?;
     catalog
         .attempt
         .stage(build_mutations(identity.table_id, index_id, &next)?.into())?;
@@ -72,37 +61,4 @@ pub(crate) async fn apply_gsi_transition<A: KvAttempt>(
         expected_revision,
         next_progress,
     )
-}
-
-fn replace_history_holds<A: KvAttempt>(
-    attempt: &mut A,
-    incarnation: &[u8],
-    expected: &GsiBuild<Vec<u8>>,
-    next: &GsiBuild<Vec<u8>>,
-) -> StorageResult<()> {
-    let Some((old, new)) = expected.history_hold_change(&next.state) else {
-        return Ok(());
-    };
-    let count = old
-        .frontier()
-        .len()
-        .checked_add(new.frontier().len())
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut changes = Vec::new();
-    changes
-        .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    // Candidate admission protected these exact old holds in this attempt.
-    for position in old.frontier() {
-        changes.push(KvMutation::Delete {
-            key: hold_key(old, position, incarnation)?,
-        });
-    }
-    for position in new.frontier() {
-        changes.push(KvMutation::Put {
-            key: hold_key(new, position, incarnation)?,
-            value: Vec::new(),
-        });
-    }
-    attempt.stage(changes)
 }

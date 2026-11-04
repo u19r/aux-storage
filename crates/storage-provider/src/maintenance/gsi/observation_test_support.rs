@@ -4,9 +4,8 @@ use std::collections::VecDeque;
 
 use storage_backfill::{
     GsiActivationState, GsiBuild, GsiBuildCandidates, GsiBuildTarget, GsiChange, GsiPageLimit,
-    GsiProjection, GsiProjectionKey, GsiProjectionStateReadBatch, GsiReferencedHistoryItem,
-    GsiReferencedHistoryRead, GsiScanObservation, GsiScanPageEnd, GsiScanSourcePage,
-    GsiStreamObservation, GsiStreamPageEnd, GsiStreamSourcePage,
+    GsiProjection, GsiProjectionKey, GsiProjectionStateReadBatch, GsiScanObservation,
+    GsiScanPageEnd, GsiScanSourcePage, GsiStreamObservation, GsiStreamPageEnd, GsiStreamSourcePage,
 };
 use storage_common::TtlConfigRecord;
 use storage_types::{
@@ -22,7 +21,6 @@ pub(super) enum Read {
     Scan(Option<u64>),
     Stream(u64, u64),
     Frontier(u64, u64),
-    Tail,
     Activation(u64),
 }
 
@@ -30,7 +28,6 @@ pub(super) struct Observations {
     pub(super) expected: VecDeque<Read>,
     pub(super) scan: Option<StorageResult<GsiScanObservation<u64>>>,
     pub(super) stream: Option<StorageResult<GsiStreamObservation>>,
-    pub(super) tail: u64,
     pub(super) history_available: bool,
     pub(super) incarnation: TargetIncarnation,
 }
@@ -41,7 +38,6 @@ impl Observations {
             expected: expected.into_iter().collect(),
             scan: None,
             stream: None,
-            tail: 0,
             history_available: true,
             incarnation: target().incarnation,
         }
@@ -93,11 +89,6 @@ impl GsiBuildTransaction for Observations {
         assert_eq!(limit.including_lookahead(), 3);
         self.read(Read::Stream(offset(&after), offset(&through)));
         self.stream.take().expect("stream observation")
-    }
-
-    async fn read_gsi_stream_tail(&mut self) -> StorageResult<SystemStreamCheckpoint> {
-        self.read(Read::Tail);
-        Ok(checkpoint(self.tail))
     }
 
     async fn validate_gsi_frontier(
@@ -169,13 +160,6 @@ impl GsiBuildTransaction for Observations {
         unreachable!("decoded observations include projection state")
     }
 
-    async fn read_gsi_referenced_histories(
-        &mut self,
-        _: &[GsiReferencedHistoryRead<'_>],
-    ) -> StorageResult<Vec<GsiReferencedHistoryItem>> {
-        unreachable!("decoded observations include history")
-    }
-
     async fn read_gsi_ttl_config(
         &mut self,
         _: &TableName,
@@ -198,6 +182,7 @@ impl GsiBuildTransaction for Observations {
 
 pub(super) fn target() -> GsiBuildTarget {
     GsiBuildTarget {
+        history_id: 1u32.into(),
         table_name: TableName::new("observation"),
         index_name: IndexName::new("by-key"),
         incarnation: [1; 16].into(),

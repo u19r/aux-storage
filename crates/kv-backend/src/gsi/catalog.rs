@@ -1,19 +1,16 @@
-//! Register KV GSI builds and their system-stream history holds.
+//! Register and delete KV GSI build state.
 
 use serde::Serialize;
 use storage_backfill::GsiBuild;
 use storage_types::{IndexName, StorageError, StorageResult, storage_serde};
 
-use super::{
-    key_layout::{gsi_build_key, gsi_runnable_key, hold_key, index_incarnation},
-    read::decode_gsi_builds_for,
-};
+use super::key_layout::{gsi_build_key, gsi_runnable_key, index_incarnation};
 use crate::{
     KvAttempt, KvMutation, ReadProtection,
     catalog::{KvIndexKind, KvTableIdentity},
 };
 
-/// Register a decided build and its stream-history holds in the caller's
+/// Register a decided build in the caller's
 /// native attempt. The caller has captured a protected SystemStream frontier.
 pub async fn register_gsi_builds<A: KvAttempt>(
     attempt: &mut A,
@@ -32,7 +29,8 @@ pub async fn register_gsi_builds<A: KvAttempt>(
             })
             .ok_or_else(|| StorageError::internal("KV GSI build has no index identity"))?;
         let incarnation = index_incarnation(identity.table_id, index.index_id);
-        if build.target.table_name != identity.table_name
+        if build.target.history_id != identity.table_id.into()
+            || build.target.table_name != identity.table_name
             || build.target.incarnation.as_ref() != incarnation.as_slice()
         {
             return Err(StorageError::internal(
@@ -40,25 +38,6 @@ pub async fn register_gsi_builds<A: KvAttempt>(
             ));
         }
         keys.push(gsi_build_key(identity.table_id, index.index_id));
-        changes.extend(
-            build
-                .state
-                .required_stream_history()
-                .frontier()
-                .iter()
-                .map(|position| {
-                    hold_key(
-                        build.state.required_stream_history(),
-                        position,
-                        &incarnation,
-                    )
-                    .map(|key| KvMutation::Put {
-                        key,
-                        value: Vec::new(),
-                    })
-                })
-                .collect::<StorageResult<Vec<_>>>()?,
-        );
         changes.extend(build_mutations(identity.table_id, index.index_id, &build)?);
     }
     let expected = keys.len();
@@ -72,7 +51,7 @@ pub async fn register_gsi_builds<A: KvAttempt>(
     attempt.stage(changes)
 }
 
-/// Delete physical build and history-hold keys selected by the shared table
+/// Delete physical build keys selected by the shared table
 /// lifecycle. Name reservation is staged by the table-update effect.
 pub(crate) async fn delete_gsi_builds<A: KvAttempt>(
     attempt: &mut A,
@@ -95,34 +74,10 @@ pub(crate) async fn delete_gsi_builds<A: KvAttempt>(
     if indexes.is_empty() {
         return Ok(());
     }
-    let keys = indexes
-        .iter()
-        .map(|index| gsi_build_key(identity.table_id, index.index_id))
-        .collect::<Vec<_>>();
-    let records = attempt.get_batch(keys, ReadProtection::Conflict).await?;
-    let builds: Vec<GsiBuild<Vec<u8>>> = decode_gsi_builds_for(identity, &indexes, records)?;
-    let mut changes = Vec::new();
-
-    for (index, build) in indexes.into_iter().zip(builds) {
-        let incarnation = index_incarnation(identity.table_id, index.index_id);
-        changes.extend(
-            build
-                .state
-                .required_stream_history()
-                .frontier()
-                .iter()
-                .map(|position| {
-                    hold_key(
-                        build.state.required_stream_history(),
-                        position,
-                        &incarnation,
-                    )
-                    .map(|key| KvMutation::Delete { key })
-                })
-                .collect::<StorageResult<Vec<_>>>()?,
-        );
-        changes.extend(delete_build_mutations(identity.table_id, index.index_id));
-    }
+    let changes = indexes
+        .into_iter()
+        .flat_map(|index| delete_build_mutations(identity.table_id, index.index_id))
+        .collect();
     attempt.stage(changes)
 }
 
@@ -133,7 +88,7 @@ pub(super) fn build_mutations<Cursor: Serialize>(
 ) -> StorageResult<[KvMutation; 2]> {
     let value = storage_serde::to_bytes(build)?;
     let runnable_key = gsi_runnable_key(table_id, index_id);
-    let runnable = if build.state.permits_projection() {
+    let runnable = if build.state.is_runnable() {
         KvMutation::Put {
             key: runnable_key,
             value: value.clone(),

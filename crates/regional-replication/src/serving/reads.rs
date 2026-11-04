@@ -87,8 +87,14 @@ pub(super) async fn read_point_in_attempt<
         infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
     let attempt = settlement.as_mut();
     let result = async {
-        let observed =
-            resolve_tables_batch_in_attempt(attempt, cache, request.table_names().as_ref()).await;
+        let bindings = storage_provider::RequestTableBindings::default();
+        let observed = resolve_tables_batch_in_attempt(
+            attempt,
+            cache,
+            request.table_names().as_ref(),
+            &bindings,
+        )
+        .await;
         let observed = match observed {
             Ok(observed) => observed,
             Err(error) => return Ok((request.metadata_failure(error)?, Vec::new())),

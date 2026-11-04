@@ -18,11 +18,11 @@ use crate::{
 impl JournalStore {
     pub(in crate::journal) fn expected_winner_key(
         &self,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         key: &CanonicalItemKey,
     ) -> StorageResult<DurableRecordKey> {
         let mut address: RecordAddress = self
-            .identity_key(EXPECTED_WINNER_SUFFIX, &operation)?
+            .table_identity_key(EXPECTED_WINNER_SUFFIX, scope.0, &scope.1)?
             .into();
         address
             .suffix
@@ -33,7 +33,7 @@ impl JournalStore {
     pub(in crate::journal) async fn fold_expected_winner<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        operation: ControlOperationId,
+        scope: (storage_types::TableHistoryId, ControlOperationId),
         input: (&KeyAttributes, WinnerProvenance),
     ) -> StorageResult<()> {
         let mut settlement =
@@ -41,7 +41,7 @@ impl JournalStore {
         let attempt = settlement.as_mut();
         let result = async {
             let (key_attributes, incoming) = input;
-            let key = self.expected_winner_key(operation, &incoming.key)?;
+            let key = self.expected_winner_key(scope, &incoming.key)?;
             let rows = self
                 .records
                 .load(
@@ -52,7 +52,7 @@ impl JournalStore {
                 .await?;
             let observed = rows[0]
                 .as_ref()
-                .map(|row| self.decode_expected_winner(row, operation))
+                .map(|row| self.decode_expected_winner(row, scope))
                 .transpose()?;
             if observed
                 .as_ref()
@@ -71,7 +71,7 @@ impl JournalStore {
                 return Ok(());
             }
             let expected = ExpectedWinner {
-                operation,
+                operation: scope.1,
                 key: key_attributes.clone(),
                 provenance: incoming,
             };

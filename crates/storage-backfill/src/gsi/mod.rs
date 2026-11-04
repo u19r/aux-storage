@@ -4,7 +4,6 @@ mod lifecycle;
 mod models;
 mod prepared_put;
 mod projection;
-mod referenced_history;
 mod status;
 mod stream;
 
@@ -15,14 +14,12 @@ pub use models::{
     GsiCatchingUp, GsiChange, GsiFailureReason, GsiIndexWriteActions, GsiKeyPart, GsiKeyParts,
     GsiObservation, GsiPageLimit, GsiProjectedRow, GsiProjection, GsiProjectionChange,
     GsiProjectionKey, GsiProjectionLifecycle, GsiProjectionStateRead, GsiProjectionStateReadBatch,
-    GsiProjectionWrite, GsiProjectionWriteBatch, GsiReadRequest, GsiRecord,
-    GsiReferencedHistoryItem, GsiScanObservation, GsiScanPageEnd, GsiScanSourcePage,
-    GsiScannedSourceItem, GsiScanning, GsiSourceProjection, GsiState, GsiStateRecord,
-    GsiStreamCandidate, GsiStreamObservation, GsiStreamPageEnd, GsiStreamSourcePage,
-    GsiWriteAction, GsiWriteRequest,
+    GsiProjectionWrite, GsiProjectionWriteBatch, GsiReadRequest, GsiRecord, GsiScanObservation,
+    GsiScanPageEnd, GsiScanSourcePage, GsiScannedSourceItem, GsiScanning, GsiSourceProjection,
+    GsiState, GsiStateRecord, GsiStreamCandidate, GsiStreamObservation, GsiStreamPageEnd,
+    GsiStreamSourcePage, GsiWriteAction, GsiWriteRequest,
 };
 pub use prepared_put::PreparedGsiPut;
-pub use referenced_history::{GsiReferencedHistory, GsiReferencedHistoryRead};
 pub use status::{GsiBuildPhase, GsiBuildStatus};
 pub use stream::GsiStreamPageAssembly;
 

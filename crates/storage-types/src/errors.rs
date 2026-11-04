@@ -143,6 +143,9 @@ pub enum StorageEnum {
     #[error("The public history cursor has expired")]
     HistoryExpired,
 
+    #[error("The data you are trying to access has been trimmed.")]
+    TrimmedDataAccess,
+
     // ConditionalCheckFailedException canonical message.
     #[error("The conditional request failed")]
     ConditionalCheckFailed,

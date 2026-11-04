@@ -12,6 +12,7 @@ use crate::{
 
 fn target(index_name: &IndexName, incarnation: u8) -> GsiBuildTarget {
     GsiBuildTarget {
+        history_id: 1u32.into(),
         table_name: TableName::new("orders"),
         index_name: index_name.clone(),
         incarnation: TargetIncarnation::from([incarnation; 16]),

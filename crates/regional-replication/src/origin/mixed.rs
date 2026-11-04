@@ -40,10 +40,11 @@ async fn load_tables<A: DynamoAttempt + PhysicalRecordAttempt>(
 ) -> StorageResult<(Vec<OperationTable>, Vec<CachePublication>)> {
     let mut tables = Vec::with_capacity(names.len());
     let mut publications = Vec::new();
-    let resolved = resolve_tables_batch_in_attempt(attempt, &context.cache, &names)
-        .await?
-        .into_iter()
-        .collect::<StorageResult<Vec<_>>>()?;
+    let resolved =
+        resolve_tables_batch_in_attempt(attempt, &context.cache, &names, &context.bindings)
+            .await?
+            .into_iter()
+            .collect::<StorageResult<Vec<_>>>()?;
     let bound = resolved
         .iter()
         .map(|(table, _)| table.as_ref())
@@ -128,7 +129,7 @@ where
 }
 
 #[derive(Clone)]
-struct BatchOperation(DynamoBatchWriteShape);
+pub(super) struct BatchOperation(pub(super) DynamoBatchWriteShape);
 
 impl OriginOperation for BatchOperation {
     type Response = BatchWriteItemResponse;
@@ -192,10 +193,7 @@ impl OriginOperation for BatchOperation {
             &context.codec,
         )
         .await?;
-        let events = captured
-            .iter()
-            .map(|mutation| mutation.event.clone())
-            .collect();
+        let has_captured = !captured.is_empty();
         let mut captured = captured.into();
         let response = accepted
             .apply(attempt, context.created_at, |ordinal, _| {
@@ -205,10 +203,29 @@ impl OriginOperation for BatchOperation {
         if !captured.is_empty() {
             return Err(corrupt_record());
         }
+        // Shared batch execution returns no collection/capacity metrics. Its
+        // unprocessed requests are the response's only retained table data.
+        let owners = response
+            .unprocessed_items
+            .as_ref()
+            .into_iter()
+            .flat_map(|items| items.keys())
+            .map(|name| {
+                let table = tables
+                    .iter()
+                    .find(|table| &table.name == name)
+                    .ok_or_else(corrupt_record)?;
+                Ok(super::ReceiptDataOwner {
+                    table: name.clone(),
+                    physical: table.binding.table.history_id,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
         Ok(OriginAttemptOutput {
             response,
             publications,
-            events,
+            has_captured,
+            owners,
         })
     }
 }
@@ -225,7 +242,7 @@ where
 }
 
 #[derive(Clone)]
-struct TransactOperation(DynamoTransactWriteShape);
+pub(super) struct TransactOperation(pub(super) DynamoTransactWriteShape);
 
 impl OriginOperation for TransactOperation {
     type Response = TransactWriteItemsResponse;
@@ -245,7 +262,8 @@ impl OriginOperation for TransactOperation {
             return Ok(OriginAttemptOutput {
                 response,
                 publications: Vec::new(),
-                events: Vec::new(),
+                has_captured: false,
+                owners: Vec::new(),
             });
         }
         let (tables, publications) = load_tables(attempt, context, self.0.table_names()).await?;
@@ -308,10 +326,7 @@ impl OriginOperation for TransactOperation {
             &context.codec,
         )
         .await?;
-        let events = captured
-            .iter()
-            .map(|mutation| mutation.event.clone())
-            .collect();
+        let has_captured = !captured.is_empty();
         let mut captured = captured.into();
         let response = accepted
             .apply(attempt, context.created_at, |ordinal, _| {
@@ -326,7 +341,8 @@ impl OriginOperation for TransactOperation {
         Ok(OriginAttemptOutput {
             response,
             publications,
-            events,
+            has_captured,
+            owners: Vec::new(),
         })
     }
 }

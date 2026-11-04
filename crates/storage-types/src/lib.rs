@@ -11,18 +11,12 @@ mod native_attempt;
 mod native_work;
 pub use native_work::NativeWorkLimits;
 mod frozen_image_projection;
-mod source_ordinal_projection;
-pub use frozen_image_projection::{FrozenImageProjection, FrozenProjectionFields};
-pub use source_ordinal_projection::{SourceOrdinalProjection, SourceProjectionOrdinals};
-mod image_address;
-pub use image_address::{ImageAddress, ImageAddressParts};
-mod immutable_image_id;
 pub(crate) use attribute_value::attribute_value_from_json_value;
 pub use attribute_value::{
     AttributeValue, ConversionError, canonical_dynamo_json, canonical_dynamo_map_json,
     from_hashmap, to_hashmap,
 };
-pub use immutable_image_id::ImmutableImageId;
+pub use frozen_image_projection::{FrozenImageProjection, FrozenProjectionFields};
 pub use native_attempt::{
     AttemptMode, NativeAttemptCall, NativeAttemptCapacity, NativeAttemptRejection,
     NativeAttemptSettlement, ReadProtection,
@@ -92,7 +86,11 @@ mod logical_item_size_set_tests;
 #[cfg(test)]
 mod logical_item_size_tests;
 pub use logical_item_size::LogicalItemSize;
+mod system_history_record;
+#[cfg(test)]
+mod system_history_record_tests;
 mod system_stream_effect_digest;
+pub use system_history_record::SystemHistoryRecord;
 pub use system_stream_effect_digest::SystemStreamEffectDigest;
 mod dynamodb_limits;
 #[cfg(test)]
@@ -132,6 +130,8 @@ mod page_limits_tests;
 pub use page_limits::PageLimits;
 mod stream_record;
 pub use stream_record::StreamRecord;
+#[cfg(test)]
+mod stream_record_tests;
 mod system_stream_source;
 pub use system_stream_source::SystemStreamSourceTableName;
 mod system_stream_checkpoint;
@@ -196,7 +196,11 @@ mod stored_table_info;
 mod stored_table_info_tests;
 pub use stored_table_info::*;
 mod stored_wire_item;
-pub use stored_wire_item::{StoredImageSource, StoredPrimaryDescriptor, StoredWireItem};
+pub use stored_wire_item::StoredWireItem;
+mod materialized_item_record;
+#[cfg(test)]
+mod materialized_item_record_tests;
+pub use materialized_item_record::MaterializedItemRecord;
 mod item_key;
 mod item_key_ordered;
 pub use item_key::{IndexKey, IndexKeyPrefix, ItemKey, ItemKeyError, TableKey};
@@ -370,11 +374,36 @@ mod batch_get_representation_tests;
 
 mod table_history_id;
 pub use table_history_id::TableHistoryId;
+mod table_history_lane;
+pub use table_history_lane::TableHistoryLane;
+#[cfg(test)]
+mod table_history_lane_tests;
+mod table_stream_sequence;
+pub use table_stream_sequence::TableStreamSequence;
+#[cfg(test)]
+mod table_stream_sequence_tests;
 
+mod table_stream_checkpoint;
+pub use table_stream_checkpoint::{TableStreamCheckpoint, TableStreamReadProgress};
 mod table_binding;
-pub use table_binding::BoundTableInfo;
+pub use table_binding::{
+    BoundTableInfo, TableHistorySchema, TableHistoryState, TableHistoryTarget, TableStreamIdentity,
+};
 
+mod item_history;
+mod item_history_pointer;
+pub use item_history_pointer::ItemHistoryPointer;
+mod item_history_record;
+pub use item_history_record::{ItemHistoryRecord, ItemHistoryRecordHeader};
+#[cfg(test)]
+mod item_history_tests;
+pub use item_history::{
+    ItemHistoryChange, ItemHistoryEntry, ItemHistoryKind, ItemHistoryMetadata,
+    ItemHistoryPublication, ItemHistoryReference,
+};
 mod item_history_address;
+#[cfg(test)]
+mod item_history_address_tests;
 pub use item_history_address::ItemHistoryAddress;
 
 #[cfg(test)]
@@ -391,3 +420,6 @@ mod item_provenance_tests;
 
 #[cfg(test)]
 mod wire_alias_decode_tests;
+
+mod page_byte_budget;
+pub use page_byte_budget::PageByteBudget;

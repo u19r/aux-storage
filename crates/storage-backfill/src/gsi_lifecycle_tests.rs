@@ -1,20 +1,18 @@
 use storage_types::{
     AttributeDefinition, AttributeValue, GlobalSecondaryIndex, HIDDEN_TTL_INDEX_PREFIX, IndexName,
-    ItemRevision, ItemStreamVersion, ItemWriteVersions, KeyAttributeType, KeyAttributes,
-    KeySchemaElement, KeyType, MaxIndexers, Projection, ProjectionType, StoredTableInfo,
-    StreamItemId, StreamName, StreamRetentionDuration, StreamSpecification, TableName, TableStatus,
-    TimestampMillis, WireItem, maintenance::TargetIncarnation,
+    ItemRevision, ItemStreamVersion, KeyAttributeType, KeyAttributes, KeySchemaElement, KeyType,
+    MaxIndexers, Projection, ProjectionType, StoredTableInfo, StreamName, StreamRetentionDuration,
+    StreamSpecification, TableName, TableStatus, TimestampMillis, WireItem,
+    maintenance::TargetIncarnation,
 };
-use stream_provider::StoredStreamPointer;
 
 use crate::gsi::{
     GsiActivationObservation, GsiActive, GsiBuild, GsiBuildCandidates, GsiBuildDiscovery,
     GsiBuildProjectionObservation, GsiBuildTarget, GsiChange, GsiFailureReason, GsiLifecycleError,
     GsiObservation, GsiPageLimit, GsiProjection, GsiProjectionChange, GsiProjectionKey,
     GsiProjectionLifecycle, GsiProjectionStateRead, GsiReadRequest, GsiRecord, GsiRecordError,
-    GsiReferencedHistory, GsiReferencedHistoryRead, GsiScanObservation, GsiScanPageEnd,
-    GsiSourceProjection, GsiState, GsiStateRecord, GsiStreamCandidate, GsiStreamObservation,
-    GsiStreamPageEnd, GsiWriteAction,
+    GsiScanObservation, GsiScanPageEnd, GsiSourceProjection, GsiState, GsiStateRecord,
+    GsiStreamCandidate, GsiStreamObservation, GsiStreamPageEnd, GsiWriteAction,
 };
 
 #[test]
@@ -29,11 +27,27 @@ fn page_limit_reserves_one_native_row_for_lookahead() {
 
 fn target() -> GsiBuildTarget {
     GsiBuildTarget {
+        history_id: 1u32.into(),
         table_name: TableName::new("orders"),
         index_name: IndexName::new("by-status"),
         incarnation: TargetIncarnation::try_from(b"orders/by-status/v1".to_vec())
             .expect("valid target incarnation"),
     }
+}
+
+#[test]
+fn given_recreated_table_when_old_gsi_target_is_validated_then_matching_names_do_not_grant_authority()
+ {
+    let original = storage_types::BoundTableInfo {
+        history_id: 1u32.into(),
+        info: std::sync::Arc::new(projection_table(ProjectionType::All)),
+    };
+    target().validate_table(&original).unwrap();
+    let recreated = storage_types::BoundTableInfo {
+        history_id: 2u32.into(),
+        info: original.info,
+    };
+    assert!(target().validate_table(&recreated).is_err());
 }
 
 fn checkpoint(offset: u64) -> storage_types::SystemStreamCheckpoint {
@@ -68,6 +82,7 @@ fn projection_table(projection_type: ProjectionType) -> StoredTableInfo {
         }],
         max_indexers: MaxIndexers::ZERO,
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("by-status"),
             key_schema: vec![KeySchemaElement {
                 attribute_name: "status".to_owned(),
@@ -83,7 +98,6 @@ fn projection_table(projection_type: ProjectionType) -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: StreamRetentionDuration::default(),
-        default_item_stream_duration: StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }
@@ -111,6 +125,7 @@ fn projection_lifecycle_try_from_rejects_ambiguous_build_identity() {
         GsiBuild::<String>::new(target(), low.clone()),
         GsiBuild::<String>::new(
             GsiBuildTarget {
+                history_id: 1u32.into(),
                 table_name: TableName::new("orders"),
                 index_name: IndexName::new("by-customer"),
                 incarnation: duplicate_incarnation,
@@ -137,6 +152,7 @@ fn hidden_ttl_projection_builds_typed_destination_without_gsi_attributes() {
     let mut table = projection_table(ProjectionType::All);
     let index_name = IndexName::new(&format!("{HIDDEN_TTL_INDEX_PREFIX}orders"));
     table.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+        capture_for_build: false,
         index_name: index_name.clone(),
         key_schema: vec![
             KeySchemaElement {
@@ -301,16 +317,15 @@ fn immediate_projection_plan_carries_exact_wire_row_and_revision() {
 }
 
 #[test]
-fn table_stream_requirement_combines_public_stream_and_deferred_projection() {
+fn given_disabled_stream_when_index_exists_then_index_does_not_enable_history() {
     let mut table = projection_table(ProjectionType::All);
-    assert!(table.requires_stream_entry(false));
-    assert!(!table.requires_stream_entry(true));
+    assert!(!table.requires_stream_entry());
 
     table.stream_specification = Some(StreamSpecification {
         stream_enabled: true,
         stream_view_type: None,
     });
-    assert!(table.requires_stream_entry(true));
+    assert!(table.requires_stream_entry());
 }
 
 #[test]
@@ -355,97 +370,6 @@ fn projection_state_read_plan_skips_sources_without_a_destination_key() {
     );
 }
 
-#[test]
-fn referenced_history_plan_and_attachment_own_pointer_correlation() {
-    let table_name = TableName::new("orders");
-    let item_version = ItemStreamVersion::new(7);
-    let mut candidates = vec![
-        GsiStreamCandidate {
-            pointer_id: StreamItemId::from([1; 12]),
-            created_at: TimestampMillis::from_timestamp(1),
-            pointer: StoredStreamPointer::pointer(
-                storage_types::ItemHistoryAddress {
-                    history_id: 1u32.into(),
-                    stream_name: StreamName::from("orders/stream-item/1"),
-                },
-                table_name.clone(),
-                ItemWriteVersions {
-                    item_revision: ItemRevision::initial(),
-                    item_stream_version: item_version,
-                },
-            ),
-            referenced_items: None,
-        },
-        GsiStreamCandidate {
-            pointer_id: StreamItemId::from([2; 12]),
-            created_at: TimestampMillis::from_timestamp(2),
-            pointer: StoredStreamPointer::embedded(
-                storage_types::ItemHistoryAddress {
-                    history_id: 1u32.into(),
-                    stream_name: StreamName::from("orders/stream-item/2"),
-                },
-                table_name.clone(),
-                ItemWriteVersions {
-                    item_revision: ItemRevision::initial(),
-                    item_stream_version: item_version,
-                },
-                Vec::new(),
-            ),
-            referenced_items: None,
-        },
-        GsiStreamCandidate {
-            pointer_id: StreamItemId::from([3; 12]),
-            created_at: TimestampMillis::from_timestamp(3),
-            pointer: StoredStreamPointer::pointer(
-                storage_types::ItemHistoryAddress {
-                    history_id: 1u32.into(),
-                    stream_name: StreamName::from("other/stream-item/1"),
-                },
-                TableName::new("other"),
-                ItemWriteVersions {
-                    item_revision: ItemRevision::initial(),
-                    item_stream_version: item_version,
-                },
-            ),
-            referenced_items: None,
-        },
-    ];
-
-    let table = storage_types::BoundTableInfo {
-        history_id: 1u32.into(),
-        info: std::sync::Arc::new(projection_table(ProjectionType::All)),
-    };
-    let reads = GsiReferencedHistoryRead::plan(&table, &candidates);
-    assert_eq!(reads.len(), 1);
-    assert_eq!(reads[0].candidate_ordinal, 0);
-    assert_eq!(reads[0].stream_name.as_ref(), b"orders/stream-item/1");
-    assert_eq!(reads[0].through, item_version);
-    let candidate_ordinal = reads[0].candidate_ordinal;
-    drop(reads);
-
-    GsiReferencedHistory::attach_all(
-        &mut candidates,
-        [GsiReferencedHistory {
-            candidate_ordinal,
-            items: Vec::new(),
-        }],
-    )
-    .expect("attach referenced history");
-    assert!(candidates[0].referenced_items.is_some());
-    assert!(candidates[1].referenced_items.is_none());
-    assert!(candidates[2].referenced_items.is_none());
-    assert!(
-        GsiReferencedHistory::attach_all(
-            &mut candidates,
-            [GsiReferencedHistory {
-                candidate_ordinal: 0,
-                items: Vec::new(),
-            }],
-        )
-        .is_err()
-    );
-}
-
 fn persisted_state<Cursor>(change: GsiChange<Cursor>) -> GsiState<Cursor> {
     match change {
         GsiChange::Persist { next_state, .. } => next_state,
@@ -457,6 +381,7 @@ fn record_for(state: GsiState<String>) -> GsiRecord {
     let target = target();
     let state = GsiStateRecord::try_from(&state).unwrap();
     GsiRecord {
+        history_id: 1u32.into(),
         table_name: target.table_name.to_string(),
         index_name: target.index_name.to_string(),
         incarnation: target.incarnation.as_ref().to_vec(),
@@ -651,61 +576,6 @@ fn unavailable_required_history_blocks_the_build() {
 }
 
 #[test]
-fn active_build_requests_and_advances_continuing_projection() {
-    let current = checkpoint(3);
-    let next = checkpoint(4);
-    let high = checkpoint(5);
-    let limit = GsiPageLimit::try_from(100).expect("positive page limit");
-    let build = GsiBuild::<String> {
-        target: target(),
-        state: GsiState::Active(GsiActive {
-            cursor: current.clone(),
-            pending_high: None,
-        }),
-    };
-    assert_eq!(build.state.required_stream_history(), &current);
-    assert!(matches!(
-        build.read_request(limit),
-        Ok(GsiReadRequest::Continue { after, .. }) if after == current
-    ));
-
-    let state = persisted_state(
-        build
-            .decide_next_change(GsiObservation::Stream(GsiStreamObservation {
-                expected_cursor: current.clone(),
-                through: high.clone(),
-
-                end: GsiStreamPageEnd::Continue(next.clone()),
-                projections: Vec::new(),
-            }))
-            .expect("continuing projection advances within the observed frontier"),
-    );
-    assert!(matches!(state, GsiState::Active(state) if state.cursor == next));
-}
-
-#[test]
-fn active_build_is_idle_only_at_its_observed_stream_frontier() {
-    let current = checkpoint(3);
-    let build = GsiBuild::<String> {
-        target: target(),
-        state: GsiState::Active(GsiActive {
-            cursor: current.clone(),
-            pending_high: None,
-        }),
-    };
-    let change = build
-        .decide_next_change(GsiObservation::Stream(GsiStreamObservation {
-            expected_cursor: current.clone(),
-            through: current.clone(),
-
-            end: GsiStreamPageEnd::ReachedThrough,
-            projections: Vec::new(),
-        }))
-        .expect("an active build at the observed stream tail is idle");
-    assert!(matches!(change, GsiChange::Idle));
-}
-
-#[test]
 fn projection_writes_are_normalized_before_provider_persistence() {
     let low = checkpoint(1);
     let key = || GsiProjectionKey {
@@ -790,7 +660,6 @@ fn shared_record_conversion_owns_persisted_phase_validation() {
 
     let active = GsiBuild::<String>::try_from(record_for(GsiState::Active(GsiActive {
         cursor: high.clone(),
-        pending_high: None,
     })))
     .expect("shared active record is valid");
     assert!(matches!(active.state, GsiState::Active(state) if state.cursor == high));
@@ -810,7 +679,6 @@ fn shared_record_conversion_owns_persisted_phase_validation() {
 
     let mut invalid_active = record_for(GsiState::Active(GsiActive {
         cursor: high.clone(),
-        pending_high: None,
     }));
     invalid_active.phase = "scanning".to_owned();
     assert!(matches!(
@@ -836,76 +704,31 @@ fn given_scheduled_builds_when_selecting_then_first_runnable_target_stops_discov
     assert!(candidates.scanned_through.as_ref().unwrap() == &target());
     assert!(matches!(
         candidates.select_next_build_candidate(GsiBuild::new_active(target(), checkpoint(7))),
+        GsiBuildDiscovery::Continue
+    ));
+    assert!(matches!(
+        candidates.select_next_build_candidate(GsiBuild::new(target(), checkpoint(8))),
         GsiBuildDiscovery::SelectionComplete
     ));
     assert!(
-        matches!(candidates.schedule(), Some(GsiBuild { state: GsiState::Active(state), .. }) if state.cursor == checkpoint(7))
+        matches!(candidates.schedule(), Some(GsiBuild { state: GsiState::Scanning(state), .. }) if state.low == checkpoint(8))
     );
 }
 
 #[test]
-fn stream_projection_fences_with_item_revision_for_both_pointer_forms() {
+fn given_exact_history_revision_when_projected_then_projection_uses_that_revision() {
     let table = storage_types::BoundTableInfo {
-        history_id: 1u32.into(),
+        history_id: 1_u32.into(),
         info: std::sync::Arc::new(projection_table(ProjectionType::All)),
     };
-    let wire = WireItem::dynamo_json(br#"{"order_id":{"S":"1"},"status":{"S":"open"}}"#.to_vec());
-    let data =
-        storage_types::storage_serde::to_bytes(&wire.to_attribute_map().expect("attributes"))
-            .expect("encode stream image");
-    let revision = ItemRevision::try_from(3_u64).expect("revision");
-    let history_version = ItemStreamVersion::new(900_000);
-    let versions = ItemWriteVersions {
-        item_revision: revision,
-        item_stream_version: history_version,
-    };
-    for embedded in [false, true] {
-        let stream = StreamName::new(b"orders/stream-item/1");
-        let pointer = if embedded {
-            StoredStreamPointer::embedded(
-                storage_types::ItemHistoryAddress {
-                    history_id: 1u32.into(),
-                    stream_name: stream,
-                },
-                table.table_name.clone(),
-                versions,
-                vec![stream_provider::EmbeddedStreamItem {
-                    data: data.clone(),
-                    data_type: stream_provider::StreamDataType::DynamoDbJson,
-                }],
-            )
-        } else {
-            StoredStreamPointer::pointer(
-                storage_types::ItemHistoryAddress {
-                    history_id: 1u32.into(),
-                    stream_name: stream,
-                },
-                table.table_name.clone(),
-                versions,
-            )
-        };
-        let candidate = GsiStreamCandidate {
-            pointer_id: StreamItemId::from([1; 12]),
-            created_at: TimestampMillis::from_timestamp(1),
-            pointer,
-            referenced_items: (!embedded).then(|| {
-                vec![stream_provider::StreamItem {
-                    id: history_version.into(),
-                    stream_name: None,
-                    data: data.clone(),
-                    data_type: stream_provider::StreamDataType::DynamoDbJson,
-                    created_at: TimestampMillis::from_timestamp(1),
-                }]
-            }),
-        };
-        let projections = candidate
-            .into_projections(&table, &IndexName::new("by-status"))
-            .expect("project stream record");
-        assert_eq!(projections.len(), 1);
-        assert!(
-            matches!(&projections[0], GsiSourceProjection::Present { item_version, .. } if *item_version == revision)
-        );
-    }
+    let candidate = resolved_candidate(&table, 3);
+    let projections = candidate
+        .into_projections(&table, &IndexName::new("by-status"))
+        .unwrap();
+    assert_eq!(projections.len(), 1);
+    assert!(
+        matches!(&projections[0], GsiSourceProjection::Present { item_version, .. } if item_version.get() == 3)
+    );
 }
 
 #[test]
@@ -928,149 +751,63 @@ fn given_unavailable_history_when_blocked_then_no_projection_write_is_kept() {
 }
 
 #[test]
-fn given_other_incarnation_when_gsi_reads_both_pointer_forms_then_no_history_or_projection_is_required()
- {
+fn given_resolved_history_for_another_table_when_projected_then_incarnation_mismatch_is_rejected() {
     let table = storage_types::BoundTableInfo {
-        history_id: 2u32.into(),
+        history_id: 1_u32.into(),
         info: std::sync::Arc::new(projection_table(ProjectionType::All)),
     };
-    for embedded in [false, true] {
-        let history = storage_types::ItemHistoryAddress {
-            history_id: 1u32.into(),
-            stream_name: StreamName::from("orders/stream-item/1"),
-        };
-        let versions = ItemWriteVersions {
-            item_revision: ItemRevision::initial(),
-            item_stream_version: ItemStreamVersion::new(1),
-        };
-        let pointer = if embedded {
-            StoredStreamPointer::embedded(
-                history,
-                table.table_name.clone(),
-                versions,
-                vec![stream_provider::EmbeddedStreamItem {
-                    data: b"deliberately invalid image".to_vec(),
-                    data_type: stream_provider::StreamDataType::DynamoDbJson,
-                }],
-            )
-        } else {
-            StoredStreamPointer::pointer(history, table.table_name.clone(), versions)
-        };
-        let candidate = GsiStreamCandidate {
-            pointer_id: StreamItemId::from([1; 12]),
-            created_at: TimestampMillis::from_timestamp(1),
-            pointer,
-            referenced_items: None,
-        };
-        assert!(
-            GsiReferencedHistoryRead::plan(&table, std::slice::from_ref(&candidate)).is_empty()
-        );
-        assert!(
-            candidate
-                .into_projections(&table, &IndexName::new("by-status"))
-                .expect("old incarnation bypasses decode and image reads")
-                .is_empty()
-        );
-    }
-}
-
-#[test]
-fn given_referenced_pointer_when_current_image_is_missing_then_nearest_older_is_rejected() {
-    let table = storage_types::BoundTableInfo {
-        history_id: 1u32.into(),
-        info: std::sync::Arc::new(projection_table(ProjectionType::All)),
+    let candidate = resolved_candidate(&table, 7);
+    let replacement = storage_types::BoundTableInfo {
+        history_id: 2_u32.into(),
+        info: table.info.clone(),
     };
-    for versions in [vec![], vec![6], vec![6, 5]] {
-        let candidate = referenced_candidate_with_images(&table, &versions);
-        assert!(
-            candidate
-                .into_projections(&table, &IndexName::new("by-status"))
-                .is_err()
-        );
-    }
-    for versions in [vec![7], vec![7, 6]] {
-        let candidate = referenced_candidate_with_images(&table, &versions);
-        let projected = candidate
-            .into_projections(&table, &IndexName::new("by-status"))
-            .expect("exact current image with optional predecessor");
-        assert_eq!(projected.len(), 1);
-    }
-}
-
-#[test]
-fn given_history_attachment_when_ordinal_is_invalid_or_embedded_then_it_is_rejected() {
-    let table = storage_types::BoundTableInfo {
-        history_id: 1u32.into(),
-        info: std::sync::Arc::new(projection_table(ProjectionType::All)),
-    };
-    let mut candidates = vec![referenced_candidate_with_images(&table, &[])];
-    candidates[0].referenced_items = None;
     assert!(
-        GsiReferencedHistory::attach_all(
-            &mut candidates,
-            [GsiReferencedHistory {
-                candidate_ordinal: 1,
-                items: Vec::new(),
-            }]
-        )
-        .is_err()
+        candidate
+            .into_projections(&replacement, &IndexName::new("by-status"))
+            .is_err()
     );
-    candidates[0].pointer = StoredStreamPointer::embedded(
+}
+
+fn resolved_candidate(table: &storage_types::BoundTableInfo, version: u64) -> GsiStreamCandidate {
+    let metadata = storage_types::ItemHistoryMetadata::try_new(
         storage_types::ItemHistoryAddress {
             history_id: table.history_id,
             stream_name: StreamName::from("orders/stream-item/1"),
         },
-        table.table_name.clone(),
-        ItemWriteVersions {
-            item_revision: ItemRevision::initial(),
-            item_stream_version: ItemStreamVersion::new(7),
+        ItemStreamVersion::new(version),
+        None,
+        storage_types::ItemHistoryPublication::Event {
+            kind: storage_types::ItemHistoryKind::Image,
+            source_scope: storage_types::SystemStreamScope::try_new("source", 1).unwrap(),
+            table_position: storage_types::SystemStreamPosition::try_new("root", "root", "1")
+                .unwrap(),
+            created_at: TimestampMillis::from_timestamp(1),
         },
-        Vec::new(),
-    );
-    assert!(
-        GsiReferencedHistory::attach_all(
-            &mut candidates,
-            [GsiReferencedHistory {
-                candidate_ordinal: 0,
-                items: Vec::new(),
-            }]
-        )
-        .is_err()
-    );
-}
-
-fn referenced_candidate_with_images(
-    table: &storage_types::BoundTableInfo,
-    versions: &[u64],
-) -> GsiStreamCandidate {
-    let wire = WireItem::dynamo_json(br#"{"order_id":{"S":"1"},"status":{"S":"open"}}"#.to_vec());
-    let data = storage_types::storage_serde::to_bytes(&wire.to_attribute_map().unwrap()).unwrap();
+    )
+    .unwrap();
+    let entry = storage_types::ItemHistoryEntry::try_new(
+        metadata,
+        storage_types::ItemHistoryChange::Image {
+            item: WireItem::dynamo_json(
+                br#"{"order_id":{"S":"1"},"status":{"S":"open"}}"#.to_vec(),
+            ),
+            indexers: storage_types::IndexerDeclaration::try_new(Vec::new(), MaxIndexers::ZERO)
+                .unwrap(),
+        },
+    )
+    .unwrap();
     GsiStreamCandidate {
-        pointer_id: StreamItemId::from([1; 12]),
-        created_at: TimestampMillis::from_timestamp(1),
-        pointer: StoredStreamPointer::pointer(
-            storage_types::ItemHistoryAddress {
-                history_id: table.history_id,
-                stream_name: StreamName::from("orders/stream-item/1"),
-            },
-            table.table_name.clone(),
-            ItemWriteVersions {
-                item_revision: ItemRevision::initial(),
-                item_stream_version: ItemStreamVersion::new(7),
-            },
-        ),
-        referenced_items: Some(
-            versions
-                .iter()
-                .map(|version| stream_provider::StreamItem {
-                    id: ItemStreamVersion::new(*version).into(),
-                    stream_name: None,
-                    data: data.clone(),
-                    data_type: stream_provider::StreamDataType::DynamoDbJson,
-                    created_at: TimestampMillis::from_timestamp(1),
-                })
-                .collect(),
-        ),
+        history: stream_provider::ResolvedItemHistory {
+            table: std::sync::Arc::new(storage_types::TableHistorySchema {
+                source_table_name: storage_types::SystemStreamSourceTableName::try_from(
+                    &table.table_name,
+                )
+                .unwrap(),
+                key_schema: table.key_schema.clone(),
+            }),
+            current: std::sync::Arc::new(entry),
+            predecessor: None,
+        },
     }
 }
 

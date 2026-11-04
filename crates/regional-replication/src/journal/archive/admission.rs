@@ -6,7 +6,7 @@ use replication_provider::{
 };
 use storage_types::{ReadProtection, StorageResult};
 
-use super::ArchiveTrimPage;
+use super::ArchiveOriginal;
 use crate::{
     archive::{
         ArchiveHold,
@@ -17,7 +17,7 @@ use crate::{
     trim::{original::OriginalPrefixWitness, proposal::PublicTrimProposal},
 };
 
-enum ArchiveDependencyProof {
+enum ArchiveOriginalProof {
     Disjoint,
     Incomplete,
     Overlap,
@@ -47,7 +47,7 @@ impl JournalStore {
     }
 
     pub(super) async fn advance_archive_admission<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -63,10 +63,6 @@ impl JournalStore {
                 .load_reservation_barrier(attempt, ReadProtection::Conflict)
                 .await?
                 .reservation_state();
-            let ordinal = match &scan.phase {
-                ArchiveAdmissionPhase::Dependency { reservation }
-                | ArchiveAdmissionPhase::Original { reservation, .. } => *reservation,
-            };
             let reservation = self
                 .load_trim_reservation_inventory(attempt, count, ReadProtection::Conflict)
                 .await?;
@@ -76,18 +72,15 @@ impl JournalStore {
                 scan.require_initial_progress()?;
                 return Ok(ArchiveAdmissionWork::Qualified);
             }
-            if ordinal != 0 {
-                return Err(corrupt_record());
-            }
             let reservation = reservation.ok_or_else(corrupt_record)?;
             let proposal = &reservation.proposal;
             let page = self
-                .load_archive_candidate_page(attempt, (hold, scan.ordinal), encoding.1)
+                .load_archive_candidate_page(attempt, hold, encoding.1)
                 .await?;
-            let (scope, next) = match &page {
-                ArchiveTrimPage::Independent { scope }
-                | ArchiveTrimPage::Manifest { scope, .. } => (*scope, None),
-                ArchiveTrimPage::Original { scope, next, .. } => (*scope, *next),
+            let scope = match &page {
+                ArchiveOriginal::Baseline { scope } | ArchiveOriginal::Event { scope, .. } => {
+                    *scope
+                }
             };
             if scan.scope.is_some_and(|expected| expected != scope) {
                 return Err(corrupt_record());
@@ -97,11 +90,9 @@ impl JournalStore {
                 .verify_archive_admission_page(attempt, (proposal, scan, page), encoding)
                 .await?
             {
-                ArchiveDependencyProof::Disjoint => {
-                    self.advance_archive_admission_dependency(scan, next)
-                }
-                ArchiveDependencyProof::Incomplete => Ok(ArchiveAdmissionWork::Advanced),
-                ArchiveDependencyProof::Overlap => Ok(ArchiveAdmissionWork::Waiting),
+                ArchiveOriginalProof::Disjoint => Ok(ArchiveAdmissionWork::Qualified),
+                ArchiveOriginalProof::Incomplete => Ok(ArchiveAdmissionWork::Advanced),
+                ArchiveOriginalProof::Overlap => Ok(ArchiveAdmissionWork::Waiting),
             }
         }
         .await;
@@ -109,35 +100,26 @@ impl JournalStore {
     }
 
     async fn verify_archive_admission_page<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         selected: (
             &PublicTrimProposal,
             &mut ArchiveAdmissionScan,
-            ArchiveTrimPage,
+            ArchiveOriginal,
         ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
-    ) -> StorageResult<ArchiveDependencyProof> {
+    ) -> StorageResult<ArchiveOriginalProof> {
         let (proposal, scan, page) = selected;
         match page {
-            ArchiveTrimPage::Independent { .. } => {
-                if !matches!(scan.phase, ArchiveAdmissionPhase::Dependency { .. }) {
+            ArchiveOriginal::Baseline { .. } => {
+                if !matches!(scan.phase, ArchiveAdmissionPhase::Classify) {
                     return Err(corrupt_record());
                 }
-                Ok(ArchiveDependencyProof::Disjoint)
+                Ok(ArchiveOriginalProof::Disjoint)
             }
-            ArchiveTrimPage::Manifest { manifest, .. } => {
-                if !matches!(scan.phase, ArchiveAdmissionPhase::Dependency { .. }) {
-                    return Err(corrupt_record());
-                }
-                if proposal.candidate.overlaps_manifest(&manifest) {
-                    return Ok(ArchiveDependencyProof::Overlap);
-                }
-                Ok(ArchiveDependencyProof::Disjoint)
-            }
-            ArchiveTrimPage::Original { event, .. } => {
+            ArchiveOriginal::Event { event, .. } => {
                 self.verify_archive_admission_original(attempt, (proposal, scan, &event), encoding)
                     .await
             }
@@ -145,7 +127,7 @@ impl JournalStore {
     }
 
     async fn verify_archive_admission_original<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -155,27 +137,26 @@ impl JournalStore {
             &replication_types::event::content::CanonicalEvent,
         ),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
-    ) -> StorageResult<ArchiveDependencyProof> {
+    ) -> StorageResult<ArchiveOriginalProof> {
         let (proposal, scan, event) = selected;
         if event.lineage() != proposal.candidate.lineage {
-            if !matches!(scan.phase, ArchiveAdmissionPhase::Dependency { .. }) {
+            if !matches!(scan.phase, ArchiveAdmissionPhase::Classify) {
                 return Err(corrupt_record());
             }
-            return Ok(ArchiveDependencyProof::Disjoint);
+            return Ok(ArchiveOriginalProof::Disjoint);
         }
         let original = event.as_ref();
         let ArchiveAdmissionPhase::Original { witness, .. } = &mut scan.phase else {
-            let ArchiveAdmissionPhase::Dependency { reservation } = scan.phase else {
+            if !matches!(scan.phase, ArchiveAdmissionPhase::Classify) {
                 return Err(corrupt_record());
-            };
+            }
             scan.phase = ArchiveAdmissionPhase::Original {
-                reservation,
                 witness: OriginalPrefixWitness::try_for_proposal(
                     proposal,
                     (original.id.clone(), original.digest),
                 )?,
             };
-            return Ok(ArchiveDependencyProof::Incomplete);
+            return Ok(ArchiveOriginalProof::Incomplete);
         };
         if witness.identity != original.id || witness.digest != original.digest {
             return Err(corrupt_record());
@@ -186,30 +167,14 @@ impl JournalStore {
                 .verify_public_trim_original_publication(attempt, proposal, witness, encoding)
                 .await?;
             if proof.has_overlap {
-                return Ok(ArchiveDependencyProof::Overlap);
+                return Ok(ArchiveOriginalProof::Overlap);
             }
             witness.after = proof.through;
         }
         Ok(if witness.advance_component(proposal)? {
-            ArchiveDependencyProof::Disjoint
+            ArchiveOriginalProof::Disjoint
         } else {
-            ArchiveDependencyProof::Incomplete
+            ArchiveOriginalProof::Incomplete
         })
-    }
-
-    fn advance_archive_admission_dependency(
-        &self,
-        scan: &mut ArchiveAdmissionScan,
-        next: Option<u64>,
-    ) -> StorageResult<ArchiveAdmissionWork> {
-        let Some(next) = next else {
-            return Ok(ArchiveAdmissionWork::Qualified);
-        };
-        if scan.ordinal.checked_add(1) != Some(next) {
-            return Err(corrupt_record());
-        }
-        scan.ordinal = next;
-        scan.phase = ArchiveAdmissionPhase::Dependency { reservation: 0 };
-        Ok(ArchiveAdmissionWork::Advanced)
     }
 }

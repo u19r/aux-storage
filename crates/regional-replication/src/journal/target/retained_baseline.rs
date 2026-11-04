@@ -28,7 +28,7 @@ struct TargetBaselineProgress {
 
 impl JournalStore {
     pub(crate) async fn accept_target_retained_baselines<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -222,7 +222,7 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
     pub(super) async fn verify_target_retained_baselines<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -269,7 +269,11 @@ impl JournalStore {
                 bytes: encoding.1.import_bytes.min(self.records.limits.max_bytes()),
             };
             let page = self
-                .load_baseline_page(attempt, (cut.cut.cut.lineage, after), (encoding.0, budget))
+                .load_baseline_page(
+                    attempt,
+                    (root.state.physical, cut.cut.cut.lineage, after),
+                    (encoding.0, budget),
+                )
                 .await?;
             for authority in page.authorities {
                 vector = cut.cut.baseline.fold_authority(vector, &authority)?;

@@ -26,7 +26,9 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
             journal: Arc::clone(&self.journal),
             codec: Arc::clone(&self.codec),
         };
+        let bindings = storage_provider::RequestTableBindings::default();
         retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
+            let bindings = bindings.clone();
             let request = request.clone();
             let admission = admission.clone();
             Arc::clone(&self.journal).with_admitted_attempt(
@@ -37,7 +39,7 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
                 crate::journal::NativeAttempt::Items(AttemptMode::ReadWrite),
                 move |attempt, _| {
                     Box::pin(async move {
-                        ExpirationAttempt::with_admission(attempt, admission)
+                        ExpirationAttempt::with_admission(attempt, admission, bindings)
                             .advance_expiration(&request)
                             .await
                     })

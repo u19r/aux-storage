@@ -64,13 +64,14 @@ pub(super) async fn write_layout<A: SqlAttempt>(
             }
             let build = GsiBuild::<()>::new(
                 GsiBuildTarget {
+                    history_id: current.history_id,
                     table_name: current.info.table_name.clone(),
                     index_name: index.index_name,
                     incarnation,
                 },
                 frontier,
             );
-            register_gsi_builds(attempt, engine, current.history_id, vec![build]).await?;
+            register_gsi_builds(attempt, engine, vec![build]).await?;
         }
         Some(GsiLifecycleAction::Delete(delete)) => {
             delete_index(attempt, engine, &change, change.target(&delete.index_name)?).await?;
@@ -92,7 +93,7 @@ async fn grow_indexer_slots<A: SqlAttempt>(
     if next <= old {
         return Ok(());
     }
-    let mut relations = vec![engine.item_table_name(&current.table_name, current.history_id)];
+    let mut relations = vec![engine.item_table_name(current.history_id)];
     let gsi_relations = current
         .global_secondary_indexes
         .as_deref()
@@ -105,7 +106,7 @@ async fn grow_indexer_slots<A: SqlAttempt>(
         })
         .map(|index| {
             let target = change.target(&index.index_name)?;
-            Ok(engine.gsi_table_name(&current.table_name, &index.index_name, &target.incarnation))
+            Ok(engine.gsi_table_name(&target.incarnation))
         })
         .collect::<StorageResult<Vec<_>>>()?;
     relations.extend(gsi_relations);
@@ -140,7 +141,7 @@ async fn grow_item_union<A: SqlAttempt>(
         .map(PlannedKeyColumn::from)
         .map(|column| {
             SqlStatement::new(
-                render_add_union_key_column(engine, next, &column, current.history_id),
+                render_add_union_key_column(engine, &column, current.history_id),
                 Vec::new(),
             )
         })
@@ -158,19 +159,8 @@ async fn delete_index<A: SqlAttempt>(
     let table = change.current;
     let index = &target.index_name;
     let name = index.as_ref();
-    attempt
-        .execute(sql_statements::delete_history_holds(
-            engine,
-            &table.table_name,
-            name,
-        ))
-        .await?;
     let changed = attempt
-        .execute(sql_statements::delete_build(
-            engine,
-            &table.table_name,
-            name,
-        ))
+        .execute(sql_statements::delete_build(engine, table.history_id, name))
         .await?;
     if changed != 1 {
         return Err(StorageError::internal(

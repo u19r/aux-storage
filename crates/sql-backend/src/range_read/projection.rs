@@ -32,7 +32,7 @@ pub(super) struct PublicImage;
 
 impl RangeProjection for PublicImage {
     type Item = RangeReadItem;
-    const COLUMNS: &'static str = "item_descriptor";
+    const COLUMNS: &'static str = "item_value";
 
     fn decode(
         _table: &BoundTableInfo,
@@ -88,7 +88,7 @@ pub(super) struct GsiState;
 
 impl RangeProjection for GsiState {
     type Item = storage_provider::GsiProjectionRow;
-    const COLUMNS: &'static str = "item_descriptor, __aux_item_version";
+    const COLUMNS: &'static str = "item_value, __aux_item_version";
 
     fn decode(
         table: &BoundTableInfo,

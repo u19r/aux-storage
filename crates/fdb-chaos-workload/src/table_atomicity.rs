@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::{common::*, constants::*, imports::*};
 
 pub(crate) struct TableAtomicityWorkload {
@@ -15,7 +17,6 @@ pub(crate) struct TableAtomicityWorkload {
     pub(crate) model: TableModel,
     pub(crate) possible_model: PossibleTableModel,
     pub(crate) gsi_model: GsiIndexModel,
-    pub(crate) trim_model: TrimStateModel,
     pub(crate) table_binding: Option<Arc<storage_types::BoundTableInfo>>,
     pub(crate) anomalies: Vec<Anomaly>,
     pub(crate) shared_audit: Option<SharedKeyAudit>,
@@ -30,7 +31,8 @@ pub(crate) struct TableAtomicityWorkload {
     pub(crate) direct_stream_pointer_audit_count: u64,
     pub(crate) direct_stream_pointer_decoupled_target_count: u64,
     pub(crate) shared_operation_count: u64,
-    pub(crate) context: WorkloadContext,
+    pub(crate) context: Rc<WorkloadContext>,
+    pub(crate) clock: Option<Arc<crate::simulation_clock::SimulationClock>>,
 }
 
 impl TableAtomicityWorkload {
@@ -63,7 +65,6 @@ impl TableAtomicityWorkload {
             model: TableModel::default(),
             possible_model: PossibleTableModel::default(),
             gsi_model: GsiIndexModel::default(),
-            trim_model: TrimStateModel::default(),
             table_binding: None,
             anomalies: Vec::new(),
             shared_audit: None,
@@ -78,7 +79,8 @@ impl TableAtomicityWorkload {
             direct_stream_pointer_audit_count: 0,
             direct_stream_pointer_decoupled_target_count: 0,
             shared_operation_count: 0,
-            context,
+            context: Rc::new(context),
+            clock: None,
         }
     }
 
@@ -95,46 +97,15 @@ impl TableAtomicityWorkload {
         db: SimDatabase,
     ) -> Result<Arc<kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>>, String>
     {
-        let store = kv_backend::KvStore::initialize_format(self.driver(db))
-            .await
-            .map_err(|error| storage_error_detail(&error))?;
-        Ok(Arc::new(store))
-    }
-
-    pub(crate) async fn manager(&self, db: SimDatabase) -> Result<DatabaseManager, String> {
-        self.manager_from_store(self.provider(db).await?).await
-    }
-
-    pub(crate) async fn manager_from_store(
-        &self,
-        store: Arc<kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>>,
-    ) -> Result<DatabaseManager, String> {
-        let config = storage_provider::StorageConfig {
-            backend_type: storage_provider::StorageBackend::FoundationDb,
-            connection_string: None,
-            file_path: None,
-            sqlite: None,
-            postgres: None,
-            turso: None,
-            rocksdb: None,
-            remote: None,
-            foundationdb: Some(storage_provider::FoundationDbSettings {
-                subspace_prefix: Some("aux-storage/fdb-chaos/table-atomicity/".into()),
-                ..Default::default()
-            }),
-        };
-        let bundle =
-            storage::StorageProviderBundle::try_from_initialized_store(store, Default::default())
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or("simulation phase clock is absent")?;
+        let store =
+            kv_backend::KvStore::initialize_format_with_clock(self.driver(db), clock.clone())
+                .await
                 .map_err(|error| storage_error_detail(&error))?;
-        DatabaseManager::from_initialized_bundle(
-            config,
-            bundle,
-            storage::DatabaseManagerRuntimeOptions::builder()
-                .enable_database_jobs(false)
-                .build(),
-        )
-        .await
-        .map_err(|error| storage_error_detail(&error))
+        Ok(Arc::new(store))
     }
 
     pub(crate) async fn capture_table_binding(
@@ -154,9 +125,6 @@ impl TableAtomicityWorkload {
             })
             .await
             .map_err(|error| storage_error_detail(&error))?;
-        self.trim_model.expect_scope(TrimScopeExpectation::table(
-            storage_provider::table_retention_scope_id(binding.history_id),
-        ));
         self.table_binding = Some(binding);
         Ok(())
     }
@@ -210,10 +178,10 @@ impl TableAtomicityWorkload {
             stream_enabled: true,
             stream_view_type: Some(StreamViewType::NewAndOldImages),
         });
-        request.aux_stream_duration_hours = Some(StreamRetentionDuration::FiniteHours(
-            TABLE_STREAM_DURATION_HOURS,
-        ));
-        request.aux_default_item_stream_duration_hours = Some(StreamRetentionDuration::Forever);
+        request.aux_stream_duration_hours = Some(
+            StreamRetentionDuration::from_hours(i64::from(TABLE_STREAM_DURATION_HOURS))
+                .expect("configured table retention"),
+        );
         request
     }
 }

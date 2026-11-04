@@ -57,7 +57,14 @@ fn build_runtime(
     observer: ScopeObserver,
 ) -> JobRuntime<ScheduledJobStore> {
     let now = Timestamp::from_millis(1_800_000_000_000);
-    let mut catalog = JobCatalog::new();
+    let mut catalog = JobCatalog::new().with_manifest(
+        scheduled_bg_jobs::CatalogManifest::try_new(
+            scheduled_bg_jobs::CatalogRevision::from(std::num::NonZeroU64::MIN),
+            vec![JobId::from([4; 16])],
+            Vec::new(),
+        )
+        .expect("complete fixture catalog manifest"),
+    );
     catalog
         .register_seeded(
             JobSpec::unit(
@@ -83,7 +90,8 @@ fn build_runtime(
         queues: QueueSelection::all(),
         max_claims: 1,
         max_concurrency: 1,
-        max_store_operations: 128,
+        // Reserve checked journal admission and settlement for one claim.
+        max_store_operations: 256,
         stop_claiming_after: Duration::from_secs(1),
         finish_after: Duration::from_secs(2),
     })

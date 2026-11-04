@@ -73,6 +73,7 @@ pub(super) fn target_index(
         })
         .ok_or_else(|| StorageError::internal("KV GSI target index is absent"))?;
     if identity.deleted
+        || target.history_id != identity.table_id.into()
         || identity.table_name != target.table_name
         || target.incarnation.as_ref()
             != index_incarnation(identity.table_id, index.index_id).as_slice()
@@ -132,7 +133,8 @@ pub(super) fn decode_gsi_builds_for<Build: serde::de::DeserializeOwned + AsRef<G
         let build: Build = storage_serde::from_bytes(&bytes)?;
         let target = build.as_ref();
         let incarnation = index_incarnation(identity.table_id, index.index_id);
-        if target.table_name != identity.table_name
+        if target.history_id != identity.table_id.into()
+            || target.table_name != identity.table_name
             || target.index_name != index.index_name
             || target.incarnation.as_ref() != incarnation.as_slice()
         {

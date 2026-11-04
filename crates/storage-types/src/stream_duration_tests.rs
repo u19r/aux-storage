@@ -3,25 +3,25 @@ use serde_json::json;
 use crate::{StreamRetentionDuration, TimestampMillis, constants::MAX_STREAM_RETENTION_HOURS};
 
 #[test]
-fn stream_retention_duration_accepts_forever_and_positive_hours() {
+fn given_table_retention_when_parsed_then_forever_and_at_least_twenty_four_hours_are_accepted() {
     assert_eq!(
         StreamRetentionDuration::try_from(-1),
         Ok(StreamRetentionDuration::Forever)
     );
     assert_eq!(
-        StreamRetentionDuration::try_from(1),
-        Ok(StreamRetentionDuration::FiniteHours(1))
+        StreamRetentionDuration::try_from(24),
+        Ok(StreamRetentionDuration::from_hours(24).unwrap())
     );
     assert_eq!(
         StreamRetentionDuration::try_from(i64::from(MAX_STREAM_RETENTION_HOURS)),
-        Ok(StreamRetentionDuration::FiniteHours(
-            MAX_STREAM_RETENTION_HOURS
-        ))
+        Ok(StreamRetentionDuration::from_hours(i64::from(MAX_STREAM_RETENTION_HOURS)).unwrap())
     );
 }
 
 #[test]
 fn stream_retention_duration_rejects_zero_negative_and_too_large_hours() {
+    assert!(StreamRetentionDuration::try_from(1).is_err());
+    assert!(StreamRetentionDuration::try_from(23).is_err());
     assert!(StreamRetentionDuration::try_from(0).is_err());
     assert!(StreamRetentionDuration::try_from(-2).is_err());
     assert!(StreamRetentionDuration::try_from(i64::from(MAX_STREAM_RETENTION_HOURS) + 1).is_err());
@@ -34,35 +34,12 @@ fn stream_retention_duration_rejects_fractional_and_string_values() {
 }
 
 #[test]
-fn effective_item_retention_uses_max_and_forever_dominates() {
-    assert_eq!(
-        StreamRetentionDuration::effective_item_retention(
-            StreamRetentionDuration::FiniteHours(72),
-            StreamRetentionDuration::FiniteHours(1),
-        ),
-        StreamRetentionDuration::FiniteHours(72)
-    );
-    assert_eq!(
-        StreamRetentionDuration::effective_item_retention(
-            StreamRetentionDuration::Forever,
-            StreamRetentionDuration::FiniteHours(1),
-        ),
-        StreamRetentionDuration::Forever
-    );
-    assert_eq!(
-        StreamRetentionDuration::effective_item_retention(
-            StreamRetentionDuration::FiniteHours(1),
-            StreamRetentionDuration::Forever,
-        ),
-        StreamRetentionDuration::Forever
-    );
-}
-
-#[test]
 fn finite_retention_computes_its_cutoff_and_forever_has_none() {
-    let reference = TimestampMillis::from_timestamp(7_200_001);
+    let reference = TimestampMillis::from_timestamp(86_400_001);
     assert_eq!(
-        StreamRetentionDuration::FiniteHours(2).cutoff_at(reference),
+        StreamRetentionDuration::from_hours(24)
+            .unwrap()
+            .cutoff_at(reference),
         Some(TimestampMillis::from_timestamp(1))
     );
     assert_eq!(StreamRetentionDuration::Forever.cutoff_at(reference), None);

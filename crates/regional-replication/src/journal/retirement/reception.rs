@@ -174,6 +174,12 @@ impl JournalStore {
                     local,
                     before.configuration.table,
                     before.configuration.lineage,
+                    request
+                        .proposal
+                        .participant(&self.region)
+                        .map_err(|_| corrupt_record())?
+                        .proposed
+                        .physical,
                 ),
                 &origins,
                 ReadProtection::Shared,

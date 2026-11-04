@@ -11,7 +11,6 @@ doctest = false
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-flate2 = "1.1.10"
 futures = { workspace = true }
 hex = { workspace = true }
 infrastructure-provider = { workspace = true }

@@ -4,9 +4,10 @@ use replication_provider::{
 };
 use replication_types::{
     event::{identity::CanonicalEventId, interval::CanonicalEventLink},
+    identity::resource::{TableIdentity, TableLineage},
     regional_import::RegionalImport,
 };
-use storage_types::{InfrastructureResultKind, StorageResult};
+use storage_types::{InfrastructureResultKind, StorageResult, TableHistoryId};
 
 use super::{JournalStore, acceptance_batch::AcceptanceReadSelection};
 use crate::native_record::corrupt_record;
@@ -15,17 +16,21 @@ impl JournalStore {
     /// A fragment receipt never establishes coverage by itself. Reconstruct
     /// complete table receipts only from exact accepted native original events.
     pub(in crate::journal) async fn load_complete_fragment_pages<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<Option<Vec<TablePageAcceptance>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let result = async {
-            let prepared = CompleteFragmentPreparation::try_new(import)?;
+            let (import, tables) = input;
+            let prepared = CompleteFragmentPreparation::try_new(self, (import, tables))?;
             let selection = AcceptanceReadSelection::SourceProof {
                 identities: &prepared.identities,
                 maximum: self.source_proof_allowance(import.manifest(), codec)?,
@@ -51,11 +56,18 @@ impl JournalStore {
 struct CompleteFragmentPreparation<'input> {
     pages: Vec<TablePageAcceptance>,
     selected: Vec<(usize, &'input CanonicalEventLink)>,
-    identities: Vec<&'input CanonicalEventId>,
+    identities: Vec<(&'input CanonicalEventId, TableHistoryId)>,
 }
 
 impl<'input> CompleteFragmentPreparation<'input> {
-    fn try_new(import: &'input RegionalImport) -> StorageResult<Self> {
+    fn try_new(
+        journal: &JournalStore,
+        input: (
+            &'input RegionalImport,
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
+    ) -> StorageResult<Self> {
+        let (import, tables) = input;
         let mut prepared = Self {
             pages: Vec::new(),
             selected: Vec::new(),
@@ -90,7 +102,10 @@ impl<'input> CompleteFragmentPreparation<'input> {
                 continue;
             };
             prepared.selected.push((slot, link));
-            prepared.identities.push(&link.event);
+            prepared.identities.push((
+                &link.event,
+                journal.select_original_history(tables, (link.table, link.lineage))?,
+            ));
         }
         for (slot, page) in prepared.pages.iter_mut().enumerate() {
             let count = prepared

@@ -8,8 +8,10 @@ impl TableAtomicityWorkload {
     pub(crate) fn trim_scope_report(&self) -> TrimScopeReport {
         TrimScopeReport::new(
             self.client_id,
-            self.trim_model.classified_scopes(),
-            self.trim_model.unclassified_scopes(),
+            self.table_binding
+                .iter()
+                .map(|table| storage_provider::table_retention_scope_id(table.history_id))
+                .collect(),
         )
     }
 
@@ -54,7 +56,6 @@ impl TableAtomicityWorkload {
     pub(crate) fn write_trim_provider_snapshot(
         &self,
         table_scopes: &BTreeSet<String>,
-        item_scopes: &BTreeSet<String>,
     ) -> Result<(), String> {
         let root = self.client_artifact_root();
         fs::create_dir_all(&root).map_err(|err| {
@@ -63,11 +64,8 @@ impl TableAtomicityWorkload {
                 root.display()
             )
         })?;
-        let snapshot = TrimProviderSnapshot::new(
-            self.client_id,
-            table_scopes.iter().cloned().collect(),
-            item_scopes.iter().cloned().collect(),
-        );
+        let snapshot =
+            TrimProviderSnapshot::new(self.client_id, table_scopes.iter().cloned().collect());
         let snapshot_json = serde_json::to_string_pretty(&snapshot)
             .map_err(|err| format!("failed to serialize trim provider snapshot: {err}"))?;
         fs::write(

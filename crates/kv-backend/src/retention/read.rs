@@ -3,8 +3,8 @@
 use std::num::NonZeroU32;
 
 use storage_provider::{
-    StreamTrimDueMarker, StreamTrimScope, StreamTrimScopeKind, StreamTrimState,
-    maintenance::StreamRetentionObservation, table_retention_scope_id,
+    StreamTrimDueMarker, StreamTrimScope, StreamTrimState, maintenance::StreamRetentionObservation,
+    table_retention_scope_id,
 };
 use storage_types::{StorageError, StorageResult, TimestampMillis, storage_serde};
 
@@ -18,8 +18,7 @@ pub(crate) async fn load_table_retention<A: KvAttempt>(
     identity: &KvTableIdentity,
     scope: &StreamTrimScope,
 ) -> StorageResult<Option<StreamTrimState>> {
-    if scope.kind != StreamTrimScopeKind::Table
-        || scope.table_name != identity.table_name
+    if scope.table_name != identity.table_name
         || scope.scope_id != table_retention_scope_id(identity.table_id.into())
     {
         return Err(StorageError::internal(
@@ -130,6 +129,7 @@ pub(crate) fn decode_trim_state(
     scope: &StreamTrimScope,
 ) -> StorageResult<StreamTrimState> {
     let state: StreamTrimState = storage_serde::from_bytes(bytes)?;
+    state.require_valid_frontier()?;
     if state.scope != *scope {
         return Err(StorageError::internal(
             "KV stream trim state has another scope",

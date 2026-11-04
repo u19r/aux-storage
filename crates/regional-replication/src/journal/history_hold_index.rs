@@ -82,7 +82,7 @@ impl JournalStore {
             || address.resource != base.resource
             || address.generation != base.generation
             || !address.suffix.starts_with(&base.suffix)
-            || address.suffix.len() != base.suffix.len() + 64
+            || address.suffix.len() != base.suffix.len() + 16 + 64
         {
             return Err(corrupt_record());
         }
@@ -301,5 +301,67 @@ impl JournalStore {
             key,
             expected: row.revision,
         }))
+    }
+    pub(super) async fn prepare_table_source_hold_index_removals<A: PhysicalRecordAttempt>(
+        &self,
+        attempt: &mut A,
+        sources: &[infrastructure_provider::record::DurableRecord],
+    ) -> StorageResult<Vec<RecordChange>> {
+        let holds = sources
+            .iter()
+            .map(|row| self.decode_source_hold(row))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let references = sources
+            .iter()
+            .zip(&holds)
+            .map(|(row, hold)| SourceHoldReference {
+                lineage: hold.lineage,
+                source: row.key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let keys = references
+            .iter()
+            .map(|reference| self.source_hold_index_key(reference))
+            .collect::<StorageResult<Vec<_>>>()?;
+        let rows = self
+            .records
+            .load(attempt, &keys, ReadProtection::Conflict)
+            .await?;
+        let mut changes = Vec::new();
+        let mut lineages = std::collections::BTreeSet::new();
+        for ((hold, reference), row) in holds.iter().zip(&references).zip(rows) {
+            changes.extend(self.prepare_source_hold_index_removal(
+                hold,
+                reference,
+                row.as_ref(),
+            )?);
+            lineages.insert(hold.lineage);
+        }
+        self.retain_history_epochs(attempt, &lineages).await?;
+        Ok(changes)
+    }
+
+    fn prepare_source_hold_index_removal(
+        &self,
+        hold: &SourceHold,
+        reference: &SourceHoldReference,
+        index: Option<&infrastructure_provider::record::DurableRecord>,
+    ) -> StorageResult<Vec<RecordChange>> {
+        match (hold.is_released(), index) {
+            (true, None) => return Ok(Vec::new()),
+            (false, Some(index)) => {
+                if self.decode_retention_hold(index)?
+                    != RetentionHoldReference::Capture(reference.clone())
+                {
+                    return Err(corrupt_record());
+                }
+            }
+            _ => return Err(corrupt_record()),
+        }
+        let index = index.ok_or_else(corrupt_record)?;
+        Ok(vec![RecordChange::Delete {
+            key: index.key.clone(),
+            expected: index.revision,
+        }])
     }
 }

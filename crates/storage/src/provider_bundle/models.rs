@@ -3,14 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use storage_provider::{
-    DynamoOperations, StreamRetentionRepository, SystemStreamTrimRepository,
-    TableReclaimRepository,
+    DynamoOperations, StorageStreamOperations, StreamRetentionRepository,
+    SystemStreamTrimRepository, TableReclaimRepository,
     maintenance::{
         ExpirationRepository, GsiBuildRepository, GsiLifecycleRepository,
         PartitionReconciliationRepository, PartitionReconciliationSource,
     },
 };
-use stream_provider::StreamOperations;
 
 use crate::newtypes::DatabaseTrait;
 
@@ -18,6 +17,8 @@ use crate::newtypes::DatabaseTrait;
 pub(crate) struct MaintenanceRepositories {
     pub job_catalog: scheduled_bg_jobs::JobCatalog,
     pub expiration_repository: Arc<dyn ExpirationRepository>,
+    pub stream_initialization_repository:
+        Arc<dyn storage_provider::TableStreamInitializationRepository>,
     pub gsi_build_repository: Arc<dyn GsiBuildRepository>,
     pub partition_reconciliation_repository: Option<Arc<dyn PartitionReconciliationRepository>>,
     pub queue_message_cleanup_repository:
@@ -31,7 +32,7 @@ pub struct StorageProviderBundle {
     pub(crate) regional_services: Option<regional_replication::runtime::PreparedRegionalServices>,
     pub(crate) database: Option<Arc<dyn DatabaseTrait>>,
     pub(crate) dynamo: Arc<dyn DynamoOperations>,
-    pub(crate) stream: Option<Arc<dyn StreamOperations>>,
+    pub(crate) stream: Option<Arc<dyn StorageStreamOperations>>,
 
     pub(crate) ttl_sweep_repository: Option<Arc<dyn storage_provider::TtlSweepRepository>>,
     pub(crate) system_stream_trim_repository: Option<Arc<dyn SystemStreamTrimRepository>>,
@@ -54,7 +55,7 @@ impl StorageProviderBundle {
         S: storage_provider::native_admission::NativeAttemptSource
             + storage_provider::DynamoPort
             + bg_job_store::ScheduledJobStoreSource
-            + StreamOperations
+            + StorageStreamOperations
             + queue_provider::QueueOperations
             + queue_provider::QueueMessageCleanupRepository
             + pubsub_provider::PubsubProvider
@@ -70,7 +71,8 @@ impl StorageProviderBundle {
             + storage_provider::TtlSweepRepository
             + 'static,
         for<'native> <S as storage_provider::DynamoPort>::Attempt<'native>:
-            storage_provider::maintenance::ExpirationPort
+            storage_provider::PrimaryStateScanAttempt
+                + storage_provider::maintenance::ExpirationPort
                 + storage_provider::maintenance::GsiPort
                 + storage_provider::maintenance::StreamRetentionPort
                 + storage_provider::TableReclaimAttempt,
@@ -101,6 +103,7 @@ impl StorageProviderBundle {
                 job_catalog: scheduled_bg_jobs::JobCatalog::new(),
                 partition_reconciliation_repository: store.clone().partition_reconciliation(),
                 expiration_repository: store.clone(),
+                stream_initialization_repository: store.clone(),
                 gsi_build_repository: store.clone(),
                 queue_message_cleanup_repository: Some(store.clone()),
                 retention_repository: store,

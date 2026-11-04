@@ -43,6 +43,8 @@ pub mod retention;
 #[cfg(feature = "rocksdb")]
 pub mod rocksdb;
 mod store;
+#[cfg(all(test, feature = "rocksdb", feature = "fault-injection"))]
+mod store_clock_tests;
 #[cfg(all(test, feature = "rocksdb"))]
 mod store_tests;
 mod stream;
@@ -55,6 +57,7 @@ mod stream_read;
 mod stream_split;
 mod stream_trim;
 pub mod stream_write;
+mod table_history_reclaim;
 mod table_reclaim;
 mod table_update;
 mod transact_write;

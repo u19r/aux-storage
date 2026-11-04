@@ -1,7 +1,2 @@
 [profile.default]
 default-filter = 'not package(cucumber-tests) and not binary(remote_canary_fixture)'
-
-# Wall-clock comparisons must run without competing workspace test processes.
-[[profile.default.overrides]]
-filter = 'test(parallel_delivery_perf_tests::delivery_window_reduces_wall_time_without_losing_claim_updates)'
-threads-required = "num-cpus"

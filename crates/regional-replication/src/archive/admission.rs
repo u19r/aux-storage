@@ -8,13 +8,8 @@ use crate::trim::{original::OriginalPrefixWitness, reservation::ReservationRevis
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum ArchiveAdmissionPhase {
-    Dependency {
-        reservation: u64,
-    },
-    Original {
-        reservation: u64,
-        witness: OriginalPrefixWitness,
-    },
+    Classify,
+    Original { witness: OriginalPrefixWitness },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -22,7 +17,6 @@ pub(crate) enum ArchiveAdmissionPhase {
 pub(crate) struct ArchiveAdmissionScan {
     selection: CanonicalDigest,
     barrier: ReservationRevision,
-    pub(crate) ordinal: u64,
     pub(crate) scope: Option<CanonicalDigest>,
     pub(crate) phase: ArchiveAdmissionPhase,
 }
@@ -32,9 +26,8 @@ impl ArchiveAdmissionScan {
         Self {
             selection,
             barrier,
-            ordinal: 0,
             scope: None,
-            phase: ArchiveAdmissionPhase::Dependency { reservation: 0 },
+            phase: ArchiveAdmissionPhase::Classify,
         }
     }
 
@@ -58,13 +51,7 @@ impl ArchiveAdmissionScan {
     }
 
     pub(crate) fn require_initial_progress(&self) -> StorageResult<()> {
-        if self.ordinal != 0
-            || self.scope.is_some()
-            || !matches!(
-                self.phase,
-                ArchiveAdmissionPhase::Dependency { reservation: 0 }
-            )
-        {
+        if self.scope.is_some() || !matches!(self.phase, ArchiveAdmissionPhase::Classify) {
             return Err(crate::native_record::corrupt_record());
         }
         Ok(())

@@ -44,6 +44,7 @@ pub trait ExpirationPort:
 }
 
 pub struct ExpirationAttempt<'a, P: ExpirationPort, S = OrdinaryExpiration> {
+    pub(super) bindings: crate::RequestTableBindings,
     pub(super) admission: S,
     pub(super) port: &'a mut P,
     pub(super) state: ExpirationAttemptState,
@@ -51,8 +52,9 @@ pub struct ExpirationAttempt<'a, P: ExpirationPort, S = OrdinaryExpiration> {
 }
 
 impl<'a, P: ExpirationPort> ExpirationAttempt<'a, P> {
-    pub fn new(port: &'a mut P) -> Self {
+    pub fn new(port: &'a mut P, bindings: crate::RequestTableBindings) -> Self {
         Self {
+            bindings,
             port,
             admission: OrdinaryExpiration,
             state: ExpirationAttemptState::default(),
@@ -62,8 +64,13 @@ impl<'a, P: ExpirationPort> ExpirationAttempt<'a, P> {
 }
 
 impl<'a, P: ExpirationPort, S: ExpirationEffectPolicy<P>> ExpirationAttempt<'a, P, S> {
-    pub fn with_admission(port: &'a mut P, admission: S) -> Self {
+    pub fn with_admission(
+        port: &'a mut P,
+        admission: S,
+        bindings: crate::RequestTableBindings,
+    ) -> Self {
         Self {
+            bindings,
             port,
             admission,
             state: ExpirationAttemptState::default(),
@@ -104,7 +111,9 @@ impl<P: ExpirationPort, S: ExpirationEffectPolicy<P>> ExpirationTransaction
         &mut self,
         read: &ExpirationTargetRead,
     ) -> StorageResult<Option<ExpirationTarget>> {
-        let bound = read_expiration_target_in_attempt(self.port, read, &self.admission).await?;
+        let bound =
+            read_expiration_target_in_attempt(self.port, read, &self.admission, &self.bindings)
+                .await?;
         Ok(self.state.bind(bound))
     }
 

@@ -4,32 +4,32 @@ use typed_builder::TypedBuilder;
 use utoipa::ToSchema;
 
 use crate::{
-    AttributeDefinition, GlobalSecondaryIndex, IndexName, KeySchemaElement, MaxIndexers,
-    MultiRegionConsistency, Projection, ReplicaDescription, StorageError, StorageResult,
-    StoredTableInfo, StreamRetentionDuration, StreamSpecification, TableName, TableStatus,
-    TimestampMillis, TimestampSecondsFractional,
+    AttributeDefinition, BoundTableInfo, GlobalSecondaryIndex, IndexName, KeySchemaElement,
+    MaxIndexers, MultiRegionConsistency, Projection, ReplicaDescription, StorageError,
+    StorageResult, StoredTableInfo, StreamRetentionDuration, StreamSpecification, TableName,
+    TableStatus, TableStreamIdentity, TimestampMillis, TimestampSecondsFractional,
 };
 
 /// Derive the stable stream identifiers returned with table responses.
 pub fn latest_stream_metadata(
     table_name: &TableName,
-    created_at: TimestampMillis,
+    identity: TableStreamIdentity,
     stream_specification: Option<&StreamSpecification>,
 ) -> (Option<String>, Option<String>) {
     if !stream_specification.is_some_and(|specification| specification.stream_enabled) {
         return (None, None);
     }
 
-    let (stream_arn, stream_label) = stream_identity(table_name, created_at);
+    let (stream_arn, stream_label) = stream_identity(table_name, identity);
     (Some(stream_arn), Some(stream_label))
 }
 
 /// Construct the stable identity after the caller has established that its
 /// table stream is enabled.
-pub fn stream_identity(table_name: &TableName, created_at: TimestampMillis) -> (String, String) {
-    let stream_label = DateTime::<Utc>::from(created_at)
-        .format("%Y-%m-%dT%H:%M:%S%.3f")
-        .to_string();
+pub fn stream_identity(table_name: &TableName, identity: TableStreamIdentity) -> (String, String) {
+    let created_at = DateTime::<Utc>::from(identity.created_at).format("%Y-%m-%dT%H:%M:%S%.3f");
+    let id = uuid::Uuid::from_bytes(*identity.history_id.as_ref());
+    let stream_label = format!("{created_at}-{}", id.simple());
     let stream_arn =
         format!("arn:aws:dynamodb:us-east-1:123456789012:table/{table_name}/stream/{stream_label}");
     (stream_arn, stream_label)
@@ -102,21 +102,15 @@ pub struct CreateTableRequest {
     #[builder(default)]
     pub deletion_protection_enabled: Option<bool>,
 
-    /// Aux-storage extension: table stream retention duration in hours.
+    /// Aux-storage table history duration: 24 through 61320 hours, or -1 for
+    /// forever. Omitted values use 72 hours. This also governs item stream
+    /// history.
     #[serde(
         rename = "AuxStreamDurationHours",
         skip_serializing_if = "Option::is_none"
     )]
     #[builder(default)]
     pub aux_stream_duration_hours: Option<StreamRetentionDuration>,
-
-    /// Aux-storage extension: default item stream retention duration in hours.
-    #[serde(
-        rename = "AuxDefaultItemStreamDurationHours",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[builder(default)]
-    pub aux_default_item_stream_duration_hours: Option<StreamRetentionDuration>,
 }
 
 impl CreateTableRequest {
@@ -144,7 +138,6 @@ impl CreateTableRequest {
             table_class: None,
             deletion_protection_enabled: None,
             aux_stream_duration_hours: None,
-            aux_default_item_stream_duration_hours: None,
         }
     }
 
@@ -242,9 +235,6 @@ impl CreateTableRequest {
             item_count: 0,
             stream_specification: self.stream_specification.clone(),
             table_stream_duration,
-            default_item_stream_duration: self
-                .aux_default_item_stream_duration_hours
-                .unwrap_or(table_stream_duration),
             deletion_protection_enabled: self.deletion_protection_enabled.unwrap_or(false),
         })
     }
@@ -263,7 +253,6 @@ pub struct PreparedTableMetadata {
     pub stream_specification_json: Option<String>,
     pub deletion_protection_enabled: bool,
     pub table_stream_duration: StreamRetentionDuration,
-    pub default_item_stream_duration: StreamRetentionDuration,
 }
 
 pub fn prepare_table_metadata(
@@ -294,9 +283,6 @@ pub fn prepare_table_metadata_at(
         .transpose()?;
     let deletion_protection_enabled = request.deletion_protection_enabled.unwrap_or(false);
     let table_stream_duration = request.aux_stream_duration_hours.unwrap_or_default();
-    let default_item_stream_duration = request
-        .aux_default_item_stream_duration_hours
-        .unwrap_or(table_stream_duration);
 
     Ok(PreparedTableMetadata {
         created_at,
@@ -307,7 +293,6 @@ pub fn prepare_table_metadata_at(
         stream_specification_json,
         deletion_protection_enabled,
         table_stream_duration,
-        default_item_stream_duration,
     })
 }
 
@@ -321,6 +306,9 @@ pub struct CreateTableResponse {
 pub struct TableDescription {
     #[serde(rename = "TableName")]
     pub table_name: TableName,
+
+    #[serde(rename = "TableId")]
+    pub table_id: String,
 
     #[serde(rename = "TableStatus")]
     pub table_status: TableStatus,
@@ -408,15 +396,23 @@ pub struct TableDescription {
 
 impl TableDescription {
     #[must_use]
-    pub fn from_stored_table_info(table_info: StoredTableInfo, table_status: TableStatus) -> Self {
+    pub fn from_bound_table_info(bound: BoundTableInfo, table_status: TableStatus) -> Self {
+        let identity = bound.stream_identity();
+        let mut table_info = StoredTableInfo::from(bound);
+        if !table_info.has_enabled_stream()
+            && let Some(spec) = &mut table_info.stream_specification
+        {
+            spec.stream_enabled = false;
+        }
         let indexes_are_active = matches!(&table_status, TableStatus::Active);
         let (latest_stream_arn, latest_stream_label) = latest_stream_metadata(
             &table_info.table_name,
-            table_info.created_at,
+            identity,
             table_info.stream_specification.as_ref(),
         );
         Self {
             table_name: table_info.table_name.clone(),
+            table_id: uuid::Uuid::from_bytes(*identity.history_id.as_ref()).to_string(),
             table_status,
             created_at: table_info.created_at.into(),
             attribute_definitions: table_info.attribute_definitions,
@@ -552,6 +548,7 @@ pub struct CreateGlobalSecondaryIndex {
 impl From<CreateGlobalSecondaryIndex> for GlobalSecondaryIndex {
     fn from(value: CreateGlobalSecondaryIndex) -> Self {
         Self {
+            capture_for_build: false,
             index_name: value.index_name,
             key_schema: value.key_schema,
             projection: value.projection,

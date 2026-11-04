@@ -20,7 +20,6 @@ pub struct PutItemInput {
     pub return_values: Option<AllOld>,
     #[builder(setter(!strip_option))]
     pub return_old_on_condition_failure: bool,
-    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(TypedBuilder)]
@@ -49,7 +48,6 @@ pub struct DeleteItemInput {
     pub return_values: Option<AllOld>,
     #[builder(setter(!strip_option))]
     pub return_old_on_condition_failure: bool,
-    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(TypedBuilder)]
@@ -145,7 +143,6 @@ pub struct UpdateItemInput {
     pub return_values: Option<ReturnValuesOldNewUpdated>,
     #[builder(setter(!strip_option))]
     pub return_old_on_condition_failure: bool,
-    pub aux_item_stream_ttl_hours: Option<storage_types::StreamRetentionDuration>,
 }
 
 #[derive(TypedBuilder)]
@@ -198,7 +195,6 @@ impl TryFrom<UpdateItemInput> for storage_types::TransactUpdateRequest {
             return_values_on_condition_check_failure: input
                 .return_old_on_condition_failure
                 .then(|| "ALL_OLD".to_string()),
-            aux_item_stream_ttl_hours: input.aux_item_stream_ttl_hours,
         })
     }
 }

@@ -23,12 +23,12 @@ use crate::{AcceptedDeleteItem, prepare_accepted_delete};
 ///     attempt: &mut P,
 ///     command: &TtlSweepPageCommand,
 /// ) -> StorageResult<()> {
-///     let page = ExpirationAttempt::new(attempt)
+///     let page = ExpirationAttempt::new(attempt, Default::default())
 ///         .prepare_direct_expiration(command)
 ///         .await?;
 ///     let provenance = vec![ItemProvenance::default(); page.items().len()];
 ///     page.apply(&provenance).await?;
-///     drop(ExpirationAttempt::new(attempt));
+///     drop(ExpirationAttempt::new(attempt, Default::default()));
 ///     Ok(())
 /// }
 /// ```
@@ -43,8 +43,8 @@ use crate::{AcceptedDeleteItem, prepare_accepted_delete};
 /// async fn reborrow<P: ExpirationPort>(
 ///     attempt: &mut P, command: &TtlSweepPageCommand,
 /// ) -> StorageResult<()> {
-///     let page = ExpirationAttempt::new(attempt).prepare_direct_expiration(command).await?;
-///     let other = ExpirationAttempt::new(attempt);
+///     let page = ExpirationAttempt::new(attempt, Default::default()).prepare_direct_expiration(command).await?;
+///     let other = ExpirationAttempt::new(attempt, Default::default());
 ///     page.apply(&[]).await?;
 ///     drop(other);
 ///     Ok(())
@@ -63,7 +63,7 @@ impl<'native, P: ExpirationPort> ExpirationAttempt<'native, P> {
         command: &TtlSweepPageCommand,
     ) -> StorageResult<AcceptedDirectExpirationPage<'native, P>> {
         let (config, table) = self
-            .read_direct_policy(&command.table_name)
+            .read_direct_policy(&command.target.table_name)
             .await?
             .ok_or_else(|| StorageError::from(StorageEnum::ConditionalCheckFailed))?;
         let scan = DirectExpirationScanRead::try_new(command, config, (*table).clone())?;

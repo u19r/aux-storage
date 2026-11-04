@@ -8,6 +8,7 @@ use super::{GsiBuildRepository, GsiBuildRequest};
 
 pub struct GsiBuildHandler {
     repository: Arc<dyn GsiBuildRepository>,
+    initialization: Arc<dyn crate::TableStreamInitializationRepository>,
     interval: Duration,
     page_limit: GsiPageLimit,
 }
@@ -15,6 +16,7 @@ pub struct GsiBuildHandler {
 impl GsiBuildHandler {
     pub fn try_new(
         repository: Arc<dyn GsiBuildRepository>,
+        initialization: Arc<dyn crate::TableStreamInitializationRepository>,
         interval: Duration,
         page_limit: GsiPageLimit,
     ) -> StorageResult<Self> {
@@ -25,15 +27,21 @@ impl GsiBuildHandler {
         }
         Ok(Self {
             repository,
+            initialization,
             interval,
             page_limit,
         })
     }
 
-    fn outcome(&self, result: StepResult<()>, wall_now: Timestamp) -> StorageResult<JobOutcome> {
+    fn outcome(
+        &self,
+        result: StepResult<()>,
+        initialized: bool,
+        wall_now: Timestamp,
+    ) -> StorageResult<JobOutcome> {
         let delay = match result {
-            StepResult::Advanced(()) | StepResult::Superseded => Duration::ZERO,
-            StepResult::Complete => self.interval,
+            StepResult::Complete if !initialized => self.interval,
+            _ => Duration::ZERO,
         };
         let not_before = wall_now
             .checked_add(delay)
@@ -75,7 +83,12 @@ impl JobHandler for GsiBuildHandler {
                     })
                     .await
                     .map_err(Self::handler_error)?;
-                self.outcome(result, context.wall_now())
+                let initialized = self
+                    .initialization
+                    .advance_table_stream_initialization()
+                    .await
+                    .map_err(Self::handler_error)?;
+                self.outcome(result, initialized, context.wall_now())
                     .map_err(Self::handler_error)
             },
             now,

@@ -8,7 +8,6 @@ mod constants;
 #[cfg(test)]
 mod constants_tests;
 mod dynamodb_assembly;
-mod dynamodb_streams;
 mod errors;
 mod get_item_response;
 #[cfg(test)]

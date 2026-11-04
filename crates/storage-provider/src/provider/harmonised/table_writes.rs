@@ -40,7 +40,6 @@ pub trait TableWriteRepository {
             table,
             stream,
             ttl_config,
-            item_stream_ttl_hours,
         } = input;
         let (ordinal, physical_table, request, ttl_context) = write.into_parts();
         let request = request.normalized_for_write()?;
@@ -109,7 +108,6 @@ pub trait TableWriteRepository {
             ttl: TtlWriteIntent {
                 config: ttl_config,
                 context: ttl_context,
-                item_stream_ttl_hours,
                 table,
             },
         })
@@ -173,7 +171,6 @@ pub trait TableWriteRepository {
             ttl: TtlWriteIntent {
                 config: input.context.ttl_config,
                 context: input.context.ttl_context,
-                item_stream_ttl_hours: input.context.item_stream_ttl_hours,
                 table: input.table,
             },
         })
@@ -225,7 +222,6 @@ pub trait TableWriteRepository {
             ttl: TtlWriteIntent {
                 config: input.ttl_config,
                 context: TtlWriteContext::clone(input.write.context()),
-                item_stream_ttl_hours: input.item_stream_ttl_hours,
                 table: input.table,
             },
         })

@@ -23,8 +23,11 @@ pub struct RegionalAppendCapture {
     pub(crate) codec: Arc<CanonicalJsonCodec>,
 }
 
-impl<A: StreamAttempt + stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt>
-    TableAppendCapture<A> for RegionalAppendCapture
+impl<
+    A: StreamAttempt
+        + infrastructure_provider::physical_attempt::PhysicalRecordAttempt
+        + CatalogAttempt,
+> TableAppendCapture<A> for RegionalAppendCapture
 {
     type Captured = crate::journal::CapturedTableAppend;
 
@@ -33,9 +36,10 @@ impl<A: StreamAttempt + stream_provider::retained_image::RetainedOwnershipAttemp
         attempt: &mut A,
         request: &stream_provider::TableAppendRequest,
         append: &UserStreamAppend,
+        table: &storage_types::BoundTableInfo,
     ) -> StorageResult<Option<Self::Captured>> {
         self.journal
-            .capture_table_append(attempt, request, (append, &self.codec))
+            .capture_table_append(attempt, request, (append, &self.codec), table)
             .await
     }
 
@@ -82,7 +86,7 @@ impl<P: Clock> Clock for RegionalStreams<P> {
 
 impl<P: StreamPort + 'static> StreamPort for RegionalStreams<P>
 where for<'native> P::Attempt<'native>:
-        stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt
+        infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt
 {
     type Attempt<'native> = P::Attempt<'native>;
     type AppendCapture = RegionalAppendCapture;

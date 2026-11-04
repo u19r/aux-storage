@@ -11,13 +11,14 @@ use crate::history::{
 };
 
 pub(super) struct HeldCausalScope {
+    pub(super) physical: storage_types::TableHistoryId,
     pub declaration: CanonicalAncestryScope,
     pub cut: CanonicalTableCut,
 }
 
 impl JournalStore {
     pub(super) async fn load_held_causal_scopes<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -40,13 +41,14 @@ impl JournalStore {
                 let cut = self
                     .load_held_causal_cut(attempt, (declaration, observed_at), encoding)
                     .await?;
-                let bytes = crate::history::response_budget::encoded_length(&cut, remaining)?;
+                let bytes = crate::history::response_budget::encoded_length(&cut.cut, remaining)?;
                 remaining = remaining.checked_sub(bytes).ok_or_else(|| {
                     StorageError::validation("Ancestry cuts exceed the source work budget")
                 })?;
                 scopes.push(HeldCausalScope {
                     declaration: declaration.clone(),
-                    cut,
+                    physical: cut.physical,
+                    cut: cut.cut,
                 });
             }
             Ok(scopes)
@@ -56,23 +58,25 @@ impl JournalStore {
     }
 
     async fn load_held_causal_cut<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         input: (&CanonicalAncestryScope, TimestampMillis),
         encoding: (&WorkLimits, &CanonicalJsonCodec),
-    ) -> StorageResult<CanonicalTableCut> {
+    ) -> StorageResult<super::portable_checkpoint::HeldTableCut> {
         let (scope, observed_at) = input;
         let held = PortableReadScope {
             table: &scope.table,
             lineage: scope.lineage,
             membership: scope.membership,
         };
-        let cut = self
+        let mut cut = self
             .load_portable_checkpoint_cut(attempt, held, scope.checkpoint, observed_at)
             .await?;
-        self.verify_held_source_vector(attempt, (&scope.table, &cut), encoding)
-            .await
+        cut.cut = self
+            .verify_held_source_vector(attempt, ((cut.physical, &scope.table), &cut.cut), encoding)
+            .await?;
+        Ok(cut)
     }
 }

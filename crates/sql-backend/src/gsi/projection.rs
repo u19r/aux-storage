@@ -50,7 +50,7 @@ pub(crate) async fn read_projection_states<A: SqlAttempt>(
             ));
         }
         let statement = if batch.target.index_name.is_ttl_index() {
-            sql_statements::ttl_projection_state_statement(engine, batch.table, &keys, history_id)?
+            sql_statements::ttl_projection_state_statement(engine, &keys, history_id)?
         } else {
             sql_statements::projection_state_statement(
                 engine,

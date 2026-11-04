@@ -1,5 +1,5 @@
 use replication_types::configuration::{control::ConfigurationChange, proposal::ControlProposal};
-use storage_provider::{TableUpdateChange, TableUpdateTransaction};
+use storage_provider::{RequestTableBindings, TableUpdateChange, TableUpdateTransaction};
 use storage_types::{BoundTableInfo, StorageResult};
 
 use crate::{
@@ -9,9 +9,7 @@ use crate::{
 };
 
 impl JournalStore {
-    pub(super) async fn prepare_table_metadata<
-        A: TableUpdateTransaction<Catalog = BoundTableInfo>,
-    >(
+    pub(super) async fn prepare_table_metadata<A: TableUpdateTransaction>(
         &self,
         attempt: &mut A,
         proposal: &ControlProposal,
@@ -35,25 +33,32 @@ impl JournalStore {
                 .as_ref()
                 .ok_or_else(corrupt_record)?;
             let request = definition.to_request(state.name.clone());
+            if request
+                .stream_specification
+                .as_ref()
+                .is_some_and(|spec| !spec.stream_enabled)
+            {
+                return Err(storage_types::StorageError::validation(
+                    "Regional replication requires the table stream",
+                ));
+            }
+            let bindings = RequestTableBindings::default();
+            bindings.observe(&state.name, state.physical)?;
             let (catalog, change) = attempt
                 .prepare_table_update(
                     &request,
                     storage_provider::TableUpdateTime::for_control(*requested_at, observed_at),
+                    &bindings,
                 )
                 .await?
                 .into_result()?;
-            if catalog.history_id != state.physical {
-                return Err(corrupt_record());
-            }
             Ok((catalog, change))
         }
         .await;
         settlement.complete(result)
     }
 
-    pub(super) async fn install_table_metadata<
-        A: TableUpdateTransaction<Catalog = BoundTableInfo>,
-    >(
+    pub(super) async fn install_table_metadata<A: TableUpdateTransaction>(
         &self,
         attempt: &mut A,
         proposal: &ControlProposal,
@@ -81,9 +86,7 @@ impl JournalStore {
 
     /// Installation effects settle before build readiness is queried. An
     /// unready installed control stays durable without issuing a ready receipt.
-    pub(crate) async fn require_control_gsi_ready<
-        A: TableUpdateTransaction<Catalog = BoundTableInfo>,
-    >(
+    pub(crate) async fn require_control_gsi_ready<A: TableUpdateTransaction>(
         &self,
         attempt: &mut A,
         record: &ControlRecord,
@@ -145,9 +148,7 @@ impl JournalStore {
         settlement.complete(result)
     }
 
-    pub(in crate::journal) async fn require_native_gsi_ready<
-        A: TableUpdateTransaction<Catalog = BoundTableInfo>,
-    >(
+    pub(in crate::journal) async fn require_native_gsi_ready<A: TableUpdateTransaction>(
         &self,
         attempt: &mut A,
         catalog: &BoundTableInfo,
@@ -179,9 +180,7 @@ impl JournalStore {
         settlement.complete(result)
     }
 
-    pub(in crate::journal) async fn require_table_gsi_ready<
-        A: TableUpdateTransaction<Catalog = BoundTableInfo>,
-    >(
+    pub(in crate::journal) async fn require_table_gsi_ready<A: TableUpdateTransaction>(
         &self,
         attempt: &mut A,
         catalog: &BoundTableInfo,

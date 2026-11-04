@@ -86,7 +86,7 @@ async fn seed_scheduled_store(path: &Path, value: &[u8]) {
         .expect("scheduled-job capabilities");
     store.bootstrap().await.expect("bootstrap seed store");
     store
-        .commit(&put_transaction(b"store-marker", value))
+        .transact(&put_transaction(b"store-marker", value))
         .await
         .expect("seed scheduled row");
 }
@@ -211,7 +211,7 @@ async fn given_committed_job_when_initialized_manager_reopens_then_receipt_and_e
         .scheduled_job_store()
         .expect("initialized owner's job store");
     assert_eq!(
-        store.commit(&transaction).await.expect("initial commit"),
+        store.transact(&transaction).await.expect("initial commit"),
         scheduled_bg_jobs::store::CommitOutcome::Committed
     );
     drop(store);
@@ -235,7 +235,7 @@ async fn given_committed_job_when_initialized_manager_reopens_then_receipt_and_e
     );
     assert_eq!(
         store
-            .commit(&transaction)
+            .transact(&transaction)
             .await
             .expect("replay durable receipt"),
         scheduled_bg_jobs::store::CommitOutcome::Committed

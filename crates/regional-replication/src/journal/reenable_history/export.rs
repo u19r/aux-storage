@@ -396,7 +396,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_reenable_original_frame<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -430,7 +430,16 @@ impl JournalStore {
                 origin: cut.origin,
                 range,
                 membership: cut.membership,
-                tables: vec![(cut.source.table, cut.lineage)],
+                tables: vec![(
+                    cut.source.table,
+                    cut.lineage,
+                    request
+                        .proposal
+                        .participant(&self.region)
+                        .map_err(|_| corrupt_record())?
+                        .proposed
+                        .physical,
+                )],
             };
             crate::delivery::load_bounded_frame(self, attempt, selection, encoding)
                 .await

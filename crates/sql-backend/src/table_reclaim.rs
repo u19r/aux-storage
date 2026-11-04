@@ -5,63 +5,64 @@ use storage_provider::{
     CATALOG_READ_BYTES, CatalogAttempt, TableReclaimAttempt, TableReclaimPhase, TableReclaimStep,
     TableReclaimTarget,
 };
-use storage_types::{StorageError, StorageResult, TimestampMillis, storage_serde};
+use storage_types::{StorageError, StorageResult, storage_serde};
 
 use crate::{
-    ColumnIndex, ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue,
-    catalog::SqlCatalogAttempt,
+    ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt,
 };
 
 pub(crate) async fn initialize_table_reclaim<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
 ) -> StorageResult<()> {
-    let text = engine.engine().text_type();
-    let int = engine.engine().integer_type();
-    let blob = engine.engine().blob_type();
     attempt
-        .execute(SqlStatement::new(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {relation_sys_table_reclaim} (history_id {text} \
-                 PRIMARY KEY, ready_at {int} NOT NULL, payload {blob} NOT NULL){}",
-                engine.engine().table_suffix(),
-                relation_sys_table_reclaim = engine.relation_name("sys_table_reclaim"),
-            ),
-            vec![],
-        ))
-        .await?;
-    attempt
-        .execute(SqlStatement::new(
-            crate::sql_template::sql_template!(
-                engine,
-                "CREATE INDEX IF NOT EXISTS "["sys_table_reclaim_due"],
-                " ON "["sys_table_reclaim"],
-                " (ready_at, history_id)"
-            )
-            .to_owned(),
-            vec![],
-        ))
+        .execute(crate::table_reclaim_sql_statements::schema(engine))
         .await?;
     Ok(())
 }
 
 impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, A, L> {
-    async fn load_reclaim_target(
+    async fn load_table_system_rows(
         &mut self,
-        observed_at: TimestampMillis,
-    ) -> StorageResult<Option<TableReclaimTarget>> {
+        history: storage_types::TableHistoryId,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<storage_provider::TableSystemHistoryPage> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = crate::table_history_reclaim::load_table_system_rows(
+            catalog.attempt,
+            catalog.engine,
+            history,
+            limit,
+        )
+        .await;
+        operation.complete(result)
+    }
+
+    async fn store_table_system_removals(
+        &mut self,
+        history: storage_types::TableHistoryId,
+        rows: &[storage_types::SystemHistoryRecord],
+    ) -> StorageResult<()> {
+        let mut operation =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = operation.as_mut();
+        let result = crate::table_history_reclaim::store_table_system_removals(
+            catalog.attempt,
+            catalog.engine,
+            history,
+            rows,
+        )
+        .await;
+        operation.complete(result)
+    }
+
+    async fn load_reclaim_target(&mut self) -> StorageResult<Option<TableReclaimTarget>> {
         let page = self
             .attempt
             .query(
-                SqlStatement::new(
-                    format!(
-                        "SELECT history_id, ready_at, payload FROM {relation_sys_table_reclaim} \
-                         WHERE ready_at <= {} ORDER BY ready_at, history_id LIMIT 1",
-                        self.engine.engine().placeholder(1),
-                        relation_sys_table_reclaim = self.engine.relation_name("sys_table_reclaim"),
-                    ),
-                    vec![SqlValue::Integer(observed_at.timestamp_millis())],
-                ),
+                crate::table_reclaim_sql_statements::load_target(self.engine),
                 ReadProtection::Conflict,
                 CATALOG_READ_BYTES,
             )
@@ -74,33 +75,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
         let Some(row) = page.rows.into_iter().next() else {
             return Ok(None);
         };
-        let SqlValue::Text(id) = row.value(ColumnIndex::new(0))? else {
-            return Err(StorageError::internal(
-                "SQL reclaim identity has invalid type",
-            ));
-        };
-        let SqlValue::Integer(ready_at) = row.value(ColumnIndex::new(1))? else {
-            return Err(StorageError::internal(
-                "SQL reclaim deadline has invalid type",
-            ));
-        };
-        let SqlValue::Blob(bytes) = row.value(ColumnIndex::new(2))? else {
-            return Err(StorageError::internal(
-                "SQL reclaim payload has invalid type",
-            ));
-        };
-        let target: TableReclaimTarget = storage_serde::from_bytes(bytes)?;
-        let expected_id = uuid::Uuid::from_bytes(*target.history_id.as_ref()).to_string();
-        let expected_ready = if target.phase == TableReclaimPhase::NameReservation {
-            target.name_locked_until.timestamp_millis()
-        } else {
-            i64::MIN
-        };
-        if id != &expected_id || *ready_at != expected_ready {
-            return Err(StorageError::internal(
-                "SQL reclaim target differs from its marker",
-            ));
-        }
+        let target = decode_reclaim_target(row)?;
         if self
             .read_catalog_stamp(&target.table_name)
             .await?
@@ -117,47 +92,28 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
         &mut self,
         target: &TableReclaimTarget,
     ) -> StorageResult<TableReclaimStep> {
-        let name = &target.table_name;
         let history = target.history_id;
         match target.phase {
+            TableReclaimPhase::ExternalData | TableReclaimPhase::SystemHistory => {
+                return Err(StorageError::internal(
+                    "Table reclaim phase requires its domain owner",
+                ));
+            }
+            TableReclaimPhase::TableHistory => {
+                return crate::table_history_reclaim::delete_table_history_rows(
+                    self.attempt,
+                    self.engine,
+                    history,
+                )
+                .await;
+            }
             TableReclaimPhase::MetadataCleanup => {
-                let mut statements = target
-                    .gsi_targets
-                    .iter()
-                    .map(|gsi| {
-                        SqlStatement::new(
-                            format!(
-                                "DELETE FROM {relation_sys_gsi_history_holds} WHERE table_name = \
-                                 {} AND index_name = {} AND index_incarnation = {} AND lineage_id \
-                                 IN (SELECT lineage_id FROM {relation_sys_gsi_history_holds} \
-                                 WHERE table_name = {} AND index_name = {} AND index_incarnation \
-                                 = {} ORDER BY lineage_id LIMIT 64)",
-                                self.engine.engine().placeholder(1),
-                                self.engine.engine().placeholder(2),
-                                self.engine.engine().placeholder(3),
-                                self.engine.engine().placeholder(4),
-                                self.engine.engine().placeholder(5),
-                                self.engine.engine().placeholder(6),
-                                relation_sys_gsi_history_holds =
-                                    self.engine.relation_name("sys_gsi_history_holds"),
-                            ),
-                            vec![
-                                SqlValue::Text(name.to_string()),
-                                SqlValue::Text(gsi.index_name.to_string()),
-                                SqlValue::Blob(gsi.incarnation.as_ref().to_vec()),
-                                SqlValue::Text(name.to_string()),
-                                SqlValue::Text(gsi.index_name.to_string()),
-                                SqlValue::Blob(gsi.incarnation.as_ref().to_vec()),
-                            ],
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let mut statements = Vec::new();
                 statements.push(SqlStatement::new(
                     format!(
-                        "DELETE FROM {relation_sys_stream_trim_due_markers} WHERE (due_bucket, \
-                         scope_id, policy_version) IN (SELECT due_bucket, scope_id, \
-                         policy_version FROM {relation_sys_stream_trim_due_markers} WHERE \
-                         scope_id = {} LIMIT 64)",
+                        "DELETE FROM {relation_sys_stream_trim_due_markers} WHERE (due_at, \
+                         scope_id, policy_version) IN (SELECT due_at, scope_id, policy_version \
+                         FROM {relation_sys_stream_trim_due_markers} WHERE scope_id = {} LIMIT 64)",
                         self.engine.engine().placeholder(1),
                         relation_sys_stream_trim_due_markers =
                             self.engine.relation_name("sys_stream_trim_due_markers"),
@@ -175,8 +131,16 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
                     return Ok(TableReclaimStep::Advanced);
                 }
             }
+            TableReclaimPhase::ExplicitAppends => {
+                return crate::stream_write::delete_table_appends(
+                    self.attempt,
+                    self.engine,
+                    history,
+                )
+                .await;
+            }
             TableReclaimPhase::PrimaryItems => {
-                drop_relation(self.attempt, self.engine.item_table_name(name, history)).await?;
+                drop_relation(self.attempt, self.engine.item_table_name(history)).await?;
             }
             TableReclaimPhase::PrimaryTombstones => {
                 let count = self
@@ -205,9 +169,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
                     .gsi_targets
                     .iter()
                     .map(|gsi| {
-                        let relation =
-                            self.engine
-                                .gsi_table_name(name, &gsi.index_name, &gsi.incarnation);
+                        let relation = self.engine.gsi_table_name(&gsi.incarnation);
                         SqlStatement::new(format!("DROP TABLE IF EXISTS \"{relation}\""), vec![])
                     })
                     .collect();
@@ -216,24 +178,7 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
                 }
             }
             TableReclaimPhase::TtlIndex => {
-                drop_relation(self.attempt, self.engine.ttl_table_name(name, history)).await?;
-            }
-            TableReclaimPhase::NameReservation => {
-                let id = uuid::Uuid::from_bytes(*history.as_ref()).to_string();
-                self.attempt
-                    .execute(SqlStatement::new(
-                        format!(
-                            "DELETE FROM {relation_tables} WHERE id = {} AND locked_until = {}",
-                            self.engine.engine().placeholder(1),
-                            self.engine.engine().placeholder(2),
-                            relation_tables = self.engine.relation_name("tables"),
-                        ),
-                        vec![
-                            SqlValue::Text(id),
-                            SqlValue::Integer(target.name_locked_until.timestamp_millis()),
-                        ],
-                    ))
-                    .await?;
+                drop_relation(self.attempt, self.engine.ttl_table_name(history)).await?;
             }
             TableReclaimPhase::GsiTombstones | TableReclaimPhase::GsiNameLocks => {}
         }
@@ -245,41 +190,20 @@ impl<A: SqlAttempt, L: SqlLayout> TableReclaimAttempt for SqlCatalogAttempt<'_, 
         target: &TableReclaimTarget,
         next: Option<TableReclaimPhase>,
     ) -> StorageResult<()> {
-        let id = uuid::Uuid::from_bytes(*target.history_id.as_ref()).to_string();
-        let statement = if let Some(phase) = next {
+        let statements = if let Some(phase) = next {
             let mut next_target = target.clone();
             next_target.phase = phase;
-            let ready_at = if phase == TableReclaimPhase::NameReservation {
-                target.name_locked_until.timestamp_millis()
-            } else {
-                i64::MIN
-            };
-            SqlStatement::new(
-                format!(
-                    "UPDATE {relation_sys_table_reclaim} SET ready_at = {}, payload = {} WHERE \
-                     history_id = {}",
-                    self.engine.engine().placeholder(1),
-                    self.engine.engine().placeholder(2),
-                    self.engine.engine().placeholder(3),
-                    relation_sys_table_reclaim = self.engine.relation_name("sys_table_reclaim"),
-                ),
-                vec![
-                    SqlValue::Integer(ready_at),
-                    SqlValue::Blob(storage_serde::to_bytes(&next_target)?),
-                    SqlValue::Text(id),
-                ],
-            )
+            vec![crate::table_reclaim_sql_statements::store_target(
+                self.engine,
+                &next_target,
+            )?]
         } else {
-            SqlStatement::new(
-                format!(
-                    "DELETE FROM {relation_sys_table_reclaim} WHERE history_id = {}",
-                    self.engine.engine().placeholder(1),
-                    relation_sys_table_reclaim = self.engine.relation_name("sys_table_reclaim"),
-                ),
-                vec![SqlValue::Text(id)],
-            )
+            crate::table_reclaim_sql_statements::finish_target(self.engine, target.history_id)
+                .into()
         };
-        if self.attempt.execute(statement).await? != 1 {
+        let expected = statements.len();
+        let counts = self.attempt.execute_batch(statements).await?;
+        if counts.len() != expected || counts.iter().any(|count| *count != 1) {
             return Err(StorageError::internal(
                 "SQL reclaim target changed during phase update",
             ));
@@ -296,4 +220,21 @@ async fn drop_relation<A: SqlAttempt>(attempt: &mut A, relation: String) -> Stor
         ))
         .await?;
     Ok(())
+}
+
+fn decode_reclaim_target(row: crate::SqlRow) -> StorageResult<TableReclaimTarget> {
+    let values: [SqlValue; 2] = row
+        .into_values()
+        .try_into()
+        .map_err(|_| StorageError::internal("Invalid SQL reclaim target width"))?;
+    let [SqlValue::Text(id), SqlValue::Blob(bytes)] = values else {
+        return Err(StorageError::internal("Invalid SQL reclaim target types"));
+    };
+    let target: TableReclaimTarget = storage_serde::from_bytes(&bytes)?;
+    if id != uuid::Uuid::from_bytes(*target.history_id.as_ref()).to_string() {
+        return Err(StorageError::internal(
+            "SQL reclaim target differs from its marker",
+        ));
+    }
+    Ok(target)
 }

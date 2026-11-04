@@ -82,14 +82,26 @@ impl JournalStore {
         input: (&GsiTombstoneRow, &CanonicalJsonCodec),
     ) -> StorageResult<()> {
         let key = self
-            .load_projection_owner(attempt, target.0.request.operation.id, &input.0.address)
+            .load_projection_owner(
+                attempt,
+                (target.0.state.physical, target.0.request.operation.id),
+                &input.0.address,
+            )
             .await?;
         let expected = self
-            .load_expected_winner(attempt, target.0.request.operation.id, &key)
+            .load_expected_winner(
+                attempt,
+                (target.0.state.physical, target.0.request.operation.id),
+                &key,
+            )
             .await?
             .ok_or_else(corrupt_record)?;
         let authority = self
-            .load_winner_authority(attempt, (&expected.key, &expected.provenance), input.1)
+            .load_winner_authority(
+                attempt,
+                (target.1.history_id, &expected.key, &expected.provenance),
+                input.1,
+            )
             .await?;
         let (observed, _) = attempt
             .observe_for_write(target.1, authority.key()?)

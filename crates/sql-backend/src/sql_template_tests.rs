@@ -51,7 +51,6 @@ fn given_sequence_advance_when_statement_rendered_then_preserve_full_sql_and_bin
 struct CaptureAttempt {
     statements: Vec<SqlStatement>,
     rejected: bool,
-    ownership: stream_provider::retained_image::RetainedOwnershipChanges,
 }
 
 impl crate::SqlAttempt for CaptureAttempt {
@@ -68,11 +67,6 @@ impl crate::SqlAttempt for CaptureAttempt {
             ));
         }
         Ok(())
-    }
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges {
-        &mut self.ownership
     }
 
     async fn query(

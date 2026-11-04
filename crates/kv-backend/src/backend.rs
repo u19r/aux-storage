@@ -30,10 +30,6 @@ pub trait KvAttempt: Send + Sync {
         self.settlement().reject();
     }
 
-    fn ownership_changes(
-        &mut self,
-    ) -> &mut stream_provider::retained_image::RetainedOwnershipChanges;
-
     /// Opaque control records use the original native address space. Data
     /// views override this method while ordinary attempts return themselves;
     /// both paths borrow the same transaction and share its settlement.
@@ -107,12 +103,12 @@ pub trait KvAttempt: Send + Sync {
         protection: ReadProtection,
     ) -> impl Future<Output = StorageResult<KvRangePage>> + Send;
 
-    fn native_has_key_in_range(
+    fn native_first_key_in_range(
         &self,
         begin: &[u8],
         end: &[u8],
         protection: ReadProtection,
-    ) -> impl Future<Output = StorageResult<bool>> + Send;
+    ) -> impl Future<Output = StorageResult<Option<Vec<u8>>>> + Send;
 
     fn native_stage(&mut self, changes: Vec<KvMutation>) -> StorageResult<()>;
 
@@ -213,31 +209,47 @@ pub trait KvAttempt: Send + Sync {
         }
     }
 
-    /// Observe a fixed logical prefix under the same head/chunk protection.
+    /// Observe up to the requested logical prefix under the same head/chunk
+    /// protection. Short values return their complete bytes; codecs own their
+    /// required header length.
     fn get_batch_prefix(
         &self,
         keys: Vec<Vec<u8>>,
         protection: ReadProtection,
         prefix_bytes: NonZeroUsize,
     ) -> impl Future<Output = StorageResult<Vec<Option<crate::KvValuePrefix>>>> + Send {
+        let allowance = crate::KvValueAllowance::for_unqualified_values(keys.len());
+        self.get_batch_prefix_admitted(keys, protection, prefix_bytes, allowance)
+    }
+
+    fn get_batch_prefix_admitted(
+        &self,
+        keys: Vec<Vec<u8>>,
+        protection: ReadProtection,
+        prefix_bytes: NonZeroUsize,
+        allowance: crate::KvValueAllowance,
+    ) -> impl Future<Output = StorageResult<Vec<Option<crate::KvValuePrefix>>>> + Send {
         async move {
             let call = self.settlement().begin_call()?;
-            let result =
-                crate::value_prefix::load_value_prefixes(self, &keys, protection, prefix_bytes)
-                    .await
-                    .inspect_err(|error| {
-                        trace_native_failure(
-                            self.backend_engine(),
-                            NativeOperation::KvGetBatch,
-                            error,
-                        )
-                    });
+            let result = crate::value_prefix::load_value_prefixes(
+                self,
+                &keys,
+                crate::value_prefix::KvPrefixRead {
+                    protection,
+                    prefix_bytes,
+                    allowance,
+                },
+            )
+            .await
+            .inspect_err(|error| {
+                trace_native_failure(self.backend_engine(), NativeOperation::KvGetBatch, error)
+            });
             call.complete(result)
         }
     }
 
     /// Admit logical value lengths from native heads before fetching chunk
-    /// trees. This value allowance excludes keys and includes caller-owned
+    /// rows. This value allowance excludes keys and includes caller-owned
     /// value headers.
     fn get_batch_bounded(
         &self,
@@ -296,6 +308,19 @@ pub trait KvAttempt: Send + Sync {
         protection: ReadProtection,
     ) -> impl Future<Output = StorageResult<bool>> + Send {
         async move {
+            self.first_key_in_range(begin, end, protection)
+                .await
+                .map(|key| key.is_some())
+        }
+    }
+
+    fn first_key_in_range(
+        &self,
+        begin: &[u8],
+        end: &[u8],
+        protection: ReadProtection,
+    ) -> impl Future<Output = StorageResult<Option<Vec<u8>>>> + Send {
+        async move {
             let call = self.settlement().begin_call()?;
             let result = async {
                 #[cfg(feature = "fault-injection")]
@@ -306,7 +331,7 @@ pub trait KvAttempt: Send + Sync {
                 }) {
                     return Err(error);
                 }
-                self.native_has_key_in_range(begin, end, protection).await
+                self.native_first_key_in_range(begin, end, protection).await
             }
             .await;
             call.complete(result.inspect_err(|error| {
@@ -362,24 +387,11 @@ pub trait KvAttempt: Send + Sync {
         async move {
             let call = self.settlement().begin_call()?;
             let result = async {
-                #[cfg(feature = "fault-injection")]
-                if let Some(error) = self.fault_probe().and_then(|probe| {
-                    probe.fail(crate::KvFaultCall {
-                        operation: crate::KvFaultOperation::ScanBatch,
-                    })
-                }) {
-                    return Err(error);
-                }
                 let budgets = ranges
                     .iter()
                     .map(|range| range.max_bytes.get())
                     .collect::<Vec<_>>();
-                let pages = self.native_scan_batch(ranges, protection).await?;
-                if pages.len() != budgets.len() {
-                    return Err(StorageError::internal(
-                        "native KV range batch returned the wrong count",
-                    ));
-                }
+                let pages = crate::value_layout::load_range_heads(self, ranges, protection).await?;
                 resolve_pages(self, pages, budgets, protection).await
             }
             .await;

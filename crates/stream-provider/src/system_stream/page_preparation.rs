@@ -15,7 +15,10 @@ pub(super) struct PreparedSystemStreamPage {
 }
 
 impl PreparedSystemStreamPage {
-    pub(super) fn prepare(request: SystemStreamPageRequest) -> StorageResult<Self> {
+    pub(super) fn prepare(
+        request: SystemStreamPageRequest,
+        issued_at: TimestampMillis,
+    ) -> StorageResult<Self> {
         let mut encoded = String::with_capacity(35);
         encoded.push_str("v1.");
         for byte in Uuid::new_v4().into_bytes() {
@@ -27,7 +30,7 @@ impl PreparedSystemStreamPage {
         Ok(Self {
             request,
             issued_token,
-            issued_at: TimestampMillis::now(),
+            issued_at,
         })
     }
 }

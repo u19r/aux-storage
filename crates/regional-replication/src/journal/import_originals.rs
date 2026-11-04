@@ -140,11 +140,11 @@ impl PreparedImportOriginal {
 
 impl JournalStore {
     pub(crate) async fn prepare_import_events<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        input: &[(&CanonicalEvent, Option<TableHistoryId>)],
+        input: &[(&CanonicalEvent, TableHistoryId)],
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<PreparedImportEvents> {
         let mut settlement =
@@ -162,14 +162,12 @@ impl JournalStore {
                 .map_err(storage_types::StorageError::from)?
                 .ok_or_else(corrupt_record)?;
             prepared.select_originals(input, accepted)?;
-            let changes = self
-                .prepare_original_batch(settlement.as_mut(), &prepared.selected)
-                .await?;
+            let changes = self.prepare_original_batch(&prepared.selected)?;
             if changes.len() != prepared.selected.len() {
                 return Err(corrupt_record());
             }
             let deliveries = self
-                .prepare_first_seen_batch(settlement.as_mut(), &prepared.selected_events)
+                .prepare_first_seen_batch(settlement.as_mut(), &prepared.selected)
                 .await?;
             prepared.bind_originals(changes, deliveries)
         }
@@ -183,20 +181,18 @@ impl JournalStore {
 /// bank.
 struct ImportOriginalPreparation<'input> {
     ordinals: Vec<usize>,
-    replays: Vec<&'input CanonicalEvent>,
-    selected: Vec<(&'input CanonicalEvent, Option<TableHistoryId>)>,
-    selected_events: Vec<&'input CanonicalEvent>,
+    replays: Vec<(&'input CanonicalEvent, TableHistoryId)>,
+    selected: Vec<(&'input CanonicalEvent, TableHistoryId)>,
     inventory: PreparedImportEvents,
 }
 
 impl<'input> ImportOriginalPreparation<'input> {
-    fn try_new(input: &[(&'input CanonicalEvent, Option<TableHistoryId>)]) -> StorageResult<Self> {
+    fn try_new(input: &[(&'input CanonicalEvent, TableHistoryId)]) -> StorageResult<Self> {
         let ordinals = Self::select_unique_ordinals(input)?;
         let mut prepared = Self {
             ordinals,
             replays: Vec::new(),
             selected: Vec::new(),
-            selected_events: Vec::new(),
             inventory: PreparedImportEvents::default(),
         };
         let count = prepared.ordinals.len();
@@ -209,22 +205,18 @@ impl<'input> ImportOriginalPreparation<'input> {
             .try_reserve_exact(count)
             .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
         prepared
-            .selected_events
-            .try_reserve_exact(count)
-            .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
-        prepared
             .inventory
             .events
             .try_reserve_exact(count)
             .map_err(|_| InfrastructureResultKind::NativeCapacityRejected)?;
         prepared
             .replays
-            .extend(prepared.ordinals.iter().map(|ordinal| input[*ordinal].0));
+            .extend(prepared.ordinals.iter().map(|ordinal| input[*ordinal]));
         Ok(prepared)
     }
 
     fn select_unique_ordinals(
-        input: &[(&CanonicalEvent, Option<TableHistoryId>)],
+        input: &[(&CanonicalEvent, TableHistoryId)],
     ) -> StorageResult<Vec<usize>> {
         let mut ordinals = Vec::new();
         ordinals
@@ -255,7 +247,7 @@ impl<'input> ImportOriginalPreparation<'input> {
 
     fn select_originals(
         &mut self,
-        input: &[(&'input CanonicalEvent, Option<TableHistoryId>)],
+        input: &[(&'input CanonicalEvent, TableHistoryId)],
         accepted: Vec<Option<(StoredAcceptance, crate::history::view::CanonicalViewPointer)>>,
     ) -> StorageResult<()> {
         if accepted.len() != self.ordinals.len() {
@@ -270,7 +262,6 @@ impl<'input> ImportOriginalPreparation<'input> {
                     .push((event.clone(), PreparedImportEvent::Accepted(accepted))),
                 None => {
                     self.selected.push((event, history));
-                    self.selected_events.push(event);
                 }
             }
         }

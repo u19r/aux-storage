@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::json;
 use storage_types::{
-    AttributeValue, DurationSeconds, StreamItemId, StreamName, StreamRecord,
-    SystemStreamCheckpointToken, SystemStreamContractError, SystemStreamPosition,
-    SystemStreamScope, SystemStreamSourceTableName, TimestampMillis, UserStreamName,
+    DurationSeconds, StreamItemId, StreamName, StreamRecord, SystemStreamCheckpointToken,
+    SystemStreamContractError, SystemStreamPosition, SystemStreamScope, TimestampMillis,
+    UserStreamName,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     SystemStreamLineage, SystemStreamLineageCatalog, SystemStreamPage, SystemStreamPageRequest,
     SystemStreamSplitChild, SystemStreamSplitDisposition, SystemStreamSplitOperationId,
     SystemStreamSplitReceipt, SystemStreamSplitRequest, SystemStreamSplitResult,
-    SystemStreamStoredRecord, SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest,
+    SystemStreamTrimPageReceipt, SystemStreamTrimPageRequest,
 };
 
 struct NoSystemStreamProvider;
@@ -501,63 +501,6 @@ fn given_trim_receipt_when_replayed_then_shared_page_contract_is_enforced() {
     assert!(invalid.replay(&request).is_err());
 }
 
-#[test]
-fn stored_system_record_requires_and_emits_logical_source_table_name() {
-    let source_table_name =
-        SystemStreamSourceTableName::try_new("orders").expect("logical source table");
-    let stored = SystemStreamStoredRecord {
-        source_table_name,
-        keys: HashMap::new().into(),
-        old_image: None,
-        new_image: Some(
-            storage_types::WireItem::try_from(&HashMap::from([(
-                "id".to_string(),
-                AttributeValue::S("1".to_string()),
-            )]))
-            .unwrap(),
-        ),
-        position: SystemStreamPosition::try_new("shard-a", "lineage-a", "1").expect("position"),
-    };
-
-    let encoded = serde_json::to_value(&stored).expect("stored record JSON");
-    assert_eq!(encoded["source_table_name"], json!("orders"));
-    let decoded = serde_json::from_value::<SystemStreamStoredRecord>(encoded.clone())
-        .expect("stored record JSON should round-trip");
-    assert_eq!(
-        serde_json::to_value(decoded).unwrap(),
-        serde_json::to_value(&stored).unwrap()
-    );
-
-    let mut changed = encoded;
-    changed["source_table_name"] = json!("customers");
-    let changed_record = serde_json::from_value::<SystemStreamStoredRecord>(changed)
-        .expect("changed logical source table should remain syntactically valid");
-    assert_ne!(
-        serde_json::to_value(changed_record).unwrap(),
-        serde_json::to_value(&stored).unwrap()
-    );
-
-    let mut physical = serde_json::to_value(&stored).expect("stored record JSON");
-    physical["source_table_name"] = json!("arn:aws:dynamodb:table/orders");
-    serde_json::from_value::<SystemStreamStoredRecord>(physical)
-        .expect_err("physical source table identity must be rejected");
-
-    let record = stored.into_stream_record().unwrap();
-    assert_eq!(
-        record.source_table_name.as_ref().map(ToString::to_string),
-        Some("orders".to_string())
-    );
-    assert_eq!(
-        record
-            .system_position
-            .as_ref()
-            .expect("position")
-            .offset()
-            .as_str(),
-        "1"
-    );
-}
-
 fn issued_checkpoint() -> SystemStreamIssuedCheckpoint {
     let checkpoint = storage_types::SystemStreamCheckpoint::try_new(
         scope(),
@@ -576,8 +519,7 @@ fn system_stream_page_requires_logical_source_table_name_before_response() {
         source_table_name: None,
         keys: HashMap::new().into(),
         sequence_number: "1".to_string(),
-        old_image: None,
-        new_image: None,
+        item: None,
         system_position: Some(
             SystemStreamPosition::try_new("shard-a", "lineage-a", "1").expect("position"),
         ),
@@ -591,16 +533,9 @@ fn system_stream_page_requires_logical_source_table_name_before_response() {
 
 #[test]
 fn system_stream_page_conversion_preserves_logical_source_table_name_on_wire() {
-    let stored = SystemStreamStoredRecord {
-        source_table_name: SystemStreamSourceTableName::try_new("orders").expect("source table"),
-        keys: HashMap::new().into(),
-        old_image: None,
-        new_image: None,
-        position: SystemStreamPosition::try_new("shard-a", "lineage-a", "1").expect("position"),
-    };
     let page = SystemStreamPage::new(
         scope(),
-        vec![stored.into_stream_record().unwrap()],
+        vec![system_delete_record()],
         issued_checkpoint(),
         false,
     )
@@ -614,15 +549,7 @@ fn system_stream_page_conversion_preserves_logical_source_table_name_on_wire() {
 #[test]
 fn given_system_stream_page_when_converted_then_issued_checkpoint_is_retained_for_all_page_shapes()
 {
-    let record = SystemStreamStoredRecord {
-        source_table_name: SystemStreamSourceTableName::try_new("orders").expect("source table"),
-        keys: HashMap::new().into(),
-        old_image: None,
-        new_image: None,
-        position: SystemStreamPosition::try_new("shard-a", "lineage-a", "1").expect("position"),
-    }
-    .into_stream_record()
-    .unwrap();
+    let record = system_delete_record();
     let expected_token = issued_checkpoint().token().clone();
 
     for (terminal, records) in [
@@ -685,4 +612,15 @@ fn given_overlapping_checkpoint_frontiers_when_protected_then_descendants_use_mi
         catalog.protected_positions(&unknown),
         Err(SystemStreamContractError::UnknownLineage)
     );
+}
+
+fn system_delete_record() -> StreamRecord {
+    StreamRecord {
+        cursor: None,
+        source_table_name: Some(storage_types::TableName::new("orders")),
+        keys: HashMap::new().into(),
+        sequence_number: "1".to_string(),
+        item: None,
+        system_position: Some(SystemStreamPosition::try_new("shard-a", "lineage-a", "1").unwrap()),
+    }
 }

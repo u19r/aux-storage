@@ -52,7 +52,9 @@ impl StorageApiManagerImpl {
     }
 }
 
-fn read_table_append(payload: &serde_json::Value) -> Result<(TableName, &str), HttpApiError> {
+fn read_table_append(
+    payload: &serde_json::Value,
+) -> Result<(storage_types::TableHistoryTarget, &str), HttpApiError> {
     let table = payload
         .get("TableName")
         .and_then(serde_json::Value::as_str)
@@ -66,7 +68,15 @@ fn read_table_append(payload: &serde_json::Value) -> Result<(TableName, &str), H
         .ok_or_else(|| {
             HttpApiError::validation_error("Data is required for a table stream append")
         })?;
-    Ok((TableName::new(table), data))
+    let id = payload
+        .get("TableId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            HttpApiError::validation_error("TableId is required for a table stream append")
+        })?;
+    let target = storage_types::TableHistoryTarget::try_from((TableName::new(table), id))
+        .map_err(HttpApiError::from)?;
+    Ok((target, data))
 }
 
 fn read_append_operation(

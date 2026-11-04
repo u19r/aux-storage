@@ -50,7 +50,6 @@ async fn given_transact_with_failing_check_when_run_then_cancelled_and_nothing_p
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     ..TransactWriteItem::default()
                 },
@@ -146,7 +145,6 @@ async fn given_mixed_transact_verbs_when_check_moves_then_identity_and_rollback_
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..TransactWriteItem::default()
         };
@@ -158,7 +156,6 @@ async fn given_mixed_transact_verbs_when_check_moves_then_identity_and_rollback_
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..TransactWriteItem::default()
         };
@@ -178,7 +175,6 @@ async fn given_mixed_transact_verbs_when_check_moves_then_identity_and_rollback_
                     AttributeValue::S("changed".to_string()),
                 )]))),
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..TransactWriteItem::default()
         };
@@ -438,7 +434,6 @@ async fn given_mixed_transact_verbs_when_committed_then_identity_and_effects_hol
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     ..TransactWriteItem::default()
                 },
@@ -469,7 +464,6 @@ async fn given_mixed_transact_verbs_when_committed_then_identity_and_effects_hol
                             AttributeValue::S("changed".to_string()),
                         )]))),
                         return_values_on_condition_check_failure: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     ..TransactWriteItem::default()
                 },
@@ -481,7 +475,6 @@ async fn given_mixed_transact_verbs_when_committed_then_identity_and_effects_hol
                         expression_attribute_names: None,
                         expression_attribute_values: None,
                         return_values_on_condition_check_failure: None,
-                        aux_item_stream_ttl_hours: None,
                     }),
                     ..TransactWriteItem::default()
                 },
@@ -573,7 +566,6 @@ async fn given_transact_with_token_when_replayed_then_applies_exactly_once() -> 
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 ..TransactWriteItem::default()
             }],
@@ -628,7 +620,6 @@ async fn given_same_token_when_request_changes_then_mismatch_without_new_effects
                 expression_attribute_names: None,
                 expression_attribute_values: None,
                 return_values_on_condition_check_failure: None,
-                aux_item_stream_ttl_hours: None,
             }),
             ..TransactWriteItem::default()
         };
@@ -702,7 +693,6 @@ async fn given_batch_puts_when_run_then_all_visible() -> anyhow::Result<()> {
                     ]))
                     .expect("generated transaction item encodes"),
                     indexers: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 delete_request: None,
             });
@@ -837,7 +827,6 @@ async fn given_batch_with_missing_table_when_run_then_fails_and_existing_preserv
                             ]))
                             .expect("generated batch item encodes"),
                             indexers: None,
-                            aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
                     }],
@@ -852,7 +841,6 @@ async fn given_batch_with_missing_table_when_run_then_fails_and_existing_preserv
                             )]))
                             .expect("generated batch item encodes"),
                             indexers: None,
-                            aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
                     }],
@@ -977,7 +965,6 @@ async fn given_transact_delete_when_committed_then_item_removed() -> anyhow::Res
                     expression_attribute_names: None,
                     expression_attribute_values: None,
                     return_values_on_condition_check_failure: None,
-                    aux_item_stream_ttl_hours: None,
                 }),
                 ..TransactWriteItem::default()
             }],
@@ -1040,7 +1027,6 @@ async fn given_batch_delete_when_run_then_targets_removed_and_sibling_kept() -> 
                         put_request: None,
                         delete_request: Some(DeleteRequest {
                             key: key_attributes("doomed"),
-                            aux_item_stream_ttl_hours: None,
                         }),
                     },
                     WriteRequest {
@@ -1051,7 +1037,6 @@ async fn given_batch_delete_when_run_then_targets_removed_and_sibling_kept() -> 
                             ]))
                             .expect("generated batch item encodes"),
                             indexers: None,
-                            aux_item_stream_ttl_hours: None,
                         }),
                         delete_request: None,
                     },

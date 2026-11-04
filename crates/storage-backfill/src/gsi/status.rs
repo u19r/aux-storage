@@ -105,13 +105,19 @@ impl GsiBuildStatus {
     }
 }
 
-impl TryFrom<(String, String, Vec<u8>)> for GsiBuildTarget {
+impl TryFrom<(storage_types::TableHistoryId, String, String, Vec<u8>)> for GsiBuildTarget {
     type Error = GsiRecordError;
 
     fn try_from(
-        (table_name, index_name, incarnation): (String, String, Vec<u8>),
+        (history_id, table_name, index_name, incarnation): (
+            storage_types::TableHistoryId,
+            String,
+            String,
+            Vec<u8>,
+        ),
     ) -> Result<Self, Self::Error> {
         Ok(Self {
+            history_id,
             table_name: storage_types::TableName::try_from(table_name)
                 .map_err(|_| GsiRecordError::TableName)?,
             index_name: storage_types::IndexName::new(&index_name),

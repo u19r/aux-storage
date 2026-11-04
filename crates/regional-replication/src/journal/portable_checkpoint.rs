@@ -23,16 +23,21 @@ use crate::{
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PortableRecord {
-    operation: CanonicalCheckpointId,
+pub(super) struct PortableRecord {
+    pub(super) operation: CanonicalCheckpointId,
     table: TableName,
-    incarnation: super::public_trim_authority::PublicTrimIncarnation,
+    pub(super) incarnation: super::public_trim_authority::PublicTrimIncarnation,
     creation: CheckpointCreation,
     input_digest: Option<CanonicalDigest>,
     #[serde(with = "super::checkpoint_state")]
-    state: CanonicalCheckpointState,
-    cut: CanonicalTableCut,
-    retention: crate::history::retention::CheckpointRetention,
+    pub(super) state: CanonicalCheckpointState,
+    pub(super) cut: CanonicalTableCut,
+    pub(super) retention: crate::history::retention::CheckpointRetention,
+}
+
+pub(in crate::journal) struct HeldTableCut {
+    pub(in crate::journal) physical: storage_types::TableHistoryId,
+    pub(in crate::journal) cut: CanonicalTableCut,
 }
 
 pub(in crate::journal) struct PortableReadScope<'a> {
@@ -66,7 +71,7 @@ impl JournalStore {
                 .pop()
                 .flatten()
                 .ok_or_else(corrupt_record)?;
-            let record = self.decode_portable_record(&row, reference.operation)?;
+            let record = self.decode_portable_record(&row)?;
             self.load_portable_authority(attempt, &record, protection)
                 .await?;
             if record.cut.lineage != reference.lineage {
@@ -115,7 +120,7 @@ impl JournalStore {
                 .pop()
                 .flatten()
                 .ok_or_else(corrupt_record)?;
-            let mut record = self.decode_portable_record(&row, entry.reference.operation)?;
+            let mut record = self.decode_portable_record(&row)?;
             self.load_portable_authority(attempt, &record, ReadProtection::Conflict)
                 .await?;
             if record.cut.lineage != entry.reference.lineage
@@ -139,7 +144,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn change_portable_checkpoint<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -170,7 +175,7 @@ impl JournalStore {
             };
             let (mut record, revision) = match row {
                 Some(row) => {
-                    let record = self.decode_portable_record(&row, request.portable_checkpoint)?;
+                    let record = self.decode_portable_record(&row)?;
                     self.require_portable_request(&record, request)?;
                     if record.state == CanonicalCheckpointState::Held {
                         self.load_portable_authority(attempt, &record, ReadProtection::Conflict)
@@ -234,7 +239,7 @@ impl JournalStore {
     }
 
     async fn prepare_portable_checkpoint<
-        A: CatalogAttempt + stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: CatalogAttempt + infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -332,7 +337,7 @@ impl JournalStore {
         selection: PortableReadScope<'_>,
         operation: CanonicalCheckpointId,
         observed_at: storage_types::TimestampMillis,
-    ) -> StorageResult<CanonicalTableCut> {
+    ) -> StorageResult<HeldTableCut> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
@@ -352,7 +357,7 @@ impl JournalStore {
                 .ok_or_else(|| {
                     StorageError::from(storage_types::StorageEnum::HistoryUnavailable)
                 })?;
-            let mut record = self.decode_portable_record(&row, operation)?;
+            let mut record = self.decode_portable_record(&row)?;
             if record.table != *selection.table
                 || record.cut.lineage != selection.lineage
                 || record.cut.membership != selection.membership
@@ -404,7 +409,10 @@ impl JournalStore {
             authority
                 .ok_or_else(corrupt_record)?
                 .require_incarnation(current)?;
-            Ok(record.cut)
+            Ok(HeldTableCut {
+                physical: record.incarnation.physical,
+                cut: record.cut,
+            })
         }
         .await;
         settlement.complete(crate::history::retention::settle_expiry(result))?
@@ -423,21 +431,22 @@ impl JournalStore {
         Ok(authority)
     }
 
-    fn decode_portable_record(
+    pub(super) fn decode_portable_record(
         &self,
         row: &DurableRecord,
-        operation: CanonicalCheckpointId,
     ) -> StorageResult<PortableRecord> {
         let record: PortableRecord = self.records.decode(row)?;
-        if record.operation != operation
-            || row.key
-                != self.identity_key(crate::constants::PORTABLE_CHECKPOINT_SUFFIX, &operation)?
+        if row.key
+            != self.identity_key(
+                crate::constants::PORTABLE_CHECKPOINT_SUFFIX,
+                &record.operation,
+            )?
         {
             return Err(corrupt_record());
         }
         record
             .creation
-            .require_distinct(operation)
+            .require_distinct(record.operation)
             .map_err(|_| corrupt_record())?;
         record.incarnation.require_cut(&record.cut)?;
         Ok(record)
@@ -505,7 +514,7 @@ impl JournalStore {
             .pop()
             .flatten()
             .ok_or_else(|| StorageError::from(storage_types::StorageEnum::HistoryUnavailable))?;
-        let mut record = self.decode_portable_record(&row, previous)?;
+        let mut record = self.decode_portable_record(&row)?;
         if record.table != request.table {
             return Err(StorageError::validation(
                 "Checkpoint rollover must preserve table",

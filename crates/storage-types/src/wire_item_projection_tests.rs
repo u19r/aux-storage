@@ -47,6 +47,7 @@ fn sample_table_info() -> StoredTableInfo {
             },
         ],
         global_secondary_indexes: Some(vec![GlobalSecondaryIndex {
+            capture_for_build: false,
             index_name: IndexName::new("gsi1"),
             key_schema: vec![
                 KeySchemaElement {
@@ -67,7 +68,6 @@ fn sample_table_info() -> StoredTableInfo {
         item_count: 0,
         stream_specification: None,
         table_stream_duration: crate::StreamRetentionDuration::default(),
-        default_item_stream_duration: crate::StreamRetentionDuration::default(),
         deletion_protection_enabled: false,
     }
 }

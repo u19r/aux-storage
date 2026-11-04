@@ -83,7 +83,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn plan_reenable_baseline<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -158,7 +158,7 @@ impl JournalStore {
     }
 
     async fn select_reenable_baseline_page<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -173,6 +173,13 @@ impl JournalStore {
             .load_baseline_page(
                 attempt,
                 (
+                    definition
+                        .initial
+                        .proposal()
+                        .participant(&self.region)
+                        .map_err(|_| corrupt_record())?
+                        .proposed
+                        .physical,
                     definition.initial.proposal().operation().lineage,
                     input.0.after.clone(),
                 ),
@@ -203,7 +210,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn record_reenable_baseline<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt + CatalogAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt + CatalogAttempt,
     >(
         &self,
         attempt: &mut A,

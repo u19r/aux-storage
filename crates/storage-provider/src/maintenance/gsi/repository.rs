@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use storage_backfill::{
     GsiActivationObservation, GsiActivationState, GsiBuild, GsiBuildCandidates,
     GsiBuildProjectionObservation, GsiBuildTarget, GsiPageLimit, GsiProjection, GsiProjectionKey,
-    GsiProjectionStateRead, GsiProjectionStateReadBatch, GsiReferencedHistory,
-    GsiReferencedHistoryItem, GsiReferencedHistoryRead, GsiScanObservation, GsiScanSourcePage,
+    GsiProjectionStateRead, GsiProjectionStateReadBatch, GsiScanObservation, GsiScanSourcePage,
     GsiSourceProjection, GsiStreamObservation, GsiStreamSourcePage,
 };
 use storage_common::{TtlConfigRecord, retry::retry_native_conflicts};
@@ -179,26 +178,6 @@ pub trait GsiBuildTransaction {
         self.read_gsi_stream_observation(target, after, through, limit)
     }
 
-    fn read_gsi_continuation(
-        &mut self,
-        target: &GsiBuildTarget,
-        after: SystemStreamCheckpoint,
-        pending_high: Option<SystemStreamCheckpoint>,
-        limit: GsiPageLimit,
-    ) -> impl Future<Output = StorageResult<GsiStreamObservation>>
-    where
-        Self: Sized,
-    {
-        async move {
-            let through = match pending_high {
-                Some(high) => high,
-                None => self.read_gsi_stream_tail().await?,
-            };
-            self.read_gsi_stream_observation(target, after, through, limit)
-                .await
-        }
-    }
-
     fn read_gsi_activation(
         &mut self,
         target: &GsiBuildTarget,
@@ -229,16 +208,9 @@ pub trait GsiBuildTransaction {
         Self: Sized,
     {
         async move {
-            let mut page = self
+            let page = self
                 .read_gsi_stream_source_page(target, &after, &through, limit)
                 .await?;
-            let history_reads = GsiReferencedHistoryRead::plan(&page.table, &page.candidates);
-            let histories = GsiReferencedHistory::group(if history_reads.is_empty() {
-                Vec::new()
-            } else {
-                self.read_gsi_referenced_histories(&history_reads).await?
-            })?;
-            GsiReferencedHistory::attach_all(&mut page.candidates, histories)?;
             let mut sources = Vec::new();
             for candidate in page.candidates {
                 sources.extend(candidate.into_projections(&page.table, &target.index_name)?);
@@ -276,10 +248,6 @@ pub trait GsiBuildTransaction {
         limit: GsiPageLimit,
     ) -> impl Future<Output = StorageResult<GsiStreamSourcePage>>;
 
-    fn read_gsi_stream_tail(
-        &mut self,
-    ) -> impl Future<Output = StorageResult<SystemStreamCheckpoint>>;
-
     fn read_gsi_projection_states(
         &mut self,
         batch: GsiProjectionStateReadBatch<'_>,
@@ -300,11 +268,6 @@ pub trait GsiBuildTransaction {
             }
         }
     }
-
-    fn read_gsi_referenced_histories(
-        &mut self,
-        reads: &[GsiReferencedHistoryRead<'_>],
-    ) -> impl Future<Output = StorageResult<Vec<GsiReferencedHistoryItem>>>;
 
     fn validate_gsi_frontier(
         &mut self,

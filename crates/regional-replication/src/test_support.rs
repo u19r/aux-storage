@@ -369,21 +369,23 @@ pub async fn install_pair(source: &Store, destination: &Store) {
 }
 
 pub async fn create_table(store: &Store, name: &TableName) {
-    store
-        .create_table(CreateTableRequest::new(
-            name.clone(),
-            vec![AttributeDefinition {
-                attribute_name: "pk".into(),
-                attribute_type: KeyAttributeType::S,
-            }],
-            vec![KeySchemaElement {
-                attribute_name: "pk".into(),
-                key_type: KeyType::Hash,
-            }],
-            BillingMode::PayPerRequest,
-        ))
-        .await
-        .unwrap();
+    let mut request = CreateTableRequest::new(
+        name.clone(),
+        vec![AttributeDefinition {
+            attribute_name: "pk".into(),
+            attribute_type: KeyAttributeType::S,
+        }],
+        vec![KeySchemaElement {
+            attribute_name: "pk".into(),
+            key_type: KeyType::Hash,
+        }],
+        BillingMode::PayPerRequest,
+    );
+    request.stream_specification = Some(storage_types::StreamSpecification {
+        stream_enabled: true,
+        stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+    });
+    store.create_table(request).await.unwrap();
 }
 
 pub fn key() -> KeyAttributes {
@@ -490,7 +492,7 @@ pub(super) async fn source_position(store: &Store, index: u8, mutations: u64) ->
                     operation: control.proposal.operation().id,
                 };
                 let original = journal
-                    .load_acceptance(attempt, &id, &codec())
+                    .load_acceptance(attempt, (state.physical, &id), &codec())
                     .await?
                     .unwrap();
                 let replication_types::event::content::CanonicalPayload::System(control) =
@@ -539,7 +541,11 @@ pub(super) async fn frame(
         },
         range: ClosedSourceInterval::try_from((after.into(), through.into())).unwrap(),
         membership: 1.into(),
-        tables: vec![(state.configuration.table, state.configuration.lineage)],
+        tables: vec![(
+            state.configuration.table,
+            state.configuration.lineage,
+            state.physical,
+        )],
     };
     let read_codec = Arc::clone(&codec);
     let frame = store
@@ -605,14 +611,19 @@ pub(super) async fn deliver(
     .unwrap()
 }
 
-pub(super) fn delivery_scope(import: &RegionalImport) -> crate::delivery::DeliveryScope {
+pub(super) async fn delivery_scope(
+    store: &Store,
+    import: &RegionalImport,
+) -> crate::delivery::DeliveryScope {
     let binding = &import.bindings()[0];
     let index = if binding.source_region == region(1) {
         2
     } else {
         1
     };
+    let state = installed_state(store, 3 - index, NAME).await;
     crate::delivery::DeliveryScope {
+        physical: state.physical,
         origin: import.manifest().origin.clone(),
         table: binding.source_table,
         local_table: binding.source_table,
@@ -638,7 +649,7 @@ pub(super) async fn acknowledge(
         store,
         journal(1),
         Arc::new(crate::delivery::DeliveryExecution {
-            scope: delivery_scope(&import),
+            scope: delivery_scope(store, &import).await,
             import,
             receipt: Arc::new(receipt),
             codec: codec(),

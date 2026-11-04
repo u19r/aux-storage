@@ -1,12 +1,13 @@
 mod filesystem;
 mod job;
 mod manifest;
+mod namespace;
 
 pub(crate) use filesystem::CanonicalArchive;
 pub(crate) use job::ArchiveJob;
 pub(crate) use manifest::{
-    ArchiveCursor, ArchiveHold, ArchiveKind, ArchivePlan, ArchivePointer, ArchivePublication,
-    ArchiveSchedule, ArchiveState, ArchiveTurn, VerifiedArchive,
+    ArchiveCursor, ArchiveHold, ArchiveKind, ArchivePlan, ArchivePointer, ArchiveSchedule,
+    ArchiveState, ArchiveTurn, VerifiedArchive,
 };
 
 pub(crate) mod admission;

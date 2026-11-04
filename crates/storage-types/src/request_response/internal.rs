@@ -1,6 +1,6 @@
 use crate::{
     AttributeMap, IndexName, KeyAttributes, StorageError, StorageResult, StoredTableInfo,
-    StreamRetentionDuration, TableName, WriteRequest, serde_types::validate_query_fields,
+    TableName, WriteRequest, serde_types::validate_query_fields,
 };
 
 #[derive(Debug, Clone)]
@@ -13,7 +13,6 @@ pub enum PreparedBatchOperation {
         non_key_attributes: AttributeMap,
         full_item: AttributeMap,
         indexers: Option<Vec<String>>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     },
     Delete {
         table_name: TableName,
@@ -21,7 +20,6 @@ pub enum PreparedBatchOperation {
         write_request: WriteRequest,
         key: KeyAttributes,
         existing_item: Option<AttributeMap>,
-        aux_item_stream_ttl_hours: Option<StreamRetentionDuration>,
     },
 }
 

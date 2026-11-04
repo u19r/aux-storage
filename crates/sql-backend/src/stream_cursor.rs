@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use storage_types::{
     StorageEnum, StorageError, StorageResult, StreamItemId, StreamName, storage_serde,
 };
-use stream_provider::{CursorName, MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS, StreamCursor};
+use stream_provider::{CursorName, StreamCursor};
 
 use crate::{ReadProtection, SqlAttempt, SqlLayout, SqlStatement, SqlValue};
 
@@ -87,59 +87,6 @@ pub(crate) async fn read_cursor<A: SqlAttempt>(
             Ok(cursor)
         })
         .transpose()
-}
-
-pub(crate) async fn list_system_cursors<A: SqlAttempt>(
-    native: &mut A,
-    engine: impl SqlLayout,
-    protection: ReadProtection,
-) -> StorageResult<Vec<StreamCursor>> {
-    let stream_name = StreamName::system_table_stream();
-    let sql = format!(
-        "SELECT cursor_name, position, row_blob FROM {relation_sys_user_stream_cursors} WHERE \
-         stream_name = {} ORDER BY cursor_name LIMIT {}",
-        engine.engine().placeholder(1),
-        MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS + 1,
-        relation_sys_user_stream_cursors = engine.relation_name("sys_user_stream_cursors"),
-    );
-    let page = native
-        .query(
-            SqlStatement::new(sql, vec![SqlValue::Blob(stream_name.as_ref().to_vec())]),
-            protection,
-            CURSOR_BYTES,
-        )
-        .await?;
-    if page.more || page.rows.len() > MAX_SYSTEM_STREAM_CURSOR_SCAN_ROWS as usize {
-        return Err(StorageError::unsupported(
-            "System cursor scan exceeds its bound",
-        ));
-    }
-    page.rows
-        .into_iter()
-        .map(|row| {
-            let [name, position, bytes]: [SqlValue; 3] = row
-                .into_values()
-                .try_into()
-                .map_err(|_| StorageError::internal("SQL System cursor row has invalid width"))?;
-            let (SqlValue::Text(name), SqlValue::Blob(position), SqlValue::Blob(bytes)) =
-                (name, position, bytes)
-            else {
-                return Err(StorageError::internal(
-                    "SQL System cursor row has invalid types",
-                ));
-            };
-            let position = StreamItemId::try_from(position.as_slice())
-                .map_err(|_| StorageError::internal("SQL System cursor position is invalid"))?;
-            let cursor: StreamCursor = storage_serde::from_bytes(&bytes)?;
-            if cursor.stream_name != stream_name
-                || cursor.name.as_str() != name
-                || cursor.position != position
-            {
-                return Err(StorageError::internal("SQL System cursor identity differs"));
-            }
-            Ok(cursor)
-        })
-        .collect()
 }
 
 pub(crate) async fn write_cursor<A: SqlAttempt>(

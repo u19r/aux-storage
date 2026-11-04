@@ -124,6 +124,10 @@ async fn given_insert_behind_scan_cursor_when_reopened_between_pages_then_replay
     let setup = async {
         let mut request = table_request("gsi_scan_replay");
         let indexes = request.global_secondary_indexes.take().unwrap();
+        request.stream_specification = Some(storage_types::StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(storage_types::StreamViewType::NewAndOldImages),
+        });
         fixture.operations.create_table(request).await?;
         for key in ["A", "B", "C"] {
             put_group(&fixture, "gsi_scan_replay", key, "x").await?;
@@ -238,6 +242,9 @@ async fn given_sanitized_index_key_when_index_is_recreated_then_physical_column_
     let fixture = TestStore::new().await;
     let outcome = async {
         fixture.create_hash_table(TableName::new("gsi_column_reuse")).await;
+        let name = TableName::new("gsi_column_reuse");
+        super::table_stream_eligibility_tests::set_stream(&fixture, &name, true).await?;
+        super::table_stream_eligibility_tests::finish_initialization(&fixture, &name).await?;
         let create: UpdateTableRequest = serde_json::from_value(json!({
             "TableName": "gsi_column_reuse",
             "AttributeDefinitions": [{"AttributeName": "group-name", "AttributeType": "S"}],

@@ -6,7 +6,7 @@ use storage_backfill::GsiProjectionLifecycle;
 use storage_types::{
     AttributeMap, BoundTableInfo, DynamoRequestValidate, IndexedWireItem, IndexerDeclaration,
     KeyAttributes, LogicalItemSize, ReturnValuesOldNewUpdated, StorageError, StorageResult,
-    StreamRetentionDuration, TableName, UpdateItemRequest, UpdateItemResponse, WireItem,
+    TableName, UpdateItemRequest, UpdateItemResponse, WireItem,
     return_values_on_condition_check_failure_all_old, validate_transact_key,
 };
 
@@ -28,7 +28,6 @@ pub struct UpdateItemShape {
     condition: Option<UncheckedCondition>,
     return_values: Option<ReturnValuesOldNewUpdated>,
     return_old_on_condition_failure: bool,
-    item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl UpdateItemShape {
@@ -68,20 +67,13 @@ impl UpdateItemShape {
             return_old_on_condition_failure: return_values_on_condition_check_failure_all_old(
                 request.return_values_on_condition_check_failure.as_ref(),
             ),
-            item_stream_ttl_hours: request.aux_item_stream_ttl_hours,
         })
     }
 
     pub fn bind_table(mut self, table: Arc<BoundTableInfo>) -> StorageResult<BoundUpdateItem> {
         validate_transact_key(&table.info, &self.key)?;
         self.key.normalize_numbers_for_write();
-        let route = stream_provider::DynamoMutationRoute::try_new(
-            &table.info.table_name,
-            &table.info.key_schema,
-            &self.key,
-        )?;
         Ok(BoundUpdateItem {
-            route,
             table,
             key: self.key,
             operations: self.operations,
@@ -89,13 +81,11 @@ impl UpdateItemShape {
             condition: self.condition,
             return_values: self.return_values,
             return_old_on_condition_failure: self.return_old_on_condition_failure,
-            item_stream_ttl_hours: self.item_stream_ttl_hours,
         })
     }
 }
 
 pub struct BoundUpdateItem {
-    route: stream_provider::DynamoMutationRoute,
     pub table: Arc<BoundTableInfo>,
     pub key: KeyAttributes,
     operations: Vec<UpdateOperation>,
@@ -103,7 +93,6 @@ pub struct BoundUpdateItem {
     condition: Option<UncheckedCondition>,
     return_values: Option<ReturnValuesOldNewUpdated>,
     return_old_on_condition_failure: bool,
-    item_stream_ttl_hours: Option<StreamRetentionDuration>,
 }
 
 impl BoundUpdateItem {
@@ -161,12 +150,14 @@ impl BoundUpdateItem {
         let new_item = WireItem::try_from(updated)?;
         let prepared_gsi =
             storage_backfill::PreparedGsiPut::try_new(&self.table.info, &new_item, &declaration)?;
-        let stream_image =
-            stream_provider::PreparedStreamImage::try_new(&self.route, new_item.clone())?;
+        let history = crate::dynamo_write_execution::PreparedItemHistory::try_new(
+            &self.table,
+            &self.key,
+            &new_item,
+        )?;
         let accepted = AcceptedUpsert {
+            history,
             ttl: crate::dynamo_put_item::UpsertTtlPreparation::ObservedItem,
-            stream_image,
-            route: self.route,
             table: self.table,
             key: self.key,
             new_item,
@@ -177,7 +168,6 @@ impl BoundUpdateItem {
             old_revision: old.revision,
             old_provenance: old.provenance,
             old_ttl_epoch: old.ttl_epoch,
-            item_stream_ttl_hours: self.item_stream_ttl_hours,
             gsi_lifecycle: lifecycle,
             prepared_gsi,
         };

@@ -100,7 +100,11 @@ async fn given_native_originals_when_selecting_varied_frames_then_measure_succes
                 .try_into()
                 .unwrap(),
             membership: state.membership,
-            tables: vec![(state.configuration.table, state.configuration.lineage)],
+            tables: vec![(
+                state.configuration.table,
+                state.configuration.lineage,
+                state.physical,
+            )],
         });
         measure_frames(
             &source,

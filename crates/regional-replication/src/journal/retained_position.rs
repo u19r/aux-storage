@@ -19,7 +19,7 @@ use replication_types::{
     regional_import::RegionalImport,
 };
 use serde::{Deserialize, Serialize};
-use storage_types::{ReadProtection, Revision, StorageResult};
+use storage_types::{ReadProtection, Revision, StorageResult, TableHistoryId};
 
 use super::JournalStore;
 use crate::{
@@ -47,6 +47,7 @@ impl JournalStore {
             || !selected.page.range.contains(selected.position)
             || row.key
                 != self.retained_position_key(
+                    self.table_record_history(&row.key, RETAINED_POSITION_SUFFIX)?,
                     (
                         &selected.page.origin,
                         selected.page.table,
@@ -62,11 +63,12 @@ impl JournalStore {
 
     fn retained_position_key(
         &self,
+        physical: TableHistoryId,
         identity: (&OriginId, TableIdentity, TableLineage),
         position: OriginPosition,
     ) -> StorageResult<DurableRecordKey> {
         let mut address: RecordAddress = self
-            .identity_key(RETAINED_POSITION_SUFFIX, &identity)?
+            .table_identity_key(RETAINED_POSITION_SUFFIX, physical, &identity)?
             .into();
         address
             .suffix
@@ -77,21 +79,35 @@ impl JournalStore {
     pub(in crate::journal) async fn prepare_import_positions<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<Vec<RecordChange>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
+            let (import, tables) = input;
             let mut changes = Vec::new();
             for binding in import.bindings() {
                 let page = ImportPageScope::Complete
                     .page_id(import, binding)
                     .map_err(|_| corrupt_record())?;
                 changes.extend(
-                    self.prepare_table_positions(attempt, page, (import.manifest(), codec))
-                        .await?,
+                    self.prepare_table_positions(
+                        attempt,
+                        (
+                            page,
+                            self.select_original_history(
+                                tables,
+                                (binding.source_table, binding.lineage),
+                            )?,
+                        ),
+                        (import.manifest(), codec),
+                    )
+                    .await?,
                 );
             }
             Ok(changes)
@@ -103,9 +119,10 @@ impl JournalStore {
     async fn prepare_table_positions<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        page: TablePageId,
+        selection: (TablePageId, TableHistoryId),
         input: (&SourceIntervalManifest, &CanonicalJsonCodec),
     ) -> StorageResult<Vec<RecordChange>> {
+        let (page, physical) = selection;
         let selected = (u64::from(page.range.after()) + 1..=u64::from(page.range.through()))
             .map(|position| RetainedTablePosition {
                 page: page.clone(),
@@ -116,6 +133,7 @@ impl JournalStore {
             .iter()
             .map(|position| {
                 self.retained_position_key(
+                    physical,
                     (&page.origin, page.table, page.lineage),
                     position.position,
                 )
@@ -145,7 +163,11 @@ impl JournalStore {
             existing.push(old);
         }
         let manifests = self
-            .load_position_manifests(attempt, &existing.iter().collect::<Vec<_>>(), input.1)
+            .load_position_manifests(
+                attempt,
+                (&existing.iter().collect::<Vec<_>>(), physical),
+                input.1,
+            )
             .await?;
         for old in &existing {
             let manifest = manifests
@@ -165,9 +187,10 @@ impl JournalStore {
     async fn load_position_manifests<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        positions: &[&RetainedTablePosition],
+        input: (&[&RetainedTablePosition], TableHistoryId),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<BTreeMap<CanonicalDigest, SourceIntervalManifest>> {
+        let (positions, physical) = input;
         let mut pages = BTreeMap::new();
         for selected in positions {
             if let Some(previous) = pages.insert(selected.page.manifest, &selected.page)
@@ -181,7 +204,7 @@ impl JournalStore {
             .map(|(digest, page)| {
                 Ok([
                     self.identity_key(IMPORT_MANIFEST_SUFFIX, digest)?,
-                    self.identity_key(IMPORT_PAGE_SUFFIX, page)?,
+                    self.table_identity_key(IMPORT_PAGE_SUFFIX, physical, page)?,
                 ])
             })
             .collect::<StorageResult<Vec<_>>>()?
@@ -233,12 +256,16 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let [(table, lineage)] = request.tables.as_slice() else {
+            let [(table, lineage, physical)] = request.tables.as_slice() else {
                 return Err(corrupt_record().into());
             };
             let keys = (u64::from(request.range.after()) + 1..=u64::from(request.range.through()))
                 .map(|position| {
-                    self.retained_position_key((&request.origin, *table, *lineage), position.into())
+                    self.retained_position_key(
+                        *physical,
+                        (&request.origin, *table, *lineage),
+                        position.into(),
+                    )
                 })
                 .collect::<StorageResult<Vec<_>>>()?;
             let mut selection = crate::source_frame::SourceManifestSelection::new(request, input.1);
@@ -256,7 +283,12 @@ impl JournalStore {
                     })
                     .collect::<StorageResult<Vec<_>>>()?;
                 if !self
-                    .append_retained_position_wave(attempt, &mut selection, positions, input.0)
+                    .append_retained_position_wave(
+                        attempt,
+                        &mut selection,
+                        (positions, *physical),
+                        input.0,
+                    )
                     .await?
                 {
                     return Ok(None);
@@ -274,7 +306,7 @@ impl JournalStore {
         request: &SourceFrameRequest,
         index: usize,
     ) -> StorageResult<()> {
-        let [(table, lineage)] = request.tables.as_slice() else {
+        let [(table, lineage, _physical)] = request.tables.as_slice() else {
             return Err(corrupt_record());
         };
         if selected.position != (u64::from(request.range.after()) + index as u64 + 1).into()
@@ -291,15 +323,19 @@ impl JournalStore {
         &self,
         attempt: &mut A,
         selection: &mut crate::source_frame::SourceManifestSelection,
-        positions: Vec<(RetainedTablePosition, CanonicalDigest)>,
+        input: (
+            Vec<(RetainedTablePosition, CanonicalDigest)>,
+            TableHistoryId,
+        ),
         codec: &CanonicalJsonCodec,
     ) -> Result<bool, replication_provider::delivery::error::DeliveryError> {
+        let (positions, physical) = input;
         let selected = positions
             .iter()
             .map(|(position, _)| position)
             .collect::<Vec<_>>();
         let originals = self
-            .load_position_manifests(attempt, &selected, codec)
+            .load_position_manifests(attempt, (&selected, physical), codec)
             .await?;
         for (position, receipt) in positions {
             let original = originals

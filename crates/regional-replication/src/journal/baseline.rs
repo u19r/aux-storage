@@ -58,7 +58,11 @@ impl JournalStore {
     ) -> StorageResult<BaselineAuthority> {
         let authority = BaselineAuthority::decode(bytes, codec)?;
         if row.revision != Revision::INITIAL
-            || row.key != self.baseline_key(&authority.provenance().version)?
+            || row.key
+                != self.baseline_key(
+                    self.decode_original_payload(row, codec)?.history,
+                    &authority.provenance().version,
+                )?
         {
             return Err(corrupt_record());
         }
@@ -67,12 +71,15 @@ impl JournalStore {
 
     pub(in crate::journal) fn baseline_key(
         &self,
+        history: storage_types::TableHistoryId,
         identity: &VersionIdentity,
     ) -> StorageResult<infrastructure_provider::record::DurableRecordKey> {
         let VersionIdentity::Baseline { lineage, key } = identity else {
             return Err(corrupt_record());
         };
-        let mut address: RecordAddress = self.identity_key(BASELINE_SUFFIX, lineage)?.into();
+        let mut address: RecordAddress = self
+            .table_identity_key(BASELINE_SUFFIX, history, lineage)?
+            .into();
         address
             .suffix
             .extend_from_slice(CanonicalDigest::of(key.as_ref()).as_ref());
@@ -80,11 +87,12 @@ impl JournalStore {
     }
 
     pub(crate) async fn load_baseline_page<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
         scope: (
+            storage_types::TableHistoryId,
             replication_types::identity::resource::TableLineage,
             Option<infrastructure_provider::record::DurableRecordKey>,
         ),
@@ -97,9 +105,9 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement_guard.as_mut();
         let result = async {
-            let (lineage, after) = scope;
+            let (history, lineage, after) = scope;
             let (codec, budget) = input;
-            let first = self.identity_key(BASELINE_SUFFIX, &lineage)?;
+            let first = self.table_identity_key(BASELINE_SUFFIX, history, &lineage)?;
             let original = self.record_prefix_range(&first)?;
             let (first, last, _) = original.bounds();
             let range = infrastructure_provider::page::BoundedRecordRange::try_new(
@@ -115,17 +123,19 @@ impl JournalStore {
             };
             let page = self.scan_immutable_records(attempt, request).await?;
             let mut selected = Vec::with_capacity(page.records.len());
-            let mut manifests = Vec::with_capacity(page.records.len());
             let mut used = 0usize;
             let mut last = None;
             let mut continuation = page.continuation;
             for row in page.records {
-                let manifest = self.decode_retained_manifest(&row, codec)?;
+                let length = self
+                    .decode_original_payload(&row, codec)?
+                    .original_bytes()?
+                    .len();
                 let size = self
                     .records
                     .limits
                     .validate_key(&row.key)?
-                    .checked_add(manifest.original_length())
+                    .checked_add(length)
                     .ok_or_else(corrupt_record)?;
                 let next = used.checked_add(size).ok_or_else(corrupt_record)?;
                 if next > budget.bytes.get() {
@@ -139,12 +149,11 @@ impl JournalStore {
                 used = next;
                 last = Some(row.key.clone());
                 selected.push(row);
-                manifests.push(manifest);
             }
-            let bytes = self
-                .load_retained_manifests(attempt, &selected, (manifests, budget.bytes.get()))
-                .await
-                .map_err(storage_types::StorageError::from)?;
+            let bytes = selected
+                .iter()
+                .map(|row| self.decode_original_bytes(row, codec))
+                .collect::<StorageResult<Vec<_>>>()?;
             let authorities = selected
                 .into_iter()
                 .zip(bytes)
@@ -165,17 +174,19 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
 
-    pub async fn load_baseline<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    pub async fn load_baseline<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
-        identity: &VersionIdentity,
+        input: (storage_types::TableHistoryId, &VersionIdentity),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<Option<BaselineAuthority>> {
         use super::reconstruction::{RetainedAuthorityRequest, WinnerAuthority};
         let mut authorities = self
             .load_retained_authorities(
                 attempt,
-                &[RetainedAuthorityRequest::Baseline(identity)],
+                &[RetainedAuthorityRequest::Baseline(input.0, input.1)],
                 codec,
             )
             .await?;
@@ -187,7 +198,7 @@ impl JournalStore {
     }
 
     pub(crate) async fn store_baseline<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -222,46 +233,21 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
 
-    pub(in crate::journal) async fn load_baseline_image<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
-    >(
+    pub(in crate::journal) fn prepare_baseline_image<'image>(
         &self,
-        attempt: &mut A,
-        input: (
-            storage_types::TableHistoryId,
-            Option<&storage_types::WireItem>,
-            Option<storage_types::StoredImageSource>,
-        ),
+        observed: Option<&'image storage_types::WireItem>,
         codec: &CanonicalJsonCodec,
-    ) -> StorageResult<Option<storage_types::WireItem>> {
-        let mut settlement_guard =
-            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
-        let attempt = settlement_guard.as_mut();
-        let result = async {
-            let (history, observed, source) = input;
-            let Some(observed) = observed else {
-                if source.is_some() {
-                    return Err(corrupt_record());
-                }
-                return Ok(None);
-            };
-            let source = source.ok_or_else(corrupt_record)?;
-            if source.address.history() != history {
-                return Err(corrupt_record());
-            }
+    ) -> StorageResult<Option<&'image storage_types::WireItem>> {
+        if let Some(image) = observed {
             codec
-                .require_event_length(source.raw_bytes.get())
+                .require_event_length(image.dynamo_json_bytes()?.len())
                 .map_err(|_| corrupt_record())?;
-            let exact = stream_provider::retained_image::load_stored_image(attempt, source).await?;
-            stream_provider::retained_image::require_materialized_image(&exact, observed)?;
-            Ok(Some(exact))
         }
-        .await;
-        settlement_guard.complete(result)
+        Ok(observed)
     }
 
     pub(in crate::journal) async fn retain_received_baseline<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
@@ -288,7 +274,9 @@ impl JournalStore {
         settlement_guard.complete(result)
     }
 
-    async fn store_baseline_bytes<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    async fn store_baseline_bytes<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
         input: (
@@ -299,7 +287,7 @@ impl JournalStore {
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<()> {
         let (provenance, bytes, history) = input;
-        let key = self.baseline_key(&provenance.version)?;
+        let key = self.baseline_key(history, &provenance.version)?;
         let rows = self
             .load_immutable_waves(
                 attempt,
@@ -308,19 +296,13 @@ impl JournalStore {
             )
             .await?;
         if let Some(row) = &rows[0] {
-            let old = self.decode_retained_baseline(
-                row,
-                self.load_retained_bytes(attempt, row, codec).await?,
-                codec,
-            )?;
+            let old =
+                self.decode_retained_baseline(row, self.decode_original_bytes(row, codec)?, codec)?;
             if old.bytes() != bytes.as_ref() {
                 return Err(corrupt_record());
             }
         } else {
-            let manifest = self
-                .prepare_baseline_manifest(attempt, (&bytes, history, key.clone()))
-                .await?;
-            let change = self.records.prepare_bytes(key, None, manifest)?;
+            let change = self.records.prepare_original(key, &bytes, history)?;
             self.records.store(attempt, &[change]).await?;
         }
         Ok(())

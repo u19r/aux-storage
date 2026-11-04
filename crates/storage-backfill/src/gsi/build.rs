@@ -5,7 +5,7 @@ use super::{
     GsiBuildDiscovery, GsiBuildProjectionObservation, GsiCatchingUp, GsiChange, GsiFailureReason,
     GsiLifecycleError, GsiObservation, GsiPageLimit, GsiProjectionWrite, GsiProjectionWriteBatch,
     GsiReadRequest, GsiScanObservation, GsiScanPageEnd, GsiScanning, GsiSourceProjection, GsiState,
-    GsiStreamObservation, GsiStreamPageEnd, models::GsiBuildProjectionChange,
+    GsiStreamObservation, models::GsiBuildProjectionChange,
 };
 
 impl<Cursor> GsiBuildCandidates<Cursor> {
@@ -20,7 +20,7 @@ impl<Cursor> GsiBuildCandidates<Cursor> {
     /// Select the first runnable build in the durable scheduler's key order.
     pub fn select_next_build_candidate(&mut self, build: GsiBuild<Cursor>) -> GsiBuildDiscovery {
         self.scanned_through = Some(build.target.clone());
-        if matches!(build.state, GsiState::Blocked(_)) {
+        if !build.state.is_runnable() {
             return GsiBuildDiscovery::Continue;
         }
         self.selected = Some(build);
@@ -40,6 +40,11 @@ impl<Cursor> Default for GsiBuildCandidates<Cursor> {
 }
 
 impl<Cursor> GsiState<Cursor> {
+    #[must_use]
+    pub const fn is_runnable(&self) -> bool {
+        matches!(self, Self::Scanning(_) | Self::CatchingUp(_))
+    }
+
     #[must_use]
     pub const fn permits_projection(&self) -> bool {
         !matches!(self, Self::Blocked(_))
@@ -62,15 +67,6 @@ impl<Cursor> GsiState<Cursor> {
 }
 
 impl<Cursor> GsiBuild<Cursor> {
-    pub fn history_hold_change<'a>(
-        &'a self,
-        next: &'a GsiState<Cursor>,
-    ) -> Option<(&'a SystemStreamCheckpoint, &'a SystemStreamCheckpoint)> {
-        let old = self.state.required_stream_history();
-        let new = next.required_stream_history();
-        (old != new).then_some((old, new))
-    }
-
     pub fn block_unavailable_history(&self) -> GsiChange<Cursor> {
         GsiChange::Persist {
             projections: GsiProjectionWriteBatch(Vec::new()),
@@ -93,10 +89,7 @@ impl<Cursor> GsiBuild<Cursor> {
     pub fn new_active(target: super::GsiBuildTarget, cursor: SystemStreamCheckpoint) -> Self {
         Self {
             target,
-            state: GsiState::Active(GsiActive {
-                cursor,
-                pending_high: None,
-            }),
+            state: GsiState::Active(GsiActive { cursor }),
         }
     }
 
@@ -123,12 +116,7 @@ impl<Cursor> GsiBuild<Cursor> {
                 })
             }
             GsiState::CatchingUp(_) => Err(GsiLifecycleError::InvalidBoundary),
-            GsiState::Active(state) => Ok(GsiReadRequest::Continue {
-                after: state.cursor.clone(),
-                pending_high: state.pending_high.clone(),
-                limit,
-            }),
-            GsiState::Blocked(_) => Err(GsiLifecycleError::InvalidPhase),
+            GsiState::Active(_) | GsiState::Blocked(_) => Err(GsiLifecycleError::InvalidPhase),
         }
     }
 }
@@ -140,13 +128,10 @@ impl<Cursor: PartialEq> GsiBuild<Cursor> {
     ) -> Result<GsiChange<Cursor>, GsiLifecycleError> {
         match (&self.state, observation) {
             (GsiState::Scanning(state), GsiObservation::Scan(observation)) => {
-                Self::decide_scan_page_change(state, observation)
+                self.decide_scan_page_change(state, observation)
             }
             (GsiState::CatchingUp(state), GsiObservation::Stream(observation)) => {
                 Self::decide_catch_up_page_change(state, observation)
-            }
-            (GsiState::Active(state), GsiObservation::Stream(observation)) => {
-                Self::decide_active_continuation_change(state, observation)
             }
             (GsiState::CatchingUp(state), GsiObservation::Activation(observation)) => {
                 Self::decide_activation_change(&self.target, state, observation)
@@ -156,6 +141,7 @@ impl<Cursor: PartialEq> GsiBuild<Cursor> {
     }
 
     fn decide_scan_page_change(
+        &self,
         state: &GsiScanning<Cursor>,
         observation: GsiScanObservation<Cursor>,
     ) -> Result<GsiChange<Cursor>, GsiLifecycleError> {
@@ -181,6 +167,9 @@ impl<Cursor: PartialEq> GsiBuild<Cursor> {
             .map_err(|_| GsiLifecycleError::ProgressConflict)?
         {
             crate::ScanTransition::Scanning(next) => GsiState::Scanning(next),
+            crate::ScanTransition::CatchingUp(next) if self.target.index_name.is_ttl_index() => {
+                GsiState::Active(GsiActive { cursor: next.high })
+            }
             crate::ScanTransition::CatchingUp(next) => GsiState::CatchingUp(next),
         };
         Ok(Self::persist(projections, next_state))
@@ -206,47 +195,6 @@ impl<Cursor: PartialEq> GsiBuild<Cursor> {
         Ok(Self::persist(projections, next_state))
     }
 
-    fn decide_active_continuation_change(
-        state: &GsiActive,
-        observation: GsiStreamObservation,
-    ) -> Result<GsiChange<Cursor>, GsiLifecycleError> {
-        if observation.expected_cursor != state.cursor {
-            return Err(GsiLifecycleError::ProgressConflict);
-        }
-        if state
-            .pending_high
-            .as_ref()
-            .is_some_and(|high| *high != observation.through)
-        {
-            return Err(GsiLifecycleError::ProgressConflict);
-        }
-        let Ok(projections) = Self::decide_projection_writes(observation.projections) else {
-            return Ok(Self::blocked(
-                state.cursor.clone(),
-                GsiFailureReason::ProjectionConflict,
-            ));
-        };
-        let cursor = match observation.end {
-            GsiStreamPageEnd::Continue(next)
-                if next != state.cursor && next != observation.through =>
-            {
-                next
-            }
-            GsiStreamPageEnd::Continue(_) => return Err(GsiLifecycleError::InvalidBoundary),
-            GsiStreamPageEnd::ReachedThrough => observation.through.clone(),
-        };
-        if cursor == state.cursor && projections.0.is_empty() && state.pending_high.is_none() {
-            return Ok(GsiChange::Idle);
-        }
-        Ok(Self::persist(
-            projections,
-            GsiState::Active(GsiActive {
-                pending_high: (cursor != observation.through).then_some(observation.through),
-                cursor,
-            }),
-        ))
-    }
-
     fn decide_activation_change(
         target: &super::GsiBuildTarget,
         state: &GsiCatchingUp,
@@ -265,7 +213,6 @@ impl<Cursor: PartialEq> GsiBuild<Cursor> {
             projections: GsiProjectionWriteBatch(Vec::new()),
             next_state: GsiState::Active(GsiActive {
                 cursor: state.high.clone(),
-                pending_high: None,
             }),
         })
     }

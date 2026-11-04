@@ -6,11 +6,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use futures::FutureExt as _;
 use serde_json::{Map, Value, json};
 use storage_observability_test_support::observation::observe;
-use storage_types::{
-    BatchWriteItemRequest, CreateTableRequest, GetItemRequest, PutItemRequest, StreamName,
-    storage_serde,
-};
-use stream_provider::{StoredStreamPointer, StreamRowKind};
+use storage_types::{BatchWriteItemRequest, CreateTableRequest, GetItemRequest, PutItemRequest};
 
 use super::test_support::{TestStore, unique_table_name};
 
@@ -57,13 +53,10 @@ async fn given_two_tables_and_an_unrelated_item_when_a_mixed_batch_writes_then_i
             .expect("valid seed item");
             store.operations.put_item(put).await.expect("seed item");
         }
-        let system_stream = StreamRowKind::System(StreamName::system_table_stream());
-        let before = store
-            .stream_operations
-            .read_forward(system_stream.clone(), None, 10)
+        let before = super::cdc_stream_tests::system_records(&store, 10)
             .await
-            .expect("read seed CDC");
-        assert_eq!(before.items.len(), 2);
+            .unwrap();
+        assert_eq!(before.len(), 2);
 
         let added = json!({"pk": {"S": "add"}, "sk": {"S": "1"}, "data": {"S": "new"}});
         let mut request_items = Map::new();
@@ -108,39 +101,23 @@ async fn given_two_tables_and_an_unrelated_item_when_a_mixed_batch_writes_then_i
             );
         }
 
-        let mut cursor = None;
-        let mut rows = Vec::new();
-        let mut exhausted = false;
-        for _ in 0..4 {
-            let page = observe(store.stream_operations.read_forward(
-                system_stream.clone(),
-                cursor,
-                10,
-            ))
-            .await;
-            page.assert_no_warning_or_error();
-            let page = page.result.expect("read committed CDC page");
-            cursor = page.last_evaluated_key;
-            rows.extend(page.items);
-            if !page.has_more {
-                exhausted = true;
-                break;
-            }
-            assert!(cursor.is_some(), "continuing CDC page has a cursor");
-        }
-        assert!(exhausted, "four changes fit in four bounded pages");
+        let rows = super::cdc_stream_tests::system_records(&store, 1)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 4, "two seed and two batch changes");
-        assert!(rows.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert_eq!(
+            rows.iter()
+                .map(|row| &row.sequence_number)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
         let tables = rows[2..]
             .iter()
-            .map(|row| {
-                let pointer: StoredStreamPointer =
-                    storage_serde::from_bytes(&row.data).expect("decode durable CDC pointer");
-                pointer.table_name().clone()
-            })
+            .map(|row| row.source_table_name.as_ref().unwrap())
             .collect::<Vec<_>>();
-        assert!(tables.contains(&table_a));
-        assert!(tables.contains(&table_b));
+        assert!(tables.contains(&&table_a));
+        assert!(tables.contains(&&table_b));
     })
     .catch_unwind()
     .await;

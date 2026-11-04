@@ -72,6 +72,24 @@ pub(super) fn existing_record() -> SqlStatement {
     SqlStatement::new("SELECT 1 FROM sys_infrastructure_records LIMIT 1", vec![])
 }
 
+pub(super) fn select_next_generation(
+    engine: SqlEngine,
+    resource_of: &DurableRecordKey,
+    minimum: u64,
+) -> StorageResult<SqlStatement> {
+    let address = resource_of.as_ref();
+    Ok(SqlStatement::new(
+        sql_template!(engine,
+        "SELECT generation FROM sys_infrastructure_records WHERE namespace = " {1},
+        " AND resource = " {2}, " AND generation >= " {3}, " ORDER BY generation LIMIT 1"),
+        vec![
+            SqlValue::try_from(SqlValueRef::Text(&address.namespace))?,
+            SqlValue::try_from(SqlValueRef::Blob(&address.resource))?,
+            SqlValue::try_from(SqlValueRef::Blob(&minimum.to_be_bytes()))?,
+        ],
+    ))
+}
+
 pub(super) fn existing_namespace_record(
     engine: SqlEngine,
     namespace: &str,

@@ -787,7 +787,6 @@ impl IndexedWireItem {
         Ok(StoredWireItem {
             item: WireItem::try_from(&item)?,
             indexers: declaration.into_names(),
-            source: None,
         })
     }
 

@@ -6,14 +6,13 @@ use infrastructure_provider::{
 use replication_provider::runtime_configuration::limits::BacklogBudgets;
 use serde::{Deserialize, Serialize};
 use storage_types::{ReadProtection, StorageResult};
-use stream_provider::retained_image::ImageChargeAccount;
 
 use crate::native_record::{NativeRecords, corrupt_record};
 
+#[derive(Clone)]
 pub(crate) struct HistoryCapacity {
     key: DurableRecordKey,
     marker: DurableRecordKey,
-    record_generation: u64,
     tenant: replication_types::identity::resource::TenantId,
     hot_bytes: u64,
     acceptance_bytes: u64,
@@ -24,6 +23,25 @@ pub(crate) struct HistoryCapacity {
 struct HistoryCapacityMarker {
     tenant: replication_types::identity::resource::TenantId,
     version: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryByteAccount {
+    key: DurableRecordKey,
+    pub(crate) bytes: u64,
+}
+
+impl HistoryByteAccount {
+    fn adjust(&self, delta: i128) -> StorageResult<Self> {
+        let bytes = i128::from(self.bytes)
+            .checked_add(delta)
+            .ok_or_else(corrupt_record)?;
+        Ok(Self {
+            key: self.key.clone(),
+            bytes: u64::try_from(bytes).map_err(|_| corrupt_record())?,
+        })
+    }
 }
 
 pub(crate) struct HistoryCapacityObservation {
@@ -44,6 +62,7 @@ struct HistoryChargeRead<'a> {
 }
 
 impl HistoryCapacity {
+    #[cfg(test)]
     pub(crate) fn root_key(&self) -> &DurableRecordKey {
         &self.key
     }
@@ -82,7 +101,6 @@ impl HistoryCapacity {
         Ok(Self {
             key,
             marker: root.try_into()?,
-            record_generation,
             tenant,
             hot_bytes: budgets.hot_history_bytes.get(),
             acceptance_bytes,
@@ -108,29 +126,12 @@ impl HistoryCapacity {
         {
             return Ok(());
         }
-        use stream_provider::retained_image::RetainedOwnerKind;
-        if matches!(
-            RetainedOwnerKind::from_key(key),
-            Some(RetainedOwnerKind::Event | RetainedOwnerKind::Baseline)
-        ) {
-            return Ok(());
-        }
         let address = key.as_ref();
         let scope = self.key.as_ref();
-        if address.namespace == scope.namespace
-            && address.resource == scope.resource
-            && address.generation == crate::constants::HISTORY_CAPACITY_ROOT_GENERATION
-            && address
-                .suffix
-                .strip_prefix(crate::constants::HISTORY_IMAGE_CHARGE_SUFFIX)
-                .is_some_and(|bytes| bytes.len() == 48)
-        {
-            return Ok(());
-        }
         if key == &self.key
             || address.namespace != scope.namespace
             || address.resource != scope.resource
-            || address.generation != self.record_generation
+            || address.generation == crate::constants::HISTORY_CAPACITY_ROOT_GENERATION
         {
             return Err(corrupt_record());
         }
@@ -140,18 +141,14 @@ impl HistoryCapacity {
 
 impl NativeRecords {
     pub(crate) fn require_history_account_capacity(&self) -> StorageResult<usize> {
-        let account = ImageChargeAccount::new((&self.capacity.key).try_into()?, u64::MAX);
-        let encoded = account.encoded_length_bound(self.limits.max_record_bytes().get())?;
-        if encoded > self.limits.max_record_bytes().get() {
-            return Err(corrupt_record());
-        }
+        let account = HistoryByteAccount {
+            key: self.capacity.key.clone(),
+            bytes: u64::MAX,
+        };
+        let change = self.prepare(self.capacity.key.clone(), None, &account)?;
         let marker = self.prepare_history_marker()?;
         let marker_bytes = marker.validate(self.limits)?;
-        let account_bytes = self
-            .limits
-            .validate_key(&self.capacity.key)?
-            .checked_add(encoded)
-            .ok_or_else(corrupt_record)?;
+        let account_bytes = change.validate(self.limits)?;
         self.limits.check_batch(1, account_bytes)?;
         account_bytes
             .checked_add(marker_bytes)
@@ -183,7 +180,7 @@ impl NativeRecords {
                 .ok_or_else(corrupt_record)?;
             Ok(HistoryCapacityObservation {
                 key: (&self.capacity.key).try_into()?,
-                bytes: account.bytes(),
+                bytes: account.bytes,
             })
         }
         .await;
@@ -206,8 +203,7 @@ impl NativeRecords {
                 .load_history_capacity(attempt, ReadProtection::Conflict)
                 .await?
                 .ok_or_else(corrupt_record)?;
-            if account.bytes() > previous.bytes && account.bytes() > self.capacity.acceptance_bytes
-            {
+            if account.bytes > previous.bytes && account.bytes > self.capacity.acceptance_bytes {
                 return Err(exhausted_capacity());
             }
             Ok(())
@@ -228,7 +224,7 @@ impl NativeRecords {
                 .load_history_capacity(attempt, ReadProtection::Conflict)
                 .await?
                 .ok_or_else(corrupt_record)?;
-            if account.bytes() > self.capacity.acceptance_bytes {
+            if account.bytes > self.capacity.acceptance_bytes {
                 return Err(exhausted_capacity());
             }
             Ok(())
@@ -258,7 +254,7 @@ impl NativeRecords {
         &self,
         attempt: &mut A,
         protection: ReadProtection,
-    ) -> StorageResult<Option<(DurableRecord, ImageChargeAccount)>> {
+    ) -> StorageResult<Option<(DurableRecord, HistoryByteAccount)>> {
         let keys = [
             (&self.capacity.key).try_into()?,
             (&self.capacity.marker).try_into()?,
@@ -278,12 +274,11 @@ impl NativeRecords {
                 {
                     return Err(corrupt_record());
                 }
-                let account =
-                    ImageChargeAccount::decode(&row.bytes, self.limits.max_record_bytes().get())
-                        .map_err(preserve_account_failure)?;
-                account
-                    .require_key(&self.capacity.key)
-                    .map_err(|_| corrupt_record())?;
+                let account: HistoryByteAccount =
+                    self.decode(&row).map_err(preserve_account_failure)?;
+                if account.key != self.capacity.key {
+                    return Err(corrupt_record());
+                }
                 Ok(Some((row, account)))
             }
             _ => Err(corrupt_record()),
@@ -293,13 +288,12 @@ impl NativeRecords {
     pub(crate) async fn prepare_history_charge<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        input: (&[RecordChange], u64),
+        changes: &[RecordChange],
     ) -> StorageResult<Vec<RecordChange>> {
         let mut settlement_guard =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement_guard.as_mut();
         let result = async {
-            let (changes, image_bytes) = input;
             let prepared = self.prepare_charge_reads(changes)?;
             let mut charges = Vec::new();
             charges
@@ -311,8 +305,8 @@ impl NativeRecords {
             if current.is_none() && !is_fresh_layout(changes) {
                 return Err(corrupt_record());
             }
-            let previous = current.as_ref().map_or(0, |(_, account)| account.bytes());
-            let mut delta = i128::from(image_bytes);
+            let previous = current.as_ref().map_or(0, |(_, account)| account.bytes);
+            let mut delta = 0i128;
             if current.is_none() {
                 let marker = self.prepare_history_marker()?;
                 delta = delta
@@ -325,21 +319,21 @@ impl NativeRecords {
                 .ok_or_else(corrupt_record)?;
             let account = match current.as_ref() {
                 Some((_, account)) => account.adjust(delta).map_err(preserve_account_failure)?,
-                None => ImageChargeAccount::new(
-                    (&self.capacity.key).try_into()?,
-                    u64::try_from(delta).map_err(|_| corrupt_record())?,
-                ),
+                None => HistoryByteAccount {
+                    key: self.capacity.key.clone(),
+                    bytes: u64::try_from(delta).map_err(|_| corrupt_record())?,
+                },
             };
-            if account.bytes() > self.capacity.hot_bytes && account.bytes() > previous {
+            if account.bytes > self.capacity.hot_bytes && account.bytes > previous {
                 return Err(exhausted_capacity());
             }
             charges.push(
-                account
-                    .prepare_change(
-                        current.map(|(row, _)| row.revision),
-                        self.limits.max_record_bytes().get(),
-                    )
-                    .map_err(preserve_account_failure)?,
+                self.prepare(
+                    account.key.clone(),
+                    current.map(|(row, _)| row.revision),
+                    &account,
+                )
+                .map_err(preserve_account_failure)?,
             );
             Ok(charges)
         }

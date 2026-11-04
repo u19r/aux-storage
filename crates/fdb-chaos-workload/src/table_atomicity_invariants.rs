@@ -1,9 +1,29 @@
 use crate::{common::*, constants::*, imports::*, table_atomicity::*};
 
 impl TableAtomicityWorkload {
+    pub(crate) async fn read_current_item(
+        &self,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
+        key: &str,
+    ) -> storage_types::StorageResult<Option<storage_types::AttributeMap>> {
+        let mut request = GetItemRequest::new(self.table_name(), self.key_attributes(key));
+        request.consistent_read = Some(true);
+        let response = storage_common::retry::retry_native_conflicts(
+            provider,
+            storage_provider::DYNAMO_WRITE_RETRY,
+            || provider.get_item(request.clone()),
+        )
+        .await?;
+        response
+            .item
+            .as_ref()
+            .map(WireItem::to_attribute_map)
+            .transpose()
+    }
+
     pub(crate) async fn check_gsi_exactness(
         &mut self,
-        manager: &DatabaseManager,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
         let partitions = self.gsi_seen_partitions.iter().cloned().collect::<Vec<_>>();
         self.trace_check_progress("gsi_snapshot", "start", 0);
@@ -12,25 +32,36 @@ impl TableAtomicityWorkload {
                 continue;
             }
             self.trace_check_progress("gsi_partition_read", "start", partition_ordinal as u64);
-            let page = manager
-                .query_index_map(
-                    QueryIndexInput::builder()
-                        .table_name(self.table_name())
-                        .index_name(IndexName::new(GSI_INDEX_NAME))
-                        .key_condition_expression(format!("{GSI_CATEGORY_ATTR} = :category"))
-                        .expression_attribute_values(HashMap::from([(
-                            ":category".to_string(),
-                            AttributeValue::S(partition.clone()),
-                        )]))
-                        .build(),
-                )
-                .await
-                .map_err(|err| storage_error_detail(&err))?;
-            let items = page.items;
+            let request = QueryRequest::builder()
+                .table_name(self.table_name())
+                .index_name(Some(IndexName::new(GSI_INDEX_NAME)))
+                .key_condition_expression(format!("{GSI_CATEGORY_ATTR} = :category"))
+                .expression_attribute_values(Some(
+                    HashMap::from([(
+                        ":category".to_string(),
+                        AttributeValue::S(partition.clone()),
+                    )])
+                    .into(),
+                ))
+                .build();
+            let page = storage_common::retry::retry_native_conflicts(
+                provider,
+                storage_provider::DYNAMO_WRITE_RETRY,
+                || provider.query(request.clone()),
+            )
+            .await
+            .map_err(|err| storage_error_detail(&err))?;
+            let items = page.items.unwrap_or_default();
             self.trace_check_progress("gsi_partition_read", "finish", partition_ordinal as u64);
             let mut actual = BTreeSet::new();
             for item in &items {
-                actual.insert(self.gsi_entry_from_item(item)?);
+                actual.insert(
+                    self.gsi_entry_from_item(
+                        &item
+                            .to_attribute_map()
+                            .map_err(|error| storage_error_detail(&error))?,
+                    )?,
+                );
             }
             let expected = self.gsi_model.entries_for_partition(&partition);
             if actual == expected {
@@ -61,20 +92,28 @@ impl TableAtomicityWorkload {
     ) -> Result<(), String> {
         self.trace_check_progress("trim_state", "start", self.trim_audit_count);
         let due_before = TimestampMillis::now() + (73 * 60 * 60 * 1000);
-        let markers =
-            StreamRetentionRepository::list_due_stream_trim_markers(provider, due_before, 1_000)
-                .await
-                .map_err(|err| storage_error_detail(&err))?;
+        let markers = storage_common::retry::retry_native_conflicts(
+            provider,
+            storage_provider::DYNAMO_WRITE_RETRY,
+            || StreamRetentionRepository::list_due_stream_trim_markers(provider, due_before, 1_000),
+        )
+        .await
+        .map_err(|err| storage_error_detail(&err))?;
         let table_name = self.table_name();
         let mut current_table_scopes = BTreeSet::new();
-        let mut current_item_scopes = BTreeSet::new();
         for marker in markers
             .into_iter()
             .filter(|marker| marker.scope.table_name == table_name)
         {
-            let mut states = StreamRetentionRepository::load_stream_trim_states(
+            let mut states = storage_common::retry::retry_native_conflicts(
                 provider,
-                std::slice::from_ref(&marker.scope),
+                storage_provider::DYNAMO_WRITE_RETRY,
+                || {
+                    StreamRetentionRepository::load_stream_trim_states(
+                        provider,
+                        std::slice::from_ref(&marker.scope),
+                    )
+                },
             )
             .await
             .map_err(|err| storage_error_detail(&err))?;
@@ -94,67 +133,21 @@ impl TableAtomicityWorkload {
                     marker.scope.scope_id, marker.policy_version
                 ));
             }
-            match marker.scope.kind {
-                storage_provider::StreamTrimScopeKind::Table => {
-                    current_table_scopes.insert(marker.scope.scope_id);
-                }
-                storage_provider::StreamTrimScopeKind::Item => {
-                    current_item_scopes.insert(marker.scope.scope_id);
-                }
-            }
+            current_table_scopes.insert(marker.scope.scope_id);
         }
-        self.write_trim_provider_snapshot(&current_table_scopes, &current_item_scopes)?;
-
-        let classified = self.trim_model.classified_scopes();
-        let expected_table_count = classified
+        self.write_trim_provider_snapshot(&current_table_scopes)?;
+        let expected = self
+            .table_binding
             .iter()
-            .filter(|scope| scope.kind == TrimScopeKind::Table)
-            .count();
-        let expected_item_scopes = classified
-            .iter()
-            .filter(|scope| scope.kind == TrimScopeKind::Item)
-            .map(|scope| scope.id.clone())
+            .map(|table| storage_provider::table_retention_scope_id(table.history_id))
             .collect::<BTreeSet<_>>();
-        let unclassified_item_scopes = self
-            .trim_model
-            .unclassified_scopes()
-            .into_iter()
-            .filter(|scope| scope.kind == TrimScopeKind::Item)
-            .map(|scope| scope.id)
-            .collect::<BTreeSet<_>>();
-        let unowned_item_budget =
-            self.active_client_count.saturating_sub(1) as usize * self.key_count as usize;
-        let unexpected_item_scopes = current_item_scopes
-            .difference(&expected_item_scopes)
-            .filter(|scope| !unclassified_item_scopes.contains(*scope))
-            .count();
-        if current_table_scopes.len() != expected_table_count
-            || !expected_item_scopes.is_subset(&current_item_scopes)
-            || unexpected_item_scopes > unowned_item_budget
-        {
-            self.record_anomaly(
-                AnomalyKind::AuditValueMismatch,
-                format!("{}/stream-trim", table_name),
-                Some(format!(
-                    "table_count={expected_table_count}, item_scopes={expected_item_scopes:?}"
-                )),
-                Some(format!(
-                    "table_scopes={current_table_scopes:?}, item_scopes={current_item_scopes:?}"
-                )),
-                "stream trim due-marker/state counts differ from expected model".to_string(),
-            );
+        if current_table_scopes != expected {
             return Err(format!(
-                "stream trim mismatch expected_table_count={} actual_table_count={} \
-                 missing_owned_item_count={} unexpected_item_count={unexpected_item_scopes}",
-                expected_table_count,
-                current_table_scopes.len(),
-                expected_item_scopes
-                    .difference(&current_item_scopes)
-                    .count(),
+                "table retention scopes differ: expected={expected:?} \
+                 actual={current_table_scopes:?}"
             ));
         }
-
-        self.trim_audit_count += (current_table_scopes.len() + expected_item_scopes.len()) as u64;
+        self.trim_audit_count += current_table_scopes.len() as u64;
         self.trace_check_progress("trim_state", "finish", self.trim_audit_count);
         Ok(())
     }
@@ -176,7 +169,7 @@ impl TableAtomicityWorkload {
 
     pub(crate) async fn check_stream_records(
         &mut self,
-        manager: &DatabaseManager,
+        provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
         self.trace_check_progress("stream_records", "start", 0);
         let expected = self
@@ -214,16 +207,27 @@ impl TableAtomicityWorkload {
             if page_count > 100 {
                 return Err("stream audit exceeded 100 pages".to_string());
             }
-            let response = manager
-                .get_stream_records_for_table_name(
-                    &self.table_name(),
-                    page_token.as_deref(),
-                    Some(1_000),
-                )
-                .await
-                .map_err(|err| storage_error_detail(&err))?;
+            let request = storage_types::GetStreamRecordsRequest::table(
+                self.table_name(),
+                page_token,
+                Some(1_000),
+            );
+            // An audit needs a completed observation. Retry a known-aborted
+            // read with a fresh snapshot; never accept an absent observation.
+            let response = storage_common::retry::retry_native_conflicts(
+                provider,
+                storage_provider::DYNAMO_WRITE_RETRY,
+                || provider.get_stream_records(request.clone()),
+            )
+            .await
+            .map_err(|err| storage_error_detail(&err))?;
+            // Active streams keep a qualified tail checkpoint on empty pages.
+            // Emptiness completes this finite replay; token presence does not.
+            if response.records().is_empty() {
+                break;
+            }
             for record in response.records() {
-                let Some(new_image) = record.new_image.as_ref() else {
+                let Some(new_image) = record.item.as_ref() else {
                     continue;
                 };
                 let key = string_attr(new_image, "pk")?;
@@ -265,25 +269,22 @@ impl TableAtomicityWorkload {
         provider: &kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>,
     ) -> Result<(), String> {
         use storage_provider::DynamoPort;
-        let table = self.table_name();
-        let cache = provider.metadata_cache();
-        let info = provider
-            .with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-                Box::pin(async move {
-                    storage_provider::resolve_table_in_attempt(attempt, &cache, &table)
-                        .await
-                        .map(|(table, _)| table)
-                })
-            })
-            .await
-            .map_err(|error| storage_error_detail(&error))?;
-        let stream = storage_types::ItemHistoryAddress {
-            history_id: info.history_id,
-            stream_name: StreamName::table_stream(&self.table_name()),
-        }
-        .physical_stream_name();
-        let (rows, decoupled) =
-            super::table_stream_audit::audit_stream_pointers(self.driver(db), stream).await?;
+        let table = self
+            .table_binding
+            .as_ref()
+            .ok_or("captured table binding is absent")?;
+        let target = storage_types::TableHistoryTarget {
+            table_name: self.table_name(),
+            history_id: table.history_id,
+        };
+        let (rows, decoupled) = super::table_stream_audit::audit_stream_pointers(
+            self.driver(db),
+            target,
+            provider.metadata_cache(),
+            provider,
+        )
+        .await
+        .map_err(|error| storage_error_detail(&error))?;
         self.direct_stream_pointer_audit_count += rows;
         self.direct_stream_pointer_decoupled_target_count += decoupled;
         Ok(())

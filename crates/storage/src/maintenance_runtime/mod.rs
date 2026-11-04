@@ -14,3 +14,9 @@ pub(crate) use runtime::{MaintenanceDriver, MaintenanceRuntime, SeededMaintenanc
     )
 ))]
 mod catalog_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod retention_tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod stream_initialization_tests;

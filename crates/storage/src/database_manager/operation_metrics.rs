@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::LazyLock, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use metrics::{Counter, Histogram};
 use storage_types::StorageResult;
@@ -35,49 +39,61 @@ static STORAGE_OPERATION_METRICS: LazyLock<HashMap<&'static str, StorageOperatio
             .collect()
     });
 
+// Construct the observed future in the admission factory, before native
+// handoff. Its opaque metric handle retains attribution; its timer starts when
+// polled.
 #[cfg(not(feature = "opt-loop-profiling"))]
-pub(crate) async fn record_storage_operation<T, Fut>(
+pub(crate) fn record_storage_operation<T, Fut>(
     operation: &'static str,
     fut: Fut,
-) -> StorageResult<T>
+) -> impl std::future::Future<Output = StorageResult<T>>
 where
     Fut: std::future::Future<Output = StorageResult<T>>,
 {
-    let database_call = metrics_facade::begin_database_call(operation);
-    let start = Instant::now();
-    let result = fut.await;
-    drop(database_call);
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    record_operation_metrics(operation, elapsed_ms);
-    result
+    let request_metric = metrics_facade::request_storage_operation_histogram(operation);
+    async move {
+        let database_call = metrics_facade::begin_database_call(operation);
+        let start = Instant::now();
+        let result = fut.await;
+        drop(database_call);
+        let elapsed = start.elapsed();
+        record_operation_metrics(operation, elapsed);
+        request_metric.record(elapsed.as_secs_f64());
+        result
+    }
 }
 
 #[cfg(feature = "opt-loop-profiling")]
-pub(crate) async fn record_storage_operation<T, Fut>(
+pub(crate) fn record_storage_operation<T, Fut>(
     operation: &'static str,
     fut: Fut,
-) -> StorageResult<T>
+) -> impl std::future::Future<Output = StorageResult<T>>
 where
     Fut: std::future::Future<Output = StorageResult<T>>,
     T: serde::Serialize,
 {
-    let database_call = metrics_facade::begin_database_call(operation);
-    let start = Instant::now();
-    let result = fut.await;
-    drop(database_call);
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    record_operation_metrics(operation, elapsed_ms);
+    let request_metric = metrics_facade::request_storage_operation_histogram(operation);
+    async move {
+        let database_call = metrics_facade::begin_database_call(operation);
+        let start = Instant::now();
+        let result = fut.await;
+        drop(database_call);
+        let elapsed = start.elapsed();
+        record_operation_metrics(operation, elapsed);
+        request_metric.record(elapsed.as_secs_f64());
 
-    let response_bytes = result
-        .as_ref()
-        .map(opt_loop_probe::estimate_json_bytes)
-        .unwrap_or(0);
-    opt_loop_probe::record_storage_call(operation, response_bytes);
+        let response_bytes = result
+            .as_ref()
+            .map(opt_loop_probe::estimate_json_bytes)
+            .unwrap_or(0);
+        opt_loop_probe::record_storage_call(operation, response_bytes);
 
-    result
+        result
+    }
 }
 
-fn record_operation_metrics(operation: &'static str, elapsed_ms: f64) {
+fn record_operation_metrics(operation: &'static str, elapsed: Duration) {
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     if let Some(handles) = STORAGE_OPERATION_METRICS.get(operation) {
         handles.total.increment(1);
         handles.latency_ms.record(elapsed_ms);

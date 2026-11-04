@@ -67,7 +67,10 @@ mod stream_read;
 mod stream_split;
 mod stream_trim;
 mod stream_write;
+mod table_history_reclaim;
+mod table_history_reclaim_sql_statements;
 mod table_reclaim;
+mod table_reclaim_sql_statements;
 mod table_update;
 mod transact_write;
 mod transact_write_statements;
@@ -98,6 +101,8 @@ mod test_support;
 
 mod write_preparation;
 
+#[cfg(all(test, feature = "sqlite", feature = "fault-injection"))]
+mod expiration_identity_tests;
 #[cfg(test)]
 mod item_lock_tests;
 #[cfg(test)]

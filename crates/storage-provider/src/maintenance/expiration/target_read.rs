@@ -16,6 +16,7 @@ pub async fn read_expiration_target_in_attempt<A, S>(
     attempt: &mut A,
     read: &ExpirationTargetRead,
     admission: &S,
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
     A: CatalogAttempt + DescribeTimeToLiveAttempt + ListTablesAttempt,
@@ -26,12 +27,12 @@ where
             table_name,
             table_incarnation,
         } => {
-            let target = configured_target(attempt, table_name, admission).await?;
+            let target = configured_target(attempt, table_name, admission, bindings).await?;
             Ok(target.filter(|(target, _)| &target.table_incarnation == table_incarnation))
         }
-        ExpirationTargetRead::First => scan_targets(attempt, None, admission).await,
+        ExpirationTargetRead::First => scan_targets(attempt, None, admission, bindings).await,
         ExpirationTargetRead::After { table_name } => {
-            scan_targets(attempt, Some(table_name), admission).await
+            scan_targets(attempt, Some(table_name), admission, bindings).await
         }
     }
 }
@@ -40,6 +41,7 @@ async fn scan_targets<A, S>(
     attempt: &mut A,
     after: Option<&TableName>,
     admission: &S,
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
     A: CatalogAttempt + DescribeTimeToLiveAttempt + ListTablesAttempt,
@@ -72,7 +74,7 @@ where
                 return Err(StorageError::internal("expiration targets are not ordered"));
             }
             cursor = Some(name.clone());
-            if let Some(target) = configured_target(attempt, &name, admission).await? {
+            if let Some(target) = configured_target(attempt, &name, admission, bindings).await? {
                 return Ok(Some(target));
             }
         }
@@ -86,6 +88,7 @@ async fn configured_target<A, S>(
     attempt: &mut A,
     name: &TableName,
     admission: &S,
+    bindings: &crate::RequestTableBindings,
 ) -> StorageResult<Option<(ExpirationTarget, Arc<BoundTableInfo>)>>
 where
     A: CatalogAttempt + DescribeTimeToLiveAttempt,
@@ -94,6 +97,7 @@ where
     let Some(stamp) = attempt.read_catalog_stamp(name).await? else {
         return Ok(None);
     };
+    bindings.observe(name, stamp.history_id)?;
     let table = attempt.read_table_at_stamp(name, stamp).await?;
     if !admission.admits_target(attempt, &table).await? {
         return Ok(None);

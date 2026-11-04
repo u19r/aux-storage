@@ -76,7 +76,6 @@ impl PreparedTablePut {
             old_item: old,
             new_indexers: self.new_indexers,
             ttl_writes,
-            item_stream_ttl_hours: self.ttl.item_stream_ttl_hours,
             ttl_context: self.ttl.context.clone(),
             stream,
         })
@@ -153,7 +152,6 @@ impl PreparedTableUpdate {
             old_item: old,
             new_indexers: self.new_indexers,
             ttl_writes,
-            item_stream_ttl_hours: self.ttl.item_stream_ttl_hours,
             ttl_context: self.ttl.context.clone(),
             stream,
             return_values: self.return_values,
@@ -221,7 +219,6 @@ impl PreparedTableDelete {
             table_key: self.table_key,
             old_item: old,
             ttl_writes,
-            item_stream_ttl_hours: self.ttl.item_stream_ttl_hours,
             ttl_context: self.ttl.context.clone(),
             stream,
         })

@@ -1,12 +1,18 @@
+mod history_entry;
+mod history_index;
+mod history_metadata;
+#[cfg(all(
+    test,
+    feature = "fault-injection",
+    any(feature = "rocksdb", feature = "foundationdb")
+))]
+mod history_metadata_tests;
+mod history_namespace;
 pub(crate) mod range;
 mod read;
-mod record;
 pub(crate) mod row;
 
 pub(crate) use read::{
-    read_item_history_pages, read_stream, read_system_history_pages, read_user_item_through,
+    load_retired_positions, read_stream, read_system_history_pages, read_user_item_through,
     read_user_page_through,
-};
-pub(crate) use record::{
-    load_stream_effects, load_stream_items, load_stream_records, load_stream_references,
 };

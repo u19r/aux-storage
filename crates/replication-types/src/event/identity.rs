@@ -5,7 +5,7 @@ use crate::{
         origin::{MutationOrdinal, OriginId, OriginPosition},
         resource::{ControlOperationId, HistoryIdentity, OriginalStreamRecordId, TableLineage},
     },
-    protocol::CanonicalBytes,
+    protocol::{CanonicalBytes, CanonicalDigest},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ pub enum CanonicalEventId {
     },
     Expiration {
         lineage: TableLineage,
-        victim: VersionIdentity,
+        victim_digest: CanonicalDigest,
     },
 }
 
@@ -73,11 +73,18 @@ impl VersionIdentity {
             Self::Baseline { lineage, .. } => *lineage,
         }
     }
-    pub fn expiration_id(self) -> CanonicalEventId {
-        CanonicalEventId::Expiration {
+    pub fn expiration_id(
+        &self,
+    ) -> Result<CanonicalEventId, crate::error::ReplicationProtocolError> {
+        let victim_digest = CanonicalDigest::of_json(self).map_err(|_| {
+            crate::error::ReplicationProtocolError::InvalidEncoding {
+                context: "expiration victim digest",
+            }
+        })?;
+        Ok(CanonicalEventId::Expiration {
             lineage: self.lineage(),
-            victim: self,
-        }
+            victim_digest,
+        })
     }
 }
 
@@ -117,16 +124,7 @@ impl CanonicalEventId {
     pub(super) fn validate(&self) -> Result<(), crate::error::ReplicationProtocolError> {
         match self {
             Self::Origin(id) => id.validate(),
-            Self::Expiration { lineage, victim } => {
-                victim.validate()?;
-                if victim.lineage() != *lineage {
-                    return Err(crate::error::ReplicationProtocolError::LineageMismatch {
-                        context: "expiration victim identity",
-                    });
-                }
-                Ok(())
-            }
-            Self::Control { .. } | Self::Adopted { .. } => Ok(()),
+            Self::Control { .. } | Self::Adopted { .. } | Self::Expiration { .. } => Ok(()),
         }
     }
 
@@ -134,10 +132,7 @@ impl CanonicalEventId {
         match self {
             Self::Origin(id) => id.lineage == lineage,
             Self::Control { lineage: own, .. } => *own == lineage,
-            Self::Expiration {
-                lineage: own,
-                victim,
-            } => *own == lineage && victim.lineage() == lineage,
+            Self::Expiration { lineage: own, .. } => *own == lineage,
             // Adopted history receives its lineage binding from the adoption
             // manifest.
             Self::Adopted { .. } => true,

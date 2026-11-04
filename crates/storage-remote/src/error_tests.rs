@@ -317,3 +317,20 @@ fn transaction_cancellation_defaults_null_code_to_none() {
             if reasons.iter().map(String::as_str).eq(["None"])
     ));
 }
+
+#[test]
+fn given_trimmed_stream_response_when_classified_then_typed_error_is_not_retryable() {
+    let (error, retryable, code) = classify_error_response(
+        StatusCode::BAD_REQUEST,
+        RemoteErrorResponse {
+            error_type: Some("com.amazonaws.dynamodb.v20120810#TrimmedDataAccessException".into()),
+            code: None,
+            message: Some("The data you are trying to access has been trimmed.".into()),
+            item: None,
+            cancellation_reasons: None,
+        },
+    );
+    assert!(!retryable);
+    assert_eq!(code.as_deref(), Some("TrimmedDataAccessException"));
+    assert!(matches!(error.to_enum(), StorageEnum::TrimmedDataAccess));
+}

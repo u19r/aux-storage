@@ -134,15 +134,3 @@ impl OperationHistory {
         Ok(history)
     }
 }
-
-pub fn classify_operation_error(error: &str) -> OperationOutcome {
-    if error.contains("commit_unknown_result") || error.contains("maybe_committed") {
-        OperationOutcome::Unknown {
-            error: error.to_string(),
-        }
-    } else {
-        OperationOutcome::Failed {
-            error: error.to_string(),
-        }
-    }
-}

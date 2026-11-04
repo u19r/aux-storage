@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use futures::TryFutureExt;
 use storage_provider::{GsiIndexReadiness, TableReclaimStep};
 use storage_types::{
     CreateTableRequest, DeleteTableRequest, DescribeTimeToLiveRequest, DescribeTimeToLiveResponse,
     IndexName, ListTablesRequest, StorageEnum, StorageError, StorageResult, StoredTableInfo,
-    TableName, TimestampMillis, UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest,
+    TableName, UpdateTableRequest, UpdateTableResponse, UpdateTimeToLiveRequest,
     UpdateTimeToLiveResponse, context::WrappedError as _,
 };
 use stream::StreamError;
@@ -24,8 +25,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::Write,
-            |dynamo| async move {
-                record_storage_operation("create_table", dynamo.create_table(owned_request)).await
+            |dynamo| {
+                record_storage_operation("create_table", async move {
+                    dynamo.create_table(owned_request).await
+                })
             },
         )
         .await?;
@@ -38,8 +41,10 @@ impl DatabaseManager {
         request: &CreateTableRequest,
     ) -> StorageResult<()> {
         let owned_request = request.clone();
-        self.run_dynamo_admitted(connection_id, AdmissionClass::Write, |dynamo| async move {
-            record_storage_operation("create_table", dynamo.create_table(owned_request)).await
+        self.run_dynamo_admitted(connection_id, AdmissionClass::Write, |dynamo| {
+            record_storage_operation("create_table", async move {
+                dynamo.create_table(owned_request).await
+            })
         })
         .await?;
         Ok(())
@@ -60,12 +65,12 @@ impl DatabaseManager {
         let index_names = index_names.to_vec();
         let table_name = table_name.clone();
         self.admission_controller_for_connection(ROUTED_DEFAULT_CONNECTION_ID)?
-            .settle_foreground(AdmissionClass::PointRead, || async move {
-                record_storage_operation(
-                    "read_gsi_index_readiness",
-                    repository.read_gsi_index_readiness(&table_name, &index_names),
-                )
-                .await
+            .settle_foreground(AdmissionClass::PointRead, || {
+                record_storage_operation("read_gsi_index_readiness", async move {
+                    repository
+                        .read_gsi_index_readiness(&table_name, &index_names)
+                        .await
+                })
             })
             .await
     }
@@ -82,13 +87,11 @@ impl DatabaseManager {
         table_name: &TableName,
     ) -> StorageResult<StoredTableInfo> {
         let table_name = table_name.clone();
-        self.run_dynamo_control(ROUTED_DEFAULT_CONNECTION_ID, |dynamo| async move {
-            record_storage_operation(
-                "get_table_info_for_control",
-                dynamo.get_table_info(table_name),
-            )
-            .await
-            .map(Arc::unwrap_or_clone)
+        self.run_dynamo_control(ROUTED_DEFAULT_CONNECTION_ID, |dynamo| {
+            record_storage_operation("get_table_info_for_control", async move {
+                dynamo.get_table_info(table_name).await
+            })
+            .map_ok(Arc::unwrap_or_clone)
         })
         .await
     }
@@ -99,14 +102,13 @@ impl DatabaseManager {
     pub async fn get_system_stream_scope_for_control(
         &self,
     ) -> StorageResult<storage_types::SystemStreamScope> {
-        self.run_stream_control(ROUTED_DEFAULT_CONNECTION_ID, |stream| async move {
+        self.run_stream_control(ROUTED_DEFAULT_CONNECTION_ID, |stream| {
             record_storage_operation("get_system_stream_scope_for_control", async move {
                 stream
                     .system_stream_scope()
                     .await
                     .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
             })
-            .await
         })
         .await
     }
@@ -118,14 +120,13 @@ impl DatabaseManager {
         &self,
         request: SystemStreamPageRequest,
     ) -> StorageResult<SystemStreamPage> {
-        self.run_stream_control(ROUTED_DEFAULT_CONNECTION_ID, |stream| async move {
+        self.run_stream_control(ROUTED_DEFAULT_CONNECTION_ID, |stream| {
             record_storage_operation("get_system_stream_page_for_control", async move {
                 stream
                     .get_system_stream_page(request)
                     .await
                     .map_err(|error| StorageError::from(StreamError::into_storage_enum(error)))
             })
-            .await
         })
         .await
     }
@@ -148,8 +149,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::PointRead,
-            |dynamo| async move {
-                record_storage_operation("get_table_info", dynamo.get_table_info(table_name)).await
+            |dynamo| {
+                record_storage_operation("get_table_info", async move {
+                    dynamo.get_table_info(table_name).await
+                })
             },
         )
         .await
@@ -161,9 +164,10 @@ impl DatabaseManager {
             .run_dynamo_admitted(
                 ROUTED_DEFAULT_CONNECTION_ID,
                 AdmissionClass::PointRead,
-                |dynamo| async move {
-                    record_storage_operation("table_exists", dynamo.get_table_info(table_name))
-                        .await
+                |dynamo| {
+                    record_storage_operation("table_exists", async move {
+                        dynamo.get_table_info(table_name).await
+                    })
                 },
             )
             .await
@@ -188,9 +192,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::Write,
-            |dynamo| async move {
-                record_storage_operation("update_time_to_live", dynamo.update_time_to_live(request))
-                    .await
+            |dynamo| {
+                record_storage_operation("update_time_to_live", async move {
+                    dynamo.update_time_to_live(request).await
+                })
             },
         )
         .await
@@ -206,12 +211,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::PointRead,
-            |dynamo| async move {
-                record_storage_operation(
-                    "describe_time_to_live",
-                    dynamo.describe_time_to_live(request),
-                )
-                .await
+            |dynamo| {
+                record_storage_operation("describe_time_to_live", async move {
+                    dynamo.describe_time_to_live(request).await
+                })
             },
         )
         .await
@@ -260,11 +263,7 @@ impl DatabaseManager {
         let reclaim = self.table_reclaim_repository.as_ref().ok_or_else(|| {
             StorageError::unsupported("test table cleanup requires local table reclaim")
         })?;
-        while reclaim
-            .reclaim_table_page_at(TimestampMillis::from_timestamp(i64::MAX))
-            .await?
-            == TableReclaimStep::Advanced
-        {}
+        while reclaim.reclaim_table_page().await? == TableReclaimStep::Advanced {}
         Ok(())
     }
 
@@ -275,8 +274,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::Write,
-            |dynamo| async move {
-                record_storage_operation("delete_table", dynamo.delete_table(request)).await
+            |dynamo| {
+                record_storage_operation("delete_table", async move {
+                    dynamo.delete_table(request).await
+                })
             },
         )
         .await?;
@@ -290,8 +291,10 @@ impl DatabaseManager {
         self.run_dynamo_admitted(
             ROUTED_DEFAULT_CONNECTION_ID,
             AdmissionClass::Write,
-            |dynamo| async move {
-                record_storage_operation("update_table", dynamo.update_table(request)).await
+            |dynamo| {
+                record_storage_operation("update_table", async move {
+                    dynamo.update_table(request).await
+                })
             },
         )
         .await
@@ -308,8 +311,10 @@ impl DatabaseManager {
         &self,
         request: UpdateTableRequest,
     ) -> StorageResult<UpdateTableResponse> {
-        self.run_dynamo_control(ROUTED_DEFAULT_CONNECTION_ID, |dynamo| async move {
-            record_storage_operation("update_table_for_control", dynamo.update_table(request)).await
+        self.run_dynamo_control(ROUTED_DEFAULT_CONNECTION_ID, |dynamo| {
+            record_storage_operation("update_table_for_control", async move {
+                dynamo.update_table(request).await
+            })
         })
         .await
     }

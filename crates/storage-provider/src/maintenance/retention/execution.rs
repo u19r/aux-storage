@@ -93,12 +93,12 @@ impl<'a> StreamDurationTrimWorker<'a> {
             let markers = Self::take_marker_wave(&mut scopes);
             stats += self
                 .backend
-                .trim_stream_marker_wave(StreamRetentionWave {
+                .trim_stream_marker_wave(StreamRetentionWave::try_new(
                     markers,
                     due_before,
-                    observed_at: now,
-                    page_limit: self.config.stream_page_size,
-                })
+                    now,
+                    self.config.stream_page_size,
+                )?)
                 .await?;
             scopes.retain(|_, markers| !markers.is_empty());
         }
@@ -112,6 +112,7 @@ impl<'a> StreamDurationTrimWorker<'a> {
         scopes
             .values_mut()
             .filter_map(VecDeque::pop_front)
+            .take(crate::constants::TABLE_CLEANUP_PAGE_ROWS)
             .collect()
     }
 }

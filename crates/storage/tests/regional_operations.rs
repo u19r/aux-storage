@@ -50,9 +50,9 @@ async fn given_local_and_global_tables_when_mixed_writes_replay_or_fail_then_ato
         let partial: storage_types::BatchWriteItemRequest = serde_json::from_value(json!({"RequestItems": {
             TABLE: [
                 {"PutRequest": {"Item": item(&colliding[0], "selected-first").into_attribute_map()?}},
-                {"DeleteRequest": {"Key": key(&colliding[1]), "AuxItemStreamTtlHours": 1}},
+                {"DeleteRequest": {"Key": key(&colliding[1])}},
                 {"PutRequest": {"Item": item(&separate, "selected-third").into_attribute_map()?}},
-                {"PutRequest": {"Item": item(&colliding[2], "retry-put").into_attribute_map()?, "Indexers": [], "AuxItemStreamTtlHours": 1}}
+                {"PutRequest": {"Item": item(&colliding[2], "retry-put").into_attribute_map()?, "Indexers": []}}
             ],
             LOCAL_TABLE: [{"PutRequest": {"Item": item("partial-local", "selected-ordinary").into_attribute_map()?}}]
         }}))?;
@@ -88,7 +88,7 @@ async fn given_local_and_global_tables_when_mixed_writes_replay_or_fail_then_ato
             partial_history.push((selected.clone(), history));
         }
         let mut bounded_batch: storage_types::BatchWriteItemRequest = serde_json::from_value(json!({"RequestItems": {
-            TABLE: [{"PutRequest": {"Item": {"pk": {"S": "bounded-batch"}, "value": {"S": "x".repeat(70000)}}, "Indexers": [], "AuxItemStreamTtlHours": 1}}],
+            TABLE: [{"PutRequest": {"Item": {"pk": {"S": "bounded-batch"}, "value": {"S": "x".repeat(70000)}}, "Indexers": []}}],
             LOCAL_TABLE: [{"PutRequest": {"Item": {"pk": {"S": "bounded-batch"}, "value": {"S": "ordinary-must-abort"}}}}]
         }}))?;
         let unprocessed = fixture.managers[0].batch_write_item(bounded_batch.clone()).await?;
@@ -173,15 +173,27 @@ async fn given_local_and_global_tables_when_mixed_writes_replay_or_fail_then_ato
 }
 
 async fn require_materialization_stream(manager: &storage::DatabaseManager) -> Result<()> {
-    let response = manager
-        .get_stream_records_for_table_name(&TableName::new(TABLE), None, Some(100))
-        .await?;
-    anyhow::ensure!(
-        response.last_evaluated_key().is_none(),
-        "mixed-operation stream exceeded its complete fixture page"
-    );
-    let records: Vec<_> = response
-        .records()
+    let mut after = None;
+    let mut materialized = Vec::new();
+    loop {
+        let response = manager
+            .get_stream_records_for_table_name(&TableName::new(TABLE), after.as_deref(), Some(100))
+            .await?;
+        if response.records().is_empty() {
+            break;
+        }
+        let checkpoint = response
+            .last_evaluated_key()
+            .context("missing qualified stream checkpoint")?;
+        checkpoint.parse::<storage_types::TableStreamCheckpoint>()?;
+        after = Some(checkpoint.to_owned());
+        materialized.extend_from_slice(response.records());
+        anyhow::ensure!(
+            materialized.len() <= 100,
+            "mixed-operation stream exceeded its complete fixture inventory"
+        );
+    }
+    let records: Vec<_> = materialized
         .iter()
         .filter(|record| record.keys == key(ITEM_KEY))
         .collect();
@@ -199,22 +211,11 @@ async fn require_materialization_stream(manager: &storage::DatabaseManager) -> R
         let value = |image: &Option<storage_types::AttributeMap>| {
             image.as_ref().and_then(|item| item.get("value")).cloned()
         };
-        let expected = [
-            (None, Some("batch")),
-            (Some("batch"), Some("transaction")),
-            (Some("transaction"), None),
-        ][index];
+        let expected = [Some("batch"), Some("transaction"), None][index];
         anyhow::ensure!(
-            (value(&record.old_image), value(&record.new_image))
-                == (
-                    expected
-                        .0
-                        .map(|value| storage_types::AttributeValue::S(value.into())),
-                    expected
-                        .1
-                        .map(|value| storage_types::AttributeValue::S(value.into()))
-                ),
-            "materialization stream lost its exact old/new transition: {record:?}"
+            value(&record.item)
+                == expected.map(|value| storage_types::AttributeValue::S(value.into())),
+            "materialization stream lost its resolved snapshot: {record:?}"
         );
     }
     Ok(())

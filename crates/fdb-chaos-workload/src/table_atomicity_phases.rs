@@ -1,4 +1,7 @@
-use crate::{common::*, constants::*, imports::*, table_atomicity::*};
+use crate::{
+    common::*, constants::*, imports::*, table_atomicity::*,
+    table_atomicity_recording::FailedOperation,
+};
 
 impl TableAtomicityWorkload {
     pub(crate) async fn setup_phase(&mut self, db: SimDatabase) {
@@ -6,15 +9,15 @@ impl TableAtomicityWorkload {
         if self.client_id != 0 {
             return;
         }
-        let manager = match self.manager(db).await {
-            Ok(manager) => manager,
+        let provider = match self.provider(db).await {
+            Ok(provider) => provider,
             Err(err) => {
                 self.trace_invariant_error("setup", err);
                 return;
             }
         };
-        match manager.create_table(&self.create_table_request()).await {
-            Ok(()) => {}
+        match provider.create_table(self.create_table_request()).await {
+            Ok(_) => {}
             Err(err) if matches!(err.as_ref(), StorageEnum::TableAlreadyExists { .. }) => {}
             Err(err) => {
                 self.trace_invariant_error("setup", storage_error_detail(&err));
@@ -41,13 +44,7 @@ impl TableAtomicityWorkload {
             self.trace_invariant_error("start", error);
             return;
         }
-        let manager = match self.manager_from_store(store).await {
-            Ok(manager) => manager,
-            Err(error) => {
-                self.trace_invariant_error("start", error);
-                return;
-            }
-        };
+        let provider = store;
 
         for sequence in 0..self.operation_count {
             let key =
@@ -56,18 +53,17 @@ impl TableAtomicityWorkload {
             match self.context.rnd() % 6 {
                 0 => {
                     let started_at_sim_us = self.sim_time_us();
-                    let result = manager
-                        .put_item(PutItemInput {
-                            table_name: self.table_name(),
-                            item: self.item(&key, &value).into(),
-                            indexers: None,
-                            condition_expression: None,
-                            expression_attribute_names: None,
-                            expression_attribute_values: None,
-                            return_values: None,
-                            return_old_on_condition_failure: false,
-                            aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
-                        })
+                    let result = provider
+                        .put_item(
+                            storage_types::PutItemRequest::builder()
+                                .table_name(self.table_name())
+                                .item(
+                                    WireItem::try_from(self.item(&key, &value))
+                                        .expect("valid workload item"),
+                                )
+                                .condition_expression(None)
+                                .build(),
+                        )
                         .await;
                     match result {
                         Ok(_) => self.record_success(
@@ -78,31 +74,30 @@ impl TableAtomicityWorkload {
                             Some(value),
                         ),
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::Put,
+                                kind: OperationKind::Put,
                                 key,
-                                Some(value),
-                                storage_error_detail(&err),
-                            );
+                                value: Some(value),
+                                error: err,
+                            });
                         }
                     }
                 }
                 1 => {
                     let started_at_sim_us = self.sim_time_us();
-                    let result = manager
-                        .put_item(PutItemInput {
-                            table_name: self.table_name(),
-                            item: self.item(&key, &value).into(),
-                            indexers: None,
-                            condition_expression: Some("attribute_not_exists(pk)".to_string()),
-                            expression_attribute_names: None,
-                            expression_attribute_values: None,
-                            return_values: None,
-                            return_old_on_condition_failure: false,
-                            aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
-                        })
+                    let result = provider
+                        .put_item(
+                            storage_types::PutItemRequest::builder()
+                                .table_name(self.table_name())
+                                .item(
+                                    WireItem::try_from(self.item(&key, &value))
+                                        .expect("valid workload item"),
+                                )
+                                .condition_expression(Some("attribute_not_exists(pk)".to_string()))
+                                .build(),
+                        )
                         .await;
                     match result {
                         Ok(_) => self.record_success(
@@ -122,14 +117,14 @@ impl TableAtomicityWorkload {
                             );
                         }
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::PutIfAbsent,
+                                kind: OperationKind::PutIfAbsent,
                                 key,
-                                Some(value),
-                                storage_error_detail(&err),
-                            );
+                                value: Some(value),
+                                error: err,
+                            });
                         }
                     }
                 }
@@ -151,19 +146,17 @@ impl TableAtomicityWorkload {
                         } else {
                             "SET payload = :payload".to_string()
                         };
-                    let result = manager
-                        .update_item(UpdateItemInput {
-                            table_name: self.table_name(),
-                            key: self.key_attributes(&key),
-                            update_expression,
-                            indexers: None,
-                            condition_expression: None,
-                            expression_attribute_names: None,
-                            expression_attribute_values: Some(expression_attribute_values.into()),
-                            return_values: None,
-                            return_old_on_condition_failure: false,
-                            aux_item_stream_ttl_hours: self.item_stream_ttl_for_key(&key),
-                        })
+                    let result = provider
+                        .update_item(
+                            storage_types::UpdateItemRequest::builder()
+                                .table_name(self.table_name())
+                                .key(self.key_attributes(&key))
+                                .update_expression(update_expression)
+                                .expression_attribute_values(Some(
+                                    expression_attribute_values.into(),
+                                ))
+                                .build(),
+                        )
                         .await;
                     match result {
                         Ok(_) => self.record_success(
@@ -174,26 +167,24 @@ impl TableAtomicityWorkload {
                             Some(next),
                         ),
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::Update,
+                                kind: OperationKind::Update,
                                 key,
-                                Some(next),
-                                storage_error_detail(&err),
-                            );
+                                value: Some(next),
+                                error: err,
+                            });
                         }
                     }
                 }
                 3 => {
                     let started_at_sim_us = self.sim_time_us();
-                    let result = manager
-                        .delete_item(
-                            DeleteItemInput::builder()
-                                .table_name(self.table_name())
-                                .key(self.key_attributes(&key))
-                                .build(),
-                        )
+                    let result = provider
+                        .delete_item(storage_types::DeleteItemRequest::new(
+                            self.table_name(),
+                            self.key_attributes(&key),
+                        ))
                         .await;
                     match result {
                         Ok(_) => self.record_success(
@@ -204,25 +195,20 @@ impl TableAtomicityWorkload {
                             None,
                         ),
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::Delete,
+                                kind: OperationKind::Delete,
                                 key,
-                                None,
-                                storage_error_detail(&err),
-                            );
+                                value: None,
+                                error: err,
+                            });
                         }
                     }
                 }
                 4 => {
                     let started_at_sim_us = self.sim_time_us();
-                    let result = manager
-                        .get_item_decode::<_, storage_types::AttributeMap>(
-                            self.table_name(),
-                            self.key_attributes(&key),
-                        )
-                        .await;
+                    let result = self.read_current_item(&provider, &key).await;
                     match result {
                         Ok(item) => {
                             let actual = match self.payload_from_item(&key, item) {
@@ -283,21 +269,21 @@ impl TableAtomicityWorkload {
                             }
                         }
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::Read,
+                                kind: OperationKind::Read,
                                 key,
-                                None,
-                                storage_error_detail(&err),
-                            );
+                                value: None,
+                                error: err,
+                            });
                         }
                     }
                 }
                 _ => {
                     let second_key = self.transact_side_effect_key(&key, self.client_id, sequence);
                     let started_at_sim_us = self.sim_time_us();
-                    let result = manager
+                    let result = provider
                         .transact_write_items(TransactWriteItemsRequest {
                             transact_items: vec![
                                 TransactWriteItem {
@@ -310,8 +296,6 @@ impl TableAtomicityWorkload {
                                         expression_attribute_names: None,
                                         expression_attribute_values: None,
                                         return_values_on_condition_check_failure: None,
-                                        aux_item_stream_ttl_hours: self
-                                            .item_stream_ttl_for_key(&key),
                                     }),
                                     update: None,
                                     delete: None,
@@ -327,7 +311,6 @@ impl TableAtomicityWorkload {
                                         expression_attribute_names: None,
                                         expression_attribute_values: None,
                                         return_values_on_condition_check_failure: None,
-                                        aux_item_stream_ttl_hours: None,
                                     }),
                                     update: None,
                                     delete: None,
@@ -350,14 +333,14 @@ impl TableAtomicityWorkload {
                             );
                         }
                         Err(err) => {
-                            self.record_failure(
+                            self.record_failure(FailedOperation {
                                 started_at_sim_us,
                                 sequence,
-                                OperationKind::TransactWrite,
+                                kind: OperationKind::TransactWrite,
                                 key,
-                                Some(value),
-                                storage_error_detail(&err),
-                            );
+                                value: Some(value),
+                                error: err,
+                            });
                         }
                     }
                 }

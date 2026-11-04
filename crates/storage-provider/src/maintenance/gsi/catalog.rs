@@ -28,6 +28,21 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiAttempt<'_, P, S> {
         Ok(table)
     }
 
+    pub(super) async fn persist_capture_release(
+        &mut self,
+        table: &BoundTableInfo,
+        mut change: crate::TableUpdateChange,
+    ) -> StorageResult<()> {
+        if change.is_capture_stop(&table.info) {
+            let retention = self.port.observe_table_retention(table).await?;
+            change.refresh_retention(retention, self.captured_at)?;
+        }
+        self.port
+            .persist_table_update(table.clone(), change)
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn load_ttl(
         &mut self,
         name: &TableName,

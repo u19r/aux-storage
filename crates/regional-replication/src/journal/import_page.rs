@@ -6,11 +6,20 @@ use replication_provider::{
     canonical_event_codec::CanonicalJsonCodec,
     regional_application::observation::{ImportPageScope, TablePageAcceptance},
 };
-use replication_types::{event::interval::TablePageId, regional_import::RegionalImport};
-use storage_types::{ReadProtection, Revision, StorageResult};
+use replication_types::{
+    event::interval::TablePageId,
+    identity::resource::{TableIdentity, TableLineage},
+    regional_import::RegionalImport,
+};
+use storage_types::{ReadProtection, Revision, StorageResult, TableHistoryId};
 
 use super::{JournalStore, acceptance_batch::AcceptanceReadSelection};
 use crate::{constants::IMPORT_PAGE_SUFFIX, native_record::corrupt_record};
+
+pub(crate) struct ImportPageInventory<'a> {
+    pub(crate) pages: &'a [TablePageAcceptance],
+    pub(crate) tables: &'a [(TableIdentity, TableLineage, TableHistoryId)],
+}
 
 impl JournalStore {
     pub(in crate::journal) fn decode_import_page_record(
@@ -20,7 +29,12 @@ impl JournalStore {
         let page: TablePageAcceptance = self.records.decode(row)?;
         page.require_selection().map_err(|_| corrupt_record())?;
         if row.revision != Revision::INITIAL
-            || row.key != self.identity_key(IMPORT_PAGE_SUFFIX, &page.page)?
+            || row.key
+                != self.table_identity_key(
+                    IMPORT_PAGE_SUFFIX,
+                    self.table_record_history(&row.key, IMPORT_PAGE_SUFFIX)?,
+                    &page.page,
+                )?
         {
             return Err(corrupt_record());
         }
@@ -29,17 +43,20 @@ impl JournalStore {
 
     /// Complete pages are sealed only after every original event receipt exists
     /// in this same native attempt. The caller still owes commit completion.
-    pub async fn seal_import_pages<A: stream_provider::retained_image::RetainedOwnershipAttempt>(
+    pub(crate) async fn seal_import_pages<
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
+    >(
         &self,
         attempt: &mut A,
-        input: (&RegionalImport, &[TablePageAcceptance]),
+        import: &RegionalImport,
+        inventory: ImportPageInventory<'_>,
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<Option<Vec<TablePageAcceptance>>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let (import, pages) = input;
+            let ImportPageInventory { pages, tables } = inventory;
             ImportPageScope::Selected
                 .require_pages(import, pages)
                 .map_err(|_| corrupt_record())?;
@@ -52,9 +69,14 @@ impl JournalStore {
             changes
                 .try_reserve_exact(count)
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            self.verify_page_acceptances(attempt, (pages, import.manifest()), codec)
-                .await?;
-            changes.extend(self.prepare_import_pages(attempt, pages).await?);
+            self.verify_page_acceptances(
+                attempt,
+                ImportPageInventory { pages, tables },
+                import.manifest(),
+                codec,
+            )
+            .await?;
+            changes.extend(self.prepare_import_pages(attempt, (pages, tables)).await?);
             if let Some(change) = self
                 .prepare_import_manifest(attempt, import.manifest(), codec)
                 .await?
@@ -63,22 +85,25 @@ impl JournalStore {
             }
             let completed = if import.fragment().is_some() {
                 let Some(pages) = self
-                    .load_complete_fragment_pages(attempt, import, codec)
+                    .load_complete_fragment_pages(attempt, (import, tables), codec)
                     .await?
                 else {
                     self.records.store(attempt, &changes).await?;
-                    self.retain_fragment_obligations(attempt, import).await?;
+                    self.retain_fragment_obligations(attempt, (import, tables))
+                        .await?;
                     return Ok(None);
                 };
-                changes.extend(self.prepare_import_pages(attempt, &pages).await?);
+                changes.extend(self.prepare_import_pages(attempt, (&pages, tables)).await?);
                 pages
             } else {
                 pages.to_vec()
             };
             self.records.store(attempt, &changes).await?;
-            self.seal_complete_import(attempt, import, codec).await?;
+            self.seal_complete_import(attempt, (import, tables), codec)
+                .await?;
             if import.fragment().is_some() {
-                self.finish_fragment_obligations(attempt, import).await?;
+                self.finish_fragment_obligations(attempt, (import, tables))
+                    .await?;
             }
             Ok(Some(completed))
         }
@@ -89,13 +114,20 @@ impl JournalStore {
     async fn seal_complete_import<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<()> {
+        let (import, tables) = input;
         let mut changes = self
-            .prepare_import_positions(attempt, import, codec)
+            .prepare_import_positions(attempt, (import, tables), codec)
             .await?;
-        changes.extend(self.prepare_import_coverage(attempt, import).await?);
+        changes.extend(
+            self.prepare_import_coverage(attempt, (import, tables))
+                .await?,
+        );
         let links = import.manifest().links.iter().filter(|link| {
             import
                 .bindings()
@@ -115,11 +147,14 @@ impl JournalStore {
     /// An absent receipt remains unresolved. Run this in a fresh native read
     /// after an unknown commit; it never grants permission to retry a mutation.
     pub(crate) async fn load_import_pages<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        import: &RegionalImport,
+        input: (
+            &RegionalImport,
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
         codec: &CanonicalJsonCodec,
         scope: ImportPageScope,
     ) -> StorageResult<Option<Vec<TablePageAcceptance>>> {
@@ -127,15 +162,17 @@ impl JournalStore {
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let result = async {
             let attempt = settlement.as_mut();
+            let (import, tables) = input;
             let mut ids = Vec::new();
             ids.try_reserve_exact(import.bindings().len())
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
             for binding in import.bindings() {
-                ids.push(
+                ids.push((
                     scope
                         .page_id(import, binding)
                         .map_err(|_| corrupt_record())?,
-                );
+                    self.select_original_history(tables, (binding.source_table, binding.lineage))?,
+                ));
             }
             let Some(pages) = self.load_page_records(attempt, &ids).await? else {
                 return Ok(None);
@@ -145,10 +182,18 @@ impl JournalStore {
                 .map_err(|_| corrupt_record())?;
             self.require_import_manifest(attempt, import.manifest(), codec)
                 .await?;
-            self.verify_page_acceptances(attempt, (&pages, import.manifest()), codec)
-                .await?;
+            self.verify_page_acceptances(
+                attempt,
+                ImportPageInventory {
+                    pages: &pages,
+                    tables,
+                },
+                import.manifest(),
+                codec,
+            )
+            .await?;
             if scope == ImportPageScope::Complete || import.fragment().is_none() {
-                self.require_complete_import_coverage(attempt, import)
+                self.require_complete_import_coverage(attempt, (import, tables))
                     .await?;
             }
             Ok(Some(pages))
@@ -160,7 +205,7 @@ impl JournalStore {
     async fn load_page_records<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        ids: &[TablePageId],
+        ids: &[(TablePageId, TableHistoryId)],
     ) -> StorageResult<Option<Vec<TablePageAcceptance>>> {
         let mut keys = Vec::new();
         let mut pages = Vec::new();
@@ -169,8 +214,8 @@ impl JournalStore {
         pages
             .try_reserve_exact(ids.len())
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-        for id in ids {
-            keys.push(self.identity_key(IMPORT_PAGE_SUFFIX, id)?);
+        for (id, physical) in ids {
+            keys.push(self.table_identity_key(IMPORT_PAGE_SUFFIX, *physical, id)?);
         }
         let rows = self
             .load_immutable_waves(attempt, &keys, ReadProtection::Snapshot)
@@ -179,7 +224,7 @@ impl JournalStore {
             return Err(corrupt_record());
         }
         let is_incomplete = rows.iter().any(Option::is_none);
-        for (row, id) in rows.iter().zip(ids) {
+        for (row, (id, _)) in rows.iter().zip(ids) {
             let Some(row) = row else {
                 continue;
             };
@@ -198,13 +243,16 @@ impl JournalStore {
     pub(in crate::journal) async fn prepare_import_pages<A: PhysicalRecordAttempt>(
         &self,
         attempt: &mut A,
-        pages: &[TablePageAcceptance],
+        input: (
+            &[TablePageAcceptance],
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
     ) -> StorageResult<Vec<RecordChange>> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(attempt);
         let attempt = settlement.as_mut();
         let result = async {
-            let mut inventory = ImportPagePreparation::try_new(self, pages)?;
+            let mut inventory = ImportPagePreparation::try_new(self, input)?;
             let rows = self
                 .load_immutable_waves(attempt, &inventory.keys, ReadProtection::Conflict)
                 .await?;
@@ -227,17 +275,15 @@ impl JournalStore {
     }
 
     async fn verify_page_acceptances<
-        A: stream_provider::retained_image::RetainedOwnershipAttempt,
+        A: infrastructure_provider::physical_attempt::PhysicalRecordAttempt,
     >(
         &self,
         attempt: &mut A,
-        input: (
-            &[TablePageAcceptance],
-            &replication_types::event::interval::SourceIntervalManifest,
-        ),
+        inventory: ImportPageInventory<'_>,
+        manifest: &replication_types::event::interval::SourceIntervalManifest,
         codec: &CanonicalJsonCodec,
     ) -> StorageResult<()> {
-        let (pages, manifest) = input;
+        let ImportPageInventory { pages, tables } = inventory;
         let count = pages.iter().try_fold(0usize, |count, page| {
             count
                 .checked_add(page.events.len())
@@ -257,7 +303,12 @@ impl JournalStore {
                 .map_err(|_| corrupt_record())?;
             expected.extend(page.events.iter().zip(links));
         }
-        identities.extend(expected.iter().map(|(receipt, _)| &receipt.event));
+        for (receipt, link) in &expected {
+            identities.push((
+                &receipt.event,
+                self.select_original_history(tables, (link.table, link.lineage))?,
+            ));
+        }
         let selection = AcceptanceReadSelection::SourceProof {
             identities: &identities,
             maximum: self.source_proof_allowance(manifest, codec)?,
@@ -293,14 +344,26 @@ struct ImportPagePreparation<'input> {
 impl<'input> ImportPagePreparation<'input> {
     fn try_new(
         journal: &JournalStore,
-        pages: &'input [TablePageAcceptance],
+        input: (
+            &'input [TablePageAcceptance],
+            &[(TableIdentity, TableLineage, TableHistoryId)],
+        ),
     ) -> StorageResult<Self> {
+        let (pages, tables) = input;
         let mut inventory = Vec::new();
         inventory
             .try_reserve_exact(pages.len())
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
         for page in pages {
-            inventory.push((journal.identity_key(IMPORT_PAGE_SUFFIX, &page.page)?, page));
+            inventory.push((
+                journal.table_identity_key(
+                    IMPORT_PAGE_SUFFIX,
+                    journal
+                        .select_original_history(tables, (page.page.table, page.page.lineage))?,
+                    &page.page,
+                )?,
+                page,
+            ));
         }
         inventory.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         for adjacent in inventory.windows(2) {

@@ -166,7 +166,7 @@ async fn given_indexer_capacity_when_increased_then_decrease_is_rejected_without
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "BillingMode": "PAY_PER_REQUEST",
-            "MaxIndexers": 2, "AuxStreamDurationHours": 1
+            "MaxIndexers": 2, "AuxStreamDurationHours": 24
         })).expect("valid table capacity");
         let created = store.operations.create_table(create).await.expect("create capacity table");
         assert_eq!(created.table_description.max_indexers.get(), 2);
@@ -181,13 +181,13 @@ async fn given_indexer_capacity_when_increased_then_decrease_is_rejected_without
 
         let describe_request = DescribeTableRequest::try_from(json!({"TableName": table.as_ref()})).unwrap();
         let before = store.operations.describe_table(describe_request.clone()).await.unwrap();
-        let due_at = store.now() + 8 * 60 * 60 * 1000;
+        let due_at = store.now() + 96 * 60 * 60 * 1000;
         let markers = store.stream_retention_repository.list_due_stream_trim_markers(due_at, 100).await.unwrap();
         let scopes = markers.iter().map(|marker| marker.scope.clone()).collect::<Vec<_>>();
         let states = store.stream_retention_repository.load_stream_trim_states(&scopes).await.unwrap();
         let decrease = UpdateTableRequest::try_from(json!({
             "TableName": table.as_ref(),
-            "MaxIndexers": 1, "DeletionProtectionEnabled": true, "AuxStreamDurationHours": 7,
+            "MaxIndexers": 1, "DeletionProtectionEnabled": true, "AuxStreamDurationHours": 48,
             "GlobalSecondaryIndexUpdates": [{"Create": {
                 "IndexName": "rejected-index", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
                 "Projection": {"ProjectionType": "ALL"}
@@ -225,6 +225,8 @@ async fn given_existing_table_when_gsi_is_added_then_describe_preserves_creating
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
+        super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
+        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
 
         let request = UpdateTableRequest::try_from(json!({
             "TableName": table.as_ref(),
@@ -278,6 +280,8 @@ async fn given_building_gsi_when_index_is_deleted_then_base_items_remain_and_ind
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
+        super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
+        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
         let put = PutItemRequest::try_from(json!({
             "TableName": table.as_ref(),
             "Item": {"pk": {"S": "customer-1"}, "gpk": {"S": "group-1"}}
@@ -353,6 +357,8 @@ async fn given_deleted_gsi_when_same_name_is_recreated_then_new_index_queries_on
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
+        super::table_stream_eligibility_tests::set_stream(&store, &table, true).await.unwrap();
+        super::table_stream_eligibility_tests::finish_initialization(&store, &table).await.unwrap();
         for attribute in ["old_key", "new_key"] {
             let create = UpdateTableRequest::try_from(json!({
                 "TableName": table.as_ref(),
@@ -434,6 +440,12 @@ async fn given_writes_around_gsi_registration_when_build_completes_then_only_ind
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let table = store.create_standard_table().await;
+        super::table_stream_eligibility_tests::set_stream(&store, &table, true)
+            .await
+            .unwrap();
+        super::table_stream_eligibility_tests::finish_initialization(&store, &table)
+            .await
+            .unwrap();
         let put = PutItemRequest::try_from(json!({
             "TableName": table.as_ref(),
             "Item": {
@@ -713,19 +725,20 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
     let table = unique_table_name();
     let store = TestStore::open_sqlite_file(&path).await;
     store.operations.create_table(CreateTableRequest::try_from(json!({
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
         "TableName": table, "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}], "BillingMode": "PAY_PER_REQUEST",
-        "MaxIndexers": 1, "AuxStreamDurationHours": 1
+        "MaxIndexers": 1, "AuxStreamDurationHours": 24
     })).unwrap()).await.unwrap();
     store.finish().await;
     for (capacity, duration, enabled, gsi) in [
         (
             3,
-            7,
+            48,
             true,
             json!({"Create": {"IndexName": "new-index", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}}),
         ),
-        (4, 9, false, json!({"Delete": {"IndexName": "new-index"}})),
+        (4, 72, false, json!({"Delete": {"IndexName": "new-index"}})),
     ] {
         let store = TestStore::open_sqlite_file(&path).await;
         let mut specification = json!({"StreamEnabled": enabled});
@@ -755,7 +768,7 @@ async fn given_combined_table_updates_when_owner_reopens_then_catalog_and_retent
             .describe_table(describe.clone())
             .await
             .unwrap();
-        let due_at = store.now() + 10 * 60 * 60 * 1000;
+        let due_at = store.now() + 96 * 60 * 60 * 1000;
         let markers = store
             .stream_retention_repository
             .list_due_stream_trim_markers(due_at, 100)
