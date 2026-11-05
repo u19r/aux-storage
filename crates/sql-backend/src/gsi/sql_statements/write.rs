@@ -1,7 +1,7 @@
 //! SQL GSI build, projection, and TTL transition statements.
 
 use storage_backfill::{GsiBuild, GsiStateRecord};
-use storage_types::{StorageError, StorageResult, TableHistoryId};
+use storage_types::{StorageResult, TableHistoryId};
 
 use crate::{SqlLayout, SqlStatement, SqlValue, sql_template::sql_template};
 
@@ -27,43 +27,6 @@ pub(in crate::gsi) fn insert_build_statement(
             SqlValue::Blob(state.state),
         ],
     )
-}
-
-pub(in crate::gsi) fn render_gsi_upsert(
-    engine: impl SqlLayout,
-    columns: &[String],
-    key_count: usize,
-    numeric_keys: &[usize],
-) -> StorageResult<GsiUpsertSql> {
-    let conflict = columns
-        .get(..key_count)
-        .ok_or_else(|| StorageError::internal("GSI conflict key count exceeds columns"))?;
-    let mut sql = crate::statement::SqlText::default();
-    sql.append(format_args!("("))?;
-    sql.append_columns(columns)?;
-    sql.append(format_args!(") VALUES ("))?;
-    for position in 1..=columns.len() {
-        sql.append(format_args!("{}", if position == 1 { "" } else { ", " }))?;
-        sql.append_parameter(engine.engine(), position, numeric_keys.contains(&position))?;
-    }
-    sql.append(format_args!(") ON CONFLICT ("))?;
-    sql.append_columns(conflict)?;
-    sql.append(format_args!(") DO UPDATE SET "))?;
-    sql.append_assignments(columns.iter().skip(key_count))?;
-    // Equal revisions must still fail the caller's changed-row count fence.
-    sql.append(format_args!(" WHERE excluded.__aux_item_version >"))?;
-    Ok(GsiUpsertSql(sql.finish()?))
-}
-
-pub(in crate::gsi) struct GsiUpsertSql(String);
-
-impl GsiUpsertSql {
-    pub(in crate::gsi) fn bind_relation(self, physical: &str) -> StorageResult<String> {
-        crate::statement::SqlText::render(format_args!(
-            "INSERT INTO \"{physical}\" {} \"{physical}\".__aux_item_version",
-            self.0
-        ))
-    }
 }
 
 pub(in crate::gsi) fn transition_state_statement<Cursor: serde::Serialize>(

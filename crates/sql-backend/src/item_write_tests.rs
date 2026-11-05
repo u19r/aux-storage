@@ -4,9 +4,19 @@ use alloc_counter::AllocationGuard;
 use storage_provider::ItemPrimaryEffects;
 use storage_types::{AttributeValue, ItemProvenance, ItemRevision, KeyAttributes};
 
-use crate::{
-    SqlEngine, item_tombstone::sql_statements::tombstone_upsert_statement, test_support::table,
-};
+use crate::{SqlEngine, item_tombstone::sql_statements::tombstone_upsert_row, test_support::table};
+
+fn tombstone_sql(
+    engine: SqlEngine,
+    table: &storage_types::BoundTableInfo,
+    key: &KeyAttributes,
+    effects: &ItemPrimaryEffects,
+) -> crate::SqlStatement {
+    let row = tombstone_upsert_row(engine, table, key, effects).unwrap();
+    row.shape
+        .render(engine, &row.relation, vec![row.binds])
+        .unwrap()
+}
 
 #[test]
 fn given_tombstone_write_when_rendered_then_preserve_sql_and_bind_order() {
@@ -23,15 +33,14 @@ fn given_tombstone_write_when_rendered_then_preserve_sql_and_bind_order() {
         (SqlEngine::Turso, "?"),
         (SqlEngine::Postgres, "$"),
     ] {
-        let (sql, binds) = tombstone_upsert_statement(engine, &table, &key, &effects)
-            .unwrap()
-            .into_parts();
+        let (sql, binds) = tombstone_sql(engine, &table, &key, &effects).into_parts();
         assert_eq!(
             sql,
             format!(
-                "INSERT INTO item_tombstones (table_id, key_json, revision, provenance) VALUES \
-                 ({prefix}1, {prefix}2, {prefix}3, {prefix}4) ON CONFLICT (table_id, key_json) DO \
-                 UPDATE SET revision = excluded.revision, provenance = excluded.provenance"
+                "INSERT INTO \"item_tombstones\" (\"table_id\", \"key_json\", \"revision\", \
+                 \"provenance\") VALUES ({prefix}1, {prefix}2, {prefix}3, {prefix}4) ON CONFLICT \
+                 (\"table_id\", \"key_json\") DO UPDATE SET \"revision\" = excluded.\"revision\", \
+                 \"provenance\" = excluded.\"provenance\""
             )
         );
         assert!(matches!(&binds[0],crate::SqlValue::Blob(value) if value == &[1;16]));
@@ -62,9 +71,7 @@ fn given_tombstone_write_when_constructed_then_report_cpu_and_allocations() {
         (SqlEngine::Postgres, "postgres"),
     ] {
         for _ in 0..100 {
-            drop(black_box(
-                tombstone_upsert_statement(engine, &table, &key, &effects).unwrap(),
-            ));
+            drop(black_box(tombstone_sql(engine, &table, &key, &effects)));
         }
         let guard = AllocationGuard::start(
             module_path!(),
@@ -75,15 +82,12 @@ fn given_tombstone_write_when_constructed_then_report_cpu_and_allocations() {
         );
         let started = cpu_time::ProcessTime::now();
         for _ in 0..100_000 {
-            drop(black_box(
-                tombstone_upsert_statement(
-                    black_box(engine),
-                    black_box(&table),
-                    black_box(&key),
-                    black_box(&effects),
-                )
-                .unwrap(),
-            ));
+            drop(black_box(tombstone_sql(
+                black_box(engine),
+                black_box(&table),
+                black_box(&key),
+                black_box(&effects),
+            )));
         }
         let cpu = started.elapsed();
         alloc_counter::emit_report(&guard.finish()).unwrap();

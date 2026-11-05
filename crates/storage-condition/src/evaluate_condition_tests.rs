@@ -1545,3 +1545,65 @@ fn assert_numeric_condition_paths(
         expected
     );
 }
+
+#[test]
+fn given_number_set_when_compared_then_members_use_numeric_value_not_spelling() {
+    let mut item = HashMap::new();
+    item.insert(
+        "numbers".to_string(),
+        AttributeValue::NS(vec!["1".to_string(), "2".to_string()]),
+    );
+
+    assert!(evaluate_condition(
+        &item,
+        &Condition::Contains {
+            field: "numbers".to_string(),
+            value: AttributeValue::N("1.0".to_string()),
+        }
+    ));
+    assert!(evaluate_condition(
+        &item,
+        &Condition::Equal {
+            field: "numbers".to_string(),
+            value: AttributeValue::NS(vec!["1.0".to_string(), "2.00".to_string()]),
+        }
+    ));
+}
+
+#[test]
+fn given_nested_numbers_when_compared_then_list_and_map_values_use_numeric_equality() {
+    let item = HashMap::from([(
+        "nested".to_owned(),
+        AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+            "n".to_owned(),
+            AttributeValue::N("1".to_owned()),
+        )]))]),
+    )]);
+    let value = AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+        "n".to_owned(),
+        AttributeValue::N("1.0".to_owned()),
+    )]))]);
+    assert!(evaluate_condition(
+        &item,
+        &Condition::Equal {
+            field: "nested".into(),
+            value
+        }
+    ));
+    for value in [
+        AttributeValue::L(vec![AttributeValue::M(HashMap::from([(
+            "n".to_owned(),
+            AttributeValue::N("2".to_owned()),
+        )]))]),
+        AttributeValue::L(Vec::new()),
+        AttributeValue::L(vec![AttributeValue::M(HashMap::new())]),
+    ] {
+        assert!(!evaluate_condition(
+            &item,
+            &Condition::Equal {
+                field: "nested".into(),
+                value
+            }
+        ));
+    }
+}

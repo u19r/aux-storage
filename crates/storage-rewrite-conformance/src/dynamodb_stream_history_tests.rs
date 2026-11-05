@@ -550,3 +550,112 @@ async fn given_large_dynamodb_events_when_page_reaches_one_mib_then_omitted_even
         resume_unwind(panic);
     }
 }
+
+#[tokio::test]
+async fn given_ttl_removal_when_stream_is_read_then_only_remove_has_top_level_service_identity()
+-> anyhow::Result<()> {
+    let store = TestStore::new().await;
+    let result = async {
+        let (table, arn) = create_stream_table(&store, "NEW_AND_OLD_IMAGES").await;
+        store
+            .operations
+            .update_time_to_live(storage_types::UpdateTimeToLiveRequest {
+                table_name: table.clone(),
+                time_to_live_specification: storage_types::TimeToLiveSpecification {
+                    attribute_name: "ttl".into(),
+                    enabled: true,
+                },
+            })
+            .await?;
+        store
+            .operations
+            .put_item(
+                PutItemRequest::try_from(json!({
+                    "TableName": table, "Item": {"pk": {"S": "item"}, "ttl": {"N": "1"}}
+                }))
+                .map_err(anyhow::Error::msg)?,
+            )
+            .await?;
+        let policy = store
+            .ttl_sweep_repository
+            .read_ttl_sweep_policy(&table)
+            .await?
+            .unwrap();
+        let now = store.now();
+        let input = storage_provider::TtlSweepPageInput::try_new("ttl", now, 100, None)?;
+        let command = storage_provider::TtlSweepPageCommand::try_new(policy, input, now)?;
+        let swept = store
+            .ttl_sweep_repository
+            .execute_ttl_sweep_page(command)
+            .await?;
+        anyhow::ensure!(swept.deleted_items == 1);
+        let shards = describe_shards(&store, &arn).await;
+        let token = iterator(&store, &arn, &shards[0].shard_id, "TRIM_HORIZON", None).await;
+        let response = read_published_records(
+            &store,
+            GetRecordsRequest {
+                shard_iterator: token,
+                limit: Some(10),
+            },
+            2,
+        )
+        .await;
+        let wire = serde_json::to_value(response)?;
+        anyhow::ensure!(wire["Records"][0].get("userIdentity").is_none());
+        anyhow::ensure!(wire["Records"][1]["eventName"] == "REMOVE");
+        anyhow::ensure!(
+            wire["Records"][1]["userIdentity"]
+                == json!({"type": "Service", "principalId": "dynamodb.amazonaws.com"})
+        );
+        anyhow::ensure!(wire["Records"][1]["dynamodb"].get("UserIdentity").is_none());
+        Ok(())
+    }
+    .await;
+    store.finish().await;
+    result
+}
+
+#[tokio::test]
+async fn given_existing_stream_when_disabled_then_reenable_cannot_change_history_view()
+-> anyhow::Result<()> {
+    let store = TestStore::new().await;
+    let result = async {
+        let (table, _) = create_stream_table(&store, "NEW_IMAGE").await;
+        store.operations.update_table(serde_json::from_value(json!({
+            "TableName": table, "StreamSpecification": {"StreamEnabled": false}
+        }))?).await?;
+        let response = store.operations.update_table(serde_json::from_value(json!({
+            "TableName": table, "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "OLD_IMAGE"}
+        }))?).await;
+        anyhow::ensure!(response.is_err(), "existing history view was changed");
+        Ok(())
+    }.await;
+    store.finish().await;
+    result
+}
+
+#[tokio::test]
+async fn given_implicit_stream_view_when_disabled_and_reenabled_then_default_view_remains_immutable()
+-> anyhow::Result<()> {
+    let store = TestStore::new().await;
+    let result = async {
+        let table = unique_table_name();
+        let mut request = super::test_support::hash_table_request(table.clone());
+        request.stream_specification = Some(storage_types::StreamSpecification { stream_enabled: true, stream_view_type: None });
+        store.operations.create_table(request).await?;
+        put_value(&store, &table, "item", "original").await;
+        let request = json!({"TableName": table, "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}});
+        anyhow::ensure!(store.operations.update_table(serde_json::from_value(request.clone())?).await.is_err());
+        store.operations.update_table(serde_json::from_value(json!({
+            "TableName": table, "StreamSpecification": {"StreamEnabled": false}
+        }))?).await?;
+        anyhow::ensure!(store.operations.update_table(serde_json::from_value(request)?).await.is_err());
+        let response = store.operations.update_table(serde_json::from_value(json!({
+            "TableName": table, "StreamSpecification": {"StreamEnabled": true}
+        }))?).await?;
+        anyhow::ensure!(response.table_description.stream_specification.unwrap().stream_view_type == Some(storage_types::StreamViewType::NewAndOldImages));
+        Ok(())
+    }.await;
+    store.finish().await;
+    result
+}

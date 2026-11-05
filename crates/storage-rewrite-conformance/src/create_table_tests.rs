@@ -234,3 +234,68 @@ async fn given_default_and_oversized_indexer_capacity_when_tables_are_created_th
         resume_unwind(panic);
     }
 }
+
+#[tokio::test]
+async fn given_native_create_with_invalid_index_schema_when_executed_then_catalog_remains_absent()
+-> anyhow::Result<()> {
+    let store = TestStore::new().await;
+    let result = async {
+        for invalid in ["empty-index", "two-hash-keys", "duplicate-definitions"] {
+            let table = unique_table_name();
+            let mut request = super::test_support::hash_table_request(table.clone());
+            let key = storage_types::KeySchemaElement {
+                attribute_name: "pk".into(),
+                key_type: storage_types::KeyType::Hash,
+            };
+            let schema = if invalid == "empty-index" {
+                Vec::new()
+            } else {
+                vec![key.clone(), key]
+            };
+            if invalid == "duplicate-definitions" {
+                request
+                    .attribute_definitions
+                    .push(request.attribute_definitions[0].clone());
+            } else {
+                request.global_secondary_indexes =
+                    Some(vec![storage_types::CreateGlobalSecondaryIndex {
+                        index_name: storage_types::IndexName::new("invalid-index"),
+                        key_schema: schema,
+                        projection: storage_types::Projection {
+                            projection_type: Some(storage_types::ProjectionType::All),
+                            non_key_attributes: None,
+                        },
+                        provisioned_throughput: None,
+                    }]);
+            }
+            let Err(error) = store.operations.create_table(request).await else {
+                anyhow::bail!("{invalid} was accepted");
+            };
+            anyhow::ensure!(
+                matches!(
+                    error.as_ref(),
+                    storage_types::StorageEnum::Validation { .. }
+                ),
+                "unexpected creation error: {error}"
+            );
+            let Err(error) = store
+                .operations
+                .describe_table(DescribeTableRequest { table_name: table })
+                .await
+            else {
+                anyhow::bail!("invalid schema left a catalog row");
+            };
+            anyhow::ensure!(
+                matches!(
+                    error.as_ref(),
+                    storage_types::StorageEnum::TableNotFound { .. }
+                ),
+                "unexpected description error: {error}"
+            );
+        }
+        Ok(())
+    }
+    .await;
+    store.finish().await;
+    result
+}

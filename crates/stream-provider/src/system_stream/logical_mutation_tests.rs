@@ -135,6 +135,7 @@ fn given_protected_old_revision_when_mutation_is_prepared_then_exact_predecessor
             indexers: &[],
             item_stream_version: ItemStreamVersion::new(5),
             created_at: TimestampMillis::from_timestamp(0),
+            user_identity: None,
         });
         assert_eq!(result.is_ok(), accepted);
         if let Ok(mutation) = result {
@@ -173,6 +174,7 @@ fn given_delete_without_a_live_predecessor_when_prepared_then_no_history_is_inve
             indexers: &[],
             item_stream_version: ItemStreamVersion::new(1),
             created_at: TimestampMillis::from_timestamp(0),
+            user_identity: None,
         })
         .is_err()
     );

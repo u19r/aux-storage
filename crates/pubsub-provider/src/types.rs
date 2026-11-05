@@ -284,7 +284,7 @@ pub struct DeliveryRecord {
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
-    pub message_attributes: HashMap<String, String>,
+    pub message_attributes: HashMap<String, crate::MessageAttribute>,
     pub target: DeliveryTarget,
     pub status: DeliveryStatus,
     pub attempts: u32,
@@ -607,7 +607,7 @@ pub struct PublishRequest {
     pub message: String,
     pub subject: Option<String>,
     #[serde(default)]
-    pub message_attributes: HashMap<String, String>,
+    pub message_attributes: HashMap<String, crate::MessageAttribute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -77,8 +77,8 @@ fn given_signed_and_unsigned_notifications_when_rendered_then_signature_and_fiel
             message: "body\n\"雪".to_string(),
             subject,
             message_attributes: HashMap::from([
-                ("z".to_string(), "雪".to_string()),
-                ("a".to_string(), "\"".to_string()),
+                ("z".to_string(), "雪".to_string().into()),
+                ("a".to_string(), "\"".to_string().into()),
             ]),
         };
         let signer = RecordingSigner::default();
@@ -213,7 +213,7 @@ fn given_notification_workloads_when_rendered_then_allocations_are_reported() {
             message: "x".repeat(size),
             subject: (attributes > 0).then(|| "subject雪".to_string()),
             message_attributes: (0..attributes)
-                .map(|n| (format!("attribute{n}"), "value雪".repeat(8)))
+                .map(|n| (format!("attribute{n}"), "value雪".repeat(8).into()))
                 .collect(),
         };
         let guard = AllocationGuard::start(

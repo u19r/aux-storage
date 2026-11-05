@@ -56,6 +56,129 @@ pub trait DynamoRequestValidate {
     fn validate_for_dynamodb(&self) -> Result<(), String>;
 }
 
+fn validate_condition_sources(
+    condition_expression: Option<&str>,
+    expected: Option<&std::collections::HashMap<String, crate::ExpectedAttributeValue>>,
+) -> Result<(), String> {
+    if condition_expression.is_some() && expected.is_some() {
+        return Err(
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {Expected}, Expression parameters: {ConditionExpression}"
+                .to_string(),
+        );
+    }
+    if expected.is_some() {
+        return Err("Expected is not supported; use ConditionExpression".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_select(
+    select: Option<&str>,
+    has_index: bool,
+    has_projection: bool,
+) -> Result<(), String> {
+    match select {
+        None => Ok(()),
+        Some("ALL_ATTRIBUTES" | "COUNT") => {
+            if has_projection {
+                return Err(format!(
+                    "Select {} cannot be used with ProjectionExpression or AttributesToGet",
+                    select.unwrap_or_default()
+                ));
+            }
+            Ok(())
+        }
+        Some("ALL_PROJECTED_ATTRIBUTES") => {
+            if !has_index {
+                return Err(
+                    "Select ALL_PROJECTED_ATTRIBUTES is only valid for an index".to_string()
+                );
+            }
+            if has_projection {
+                return Err("Select ALL_PROJECTED_ATTRIBUTES cannot be used with \
+                            ProjectionExpression or AttributesToGet"
+                    .to_string());
+            }
+            Ok(())
+        }
+        Some("SPECIFIC_ATTRIBUTES") => {
+            if !has_projection {
+                return Err(
+                    "Select SPECIFIC_ATTRIBUTES requires ProjectionExpression or AttributesToGet"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        Some(value) => Err(format!("Invalid Select value: {value}")),
+    }
+}
+
+pub(super) fn validate_index_key_schema(
+    key_schema: &[crate::KeySchemaElement],
+    definitions: &[crate::AttributeDefinition],
+    label: &str,
+) -> Result<(), String> {
+    validate_key_schema_shape(key_schema, label)?;
+    for key in key_schema {
+        if !definitions
+            .iter()
+            .any(|definition| definition.attribute_name == key.attribute_name)
+        {
+            return Err(format!(
+                "Key attribute '{}' not found in AttributeDefinitions",
+                key.attribute_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_key_schema_shape(
+    key_schema: &[crate::KeySchemaElement],
+    label: &str,
+) -> Result<(), String> {
+    if key_schema.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if key_schema.len() > 2 {
+        return Err(format!("{label} cannot have more than 2 elements"));
+    }
+    match key_schema
+        .iter()
+        .filter(|key| key.key_type == KeyType::Hash)
+        .count()
+    {
+        0 => return Err(format!("{label} must have a HASH key")),
+        1 => {}
+        _ => return Err(format!("{label} can only have one HASH key")),
+    }
+    if let [first, second] = key_schema
+        && first.attribute_name == second.attribute_name
+    {
+        return Err(format!("{label} has duplicate attributes"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_attribute_definitions(
+    definitions: &[crate::AttributeDefinition],
+) -> Result<(), String> {
+    for (index, definition) in definitions.iter().enumerate() {
+        if definitions[..index]
+            .iter()
+            .any(|previous| previous.attribute_name == definition.attribute_name)
+        {
+            return Err(format!(
+                "Duplicate AttributeDefinitions entry for '{}'",
+                definition.attribute_name
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl DynamoRequestValidate for PutItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
@@ -97,6 +220,7 @@ impl PutItemRequest {
         )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
+        validate_condition_sources(self.condition_expression.as_deref(), self.expected.as_ref())?;
         validate_expression_set(
             [(
                 self.condition_expression.as_deref(),
@@ -150,6 +274,7 @@ impl DynamoRequestValidate for DeleteItemRequest {
         )?;
         validate_expression_attribute_name_keys(self.expression_attribute_names.as_ref(), true)?;
         validate_expression_attribute_value_keys(self.expression_attribute_values.as_ref(), true)?;
+        validate_condition_sources(self.condition_expression.as_deref(), self.expected.as_ref())?;
         validate_expression_set(
             [(
                 self.condition_expression.as_deref(),
@@ -166,6 +291,14 @@ impl DynamoRequestValidate for UpdateItemRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
         validate_key_not_empty(&self.key)?;
+        if self.update_expression.is_some() && self.attribute_updates.is_some() {
+            return Err(
+                "Can not use both expression and non-expression parameters in the same request: \
+                 Non-expression parameters: {AttributeUpdates}, Expression parameters: \
+                 {UpdateExpression}"
+                    .to_string(),
+            );
+        }
         if self
             .update_expression
             .as_ref()
@@ -173,6 +306,7 @@ impl DynamoRequestValidate for UpdateItemRequest {
         {
             return Err("UpdateExpression cannot be empty".to_string());
         }
+        validate_condition_sources(self.condition_expression.as_deref(), self.expected.as_ref())?;
         validate_return_item_collection_metrics(
             self.return_item_collection_metrics.as_deref(),
             true,
@@ -289,6 +423,11 @@ impl DynamoRequestValidate for QueryRequest {
             self.projection_expression.as_deref(),
             self.expression_attribute_names.as_ref(),
             self.expression_attribute_values.as_ref(),
+        )?;
+        validate_select(
+            self.select.as_deref(),
+            self.index_name.is_some(),
+            self.projection_expression.is_some() || self.attributes_to_get.is_some(),
         )
     }
 }
@@ -494,6 +633,7 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
         if request.attribute_definitions.is_empty() {
             return Err("AttributeDefinitions cannot be empty".to_string());
         }
+        validate_attribute_definitions(&request.attribute_definitions)?;
 
         for ad in &request.attribute_definitions {
             validate_attribute_name(&ad.attribute_name, || {
@@ -511,50 +651,11 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
             }
         }
 
-        if request.key_schema.is_empty() {
-            return Err("KeySchema cannot be empty".to_string());
-        }
-
-        if request.key_schema.len() > 2 {
-            return Err("KeySchema cannot have more than 2 elements".to_string());
-        }
-
-        let mut has_hash_key = false;
-        let mut has_range_key = false;
-
-        for key_element in &request.key_schema {
-            match key_element.key_type {
-                KeyType::Hash => {
-                    if has_hash_key {
-                        return Err("KeySchema can only have one HASH key".to_string());
-                    }
-                    has_hash_key = true;
-                }
-                KeyType::Range => {
-                    if has_range_key {
-                        return Err("KeySchema can only have one RANGE key".to_string());
-                    }
-                    has_range_key = true;
-                }
-            }
-        }
-
-        if !has_hash_key {
-            return Err("KeySchema must have a HASH key".to_string());
-        }
-
-        for key_element in &request.key_schema {
-            if !request
-                .attribute_definitions
-                .iter()
-                .any(|attr| attr.attribute_name == key_element.attribute_name)
-            {
-                return Err(format!(
-                    "Key attribute '{}' not found in AttributeDefinitions",
-                    key_element.attribute_name
-                ));
-            }
-        }
+        validate_index_key_schema(
+            &request.key_schema,
+            &request.attribute_definitions,
+            "KeySchema",
+        )?;
 
         if let Some(gsi) = &request.global_secondary_indexes
             && gsi.len() > 20
@@ -564,6 +665,11 @@ impl TryFrom<serde_json::Value> for CreateTableRequest {
         if let Some(gsis) = &request.global_secondary_indexes {
             for gsi in gsis {
                 validate_index_name(&gsi.index_name, "IndexName")?;
+                validate_index_key_schema(
+                    &gsi.key_schema,
+                    &request.attribute_definitions,
+                    "GSI KeySchema",
+                )?;
                 for key in &gsi.key_schema {
                     validate_attribute_name(&key.attribute_name, || {
                         "GSI KeySchema AttributeName".into()
@@ -706,6 +812,14 @@ impl TryFrom<serde_json::Value> for ScanRequest {
 impl DynamoRequestValidate for ScanRequest {
     fn validate_for_dynamodb(&self) -> Result<(), String> {
         validate_table_name(&self.table_name)?;
+        if self.segment.is_some() || self.total_segments.is_some() {
+            return Err("Parallel Scan is not supported".to_string());
+        }
+        validate_select(
+            self.select.as_deref(),
+            self.index_name.is_some(),
+            self.projection_expression.is_some() || self.attributes_to_get.is_some(),
+        )?;
 
         if let Some(filter_expr) = &self.filter_expression
             && (filter_expr.trim().is_empty() || filter_expr == "invalid filter")

@@ -24,6 +24,7 @@ fn given_history_envelope_when_only_metadata_is_loaded_then_payload_is_unneeded_
             source_scope: SystemStreamScope::try_new("test", 1).unwrap(),
             table_position: SystemStreamPosition::try_new("shard", "lineage", "2").unwrap(),
             created_at: timestamp,
+            user_identity: None,
         },
     )
     .unwrap();

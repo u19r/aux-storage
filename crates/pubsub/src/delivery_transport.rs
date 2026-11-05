@@ -159,7 +159,13 @@ impl PubsubManager {
             destination,
             request.message.into_bytes(),
         )
-        .with_attributes(request.message_attributes);
+        .with_attributes(
+            request
+                .message_attributes
+                .into_iter()
+                .map(|(name, value)| (name, value.wire_value().into_owned()))
+                .collect(),
+        );
         match sender.send_subscription_message(message).await {
             Ok(SubscriptionSendOutcome::Delivered) => {
                 self.create_delivery_outcome(claim, DeliveryStatus::Delivered, None)
@@ -200,6 +206,13 @@ impl PubsubManager {
         let Some(manager) = &self.queue_manager else {
             return self.plan_retry_outcome(claim, "queue manager is not configured");
         };
+        if subscription.raw_message_delivery && request.message_attributes.len() > 10 {
+            return self.create_delivery_outcome(
+                claim,
+                DeliveryStatus::Failed,
+                Some("raw SQS delivery supports at most ten message attributes".to_owned()),
+            );
+        }
         let message_attributes = if subscription.raw_message_delivery {
             queue_message_attributes(&request.message_attributes)
         } else {
@@ -350,7 +363,7 @@ impl PubsubManager {
 }
 
 fn queue_message_attributes(
-    attributes: &HashMap<String, String>,
+    attributes: &HashMap<String, pubsub_provider::MessageAttribute>,
 ) -> Option<HashMap<String, MessageAttributeValue>> {
     if attributes.is_empty() {
         return None;
@@ -359,12 +372,14 @@ fn queue_message_attributes(
         attributes
             .iter()
             .map(|(name, value)| {
+                let binary = matches!(value, pubsub_provider::MessageAttribute::Binary(_));
+                let data_type = value.data_type().to_owned();
                 (
                     name.clone(),
                     MessageAttributeValue {
-                        string_value: Some(value.clone()),
-                        binary_value: None,
-                        data_type: "String".to_string(),
+                        string_value: (!binary).then(|| value.wire_value().into_owned()),
+                        binary_value: binary.then(|| value.wire_value().into_owned()),
+                        data_type,
                     },
                 )
             })

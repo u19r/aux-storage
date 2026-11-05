@@ -49,7 +49,9 @@ async fn read_page_in_attempt<A: StreamAttempt>(
     prepared: PreparedSystemStreamPage,
 ) -> StorageResult<SystemStreamPage> {
     let request = &prepared.request;
-    let (history, receipt) = attempt.read_system_page_start(request.checkpoint()).await?;
+    let (history, receipt) = attempt
+        .read_system_page_start_snapshot(request.checkpoint())
+        .await?;
     history
         .validate_scope(request.source_scope())
         .map_err(contract_error)?;

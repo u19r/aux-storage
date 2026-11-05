@@ -1121,3 +1121,78 @@ fn wrong_type_is_preserved_as_wrong_type_error() {
     let error = result.unwrap_err();
     assert_eq!(error.message, "QueueName must be a string");
 }
+
+#[test]
+fn given_invalid_number_message_attribute_when_validated_then_it_is_rejected() {
+    let attribute = MessageAttributeValue {
+        string_value: Some("not-a-number".to_string()),
+        binary_value: None,
+        data_type: "Number".to_string(),
+    };
+    assert!(attribute.validate().is_err());
+}
+
+#[test]
+fn given_invalid_binary_message_attribute_when_validated_then_it_is_rejected() {
+    let attribute = MessageAttributeValue {
+        string_value: None,
+        binary_value: Some("!!!!".to_string()),
+        data_type: "Binary".to_string(),
+    };
+    assert!(attribute.validate().is_err());
+}
+
+#[test]
+fn given_valid_number_and_binary_attributes_when_validated_then_they_are_accepted() {
+    for attribute in [
+        MessageAttributeValue {
+            string_value: Some("42.5".to_string()),
+            binary_value: None,
+            data_type: "Number".to_string(),
+        },
+        MessageAttributeValue {
+            string_value: None,
+            binary_value: Some("YQ==".to_string()),
+            data_type: "Binary".to_string(),
+        },
+    ] {
+        attribute.validate().expect("valid message attribute");
+    }
+}
+
+#[test]
+fn given_invalid_attribute_type_or_value_variant_when_validated_then_request_is_rejected() {
+    for (data_type, string_value, binary_value) in [
+        ("StringGarbage", Some("value"), None),
+        ("NumberGarbage", Some("1"), None),
+        ("String", None, Some("AQID")),
+        ("Binary", Some("AQID"), None),
+    ] {
+        let attribute = MessageAttributeValue {
+            data_type: data_type.to_owned(),
+            string_value: string_value.map(str::to_owned),
+            binary_value: binary_value.map(str::to_owned),
+        };
+        assert!(attribute.validate().is_err(), "{data_type}");
+    }
+}
+
+#[test]
+fn given_sqs_number_attributes_when_validated_then_sqs_magnitude_and_precision_limits_apply() {
+    for (value, valid) in [
+        ("1e-128", true),
+        ("-1e126", true),
+        ("0", true),
+        ("1e-129", false),
+        ("1.1e126", false),
+        ("1e127", false),
+        ("123456789012345678901234567890123456789", false),
+    ] {
+        let attribute = MessageAttributeValue {
+            data_type: "Number".into(),
+            string_value: Some(value.into()),
+            binary_value: None,
+        };
+        assert_eq!(attribute.validate().is_ok(), valid, "{value}");
+    }
+}

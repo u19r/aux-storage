@@ -1022,3 +1022,26 @@ fn table_frontier_fixture(
         }],
     }
 }
+
+#[test]
+fn given_ttl_stream_record_when_serialized_then_identity_uses_aws_top_level_shape() {
+    let record: crate::DynamoDbStreamsRecord = serde_json::from_value(serde_json::json!({
+        "eventID": "1", "eventName": "REMOVE", "eventVersion": "1.0",
+        "eventSource": "aws:dynamodb", "awsRegion": "us-east-1", "eventSourceARN": "arn:test",
+        "userIdentity": {"type": "Service", "principalId": "dynamodb.amazonaws.com"},
+        "dynamodb": {"Keys": {"pk": {"S": "a"}}, "SequenceNumber": "1",
+                     "StreamViewType": "KEYS_ONLY", "SizeBytes": 1}
+    }))
+    .unwrap();
+    assert_eq!(
+        record.user_identity,
+        Some(crate::StreamUserIdentity::service_ttl())
+    );
+    let wire = serde_json::to_value(record).unwrap();
+    assert_eq!(wire["userIdentity"]["type"], "Service");
+    assert_eq!(
+        wire["userIdentity"]["principalId"],
+        "dynamodb.amazonaws.com"
+    );
+    assert!(wire["dynamodb"].get("UserIdentity").is_none());
+}

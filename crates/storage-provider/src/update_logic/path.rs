@@ -50,6 +50,11 @@ fn resolve_path_aliases(
                 "Attribute name {placeholder} not found in ExpressionAttributeNames"
             ))
         })?;
+        if value.contains(['.', '[', ']']) {
+            return Err(StorageError::validation(
+                "UpdateExpression aliases containing document-path punctuation are not supported",
+            ));
+        }
         resolved.push_str(value);
     }
     Ok(resolved)

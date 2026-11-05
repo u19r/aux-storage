@@ -34,8 +34,11 @@ where for<'native> P::Attempt<'native>: StreamRetentionPort
         &self,
         wave: super::StreamRetentionWave,
     ) -> StorageResult<super::StreamDurationTrimStats> {
-        self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
-            Box::pin(async move { wave.execute(attempt).await })
+        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
+            let wave = wave.clone();
+            self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
+                Box::pin(async move { wave.execute(attempt).await })
+            })
         })
         .await
     }
@@ -44,10 +47,12 @@ where for<'native> P::Attempt<'native>: StreamRetentionPort
         due_before: TimestampMillis,
         limit: usize,
     ) -> StorageResult<Vec<StreamTrimDueMarker>> {
-        self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(StreamRetentionPort::list_due_stream_trim_markers(
-                attempt, due_before, limit,
-            ))
+        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
+            self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+                Box::pin(StreamRetentionPort::list_due_stream_trim_markers(
+                    attempt, due_before, limit,
+                ))
+            })
         })
         .await
     }
@@ -55,11 +60,13 @@ where for<'native> P::Attempt<'native>: StreamRetentionPort
         &self,
         scopes: &[StreamTrimScope],
     ) -> StorageResult<Vec<Option<StreamTrimState>>> {
-        let scopes = scopes.to_vec();
-        self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(
-                async move { StreamRetentionPort::load_stream_trim_states(attempt, &scopes).await },
-            )
+        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
+            let scopes = scopes.to_vec();
+            self.with_dynamo_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+                Box::pin(async move {
+                    StreamRetentionPort::load_stream_trim_states(attempt, &scopes).await
+                })
+            })
         })
         .await
     }

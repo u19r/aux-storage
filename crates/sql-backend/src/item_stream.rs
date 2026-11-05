@@ -98,12 +98,9 @@ impl<A: SqlAttempt, L: SqlLayout> DynamoStreamWriteAttempt for SqlCatalogAttempt
                 },
             )?;
             catalog.prepared_writes = Ok(prepared);
-            catalog.append_dynamo_statements(
-                SqlDynamoWriteKind::Gsi,
-                statements
-                    .into_iter()
-                    .map(|statement| (statement, SqlDynamoCount::ExactlyOne)),
-            )?;
+            for statement in statements {
+                catalog.stage_gsi_upsert(statement)?;
+            }
             Ok(())
         }
         .await;

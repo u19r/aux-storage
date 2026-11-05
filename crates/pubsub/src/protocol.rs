@@ -166,12 +166,24 @@ pub fn decode_query_request(body: &[u8]) -> PubsubResult<PubsubAction> {
                 next_token: fields.remove("NextToken"),
             },
         )),
-        "Publish" => Ok(PubsubAction::Publish(PublishRequest {
-            topic_arn: TopicArn::new(required(&mut fields, "TopicArn")?)?,
-            message: required(&mut fields, "Message")?,
-            subject: fields.remove("Subject"),
-            message_attributes: decode_message_attributes(fields),
-        })),
+        "Publish" => {
+            let message = required(&mut fields, "Message")?;
+            if fields.remove("MessageStructure").is_some() {
+                return Err(PubsubError::validation_with_detail(
+                    PubsubValidationKind::UnsupportedAttribute,
+                    "MessageStructure",
+                ));
+            }
+            let topic_arn = TopicArn::new(required(&mut fields, "TopicArn")?)?;
+            let subject = fields.remove("Subject");
+            let message_attributes = decode_message_attributes(fields)?;
+            Ok(PubsubAction::Publish(PublishRequest {
+                topic_arn,
+                message,
+                subject,
+                message_attributes,
+            }))
+        }
         _ => Err(PubsubError::validation_with_detail(
             PubsubValidationKind::UnsupportedAttribute,
             action,
@@ -342,33 +354,59 @@ fn decode_entry_map(fields: BTreeMap<String, String>, prefix: &str) -> HashMap<S
         .collect()
 }
 
-fn decode_message_attributes(fields: BTreeMap<String, String>) -> HashMap<String, String> {
-    let mut names: BTreeMap<usize, String> = BTreeMap::new();
-    let mut values: BTreeMap<usize, String> = BTreeMap::new();
+#[derive(Default)]
+struct MessageAttributeFields {
+    name: Option<String>,
+    data_type: Option<String>,
+    string_value: Option<String>,
+    binary_value: Option<String>,
+}
+
+impl MessageAttributeFields {
+    fn decode(self) -> PubsubResult<(String, pubsub_provider::MessageAttribute)> {
+        let invalid = || PubsubError::validation(PubsubValidationKind::InvalidMessageAttribute);
+        let name = self.name.ok_or_else(invalid)?;
+        let data_type = self.data_type.ok_or_else(invalid)?;
+        let value = match (data_type.as_str(), self.string_value, self.binary_value) {
+            ("Binary", None, Some(value)) => value,
+            ("String" | "String.Array" | "Number", Some(value), None) => value,
+            _ => return Err(invalid()),
+        };
+        Ok((
+            name,
+            pubsub_provider::MessageAttribute::try_from_wire(&data_type, value)?,
+        ))
+    }
+}
+
+fn decode_message_attributes(
+    fields: BTreeMap<String, String>,
+) -> PubsubResult<HashMap<String, pubsub_provider::MessageAttribute>> {
+    let invalid = || PubsubError::validation(PubsubValidationKind::InvalidMessageAttribute);
+    let mut entries = BTreeMap::<usize, MessageAttributeFields>::new();
     for (field, value) in fields {
         let Some(rest) = field.strip_prefix("MessageAttributes.entry.") else {
             continue;
         };
-        let Some((index, part)) = rest.split_once('.') else {
-            continue;
-        };
-        let Ok(index) = index.parse::<usize>() else {
-            continue;
-        };
+        let (index, part) = rest.split_once('.').ok_or_else(invalid)?;
+        let index = index.parse::<usize>().map_err(|_| invalid())?;
+        let entry = entries.entry(index).or_default();
         match part {
-            "Name" => {
-                names.insert(index, value);
-            }
-            "Value.StringValue" => {
-                values.insert(index, value);
-            }
-            _ => {}
+            "Name" => entry.name = Some(value),
+            "Value.DataType" => entry.data_type = Some(value),
+            "Value.StringValue" => entry.string_value = Some(value),
+            "Value.BinaryValue" => entry.binary_value = Some(value),
+            _ => return Err(invalid()),
         }
     }
-    names
-        .into_iter()
-        .filter_map(|(index, name)| Some((name, values.remove(&index)?)))
-        .collect()
+    let mut attributes = HashMap::new();
+    for entry in entries.into_values() {
+        let (name, value) = entry.decode()?;
+        if attributes.insert(name, value).is_some() {
+            return Err(invalid());
+        }
+    }
+    Ok(attributes)
 }
 
 fn escape(value: &str) -> String {

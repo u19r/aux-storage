@@ -31,6 +31,7 @@ impl PreparedGsiPut {
         item: &WireItem,
         indexers: &storage_types::IndexerDeclaration,
     ) -> StorageResult<Self> {
+        super::projection::validate_gsi_key_values(table, item)?;
         let indexes = table
             .global_secondary_indexes
             .as_deref()

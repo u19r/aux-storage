@@ -14,3 +14,8 @@ pub(crate) const PUBSUB_SNAPSHOT_CHUNK_SIZE: usize = 10;
 pub(crate) const PUBSUB_CLAIM_BATCH_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(32 - 1);
 pub(crate) const PUBSUB_WRITE_RETRY: WriteRetryPolicy =
     WriteRetryPolicy::new(5, Duration::from_millis(2));
+
+pub(crate) const SNS_DEFAULT_MAX_MESSAGE_SIZE_BYTES: usize = 256 * 1024;
+pub(crate) const SNS_SUBJECT_CHARACTER_LIMIT: usize = 100;
+
+pub(crate) const SNS_MAX_ATTRIBUTE_NAME_BYTES: usize = 256;

@@ -130,7 +130,8 @@ async fn given_large_snapshots_when_response_byte_limit_is_reached_then_checkpoi
     let outcome = AssertUnwindSafe(async {
         let table = create_stream_table(&store).await;
         let scope = store.stream_operations.system_stream_scope().await.unwrap();
-        for key in 0..12 {
+        let item_count = storage_types::STREAM_RECORDS_MAX_ENCODED_BYTES as usize / 380_000 + 2;
+        for key in 0..item_count {
             put_snapshot(
                 &store,
                 &table,
@@ -142,11 +143,11 @@ async fn given_large_snapshots_when_response_byte_limit_is_reached_then_checkpoi
         let first = store
             .stream_operations
             .get_system_stream_page(
-                SystemStreamPageRequest::try_new(scope.clone(), None, 12).unwrap(),
+                SystemStreamPageRequest::try_new(scope.clone(), None, item_count as u32).unwrap(),
             )
             .await
             .unwrap();
-        assert!(!first.records().is_empty() && first.records().len() < 12);
+        assert!(!first.records().is_empty() && first.records().len() < item_count);
         assert!(!first.terminal());
         assert!(
             serde_json::to_vec(&first.clone().into_response().unwrap())
@@ -160,13 +161,13 @@ async fn given_large_snapshots_when_response_byte_limit_is_reached_then_checkpoi
                 SystemStreamPageRequest::try_new(
                     scope.clone(),
                     Some(first.issued_checkpoint().token().clone()),
-                    12,
+                    item_count as u32,
                 )
                 .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(second.records().len(), 12 - first.records().len());
+        assert_eq!(second.records().len(), item_count - first.records().len());
         assert!(second.terminal());
         let keys = first
             .records()
@@ -181,7 +182,7 @@ async fn given_large_snapshots_when_response_byte_limit_is_reached_then_checkpoi
             .collect::<Vec<_>>();
         assert_eq!(
             keys,
-            (0..12)
+            (0..item_count)
                 .map(|key| format!("key-{key:02}"))
                 .collect::<Vec<_>>()
         );
@@ -191,7 +192,7 @@ async fn given_large_snapshots_when_response_byte_limit_is_reached_then_checkpoi
                 SystemStreamPageRequest::try_new(
                     scope,
                     Some(second.issued_checkpoint().token().clone()),
-                    12,
+                    item_count as u32,
                 )
                 .unwrap(),
             )

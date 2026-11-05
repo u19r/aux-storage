@@ -74,7 +74,7 @@ async fn given_sqlite_deliveries_when_job_runs_then_payloads_claims_and_allocati
                     subject: Some("subject雪".to_string()),
                     message_attributes: HashMap::from([(
                         "event".to_string(),
-                        "created".to_string(),
+                        "created".to_string().into(),
                     )]),
                 })
                 .await

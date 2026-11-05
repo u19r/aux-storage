@@ -135,15 +135,18 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
             Settlement::Commit => vec!["earlier", "later"],
             Settlement::Abort => vec!["later"],
         };
-        let visible = store
-            .operations
-            .get_stream_records(GetStreamRecordsRequest::table(
-                table,
-                blocked.last_evaluated_key().map(str::to_owned),
-                Some(10),
-            ))
-            .await
-            .map_err(|error| anyhow::anyhow!("settled table read: {:?}", error.as_ref()))?;
+        let request = GetStreamRecordsRequest::table(
+            table,
+            blocked.last_evaluated_key().map(str::to_owned),
+            Some(10),
+        );
+        let visible = wait_for_published_records(
+            || store.operations.get_stream_records(request.clone()),
+            expected.len(),
+            |page: &storage_types::GetStreamRecordsResponse| page.records().len(),
+        )
+        .await
+        .context("settled table read")?;
         let keys = visible
             .records()
             .iter()
@@ -158,15 +161,22 @@ async fn qualify_publication_floor(settlement: Settlement) -> anyhow::Result<()>
             keys == expected,
             "table continuation skipped or invented a settled event"
         );
-        let visible_system = store
-            .stream_operations
-            .get_system_stream_page(SystemStreamPageRequest::try_new(
-                scope,
-                Some(blocked_system.issued_checkpoint().token().clone()),
-                10,
-            )?)
-            .await
-            .context("settled system read")?;
+        let request = SystemStreamPageRequest::try_new(
+            scope,
+            Some(blocked_system.issued_checkpoint().token().clone()),
+            10,
+        )?;
+        let visible_system = wait_for_published_records(
+            || {
+                store
+                    .stream_operations
+                    .get_system_stream_page(request.clone())
+            },
+            expected.len(),
+            |page: &stream_provider::SystemStreamPage| page.records().len(),
+        )
+        .await
+        .context("settled system read")?;
         let keys = visible_system
             .records()
             .iter()
@@ -193,4 +203,28 @@ fn history_put(table: &TableName, key: &str) -> PutItemRequest {
         "TableName": table, "Item": {"pk": {"S": key}, "value": {"S": key}}
     }))
     .unwrap()
+}
+
+// PostgreSQL's safe publication floor includes unrelated cluster transactions.
+// Keep the exact original continuation until all settled fixture rows publish.
+async fn wait_for_published_records<T, F, Fut, E>(
+    mut read: F,
+    expected: usize,
+    count: impl Fn(&T) -> usize,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Ok(tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let page = read().await?;
+            if count(&page) >= expected {
+                return Ok::<_, E>(page);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??)
 }

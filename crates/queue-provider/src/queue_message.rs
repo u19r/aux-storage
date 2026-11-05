@@ -211,38 +211,28 @@ pub(crate) async fn send_messages<P: QueuePort>(
         ));
     }
     for message in &mut messages {
+        message.validate_for_send()?;
         if message.message_id == MessageId::default() {
             message.message_id = MessageId::random();
         }
     }
-    let ids = messages
-        .iter()
-        .map(|message| message.message_id)
-        .collect::<Vec<_>>();
-    let found = retry_native_conflicts(port, QUEUE_WRITE_RETRY, || {
+    retry_native_conflicts(port, QUEUE_WRITE_RETRY, || {
         let messages = messages.clone();
         let queue_url = queue_url.clone();
         port.with_queue_attempt(AttemptMode::ReadWrite, move |attempt| {
             Box::pin(async move {
                 let Some(queue) = QueueOperation::load(attempt, &queue_url).await? else {
-                    return Ok(false);
+                    return Ok(messages
+                        .into_iter()
+                        .map(|_| Err(queue_not_found(queue_url.clone())))
+                        .collect());
                 };
-                queue.send_messages(messages).await?;
-                Ok(true)
+                queue.send_messages(messages).await
             })
         })
     })
-    .await?;
-    Ok(ids
-        .into_iter()
-        .map(|id| {
-            if found {
-                Ok(id)
-            } else {
-                Err(queue_not_found(queue_url.clone()))
-            }
-        })
-        .collect())
+    .await
+    .map_err(QueueError::from)
 }
 
 pub(crate) async fn delete_message<P: QueuePort>(

@@ -124,20 +124,7 @@ pub fn evaluate_condition(item: &impl AttributeValueLookup, condition: &Conditio
             let Some(field_value) = get_path_value(item, field) else {
                 return false;
             };
-            match field_value {
-                AttributeValue::S(s) => matches!(value, AttributeValue::S(v) if s.contains(v)),
-                AttributeValue::B(b) => {
-                    let AttributeValue::B(value) = value else {
-                        return false;
-                    };
-                    decoded_binary_contains(b, value)
-                }
-                AttributeValue::SS(ss) => matches!(value, AttributeValue::S(v) if ss.contains(v)),
-                AttributeValue::NS(ns) => matches!(value, AttributeValue::N(v) if ns.contains(v)),
-                AttributeValue::BS(bs) => matches!(value, AttributeValue::B(v) if bs.contains(v)),
-                AttributeValue::L(l) => l.iter().any(|elem| elem == value),
-                _ => false,
-            }
+            contains_attribute(field_value, value)
         }
         Condition::BeginsWith { field, prefix } => {
             if let Some(field_value) = get_path_value(item, field) {
@@ -288,20 +275,7 @@ pub fn try_evaluate_condition_with_root<E>(
             let Some(field_value) = try_get_path_value(root_value, field)? else {
                 return Ok(false);
             };
-            Ok(match field_value {
-                AttributeValue::S(s) => matches!(value, AttributeValue::S(v) if s.contains(v)),
-                AttributeValue::B(b) => {
-                    let AttributeValue::B(value) = value else {
-                        return Ok(false);
-                    };
-                    decoded_binary_contains(&b, value)
-                }
-                AttributeValue::SS(ss) => matches!(value, AttributeValue::S(v) if ss.contains(v)),
-                AttributeValue::NS(ns) => matches!(value, AttributeValue::N(v) if ns.contains(v)),
-                AttributeValue::BS(bs) => matches!(value, AttributeValue::B(v) if bs.contains(v)),
-                AttributeValue::L(l) => l.iter().any(|elem| elem == value),
-                _ => false,
-            })
+            Ok(contains_attribute(&field_value, value))
         }
         Condition::BeginsWith { field, prefix } => {
             let Some(field_value) = try_get_path_value(root_value, field)? else {
@@ -534,20 +508,7 @@ fn try_evaluate_condition_with_cached_roots_inner<'c, E>(
             let Some(field_value) = try_get_path_value_cached(root_value, cache, field)? else {
                 return Ok(false);
             };
-            Ok(match field_value {
-                AttributeValue::S(s) => matches!(value, AttributeValue::S(v) if s.contains(v)),
-                AttributeValue::B(b) => {
-                    let AttributeValue::B(value) = value else {
-                        return Ok(false);
-                    };
-                    decoded_binary_contains(b, value)
-                }
-                AttributeValue::SS(ss) => matches!(value, AttributeValue::S(v) if ss.contains(v)),
-                AttributeValue::NS(ns) => matches!(value, AttributeValue::N(v) if ns.contains(v)),
-                AttributeValue::BS(bs) => matches!(value, AttributeValue::B(v) if bs.contains(v)),
-                AttributeValue::L(l) => l.iter().any(|elem| elem == value),
-                _ => false,
-            })
+            Ok(contains_attribute(field_value, value))
         }
         Condition::BeginsWith { field, prefix } => {
             let Some(field_value) = try_get_path_value_cached(root_value, cache, field)? else {
@@ -701,20 +662,64 @@ fn root_field(path: &str) -> &str {
     path.get(..root_end).unwrap_or_default()
 }
 
+fn contains_attribute(field_value: &AttributeValue, value: &AttributeValue) -> bool {
+    match field_value {
+        AttributeValue::S(s) => matches!(value, AttributeValue::S(v) if s.contains(v)),
+        AttributeValue::B(b) => {
+            let AttributeValue::B(value) = value else {
+                return false;
+            };
+            decoded_binary_contains(b, value)
+        }
+        AttributeValue::SS(ss) => matches!(value, AttributeValue::S(v) if ss.contains(v)),
+        AttributeValue::NS(ns) => matches!(value, AttributeValue::N(value)
+            if ns.iter().any(|member| compare_dynamodb_numbers(member, value).is_ok_and(Ordering::is_eq))),
+        AttributeValue::BS(bs) => matches!(value, AttributeValue::B(v) if bs.contains(v)),
+        AttributeValue::L(l) => l
+            .iter()
+            .any(|elem| dynamodb_attribute_values_equal(elem, value)),
+        _ => false,
+    }
+}
+
 fn dynamodb_attribute_values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
     match (left, right) {
         (AttributeValue::N(left), AttributeValue::N(right)) => {
             compare_dynamodb_numbers(left, right).is_ok_and(Ordering::is_eq)
         }
         (AttributeValue::SS(left), AttributeValue::SS(right))
-        | (AttributeValue::NS(left), AttributeValue::NS(right))
         | (AttributeValue::BS(left), AttributeValue::BS(right)) => string_sets_equal(left, right),
+        (AttributeValue::NS(left), AttributeValue::NS(right)) => number_sets_equal(left, right),
+        (AttributeValue::L(left), AttributeValue::L(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| dynamodb_attribute_values_equal(left, right))
+        }
+        (AttributeValue::M(left), AttributeValue::M(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(name, value)| {
+                    right
+                        .get(name)
+                        .is_some_and(|other| dynamodb_attribute_values_equal(value, other))
+                })
+        }
         _ => left == right,
     }
 }
 
 fn string_sets_equal(left: &[String], right: &[String]) -> bool {
     left.len() == right.len() && left.iter().all(|value| right.contains(value))
+}
+
+fn number_sets_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|value| {
+            right.iter().any(|candidate| {
+                compare_dynamodb_numbers(value, candidate).is_ok_and(Ordering::is_eq)
+            })
+        })
 }
 
 fn attribute_size(value: &AttributeValue) -> Option<usize> {

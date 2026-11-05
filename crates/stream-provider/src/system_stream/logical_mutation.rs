@@ -21,6 +21,7 @@ pub struct LogicalSystemStreamMutationInput<'a> {
     pub item_stream_version: ItemStreamVersion,
 
     pub created_at: TimestampMillis,
+    pub user_identity: Option<storage_types::StreamUserIdentity>,
 }
 
 /// Backend-neutral logical mutation retaining validated wire images without
@@ -37,6 +38,7 @@ pub struct LogicalSystemStreamMutation {
     pub indexers: Vec<String>,
 
     pub created_at: TimestampMillis,
+    pub user_identity: Option<storage_types::StreamUserIdentity>,
 }
 
 impl TryFrom<LogicalSystemStreamMutationInput<'_>> for LogicalSystemStreamMutation {
@@ -71,6 +73,7 @@ impl TryFrom<LogicalSystemStreamMutationInput<'_>> for LogicalSystemStreamMutati
             indexers: input.indexers.to_vec(),
 
             created_at: input.created_at,
+            user_identity: input.user_identity,
         })
     }
 }

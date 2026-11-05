@@ -351,6 +351,47 @@ fn push_unique<'a>(fields: &mut Vec<&'a str>, name: &'a str) {
     }
 }
 
+pub(super) fn validate_gsi_key_values(
+    table_info: &StoredTableInfo,
+    item: &WireItem,
+) -> StorageResult<()> {
+    for index in table_info
+        .global_secondary_indexes
+        .as_deref()
+        .unwrap_or_default()
+    {
+        if index.index_name.is_ttl_index() {
+            continue;
+        }
+        let fields = index
+            .key_schema
+            .iter()
+            .map(|key| key.attribute_name.as_str())
+            .collect::<Vec<_>>();
+        let values = item.select_attribute_values(&fields)?;
+        for (key, value) in index.key_schema.iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let expected = table_info
+                .attribute_definitions
+                .iter()
+                .find(|definition| definition.attribute_name == key.attribute_name)
+                .ok_or_else(|| {
+                    StorageError::internal("GSI key attribute has no table definition")
+                })?;
+            if !value.matches_key_type(&expected.attribute_type) {
+                return Err(StorageError::validation(format!(
+                    "Type mismatch for Index Key {} Expected: {:?} IndexName: {}",
+                    key.attribute_name, expected.attribute_type, index.index_name,
+                )));
+            }
+            storage_types::validate_key_attribute_value_for_schema(key, &value)?;
+        }
+    }
+    Ok(())
+}
+
 fn plan_gsi_index_write_actions<'a>(
     table_info: &'a StoredTableInfo,
     gsi: &'a GlobalSecondaryIndex,

@@ -301,9 +301,6 @@ impl PubsubManager {
     }
 
     pub async fn publish(&self, request: PublishRequest) -> PubsubResult<PublishResponse> {
-        if request.message.is_empty() {
-            return Err(PubsubError::validation(PubsubValidationKind::EmptyMessage));
-        }
         let message_id = PubsubMessageId::new();
         self.provider
             .accept_publish(

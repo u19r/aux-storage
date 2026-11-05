@@ -938,14 +938,19 @@ fn apply_add_operation(
             let parsed = parse_add_number(field, add_num)?;
             *existing_num = add_add_expression_with_rhs(field, existing_num, &parsed)?;
         }
-        (AttributeValue::SS(existing_set), AttributeValue::SS(add_set)) => {
-            append_unique_values(existing_set, add_set);
+        (AttributeValue::SS(existing_set), AttributeValue::SS(add_set))
+        | (AttributeValue::BS(existing_set), AttributeValue::BS(add_set)) => {
+            append_unique_values(existing_set, add_set)
         }
         (AttributeValue::NS(existing_set), AttributeValue::NS(add_set)) => {
-            append_unique_values(existing_set, add_set);
-        }
-        (AttributeValue::BS(existing_set), AttributeValue::BS(add_set)) => {
-            append_unique_values(existing_set, add_set);
+            for value in add_set {
+                if !existing_set
+                    .iter()
+                    .any(|existing| numeric_set_members_equal(existing, value))
+                {
+                    existing_set.push(value.clone());
+                }
+            }
         }
         _ => {
             return Err(update_operand_type_error());
@@ -998,16 +1003,17 @@ fn apply_delete_set_operation(
     _field: &str,
 ) -> StorageResult<bool> {
     match (existing_value, delete_value) {
-        (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set)) => {
+        (AttributeValue::SS(existing_set), AttributeValue::SS(delete_set))
+        | (AttributeValue::BS(existing_set), AttributeValue::BS(delete_set)) => {
             remove_set_members(existing_set, delete_set);
             Ok(existing_set.is_empty())
         }
         (AttributeValue::NS(existing_set), AttributeValue::NS(delete_set)) => {
-            remove_set_members(existing_set, delete_set);
-            Ok(existing_set.is_empty())
-        }
-        (AttributeValue::BS(existing_set), AttributeValue::BS(delete_set)) => {
-            remove_set_members(existing_set, delete_set);
+            existing_set.retain(|existing| {
+                !delete_set
+                    .iter()
+                    .any(|value| numeric_set_members_equal(existing, value))
+            });
             Ok(existing_set.is_empty())
         }
         _ => Err(update_operand_type_error()),
@@ -1168,4 +1174,8 @@ fn condition_attribute_values_match(
     cached_values.iter().all(|(key, value)| {
         expression_attribute_values.and_then(|values| values.get(key)) == Some(value)
     })
+}
+
+fn numeric_set_members_equal(left: &str, right: &str) -> bool {
+    storage_types::compare_dynamodb_numbers(left, right).is_ok_and(std::cmp::Ordering::is_eq)
 }

@@ -107,3 +107,9 @@ pub(crate) const SQLITE_FORMAT_HEADER_BOUND: usize = (INFRASTRUCTURE_FORMAT_COLU
 
 pub(crate) const INFRASTRUCTURE_GENERATION_BYTES: std::num::NonZeroUsize =
     std::num::NonZeroUsize::MIN.saturating_add(std::mem::size_of::<u64>() - 1);
+
+/// Keep batched writes below native parameter limits.
+pub(crate) const MULTI_ROW_WRITE_BINDS: usize = 8_000;
+
+pub(crate) const WRITE_COLUMNS: &str =
+    "item_value, __aux_revision, __aux_provenance, __aux_ttl_epoch";

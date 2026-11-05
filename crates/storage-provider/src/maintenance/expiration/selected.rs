@@ -110,6 +110,9 @@ impl ExpirationSelection {
             }
         }
         read.config.checkpoint.cursor = read.next_cursor.clone();
+        if read.next_cursor.is_none() {
+            read.config.complete_enabling_at(read.captured_at)?;
+        }
         let result = TtlSweepPageResult {
             deleted_items: u64::try_from(items.len())
                 .map_err(|_| StorageError::internal("expiration deletion count exceeds u64"))?,

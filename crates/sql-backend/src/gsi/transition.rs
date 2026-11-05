@@ -87,11 +87,14 @@ async fn transition_statements<A: SqlAttempt, L: SqlLayout>(
         .try_reserve_exact(count)
         .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
     writes.push((statement, 1..=1));
-    writes.extend(
-        projection_writes
-            .into_iter()
-            .map(|statement| (statement, 1..=1)),
-    );
+    for projection in projection_writes {
+        writes.push((
+            projection
+                .shape
+                .render(engine, &projection.relation, vec![projection.binds])?,
+            1..=1,
+        ));
+    }
     writes.extend(ttl_writes.into_iter().map(|statement| (statement, 0..=1)));
     if let Some(activation) = ttl_activation {
         writes.push((

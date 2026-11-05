@@ -22,7 +22,7 @@ fn read_sequence_checker_sums_client_metrics() {
     assert_eq!(report.ordinary_attempts, 0);
     assert_eq!(report.mapped_attempts, 0);
     assert_eq!(report.mapped_selected, 0);
-    assert_eq!(report.mapped_fallbacks, 0);
+    assert_eq!(report.continuation_pages, 0);
     assert_eq!(report.mismatches, 0);
     assert_eq!(report.errors, 0);
 }
@@ -37,8 +37,8 @@ fn read_sequence_checker_accepts_retried_ordinary_attempts() {
             oracle_checks: ordinary_attempts,
             ordinary_attempts,
             mapped_attempts,
-            mapped_selected: mapped_attempts,
-            mapped_fallbacks: 0,
+            mapped_selected: 16,
+            continuation_pages: 2,
             mismatches: 0,
             errors: 0,
         };
@@ -56,10 +56,54 @@ fn read_sequence_checker_rejects_unaccounted_mapped_outcome() {
         ordinary_attempts: 1,
         mapped_attempts: 1,
         mapped_selected: 0,
-        mapped_fallbacks: 0,
+        continuation_pages: 2,
         mismatches: 0,
         errors: 0,
     };
     let error = validate_read_sequence_report(&report).expect_err("missing mapped outcome");
     assert!(error.contains("mapped outcomes"));
+}
+
+#[test]
+fn given_continuation_metrics_when_parsed_then_actual_pages_are_counted() {
+    let report = parse_read_sequence_metrics(
+        "Metric (0, 8): External.aux_storage_read_sequence_dag_continuation_pages, 2.000000, \
+         2\nMetric (1, 8): External.aux_storage_read_sequence_dag_continuation_pages, 3.000000, 3",
+    )
+    .unwrap();
+    assert_eq!(report.continuation_pages, 5);
+}
+
+#[test]
+fn given_completed_fixture_without_continuations_when_checked_then_coverage_failure_is_reported() {
+    let report = ReadSequenceDagCheckReport {
+        attempts: 2,
+        published: 2,
+        ordinary_attempts: 2,
+        oracle_checks: 2,
+        mapped_attempts: 2,
+        mapped_selected: 2,
+        ..Default::default()
+    };
+    let error = validate_read_sequence_report(&report).unwrap_err();
+    assert!(error.contains("did not exercise public continuation"));
+}
+
+#[test]
+fn given_missing_ordinary_execution_when_checked_then_mapped_bounds_reject_the_report() {
+    let report = ReadSequenceDagCheckReport {
+        attempts: 2,
+        published: 2,
+        ordinary_attempts: 1,
+        oracle_checks: 1,
+        mapped_attempts: 2,
+        mapped_selected: 2,
+        continuation_pages: 1,
+        ..Default::default()
+    };
+    assert!(
+        validate_read_sequence_report(&report)
+            .unwrap_err()
+            .contains("cannot exceed ordinary attempts")
+    );
 }

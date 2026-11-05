@@ -136,6 +136,7 @@ impl AcceptedUpsert {
             indexers: self.declaration.names(),
             item_stream_version: storage_types::ItemStreamVersion::new(revision.get()),
             created_at,
+            user_identity: None,
         })?;
         let publication = attempt.reserve_stream_position(route.routing_key()).await?;
         attempt
@@ -168,6 +169,7 @@ impl AcceptedDeleteItem {
             indexers: &[],
             item_stream_version: storage_types::ItemStreamVersion::new(revision.get()),
             created_at,
+            user_identity: self.user_identity.clone(),
         })?;
         let publication = attempt.reserve_stream_position(route.routing_key()).await?;
         attempt

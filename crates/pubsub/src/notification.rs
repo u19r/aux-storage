@@ -234,7 +234,7 @@ fn sign(
 
 fn append_message_attributes(
     body: &mut String,
-    message_attributes: &HashMap<String, String>,
+    message_attributes: &HashMap<String, pubsub_provider::MessageAttribute>,
 ) -> PubsubResult<()> {
     let attributes: BTreeMap<_, _> = message_attributes.iter().collect();
     for (index, (name, value)) in attributes.iter().enumerate() {
@@ -245,8 +245,11 @@ fn append_message_attributes(
         };
         body.push_str("    ");
         append_json_string(body, name)?;
-        body.push_str(" : {\"Type\":\"String\",\"Value\":");
-        append_json_string(body, value)?;
+        let data_type = value.data_type();
+        body.push_str(" : {\"Type\":");
+        append_json_string(body, data_type)?;
+        body.push_str(",\"Value\":");
+        append_json_string(body, &value.wire_value())?;
         body.push('}');
         body.push_str(trailing_comma);
         body.push('\n');
@@ -411,13 +414,15 @@ fn confirmation_body_capacity(
         + signing_cert_url.len()
 }
 
-fn message_attributes_capacity(message_attributes: &HashMap<String, String>) -> usize {
+fn message_attributes_capacity(
+    message_attributes: &HashMap<String, pubsub_provider::MessageAttribute>,
+) -> usize {
     if message_attributes.is_empty() {
         return 0;
     }
     32 + message_attributes
         .iter()
-        .map(|(name, value)| 42 + name.len() + value.len())
+        .map(|(name, value)| 42 + name.len() + value.byte_len())
         .sum::<usize>()
 }
 

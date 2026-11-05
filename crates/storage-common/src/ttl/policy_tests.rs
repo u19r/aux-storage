@@ -75,3 +75,30 @@ fn given_exhausted_policy_epoch_when_reenabled_then_transition_fails_closed() {
         .is_err()
     );
 }
+
+#[test]
+fn given_enabling_policy_when_sweep_completes_then_policy_becomes_enabled() {
+    let TtlPolicyChange::Enable(mut config) = change(true, None) else {
+        panic!("enable");
+    };
+    assert_eq!(config.status, TimeToLiveStatus::Enabling);
+
+    config
+        .complete_enabling_at(TimestampMillis::from_timestamp(2000))
+        .unwrap();
+
+    assert_eq!(config.status, TimeToLiveStatus::Enabled);
+    assert_eq!(
+        config.updated_at,
+        TimestampMillis::from_timestamp(2000),
+        "completion must publish the sweep timestamp"
+    );
+    config
+        .complete_enabling_at(TimestampMillis::from_timestamp(3000))
+        .unwrap();
+    assert_eq!(
+        config.updated_at,
+        TimestampMillis::from_timestamp(2000),
+        "an already-enabled policy is unchanged"
+    );
+}

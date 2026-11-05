@@ -25,6 +25,7 @@ mod gsi_reclaim_sql_statements;
 pub mod infrastructure;
 mod item_delete;
 mod item_lock;
+mod item_observation;
 mod item_read;
 pub mod item_schema;
 mod item_stream;
@@ -99,6 +100,7 @@ mod item_read_tests;
 #[cfg(test)]
 mod test_support;
 
+mod write_batch;
 mod write_preparation;
 
 #[cfg(all(test, feature = "sqlite", feature = "fault-injection"))]
@@ -107,3 +109,6 @@ mod expiration_identity_tests;
 mod item_lock_tests;
 #[cfg(test)]
 mod item_schema_tests;
+
+#[cfg(test)]
+mod write_batch_tests;

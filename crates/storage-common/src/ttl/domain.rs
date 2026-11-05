@@ -392,6 +392,23 @@ impl TtlConfigRecord {
         Ok(())
     }
 
+    /// A completed direct sweep promotes an enabling table policy to enabled.
+    /// The caller persists this record in the same native attempt that removed
+    /// the final expired index entry.
+    pub fn complete_enabling_at(&mut self, now: TimestampMillis) -> StorageResult<()> {
+        if self.status != TimeToLiveStatus::Enabling {
+            return Ok(());
+        }
+        if now < self.updated_at {
+            return Err(StorageError::internal(
+                "ttl activation time precedes the current policy",
+            ));
+        }
+        self.status = TimeToLiveStatus::Enabled;
+        self.updated_at = now;
+        Ok(())
+    }
+
     pub fn touch(&mut self) {
         self.touch_at(TimestampMillis::now());
     }

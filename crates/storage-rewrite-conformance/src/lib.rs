@@ -1018,3 +1018,18 @@ mod table_stream_fault_tests;
 
 #[cfg(all(test, feature = "sqlite"))]
 mod scheduled_job_process_tests;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "sqlite",
+        feature = "turso",
+        feature = "postgres",
+        feature = "rocksdb",
+        feature = "foundationdb"
+    )
+))]
+mod item_write_key_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+mod sql_item_write_concurrency_tests;

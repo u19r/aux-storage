@@ -291,7 +291,10 @@ async fn given_manager_when_custom_sender_then_extra_json_preserved() -> anyhow:
                 topic_arn: topic.topic_arn,
                 message: "created".to_string(),
                 subject: Some("order".to_string()),
-                message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+                message_attributes: HashMap::from([(
+                    "event".to_string(),
+                    "created".to_string().into(),
+                )]),
             })
             .await
             .map_err(|err| anyhow::anyhow!("publish failed: {err:?}"))?;
@@ -362,7 +365,10 @@ async fn given_manager_when_queue_delivery_then_notification_persisted() -> anyh
                 topic_arn: topic.topic_arn.clone(),
                 message: "created".to_string(),
                 subject: Some("order".to_string()),
-                message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+                message_attributes: HashMap::from([(
+                    "event".to_string(),
+                    "created".to_string().into(),
+                )]),
             })
             .await
             .map_err(|err| anyhow::anyhow!("publish failed: {err:?}"))?;
@@ -400,4 +406,129 @@ async fn given_manager_when_queue_delivery_then_notification_persisted() -> anyh
     .await;
     fixture.finish().await;
     outcome
+}
+
+#[tokio::test]
+async fn given_receive_attribute_prefix_when_projected_then_names_and_digest_match()
+-> anyhow::Result<()> {
+    let fixture = TestStore::new().await;
+    fixture.use_system_time();
+    let result = async {
+        let manager = queue::QueueManager::new(fixture.queue_operations.clone());
+        let url = manager
+            .create_queue(queue_provider::CreateQueueRequest {
+                queue_name: "receive-projection".to_owned(),
+                attributes: None,
+            })
+            .await?
+            .queue_url;
+        let attributes = ["bar.one", "barley", "other"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    queue_provider::MessageAttributeValue {
+                        data_type: "String".to_owned(),
+                        string_value: Some(name.to_owned()),
+                        binary_value: None,
+                    },
+                )
+            })
+            .collect();
+        manager
+            .send_message(queue_provider::SendMessageRequest {
+                queue_url: url.clone(),
+                message_body: "body".to_owned(),
+                delay_seconds: None,
+                message_attributes: Some(attributes),
+            })
+            .await?;
+        let request: queue_provider::ReceiveMessageRequest =
+            serde_json::from_value(serde_json::json!({
+                "QueueUrl": url, "MessageSystemAttributeNames": ["SentTimestamp"],
+                "MessageAttributeNames": ["bar.*"], "VisibilityTimeout": 0,
+            }))?;
+        let response = manager.receive_message(request).await?;
+        let message = &response.messages[0];
+        let projected = message.message_attributes.as_ref().unwrap();
+        anyhow::ensure!(projected.len() == 1 && projected.contains_key("bar.one"));
+        anyhow::ensure!(
+            message.md5_of_message_attributes
+                == queue_provider::md5_of_message_attributes(projected)
+        );
+        let system = message.attributes.as_ref().unwrap();
+        anyhow::ensure!(system.len() == 1 && system.contains_key("SentTimestamp"));
+        let request: queue_provider::ReceiveMessageRequest =
+            serde_json::from_value(serde_json::json!({
+                "QueueUrl": url, "MessageAttributeNames": [".*"], "VisibilityTimeout": 0,
+            }))?;
+        let response = manager.receive_message(request).await?;
+        anyhow::ensure!(
+            response.messages[0]
+                .message_attributes
+                .as_ref()
+                .unwrap()
+                .len()
+                == 3
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}
+
+#[tokio::test]
+async fn given_mixed_queue_size_batch_when_sent_then_valid_entry_succeeds_and_oversize_entry_fails()
+-> anyhow::Result<()> {
+    let fixture = TestStore::new().await;
+    fixture.use_system_time();
+    let result = async {
+        let manager = queue::QueueManager::new(fixture.queue_operations.clone());
+        let url = manager
+            .create_queue(queue_provider::CreateQueueRequest {
+                queue_name: "mixed-size-batch".to_owned(),
+                attributes: Some(HashMap::from([(
+                    "MaximumMessageSize".to_owned(),
+                    "1024".to_owned(),
+                )])),
+            })
+            .await?
+            .queue_url;
+        let entry = |id: &str, body: String| queue_provider::SendMessageBatchRequestEntry {
+            id: id.to_owned(),
+            message_body: body,
+            delay_seconds: None,
+            message_attributes: None,
+        };
+        let response = manager
+            .send_message_batch(queue_provider::SendMessageBatchRequest {
+                queue_url: url.clone(),
+                entries: vec![
+                    entry("good", "body".into()),
+                    entry("oversize", "x".repeat(1025)),
+                ],
+            })
+            .await?;
+        anyhow::ensure!(response.successful.len() == 1 && response.successful[0].id == "good");
+        anyhow::ensure!(response.failed.len() == 1 && response.failed[0].id == "oversize");
+        anyhow::ensure!(
+            response.failed[0].sender_fault && response.failed[0].code == "InvalidParameterValue"
+        );
+        let response = manager
+            .receive_message(queue_provider::ReceiveMessageRequest {
+                queue_url: url,
+                max_number_of_messages: Some(10),
+                visibility_timeout: None,
+                wait_time_seconds: Some(0),
+                attribute_names: None,
+                message_attribute_names: None,
+            })
+            .await?;
+        anyhow::ensure!(response.messages.len() == 1 && response.messages[0].body == "body");
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
 }

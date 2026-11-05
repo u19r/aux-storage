@@ -6,14 +6,17 @@ use storage_provider::{
     AcceptedUpsert, BoundPutItem, ItemPrimaryEffects, PreparedWriteAttempt, UpsertImage,
 };
 use storage_types::{
-    AttributeName, AttributeValue, KeyAttributeType, KeyAttributes, KeySchemaElement, StorageError,
-    StorageResult, TableHistoryId, planned_key_columns,
+    AttributeName, AttributeValue, BoundTableInfo, KeyAttributeType, KeyAttributes,
+    KeySchemaElement, StorageError, StorageResult, TableHistoryId, planned_key_columns,
 };
 
 use crate::{
-    SqlAttempt, SqlEngine, SqlLayout, SqlStatement, SqlValue, catalog::SqlCatalogAttempt,
-    gsi::PreparedGsiWrite, item_read::encode_key_value,
+    SqlAttempt, SqlEngine, SqlLayout, SqlStatement, SqlValue,
+    catalog::SqlCatalogAttempt,
+    gsi::PreparedGsiWrite,
+    item_read::encode_key_value,
     item_tombstone::sql_statements::delete_tombstone_statement,
+    write_batch::{DeleteShape, PreparedDeleteRow, PreparedUpsertRow, UpsertShape},
 };
 
 #[derive(Default)]
@@ -80,7 +83,9 @@ impl<A: SqlAttempt, L: SqlLayout> PreparedWriteAttempt for SqlCatalogAttempt<'_,
 pub(crate) struct PreparedPrimaryWrite {
     history_id: TableHistoryId,
     key: KeyAttributes,
-    statement: SqlStatement,
+    relation: String,
+    shape: UpsertShape,
+    binds: Vec<SqlValue>,
     revision_bind: usize,
     tombstone: SqlStatement,
     image: Vec<u8>,
@@ -96,11 +101,13 @@ impl PreparedPrimaryWrite {
         let history_id = item.table.history_id;
         let key = item.key.clone();
         let tombstone = delete_tombstone_statement(engine, item.table, item.key)?;
-        let (statement, revision_bind) = encode_primary_upsert(engine, item)?;
+        let (relation, shape, binds, revision_bind) = encode_primary_upsert(engine, item)?;
         Ok(Self {
             history_id,
             key,
-            statement,
+            relation,
+            shape,
+            binds,
             revision_bind,
             tombstone,
             image,
@@ -114,9 +121,9 @@ impl PreparedPrimaryWrite {
     pub(crate) fn prepare(
         self,
         effects: &ItemPrimaryEffects,
-    ) -> StorageResult<(SqlStatement, SqlStatement)> {
+    ) -> StorageResult<(PreparedUpsertRow, SqlStatement)> {
         let image = self.image;
-        let (sql, mut binds) = self.statement.into_parts();
+        let mut binds = self.binds;
         binds[self.revision_bind + 4] = SqlValue::Blob(image);
         binds[self.revision_bind] = SqlValue::Integer(i64::try_from(effects.revision())?);
         binds[self.revision_bind + 1] = SqlValue::try_from(crate::row_view::SqlValueRef::Blob(
@@ -125,14 +132,21 @@ impl PreparedPrimaryWrite {
         binds[self.revision_bind + 2] = effects
             .ttl_epoch()
             .map_or(SqlValue::Null, SqlValue::Integer);
-        Ok((SqlStatement::new(sql, binds), self.tombstone))
+        Ok((
+            PreparedUpsertRow {
+                relation: self.relation,
+                shape: self.shape,
+                binds,
+            },
+            self.tombstone,
+        ))
     }
 }
 
 fn encode_primary_upsert(
     engine: impl SqlLayout,
     item: storage_provider::UpsertImage<'_>,
-) -> StorageResult<(SqlStatement, usize)> {
+) -> StorageResult<(String, UpsertShape, Vec<SqlValue>, usize)> {
     let table = &item.table.info;
     let schemas = table
         .global_secondary_indexes
@@ -169,7 +183,49 @@ fn encode_primary_upsert(
     }
     row.append_item_payload(&item, &attributes)?;
     let physical = engine.item_table_name(item.table.history_id);
-    Ok((row.finish(&physical, &table.key_schema)?, revision_bind))
+    let (relation, shape, binds) = row.finish(engine, &physical, &table.key_schema)?;
+    Ok((relation, shape, binds, revision_bind))
+}
+
+pub(crate) fn encode_primary_delete(
+    engine: impl SqlLayout,
+    table: &BoundTableInfo,
+    key: &KeyAttributes,
+) -> StorageResult<PreparedDeleteRow> {
+    let key_elements = KeySchemaElement::ordered(&table.info.key_schema).collect::<Vec<_>>();
+    let mut columns = Vec::new();
+    let mut numeric_columns = Vec::new();
+    let mut binds = Vec::new();
+    columns
+        .try_reserve_exact(key_elements.len())
+        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+    numeric_columns
+        .try_reserve_exact(key_elements.len())
+        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+    binds
+        .try_reserve_exact(key_elements.len())
+        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+    for element in key_elements {
+        let column = AttributeName::new(&element.attribute_name);
+        columns.push(column.sanitized().to_owned());
+        let key_type = table
+            .info
+            .attribute_definitions
+            .iter()
+            .find(|definition| definition.attribute_name == element.attribute_name)
+            .map_or(KeyAttributeType::S, |definition| definition.attribute_type);
+        numeric_columns
+            .push(engine.engine() == SqlEngine::Postgres && key_type == KeyAttributeType::N);
+        let value = key
+            .get(&element.attribute_name)
+            .ok_or_else(StorageError::invalid_or_missing_key)?;
+        binds.push(encode_key_value(engine, value)?);
+    }
+    Ok(PreparedDeleteRow {
+        relation: engine.item_table_name(table.history_id),
+        shape: DeleteShape::try_new(columns, numeric_columns)?,
+        binds,
+    })
 }
 
 struct InsertRow<L: SqlLayout> {
@@ -275,32 +331,30 @@ impl<L: SqlLayout> InsertRow<L> {
 
     fn finish(
         self,
+        engine: L,
         physical: &str,
         key_schema: &[KeySchemaElement],
-    ) -> StorageResult<SqlStatement> {
-        let mut sql = crate::statement::SqlText::default();
-        sql.append(format_args!("INSERT INTO \"{physical}\" ("))?;
-        sql.append_columns(&self.columns)?;
-        sql.append(format_args!(") VALUES ("))?;
-        for (ordinal, key_type) in self.key_types.iter().enumerate() {
-            sql.append(format_args!("{}", if ordinal == 0 { "" } else { ", " }))?;
-            sql.append_parameter(
-                self.engine.engine(),
-                ordinal + 1,
-                self.engine.engine() == SqlEngine::Postgres
-                    && *key_type == Some(KeyAttributeType::N),
-            )?;
-        }
-        sql.append(format_args!(") ON CONFLICT ("))?;
-        for (ordinal, key) in KeySchemaElement::ordered(key_schema).enumerate() {
-            sql.append(format_args!(
-                "{}\"{}\"",
-                if ordinal == 0 { "" } else { ", " },
-                AttributeName::new(&key.attribute_name).sanitized()
-            ))?;
-        }
-        sql.append(format_args!(") DO UPDATE SET "))?;
-        sql.append_assignments(self.columns.iter().skip(key_schema.len()))?;
-        Ok(SqlStatement::new(sql.finish()?, self.binds))
+    ) -> StorageResult<(String, UpsertShape, Vec<SqlValue>)> {
+        let conflict_columns = KeySchemaElement::ordered(key_schema)
+            .map(|key| {
+                AttributeName::new(&key.attribute_name)
+                    .sanitized()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let numeric_columns = self
+            .key_types
+            .iter()
+            .map(|key_type| {
+                engine.engine() == SqlEngine::Postgres && *key_type == Some(KeyAttributeType::N)
+            })
+            .collect::<Vec<_>>();
+        let columns = self
+            .columns
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect::<Vec<_>>();
+        let shape = UpsertShape::try_new(columns, numeric_columns, conflict_columns, false)?;
+        Ok((physical.to_owned(), shape, self.binds))
     }
 }

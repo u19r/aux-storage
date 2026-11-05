@@ -22,6 +22,8 @@ pub trait PubsubPublishAcceptanceRepository:
         message_id: PubsubMessageId,
         custom_sender_enabled: bool,
     ) -> PubsubResult<()> {
+        let mut request = request;
+        request.validate()?;
         self.publish_acceptance_started(&message_id);
         let result = self
             .persist_publish_generation(request, message_id.clone(), custom_sender_enabled)

@@ -175,6 +175,8 @@ impl CreateTableRequest {
     }
 
     pub fn validate_for_storage(&self) -> Result<(), StorageError> {
+        crate::serde_types::validate_attribute_definitions(&self.attribute_definitions)
+            .map_err(StorageError::validation)?;
         self.validate_key_schema()?;
         if let Some(global_secondary_indexes) = &self.global_secondary_indexes
             && global_secondary_indexes.len() > 20
@@ -195,18 +197,12 @@ impl CreateTableRequest {
                         index.index_name
                     )));
                 }
-                for key in &index.key_schema {
-                    if !self
-                        .attribute_definitions
-                        .iter()
-                        .any(|definition| definition.attribute_name == key.attribute_name)
-                    {
-                        return Err(StorageError::validation(format!(
-                            "GSI '{}' key attribute '{}' missing from attribute definitions",
-                            index.index_name, key.attribute_name
-                        )));
-                    }
-                }
+                crate::serde_types::validate_index_key_schema(
+                    &index.key_schema,
+                    &self.attribute_definitions,
+                    "GSI KeySchema",
+                )
+                .map_err(StorageError::validation)?;
             }
         }
         Ok(())

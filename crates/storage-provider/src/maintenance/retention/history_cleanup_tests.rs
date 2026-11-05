@@ -41,6 +41,7 @@ fn event(version: u64, previous: Option<u64>, lane: usize, deleted: bool) -> Ite
             )
             .unwrap(),
             created_at: TimestampMillis::from_timestamp(0),
+            user_identity: None,
         },
     )
     .unwrap()

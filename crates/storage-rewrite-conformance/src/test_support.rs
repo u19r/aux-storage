@@ -238,7 +238,8 @@ impl TestStore {
     ) -> Self {
         Self::new_with_fault_probes(FaultProbes {
             sql: Some(probe),
-            ..FaultProbes::default()
+            #[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+            kv: None,
         })
         .await
     }

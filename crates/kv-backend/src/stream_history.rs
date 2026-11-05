@@ -308,6 +308,24 @@ pub(crate) async fn read_page_start<A: KvAttempt>(
     Ok((history, receipt))
 }
 
+/// Read one page snapshot while protecting only the catalog identity and the
+/// checkpoint receipt key. Sequence and lineage rows advance on ordinary
+/// writes; they are read from the attempt snapshot so a busy stream does not
+/// abort every page read.
+pub(crate) async fn read_page_start_snapshot<A: KvAttempt>(
+    attempt: &A,
+    token: Option<&SystemStreamCheckpointToken>,
+) -> StorageResult<(SystemStreamHistory, Option<SystemStreamCheckpointReceipt>)> {
+    let (_, history, receipt) = read_history_with_protection(
+        attempt,
+        ReadProtection::Conflict,
+        ReadProtection::Snapshot,
+        token,
+    )
+    .await?;
+    Ok((history, receipt))
+}
+
 async fn read_history_with_protection<A: KvAttempt>(
     attempt: &A,
     catalog_protection: ReadProtection,

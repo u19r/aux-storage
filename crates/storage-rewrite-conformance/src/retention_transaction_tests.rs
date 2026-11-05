@@ -424,3 +424,109 @@ async fn given_concurrent_same_duration_updates_when_reopened_then_each_generati
 -> anyhow::Result<()> {
     verify_policy_restart().await
 }
+
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+#[derive(Default)]
+struct RetentionCommitProbe(std::sync::Mutex<(Option<bool>, usize, usize)>);
+
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+impl kv_backend::KvFaultProbe for RetentionCommitProbe {
+    fn fail(&self, call: kv_backend::KvFaultCall) -> Option<storage_types::StorageError> {
+        if call.operation == kv_backend::KvFaultOperation::GetBatch {
+            let mut state = self.0.lock().unwrap();
+            if state.1 > 0 {
+                state.2 += 1;
+            }
+        }
+        None
+    }
+
+    fn at_commit_boundary(
+        &self,
+        boundary: kv_backend::KvCommitBoundary,
+    ) -> futures::future::BoxFuture<'_, storage_types::StorageResult<()>> {
+        Box::pin(async move {
+            let mut state = self.0.lock().unwrap();
+            let expected = match state.0 {
+                Some(true) => kv_backend::KvCommitBoundary::AfterDurableAcknowledgement,
+                Some(false) => kv_backend::KvCommitBoundary::BeforeCommit,
+                None => return Ok(()),
+            };
+            if boundary != expected {
+                return Ok(());
+            }
+            if let Some(is_unknown) = state.0.take() {
+                state.1 += 1;
+                return Err(if is_unknown {
+                    storage_types::StorageError::sync_submission_ambiguous(
+                        None,
+                        "injected unknown retention commit",
+                    )
+                } else {
+                    storage_types::StorageEnum::TransactionConflict {
+                        message: "injected retention conflict".into(),
+                    }
+                    .into()
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+#[tokio::test]
+async fn given_retention_wave_when_commit_conflicts_then_fresh_attempt_reloads_and_finishes()
+-> anyhow::Result<()> {
+    let probe = std::sync::Arc::new(RetentionCommitProbe::default());
+    let fixture = TestStore::new_kv_with_fault_probe(probe.clone()).await;
+    let result = async {
+        let table = publish_history(&fixture).await?;
+        let now = fixture.advance_time(std::time::Duration::from_secs(25 * 3600));
+        let wave = discover_wave(&fixture, &table, now).await?;
+        *probe.0.lock().unwrap() = (Some(false), 0, 0);
+        fixture
+            .stream_retention_repository
+            .trim_stream_marker_wave(wave)
+            .await?;
+        let state = probe.0.lock().unwrap();
+        anyhow::ensure!(
+            state.1 == 1 && state.2 > 0,
+            "retry did not reload native observations"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}
+
+#[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
+#[tokio::test]
+async fn given_retention_wave_when_commit_is_unknown_then_outcome_is_preserved_without_replay()
+-> anyhow::Result<()> {
+    let probe = std::sync::Arc::new(RetentionCommitProbe::default());
+    let fixture = TestStore::new_kv_with_fault_probe(probe.clone()).await;
+    let result = async {
+        let table = publish_history(&fixture).await?;
+        let now = fixture.advance_time(std::time::Duration::from_secs(25 * 3600));
+        let wave = discover_wave(&fixture, &table, now).await?;
+        *probe.0.lock().unwrap() = (Some(true), 0, 0);
+        let Err(error) = fixture
+            .stream_retention_repository
+            .trim_stream_marker_wave(wave)
+            .await
+        else {
+            anyhow::bail!("unknown commit was hidden");
+        };
+        anyhow::ensure!(error.is_commit_unknown());
+        anyhow::ensure!(
+            probe.0.lock().unwrap().2 == 0,
+            "unknown outcome was replayed"
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}

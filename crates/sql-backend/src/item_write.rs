@@ -5,131 +5,21 @@ use storage_common::{TtlConfigRecord, TtlIndexWrite, TtlIndexWriteBatch};
 use storage_provider::{
     AcceptedUpsert, CATALOG_READ_BYTES, ItemPrimaryEffects, ItemWriteObservation,
     ItemWriteObservationAttempt, ItemWriteObservationRead, UpsertAttempt,
-    combine_write_observations, lifecycle_tables_for_writes,
+    combine_write_observations,
 };
-use storage_types::{BoundTableInfo, StorageError, StorageResult, StoredWireItem, TableName};
+use storage_types::{BoundTableInfo, StorageError, StorageResult, StoredWireItem};
 
 use crate::{
-    ReadProtection, SqlAttempt, SqlEngine, SqlLayout, SqlQueryPage, SqlRow, SqlStatement, SqlValue,
+    ReadProtection, SqlAttempt, SqlEngine, SqlLayout, SqlRow, SqlStatement, SqlValue,
     catalog::{SqlCatalogAttempt, SqlDynamoCount, SqlDynamoWriteKind},
-    gsi::{decode_gsi_lifecycle, gsi_lifecycle_statement},
-    item_read::point_read_statement,
-    item_tombstone::{
-        decode::{decode_deleted, decode_provenance, decode_revision},
-        sql_statements::deleted_observation_statement,
+    gsi::decode_gsi_lifecycle,
+    item_observation::{
+        WriteObservationReads, decode_write_observations, match_observation_rows,
+        prepare_observation_reads,
     },
+    item_tombstone::decode::{decode_provenance, decode_revision},
     stream_history, ttl_policy,
 };
-
-pub(crate) const WRITE_COLUMNS: &str =
-    "item_value, __aux_revision, __aux_provenance, __aux_ttl_epoch";
-
-struct WriteObservationReads<'a> {
-    statements: Vec<(SqlStatement, ReadProtection)>,
-    lifecycle_tables: Vec<&'a BoundTableInfo>,
-}
-
-fn plan_write_observation_reads<'a>(
-    engine: impl SqlLayout,
-    reads: &[ItemWriteObservationRead<'a>],
-) -> StorageResult<WriteObservationReads<'a>> {
-    let lifecycle_tables = lifecycle_tables_for_writes(reads)?;
-    let count = reads
-        .len()
-        .checked_mul(2)
-        .and_then(|count| count.checked_add(lifecycle_tables.len()))
-        .and_then(|count| {
-            count.checked_add(usize::from(
-                engine.engine() == SqlEngine::Postgres && !reads.is_empty(),
-            ))
-        })
-        .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    let mut statements = Vec::new();
-    statements
-        .try_reserve_exact(count)
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    if engine.engine() == SqlEngine::Postgres && !reads.is_empty() {
-        statements.push((
-            crate::item_lock::item_lock_statement(
-                reads.iter().map(ItemWriteObservationRead::target),
-            )?,
-            ReadProtection::Snapshot,
-        ));
-    }
-    for read in reads {
-        let (table, key) = read.target();
-        statements.push((
-            point_read_statement(engine, table, key, WRITE_COLUMNS)?,
-            ReadProtection::Conflict,
-        ));
-        statements.push((
-            deleted_observation_statement(engine, table, key)?,
-            ReadProtection::Conflict,
-        ));
-    }
-    statements.extend(
-        lifecycle_tables
-            .iter()
-            .filter_map(|table| gsi_lifecycle_statement(engine, table))
-            .map(|statement| (statement, ReadProtection::Snapshot)),
-    );
-    Ok(WriteObservationReads {
-        statements,
-        lifecycle_tables,
-    })
-}
-
-fn decode_write_observations(
-    reads: &[ItemWriteObservationRead<'_>],
-    lifecycle_tables: &[&BoundTableInfo],
-    observed: (Vec<SqlQueryPage>, Vec<Option<StoredWireItem>>),
-    lifecycles: &mut Vec<(TableName, GsiProjectionLifecycle)>,
-) -> StorageResult<Vec<ItemWriteObservation>> {
-    let (pages, hydrated) = observed;
-    let mut hydrated = hydrated.into_iter();
-    let mut pages = pages.into_iter();
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(reads.len())
-        .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-    for _read in reads {
-        let live = decode_one(
-            pages
-                .next()
-                .ok_or_else(|| StorageError::internal("SQL live observation page is missing"))?,
-        )?;
-        let deleted =
-            decode_one(pages.next().ok_or_else(|| {
-                StorageError::internal("SQL revision observation page is missing")
-            })?)?;
-        if live.is_some() && deleted.is_some() {
-            return Err(StorageError::internal(
-                "SQL key has both a live item and a tombstone",
-            ));
-        }
-        let stored = hydrated
-            .next()
-            .ok_or_else(|| StorageError::internal("Missing SQL observation hydration slot"))?;
-        items.push(match live {
-            Some(row) => decode_live(
-                row,
-                stored.ok_or_else(|| StorageError::internal("Missing SQL observation content"))?,
-            )?,
-            None => match deleted {
-                Some(row) => decode_deleted(row)?,
-                None => ItemWriteObservation::Absent,
-            },
-        });
-    }
-    for table in lifecycle_tables {
-        let page = pages
-            .next()
-            .ok_or_else(|| StorageError::internal("SQL GSI observation page is missing"))?;
-        let lifecycle = decode_gsi_lifecycle(page, table)?;
-        lifecycles.push((table.info.table_name.clone(), lifecycle));
-    }
-    Ok(items)
-}
 
 impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAttempt<'_, A, L> {
     fn item_write_cache(&self) -> Option<&storage_provider::TableMetadataCache> {
@@ -222,40 +112,78 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
         let result = async {
             let WriteObservationReads {
                 statements,
+                live_groups,
                 lifecycle_tables,
-            } = plan_write_observation_reads(catalog.engine, reads)?;
+            } = prepare_observation_reads(catalog.engine, reads)?;
             if statements.is_empty() {
                 return Ok(Vec::new());
             }
             let expected = statements.len();
+            let max_bytes = CATALOG_READ_BYTES
+                .get()
+                .checked_mul(reads.len().max(1))
+                .and_then(std::num::NonZeroUsize::new)
+                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
             let pages = catalog
                 .attempt
-                .query_batch_protected(statements, CATALOG_READ_BYTES)
+                .query_batch_protected(statements, max_bytes)
                 .await?;
             if pages.len() != expected {
                 return Err(StorageError::internal(
                     "SQL write observation page count differs",
                 ));
             }
-            let mut pages = pages;
-            if catalog.engine.engine() == SqlEngine::Postgres {
-                pages.remove(0);
+            let mut pages = pages.into_iter();
+            if catalog.engine.engine() == SqlEngine::Postgres && !reads.is_empty() {
+                pages
+                    .next()
+                    .ok_or_else(|| StorageError::internal("SQL item lock page is missing"))?;
+            }
+            let mut live_rows = (0..reads.len()).map(|_| None).collect::<Vec<_>>();
+            for group in &live_groups {
+                let page = pages.next().ok_or_else(|| {
+                    StorageError::internal("SQL live observation page is missing")
+                })?;
+                if page.more {
+                    return Err(StorageError::internal(
+                        "SQL live observation exceeded its page bound",
+                    ));
+                }
+                let mut matched = match_observation_rows(group.len(), page.rows)?;
+                for (position, index) in group.iter().enumerate() {
+                    live_rows[*index] = matched[position].take();
+                }
+            }
+            let page = pages.next().ok_or_else(|| {
+                StorageError::internal("SQL revision observation page is missing")
+            })?;
+            if page.more {
+                return Err(StorageError::internal(
+                    "SQL revision observation exceeded its page bound",
+                ));
+            }
+            let deleted_rows = match_observation_rows(reads.len(), page.rows)?;
+            let mut lifecycles = Vec::new();
+            lifecycles
+                .try_reserve_exact(lifecycle_tables.len())
+                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
+            for table in &lifecycle_tables {
+                let page = pages
+                    .next()
+                    .ok_or_else(|| StorageError::internal("SQL GSI observation page is missing"))?;
+                lifecycles.push((
+                    table.info.table_name.clone(),
+                    decode_gsi_lifecycle(page, table)?,
+                ));
             }
             let mut requests = Vec::new();
             requests
                 .try_reserve_exact(reads.len())
                 .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            for (index, read) in reads.iter().enumerate() {
-                let page = pages
-                    .get(index * 2)
-                    .ok_or_else(|| StorageError::internal("Missing SQL live observation page"))?;
-                if page.more || page.rows.len() > 1 {
-                    return Err(StorageError::internal("SQL live observation is not unique"));
-                }
+            for (read, row) in reads.iter().zip(&live_rows) {
                 requests.push((
                     read.target().0,
-                    page.rows
-                        .first()
+                    row.as_ref()
                         .map(|row| row.value(crate::ColumnIndex::new(0)))
                         .transpose()?,
                     read.target().0.max_indexers,
@@ -275,16 +203,7 @@ impl<A: SqlAttempt, L: SqlLayout> ItemWriteObservationAttempt for SqlCatalogAtte
                     ));
                 }
             }
-            let mut lifecycles = Vec::new();
-            lifecycles
-                .try_reserve_exact(lifecycle_tables.len())
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            let items = decode_write_observations(
-                reads,
-                &lifecycle_tables,
-                (pages, hydrated),
-                &mut lifecycles,
-            )?;
+            let items = decode_write_observations(reads, live_rows, deleted_rows, hydrated)?;
             catalog.bind_gsi_targets(
                 lifecycles
                     .iter()
@@ -323,34 +242,20 @@ impl<A: SqlAttempt, L: SqlLayout> UpsertAttempt for SqlCatalogAttempt<'_, A, L> 
             };
             catalog.prepared_writes = Ok(prepared);
             let (primary, tombstone) = image.prepare(effects)?;
+            catalog.stage_primary_upsert(primary)?;
+            // A live or absent observation proves no tombstone can exist under
+            // the caller's item lock. Only an observed deletion needs cleanup.
+            if item.old_item.is_none() && item.old_revision.is_some() {
+                catalog.stage_tombstone_delete(tombstone)?;
+            }
             let ttl = ttl_index_statements(catalog.engine, &item.table, writes)?;
-            let count = ttl
-                .len()
-                .checked_add(2)
-                .ok_or(storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            let mut statements = Vec::new();
-            statements
-                .try_reserve_exact(count)
-                .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
-            statements.push(primary);
-            statements.push(tombstone);
-            statements.extend(ttl);
-            catalog.append_dynamo_statements(
-                SqlDynamoWriteKind::Primary,
-                statements
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, statement)| {
-                        (
-                            statement,
-                            if index == 0 {
-                                SqlDynamoCount::ExactlyOne
-                            } else {
-                                SqlDynamoCount::AtMostOne
-                            },
-                        )
-                    }),
-            )?;
+            if !ttl.is_empty() {
+                catalog.append_dynamo_statements(
+                    SqlDynamoWriteKind::Primary,
+                    ttl.into_iter()
+                        .map(|statement| (statement, SqlDynamoCount::AtMostOne)),
+                )?;
+            }
             Ok(())
         }
         .await;
@@ -419,15 +324,6 @@ pub(crate) fn ttl_index_statements(
         statements.push(SqlStatement::new(sql, binds));
     }
     Ok(statements)
-}
-
-fn decode_one(page: SqlQueryPage) -> StorageResult<Option<SqlRow>> {
-    if page.more || page.rows.len() > 1 {
-        return Err(StorageError::internal(
-            "SQL write observation returned multiple rows",
-        ));
-    }
-    Ok(page.rows.into_iter().next())
 }
 
 pub(crate) fn decode_live(

@@ -226,7 +226,11 @@ pub struct ReceiveMessageRequest {
     // Keep in sync with MAX_WAIT_TIME_SECONDS.
     pub wait_time_seconds: Option<u32>,
 
-    #[serde(rename = "AttributeNames", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "MessageSystemAttributeNames",
+        alias = "AttributeNames",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attribute_names: Option<Vec<String>>,
 
     #[serde(

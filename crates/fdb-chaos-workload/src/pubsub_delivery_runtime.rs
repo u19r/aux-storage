@@ -1,9 +1,9 @@
 use fdb_chaos_model::PublishAuditPhase;
 
-use crate::{common::*, imports::*, pubsub_delivery::*};
+use crate::{imports::*, pubsub_delivery::*};
 
-impl RustWorkload for PubsubDeliveryWorkload {
-    async fn setup(&mut self, db: SimDatabase) {
+impl PubsubDeliveryWorkload {
+    pub(super) async fn setup_phase(&mut self, db: SimDatabase) {
         self.setup_count += 1;
         self.trace_phase("setup");
         if self.client_id != 0 {
@@ -63,7 +63,7 @@ impl RustWorkload for PubsubDeliveryWorkload {
         self.subscription_arns = subscription_arns;
     }
 
-    async fn start(&mut self, db: SimDatabase) {
+    pub(super) async fn start_phase(&mut self, db: SimDatabase) {
         self.start_count += 1;
         self.trace_phase("start");
         if !self.is_active_client() {
@@ -417,7 +417,7 @@ impl RustWorkload for PubsubDeliveryWorkload {
         self.delivery_record_ids = delivery_record_ids;
     }
 
-    async fn check(&mut self, db: SimDatabase) {
+    pub(super) async fn check_phase(&mut self, db: SimDatabase) {
         self.check_count += 1;
         self.trace_phase("check");
         if self.client_id != 0 {
@@ -483,67 +483,5 @@ impl RustWorkload for PubsubDeliveryWorkload {
                 }
             }
         }
-    }
-
-    fn get_metrics(&self, mut out: Metrics) {
-        out.extend([
-            metric_val_u64("aux_storage_pubsub_delivery_setup_count", self.setup_count),
-            metric_val_u64("aux_storage_pubsub_delivery_start_count", self.start_count),
-            metric_val_u64("aux_storage_pubsub_delivery_check_count", self.check_count),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_publish_count",
-                self.publish_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_unknown_publish_count",
-                self.unknown_publish_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_unknown_materialization_count",
-                self.unknown_materialization_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_unknown_claim_count",
-                self.unknown_claim_count,
-            ),
-            metric_val_u64("aux_storage_pubsub_delivery_claim_count", self.claim_count),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_duplicate_claim_reject_count",
-                self.duplicate_claim_reject_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_delivered_count",
-                self.delivered_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_failed_count",
-                self.failed_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_retry_reschedule_count",
-                self.retry_reschedule_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_retry_claim_count",
-                self.retry_claim_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_direct_scan_count",
-                self.direct_scan_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_terminal_duplicate_reject_count",
-                self.terminal_duplicate_reject_count,
-            ),
-            metric_val_u64(
-                "aux_storage_pubsub_delivery_orphan_check_count",
-                self.orphan_check_count,
-            ),
-            metric_val_u64("aux_storage_pubsub_delivery_error_count", self.error_count),
-        ]);
-    }
-
-    fn get_check_timeout(&self) -> f64 {
-        60.0
     }
 }

@@ -52,6 +52,7 @@ fn given_sparse_lineages_when_first_is_empty_then_later_records_are_consumed() {
             source_scope: SystemStreamScope::try_new("sparse", 1).unwrap(),
             table_position: position("b", 10),
             created_at: storage_types::TimestampMillis::from_timestamp(0),
+            user_identity: None,
         },
     )
     .unwrap();

@@ -12,8 +12,7 @@ pub(super) use read::{
 };
 pub(super) use schema::gsi_schema;
 pub(super) use write::{
-    GsiUpsertSql, activate_ttl_statement, insert_build_statement, render_gsi_upsert,
-    transition_state_statement,
+    activate_ttl_statement, insert_build_statement, transition_state_statement,
 };
 
 #[cfg(test)]

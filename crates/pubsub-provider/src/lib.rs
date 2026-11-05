@@ -6,6 +6,7 @@ mod delivery_repository;
 mod delivery_transition;
 mod errors;
 mod memory;
+mod message_attribute;
 mod models;
 mod newtypes;
 mod provider;
@@ -32,6 +33,7 @@ pub use delivery_repository::PubsubDeliveryRepository;
 pub use delivery_transition::settle_delivery_in_attempt;
 pub use errors::{PubsubError, PubsubInternalKind, PubsubResult, PubsubValidationKind};
 pub use memory::InMemoryPubsubProvider;
+pub use message_attribute::MessageAttribute;
 pub use models::{
     AcceptedPublication, ClaimedPublishChunk, DeliveryClaimLimit, PublishAcceptancePlan,
     PublishChunkClaimLimit, PublishChunkClaimRequest, PublishChunkCommit, PublishIntent,

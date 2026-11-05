@@ -32,7 +32,7 @@ struct ReadSequenceDagCheckReport {
     ordinary_attempts: u64,
     mapped_attempts: u64,
     mapped_selected: u64,
-    mapped_fallbacks: u64,
+    continuation_pages: u64,
     mismatches: u64,
     errors: u64,
 }
@@ -76,12 +76,6 @@ fn validate_read_sequence_report(report: &ReadSequenceDagCheckReport) -> Result<
             report.oracle_checks, report.ordinary_attempts
         ));
     }
-    if report.ordinary_attempts < report.attempts {
-        return Err(format!(
-            "ordinary attempts cannot be below logical attempts ({} < {})",
-            report.ordinary_attempts, report.attempts
-        ));
-    }
     if report.ordinary_attempts > report.attempts.saturating_add(report.retries) {
         return Err(format!(
             "ordinary attempts exceed logical attempts plus retries ({} > {} + {})",
@@ -100,15 +94,14 @@ fn validate_read_sequence_report(report: &ReadSequenceDagCheckReport) -> Result<
             report.mapped_attempts, report.ordinary_attempts
         ));
     }
-    if report
-        .mapped_selected
-        .saturating_add(report.mapped_fallbacks)
-        != report.mapped_attempts
-    {
+    if report.mapped_selected != report.published {
         return Err(format!(
-            "mapped outcomes must account for mapped attempts ({} + {} != {})",
-            report.mapped_selected, report.mapped_fallbacks, report.mapped_attempts
+            "completed mapped outcomes must equal published operations ({} != {})",
+            report.mapped_selected, report.published,
         ));
+    }
+    if report.continuation_pages == 0 {
+        return Err("fixture did not exercise public continuation".to_owned());
     }
     Ok(())
 }
@@ -135,7 +128,9 @@ fn parse_read_sequence_metrics(input: &str) -> Result<ReadSequenceDagCheckReport
             "aux_storage_read_sequence_dag_ordinary_attempts" => report.ordinary_attempts += value,
             "aux_storage_read_sequence_dag_mapped_attempts" => report.mapped_attempts += value,
             "aux_storage_read_sequence_dag_mapped_selected" => report.mapped_selected += value,
-            "aux_storage_read_sequence_dag_mapped_fallbacks" => report.mapped_fallbacks += value,
+            "aux_storage_read_sequence_dag_continuation_pages" => {
+                report.continuation_pages += value
+            }
             "aux_storage_read_sequence_dag_mismatches" => report.mismatches += value,
             "aux_storage_read_sequence_dag_errors" => report.errors += value,
             _ => {}

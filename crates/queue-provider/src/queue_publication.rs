@@ -55,6 +55,7 @@ pub(crate) async fn publish_message<P: QueuePort>(
     port: &P,
     message: QueueMessage,
 ) -> QueueResult<MessageId> {
+    message.validate_for_send()?;
     if message.message_id == MessageId::default() {
         return Err(QueueError::validation(
             QueueValidationKind::InvalidParameterValue,
@@ -106,7 +107,9 @@ impl<A: QueueAttempt> QueueOperation<'_, A> {
                 return Ok(QueuePublication::Accepted);
             }
         }
-        let record = QueueSendPolicy::try_from(&self.record)?.prepare_message(message);
+        let policy = QueueSendPolicy::try_from(&self.record)?;
+        policy.validate_message(&message)?;
+        let record = policy.prepare_message(message);
         self.attempt
             .write_message_records(vec![(record, previous)])
             .await?;

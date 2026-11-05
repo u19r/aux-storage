@@ -11,6 +11,19 @@ impl ParsedDynamodbNumber {
     pub(super) fn parse_bytes(
         input: impl Iterator<Item = u8>,
     ) -> Result<Self, DynamodbNumberError> {
+        let number = Self::parse_decimal_bytes(input)?;
+        if number.adjusted_exponent < -130 {
+            return Err(DynamodbNumberError::Underflow);
+        }
+        if number.adjusted_exponent > 125 {
+            return Err(DynamodbNumberError::Overflow);
+        }
+        Ok(number)
+    }
+
+    pub(super) fn parse_decimal_bytes(
+        input: impl Iterator<Item = u8>,
+    ) -> Result<Self, DynamodbNumberError> {
         let mut input = input.peekable();
         if input.peek().is_none() {
             return Err(DynamodbNumberError::Empty);

@@ -18,7 +18,8 @@ pub(crate) struct QueueVisibilityWorkload {
     delete_count: u64,
     empty_check_count: u64,
     error_count: u64,
-    context: WorkloadContext,
+    context: std::rc::Rc<WorkloadContext>,
+    clock: Option<Arc<crate::simulation_clock::SimulationClock>>,
 }
 
 impl QueueVisibilityWorkload {
@@ -50,7 +51,8 @@ impl QueueVisibilityWorkload {
             delete_count: 0,
             empty_check_count: 0,
             error_count: 0,
-            context,
+            context: std::rc::Rc::new(context),
+            clock: None,
         }
     }
 
@@ -60,7 +62,11 @@ impl QueueVisibilityWorkload {
             Some(b"aux-storage/fdb-chaos/queue-visibility/"),
             None,
         );
-        let store = kv_backend::KvStore::initialize_format(driver)
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or("simulation phase clock is absent")?;
+        let store = kv_backend::KvStore::initialize_format_with_clock(driver, clock.clone())
             .await
             .map_err(|error| storage_error_detail(&error))?;
         Ok(QueueManager::new(Arc::new(store)))
@@ -141,8 +147,8 @@ impl QueueVisibilityWorkload {
     }
 }
 
-impl RustWorkload for QueueVisibilityWorkload {
-    async fn setup(&mut self, db: SimDatabase) {
+impl QueueVisibilityWorkload {
+    async fn setup_phase(&mut self, db: SimDatabase) {
         self.setup_count += 1;
         self.trace_phase("setup");
         if self.client_id != 0 {
@@ -167,7 +173,7 @@ impl RustWorkload for QueueVisibilityWorkload {
         }
     }
 
-    async fn start(&mut self, db: SimDatabase) {
+    async fn start_phase(&mut self, db: SimDatabase) {
         self.start_count += 1;
         self.trace_phase("start");
         if !self.is_active_client() {
@@ -343,7 +349,7 @@ impl RustWorkload for QueueVisibilityWorkload {
         }
     }
 
-    async fn check(&mut self, db: SimDatabase) {
+    async fn check_phase(&mut self, db: SimDatabase) {
         self.check_count += 1;
         self.trace_phase("check");
         if self.client_id != 0 {
@@ -391,6 +397,42 @@ impl RustWorkload for QueueVisibilityWorkload {
                 self.trace_error("empty_check", err.to_string());
             }
         }
+    }
+
+    async fn run_simulation_phase(
+        &mut self,
+        db: SimDatabase,
+        phase: crate::simulation_clock::SimulationPhase,
+    ) {
+        let context = std::rc::Rc::clone(&self.context);
+        let (clock, requests) = crate::simulation_clock::SimulationClock::new();
+        self.clock = Some(clock);
+        let operation = async {
+            match phase {
+                crate::simulation_clock::SimulationPhase::Setup => self.setup_phase(db).await,
+                crate::simulation_clock::SimulationPhase::Start => self.start_phase(db).await,
+                crate::simulation_clock::SimulationPhase::Check => self.check_phase(db).await,
+            }
+        };
+        crate::simulation_clock::drive_operation(context, requests, operation).await;
+        self.clock = None;
+    }
+}
+
+impl RustWorkload for QueueVisibilityWorkload {
+    async fn setup(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Setup)
+            .await;
+    }
+
+    async fn start(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Start)
+            .await;
+    }
+
+    async fn check(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Check)
+            .await;
     }
 
     fn get_metrics(&self, mut out: Metrics) {

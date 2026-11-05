@@ -32,6 +32,10 @@ pub struct SqlCatalogAttempt<'a, A, L: SqlLayout = SqlEngine> {
     pub(crate) engine: L,
     pub(crate) protection: ReadProtection,
     dynamo_statements: Vec<(SqlStatement, SqlDynamoCount, SqlDynamoWriteKind)>,
+    primary_upserts: crate::write_batch::UpsertGroups,
+    primary_deletes: crate::write_batch::DeleteGroups,
+    tombstone_upserts: crate::write_batch::UpsertGroups,
+    gsi_upserts: crate::write_batch::UpsertGroups,
     pub(crate) dynamo_history: Option<SystemStreamHistory>,
     pub(crate) dynamo_positions: DynamoStreamPositions,
     pub(crate) metadata_cache: Option<Arc<TableMetadataCache>>,
@@ -48,6 +52,28 @@ pub(crate) enum DynamoStreamPositions {
 pub(crate) enum SqlDynamoCount {
     ExactlyOne,
     AtMostOne,
+    ExactlyRows(usize),
+    AtMostRows(usize),
+}
+
+impl SqlDynamoCount {
+    fn rejects(self, changed: u64) -> bool {
+        match self {
+            Self::ExactlyOne => changed != 1,
+            Self::AtMostOne => changed > 1,
+            Self::ExactlyRows(rows) => changed != u64::try_from(rows).unwrap_or(u64::MAX),
+            Self::AtMostRows(rows) => changed > u64::try_from(rows).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn expected(self) -> u64 {
+        match self {
+            Self::ExactlyOne | Self::AtMostOne => 1,
+            Self::ExactlyRows(rows) | Self::AtMostRows(rows) => {
+                u64::try_from(rows).unwrap_or(u64::MAX)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +106,10 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
             engine,
             protection,
             dynamo_statements: Vec::new(),
+            primary_upserts: crate::write_batch::UpsertGroups::default(),
+            primary_deletes: crate::write_batch::DeleteGroups::default(),
+            tombstone_upserts: crate::write_batch::UpsertGroups::default(),
+            gsi_upserts: crate::write_batch::UpsertGroups::default(),
             dynamo_history: None,
             dynamo_positions: DynamoStreamPositions::Sequential(Vec::new()),
             metadata_cache: None,
@@ -179,6 +209,41 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
         Ok(())
     }
 
+    pub(crate) fn stage_primary_upsert(
+        &mut self,
+        row: crate::write_batch::PreparedUpsertRow,
+    ) -> StorageResult<()> {
+        self.primary_upserts.stage(row)
+    }
+
+    pub(crate) fn stage_primary_delete(
+        &mut self,
+        row: crate::write_batch::PreparedDeleteRow,
+    ) -> StorageResult<()> {
+        self.primary_deletes.stage(row)
+    }
+
+    pub(crate) fn stage_tombstone_upsert(
+        &mut self,
+        row: crate::write_batch::PreparedUpsertRow,
+    ) -> StorageResult<()> {
+        self.tombstone_upserts.stage(row)
+    }
+
+    pub(crate) fn stage_gsi_upsert(
+        &mut self,
+        row: crate::write_batch::PreparedUpsertRow,
+    ) -> StorageResult<()> {
+        self.gsi_upserts.stage(row)
+    }
+
+    pub(crate) fn stage_tombstone_delete(&mut self, statement: SqlStatement) -> StorageResult<()> {
+        self.append_dynamo_statements(
+            SqlDynamoWriteKind::Primary,
+            std::iter::once((statement, SqlDynamoCount::AtMostOne)),
+        )
+    }
+
     pub(crate) async fn flush_dynamo_statements(&mut self) -> StorageResult<()> {
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
@@ -209,6 +274,42 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
                     SqlDynamoWriteKind::SystemSequence,
                 ));
             }
+            for (statement, rows) in
+                std::mem::take(&mut catalog.primary_upserts).into_statements(catalog.engine)?
+            {
+                planned.push((
+                    statement,
+                    SqlDynamoCount::ExactlyRows(rows),
+                    SqlDynamoWriteKind::Primary,
+                ));
+            }
+            for (statement, rows) in
+                std::mem::take(&mut catalog.primary_deletes).into_statements(catalog.engine)?
+            {
+                planned.push((
+                    statement,
+                    SqlDynamoCount::AtMostRows(rows),
+                    SqlDynamoWriteKind::Primary,
+                ));
+            }
+            for (statement, rows) in
+                std::mem::take(&mut catalog.tombstone_upserts).into_statements(catalog.engine)?
+            {
+                planned.push((
+                    statement,
+                    SqlDynamoCount::ExactlyRows(rows),
+                    SqlDynamoWriteKind::Primary,
+                ));
+            }
+            for (statement, rows) in
+                std::mem::take(&mut catalog.gsi_upserts).into_statements(catalog.engine)?
+            {
+                planned.push((
+                    statement,
+                    SqlDynamoCount::ExactlyRows(rows),
+                    SqlDynamoWriteKind::Gsi,
+                ));
+            }
             planned.extend(std::mem::take(&mut catalog.dynamo_statements));
             if planned.is_empty() {
                 return Ok(());
@@ -232,12 +333,8 @@ impl<'a, A: SqlAttempt, L: SqlLayout> SqlCatalogAttempt<'a, A, L> {
                 ));
             }
             for (count, (expected, kind)) in counts.into_iter().zip(expected) {
-                let invalid = match expected {
-                    SqlDynamoCount::ExactlyOne => count != 1,
-                    SqlDynamoCount::AtMostOne => count > 1,
-                };
-                if invalid {
-                    if matches!(kind, SqlDynamoWriteKind::Gsi) && count == 0 {
+                if expected.rejects(count) {
+                    if matches!(kind, SqlDynamoWriteKind::Gsi) && count < expected.expected() {
                         return Err(StorageEnum::TransactionConflict {
                             message: "SQL GSI projection changed during write".to_owned(),
                         }

@@ -46,25 +46,14 @@ impl kv_backend::KvFaultProbe for CleanupAbortProbe {
     fn fail(&self, call: kv_backend::KvFaultCall) -> Option<StorageError> {
         if call.operation == kv_backend::KvFaultOperation::Stage
             && self.armed.load(Ordering::SeqCst)
+            && self.staged.swap(true, Ordering::SeqCst)
+            && self.armed.swap(false, Ordering::SeqCst)
         {
-            self.staged.store(true, Ordering::SeqCst);
+            return Some(StorageError::internal(
+                "injected cleanup staged-write failure",
+            ));
         }
         None
-    }
-
-    fn at_commit_boundary(
-        &self,
-        boundary: kv_backend::KvCommitBoundary,
-    ) -> futures::future::BoxFuture<'_, storage_types::StorageResult<()>> {
-        Box::pin(async move {
-            if boundary == kv_backend::KvCommitBoundary::BeforeCommit
-                && self.staged.load(Ordering::SeqCst)
-                && self.armed.swap(false, Ordering::SeqCst)
-            {
-                return Err(StorageError::internal("injected cleanup commit failure"));
-            }
-            Ok(())
-        })
     }
 }
 
@@ -126,7 +115,7 @@ async fn given_sql_history_deletes_when_marker_completion_fails_then_native_atte
 
 #[cfg(any(feature = "rocksdb", feature = "foundationdb"))]
 #[tokio::test]
-async fn given_kv_history_deletes_when_native_commit_aborts_then_rows_and_progress_roll_back_and_retry_finishes()
+async fn given_kv_history_deletes_when_native_write_fails_then_rows_and_progress_roll_back_and_retry_finishes()
 -> anyhow::Result<()> {
     let probe = Arc::new(CleanupAbortProbe::default());
     let store = TestStore::new_kv_with_fault_probe(probe.clone()).await;

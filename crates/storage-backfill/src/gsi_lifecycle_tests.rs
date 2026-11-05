@@ -782,6 +782,7 @@ fn resolved_candidate(table: &storage_types::BoundTableInfo, version: u64) -> Gs
             table_position: storage_types::SystemStreamPosition::try_new("root", "root", "1")
                 .unwrap(),
             created_at: TimestampMillis::from_timestamp(1),
+            user_identity: None,
         },
     )
     .unwrap();
@@ -910,4 +911,28 @@ fn given_prepared_put_when_old_image_and_lifecycle_change_then_projection_effect
             assert_eq!(writes.into_iter().count(), 0);
         }
     }
+}
+
+#[test]
+fn given_wrong_typed_gsi_key_when_preparing_put_then_it_is_rejected_before_any_row() {
+    let table = projection_table(ProjectionType::All);
+    let declaration =
+        storage_types::IndexerDeclaration::try_new(Vec::new(), MaxIndexers::ZERO).unwrap();
+    let wrong_type =
+        WireItem::dynamo_json(br#"{"order_id":{"S":"1"},"status":{"N":"1"}}"#.to_vec());
+    let Err(error) = crate::PreparedGsiPut::try_new(&table, &wrong_type, &declaration) else {
+        panic!("wrong-typed GSI key must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("Type mismatch for Index Key status"),
+        "{error}"
+    );
+
+    let empty = WireItem::dynamo_json(br#"{"order_id":{"S":"1"},"status":{"S":""}}"#.to_vec());
+    let Err(error) = crate::PreparedGsiPut::try_new(&table, &empty, &declaration) else {
+        panic!("empty GSI key must fail closed");
+    };
+    assert!(error.to_string().contains("empty string value"), "{error}");
 }

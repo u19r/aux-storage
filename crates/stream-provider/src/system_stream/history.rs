@@ -30,6 +30,26 @@ pub trait SystemHistoryReadAttempt:
         )>,
     > + Send;
 
+    /// Read the history snapshot for one page without adding the hot sequence
+    /// rows to the native write conflict range.
+    ///
+    /// Page reads issue a checkpoint receipt, so they need a read-write
+    /// attempt. The receipt key is the only key that must be protected. The
+    /// sequence rows advance on every ordinary write; protecting them makes
+    /// every concurrent write abort the page read. A snapshot read observes a
+    /// consistent frontier and the next page advances from it.
+    fn read_system_page_start_snapshot(
+        &mut self,
+        token: Option<&storage_types::SystemStreamCheckpointToken>,
+    ) -> impl Future<
+        Output = StorageResult<(
+            SystemStreamHistory,
+            Option<super::SystemStreamCheckpointReceipt>,
+        )>,
+    > + Send {
+        self.read_system_page_start(token)
+    }
+
     fn load_system_retired_frontiers(
         &mut self,
         origins: &[SystemStreamPosition],

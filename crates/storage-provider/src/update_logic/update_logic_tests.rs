@@ -2607,3 +2607,40 @@ fn measure_decimal_add_current(
     }
     guard.finish()
 }
+
+#[test]
+fn given_equivalent_numeric_set_members_when_added_and_deleted_then_numeric_identity_is_preserved()
+{
+    let item = HashMap::from([(
+        "scores".to_owned(),
+        AttributeValue::NS(vec!["1".into(), "2".into()]),
+    )]);
+    let added = apply_update_operations(
+        item.into(),
+        &[UpdateOperation::Add {
+            field: Arc::from("scores"),
+            value: AttributeValue::NS(vec!["1.0".into(), "3".into()]),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        added.get("scores"),
+        Some(&AttributeValue::NS(vec![
+            "1".into(),
+            "2".into(),
+            "3".into()
+        ]))
+    );
+    let deleted = apply_update_operations(
+        added,
+        &[UpdateOperation::Delete {
+            field: Arc::from("scores"),
+            value: AttributeValue::NS(vec!["2.00".into()]),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        deleted.get("scores"),
+        Some(&AttributeValue::NS(vec!["1".into(), "3".into()]))
+    );
+}

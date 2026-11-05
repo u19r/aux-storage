@@ -276,6 +276,20 @@ impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
         stream_checkpoint::read_page_start(self.attempt, self.engine, token)
     }
 
+    fn read_system_page_start_snapshot(
+        &mut self,
+        token: Option<&storage_types::SystemStreamCheckpointToken>,
+    ) -> impl Future<
+        Output = StorageResult<(
+            stream_provider::SystemStreamHistory,
+            Option<stream_provider::SystemStreamCheckpointReceipt>,
+        )>,
+    > + Send {
+        // The SQL history read is already a snapshot read; only the receipt
+        // lookup uses conflict protection.
+        stream_checkpoint::read_page_start(self.attempt, self.engine, token)
+    }
+
     async fn read_system_history_pages(
         &mut self,
         reads: &[stream_provider::SystemStreamHistoryRead],

@@ -79,12 +79,6 @@ impl MantissaDigits {
             .and_then(|value| value.checked_sub(1))
             .and_then(|value| i32::try_from(value).ok())
             .ok_or(DynamodbNumberError::AdjustedExponentOutOfRange)?;
-        if adjusted < -130 {
-            return Err(DynamodbNumberError::Underflow);
-        }
-        if adjusted > 125 {
-            return Err(DynamodbNumberError::Overflow);
-        }
         Ok(ParsedDynamodbNumber {
             negative,
             adjusted_exponent: adjusted,

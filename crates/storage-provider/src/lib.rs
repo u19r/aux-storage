@@ -239,5 +239,8 @@ mod dynamo_range_read_tests;
 #[cfg(test)]
 mod dynamo_catalog_tests;
 
+#[cfg(test)]
+mod dynamo_update_item_tests;
+
 mod table_stream_initialization;
 pub use table_stream_initialization::repository::TableStreamInitializationRepository;

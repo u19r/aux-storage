@@ -104,7 +104,8 @@ impl<P: ExpirationPort> AcceptedDirectExpirationPage<'_, P> {
                     "expiration provenance count differs from accepted deletions",
                 ));
             }
-            for (item, winner) in self.items.into_iter().zip(provenance) {
+            for (mut item, winner) in self.items.into_iter().zip(provenance) {
+                item.user_identity = Some(storage_types::StreamUserIdentity::service_ttl());
                 prepare_accepted_delete(attempt, &item, self.write.captured_at, winner.clone())
                     .await?;
             }

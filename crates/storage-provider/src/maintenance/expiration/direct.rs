@@ -240,6 +240,9 @@ impl DirectExpirationPageWrite {
         let deleted_items = u64::try_from(deletions.items.len())
             .map_err(|_| StorageError::internal("expiration deletion count exceeds u64"))?;
         config.checkpoint.cursor = next_cursor.clone();
+        if next_cursor.is_none() {
+            config.complete_enabling_at(captured_at)?;
+        }
         Ok(Self {
             config,
             table_info,

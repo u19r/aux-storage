@@ -1091,3 +1091,42 @@ async fn given_message_when_checkpoint_updated_then_stale_rejected() -> anyhow::
     result?;
     Ok(())
 }
+
+#[tokio::test]
+async fn given_binary_attribute_when_queue_size_is_enforced_then_decoded_bytes_count()
+-> anyhow::Result<()> {
+    let fixture = TestStore::new().await;
+    let result = async {
+        let url = create_queue_url(
+            &fixture,
+            "binary-size-boundary",
+            HashMap::from([("MaximumMessageSize".to_owned(), "1024".to_owned())]),
+        )
+        .await?;
+        let mut message = send_request(&url, &"x".repeat(1014), None, fixture.now());
+        message.message_attributes = Some(HashMap::from([(
+            "a".to_owned(),
+            queue_provider::MessageAttributeValue {
+                data_type: "Binary".to_owned(),
+                string_value: None,
+                binary_value: Some("AQID".to_owned()),
+            },
+        )]));
+        fixture
+            .queue_operations
+            .send_message(message.clone())
+            .await?;
+        message.body.push('x');
+        anyhow::ensure!(
+            fixture
+                .queue_operations
+                .send_message(message)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}

@@ -3109,3 +3109,151 @@ fn create_table_with_projected_attribute_count(
     );
     payload
 }
+
+#[test]
+fn create_table_rejects_duplicate_attribute_definitions() {
+    let mut payload = valid_create_table_payload();
+    payload["AttributeDefinitions"] = json!([
+        { "AttributeName": "pk", "AttributeType": "S" },
+        { "AttributeName": "pk", "AttributeType": "S" }
+    ]);
+
+    let error = CreateTableRequest::try_from(payload).unwrap_err();
+
+    assert!(error.contains("Duplicate AttributeDefinitions"), "{error}");
+}
+
+#[test]
+fn create_table_rejects_invalid_gsi_key_schemas() {
+    for schema in [
+        json!([
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "HASH"}
+        ]),
+        json!([
+            {"AttributeName": "pk", "KeyType": "RANGE"},
+            {"AttributeName": "sk", "KeyType": "RANGE"}
+        ]),
+        json!([
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "pk", "KeyType": "RANGE"}
+        ]),
+    ] {
+        let mut payload = valid_create_table_payload();
+        payload["GlobalSecondaryIndexes"] = json!([{
+            "IndexName": "gsi1",
+            "KeySchema": schema,
+            "Projection": {"ProjectionType": "ALL"}
+        }]);
+
+        let error = CreateTableRequest::try_from(payload).unwrap_err();
+
+        assert!(error.contains("GSI KeySchema"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn update_item_rejects_combined_expression_and_attribute_updates() {
+    let error = UpdateItemRequest::try_from(json!({
+        "TableName": "TestTable",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET v = :v",
+        "AttributeUpdates": {"v": {"Value": {"S": "b"}, "Action": "PUT"}},
+        "ExpressionAttributeValues": {":v": {"S": "b"}}
+    }))
+    .unwrap_err();
+    assert!(
+        error.contains("Can not use both") && error.contains("AttributeUpdates"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn update_item_accepts_no_operation_like_dynamodb() {
+    UpdateItemRequest::try_from(json!({
+        "TableName": "TestTable",
+        "Key": {"pk": {"S": "a"}}
+    }))
+    .expect("DynamoDB treats a missing operation as a no-op upsert");
+}
+
+#[test]
+fn item_writes_reject_mixing_condition_expression_and_expected() {
+    for (operation, payload) in [
+        (
+            "put",
+            json!({
+                "TableName": "TestTable",
+                "Item": {"pk": {"S": "a"}},
+                "ConditionExpression": "attribute_exists(pk)",
+                "Expected": {"pk": {"Exists": false}}
+            }),
+        ),
+        (
+            "update",
+            json!({
+                "TableName": "TestTable",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET v = :v",
+                "ExpressionAttributeValues": {":v": {"S": "b"}},
+                "ConditionExpression": "attribute_exists(pk)",
+                "Expected": {"pk": {"Exists": false}}
+            }),
+        ),
+        (
+            "delete",
+            json!({
+                "TableName": "TestTable",
+                "Key": {"pk": {"S": "a"}},
+                "ConditionExpression": "attribute_exists(pk)",
+                "Expected": {"pk": {"Exists": false}}
+            }),
+        ),
+    ] {
+        let error = match operation {
+            "put" => PutItemRequest::try_from(payload).unwrap_err(),
+            "update" => UpdateItemRequest::try_from(payload).unwrap_err(),
+            "delete" => DeleteItemRequest::try_from(payload).unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(error.contains("Can not use both"), "{operation}: {error}");
+    }
+}
+
+#[test]
+fn scan_rejects_parallel_segments_and_invalid_select() {
+    for payload in [
+        json!({"TableName": "TestTable", "Segment": 0, "TotalSegments": 2}),
+        json!({"TableName": "TestTable", "Segment": 0}),
+        json!({"TableName": "TestTable", "Select": "BOGUS"}),
+        json!({"TableName": "TestTable", "Select": "SPECIFIC_ATTRIBUTES"}),
+        json!({"TableName": "TestTable", "Select": "ALL_PROJECTED_ATTRIBUTES"}),
+    ] {
+        assert!(ScanRequest::try_from(payload).is_err());
+    }
+}
+
+#[test]
+fn query_rejects_invalid_select() {
+    for payload in [
+        json!({"TableName": "TestTable", "KeyConditionExpression": "pk = :pk", "ExpressionAttributeValues": {":pk": {"S": "a"}}, "Select": "BOGUS"}),
+        json!({"TableName": "TestTable", "KeyConditionExpression": "pk = :pk", "ExpressionAttributeValues": {":pk": {"S": "a"}}, "Select": "SPECIFIC_ATTRIBUTES"}),
+        json!({"TableName": "TestTable", "KeyConditionExpression": "pk = :pk", "ExpressionAttributeValues": {":pk": {"S": "a"}}, "Select": "ALL_PROJECTED_ATTRIBUTES"}),
+    ] {
+        assert!(QueryRequest::try_from(payload).is_err());
+    }
+}
+
+#[test]
+fn given_legacy_expected_only_when_write_is_validated_then_condition_is_not_silently_ignored() {
+    let request: crate::PutItemRequest = serde_json::from_value(serde_json::json!({
+        "TableName": "expected-only", "Item": {"pk": {"S": "a"}},
+        "Expected": {"pk": {"Exists": false}}
+    }))
+    .unwrap();
+    assert!(
+        crate::DynamoRequestValidate::validate_for_dynamodb(&request)
+            .unwrap_err()
+            .contains("Expected is not supported")
+    );
+}

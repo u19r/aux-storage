@@ -622,12 +622,21 @@ pub struct DynamoDbStreamsRecord {
     pub event_source: String,
     #[serde(rename = "awsRegion")]
     pub aws_region: String,
+    #[serde(rename = "eventSourceARN")]
+    pub event_source_arn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity: Option<crate::StreamUserIdentity>,
     pub dynamodb: StreamRecordDetails,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct StreamRecordDetails {
+    #[serde(
+        rename = "ApproximateCreationDateTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub approximate_creation_date_time: Option<TimestampSecondsFractional>,
     pub keys: KeyAttributes,
     pub sequence_number: String,
     pub stream_view_type: StreamViewType,

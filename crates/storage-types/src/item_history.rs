@@ -14,6 +14,24 @@ pub enum ItemHistoryKind {
     Deleted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamUserIdentity {
+    #[serde(rename = "type")]
+    pub user_type: String,
+    pub principal_id: String,
+}
+
+impl StreamUserIdentity {
+    #[must_use]
+    pub fn service_ttl() -> Self {
+        Self {
+            user_type: "Service".to_string(),
+            principal_id: "dynamodb.amazonaws.com".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemHistoryPublication {
     Event {
@@ -21,6 +39,8 @@ pub enum ItemHistoryPublication {
         source_scope: SystemStreamScope,
         table_position: SystemStreamPosition,
         created_at: TimestampMillis,
+        #[serde(default)]
+        user_identity: Option<StreamUserIdentity>,
     },
     /// An imported current value becomes an old image without inventing an
     /// event.

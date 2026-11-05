@@ -17,6 +17,7 @@ fn publication(kind: ItemHistoryKind) -> ItemHistoryPublication {
         source_scope: SystemStreamScope::try_new("test", 1).unwrap(),
         table_position: SystemStreamPosition::try_new("shard", "lineage", "1").unwrap(),
         created_at: TimestampMillis::from_timestamp(1000),
+        user_identity: None,
     }
 }
 
@@ -357,6 +358,7 @@ fn given_pending_native_publication_when_commit_stamp_is_bound_then_metadata_use
             source_scope: SystemStreamScope::try_new("test", 1).unwrap(),
             table_position: base.with_versionstamp(pending).unwrap(),
             created_at: TimestampMillis::from_timestamp(1000),
+            user_identity: None,
         },
     )
     .unwrap();
@@ -417,6 +419,7 @@ fn given_maximum_history_metadata_when_prefix_is_encoded_then_native_read_bound_
             )
             .unwrap(),
             created_at: TimestampMillis::from_timestamp(0),
+            user_identity: None,
         },
     )
     .unwrap();

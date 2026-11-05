@@ -8,7 +8,7 @@ pub const MAX_STREAM_ITEM_DATA_BYTES: usize = 1_048_576;
 pub const DYNAMO_SYSTEM_SHARD_ID: &str = "default-shard";
 pub const DYNAMO_SYSTEM_LINEAGE_ID: &str = "default-lineage";
 pub(crate) const SYSTEM_STREAM_PAGE_ENVELOPE_RESERVE_BYTES: usize = 256;
-pub const SYSTEM_STREAM_HISTORY_READ_BATCH: usize = 8;
+pub const SYSTEM_STREAM_HISTORY_READ_BATCH: usize = 256;
 pub(crate) const STREAM_WRITE_RETRY: WriteRetryPolicy =
     WriteRetryPolicy::new(5, std::time::Duration::from_millis(2));
 /// Logical user-stream namespace shared by catalog creation and read

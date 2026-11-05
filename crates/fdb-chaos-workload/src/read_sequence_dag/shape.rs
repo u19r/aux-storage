@@ -51,7 +51,7 @@ impl ReadSequenceDagWorkload {
         provider
             .create_table(self.create_mapped_table(table_name.clone()))
             .await
-            .map_err(|error| storage_error_detail(&error))?;
+            .map_err(|error| format!("create fixture table: {}", storage_error_detail(&error)))?;
         self.seed_rows(provider, table_name, ["a", "b", "c"], "open")
             .await?;
         self.seed_overflow_rows(provider, table_name).await
@@ -76,13 +76,7 @@ impl ReadSequenceDagWorkload {
                     AttributeValue::S(format!("payload-{pk}")),
                 ),
             ]);
-            provider
-                .put_item(PutItemRequest::new(
-                    table_name.clone(),
-                    WireItem::try_from(&item).map_err(|error| storage_error_detail(&error))?,
-                ))
-                .await
-                .map_err(|error| storage_error_detail(&error))?;
+            persist_seed_item(provider, table_name, item).await?;
         }
         Ok(())
     }
@@ -106,13 +100,7 @@ impl ReadSequenceDagWorkload {
                     AttributeValue::S(format!("payload-{pk}")),
                 ),
             ]);
-            provider
-                .put_item(PutItemRequest::new(
-                    table_name.clone(),
-                    WireItem::try_from(&item).map_err(|error| storage_error_detail(&error))?,
-                ))
-                .await
-                .map_err(|error| storage_error_detail(&error))?;
+            persist_seed_item(provider, table_name, item).await?;
         }
         Ok(())
     }
@@ -226,4 +214,72 @@ fn query_keys(status: &str) -> Vec<String> {
     } else {
         ["a", "b", "c"].into_iter().map(str::to_string).collect()
     }
+}
+
+// Setup owns immutable keys. An acknowledged read can reconcile an uncertain
+// write without repeating it or accepting a partially seeded fixture.
+async fn persist_seed_item(
+    provider: &Arc<dyn storage_provider::DynamoOperations>,
+    table_name: &TableName,
+    item: HashMap<String, AttributeValue>,
+) -> Result<(), String> {
+    let wire = WireItem::try_from(&item).map_err(|error| storage_error_detail(&error))?;
+    let result = provider
+        .put_item(PutItemRequest::new(table_name.clone(), wire))
+        .await;
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if !error.is_commit_unknown() {
+        return Err(format!("seed put: {}", storage_error_detail(&error)));
+    }
+    let request: GetItemRequest = serde_json::from_value(serde_json::json!({
+        "TableName": table_name,
+        "Key": {"pk": item.get("pk")},
+        "ConsistentRead": true,
+    }))
+    .map_err(|error| error.to_string())?;
+    let observed = provider
+        .get_item(request)
+        .await
+        .map_err(|error| format!("reconcile seed put: {}", storage_error_detail(&error)))?;
+    let observed = observed
+        .item
+        .as_ref()
+        .map(|wire| {
+            <HashMap<String, AttributeValue> as storage_types::TryFromWireItem>::try_from_wire_item(
+                wire,
+            )
+        })
+        .transpose()
+        .map_err(|error| storage_error_detail(&error))?;
+    if observed.as_ref() == Some(&item) {
+        return Ok(());
+    }
+    Err(format!(
+        "seed put not observed: {}",
+        storage_error_detail(&error)
+    ))
+}
+
+type FixturePages = std::collections::BTreeMap<
+    String,
+    std::collections::BTreeMap<u32, Vec<HashMap<String, AttributeValue>>>,
+>;
+
+// The fixture has one root Query and child Gets. Root Query continuations
+// extend one invocation; child ordinals restart on every parent Query page.
+pub(super) fn merge_fixture_invocation(
+    results: &mut FixturePages,
+    name: &str,
+    ordinal: u32,
+    items: Vec<HashMap<String, AttributeValue>>,
+) {
+    let rows = results.entry(name.to_owned()).or_default();
+    let ordinal = if name == "child" {
+        rows.len() as u32
+    } else {
+        ordinal
+    };
+    rows.entry(ordinal).or_default().extend(items);
 }

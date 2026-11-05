@@ -33,7 +33,8 @@ pub(crate) struct PubsubDeliveryWorkload {
     pub(crate) subscription_arns: Vec<SubscriptionArn>,
     pub(crate) message_id: Option<PubsubMessageId>,
     pub(crate) delivery_record_ids: Vec<DeliveryRecordId>,
-    pub(crate) context: WorkloadContext,
+    pub(crate) context: std::rc::Rc<WorkloadContext>,
+    pub(crate) clock: Option<Arc<crate::simulation_clock::SimulationClock>>,
 }
 
 impl PubsubDeliveryWorkload {
@@ -80,7 +81,8 @@ impl PubsubDeliveryWorkload {
             subscription_arns: Vec::new(),
             message_id: None,
             delivery_record_ids: Vec::new(),
-            context,
+            context: std::rc::Rc::new(context),
+            clock: None,
         }
     }
 
@@ -97,9 +99,14 @@ impl PubsubDeliveryWorkload {
         db: SimDatabase,
     ) -> Result<Arc<kv_backend::KvStore<kv_backend::foundationdb::FoundationDbBackend>>, String>
     {
-        let store = kv_backend::KvStore::initialize_format(self.driver(db))
-            .await
-            .map_err(|error| storage_error_detail(&error))?;
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or("simulation phase clock is absent")?;
+        let store =
+            kv_backend::KvStore::initialize_format_with_clock(self.driver(db), clock.clone())
+                .await
+                .map_err(|error| storage_error_detail(&error))?;
         Ok(Arc::new(store))
     }
 
@@ -165,5 +172,105 @@ impl PubsubDeliveryWorkload {
                 "Error" => error,
             ],
         );
+    }
+}
+
+impl PubsubDeliveryWorkload {
+    async fn run_simulation_phase(
+        &mut self,
+        db: SimDatabase,
+        phase: crate::simulation_clock::SimulationPhase,
+    ) {
+        let context = std::rc::Rc::clone(&self.context);
+        let (clock, requests) = crate::simulation_clock::SimulationClock::new();
+        self.clock = Some(clock);
+        let operation = async {
+            match phase {
+                crate::simulation_clock::SimulationPhase::Setup => self.setup_phase(db).await,
+                crate::simulation_clock::SimulationPhase::Start => self.start_phase(db).await,
+                crate::simulation_clock::SimulationPhase::Check => self.check_phase(db).await,
+            }
+        };
+        crate::simulation_clock::drive_operation(context, requests, operation).await;
+        self.clock = None;
+    }
+}
+
+impl RustWorkload for PubsubDeliveryWorkload {
+    async fn setup(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Setup)
+            .await;
+    }
+
+    async fn start(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Start)
+            .await;
+    }
+
+    async fn check(&mut self, db: SimDatabase) {
+        self.run_simulation_phase(db, crate::simulation_clock::SimulationPhase::Check)
+            .await;
+    }
+
+    fn get_metrics(&self, mut out: Metrics) {
+        out.extend([
+            metric_val_u64("aux_storage_pubsub_delivery_setup_count", self.setup_count),
+            metric_val_u64("aux_storage_pubsub_delivery_start_count", self.start_count),
+            metric_val_u64("aux_storage_pubsub_delivery_check_count", self.check_count),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_publish_count",
+                self.publish_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_publish_count",
+                self.unknown_publish_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_materialization_count",
+                self.unknown_materialization_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_unknown_claim_count",
+                self.unknown_claim_count,
+            ),
+            metric_val_u64("aux_storage_pubsub_delivery_claim_count", self.claim_count),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_duplicate_claim_reject_count",
+                self.duplicate_claim_reject_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_delivered_count",
+                self.delivered_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_failed_count",
+                self.failed_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_retry_reschedule_count",
+                self.retry_reschedule_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_retry_claim_count",
+                self.retry_claim_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_direct_scan_count",
+                self.direct_scan_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_terminal_duplicate_reject_count",
+                self.terminal_duplicate_reject_count,
+            ),
+            metric_val_u64(
+                "aux_storage_pubsub_delivery_orphan_check_count",
+                self.orphan_check_count,
+            ),
+            metric_val_u64("aux_storage_pubsub_delivery_error_count", self.error_count),
+        ]);
+    }
+
+    fn get_check_timeout(&self) -> f64 {
+        60.0
     }
 }

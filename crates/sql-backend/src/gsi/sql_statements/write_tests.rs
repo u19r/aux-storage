@@ -7,8 +7,8 @@ use storage_types::{
     maintenance::TargetIncarnation,
 };
 
-use super::write::{render_gsi_upsert, transition_state_statement};
-use crate::SqlEngine;
+use super::write::transition_state_statement;
+use crate::{SqlEngine, SqlValue, write_batch::UpsertShape};
 
 fn build() -> GsiBuild<String> {
     let checkpoint = SystemStreamCheckpoint::try_new(
@@ -76,18 +76,25 @@ fn given_gsi_statement_shapes_when_rendered_then_report_cpu_and_allocations() {
             let columns = (0..count)
                 .map(|index| format!("column_{index}"))
                 .collect::<Vec<_>>();
-            let numeric = vec![1, 2];
+            let mut numeric = vec![false; count];
+            numeric[0] = true;
+            numeric[1] = true;
             report(&format!("{name}_upsert_{count}"), || {
+                let shape = UpsertShape::try_new(
+                    black_box(columns.clone()),
+                    black_box(numeric.clone()),
+                    black_box(columns[..2].to_vec()),
+                    true,
+                )
+                .unwrap();
                 drop(black_box(
-                    render_gsi_upsert(
-                        black_box(engine),
-                        black_box(&columns),
-                        2,
-                        black_box(&numeric),
-                    )
-                    .unwrap()
-                    .bind_relation("physical_table")
-                    .unwrap(),
+                    shape
+                        .render(
+                            black_box(engine),
+                            "physical_table",
+                            vec![(0..count).map(|_| SqlValue::Null).collect()],
+                        )
+                        .unwrap(),
                 ));
             });
         }
@@ -119,10 +126,26 @@ fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slot
         (SqlEngine::Postgres, "$"),
     ] {
         let columns = vec!["pk".to_owned(), "sk".to_owned(), "value".to_owned()];
-        let sql = render_gsi_upsert(engine, &columns, 2, &[2])
+        let shape = UpsertShape::try_new(
+            columns.clone(),
+            vec![false, true, false],
+            columns[..2].to_vec(),
+            true,
+        )
+        .unwrap();
+        let (sql, binds) = shape
+            .render(
+                engine,
+                "physical",
+                vec![vec![
+                    SqlValue::Text("pk".into()),
+                    SqlValue::Text("1".into()),
+                    SqlValue::Text("value".into()),
+                ]],
+            )
             .unwrap()
-            .bind_relation("physical")
-            .unwrap();
+            .into_parts();
+        assert_eq!(binds.len(), 3);
         assert_eq!(
             sql,
             format!(
@@ -135,10 +158,20 @@ fn given_gsi_upsert_when_rendered_then_preserve_dynamic_columns_and_numeric_slot
         let columns = (1..=32)
             .map(|index| format!("column_{index}"))
             .collect::<Vec<_>>();
-        let sql = render_gsi_upsert(engine, &columns, 2, &[20, 21, 32])
+        let mut numeric = vec![false; columns.len()];
+        for index in [20, 21, 32] {
+            numeric[index - 1] = true;
+        }
+        let shape =
+            UpsertShape::try_new(columns.clone(), numeric, columns[..2].to_vec(), true).unwrap();
+        let (sql, _) = shape
+            .render(
+                engine,
+                "physical",
+                vec![(0..columns.len()).map(|_| SqlValue::Null).collect()],
+            )
             .unwrap()
-            .bind_relation("physical")
-            .unwrap();
+            .into_parts();
         for index in [20, 21, 32] {
             assert!(sql.contains(&format!("CAST({prefix}{index} AS TEXT)::NUMERIC")));
         }

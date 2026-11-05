@@ -35,7 +35,8 @@ pub async fn prepare_expiration_item_deletes<A: DeleteItemAttempt>(
     let attempt = settlement.as_mut();
     let result = async {
         for accepted in accept_expiration_item_deletes(attempt, table, items).await? {
-            let accepted = accepted?;
+            let mut accepted = accepted?;
+            accepted.user_identity = Some(storage_types::StreamUserIdentity::service_ttl());
             prepare_accepted_delete(attempt, &accepted, captured_at, ItemProvenance::default())
                 .await?;
         }

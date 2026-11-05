@@ -56,7 +56,7 @@ pub(super) struct PrimaryState;
 
 impl RangeProjection for PrimaryState {
     type Item = PrimaryStateRow;
-    const COLUMNS: &'static str = item_write::WRITE_COLUMNS;
+    const COLUMNS: &'static str = crate::constants::WRITE_COLUMNS;
 
     fn decode(
         table: &BoundTableInfo,

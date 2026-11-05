@@ -27,7 +27,7 @@ pub const DYNAMODB_STREAM_RECORDS_LIMIT_MAX: u32 = 1000;
 pub const DYNAMODB_STREAM_RECORDS_LIMIT_MESSAGE: &str = "Limit must be between 1 and 1000";
 pub const SYSTEM_STREAM_RECORDS_LIMIT_MAX: u32 = 8_192;
 pub const SYSTEM_STREAM_SOURCE_TABLE_NAME_MAX_BYTES: usize = 255;
-pub const STREAM_RECORDS_MAX_ENCODED_BYTES: u32 = 4 * 1024 * 1024;
+pub const STREAM_RECORDS_MAX_ENCODED_BYTES: u32 = 8 * 1024 * 1024;
 pub const STORAGE_SERDE_RAW_JSON_LIMIT_BYTES: usize = 4 * 1024;
 pub const STORAGE_SERDE_MIN_COMPRESSION_SAVINGS_BYTES: usize = 64;
 pub const STORAGE_SERDE_MIN_COMPRESSION_SAVINGS_DIVISOR: usize = 8;
@@ -276,3 +276,6 @@ pub(crate) const MATERIALIZED_ITEM_HEADER_BYTES: usize = 21;
 /// Bounds generated history addresses, scope/position and the 1,024-byte
 /// declaration, including JSON escaping, before metadata allocation.
 pub(crate) const ITEM_HISTORY_METADATA_MAX_BYTES: usize = 32 * 1024;
+
+pub(crate) const SQS_NUMBER_MIN_EXPONENT: i32 = -128;
+pub(crate) const SQS_NUMBER_MAX_EXPONENT: i32 = 126;

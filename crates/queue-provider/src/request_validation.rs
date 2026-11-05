@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http_error::HttpApiError;
 use storage_types::PaginationLimit;
 
@@ -219,10 +220,8 @@ impl MessageAttributeValue {
             ));
         }
 
-        if !self.data_type.starts_with("String")
-            && !self.data_type.starts_with("Number")
-            && !self.data_type.starts_with("Binary")
-        {
+        let data_type = self.data_type.split('.').next().unwrap_or_default();
+        if !matches!(data_type, "String" | "Number" | "Binary") {
             return Err(HttpApiError::validation_error(
                 "Message attribute data type must be String, Number, or Binary (with optional \
                  .custom suffix)",
@@ -241,7 +240,28 @@ impl MessageAttributeValue {
             ));
         }
 
-        Ok(())
+        self.validate_typed_value(data_type)
+    }
+
+    fn validate_typed_value(&self, data_type: &str) -> Result<(), HttpApiError> {
+        match (
+            data_type,
+            self.string_value.as_deref(),
+            self.binary_value.as_deref(),
+        ) {
+            ("String", Some(_), None) => Ok(()),
+            ("Number", Some(value), None) => storage_types::canonical_sqs_number(value)
+                .map(|_| ())
+                .map_err(|_| {
+                    HttpApiError::validation_error("Number message attribute is not a valid number")
+                }),
+            ("Binary", None, Some(value)) => STANDARD.decode(value).map(|_| ()).map_err(|_| {
+                HttpApiError::validation_error("Binary message attribute is not valid base64")
+            }),
+            _ => Err(HttpApiError::validation_error(
+                "Message attribute value does not match its data type",
+            )),
+        }
     }
 }
 

@@ -86,6 +86,7 @@ impl DynamoStreamWriteInput<'_> {
                 source_scope: self.source_scope.clone(),
                 table_position: self.position.clone(),
                 created_at: self.mutation.created_at,
+                user_identity: self.mutation.user_identity.clone(),
             },
         )
     }

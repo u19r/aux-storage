@@ -157,6 +157,7 @@ impl DynamoStreamRead for GetDynamoStreamRecords {
         let records = response.records;
         let checkpoint = response.checkpoint;
         let next = checkpoint.or_else(|| records.last().and_then(|record| record.cursor.clone()));
+        let stream_arn = self.iterator.stream_arn.clone();
         Ok(GetRecordsResponse {
             next_shard_iterator: (!response.sealed_end).then(|| match next {
                 Some(token) => {
@@ -168,7 +169,7 @@ impl DynamoStreamRead for GetDynamoStreamRecords {
             }),
             records: records
                 .into_iter()
-                .map(|record| dynamodb_stream_record(record, specification))
+                .map(|record| dynamodb_stream_record(record, specification, &stream_arn))
                 .collect(),
         })
     }

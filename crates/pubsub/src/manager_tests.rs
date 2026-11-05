@@ -323,7 +323,10 @@ async fn publish_routes_http_subscription_to_custom_sender_with_extra_json() {
             topic_arn: topic.topic_arn,
             message: "created".to_string(),
             subject: Some("order".to_string()),
-            message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+            message_attributes: HashMap::from([(
+                "event".to_string(),
+                "created".to_string().into(),
+            )]),
         })
         .await
         .unwrap();
@@ -477,7 +480,10 @@ async fn process_due_deliveries_sends_pending_builtin_http_delivery() {
             topic_arn: topic.topic_arn,
             message: "created".to_string(),
             subject: Some("order".to_string()),
-            message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+            message_attributes: HashMap::from([(
+                "event".to_string(),
+                "created".to_string().into(),
+            )]),
         })
         .await
         .unwrap();
@@ -557,7 +563,10 @@ async fn publish_sends_queue_notification_body_matching_aws_fixture() {
             topic_arn: topic.topic_arn,
             message: "created".to_string(),
             subject: Some("order".to_string()),
-            message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+            message_attributes: HashMap::from([(
+                "event".to_string(),
+                "created".to_string().into(),
+            )]),
         })
         .await
         .unwrap();
@@ -621,7 +630,10 @@ async fn publish_sends_raw_queue_body_and_attributes_matching_aws_fixture() {
             topic_arn: topic.topic_arn,
             message: "raw-created".to_string(),
             subject: Some("order".to_string()),
-            message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+            message_attributes: HashMap::from([(
+                "event".to_string(),
+                "created".to_string().into(),
+            )]),
         })
         .await
         .unwrap();
@@ -671,7 +683,7 @@ async fn notification_body_and_headers_match_normalized_aws_http_fixture() {
         topic_arn: topic.topic_arn,
         message: "created".to_string(),
         subject: Some("order".to_string()),
-        message_attributes: HashMap::from([("event".to_string(), "created".to_string())]),
+        message_attributes: HashMap::from([("event".to_string(), "created".to_string().into())]),
     };
     let message_id = pubsub_provider::PubsubMessageId::new();
     let body = notification_body(NotificationRenderContext {
@@ -1007,4 +1019,136 @@ fn normalize_confirmation_headers(headers: &HeaderMap) -> Value {
 
 fn header_value(headers: &HeaderMap, name: &str) -> String {
     headers.get(name).unwrap().to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn given_typed_attributes_when_delivered_then_raw_queue_retains_types_and_large_envelope_succeeds()
+ {
+    let provider = Arc::new(InMemoryPubsubProvider::default());
+    let (queues, _directory) = create_test_queue_manager().await;
+    let queues = Arc::new(queues);
+    let manager = PubsubManager::builder()
+        .provider(provider.clone())
+        .queue_manager(queues.clone())
+        .build()
+        .unwrap();
+    let topic = manager.create_topic("typed-delivery").await.unwrap();
+    let mut urls = Vec::new();
+    for raw in [false, true] {
+        let url = queues
+            .create_queue(CreateQueueRequest {
+                queue_name: format!("typed-delivery-{raw}"),
+                attributes: None,
+            })
+            .await
+            .unwrap()
+            .queue_url;
+        manager
+            .subscribe(SubscribeRequest {
+                topic_arn: topic.topic_arn.clone(),
+                protocol: SubscriptionProtocol::Queue,
+                endpoint: url.clone(),
+                attributes: HashMap::from([("RawMessageDelivery".to_owned(), raw.to_string())]),
+                extra_json: Value::Null,
+            })
+            .await
+            .unwrap();
+        urls.push(url);
+    }
+    let attributes = HashMap::from([
+        (
+            "array".to_owned(),
+            pubsub_provider::MessageAttribute::StringArray("[1,true,null]".to_owned()),
+        ),
+        (
+            "count".to_owned(),
+            pubsub_provider::MessageAttribute::Number("42".to_owned()),
+        ),
+        (
+            "blob".to_owned(),
+            pubsub_provider::MessageAttribute::Binary(vec![0, 1, 255]),
+        ),
+    ]);
+    manager
+        .publish(PublishRequest {
+            topic_arn: topic.topic_arn.clone(),
+            message: "typed".to_owned(),
+            subject: None,
+            message_attributes: attributes,
+        })
+        .await
+        .unwrap();
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 2);
+    for (raw, url) in [false, true].into_iter().zip(&urls) {
+        let response = queues
+            .receive_message(ReceiveMessageRequest {
+                queue_url: url.clone(),
+                max_number_of_messages: Some(1),
+                visibility_timeout: Some(30),
+                wait_time_seconds: Some(0),
+                attribute_names: None,
+                message_attribute_names: Some(vec!["All".into()]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.messages.len(), 1);
+        let message = &response.messages[0];
+        if raw {
+            let attributes = message.message_attributes.as_ref().unwrap();
+            assert_eq!(attributes["array"].data_type, "String.Array");
+            assert_eq!(
+                attributes["array"].string_value.as_deref(),
+                Some("[1,true,null]")
+            );
+            assert_eq!(attributes["count"].data_type, "Number");
+            assert_eq!(attributes["count"].string_value.as_deref(), Some("42"));
+            assert_eq!(attributes["blob"].data_type, "Binary");
+            assert_eq!(attributes["blob"].binary_value.as_deref(), Some("AAH/"));
+        } else {
+            let body: Value = serde_json::from_str(&message.body).unwrap();
+            assert_eq!(
+                body["MessageAttributes"]["blob"],
+                serde_json::json!({"Type": "Binary", "Value": "AAH/"})
+            );
+        }
+    }
+    let published = manager
+        .publish(PublishRequest {
+            topic_arn: topic.topic_arn.clone(),
+            message: "large-attribute-set".to_owned(),
+            subject: None,
+            message_attributes: (0..11)
+                .map(|index| (format!("attribute{index}"), "value".to_owned().into()))
+                .collect(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(manager.process_due_deliveries(10).await.unwrap(), 2);
+    let subscriptions = provider
+        .list_subscriptions(ListSubscriptionsRequest {
+            topic_arn: Some(topic.topic_arn),
+            next_token: None,
+        })
+        .await
+        .unwrap()
+        .subscriptions;
+    for subscription in subscriptions {
+        let record = provider
+            .get_delivery_record(&DeliveryRecordId(format!(
+                "{}:{}",
+                subscription.subscription_arn, published.message_id
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.status,
+            if subscription.raw_message_delivery {
+                DeliveryStatus::Failed
+            } else {
+                DeliveryStatus::Delivered
+            }
+        );
+        assert_eq!(record.attempts, 1);
+    }
 }

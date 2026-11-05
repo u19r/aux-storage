@@ -126,7 +126,7 @@ pub enum QueueError {
     },
 
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    StorageError(StorageError),
 
     #[error("Transact Write failed")]
     TransactWrite(StorageError),
@@ -315,5 +315,17 @@ impl From<QueueError> for HttpApiError {
             error.aws_query_message(),
             error.aws_query_status_code(),
         )
+    }
+}
+
+impl From<StorageError> for QueueError {
+    fn from(error: StorageError) -> Self {
+        if let StorageEnum::Validation { message, .. } = error.as_ref() {
+            return Self::validation_with_detail(
+                QueueValidationKind::InvalidParameterValue,
+                message.clone(),
+            );
+        }
+        Self::StorageError(error)
     }
 }

@@ -149,6 +149,7 @@ impl BoundDeleteItem {
             old_provenance: old.provenance,
             gsi_lifecycle: lifecycle,
             return_old: self.return_old,
+            user_identity: None,
         }))
     }
 }
@@ -165,6 +166,7 @@ pub struct AcceptedDeleteItem {
     pub old_provenance: Option<ItemProvenance>,
     gsi_lifecycle: GsiProjectionLifecycle,
     return_old: bool,
+    pub user_identity: Option<storage_types::StreamUserIdentity>,
 }
 
 impl AcceptedDeleteItem {

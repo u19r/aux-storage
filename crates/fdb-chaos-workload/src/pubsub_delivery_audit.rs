@@ -257,12 +257,18 @@ async fn read_claim_records(
     ids: Vec<DeliveryRecordId>,
 ) -> Result<Vec<DeliveryRecord>, String> {
     let count = ids.len();
-    let rows = provider
-        .with_pubsub_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
-            Box::pin(async move { attempt.read_deliveries(ids).await })
-        })
-        .await
-        .map_err(|error| storage_error_detail(&error))?;
+    let rows = storage_common::retry::retry_native_conflicts(
+        provider,
+        storage_provider::DYNAMO_WRITE_RETRY,
+        || {
+            let ids = ids.clone();
+            provider.with_pubsub_attempt(storage_types::AttemptMode::ReadOnly, move |attempt| {
+                Box::pin(async move { attempt.read_deliveries(ids).await })
+            })
+        },
+    )
+    .await
+    .map_err(|error| storage_error_detail(&error))?;
     if rows.len() != count || rows.iter().any(Option::is_none) {
         return Err("claim audit lost a durable delivery".into());
     }

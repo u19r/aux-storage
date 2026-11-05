@@ -18,6 +18,9 @@ pub enum PubsubValidationKind {
     UnsupportedAttribute,
     EmptyMessage,
     InvalidToken,
+    InvalidMessageAttribute,
+    MessageTooLarge,
+    InvalidSubject,
 }
 
 impl PubsubValidationKind {
@@ -32,6 +35,9 @@ impl PubsubValidationKind {
             Self::UnsupportedAttribute => "unsupported_attribute",
             Self::EmptyMessage => "empty_message",
             Self::InvalidToken => "invalid_token",
+            Self::InvalidMessageAttribute => "invalid_message_attribute",
+            Self::MessageTooLarge => "message_too_large",
+            Self::InvalidSubject => "invalid_subject",
         }
     }
 
@@ -59,6 +65,9 @@ impl PubsubValidationKind {
             Self::UnsupportedAttribute => "Invalid parameter: AttributeName".to_string(),
             Self::EmptyMessage => "Invalid parameter: Empty message".to_string(),
             Self::InvalidToken => "Invalid token".to_string(),
+            Self::InvalidMessageAttribute => "Invalid parameter: MessageAttributes".to_string(),
+            Self::MessageTooLarge => "Invalid parameter: Message too long".to_string(),
+            Self::InvalidSubject => "Invalid parameter: Subject".to_string(),
         }
     }
 }

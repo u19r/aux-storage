@@ -10,6 +10,12 @@ use futures::{
 };
 use storage_types::{Clock, StorageError, StorageResult, TimestampMillis};
 
+pub(crate) enum SimulationPhase {
+    Setup,
+    Start,
+    Check,
+}
+
 pub(crate) struct SimulationClock {
     requests: mpsc::UnboundedSender<DelayRequest>,
 }

@@ -76,7 +76,7 @@ pub use constants::{
 };
 mod dynamodb_number;
 pub use dynamodb_number::{
-    DynamodbNumberError, canonical_dynamodb_number, compare_dynamodb_numbers,
+    DynamodbNumberError, canonical_dynamodb_number, canonical_sqs_number, compare_dynamodb_numbers,
     decode_dynamodb_number_key, encode_dynamodb_number_key, project_dynamodb_number_from_bytes,
 };
 mod item_json_projection;
@@ -399,7 +399,7 @@ pub use item_history_record::{ItemHistoryRecord, ItemHistoryRecordHeader};
 mod item_history_tests;
 pub use item_history::{
     ItemHistoryChange, ItemHistoryEntry, ItemHistoryKind, ItemHistoryMetadata,
-    ItemHistoryPublication, ItemHistoryReference,
+    ItemHistoryPublication, ItemHistoryReference, StreamUserIdentity,
 };
 mod item_history_address;
 #[cfg(test)]

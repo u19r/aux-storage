@@ -91,6 +91,22 @@ pub fn canonical_dynamodb_number(value: &str) -> Result<String, DynamodbNumberEr
     ParsedDynamodbNumber::parse(value).and_then(|number| number.canonical_string())
 }
 
+/// SQS shares decimal grammar and precision with DynamoDB, but accepts a
+/// different magnitude range: 10^-128 through 10^126 inclusive.
+pub fn canonical_sqs_number(value: &str) -> Result<String, DynamodbNumberError> {
+    let number = ParsedDynamodbNumber::parse_decimal_bytes(value.bytes())?;
+    if number.adjusted_exponent < crate::constants::SQS_NUMBER_MIN_EXPONENT {
+        return Err(DynamodbNumberError::Underflow);
+    }
+    if number.adjusted_exponent > crate::constants::SQS_NUMBER_MAX_EXPONENT
+        || number.adjusted_exponent == crate::constants::SQS_NUMBER_MAX_EXPONENT
+            && number.digits.as_slice() != b"1"
+    {
+        return Err(DynamodbNumberError::Overflow);
+    }
+    number.canonical_string()
+}
+
 /// Compares valid DynamoDB numbers without losing decimal precision.
 pub fn compare_dynamodb_numbers(
     left: &str,

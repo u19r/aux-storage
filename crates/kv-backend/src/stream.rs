@@ -317,6 +317,18 @@ impl<A: KvAttempt> stream_provider::SystemHistoryReadAttempt for KvCatalogAttemp
         crate::stream_history::read_page_start(self.attempt, token, self.protection)
     }
 
+    fn read_system_page_start_snapshot(
+        &mut self,
+        token: Option<&storage_types::SystemStreamCheckpointToken>,
+    ) -> impl Future<
+        Output = StorageResult<(
+            stream_provider::SystemStreamHistory,
+            Option<stream_provider::SystemStreamCheckpointReceipt>,
+        )>,
+    > + Send {
+        crate::stream_history::read_page_start_snapshot(self.attempt, token)
+    }
+
     async fn read_system_history_pages(
         &mut self,
         reads: &[stream_provider::SystemStreamHistoryRead],

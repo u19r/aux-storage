@@ -421,11 +421,21 @@ fn decode_record(
         })
         .transpose()?
         .flatten();
+    let (created_at, user_identity) = match resolved.current.metadata().publication() {
+        ItemHistoryPublication::Event {
+            created_at,
+            user_identity,
+            ..
+        } => (*created_at, user_identity.clone()),
+        ItemHistoryPublication::PredecessorAnchor => return Err(history_unavailable()),
+    };
     Ok(DynamoStreamRecord {
         cursor: Some(cursor),
         source_table_name: snapshot.source_table_name,
         keys: snapshot.keys,
         sequence_number,
+        created_at,
+        user_identity,
         old_image,
         new_image: snapshot.item,
     })

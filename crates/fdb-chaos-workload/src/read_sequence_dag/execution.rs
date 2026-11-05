@@ -7,10 +7,9 @@ use crate::{
         NormalizedResult, ReadSequenceDagWorkload,
         constants::{MAPPED_FALLBACK_SHAPE_ID, MAPPED_SHAPE_ID},
         ordinary::OrdinaryFailure,
+        shape::merge_fixture_invocation,
     },
 };
-
-const MAX_BUGGIFIED_RETRIES: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum OperationFailure {
@@ -19,6 +18,16 @@ pub(super) enum OperationFailure {
 }
 
 impl OperationFailure {
+    pub(super) fn from_storage(error: StorageError) -> Self {
+        let message = storage_error_detail(&error);
+        if error.native_attempt_rejection() == Some(storage_types::NativeAttemptRejection::Conflict)
+        {
+            Self::RetryableStorage(message)
+        } else {
+            Self::Fatal(message)
+        }
+    }
+
     fn retryable_storage(error: impl Into<String>) -> Self {
         Self::RetryableStorage(error.into())
     }
@@ -40,6 +49,7 @@ pub(super) type OperationFuture<'a> =
 pub(super) async fn run_with_buggified_retries<T, F>(
     owner: &mut T,
     buggify: bool,
+    clock: &dyn storage_types::Clock,
     mut operation: F,
 ) -> (Result<(), OperationFailure>, u8)
 where
@@ -51,9 +61,19 @@ where
             Ok(()) => return (Ok(()), retries),
             Err(failure @ OperationFailure::Fatal(_)) => return (Err(failure), retries),
             Err(_failure @ OperationFailure::RetryableStorage(_))
-                if buggify && retries < MAX_BUGGIFIED_RETRIES =>
+                if buggify
+                    && u32::from(retries) + 1
+                        < storage_provider::DYNAMO_WRITE_RETRY.max_attempts() =>
             {
                 retries += 1;
+                let delay =
+                    storage_provider::DYNAMO_WRITE_RETRY.delay_after_conflict(u32::from(retries));
+                if let Err(error) = clock.sleep(delay).await {
+                    return (
+                        Err(OperationFailure::Fatal(storage_error_detail(&error))),
+                        retries,
+                    );
+                }
             }
             Err(failure) => return (Err(failure), retries),
         }
@@ -85,6 +105,7 @@ impl ReadSequenceDagWorkload {
             .run_ordinary_fixture(&provider, &request, &plan)
             .await
             .map_err(|failure| match failure {
+                OrdinaryFailure::Native(error) => OperationFailure::from_storage(error),
                 OrdinaryFailure::Storage(error) => OperationFailure::retryable_storage(error),
                 OrdinaryFailure::Fixture(error) => OperationFailure::fatal(error),
             })?;
@@ -101,8 +122,7 @@ impl ReadSequenceDagWorkload {
         self.validate_ordinary(&expectation)
             .map_err(OperationFailure::fatal)?;
         self.trace("ordinary-complete");
-        self.run_mapped_operation(&provider, &plan, expectation)
-            .await
+        self.run_mapped_operation(&provider, expectation).await
     }
 
     fn validate_ordinary(&self, expectation: &OperationExpectation<'_>) -> Result<(), String> {
@@ -124,7 +144,6 @@ impl ReadSequenceDagWorkload {
     async fn run_mapped_operation(
         &mut self,
         provider: &Arc<dyn storage_provider::DynamoOperations>,
-        _plan: &storage_types::ReadSequencePlan,
         expectation: OperationExpectation<'_>,
     ) -> Result<(), OperationFailure> {
         let mut request = expectation.request.clone();
@@ -132,24 +151,17 @@ impl ReadSequenceDagWorkload {
             String,
             std::collections::BTreeMap<u32, Vec<HashMap<String, AttributeValue>>>,
         >::new();
+        self.mapped_attempts += 1;
         for _ in 0..256 {
             let response = provider
                 .read_sequence(request.clone())
                 .await
-                .map_err(|error| {
-                    OperationFailure::retryable_storage(storage_error_detail(&error))
-                })?;
-            self.mapped_attempts += 1;
+                .map_err(OperationFailure::from_storage)?;
             for node in response.nodes {
                 for invocation in node.invocations {
                     let items =
                         normalize_payload(invocation.result).map_err(OperationFailure::fatal)?;
-                    results
-                        .entry(node.name.clone())
-                        .or_default()
-                        .entry(invocation.ordinal)
-                        .or_default()
-                        .extend(items);
+                    merge_fixture_invocation(&mut results, &node.name, invocation.ordinal, items);
                 }
             }
             let Some(token) = response.next_sequence_token else {
@@ -168,7 +180,7 @@ impl ReadSequenceDagWorkload {
                 );
                 return Ok(());
             };
-            self.mapped_fallbacks += 1;
+            self.continuation_pages += 1;
             request.next_sequence_token = Some(token);
         }
         Err(OperationFailure::fatal(
@@ -219,7 +231,7 @@ impl ReadSequenceDagWorkload {
                 "OrdinaryAttempts" => self.ordinary_attempts,
                 "MappedAttempts" => self.mapped_attempts,
                 "MappedSelected" => self.mapped_selected,
-                "ContinuationPages" => self.mapped_fallbacks,
+                "ContinuationPages" => self.continuation_pages,
                 "OracleChecks" => self.oracle_checks,
                 "PermutedPlans" => self.permuted_plans,
             ],
@@ -281,33 +293,38 @@ impl ReadSequenceDagWorkload {
         let table_name = table_name.clone();
         let index_name = index_name.clone();
         let status = status.to_owned();
-        let (result, retries) = run_with_buggified_retries(self, buggify, move |workload| {
-            Box::pin(workload.run_operation(
-                Arc::clone(&provider),
-                table_name.clone(),
-                index_name.clone(),
-                status.clone(),
-                permuted,
-            ))
-        })
-        .await;
+        let Some(clock) = self.clock.clone() else {
+            self.error("operation", "simulation phase clock is absent".to_owned());
+            return;
+        };
+        let (result, retries) =
+            run_with_buggified_retries(self, buggify, clock.as_ref(), move |workload| {
+                Box::pin(workload.run_operation(
+                    Arc::clone(&provider),
+                    table_name.clone(),
+                    index_name.clone(),
+                    status.clone(),
+                    permuted,
+                ))
+            })
+            .await;
         self.retries += u64::from(retries);
         match result {
             Ok(()) => self.published += 1,
             Err(error) => {
-                self.mismatches += 1;
+                self.mismatches += u64::from(matches!(&error, OperationFailure::Fatal(_)));
                 self.error("operation", error.into_message());
             }
         }
     }
 }
 
-impl RustWorkload for ReadSequenceDagWorkload {
-    async fn setup(&mut self, _db: SimDatabase) {
+impl ReadSequenceDagWorkload {
+    pub(super) async fn setup_phase(&mut self, _db: SimDatabase) {
         self.trace("setup");
     }
 
-    async fn start(&mut self, db: SimDatabase) {
+    pub(super) async fn start_phase(&mut self, db: SimDatabase) {
         self.trace("start");
         if self.client_id >= self.active_client_count {
             return;
@@ -340,46 +357,8 @@ impl RustWorkload for ReadSequenceDagWorkload {
         self.trace("complete");
     }
 
-    async fn check(&mut self, _db: SimDatabase) {
+    pub(super) async fn check_phase(&mut self, _db: SimDatabase) {
         self.trace("check");
-    }
-
-    fn get_check_timeout(&self) -> f64 {
-        30.0
-    }
-
-    fn get_metrics(&self, mut out: Metrics) {
-        out.extend([
-            metric_val_u64("aux_storage_read_sequence_dag_attempts", self.attempts),
-            metric_val_u64("aux_storage_read_sequence_dag_published", self.published),
-            metric_val_u64("aux_storage_read_sequence_dag_retries", self.retries),
-            metric_val_u64("aux_storage_read_sequence_dag_mismatches", self.mismatches),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_oracle_checks",
-                self.oracle_checks,
-            ),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_ordinary_attempts",
-                self.ordinary_attempts,
-            ),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_mapped_attempts",
-                self.mapped_attempts,
-            ),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_mapped_selected",
-                self.mapped_selected,
-            ),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_continuation_pages",
-                self.mapped_fallbacks,
-            ),
-            metric_val_u64(
-                "aux_storage_read_sequence_dag_permuted_plans",
-                self.permuted_plans,
-            ),
-            metric_val_u64("aux_storage_read_sequence_dag_errors", self.errors),
-        ]);
     }
 }
 

@@ -17,6 +17,7 @@ fn record(offset: &str) -> SystemHistoryRecord {
             source_scope: SystemStreamScope::try_new("source", 1).unwrap(),
             table_position: SystemStreamPosition::try_new("shard", "lineage", offset).unwrap(),
             created_at: TimestampMillis::from_timestamp(1000),
+            user_identity: None,
         },
     )
     .unwrap();

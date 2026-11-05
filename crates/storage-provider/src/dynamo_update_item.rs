@@ -30,6 +30,25 @@ pub struct UpdateItemShape {
     return_old_on_condition_failure: bool,
 }
 
+fn reject_key_attribute_updates(
+    key_schema: &[storage_types::KeySchemaElement],
+    operations: &[UpdateOperation],
+) -> StorageResult<()> {
+    for operation in operations {
+        let root = operation
+            .field_name()
+            .split(['.', '['])
+            .next()
+            .unwrap_or_default();
+        if key_schema.iter().any(|key| key.attribute_name == root) {
+            return Err(StorageError::validation(format!(
+                "Cannot update attribute '{root}'. This attribute is part of the key"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl UpdateItemShape {
     pub(crate) fn key(&self) -> &KeyAttributes {
         &self.key
@@ -44,13 +63,26 @@ impl UpdateItemShape {
 
     /// Parent batch/transaction validation covers member request fields.
     pub(crate) fn from_validated_request(request: UpdateItemRequest) -> StorageResult<Self> {
-        let operations = match request.update_expression.as_deref() {
-            Some(expression) => parse_update_expression(
+        let operations = match (
+            request.update_expression.as_deref(),
+            request.attribute_updates,
+        ) {
+            (Some(expression), None) => parse_update_expression(
                 expression,
                 request.expression_attribute_names.as_ref(),
                 request.expression_attribute_values.as_ref(),
             )?,
-            None => Vec::new(),
+            (None, Some(_)) => {
+                return Err(StorageError::validation(
+                    "AttributeUpdates is not supported; use UpdateExpression",
+                ));
+            }
+            (None, None) => Vec::new(),
+            (Some(_), Some(_)) => {
+                return Err(StorageError::validation(
+                    "UpdateItem cannot combine UpdateExpression and AttributeUpdates",
+                ));
+            }
         };
         let condition = UncheckedCondition::parse(
             request.condition_expression,
@@ -72,6 +104,7 @@ impl UpdateItemShape {
 
     pub fn bind_table(mut self, table: Arc<BoundTableInfo>) -> StorageResult<BoundUpdateItem> {
         validate_transact_key(&table.info, &self.key)?;
+        reject_key_attribute_updates(&table.info.key_schema, &self.operations)?;
         self.key.normalize_numbers_for_write();
         Ok(BoundUpdateItem {
             table,

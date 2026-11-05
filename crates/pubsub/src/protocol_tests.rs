@@ -53,7 +53,9 @@ fn decode_query_publish_message_attributes() {
             assert_eq!(request.message, "hello");
             assert_eq!(
                 request.message_attributes.get("event"),
-                Some(&"created".to_string())
+                Some(&pubsub_provider::MessageAttribute::String(
+                    "created".to_string()
+                ))
             );
         }
         other => panic!("unexpected action: {other:?}"),
@@ -308,4 +310,45 @@ struct QueryErrorFixtures {
 struct QueryErrorCase {
     code: String,
     message: String,
+}
+
+#[test]
+fn decode_query_publish_preserves_number_and_binary_attribute_types() {
+    let action = decode_query_request(
+        b"Action=Publish&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aorders&Message=hello&MessageAttributes.entry.1.Name=count&MessageAttributes.entry.1.Value.DataType=Number&MessageAttributes.entry.1.Value.StringValue=42&MessageAttributes.entry.2.Name=blob&MessageAttributes.entry.2.Value.DataType=Binary&MessageAttributes.entry.2.Value.BinaryValue=YQ%3D%3D",
+    )
+    .unwrap();
+
+    match action {
+        PubsubAction::Publish(request) => {
+            assert_eq!(
+                request.message_attributes.get("count"),
+                Some(&pubsub_provider::MessageAttribute::Number("42".to_string()))
+            );
+            assert_eq!(
+                request.message_attributes.get("blob"),
+                Some(&pubsub_provider::MessageAttribute::Binary(vec![b'a']))
+            );
+            assert_eq!(
+                request.message_attributes.get("blob"),
+                Some(&pubsub_provider::MessageAttribute::Binary(vec![b'a']))
+            );
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+}
+
+#[test]
+fn decode_query_publish_rejects_invalid_number_and_binary_attributes() {
+    for body in [
+        b"Action=Publish&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aorders&Message=hello&MessageAttributes.entry.1.Name=count&MessageAttributes.entry.1.Value.DataType=Number&MessageAttributes.entry.1.Value.StringValue=not-a-number".as_slice(),
+        b"Action=Publish&TopicArn=arn%3Aaws%3Asns%3Aus-east-1%3A000000000000%3Aorders&Message=hello&MessageAttributes.entry.1.Name=blob&MessageAttributes.entry.1.Value.DataType=Binary&MessageAttributes.entry.1.Value.BinaryValue=%21%21%21%21".as_slice(),
+    ] {
+        assert!(decode_query_request(body).is_err());
+    }
+}
+
+#[test]
+fn given_json_message_structure_when_decoded_then_unsupported_routing_is_rejected() {
+    assert!(decode_query_request(b"Action=Publish&TopicArn=arn:aws:sns:us-east-1:000000000000:orders&Message=%7B%22default%22%3A%22hello%22%7D&MessageStructure=json").is_err());
 }

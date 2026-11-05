@@ -333,6 +333,11 @@ impl QueueManager {
             )
             .await?;
 
+        let messages = project_received_messages(
+            messages,
+            request.attribute_names.as_deref(),
+            request.message_attribute_names.as_deref(),
+        );
         tracing::Span::current().record("messages_received", messages.len());
         Ok(ReceiveMessageResponse { messages })
     }
@@ -579,6 +584,53 @@ fn receipt_handle_error_with_value(
 fn is_transaction_conflict(error: &QueueError) -> bool {
     matches!(error, QueueError::StorageError(error) | QueueError::TransactWrite(error)
         if matches!(error.base_error(), Some(StorageEnum::TransactionConflict { .. })))
+}
+
+fn project_received_messages(
+    mut messages: Vec<queue_provider::MessageResponse>,
+    attribute_names: Option<&[String]>,
+    message_attribute_names: Option<&[String]>,
+) -> Vec<queue_provider::MessageResponse> {
+    for message in &mut messages {
+        message.attributes =
+            project_named_attributes(message.attributes.take(), attribute_names, false);
+        message.message_attributes = project_named_attributes(
+            message.message_attributes.take(),
+            message_attribute_names,
+            true,
+        );
+        message.md5_of_message_attributes = message
+            .message_attributes
+            .as_ref()
+            .and_then(queue_provider::md5_of_message_attributes);
+    }
+    messages
+}
+
+fn project_named_attributes<T>(
+    attributes: Option<std::collections::HashMap<String, T>>,
+    requested: Option<&[String]>,
+    allow_prefix: bool,
+) -> Option<std::collections::HashMap<String, T>> {
+    let attributes = attributes?;
+    let requested = requested.filter(|names| !names.is_empty())?;
+    let requested_all = requested
+        .iter()
+        .any(|name| name == "All" || allow_prefix && name == ".*");
+    let projected = attributes
+        .into_iter()
+        .filter(|(name, _)| {
+            requested_all
+                || requested.iter().any(|requested| {
+                    requested == name
+                        || (allow_prefix
+                            && requested
+                                .strip_suffix('*')
+                                .is_some_and(|prefix| name.starts_with(prefix)))
+                })
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    (!projected.is_empty()).then_some(projected)
 }
 
 fn selected_queue_attributes(

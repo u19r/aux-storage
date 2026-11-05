@@ -62,6 +62,7 @@ fn given_wide_current_and_predecessor_when_write_is_planned_then_only_history_co
             indexers: &[],
             item_stream_version: ItemStreamVersion::new(9),
             created_at: TimestampMillis::from_timestamp(1000),
+            user_identity: None,
         })
         .unwrap();
         let plan = DynamoStreamWritePlan::try_from(DynamoStreamWriteInput {
@@ -144,6 +145,7 @@ fn given_another_table_when_write_is_planned_then_identity_is_rejected() {
         indexers: &[],
         item_stream_version: ItemStreamVersion::new(1),
         created_at: TimestampMillis::from_timestamp(1000),
+        user_identity: None,
     })
     .unwrap();
     assert!(

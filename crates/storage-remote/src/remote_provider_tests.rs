@@ -1251,7 +1251,9 @@ async fn given_dynamodb_stream_requests_when_forwarded_then_standard_actions_pre
             .json_body(serde_json::json!({"ShardIterator": "iterator-1", "Limit": 1}));
         then.status(200).json_body(serde_json::json!({"NextShardIterator": "iterator-2", "Records": [{
             "eventID": "event-1", "eventName": "MODIFY", "eventVersion": "1.0",
-            "eventSource": "aws:dynamodb", "awsRegion": "eu-north-1", "dynamodb": {
+            "eventSource": "aws:dynamodb", "awsRegion": "eu-north-1",
+            "eventSourceARN": "arn:aws:dynamodb:eu-north-1:000000000000:table/tenant_a/stream/label",
+            "dynamodb": {
                 "Keys": {"pk": {"S": "key"}}, "SequenceNumber": "1", "StreamViewType": "NEW_AND_OLD_IMAGES",
                 "SizeBytes": 100, "OldImage": {"pk": {"S": "key"}, "value": {"S": "old"}},
                 "NewImage": {"pk": {"S": "key"}, "value": {"S": "new"}}

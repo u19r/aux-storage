@@ -73,6 +73,7 @@ fn mapped_result_mismatch_is_not_retried_as_storage_failure() {
     let (result, retries) = block_on_ready(run_with_buggified_retries(
         &mut (),
         true,
+        &ReadyClock,
         |_: &mut ()| -> OperationFuture<'_> {
             Box::pin(ready(outcomes.next().expect("test operation outcome")))
         },
@@ -100,6 +101,7 @@ fn retryable_storage_failure_uses_the_buggify_budget() {
     let (result, retries) = block_on_ready(run_with_buggified_retries(
         &mut (),
         true,
+        &ReadyClock,
         |_: &mut ()| -> OperationFuture<'_> {
             Box::pin(ready(outcomes.next().expect("test operation outcome")))
         },
@@ -107,4 +109,62 @@ fn retryable_storage_failure_uses_the_buggify_budget() {
 
     assert_eq!(result, Ok(()));
     assert_eq!(retries, 1);
+}
+
+struct ReadyClock;
+impl storage_types::Clock for ReadyClock {
+    fn now(&self) -> storage_types::TimestampMillis {
+        storage_types::TimestampMillis::from_timestamp(0)
+    }
+    fn sleep(
+        &self,
+        _: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = storage_types::StorageResult<()>> + Send + '_>> {
+        Box::pin(ready(Ok(())))
+    }
+}
+
+#[test]
+fn given_unclassified_native_failure_when_classified_then_it_is_not_retried() {
+    let error = storage_types::StorageError::internal("corrupt response");
+    assert!(matches!(
+        OperationFailure::from_storage(error),
+        OperationFailure::Fatal(_)
+    ));
+}
+
+#[test]
+fn given_native_settlements_when_classified_then_only_known_conflicts_are_retryable() {
+    let conflict = storage_types::StorageEnum::TransactionConflict {
+        message: "conflict".into(),
+    }
+    .into();
+    assert!(matches!(
+        OperationFailure::from_storage(conflict),
+        OperationFailure::RetryableStorage(_)
+    ));
+    let unknown = storage_types::StorageError::sync_submission_ambiguous(None, "unknown");
+    assert!(matches!(
+        OperationFailure::from_storage(unknown),
+        OperationFailure::Fatal(_)
+    ));
+}
+
+#[test]
+fn given_persistent_conflicts_when_budget_exhausts_then_operation_still_fails() {
+    let mut calls = 0;
+    let (result, retries) = block_on_ready(run_with_buggified_retries(
+        &mut calls,
+        true,
+        &ReadyClock,
+        |calls| {
+            *calls += 1;
+            Box::pin(ready(Err(OperationFailure::RetryableStorage(
+                "conflict".into(),
+            ))))
+        },
+    ));
+    assert!(result.is_err());
+    assert_eq!(calls, storage_provider::DYNAMO_WRITE_RETRY.max_attempts());
+    assert_eq!(u32::from(retries) + 1, calls);
 }

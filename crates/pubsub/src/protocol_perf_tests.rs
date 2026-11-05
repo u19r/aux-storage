@@ -17,6 +17,10 @@ fn publish_body(message_len: usize, attributes: usize) -> Vec<u8> {
             &format!("attribute{index}"),
         )
         .append_pair(
+            &format!("MessageAttributes.entry.{index}.Value.DataType"),
+            "String",
+        )
+        .append_pair(
             &format!("MessageAttributes.entry.{index}.Value.StringValue"),
             "value雪",
         );

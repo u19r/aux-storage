@@ -1,0 +1,31 @@
+{
+  "generated_by": "aux-infra: just versions-sync",
+  "schema_version": 1,
+  "targets": {
+    "hetzner-single-node": {
+      "artifact": {
+        "analytics_lambda_repository": null,
+        "arguments": {
+          "BUILD_PROFILE": "release",
+          "FDB_VERSION": "7.4.8",
+          "STORAGE_BACKEND": "foundationdb"
+        },
+        "bake_target": "app",
+        "kind": "container",
+        "platform": "linux/amd64",
+        "private_inputs": {},
+        "repository": "614073402005.dkr.ecr.us-east-1.amazonaws.com/aux-storage"
+      },
+      "component": "aux-storage",
+      "identity": {
+        "account_id": "614073402005",
+        "profile": "build-poweruser",
+        "region": "us-east-1",
+        "repository": "u19r/aux-storage-private",
+        "role_arn": "arn:aws:iam::614073402005:role/aux-build-eu-north-1-aux-storage-private-github-ecr-publish"
+      },
+      "repository": "u19r/aux-storage-private",
+      "schema_version": 1
+    }
+  }
+}

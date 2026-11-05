@@ -4,8 +4,9 @@ use std::future::Future;
 
 use storage_common::GsiTableUpdatePlan;
 use storage_types::{
-    BoundTableInfo, IndexName, StorageError, StorageResult, StoredTableInfo, TableDescription,
-    TableName, TableStatus, TimestampMillis, UpdateTableRequest, UpdateTableResponse,
+    BoundTableInfo, IndexName, StorageError, StorageResult, StoredTableInfo, StreamSpecification,
+    StreamViewType, TableDescription, TableName, TableStatus, TimestampMillis, UpdateTableRequest,
+    UpdateTableResponse,
 };
 
 use super::GsiReadinessSnapshot;
@@ -88,15 +89,16 @@ impl TableUpdateChange {
         request: &UpdateTableRequest,
     ) -> StorageResult<()> {
         if let Some(specification) = &request.stream_specification {
-            table.next_table.stream_specification = Some(specification.clone());
-            table.next_table.table_status = match (
-                specification.stream_enabled,
-                current.has_public_stream_request(),
-            ) {
-                (true, false) => TableStatus::Updating,
-                (false, _) => TableStatus::Active,
-                _ => current.table_status.clone(),
-            };
+            let specification =
+                plan_stream_specification(current.stream_specification.as_ref(), specification)?;
+            let stream_enabled = specification.stream_enabled;
+            table.next_table.stream_specification = Some(specification);
+            table.next_table.table_status =
+                match (stream_enabled, current.has_public_stream_request()) {
+                    (true, false) => TableStatus::Updating,
+                    (false, _) => TableStatus::Active,
+                    _ => current.table_status.clone(),
+                };
         }
         if let Some(storage_common::GsiLifecycleAction::Create(create)) = &table.lifecycle
             && !table.next_table.has_public_stream_request()
@@ -457,4 +459,33 @@ async fn describe_updated_table<A: TableUpdateTransaction + ?Sized>(
         TableDescription::from_bound_table_info(catalog.clone(), table.table_status.clone());
     readiness.apply_to_description(&mut table_description)?;
     Ok(UpdateTableResponse { table_description })
+}
+
+fn plan_stream_specification(
+    current: Option<&StreamSpecification>,
+    requested: &StreamSpecification,
+) -> StorageResult<StreamSpecification> {
+    // The Streams adapter renders an enabled legacy None view as
+    // NewAndOldImages. Preserve that effective view across disable and
+    // re-enable operations.
+    let current_view = current.and_then(|current| {
+        current.stream_view_type.clone().or_else(|| {
+            current
+                .stream_enabled
+                .then_some(StreamViewType::NewAndOldImages)
+        })
+    });
+    if current_view
+        .as_ref()
+        .zip(requested.stream_view_type.as_ref())
+        .is_some_and(|(current, requested)| current != requested)
+    {
+        return Err(StorageError::validation(
+            "Changing StreamViewType for an existing stream is not supported",
+        ));
+    }
+    Ok(StreamSpecification {
+        stream_enabled: requested.stream_enabled,
+        stream_view_type: requested.stream_view_type.clone().or(current_view),
+    })
 }

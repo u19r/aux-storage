@@ -1504,3 +1504,180 @@ async fn given_missing_when_observed_then_fail_closed_without_effect() -> anyhow
     result?;
     Ok(())
 }
+
+#[tokio::test]
+async fn given_native_publish_when_attributes_are_validated_then_types_and_limits_are_enforced()
+-> anyhow::Result<()> {
+    let fixture = TestStore::new().await;
+    let result = async {
+        let topic = fixture
+            .pubsub_provider
+            .create_topic(CreateTopicRequest {
+                name: TopicName::new("typed-attributes")?,
+                attributes: HashMap::new(),
+            })
+            .await?;
+        let mut request = PublishRequest {
+            topic_arn: topic.topic_arn,
+            message: "body".to_owned(),
+            subject: None,
+            message_attributes: (0..11)
+                .map(|index| {
+                    (
+                        format!("attr{index}"),
+                        pubsub_provider::MessageAttribute::String("value".to_owned()),
+                    )
+                })
+                .collect(),
+        };
+        fixture
+            .pubsub_provider
+            .accept_publish(
+                request.clone(),
+                pubsub_provider::PubsubMessageId::new(),
+                false,
+            )
+            .await?;
+        for attribute in [
+            pubsub_provider::MessageAttribute::Number("1000000001".into()),
+            pubsub_provider::MessageAttribute::Number("0.000001".into()),
+            pubsub_provider::MessageAttribute::StringArray("[{}]".into()),
+            pubsub_provider::MessageAttribute::Binary(Vec::new()),
+        ] {
+            request.message_attributes = HashMap::from([("test".into(), attribute)]);
+            anyhow::ensure!(
+                fixture
+                    .pubsub_provider
+                    .accept_publish(
+                        request.clone(),
+                        pubsub_provider::PubsubMessageId::new(),
+                        false
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        request.message_attributes.clear();
+        request.subject = Some("s".repeat(99));
+        fixture
+            .pubsub_provider
+            .accept_publish(
+                request.clone(),
+                pubsub_provider::PubsubMessageId::new(),
+                false,
+            )
+            .await?;
+        request.subject = Some("s".repeat(100));
+        anyhow::ensure!(
+            fixture
+                .pubsub_provider
+                .accept_publish(
+                    request.clone(),
+                    pubsub_provider::PubsubMessageId::new(),
+                    false
+                )
+                .await
+                .is_err()
+        );
+
+        request.subject = Some("line\nbreak".to_owned());
+        anyhow::ensure!(
+            fixture
+                .pubsub_provider
+                .accept_publish(request, pubsub_provider::PubsubMessageId::new(), false)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}
+
+#[tokio::test]
+async fn given_large_binary_attribute_when_fanout_is_materialized_then_all_values_round_trip()
+-> anyhow::Result<()> {
+    let fixture = TestStore::new().await;
+    let result = async {
+        let topic = fixture
+            .pubsub_provider
+            .create_topic(CreateTopicRequest {
+                name: TopicName::new("large-binary-fanout")?,
+                attributes: HashMap::new(),
+            })
+            .await?;
+        for index in 0..10 {
+            fixture
+                .pubsub_provider
+                .create_subscription(SubscribeRequest {
+                    topic_arn: topic.topic_arn.clone(),
+                    protocol: SubscriptionProtocol::Queue,
+                    endpoint: format!("http://localhost/000000000000/large-{index}"),
+                    attributes: HashMap::new(),
+                    extra_json: serde_json::Value::Null,
+                })
+                .await?;
+        }
+        let mut entropy = 1_u64;
+        let bytes = (0..262_000)
+            .map(|_| {
+                entropy ^= entropy << 13;
+                entropy ^= entropy >> 7;
+                entropy ^= entropy << 17;
+                entropy as u8
+            })
+            .collect();
+        let attribute = pubsub_provider::MessageAttribute::Binary(bytes);
+        fixture
+            .pubsub_provider
+            .accept_publish(
+                PublishRequest {
+                    topic_arn: topic.topic_arn,
+                    message: "body".into(),
+                    subject: None,
+                    message_attributes: HashMap::from([("blob".into(), attribute.clone())]),
+                },
+                PubsubMessageId::new(),
+                false,
+            )
+            .await?;
+        anyhow::ensure!(
+            fixture
+                .pubsub_provider
+                .materialize_publish_intents(100)
+                .await?
+                == 10
+        );
+        let now = TimestampMillis::now() + 1_000;
+        let request = ClaimDeliveryRecordsRequest {
+            owner: "large-binary-test".into(),
+            now,
+            lease_expires_at: now + 60_000,
+            limit: DeliveryClaimLimit::try_from(10_usize)?,
+        };
+        let mut claimed_ids = HashSet::new();
+        // Providers can return a short claim page at their byte budget.
+        for _ in 0..10 {
+            let claimed = fixture
+                .pubsub_provider
+                .claim_delivery_records(request.clone())
+                .await?;
+            if claimed.records.is_empty() {
+                break;
+            }
+            for record in claimed.records {
+                anyhow::ensure!(record.message_attributes.get("blob") == Some(&attribute));
+                anyhow::ensure!(
+                    claimed_ids.insert(record.id.0),
+                    "delivery was claimed twice"
+                );
+            }
+        }
+        anyhow::ensure!(claimed_ids.len() == 10);
+        Ok(())
+    }
+    .await;
+    fixture.finish().await;
+    result
+}

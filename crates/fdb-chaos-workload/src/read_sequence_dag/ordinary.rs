@@ -14,6 +14,7 @@ const ORDINARY_BATCH_GET_RETRY_BASE_DELAY_MS: u64 = 10;
 
 #[derive(Debug)]
 pub(super) enum OrdinaryFailure {
+    Native(StorageError),
     Storage(String),
     Fixture(String),
 }
@@ -125,7 +126,7 @@ async fn load_query_items(
                 consistent_read: query.consistent_read.unwrap_or(false),
             })
             .await
-            .map_err(|error| OrdinaryFailure::storage(storage_error_detail(&error)))?;
+            .map_err(OrdinaryFailure::Native)?;
         let continuation = result.continuation;
         items.extend(result.items);
         if continuation.is_none() {
@@ -155,7 +156,7 @@ async fn load_root_get(
     let item = provider
         .get_item(get.clone())
         .await
-        .map_err(|error| OrdinaryFailure::storage(storage_error_detail(&error)))?
+        .map_err(OrdinaryFailure::Native)?
         .item
         .map(|item| {
             <HashMap<String, AttributeValue> as storage_types::TryFromWireItem>::try_from_wire_item(
@@ -238,6 +239,25 @@ async fn load_child_batch(
     get: &GetItemRequest,
     keys: Vec<KeyAttributes>,
 ) -> Result<storage_types::BatchGetItemResponse, OrdinaryFailure> {
+    let mut responses = HashMap::new();
+    for chunk in keys.chunks(100) {
+        let mut response =
+            load_child_batch_chunk(simulation, provider, get, chunk.to_vec()).await?;
+        merge_batch_get_page(&mut responses, &mut response);
+    }
+    Ok(storage_types::BatchGetItemResponse {
+        responses: (!responses.is_empty()).then(|| responses.into_iter().collect()),
+        unprocessed_keys: None,
+        consumed_capacity: None,
+    })
+}
+
+async fn load_child_batch_chunk(
+    simulation: &WorkloadContext,
+    provider: &Arc<dyn storage_provider::DynamoOperations>,
+    get: &GetItemRequest,
+    keys: Vec<KeyAttributes>,
+) -> Result<storage_types::BatchGetItemResponse, OrdinaryFailure> {
     let mut request_items: HashMap<TableName, KeysAndAttributes> = [(
         get.table_name.clone(),
         KeysAndAttributes {
@@ -259,7 +279,7 @@ async fn load_child_batch(
                 return_consumed_capacity: None,
             })
             .await
-            .map_err(|error| OrdinaryFailure::storage(storage_error_detail(&error)))?;
+            .map_err(OrdinaryFailure::Native)?;
         let unprocessed_keys = merge_batch_get_page(&mut responses, &mut response);
         let Some(next_request_items) = next_batch_get_request(attempt, unprocessed_keys)? else {
             return Ok(storage_types::BatchGetItemResponse {
@@ -274,7 +294,7 @@ async fn load_child_batch(
             ))
             .await
             .map_err(|error| {
-                OrdinaryFailure::storage(format!("ordinary BatchGet retry delay failed: {error}"))
+                OrdinaryFailure::fixture(format!("ordinary BatchGet retry delay failed: {error}"))
             })?;
         request_items = next_request_items;
     }

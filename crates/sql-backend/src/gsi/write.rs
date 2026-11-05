@@ -4,8 +4,11 @@ use storage_backfill::{GsiBuildTarget, GsiProjectionWriteBatch};
 use storage_provider::GsiWriteSource;
 use storage_types::{AttributeValue, BoundTableInfo, StorageError, StorageResult};
 
-use super::sql_statements::{BoundProjectionKey, GsiUpsertSql, render_gsi_upsert};
-use crate::{SqlLayout, SqlStatement, SqlValue};
+use super::sql_statements::BoundProjectionKey;
+use crate::{
+    SqlLayout, SqlValue,
+    write_batch::{PreparedUpsertRow, UpsertShape},
+};
 
 pub(crate) struct GsiWriteInput<'a> {
     pub table: &'a BoundTableInfo,
@@ -18,7 +21,7 @@ pub(crate) struct GsiWriteInput<'a> {
 pub(crate) fn prepare_gsi_writes(
     engine: impl SqlLayout,
     input: GsiWriteInput<'_>,
-) -> StorageResult<Vec<SqlStatement>> {
+) -> StorageResult<Vec<PreparedUpsertRow>> {
     let mut rows = Vec::new();
     let writes = input.writes.into_iter();
     rows.try_reserve_exact(writes.len())
@@ -46,7 +49,7 @@ pub(crate) fn prepare_gsi_writes(
 pub(crate) struct PreparedGsiWrite {
     pub(crate) history_id: storage_types::TableHistoryId,
     pub(crate) key: storage_backfill::GsiProjectionKey,
-    sql: GsiUpsertSql,
+    shape: UpsertShape,
     binds: Vec<SqlValue>,
     revision_bind: usize,
 }
@@ -82,11 +85,18 @@ impl PreparedGsiWrite {
             .map_err(|_| storage_types::InfrastructureResultKind::NativeCapacityRejected)?;
         columns.extend(payload_columns);
         binds.extend(payload_binds);
-        let sql = render_gsi_upsert(engine, &columns, key_count, &numeric_keys)?;
+        let conflict_columns = columns
+            .get(..key_count)
+            .ok_or_else(|| StorageError::internal("GSI conflict key count exceeds columns"))?
+            .to_vec();
+        let numeric_columns = (1..=columns.len())
+            .map(|position| numeric_keys.contains(&position))
+            .collect::<Vec<_>>();
+        let shape = UpsertShape::try_new(columns, numeric_columns, conflict_columns, true)?;
         Ok(Self {
             history_id: table.history_id,
             key: key.clone(),
-            sql,
+            shape,
             binds,
             revision_bind: key_count + 1,
         })
@@ -98,19 +108,20 @@ impl PreparedGsiWrite {
         table: &BoundTableInfo,
         revision: storage_types::ItemRevision,
         targets: &[GsiBuildTarget],
-    ) -> StorageResult<SqlStatement> {
+    ) -> StorageResult<PreparedUpsertRow> {
         let target = targets
             .iter()
             .find(|target| {
                 target.table_name == table.table_name && target.index_name == self.key.index_name
             })
             .ok_or_else(|| StorageError::internal("SQL GSI write target was not bound"))?;
-        let physical = engine.gsi_table_name(&target.incarnation);
+        let relation = engine.gsi_table_name(&target.incarnation);
         self.binds[self.revision_bind] = SqlValue::Integer(i64::try_from(revision)?);
-        Ok(SqlStatement::new(
-            self.sql.bind_relation(&physical)?,
-            self.binds,
-        ))
+        Ok(PreparedUpsertRow {
+            relation,
+            shape: self.shape,
+            binds: self.binds,
+        })
     }
 }
 
