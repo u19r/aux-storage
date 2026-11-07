@@ -69,4 +69,6 @@ pub(crate) const DEFAULT_JOB_INTERVALS: crate::jobs::DatabaseJobIntervals =
         stream_trim_interval_ms: crate::JobIntervalMillis(3_600_000),
         table_reclaim_interval_ms: crate::JobIntervalMillis(30_000),
         queue_message_cleanup_interval_ms: crate::JobIntervalMillis(60_000),
+        // Matches the ten-minute transact-write idempotency window.
+        transact_receipt_trim_interval_ms: crate::JobIntervalMillis(600_000),
     };

@@ -105,6 +105,16 @@ impl ExpirationRepository for FaultingExpirationRepository {
         }
         Ok(result)
     }
+
+    async fn trim_transact_receipts_page(
+        &self,
+        after: Option<String>,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>> {
+        self.repository
+            .trim_transact_receipts_page(after, limit)
+            .await
+    }
 }
 
 impl StatefulTestBackend {

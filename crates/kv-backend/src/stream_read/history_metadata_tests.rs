@@ -57,6 +57,7 @@ async fn given_local_histories_when_metadata_is_read_then_native_heads_supply_th
 
 #[cfg(feature = "foundationdb")]
 #[tokio::test]
+#[ignore = "requires an owned FoundationDB fixture (FDB_CLUSTER_FILE)"]
 async fn given_chunked_histories_when_metadata_is_read_then_first_chunks_are_batched_and_committed()
 {
     let cluster = std::env::var("FDB_CLUSTER_FILE").expect("owned FoundationDB fixture");

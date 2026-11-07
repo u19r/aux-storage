@@ -15,6 +15,7 @@ use storage_provider::{
     StreamDurationTrimConfig, TableReclaimHandler, TableReclaimRepository,
     maintenance::{
         ExpirationHandler, GsiBuildHandler, PartitionReconciliationHandler, RetentionHandler,
+        TransactReceiptTrimHandler,
     },
 };
 use storage_types::{StorageError, StorageResult};
@@ -41,6 +42,12 @@ impl MaintenanceJobCatalog {
             schema_version,
             seed_now,
         };
+        registration.register_job(&mut catalog, StorageJob::TransactReceiptTrim, |interval| {
+            TransactReceiptTrimHandler::try_new(
+                Arc::clone(&repositories.expiration_repository),
+                interval,
+            )
+        })?;
         registration.register_job(&mut catalog, StorageJob::TtlSweep, |interval| {
             ExpirationHandler::try_new(repositories.expiration_repository, interval)
         })?;

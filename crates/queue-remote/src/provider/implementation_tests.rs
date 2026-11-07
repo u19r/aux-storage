@@ -500,7 +500,7 @@ async fn given_sqs_delivery_when_receiving_then_durable_attempt_and_original_age
     let server = MockServer::start();
     let receive = server.mock(|when, then| {
         when.method(POST).header("x-amz-target", "AmazonSQS.ReceiveMessage")
-            .json_body_includes(serde_json::json!({"AttributeNames": ["SentTimestamp", "ApproximateReceiveCount"], "MessageAttributeNames": ["All"]}).to_string());
+            .json_body_includes(serde_json::json!({"MessageSystemAttributeNames": ["SentTimestamp", "ApproximateReceiveCount"], "MessageAttributeNames": ["All"]}).to_string());
         then.status(200).json_body_obj(&serde_json::json!({"Messages": [{
             "MessageId": "message", "ReceiptHandle": "receipt", "MD5OfBody": "digest", "Body": "work",
             "Attributes": {"SentTimestamp": "1000", "ApproximateReceiveCount": "180"}

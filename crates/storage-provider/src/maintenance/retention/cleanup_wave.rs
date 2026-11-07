@@ -56,7 +56,7 @@ async fn load_cleanup_works(
     pending: Vec<(StreamTrimDueMarker, StreamTrimState)>,
     finishes: &mut Vec<StreamRetentionFinish>,
 ) -> StorageResult<Vec<TableCleanupWork>> {
-    let (source, _) = attempt.read_system_page_start(None).await?;
+    let source = attempt.read_system_page_start().await?;
     let tables = load_tables(attempt, &pending).await?;
     let mut works = Vec::new();
     for ((marker, state), table) in pending.into_iter().zip(tables) {

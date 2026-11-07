@@ -6,16 +6,12 @@ use futures::future::BoxFuture;
 use storage_common::partition::{
     PartitionInfo, PartitionLoadSampleRecord, ResolvedPartitionFamily,
 };
-use storage_types::{
-    AttemptMode, Clock, StorageError, StorageResult, StreamItemId, StreamName,
-    SystemStreamCheckpoint,
-};
+use storage_types::{AttemptMode, Clock, StorageError, StorageResult, StreamItemId, StreamName};
 
 use crate::{
     CursorName, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem, StreamReadKind,
     StreamReadRequest, StreamReadResult, StreamRowKind, StreamRowPage, StreamRowValue,
-    SystemStreamCheckpointIssue, SystemStreamHistory, SystemStreamSplitOperationId,
-    SystemStreamSplitReceipt,
+    SystemStreamHistory, SystemStreamSplitOperationId, SystemStreamSplitReceipt,
 };
 
 /// The selected physical stream layout's behavior when a caller requests
@@ -99,14 +95,6 @@ pub trait StreamAttempt:
     fn write_system_split(
         &mut self,
         receipt: &SystemStreamSplitReceipt,
-    ) -> impl Future<Output = StorageResult<()>> + Send;
-
-    /// Issue a logical-history checkpoint with its token and frontier in this
-    /// same native attempt. Ordinary stream cursors cannot express its lineage.
-    fn write_system_stream_checkpoint(
-        &mut self,
-        issue: &SystemStreamCheckpointIssue,
-        checkpoint: &SystemStreamCheckpoint,
     ) -> impl Future<Output = StorageResult<()>> + Send;
 
     /// Store the caller's fully addressed row in this native attempt. The

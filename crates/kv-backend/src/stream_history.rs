@@ -7,13 +7,11 @@ use serde::{Deserialize, Serialize};
 use storage_provider::{SYSTEM_STREAM_SNAPSHOT_BYTES, SYSTEM_STREAM_SNAPSHOT_ROWS};
 use storage_types::{
     SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES, StorageEnum, StorageError, StorageResult,
-    SystemStreamCheckpoint, SystemStreamCheckpointToken, SystemStreamPosition, SystemStreamScope,
-    storage_serde,
+    SystemStreamCheckpoint, SystemStreamPosition, SystemStreamScope, storage_serde,
 };
 use stream_provider::{
-    DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamCheckpointReceipt,
-    SystemStreamHistory, SystemStreamHistoryBounds, SystemStreamLineage,
-    SystemStreamLineageCatalog,
+    DYNAMO_SYSTEM_LINEAGE_ID, DYNAMO_SYSTEM_SHARD_ID, SystemStreamHistory,
+    SystemStreamHistoryBounds, SystemStreamLineage, SystemStreamLineageCatalog,
 };
 
 use crate::{
@@ -23,7 +21,6 @@ use crate::{
         SYSTEM_STREAM_LINEAGE_PREFIX as LINEAGE_PREFIX, SYSTEM_STREAM_SCHEMA_KEY as SCHEMA_KEY,
         SYSTEM_STREAM_SCOPE_KEY as SCOPE_KEY, SYSTEM_STREAM_SEQUENCE_PREFIX as SEQUENCE_PREFIX,
     },
-    stream_checkpoint,
 };
 
 // Persisted identifiers are open-ended strings, validated when the row is
@@ -259,87 +256,58 @@ impl KvSystemWriteState {
 pub(crate) async fn read_history<A: KvAttempt>(
     attempt: &A,
 ) -> StorageResult<(u64, SystemStreamHistory)> {
-    let (epoch, history, _) = read_history_with_protection(
-        attempt,
-        ReadProtection::Conflict,
-        ReadProtection::Snapshot,
-        None,
-    )
-    .await?;
+    let (epoch, history) =
+        read_history_with_protection(attempt, ReadProtection::Conflict, ReadProtection::Snapshot)
+            .await?;
     Ok((epoch, history))
 }
 
 pub(crate) async fn read_history_protected<A: KvAttempt>(
     attempt: &A,
 ) -> StorageResult<(u64, SystemStreamHistory)> {
-    let (epoch, history, _) = read_history_with_protection(
-        attempt,
-        ReadProtection::Conflict,
-        ReadProtection::Conflict,
-        None,
-    )
-    .await?;
+    let (epoch, history) =
+        read_history_with_protection(attempt, ReadProtection::Conflict, ReadProtection::Conflict)
+            .await?;
     Ok((epoch, history))
 }
 
-/// Keep catalog, checkpoint, and private hold observations in the caller's
+/// Keep catalog and private hold observations in the caller's
 /// protected attempt. The shared history model owns all trim decisions.
 /// Discovery needs one coherent read snapshot but does not commit a write.
 pub(crate) async fn read_history_for_catalog<A: KvAttempt>(
     attempt: &A,
 ) -> StorageResult<SystemStreamHistory> {
-    read_history_with_protection(
-        attempt,
-        ReadProtection::Snapshot,
-        ReadProtection::Snapshot,
-        None,
-    )
-    .await
-    .map(|(_, history, _)| history)
+    read_history_with_protection(attempt, ReadProtection::Snapshot, ReadProtection::Snapshot)
+        .await
+        .map(|(_, history)| history)
 }
 
 pub(crate) async fn read_page_start<A: KvAttempt>(
     attempt: &A,
-    token: Option<&SystemStreamCheckpointToken>,
     protection: ReadProtection,
-) -> StorageResult<(SystemStreamHistory, Option<SystemStreamCheckpointReceipt>)> {
-    let (_, history, receipt) =
-        read_history_with_protection(attempt, protection, protection, token).await?;
-    Ok((history, receipt))
+) -> StorageResult<SystemStreamHistory> {
+    let (_, history) = read_history_with_protection(attempt, protection, protection).await?;
+    Ok(history)
 }
 
-/// Read one page snapshot while protecting only the catalog identity and the
-/// checkpoint receipt key. Sequence and lineage rows advance on ordinary
-/// writes; they are read from the attempt snapshot so a busy stream does not
-/// abort every page read.
+/// Read one page snapshot while protecting only the catalog identity.
+/// Sequence and lineage rows advance on ordinary writes; they are read from
+/// the attempt snapshot so a busy stream does not abort every page read.
 pub(crate) async fn read_page_start_snapshot<A: KvAttempt>(
     attempt: &A,
-    token: Option<&SystemStreamCheckpointToken>,
-) -> StorageResult<(SystemStreamHistory, Option<SystemStreamCheckpointReceipt>)> {
-    let (_, history, receipt) = read_history_with_protection(
-        attempt,
-        ReadProtection::Conflict,
-        ReadProtection::Snapshot,
-        token,
-    )
-    .await?;
-    Ok((history, receipt))
+    protection: ReadProtection,
+) -> StorageResult<SystemStreamHistory> {
+    let (_, history) =
+        read_history_with_protection(attempt, protection, ReadProtection::Snapshot).await?;
+    Ok(history)
 }
 
 async fn read_history_with_protection<A: KvAttempt>(
     attempt: &A,
     catalog_protection: ReadProtection,
     sequence_protection: ReadProtection,
-    token: Option<&SystemStreamCheckpointToken>,
-) -> StorageResult<(
-    u64,
-    SystemStreamHistory,
-    Option<SystemStreamCheckpointReceipt>,
-)> {
-    let mut keys = vec![CATALOG_EPOCH_KEY.to_vec(), SCOPE_KEY.to_vec()];
-    if let Some(token) = token {
-        keys.push(stream_checkpoint::key_layout::token(token));
-    }
+) -> StorageResult<(u64, SystemStreamHistory)> {
+    let keys = vec![CATALOG_EPOCH_KEY.to_vec(), SCOPE_KEY.to_vec()];
     let ((values, pages), native_version) = try_join(
         try_join(
             attempt.get_batch(keys, catalog_protection),
@@ -357,15 +325,6 @@ async fn read_history_with_protection<A: KvAttempt>(
     let mut values = values.into_iter();
     let epoch = values.next().ok_or_else(unavailable)?;
     let scope_bytes = values.next().ok_or_else(unavailable)?;
-    let receipt = if token.is_some() {
-        values
-            .next()
-            .ok_or_else(unavailable)?
-            .map(|bytes| storage_serde::from_bytes(&bytes))
-            .transpose()?
-    } else {
-        None
-    };
     if values.next().is_some() {
         return Err(unavailable());
     }
@@ -437,7 +396,7 @@ async fn read_history_with_protection<A: KvAttempt>(
     } else {
         history
     };
-    Ok((epoch, history, receipt))
+    Ok((epoch, history))
 }
 
 fn prefix_range(prefix: &[u8]) -> StorageResult<KvRange> {

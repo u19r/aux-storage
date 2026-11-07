@@ -182,7 +182,7 @@ async fn load_source_rows<P: DynamoPort>(store: &P) -> Vec<SystemHistoryRecord> 
     store
         .with_dynamo_attempt(AttemptMode::ReadWrite, move |attempt| {
             Box::pin(async move {
-                let (source, _) = attempt.read_system_page_start(None).await?;
+                let source = attempt.read_system_page_start().await?;
                 let initial = source.initial_checkpoint().unwrap();
                 let high = source.capture_high().unwrap();
                 let plan = source.plan_page(&initial, &high, 200).unwrap();

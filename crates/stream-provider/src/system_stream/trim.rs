@@ -381,7 +381,7 @@ pub async fn execute_trim_page<A: SystemStreamTrimAttempt>(
             return current.replay(&request);
         }
         request.validate_predecessor(predecessor.as_ref())?;
-        let (history, _) = attempt.read_system_page_start(None).await?;
+        let history = attempt.read_system_page_start().await?;
         history
             .validate_scope(request.scope())
             .map_err(|_| StorageError::internal("SystemStream trim has another source"))?;

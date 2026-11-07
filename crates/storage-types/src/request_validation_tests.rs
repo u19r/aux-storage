@@ -6,8 +6,8 @@ use crate::{
     BatchGetItemRequest, BatchWriteItemRequest, CreateTableRequest, DeleteItemRequest,
     DeleteTableRequest, DescribeTableRequest, GetItemRequest, GetStreamRecordsRequest,
     ListTablesRequest, PutItemRequest, QueryRequest, ScanRequest, StreamRetentionDuration,
-    SystemStreamCheckpointToken, TableName, TransactGetItemsRequest, TransactWriteItemsRequest,
-    UpdateItemRequest, UpdateTableRequest,
+    TableName, TransactGetItemsRequest, TransactWriteItemsRequest, UpdateItemRequest,
+    UpdateTableRequest,
 };
 
 fn valid_create_table_payload() -> serde_json::Value {
@@ -419,7 +419,7 @@ fn system_stream_rejects_legacy_last_evaluated_key_resume_tokens() {
 
 #[test]
 fn system_stream_checkpoint_requires_source_scope() {
-    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16))).unwrap();
+    let token = crate::system_stream_checkpoint_tests::token("0");
     let request = json!({
         "SystemStream": true,
         "Checkpoint": token.as_str(),
@@ -432,7 +432,7 @@ fn system_stream_checkpoint_requires_source_scope() {
 
 #[test]
 fn ordinary_stream_rejects_system_scope_and_checkpoint_fields() {
-    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16))).unwrap();
+    let token = crate::system_stream_checkpoint_tests::token("0");
     let request = json!({
         "TableName": "TestTable",
         "SourceScope": {

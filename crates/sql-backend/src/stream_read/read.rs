@@ -8,7 +8,7 @@ use stream_provider::{
 use super::{row, sql_statements};
 use crate::{
     ReadProtection, SqlAttempt, SqlLayout, catalog::SqlCatalogAttempt,
-    constants::STREAM_READ_BYTES, stream_checkpoint, stream_history,
+    constants::STREAM_READ_BYTES, stream_history,
 };
 
 pub(crate) async fn read_stream<A: SqlAttempt>(
@@ -37,17 +37,13 @@ pub(crate) async fn read_stream<A: SqlAttempt>(
             let history = stream_history::read_history(attempt, engine).await?;
             Ok(StreamReadResult::SystemCatalog(history))
         }
-        StreamReadKind::System(SystemStreamReadKind::Checkpoint(lookup)) => {
-            stream_checkpoint::read_receipt(attempt, engine, lookup)
-                .await
-                .map(StreamReadResult::SystemCheckpoint)
-        }
     }
 }
 
 pub(crate) async fn read_system_history_pages<A: SqlAttempt>(
     attempt: &mut A,
     engine: impl SqlLayout,
+    protection: ReadProtection,
     reads: &[SystemStreamHistoryRead],
 ) -> StorageResult<Vec<SystemStreamHistoryReadPage>> {
     let retired = crate::stream_allocation::load_retired_offsets(
@@ -66,7 +62,7 @@ pub(crate) async fn read_system_history_pages<A: SqlAttempt>(
     let pages = attempt
         .query_batch(
             statements,
-            ReadProtection::Conflict,
+            protection,
             crate::constants::SYSTEM_STREAM_PAGE_READ_BYTES,
         )
         .await?;

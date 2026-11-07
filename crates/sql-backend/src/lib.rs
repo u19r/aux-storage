@@ -61,7 +61,6 @@ mod stream_allocation;
 #[cfg(test)]
 mod stream_allocation_tests;
 mod stream_catalog;
-mod stream_checkpoint;
 mod stream_cursor;
 pub mod stream_history;
 mod stream_read;

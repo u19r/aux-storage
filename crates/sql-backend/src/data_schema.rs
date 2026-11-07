@@ -11,10 +11,9 @@ use crate::{
     pubsub_subscription::initialize_pubsub_subscriptions, pubsub_topic::initialize_pubsub_topics,
     queue_catalog::initialize_queue_catalog, queue_message::initialize_queue_messages,
     retention::initialize_retention, stream_catalog::initialize_stream_catalog,
-    stream_checkpoint::initialize_checkpoints, stream_cursor::initialize_stream_cursors,
-    stream_history::initialize_system_stream, stream_trim::initialize_trim_receipts,
-    stream_write::initialize_stream_rows, table_reclaim::initialize_table_reclaim,
-    transact_write::initialize_transact_receipts,
+    stream_cursor::initialize_stream_cursors, stream_history::initialize_system_stream,
+    stream_trim::initialize_trim_receipts, stream_write::initialize_stream_rows,
+    table_reclaim::initialize_table_reclaim, transact_write::initialize_transact_receipts,
 };
 
 pub(crate) async fn initialize_data_schema<A: SqlAttempt>(
@@ -33,7 +32,6 @@ pub(crate) async fn initialize_data_schema<A: SqlAttempt>(
     initialize_maintenance(attempt, engine).await?;
     initialize_stream_rows(attempt, engine).await?;
     initialize_system_stream(attempt, engine).await?;
-    initialize_checkpoints(attempt, engine).await?;
     initialize_stream_catalog(attempt, engine).await?;
     initialize_stream_cursors(attempt, engine).await?;
     initialize_trim_receipts(attempt, engine).await?;

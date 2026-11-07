@@ -155,6 +155,69 @@ The workspace is structured around backend features:
 
 Backend support varies by crate. Check each crate's `Cargo.toml` before enabling a feature in a downstream workspace.
 
+## QuerySourcePage Extension
+
+`QuerySourcePage` is an Aux extension, not a standard DynamoDB API. It queries a table
+or index and returns each item together with a separate, decoded storage key. Over HTTP,
+use `x-amz-target: DynamoDB_20120810.QuerySourcePage` with the snake_case fields of
+[`QueryTableRequest`](crates/storage-types/src/request_response/internal.rs).
+It requires an Aux service; AWS DynamoDB does not implement this target.
+
+### Difference from query_table
+
+Both Rust methods use the same query execution path, key conditions, ordering, limits,
+consistency rules, and pagination. Their return values differ:
+
+| Method | Each entry in `page.items` | Page metadata |
+| --- | --- | --- |
+| `query_table` | Item attributes (`WireItem`) | Evaluated item count, evaluated bytes, last evaluated key, continuation token |
+| `query_source_page` | `{ key: ItemKey, item: WireItem }` | The same metadata |
+
+`projection_expression` applies to the returned item in both methods. `QuerySourcePage`
+does **not** guarantee unprojected items. Omit the expression to keep all attributes available
+from the selected table or index. An index query returns the index's stored projection;
+it does not automatically fetch the complete base-table item. Continue paging by passing
+`page.continuation` as the next request's `exclusive_start_key`.
+
+### What the separate key means
+
+`ItemKey` contains the table name and decoded partition/sort key values. For an index,
+it also contains the index name, index key values, and base-table key. It does not expose
+raw FoundationDB or RocksDB key bytes, SQL row locations, or Postgres tuple identifiers.
+
+- Postgres, SQLite, and Turso decode the key from dedicated SQL key columns alongside
+  the item payload.
+- RocksDB and FoundationDB decode base-table keys from the native KV key. For index
+  reads, the backend reconstructs the logical key using item attributes and checks the
+  native ordered index key, including its base-table key component.
+
+For a complete, valid item, extracting its key attributes is normally enough for ordinary
+application reads. Native SQL and KV range readers already check that stored key attributes
+agree with the storage key. The separate `key` preserves the storage address through
+response projection and remote forwarding, instead of requiring callers to reconstruct it
+from the returned attributes. A remote client receives this address from the Aux server;
+it does not independently inspect the server's database.
+
+For typed entities, there is another comparison: the entity's fields may imply a different
+key even when the stored `pk` and `sk` agree with storage. For example, a record stored at
+`pk=roles, sk=role-123` could contain `role_id=role-456`. Entity validation checks that the
+decoded entity belongs at the returned address. `QuerySourcePage` supplies the address;
+it does not itself validate application entity identity.
+
+### When to use it
+
+- Use `query_table` for ordinary queries that need item attributes.
+- Use `query_table_stored_entity<T>` for complete typed entities with automatic stored
+  and addressed identity checks. It uses `query_source_page` internally; provide the
+  attributes required to decode and validate the entity.
+- Use `query_source_page` directly when repository or maintenance code needs each storage
+  address separately, including when a projection omits key attributes or when the caller
+  needs to validate or reject individual entities itself.
+- Use standard DynamoDB `Query` when compatibility with AWS DynamoDB clients and servers
+  is required.
+
+The extension does not make index reads fresher or strengthen their consistency guarantees.
+
 ## ReadSequence Extension
 
 `ReadSequence` is an aux-storage DynamoDB JSON protocol extension for bounded graph-shaped read

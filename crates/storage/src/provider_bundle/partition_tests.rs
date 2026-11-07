@@ -357,7 +357,16 @@ async fn given_ten_job_nodes_when_claiming_one_partition_job_then_one_canonical_
                 futures::future::join_all(runtimes.iter().map(|runtime| runtime.drive_once())).await
             {
                 match result {
+                    // Ten nodes race for one claim. Losing nodes legitimately
+                    // observe a fenced lease or a commit identity that the
+                    // winner already retired; the canonical-split assertions
+                    // below prove the single winning publication.
                     Ok(_) | Err(scheduled_bg_jobs::JobSystemError::LeaseConflict) => {}
+                    Err(scheduled_bg_jobs::JobSystemError::StoreContract(error))
+                        if matches!(
+                            error.to_string().as_str(),
+                            "commit identity is retired" | "commit recovery authority was fenced"
+                        ) => {}
                     Err(error) => panic!("competing claim and dispatch: {error:?}"),
                 }
             }

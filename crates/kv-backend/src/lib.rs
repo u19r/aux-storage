@@ -49,7 +49,6 @@ mod store_clock_tests;
 mod store_tests;
 mod stream;
 mod stream_catalog;
-mod stream_checkpoint;
 mod stream_cursor;
 pub mod stream_history;
 mod stream_partition;

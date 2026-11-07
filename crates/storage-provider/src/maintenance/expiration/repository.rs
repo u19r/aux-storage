@@ -95,6 +95,13 @@ pub trait ExpirationTransaction {
 pub trait ExpirationRepository: Send + Sync {
     async fn advance_expiration(&self, request: ExpirationRequest)
     -> StorageResult<StepResult<()>>;
+
+    /// Trim one page of expired transact-write receipts; `None` ends the pass.
+    async fn trim_transact_receipts_page(
+        &self,
+        after: Option<String>,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>>;
 }
 
 #[async_trait]
@@ -114,6 +121,23 @@ where for<'native> P::Attempt<'native>: ExpirationPort
                     ExpirationAttempt::new(attempt, bindings)
                         .advance_expiration(&request)
                         .await
+                })
+            })
+        })
+        .await
+    }
+
+    async fn trim_transact_receipts_page(
+        &self,
+        after: Option<String>,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>> {
+        let at = self.now();
+        retry_native_conflicts(self, DYNAMO_WRITE_RETRY, || {
+            let after = after.clone();
+            self.with_dynamo_attempt(storage_types::AttemptMode::ReadWrite, move |attempt| {
+                Box::pin(async move {
+                    super::trim_transact_receipts_page(attempt, after.as_deref(), limit, at).await
                 })
             })
         })

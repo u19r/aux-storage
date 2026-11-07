@@ -7,7 +7,10 @@ use std::{
 
 use futures::{FutureExt as _, future::join_all};
 use storage_observability_test_support::observation::observe;
-use storage_types::{SystemStreamCheckpointToken, SystemStreamScope};
+use storage_types::{
+    SystemStreamCheckpoint, SystemStreamCheckpointToken, SystemStreamPosition, SystemStreamScope,
+    TimestampMillis,
+};
 use stream_provider::SystemStreamPageRequest;
 use tokio::sync::Barrier;
 use tracing::Level;
@@ -22,8 +25,17 @@ async fn given_wrong_scope_generation_or_forged_checkpoint_when_system_cdc_is_re
     let store = TestStore::new().await;
     let outcome = AssertUnwindSafe(async {
         let scope = store.stream_operations.system_stream_scope().await.unwrap();
-        let forged_text = format!("v1.{}", "ab".repeat(16));
-        let forged = SystemStreamCheckpointToken::try_from(forged_text.as_str()).unwrap();
+        let forged_frontier = SystemStreamCheckpoint::try_new(
+            scope.clone(),
+            vec![SystemStreamPosition::try_new("forged-shard", "forged-lineage", "0").unwrap()],
+        )
+        .unwrap();
+        let forged = SystemStreamCheckpointToken::encode(
+            &forged_frontier,
+            TimestampMillis::from_timestamp(0),
+        )
+        .unwrap();
+        let forged_text = forged.as_str().to_owned();
         let cases = [
             (
                 SystemStreamPageRequest::try_new(
@@ -46,7 +58,7 @@ async fn given_wrong_scope_generation_or_forged_checkpoint_when_system_cdc_is_re
             ),
             (
                 SystemStreamPageRequest::try_new(scope, Some(forged), 1).unwrap(),
-                "SystemStream checkpoint token is not issued for this source",
+                "SystemStream checkpoint names an unknown lineage",
             ),
         ];
 

@@ -48,4 +48,36 @@ where for<'native> P::Attempt<'native>: ExpirationPort + PhysicalRecordAttempt
         })
         .await
     }
+
+    async fn trim_transact_receipts_page(
+        &self,
+        after: Option<String>,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<Option<String>> {
+        // Receipts are node-local idempotency bookkeeping: the journal never
+        // replicates them, so their trim is an unjournaled native attempt.
+        let at = self.port.now();
+        retry_native_conflicts(self.port.as_ref(), DYNAMO_WRITE_RETRY, || {
+            let after = after.clone();
+            Arc::clone(&self.journal).with_admitted_attempt(
+                (
+                    self.port.as_ref(),
+                    storage_provider::native_admission::NativeWork::Background,
+                ),
+                crate::journal::NativeAttempt::Items(AttemptMode::ReadWrite),
+                move |attempt, _| {
+                    Box::pin(async move {
+                        storage_provider::maintenance::trim_transact_receipts_page(
+                            attempt,
+                            after.as_deref(),
+                            limit,
+                            at,
+                        )
+                        .await
+                    })
+                },
+            )
+        })
+        .await
+    }
 }

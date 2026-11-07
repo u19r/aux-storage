@@ -61,7 +61,9 @@ pub trait DynamoOperations: Send + Sync {
         &self,
         request: storage_types::QueryTableRequest,
     ) -> StorageResult<crate::RangeReadPage<storage_types::WireItem>>;
-    /// Native source addresses are independent of persisted item attributes.
+    /// Aux extension: query items together with decoded table/index storage
+    /// keys. Response projection still applies to items; keys remain separate.
+    /// AWS DynamoDB does not implement the remote QuerySourcePage target.
     async fn query_source_page(
         &self,
         _request: storage_types::QueryTableRequest,

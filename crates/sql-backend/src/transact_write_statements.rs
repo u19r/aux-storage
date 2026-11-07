@@ -27,6 +27,39 @@ pub(super) fn read_receipt(engine: impl SqlLayout, token: &str) -> SqlStatement 
     )
 }
 
+pub(super) fn scan_receipts(
+    engine: impl SqlLayout,
+    after: Option<&str>,
+    limit: u32,
+) -> SqlStatement {
+    SqlStatement::new(
+        format!(
+            "SELECT token, receipt_blob FROM {relation_sys_transact_receipts} WHERE token > {} \
+             ORDER BY token LIMIT {limit}",
+            engine.engine().placeholder(1),
+            relation_sys_transact_receipts = engine.relation_name("sys_transact_receipts"),
+        ),
+        vec![SqlValue::Text(after.unwrap_or_default().to_owned())],
+    )
+}
+
+/// Delete only while the bytes still equal the scanned receipt, so a receipt
+/// rewritten after the scan survives.
+pub(super) fn delete_receipt(engine: impl SqlLayout, token: &str, receipt: &[u8]) -> SqlStatement {
+    SqlStatement::new(
+        format!(
+            "DELETE FROM {relation_sys_transact_receipts} WHERE token = {} AND receipt_blob = {}",
+            engine.engine().placeholder(1),
+            engine.engine().placeholder(2),
+            relation_sys_transact_receipts = engine.relation_name("sys_transact_receipts"),
+        ),
+        vec![
+            SqlValue::Text(token.to_owned()),
+            SqlValue::Blob(receipt.to_vec()),
+        ],
+    )
+}
+
 pub(super) fn write_receipt(engine: impl SqlLayout, token: &str, receipt: Vec<u8>) -> SqlStatement {
     SqlStatement::new(
         format!(

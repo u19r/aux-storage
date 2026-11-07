@@ -156,7 +156,7 @@ impl<P: GsiPort, S: GsiTargetAdmission<P>> GsiBuildTransaction for GsiAttempt<'_
     ) -> StorageResult<GsiStreamSourcePage> {
         let table = self.load_table(&target.table_name).await?;
         target.validate_table(&table)?;
-        let (history, _) = self.port.read_system_page_start(None).await?;
+        let history = self.port.read_system_page_start().await?;
         let plan = history
             .plan_page(
                 after,

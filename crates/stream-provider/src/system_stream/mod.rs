@@ -7,7 +7,6 @@
 //! while physical stream/table identifiers remain provider-private.
 
 mod catalog;
-mod checkpoint;
 mod history;
 #[cfg(test)]
 mod history_tests;
@@ -24,10 +23,6 @@ mod trim;
 mod trim_tests;
 
 pub use catalog::{SystemStreamLineage, SystemStreamLineageCatalog};
-pub use checkpoint::{
-    SystemStreamCheckpointIssue, SystemStreamCheckpointIssueInput, SystemStreamCheckpointLookup,
-    SystemStreamCheckpointReceipt,
-};
 pub use history::{
     SystemHistoryReadAttempt, SystemStreamHistory, SystemStreamHistoryBounds,
     SystemStreamHistoryObservation, SystemStreamHistoryOrdering, SystemStreamHistoryPage,

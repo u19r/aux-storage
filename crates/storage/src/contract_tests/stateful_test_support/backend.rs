@@ -716,7 +716,7 @@ async fn inject_kv_required_history_gap<B: kv_backend::KvBackend>(
             Box::pin(async move {
                 let position = {
                     let mut catalog = KvCatalogAttempt::new(attempt, ReadProtection::Conflict);
-                    let (history, _) = catalog.read_system_page_start(None).await?;
+                    let history = catalog.read_system_page_start().await?;
                     let high = history.capture_high().map_err(|_| {
                         storage::StorageError::internal("invalid fault source high")
                     })?;

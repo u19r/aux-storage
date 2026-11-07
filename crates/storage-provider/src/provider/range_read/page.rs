@@ -2,7 +2,9 @@ use storage_types::{ItemKey, StorageError, StorageResult, WireItem};
 
 use super::RangeReadProgress;
 
-/// A native range image paired with its independently decoded physical address.
+/// An item paired with its decoded table/index storage key, not raw backend
+/// bytes. Query response projection can remove item attributes without changing
+/// `key`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RangeReadItem {
     pub key: ItemKey,

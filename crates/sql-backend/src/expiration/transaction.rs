@@ -2,7 +2,9 @@
 //! attempt.
 
 use storage_common::TtlIndexWrite;
-use storage_provider::maintenance::{ExpirationIndexLocator, ExpirationPort, ExpirationScanRead};
+use storage_provider::maintenance::{
+    ExpirationIndexLocator, ExpirationPort, ExpirationScanRead, TransactReceiptRow,
+};
 use storage_types::{BoundTableInfo, StorageResult};
 
 use super::read::read_expiration_index;
@@ -43,6 +45,32 @@ impl<A: SqlAttempt, L: SqlLayout> ExpirationPort for SqlCatalogAttempt<'_, A, L>
         let result =
             async { apply_ttl_index_writes(catalog.attempt, catalog.engine, table, writes).await }
                 .await;
+        settlement.complete(result)
+    }
+
+    async fn scan_transact_receipts(
+        &mut self,
+        after: Option<&str>,
+        limit: std::num::NonZeroU32,
+    ) -> StorageResult<Vec<TransactReceiptRow>> {
+        let mut settlement =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = settlement.as_mut();
+        let result =
+            crate::transact_write::scan_receipts(catalog.attempt, catalog.engine, after, limit)
+                .await;
+        settlement.complete(result)
+    }
+
+    async fn delete_transact_receipts(
+        &mut self,
+        receipts: &[TransactReceiptRow],
+    ) -> StorageResult<()> {
+        let mut settlement =
+            infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
+        let catalog = settlement.as_mut();
+        let result =
+            crate::transact_write::delete_receipts(catalog.attempt, catalog.engine, receipts).await;
         settlement.complete(result)
     }
 }

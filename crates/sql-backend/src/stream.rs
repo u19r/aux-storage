@@ -4,17 +4,16 @@ use std::future::Future;
 
 use futures::future::BoxFuture;
 use storage_provider::DynamoTableStreamAttempt;
-use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName, SystemStreamCheckpoint};
+use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName};
 use stream_provider::{
     CursorName, StreamAttempt, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem,
     StreamPartitioningSupport, StreamPort, StreamReadKind, StreamReadRequest, StreamReadResult,
-    StreamRowKind, StreamRowPage, StreamRowValue, SystemStreamCheckpointIssue,
-    SystemStreamHistoryReadPage,
+    StreamRowKind, StreamRowPage, StreamRowValue, SystemStreamHistoryReadPage,
 };
 
 use crate::{
     SqlAttempt, SqlBackend, SqlLayout, SqlStore, catalog::SqlCatalogAttempt, stream_catalog,
-    stream_checkpoint, stream_cursor, stream_read, stream_split, stream_write,
+    stream_cursor, stream_history, stream_read, stream_split, stream_write,
 };
 
 impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> {
@@ -106,14 +105,6 @@ impl<A: SqlAttempt, L: SqlLayout> StreamAttempt for SqlCatalogAttempt<'_, A, L> 
         receipt: &stream_provider::SystemStreamSplitReceipt,
     ) -> impl Future<Output = StorageResult<()>> + Send {
         stream_split::write_split(self.attempt, self.engine, receipt)
-    }
-
-    fn write_system_stream_checkpoint(
-        &mut self,
-        issue: &SystemStreamCheckpointIssue,
-        checkpoint: &SystemStreamCheckpoint,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        stream_checkpoint::write_checkpoint(self.attempt, self.engine, issue, checkpoint)
     }
 
     fn store_user_item(
@@ -266,28 +257,9 @@ impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
 
     fn read_system_page_start(
         &mut self,
-        token: Option<&storage_types::SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(
-            stream_provider::SystemStreamHistory,
-            Option<stream_provider::SystemStreamCheckpointReceipt>,
-        )>,
-    > + Send {
-        stream_checkpoint::read_page_start(self.attempt, self.engine, token)
-    }
-
-    fn read_system_page_start_snapshot(
-        &mut self,
-        token: Option<&storage_types::SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(
-            stream_provider::SystemStreamHistory,
-            Option<stream_provider::SystemStreamCheckpointReceipt>,
-        )>,
-    > + Send {
-        // The SQL history read is already a snapshot read; only the receipt
-        // lookup uses conflict protection.
-        stream_checkpoint::read_page_start(self.attempt, self.engine, token)
+    ) -> impl Future<Output = StorageResult<stream_provider::SystemStreamHistory>> + Send {
+        // The SQL history read is already a snapshot read.
+        stream_history::read_history(self.attempt, self.engine)
     }
 
     async fn read_system_history_pages(
@@ -297,8 +269,13 @@ impl<A: SqlAttempt, L: SqlLayout> stream_provider::SystemHistoryReadAttempt
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result =
-            stream_read::read_system_history_pages(catalog.attempt, catalog.engine, reads).await;
+        let result = stream_read::read_system_history_pages(
+            catalog.attempt,
+            catalog.engine,
+            catalog.protection,
+            reads,
+        )
+        .await;
         settlement.complete(result)
     }
 }

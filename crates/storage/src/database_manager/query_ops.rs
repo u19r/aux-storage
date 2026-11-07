@@ -85,7 +85,11 @@ impl DatabaseManager {
             .try_map(T::try_from_wire_item)
     }
 
-    /// Returns physical addresses independently of the persisted images.
+    /// Aux extension: query items with a separate decoded storage key per item.
+    /// Uses the same query rules as `query_table`, including response
+    /// projection. Keys are logical table/index addresses, not raw backend
+    /// bytes or row IDs. Prefer `query_table_stored_entity` for automatic
+    /// entity identity checks.
     pub async fn query_source_page(
         &self,
         request: QueryTableRequest,

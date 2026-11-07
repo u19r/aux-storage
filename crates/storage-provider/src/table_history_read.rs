@@ -29,7 +29,7 @@ impl TableHistoryReadState {
         attempt: &mut impl DynamoTableStreamAttempt,
         table: &BoundTableInfo,
     ) -> StorageResult<Self> {
-        let (source, _) = attempt.read_system_page_start(None).await?;
+        let source = attempt.read_system_page_start().await?;
         let retention = attempt
             .load_table_history_retention(table, storage_types::ReadProtection::Snapshot)
             .await?

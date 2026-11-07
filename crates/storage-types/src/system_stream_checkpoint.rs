@@ -14,8 +14,8 @@ use utoipa::ToSchema;
 use crate::constants::{
     CHECKPOINT_TOKEN_PREFIX, SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES,
     SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES, SYSTEM_STREAM_CHECKPOINT_MAX_STATE_BYTES,
-    SYSTEM_STREAM_CHECKPOINT_TOKEN_ID_BYTES, SYSTEM_STREAM_LINEAGE_ID_MAX_BYTES,
-    SYSTEM_STREAM_OFFSET_MAX_BYTES, SYSTEM_STREAM_SCOPE_ID_MAX_BYTES, SYSTEM_STREAM_SCOPE_VERSION,
+    SYSTEM_STREAM_LINEAGE_ID_MAX_BYTES, SYSTEM_STREAM_OFFSET_MAX_BYTES,
+    SYSTEM_STREAM_SCOPE_ID_MAX_BYTES, SYSTEM_STREAM_SCOPE_VERSION,
     SYSTEM_STREAM_SHARD_ID_MAX_BYTES,
 };
 
@@ -77,8 +77,6 @@ pub enum SystemStreamContractError {
     DuplicateShard,
     #[error("SystemStream checkpoint names an unknown lineage")]
     UnknownLineage,
-    #[error("SystemStream checkpoint token is not issued for this source")]
-    UnknownCheckpoint,
     #[error("SystemStream record is missing logical position")]
     MissingRecordPosition,
     #[error("SystemStream record is missing logical source table name")]

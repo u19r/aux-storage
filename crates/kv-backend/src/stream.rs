@@ -7,17 +7,17 @@ use storage_common::partition::{
     PartitionInfo, PartitionLoadSampleRecord, ResolvedPartitionFamily,
 };
 use storage_provider::DynamoTableStreamAttempt;
-use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName, SystemStreamCheckpoint};
+use storage_types::{AttemptMode, StorageResult, StreamItemId, StreamName};
 use stream_provider::{
     CursorName, StreamAttempt, StreamCatalogLookup, StreamCatalogRecord, StreamCursor, StreamItem,
     StreamItemIdAllocation, StreamPartitioningSupport, StreamPort, StreamReadKind,
     StreamReadRequest, StreamReadResult, StreamRowKind, StreamRowPage, StreamRowValue,
-    SystemStreamCheckpointIssue, SystemStreamHistoryReadPage,
+    SystemStreamHistoryReadPage,
 };
 
 use crate::{
     KvAttempt, KvBackend, KvStore, KvTopology, catalog::KvCatalogAttempt, stream_catalog,
-    stream_checkpoint, stream_cursor, stream_partition, stream_read, stream_split, stream_write,
+    stream_cursor, stream_partition, stream_read, stream_split, stream_write,
 };
 
 impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
@@ -106,14 +106,6 @@ impl<A: KvAttempt> StreamAttempt for KvCatalogAttempt<'_, A> {
         receipt: &stream_provider::SystemStreamSplitReceipt,
     ) -> impl Future<Output = StorageResult<()>> + Send {
         stream_split::write_split(self.attempt, receipt)
-    }
-
-    fn write_system_stream_checkpoint(
-        &mut self,
-        issue: &SystemStreamCheckpointIssue,
-        checkpoint: &SystemStreamCheckpoint,
-    ) -> impl Future<Output = StorageResult<()>> + Send {
-        stream_checkpoint::write_checkpoint(self.attempt, issue, checkpoint)
     }
 
     async fn store_user_item(&mut self, row: StreamItem) -> StorageResult<()> {
@@ -301,32 +293,21 @@ impl<A: KvAttempt> stream_provider::SystemHistoryReadAttempt for KvCatalogAttemp
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result = stream_read::load_retired_positions(catalog.attempt, origins).await;
+        let result =
+            stream_read::load_retired_positions(catalog.attempt, catalog.protection, origins).await;
         settlement.complete(result)
     }
 
     fn read_system_page_start(
         &mut self,
-        token: Option<&storage_types::SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(
-            stream_provider::SystemStreamHistory,
-            Option<stream_provider::SystemStreamCheckpointReceipt>,
-        )>,
-    > + Send {
-        crate::stream_history::read_page_start(self.attempt, token, self.protection)
+    ) -> impl Future<Output = StorageResult<stream_provider::SystemStreamHistory>> + Send {
+        crate::stream_history::read_page_start(self.attempt, self.protection)
     }
 
     fn read_system_page_start_snapshot(
         &mut self,
-        token: Option<&storage_types::SystemStreamCheckpointToken>,
-    ) -> impl Future<
-        Output = StorageResult<(
-            stream_provider::SystemStreamHistory,
-            Option<stream_provider::SystemStreamCheckpointReceipt>,
-        )>,
-    > + Send {
-        crate::stream_history::read_page_start_snapshot(self.attempt, token)
+    ) -> impl Future<Output = StorageResult<stream_provider::SystemStreamHistory>> + Send {
+        crate::stream_history::read_page_start_snapshot(self.attempt, self.protection)
     }
 
     async fn read_system_history_pages(
@@ -336,7 +317,9 @@ impl<A: KvAttempt> stream_provider::SystemHistoryReadAttempt for KvCatalogAttemp
         let mut settlement =
             infrastructure_provider::physical_attempt::PhysicalRecordOperation::new(self);
         let catalog = settlement.as_mut();
-        let result = stream_read::read_system_history_pages(catalog.attempt, reads).await;
+        let result =
+            stream_read::read_system_history_pages(catalog.attempt, catalog.protection, reads)
+                .await;
         settlement.complete(result)
     }
 }

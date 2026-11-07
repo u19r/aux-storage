@@ -78,6 +78,8 @@ mod write_ops_tests;
 
 #[cfg(feature = "regional")]
 mod history_read;
+#[cfg(all(test, any(feature = "sqlite", feature = "rocksdb")))]
+mod transact_receipt_trim_tests;
 #[cfg(all(test, feature = "sqlite"))]
 mod transaction_write_coordinator_tests;
 

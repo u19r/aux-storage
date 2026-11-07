@@ -7,10 +7,7 @@ use storage_types::{AttemptMode, StorageError, StorageResult, StreamItemId, Stre
 use crate::{
     ReadDirection, StreamAttempt, StreamError, StreamItem, StreamKind, StreamPage,
     StreamPartitioningMode, StreamPort, StreamResult, StreamRowKind,
-    system_stream::{
-        SystemStreamCheckpointLookup, SystemStreamCheckpointReceipt, SystemStreamHistory,
-        SystemStreamHistoryRecord,
-    },
+    system_stream::{SystemStreamHistory, SystemStreamHistoryRecord},
     validate_limit,
 };
 
@@ -56,7 +53,6 @@ pub enum StreamRowReadKind<'a> {
 pub enum SystemStreamReadKind<'a> {
     Rows(AddressedStreamRead<'a>),
     Catalog,
-    Checkpoint(SystemStreamCheckpointLookup<'a>),
 }
 
 impl StreamRowKind {
@@ -78,7 +74,6 @@ pub enum StreamReadResult {
     Items(StreamRowPage),
     Item(Option<StreamItem>),
     SystemCatalog(SystemStreamHistory),
-    SystemCheckpoint(Option<SystemStreamCheckpointReceipt>),
 }
 
 /// One physical logical-history read, with its pointer rows in the same order.
@@ -111,17 +106,6 @@ impl StreamReadResult {
     pub fn into_system_catalog(self) -> StorageResult<SystemStreamHistory> {
         match self {
             Self::SystemCatalog(history) => Ok(history),
-            _ => Err(StorageError::internal(
-                "stream backend returned another read kind",
-            )),
-        }
-    }
-
-    pub(crate) fn into_system_checkpoint(
-        self,
-    ) -> StorageResult<Option<SystemStreamCheckpointReceipt>> {
-        match self {
-            Self::SystemCheckpoint(receipt) => Ok(receipt),
             _ => Err(StorageError::internal(
                 "stream backend returned another read kind",
             )),

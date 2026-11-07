@@ -120,7 +120,10 @@ async fn given_absent_optional_maintenance_repositories_when_catalog_is_assemble
         .filter(|job| {
             matches!(
                 job,
-                StorageJob::GsiBackfill | StorageJob::TtlSweep | StorageJob::StreamTrim
+                StorageJob::GsiBackfill
+                    | StorageJob::TransactReceiptTrim
+                    | StorageJob::TtlSweep
+                    | StorageJob::StreamTrim
             )
         })
         .map(|job| (job.as_str().into(), 1))

@@ -625,12 +625,27 @@ async fn system_stream_reads_sqlite_logical_records_and_resumes_with_checkpoint(
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
-async fn system_stream_rejects_forged_well_formed_checkpoint_before_backend_reads() {
+async fn system_stream_rejects_well_formed_checkpoint_naming_an_unknown_lineage() {
     let db = create_sqlite_test_db().await;
     let source_scope = system_scope_json(&db).await;
+    let scope = db
+        .get_system_stream_scope_for_control()
+        .await
+        .expect("persisted logical SystemStream scope");
     let app_state = Arc::new(AppState::new(db));
-    let forged = SystemStreamCheckpointToken::try_from(format!("v1.{}", "43".repeat(16)))
-        .expect("syntactic token");
+    let forged_frontier = storage_types::SystemStreamCheckpoint::try_new(
+        scope,
+        vec![
+            storage_types::SystemStreamPosition::try_new("forged-shard", "forged-lineage", "0")
+                .expect("position"),
+        ],
+    )
+    .expect("forged frontier");
+    let forged = SystemStreamCheckpointToken::encode(
+        &forged_frontier,
+        storage_types::TimestampMillis::from_timestamp(0),
+    )
+    .expect("well-formed token");
     let error = internal::get_stream_records_endpoint(
         State(app_state),
         Bytes::from(
@@ -643,7 +658,7 @@ async fn system_stream_rejects_forged_well_formed_checkpoint_before_backend_read
         ),
     )
     .await
-    .expect_err("unknown checkpoint must not reach a provider read");
+    .expect_err("a frontier outside the catalog must not read records");
     let (status, error) = error;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -652,7 +667,7 @@ async fn system_stream_rejects_forged_well_formed_checkpoint_before_backend_read
     );
     assert_eq!(
         error.0.message,
-        "SystemStream checkpoint token is not issued for this source"
+        "SystemStream checkpoint names an unknown lineage"
     );
 }
 

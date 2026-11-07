@@ -41,6 +41,20 @@ pub trait ExpirationPort:
         table: &BoundTableInfo,
         writes: impl Iterator<Item = TtlIndexWrite> + Send,
     ) -> impl Future<Output = StorageResult<()>> + Send;
+
+    /// Read up to `limit` transact-write receipts with tokens after `after`,
+    /// in ascending token order.
+    fn scan_transact_receipts(
+        &mut self,
+        after: Option<&str>,
+        limit: std::num::NonZeroU32,
+    ) -> impl Future<Output = StorageResult<Vec<super::TransactReceiptRow>>> + Send;
+
+    /// Delete each receipt whose stored bytes still equal the scanned bytes.
+    fn delete_transact_receipts(
+        &mut self,
+        receipts: &[super::TransactReceiptRow],
+    ) -> impl Future<Output = StorageResult<()>> + Send;
 }
 
 pub struct ExpirationAttempt<'a, P: ExpirationPort, S = OrdinaryExpiration> {

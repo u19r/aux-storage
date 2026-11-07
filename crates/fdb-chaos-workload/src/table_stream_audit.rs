@@ -73,7 +73,7 @@ async fn load_table_reference_pages(
     storage_provider::maintenance::TableHistoryTrimFrontier,
 )> {
     let mut catalog = KvCatalogAttempt::new(attempt, ReadProtection::Snapshot);
-    let (history, _) = catalog.read_system_page_start(None).await?;
+    let history = catalog.read_system_page_start().await?;
     let state = catalog
         .load_table_history_retention(table, ReadProtection::Snapshot)
         .await?

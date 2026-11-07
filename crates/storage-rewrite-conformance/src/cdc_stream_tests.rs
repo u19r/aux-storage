@@ -206,3 +206,35 @@ async fn given_large_item_when_put_then_cdc_snapshot_has_exact_logical_attribute
     store.finish().await;
     result
 }
+
+/// The page read runs in a read-only native attempt, so it must use snapshot
+/// reads and never request conflict protection, which only write attempts
+/// allow.
+#[tokio::test]
+async fn system_stream_page_reads_history_in_a_read_only_attempt() {
+    let store = TestStore::new().await;
+    let table = create_table(&store).await.unwrap();
+    put(&store, &table, "customer-1", "active").await.unwrap();
+    let scope = store.stream_operations.system_stream_scope().await.unwrap();
+    let request =
+        stream_provider::SystemStreamPageRequest::try_new(scope.clone(), None, 10).unwrap();
+    let first = store
+        .stream_operations
+        .get_system_stream_page(request)
+        .await
+        .unwrap();
+    assert!(!first.records().is_empty());
+    let resumed = stream_provider::SystemStreamPageRequest::try_new(
+        scope,
+        Some(first.issued_checkpoint().token().clone()),
+        10,
+    )
+    .unwrap();
+    let second = store
+        .stream_operations
+        .get_system_stream_page(resumed)
+        .await
+        .unwrap();
+    assert!(second.records().is_empty());
+    store.finish().await;
+}

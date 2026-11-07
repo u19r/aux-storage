@@ -8,8 +8,8 @@ use stream_provider::{
 
 use super::{range, row};
 use crate::{
-    KvAttempt, KvRangePage, ReadProtection, catalog::KvCatalogAttempt, stream_checkpoint,
-    stream_history, stream_partition,
+    KvAttempt, KvRangePage, ReadProtection, catalog::KvCatalogAttempt, stream_history,
+    stream_partition,
 };
 
 pub(crate) async fn read_stream<A: KvAttempt>(
@@ -54,16 +54,12 @@ pub(crate) async fn read_stream<A: KvAttempt>(
             };
             Ok(StreamReadResult::SystemCatalog(history))
         }
-        StreamReadKind::System(SystemStreamReadKind::Checkpoint(lookup)) => {
-            stream_checkpoint::read_receipt(attempt, lookup)
-                .await
-                .map(StreamReadResult::SystemCheckpoint)
-        }
     }
 }
 
 pub(crate) async fn read_system_history_pages<A: KvAttempt>(
     attempt: &mut A,
+    protection: ReadProtection,
     reads: &[SystemStreamHistoryRead],
 ) -> StorageResult<Vec<SystemStreamHistoryReadPage>> {
     let ranges = reads
@@ -75,12 +71,13 @@ pub(crate) async fn read_system_history_pages<A: KvAttempt>(
             Ok(range)
         })
         .collect::<StorageResult<Vec<_>>>()?;
-    let pages = attempt.scan_batch(ranges, ReadProtection::Conflict).await?;
+    let pages = attempt.scan_batch(ranges, protection).await?;
     if pages.len() != reads.len() {
         return Err(StorageEnum::HistoryUnavailable.into());
     }
     let retired = load_retired_positions(
         attempt,
+        protection,
         &reads
             .iter()
             .map(|read| read.after.clone())
@@ -112,6 +109,7 @@ pub(crate) async fn read_system_history_pages<A: KvAttempt>(
 
 pub(crate) async fn load_retired_positions<A: KvAttempt>(
     attempt: &A,
+    protection: ReadProtection,
     origins: &[storage_types::SystemStreamPosition],
 ) -> StorageResult<Vec<Option<storage_types::SystemStreamPosition>>> {
     let keys = origins
@@ -121,7 +119,7 @@ pub(crate) async fn load_retired_positions<A: KvAttempt>(
     let values = if keys.is_empty() {
         Vec::new()
     } else {
-        attempt.get_batch(keys, ReadProtection::Conflict).await?
+        attempt.get_batch(keys, protection).await?
     };
     if values.len() != origins.len() {
         return Err(StorageError::internal(

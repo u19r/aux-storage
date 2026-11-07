@@ -13,16 +13,18 @@ pub enum StorageJob {
     QueueMessageCleanup,
     StreamTrim,
     TableReclaim,
+    TransactReceiptTrim,
     TtlSweep,
 }
 
 impl StorageJob {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::GsiBackfill,
         Self::PartitionReconciliation,
         Self::QueueMessageCleanup,
         Self::StreamTrim,
         Self::TableReclaim,
+        Self::TransactReceiptTrim,
         Self::TtlSweep,
     ];
 
@@ -34,6 +36,7 @@ impl StorageJob {
             Self::QueueMessageCleanup => "queue-message-cleanup",
             Self::StreamTrim => "stream-trim",
             Self::TableReclaim => "table-reclaim",
+            Self::TransactReceiptTrim => "transact-receipt-trim",
             Self::TtlSweep => "ttl-sweep",
         }
     }
@@ -48,6 +51,7 @@ impl StorageJob {
             Self::StreamTrim => 4,
             Self::TableReclaim => 5,
             Self::TtlSweep => 6,
+            Self::TransactReceiptTrim => 7,
         };
         JobId::from([identity; 16])
     }
@@ -66,6 +70,7 @@ impl StorageJob {
             Self::QueueMessageCleanup => "storage-queue-message-cleanup",
             Self::StreamTrim => "storage-stream-trim",
             Self::TableReclaim => "storage-table-reclaim",
+            Self::TransactReceiptTrim => "storage-transact-receipt-trim",
             Self::TtlSweep => "storage-ttl-sweep",
         };
         QueueName::try_new(queue).unwrap_or_else(|_| unreachable!("static queue name"))
@@ -85,6 +90,7 @@ impl StorageJob {
             Self::QueueMessageCleanup => intervals.queue_message_cleanup_interval_ms.0,
             Self::StreamTrim => intervals.stream_trim_interval_ms.0,
             Self::TableReclaim => intervals.table_reclaim_interval_ms.0,
+            Self::TransactReceiptTrim => intervals.transact_receipt_trim_interval_ms.0,
             Self::TtlSweep => intervals.ttl_sweep_interval_ms.0,
         };
         Duration::from_millis(millis)
@@ -107,6 +113,7 @@ impl FromStr for StorageJob {
             "queue-message-cleanup" => Ok(Self::QueueMessageCleanup),
             "stream-trim" => Ok(Self::StreamTrim),
             "table-reclaim" => Ok(Self::TableReclaim),
+            "transact-receipt-trim" => Ok(Self::TransactReceiptTrim),
             "ttl-sweep" => Ok(Self::TtlSweep),
             _ => Err(StorageJobParseError::Unsupported),
         }
@@ -122,6 +129,7 @@ pub struct DatabaseJobIntervals {
     pub stream_trim_interval_ms: JobIntervalMillis,
     pub table_reclaim_interval_ms: JobIntervalMillis,
     pub queue_message_cleanup_interval_ms: JobIntervalMillis,
+    pub transact_receipt_trim_interval_ms: JobIntervalMillis,
 }
 
 impl Default for DatabaseJobIntervals {

@@ -483,8 +483,7 @@ fn system_stream_response_uses_scope_checkpoint_and_record_position_fields() {
         item: None,
         system_position: Some(position),
     };
-    let checkpoint =
-        crate::SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16))).unwrap();
+    let checkpoint = crate::system_stream_checkpoint_tests::token("0");
 
     let response =
         GetStreamRecordsResponse::system_stream(scope, vec![record], Some(checkpoint)).unwrap();

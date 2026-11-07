@@ -507,8 +507,11 @@ fn issued_checkpoint() -> SystemStreamIssuedCheckpoint {
         vec![SystemStreamPosition::try_new("shard-a", "lineage-a", "0").expect("position")],
     )
     .expect("checkpoint");
-    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16)))
-        .expect("checkpoint token");
+    let token = SystemStreamCheckpointToken::encode(
+        &checkpoint,
+        storage_types::TimestampMillis::from_timestamp(0),
+    )
+    .expect("checkpoint token");
     SystemStreamIssuedCheckpoint::new(token, checkpoint).expect("issued checkpoint")
 }
 

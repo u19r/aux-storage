@@ -229,10 +229,10 @@ pub const SYSTEM_STREAM_SHARD_ID_MAX_BYTES: usize = 128;
 pub const SYSTEM_STREAM_LINEAGE_ID_MAX_BYTES: usize = 128;
 pub const SYSTEM_STREAM_OFFSET_MAX_BYTES: usize = 256;
 pub const SYSTEM_STREAM_CHECKPOINT_MAX_ENTRIES: usize = 128;
-pub const SYSTEM_STREAM_CHECKPOINT_TOKEN_ID_BYTES: usize = 16;
 pub const SYSTEM_STREAM_CHECKPOINT_MAX_STATE_BYTES: usize = 64 * 1024;
+/// Token prefix plus the base64 of the maximum frontier state and its cutoff.
 pub const SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES: usize =
-    3 + (SYSTEM_STREAM_CHECKPOINT_TOKEN_ID_BYTES * 2);
+    3 + (SYSTEM_STREAM_CHECKPOINT_MAX_STATE_BYTES + size_of::<i64>()).div_ceil(3) * 4;
 pub const SYSTEM_STREAM_EFFECT_DIGEST_HEX_BYTES: usize = 64;
 pub(crate) const CHECKPOINT_TOKEN_PREFIX: &str = "v1.";
 

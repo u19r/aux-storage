@@ -22,8 +22,11 @@ fn given_tombstone_when_canonical_system_page_is_converted_then_keys_and_source_
     };
     let checkpoint =
         SystemStreamCheckpoint::try_new(scope.clone(), vec![position]).expect("logical checkpoint");
-    let token = SystemStreamCheckpointToken::try_from(format!("v1.{}", "42".repeat(16)))
-        .expect("checkpoint token");
+    let token = SystemStreamCheckpointToken::encode(
+        &checkpoint,
+        storage_types::TimestampMillis::from_timestamp(0),
+    )
+    .expect("checkpoint token");
     let page = SystemStreamPage::new(
         scope,
         vec![record],

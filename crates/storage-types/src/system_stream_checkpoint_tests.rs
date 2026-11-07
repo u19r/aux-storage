@@ -1,12 +1,7 @@
 use alloc_counter::AllocationGuard;
 use serde_json::json;
 
-use crate::{
-    constants::{
-        SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES, SYSTEM_STREAM_CHECKPOINT_TOKEN_ID_BYTES,
-    },
-    *,
-};
+use crate::{constants::SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES, *};
 
 fn scope() -> SystemStreamScope {
     SystemStreamScope::try_new("catalog", 7).expect("scope")
@@ -16,9 +11,12 @@ fn position(shard: &str, lineage: &str, offset: &str) -> SystemStreamPosition {
     SystemStreamPosition::try_new(shard, lineage, offset).expect("position")
 }
 
-fn token(nibble: char) -> SystemStreamCheckpointToken {
-    SystemStreamCheckpointToken::try_from(format!("v1.{}", nibble.to_string().repeat(32)))
-        .expect("syntactic token")
+pub(crate) fn token(offset: &str) -> SystemStreamCheckpointToken {
+    let checkpoint =
+        SystemStreamCheckpoint::try_new(scope(), vec![position("shard-a", "lineage-a", offset)])
+            .expect("checkpoint");
+    SystemStreamCheckpointToken::encode(&checkpoint, TimestampMillis::from_timestamp(1_700))
+        .expect("token")
 }
 
 fn checkpoint() -> SystemStreamCheckpoint {
@@ -59,18 +57,20 @@ fn scope_wire_shape_is_versioned_and_validated() {
 }
 
 #[test]
-fn checkpoint_token_is_opaque_versioned_and_bounded() {
-    let token = token('4');
-    assert!(!token.as_str().contains("catalog"));
-    assert!(!token.as_str().contains("shard-a"));
+fn checkpoint_token_round_trips_frontier_and_cutoff_without_storage() {
+    let token = token("00000000000000000009");
+    let (checkpoint, cutoff) = token.decode().expect("decode");
+    assert_eq!(checkpoint.scope(), &scope());
     assert_eq!(
-        token.as_str().len(),
-        SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES
+        checkpoint.frontier(),
+        &[position("shard-a", "lineage-a", "00000000000000000009")]
     );
+    assert_eq!(cutoff, TimestampMillis::from_timestamp(1_700));
     assert_eq!(
         SystemStreamCheckpointToken::try_from(token.as_str()).expect("token"),
         token
     );
+    assert!(token.as_str().len() <= SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES);
     assert_eq!(
         format!("{token:?}"),
         "SystemStreamCheckpointToken(redacted)"
@@ -78,110 +78,29 @@ fn checkpoint_token_is_opaque_versioned_and_bounded() {
 }
 
 #[test]
-fn checkpoint_token_rejects_malformed_versions_and_forged_issued_id() {
-    let issued = token('4');
-    let mut tampered = issued.as_str().to_string();
-    tampered.replace_range(0..3, "v2.");
+fn checkpoint_token_rejects_malformed_versions_and_non_canonical_text() {
+    let issued = token("00000000000000000009");
+    let mut legacy = issued.as_str().to_string();
+    legacy.replace_range(0..3, "v9.");
     assert_eq!(
-        SystemStreamCheckpointToken::try_from(tampered),
+        SystemStreamCheckpointToken::try_from(legacy),
         Err(SystemStreamContractError::UnsupportedCheckpointVersion)
     );
-    assert!(matches!(
+    assert_eq!(
         SystemStreamCheckpointToken::try_from("legacy-raw-token"),
         Err(SystemStreamContractError::MalformedCheckpoint)
-    ));
-    assert!(matches!(
-        SystemStreamCheckpointToken::try_from("v1.4242424242424242424242424242424A"),
-        Err(SystemStreamContractError::NonCanonicalCheckpoint)
-    ));
-    let forged = token('3');
+    );
     assert_eq!(
-        forged.ensure_issued([&issued]),
-        Err(SystemStreamContractError::UnknownCheckpoint)
+        SystemStreamCheckpointToken::try_from("v1.not base64!"),
+        Err(SystemStreamContractError::MalformedCheckpoint)
     );
-}
-
-fn legacy_token_parse(value: &str) -> Result<String, SystemStreamContractError> {
-    let value = value.to_owned();
-    if value.is_empty() || value.len() > SYSTEM_STREAM_CHECKPOINT_MAX_ENCODED_BYTES {
-        return Err(SystemStreamContractError::MalformedCheckpoint);
-    }
-    let Some(encoded_id) = value.strip_prefix("v1.") else {
-        if value.starts_with('v') {
-            return Err(SystemStreamContractError::UnsupportedCheckpointVersion);
-        }
-        return Err(SystemStreamContractError::MalformedCheckpoint);
-    };
-    if encoded_id.len() != SYSTEM_STREAM_CHECKPOINT_TOKEN_ID_BYTES * 2 {
-        return Err(SystemStreamContractError::MalformedCheckpoint);
-    }
-    let id = hex::decode(encoded_id).map_err(|_| SystemStreamContractError::MalformedCheckpoint)?;
-    if hex::encode(id) != encoded_id {
-        return Err(SystemStreamContractError::NonCanonicalCheckpoint);
-    }
-    Ok(value)
-}
-
-#[test]
-fn checkpoint_token_direct_validation_preserves_bytes_and_errors() {
-    let canonical = token('4').as_str().to_owned();
-    let mut uppercase = canonical.clone();
-    uppercase.replace_range(3..4, "A");
-    let mut malformed = canonical.clone();
-    malformed.replace_range(3..4, "g");
-    let inputs = [
-        canonical.as_str(),
-        uppercase.as_str(),
-        malformed.as_str(),
-        "v2.44444444444444444444444444444444",
-        "v1.4444",
-        "legacy-raw-token",
-    ];
-
-    for input in inputs {
-        let expected = legacy_token_parse(input);
-        let actual = SystemStreamCheckpointToken::try_from(input).map(String::from);
-        assert_eq!(actual, expected, "token validation changed for {input:?}");
-    }
-}
-
-fn measure_token_validation_allocations(
-    label: &'static str,
-    input: &str,
-    candidate: bool,
-) -> alloc_counter::AllocationReport<'static> {
-    let guard = AllocationGuard::start(
-        module_path!(),
-        "checkpoint_token_validation_allocation_profile",
-        file!(),
-        line!(),
-        Some(label),
+    assert_eq!(
+        SystemStreamCheckpointToken::try_from("v1.AAAA"),
+        Err(SystemStreamContractError::MalformedCheckpoint)
     );
-    for _ in 0..256 {
-        let parsed = if candidate {
-            SystemStreamCheckpointToken::try_from(input).map(String::from)
-        } else {
-            legacy_token_parse(input)
-        };
-        let _ = std::hint::black_box(parsed);
-    }
-    guard.finish()
-}
-
-#[test]
-fn checkpoint_token_direct_validation_avoids_decode_and_invalid_input_allocations() {
-    let valid = token('4');
-    let mut invalid = valid.as_str().to_owned();
-    invalid.replace_range(3..4, "g");
-
-    for input in [valid.as_str(), invalid.as_str()] {
-        let legacy = measure_token_validation_allocations("legacy_hex_validation", input, false);
-        let candidate = measure_token_validation_allocations("direct_validation", input, true);
-        let _ = alloc_counter::emit_report(&legacy);
-        let _ = alloc_counter::emit_report(&candidate);
-        assert!(candidate.allocation_count < legacy.allocation_count);
-        assert!(candidate.allocated_bytes < legacy.allocated_bytes);
-    }
+    let mut padded = issued.as_str().to_string();
+    padded.push('=');
+    assert!(SystemStreamCheckpointToken::try_from(padded).is_err());
 }
 
 fn write_legacy_bounded_string(value: &SystemStreamScopeId, output: &mut Vec<u8>) {

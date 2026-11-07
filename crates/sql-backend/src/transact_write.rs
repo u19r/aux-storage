@@ -1,6 +1,8 @@
 //! SQL receipt persistence for the shared TransactWriteItems executor.
 
-use storage_provider::{DynamoTransactWriteAttempt, TRANSACT_RECEIPT_READ_BYTES};
+use storage_provider::{
+    DynamoTransactWriteAttempt, TRANSACT_RECEIPT_READ_BYTES, maintenance::TransactReceiptRow,
+};
 use storage_types::{StorageError, StorageResult};
 
 use crate::{
@@ -151,4 +153,48 @@ fn decode_receipt_row(row: SqlRow) -> StorageResult<Vec<u8>> {
         return Err(invalid());
     };
     Ok(bytes)
+}
+
+pub(crate) async fn scan_receipts<A: SqlAttempt>(
+    attempt: &mut A,
+    engine: impl SqlLayout,
+    after: Option<&str>,
+    limit: std::num::NonZeroU32,
+) -> StorageResult<Vec<TransactReceiptRow>> {
+    let page = attempt
+        .query(
+            sql_statements::scan_receipts(engine, after, limit.get()),
+            crate::ReadProtection::Conflict,
+            TRANSACT_RECEIPT_READ_BYTES,
+        )
+        .await?;
+    page.rows.into_iter().map(decode_receipt_pair).collect()
+}
+
+pub(crate) async fn delete_receipts<A: SqlAttempt>(
+    attempt: &mut A,
+    engine: impl SqlLayout,
+    receipts: &[TransactReceiptRow],
+) -> StorageResult<()> {
+    for row in receipts {
+        attempt
+            .execute(sql_statements::delete_receipt(
+                engine,
+                &row.token,
+                &row.receipt,
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+fn decode_receipt_pair(row: SqlRow) -> StorageResult<TransactReceiptRow> {
+    let invalid = || StorageError::internal("SQL transact token receipt has invalid scan columns");
+    let mut values = row.into_values().into_iter();
+    let (Some(SqlValue::Text(token)), Some(SqlValue::Blob(receipt)), None) =
+        (values.next(), values.next(), values.next())
+    else {
+        return Err(invalid());
+    };
+    Ok(TransactReceiptRow { token, receipt })
 }

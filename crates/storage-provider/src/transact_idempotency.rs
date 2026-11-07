@@ -82,6 +82,16 @@ pub(crate) async fn find_transact_response<A: DynamoTransactWriteAttempt>(
     Ok(SemanticDecision::Accepted(Some(response)))
 }
 
+/// A request-window receipt is dead once its idempotency window closes;
+/// scheduled-job effect receipts live until their execution finishes.
+pub(crate) fn transact_receipt_is_trimmable(
+    bytes: &[u8],
+    at: TimestampMillis,
+) -> StorageResult<bool> {
+    let receipt: TransactReceipt<Vec<u8>> = storage_types::storage_serde::from_bytes(bytes)?;
+    Ok(receipt.expired(at))
+}
+
 pub(crate) async fn find_job_effect_response<A: DynamoTransactWriteAttempt>(
     attempt: &mut A,
     token: &str,
